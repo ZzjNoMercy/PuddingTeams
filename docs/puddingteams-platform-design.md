@@ -4,6 +4,7 @@
 > 创建时间：2026-08-03。
 > 项目关系：PuddingTeams 与 PuddingClaw 为两个隔离项目；PuddingClaw 仅作为首个 worker 经 CLI/MCP 契约被调用，无代码耦合。
 > 关联文档（PuddingClaw 侧文档的参考拷贝，以 PuddingClaw 仓库为准）：`docs/reference/2026-08-03-headless-worker-api-cli-mcp-plan.md`（PuddingClaw headless 调用面方案）、`docs/reference/deerflow-harness-对比与借鉴分析.md`。原始位置：PuddingClaw 仓库 `/Users/pet/Code/AI/Agent/PuddingClaw/docs/`。
+> 关联文档（本仓方案）：`docs/2026-08-05-房间即群聊-产品模型方案.md`（阶段二产品模型：solo/单聊/群聊、session 归属窗口、solo 派活路由；落地后 §3 房间描述以该文为准）。
 > 参考源码：pi `/Users/pet/Code/AI/Agent/源码合集/pi`，AgentTeams `/Users/pet/Code/AI/Agent/源码合集/AgentTeams`。
 > 核心原则：**极简，尽量用 pi 原生原语；重的部分（权限、验收、上下文）由各 worker agent 自己实现**。
 

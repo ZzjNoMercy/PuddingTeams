@@ -43,8 +43,13 @@ export function useChat(sessionId: string) {
 				attempt = 0;
 				setStatus("connected");
 				// Re-align with the server after a drop: events emitted while the
-				// socket was down were never delivered.
-				if (wasReconnect) void loadHistory();
+				// socket was down were never delivered. Reset the running flag —
+				// if a turn is still live, the reloaded history + new events
+				// restore an accurate view.
+				if (wasReconnect) {
+					setRunning(false);
+					void loadHistory();
+				}
 			};
 			ws.onmessage = (m) => {
 				let event: { type: string; [k: string]: unknown };
@@ -59,6 +64,9 @@ export function useChat(sessionId: string) {
 			};
 			ws.onclose = () => {
 				if (disposed) return;
+				// A dropped socket can't deliver agent_settled; unblock the UI
+				// so the user isn't stuck with a permanently disabled input.
+				setRunning(false);
 				// Exponential backoff: 1s, 2s, 4s, … capped at 15s. Retries never
 				// stop; after a few failures the UI switches to the "disconnected"
 				// hint while reconnecting continues in the background.

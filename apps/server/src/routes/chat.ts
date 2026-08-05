@@ -1,7 +1,42 @@
 import type { FastifyInstance } from "fastify";
 import type { WebSocket } from "@fastify/websocket";
+import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { serializePiEvent } from "../pi-bridge/bridge.js";
 import { PiSessionStore } from "../pi-bridge/session-store.js";
+import type { TeamsStore } from "../store/teams.js";
+import { config } from "../config.js";
+
+/**
+ * Version of the bundled pi SDK, surfaced via /api/health for the About
+ * dialog. The package's exports map hides ./package.json and defines only an
+ * `import` condition, so resolve via import.meta and read the manifest next
+ * to the entry point.
+ */
+function readPiVersion(): string | undefined {
+	try {
+		const entry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
+		let dir = path.dirname(entry);
+		for (let i = 0; i < 5; i++) {
+			try {
+				const pkg = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf-8")) as {
+					name?: string;
+					version?: string;
+				};
+				if (pkg.name === "@earendil-works/pi-coding-agent") return pkg.version;
+			} catch {
+				// keep walking up
+			}
+			dir = path.dirname(dir);
+		}
+	} catch {
+		// unresolvable — omit the field
+	}
+	return undefined;
+}
+
+const piVersion = readPiVersion();
 
 interface WsHandlerParams {
 	Params: { id: string };
@@ -25,12 +60,23 @@ function forwardError(sessionId: string, message: string): void {
 	}
 }
 
-export async function registerChatRoutes(app: FastifyInstance, store: PiSessionStore): Promise<void> {
-	app.get("/api/health", async () => ({ ok: true, service: "puddingteams-server" }));
+export async function registerChatRoutes(
+	app: FastifyInstance,
+	store: PiSessionStore,
+	teams?: TeamsStore,
+): Promise<void> {
+	app.get("/api/health", async () => ({ ok: true, service: "puddingteams-server", piVersion }));
 
 	app.get("/api/models", async () => ({ models: await store.listModels() }));
 
 	app.get("/api/providers", async () => ({ providers: await store.listProviders() }));
+
+	app.get<{ Params: { id: string } }>("/api/providers/:id/models", async (req, reply) => {
+		if (!(await store.hasProvider(req.params.id))) {
+			return reply.code(404).send({ error: "provider not found" });
+		}
+		return { models: await store.listProviderModels(req.params.id) };
+	});
 
 	app.post<{ Params: { id: string }; Body: { apiKey?: string } }>(
 		"/api/providers/:id/key",
@@ -71,7 +117,12 @@ export async function registerChatRoutes(app: FastifyInstance, store: PiSessionS
 
 	app.delete<{ Params: { id: string } }>("/api/sessions/:id", async (req, reply) => {
 		const removed = await store.remove(req.params.id);
-		if (!removed) return reply.code(404).send({ error: "session not found" });
+		// A fresh room may only exist as a config (pi writes the session file
+		// lazily) — clean the room store regardless, and only 404 when nothing
+		// existed at all.
+		const hadRoom = teams ? await teams.hasRoomConfig(req.params.id) : false;
+		await teams?.removeSessionFromRooms(req.params.id);
+		if (!removed && !hadRoom) return reply.code(404).send({ error: "session not found" });
 		return reply.code(204).send();
 	});
 
@@ -121,6 +172,13 @@ export async function registerChatRoutes(app: FastifyInstance, store: PiSessionS
 		{ websocket: true },
 		async (socket, req) => {
 			const sessionId = req.params.id;
+			// Browsers always send Origin on cross-origin upgrades; native
+			// clients (curl/node) may omit it — allow those, block foreign pages.
+			const origin = req.headers.origin;
+			if (origin && !config.allowedOrigins.includes(origin)) {
+				socket.close(1008, "origin not allowed");
+				return;
+			}
 			let sockets = socketsBySession.get(sessionId);
 			if (!sockets) {
 				sockets = new Set();

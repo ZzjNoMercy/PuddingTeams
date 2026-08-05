@@ -6,3 +6,4 @@ dist/
 .env.local
 .DS_Store
 apps/server/.sessions/
+apps/server/.teams/

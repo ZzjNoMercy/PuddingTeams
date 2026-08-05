@@ -6,6 +6,8 @@ import {
 	type CreateAgentSessionOptions,
 } from "@earendil-works/pi-coding-agent";
 import { unlink } from "node:fs/promises";
+import type { TeamsStore } from "../store/teams.js";
+import { createTeamTaskTool } from "./team-task.js";
 
 export interface SessionSummary {
 	id: string;
@@ -20,6 +22,9 @@ export interface ModelSummary {
 	id: string;
 	name: string;
 	provider: string;
+	reasoning: boolean;
+	contextWindow: number;
+	maxTokens: number;
 }
 
 export interface ProviderSummary {
@@ -28,6 +33,8 @@ export interface ProviderSummary {
 	modelCount: number;
 	configured: boolean;
 	oauth: boolean;
+	/** API endpoint (base URL) the provider talks to, when it has one. */
+	baseUrl?: string;
 }
 
 type PiModel = NonNullable<CreateAgentSessionOptions["model"]>;
@@ -47,7 +54,13 @@ export class PiSessionStore {
 	constructor(
 		private readonly cwd: string,
 		private readonly sessionDir: string,
+		private readonly teamsStore?: TeamsStore,
 	) {}
+
+	/** Custom tools registered into every manager session (team_task). */
+	private customToolsFor(getSessionId: () => string): CreateAgentSessionOptions["customTools"] {
+		return this.teamsStore ? [createTeamTaskTool(this.teamsStore, getSessionId)] : undefined;
+	}
 
 	/** Shared model runtime (auth + model catalog), created on first use. */
 	private runtime(): Promise<ModelRuntime> {
@@ -56,7 +69,14 @@ export class PiSessionStore {
 	}
 
 	private static summarizeModel(model: PiModel): ModelSummary {
-		return { id: `${model.provider}/${model.id}`, name: model.name, provider: model.provider };
+		return {
+			id: `${model.provider}/${model.id}`,
+			name: model.name,
+			provider: model.provider,
+			reasoning: model.reasoning,
+			contextWindow: model.contextWindow,
+			maxTokens: model.maxTokens,
+		};
 	}
 
 	/** Models the user can pick: available (auth configured), else full catalog. */
@@ -83,8 +103,15 @@ export class PiSessionStore {
 				modelCount: rt.getModels(p.id).length,
 				configured: rt.hasConfiguredAuth(p.id),
 				oauth: rt.isUsingOAuth(p.id),
+				baseUrl: p.baseUrl,
 			}))
 			.sort((a, b) => a.name.localeCompare(b.name));
+	}
+
+	/** Full catalog models for one provider (no auth required), matching listProviders().modelCount. */
+	async listProviderModels(providerId: string): Promise<ModelSummary[]> {
+		const rt = await this.runtime();
+		return rt.getModels(providerId).map((m) => PiSessionStore.summarizeModel(m as PiModel));
 	}
 
 	async hasProvider(providerId: string): Promise<boolean> {
@@ -155,11 +182,14 @@ export class PiSessionStore {
 
 	async create(modelRef?: string): Promise<SessionSummary> {
 		const model = modelRef ? await this.resolveModel(modelRef) : undefined;
+		const binding: { sessionId: string } = { sessionId: "" };
 		const { session } = await createAgentSession({
 			cwd: this.cwd,
 			sessionManager: SessionManager.create(this.cwd, this.sessionDir),
 			...(model ? { model } : {}),
+			customTools: this.customToolsFor(() => binding.sessionId),
 		});
+		binding.sessionId = session.sessionId;
 		return this.summarize(session);
 	}
 
@@ -185,6 +215,7 @@ export class PiSessionStore {
 		const { session } = await createAgentSession({
 			cwd: this.cwd,
 			sessionManager: SessionManager.open(info.path, this.sessionDir),
+			customTools: this.customToolsFor(() => id),
 		});
 		this.active.set(session.sessionId, session);
 		return session;

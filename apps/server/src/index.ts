@@ -4,7 +4,11 @@ import websocket from "@fastify/websocket";
 import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { config } from "./config.js";
 import { PiSessionStore } from "./pi-bridge/session-store.js";
+import { TeamsStore } from "./store/teams.js";
 import { registerChatRoutes } from "./routes/chat.js";
+import { registerSettingsRoutes } from "./routes/settings.js";
+import { registerAgentsRoutes } from "./routes/agents.js";
+import { registerRoomsRoutes } from "./routes/rooms.js";
 
 const app = Fastify({ logger: true });
 
@@ -12,11 +16,21 @@ const app = Fastify({ logger: true });
 // requests and WebSocket upgrades to this server must be allowed. DELETE must
 // be listed explicitly: the plugin's default methods are GET,HEAD,POST, and a
 // preflight without DELETE makes the browser silently drop the real request.
-await app.register(cors, { origin: true, methods: ["GET", "HEAD", "POST", "DELETE"] });
+// Origins are restricted to the local app so a random website on the user's
+// machine can't drive the management API (CSRF / localhost port attack).
+await app.register(cors, {
+	origin: config.allowedOrigins,
+	methods: ["GET", "HEAD", "POST", "DELETE", "PUT", "PATCH"],
+});
 await app.register(websocket);
 
-const store = new PiSessionStore(config.agentCwd, config.sessionDir);
-await registerChatRoutes(app, store);
+const teams = new TeamsStore(config.teamsDir, config.agentCwd, config.workerTimeoutMs);
+await teams.init();
+const store = new PiSessionStore(config.agentCwd, config.sessionDir, teams);
+await registerChatRoutes(app, store, teams);
+await registerSettingsRoutes(app);
+await registerAgentsRoutes(app, teams);
+await registerRoomsRoutes(app, store, teams);
 
 // §4 health: startup smoke check — create + destroy an in-memory session.
 // Validates pi SDK wiring (packages load, resource loader resolves). Model

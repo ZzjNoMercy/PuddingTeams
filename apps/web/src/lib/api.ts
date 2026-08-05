@@ -1,6 +1,19 @@
-import type { ModelSummary, ProviderSummary, SessionSummary } from "./types";
+import type { AgentConfig, ModelSummary, ProviderSummary, RoomSummary, SessionSummary, WorkerProbeResult } from "./types";
 
 const SERVER_URL = process.env.NEXT_PUBLIC_SERVER_URL ?? "http://127.0.0.1:8933";
+
+export interface HealthInfo {
+	ok: boolean;
+	service: string;
+	/** Bundled pi SDK version; omitted when the server cannot resolve it. */
+	piVersion?: string;
+}
+
+export async function getHealth(): Promise<HealthInfo> {
+	const res = await fetch(`${SERVER_URL}/api/health`);
+	if (!res.ok) throw new Error(`health check failed: ${res.status}`);
+	return (await res.json()) as HealthInfo;
+}
 
 export async function listSessions(): Promise<SessionSummary[]> {
 	const res = await fetch(`${SERVER_URL}/api/sessions`);
@@ -11,6 +24,13 @@ export async function listSessions(): Promise<SessionSummary[]> {
 export async function listModels(): Promise<ModelSummary[]> {
 	const res = await fetch(`${SERVER_URL}/api/models`);
 	if (!res.ok) throw new Error(`list models failed: ${res.status}`);
+	return ((await res.json()) as { models: ModelSummary[] }).models;
+}
+
+/** Full catalog models for one provider (no auth needed), matching its modelCount. */
+export async function listProviderModels(providerId: string): Promise<ModelSummary[]> {
+	const res = await fetch(`${SERVER_URL}/api/providers/${providerId}/models`);
+	if (!res.ok) throw new Error(`list provider models failed: ${res.status}`);
 	return ((await res.json()) as { models: ModelSummary[] }).models;
 }
 
@@ -89,4 +109,111 @@ export async function abortSession(sessionId: string): Promise<void> {
 
 export function sessionWsUrl(sessionId: string): string {
 	return `${SERVER_URL.replace(/^http/, "ws")}/api/sessions/${sessionId}/ws`;
+}
+
+export async function getSettings(): Promise<{
+	defaultProvider?: string;
+	defaultModel?: string;
+}> {
+	const res = await fetch(`${SERVER_URL}/api/settings`);
+	if (!res.ok) throw new Error(`get settings failed: ${res.status}`);
+	return (await res.json()) as { defaultProvider?: string; defaultModel?: string };
+}
+
+export async function setDefaultModel(provider: string, model: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/settings/model`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ provider, model }),
+	});
+	if (!res.ok) throw new Error(`set default model failed: ${res.status}`);
+}
+
+// ---- agents registry (teams.json) ----
+
+export async function listAgents(): Promise<AgentConfig[]> {
+	const res = await fetch(`${SERVER_URL}/api/agents`);
+	if (!res.ok) throw new Error(`list agents failed: ${res.status}`);
+	return ((await res.json()) as { agents: AgentConfig[] }).agents;
+}
+
+export async function createAgent(agent: AgentConfig): Promise<AgentConfig> {
+	const res = await fetch(`${SERVER_URL}/api/agents`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(agent),
+	});
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `create agent failed: ${res.status}`);
+	}
+	return ((await res.json()) as { agent: AgentConfig }).agent;
+}
+
+export async function updateAgent(name: string, agent: AgentConfig): Promise<AgentConfig> {
+	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}`, {
+		method: "PUT",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(agent),
+	});
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `update agent failed: ${res.status}`);
+	}
+	return ((await res.json()) as { agent: AgentConfig }).agent;
+}
+
+export async function deleteAgent(name: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}`, { method: "DELETE" });
+	if (!res.ok) throw new Error(`delete agent failed: ${res.status}`);
+}
+
+export async function probeAgent(name: string): Promise<WorkerProbeResult> {
+	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}/probe`, { method: "POST" });
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `probe failed: ${res.status}`);
+	}
+	return ((await res.json()) as { probe: WorkerProbeResult }).probe;
+}
+
+// ---- rooms ----
+
+export async function listRooms(): Promise<RoomSummary[]> {
+	const res = await fetch(`${SERVER_URL}/api/rooms`);
+	if (!res.ok) throw new Error(`list rooms failed: ${res.status}`);
+	return ((await res.json()) as { rooms: RoomSummary[] }).rooms;
+}
+
+export async function getRoom(sessionId: string): Promise<RoomSummary> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${sessionId}`);
+	if (!res.ok) throw new Error(`get room failed: ${res.status}`);
+	return ((await res.json()) as { room: RoomSummary }).room;
+}
+
+export async function updateRoom(
+	sessionId: string,
+	patch: { name?: string; agents?: string[] },
+): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${sessionId}`, {
+		method: "PATCH",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(patch),
+	});
+	if (!res.ok) throw new Error(`update room failed: ${res.status}`);
+}
+
+/** Create a new pi session inside a room and make it the active one. */
+export async function createRoomSession(roomId: string): Promise<SessionSummary> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${roomId}/sessions`, { method: "POST" });
+	if (!res.ok) throw new Error(`create room session failed: ${res.status}`);
+	return ((await res.json()) as { session: SessionSummary }).session;
+}
+
+/** Switch the active pi session of a room. */
+export async function setActiveRoomSession(roomId: string, sessionId: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${roomId}/sessions/${sessionId}/activate`, {
+		method: "POST",
+	});
+	if (!res.ok) throw new Error(`switch session failed: ${res.status}`);
 }

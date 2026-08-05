@@ -100,6 +100,14 @@ function findLastAssistant(messages: ChatMessage[]): number {
 	return -1;
 }
 
+/** Find the (latest) message that already holds a tool call with this id. */
+function findMessageWithTool(messages: ChatMessage[], toolCallId: string): number {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (messages[i]!.toolCalls.some((t) => t.id === toolCallId)) return i;
+	}
+	return -1;
+}
+
 function upsertToolCall(messages: ChatMessage[], patch: Partial<ToolCallView> & { id: string }): ChatMessage[] {
 	const idx = findLastAssistant(messages);
 	if (idx < 0) return messages;
@@ -115,6 +123,7 @@ function upsertToolCall(messages: ChatMessage[], patch: Partial<ToolCallView> & 
 					status: patch.status ?? "pending",
 					args: patch.args,
 					result: patch.result,
+					details: patch.details,
 					isError: patch.isError,
 				},
 			];
@@ -129,6 +138,28 @@ function stringifyResult(result: unknown): string {
 	} catch {
 		return String(result);
 	}
+}
+
+/**
+ * Extract the user-facing text (and optional structured details) from a tool
+ * result. Custom tools return AgentToolResult = { content: [...], details }.
+ */
+function extractToolResult(result: unknown): { text: string; details?: unknown } {
+	if (result && typeof result === "object" && Array.isArray((result as { content?: unknown }).content)) {
+		const text = textOf((result as { content: PiContentBlock[] }).content);
+		const details = (result as { details?: unknown }).details;
+		return { text, details };
+	}
+	return { text: stringifyResult(result) };
+}
+
+/** The team_task worker a tool call was delegated to (args or result details). */
+export function teamTaskWorker(call: ToolCallView): string | undefined {
+	if (call.name !== "team_task") return undefined;
+	const args = call.args as { worker?: string } | undefined;
+	if (args?.worker) return args.worker;
+	const details = call.details as { worker?: string } | undefined;
+	return details?.worker;
 }
 
 /**
@@ -225,26 +256,53 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 				status: "running",
 			});
 		}
-		case "tool_execution_end": {
+		case "tool_execution_update": {
+			// Live progress from tools (team_task onUpdate). The tool call is
+			// already running; keep it visible in case a start was missed.
 			return upsertToolCall(messages, {
 				id: event.toolCallId as string,
 				name: event.toolName as string,
-				status: event.isError ? "error" : "done",
-				result: stringifyResult(event.result),
-				isError: Boolean(event.isError),
+				status: "running",
+			});
+		}
+		case "tool_execution_end": {
+			const isError = Boolean(event.isError);
+			const { text, details } = extractToolResult(event.result);
+			return upsertToolCall(messages, {
+				id: event.toolCallId as string,
+				name: event.toolName as string,
+				status: isError ? "error" : "done",
+				result: text,
+				details,
+				isError,
 			});
 		}
 		case "turn_end": {
 			let next = messages;
 			const results = (event.toolResults as PiToolResultMessage[] | undefined) ?? [];
 			for (const tr of results) {
-				next = upsertToolCall(next, {
-					id: tr.toolCallId,
-					name: tr.toolName,
-					status: tr.isError ? "error" : "done",
-					result: textOf(tr.content),
-					isError: tr.isError,
-				});
+				// tool_execution_end already folded the result into the
+				// originating assistant message. Only backstop that message —
+				// never append a duplicate card to a later assistant message.
+				const idx = findMessageWithTool(next, tr.toolCallId);
+				if (idx < 0) continue;
+				next = next.map((m, i) =>
+					i === idx
+						? {
+								...m,
+								toolCalls: m.toolCalls.map((t) =>
+									t.id === tr.toolCallId
+										? {
+												...t,
+												status: tr.isError ? "error" : "done",
+												result: textOf(tr.content),
+												isError: tr.isError,
+											}
+										: t,
+								),
+							}
+						: m,
+				);
 			}
 			return next;
 		}

@@ -4,19 +4,56 @@ import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import {
 	deleteProviderKey,
+	getSettings,
+	listProviderModels,
 	listProviders,
 	MODELS_CHANGED_EVENT,
+	setDefaultModel,
 	setProviderKey,
 } from "@/lib/api";
-import type { ProviderSummary } from "@/lib/types";
+import type { ModelSummary, ProviderSummary } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { cn } from "@/lib/utils";
 
-function ProviderRow({ provider, onChanged }: { provider: ProviderSummary; onChanged: () => void }) {
+function defaultRef(provider?: string, model?: string): string | undefined {
+	return provider && model ? `${provider}/${model}` : undefined;
+}
+
+function ProviderRow({
+	provider,
+	defaultModelRef,
+	onSetDefault,
+	onChanged,
+}: {
+	provider: ProviderSummary;
+	defaultModelRef?: string;
+	onSetDefault: (provider: string, model: string) => Promise<void>;
+	onChanged: () => void;
+}) {
 	const [expanded, setExpanded] = useState(false);
+	const [showModels, setShowModels] = useState(false);
+	const [models, setModels] = useState<ModelSummary[] | null>(null);
+	const [loadingModels, setLoadingModels] = useState(false);
 	const [apiKey, setApiKey] = useState("");
 	const [confirmingDelete, setConfirmingDelete] = useState(false);
 	const [busy, setBusy] = useState(false);
+
+	const toggleModels = async () => {
+		const next = !showModels;
+		setShowModels(next);
+		if (next && models === null) {
+			setLoadingModels(true);
+			try {
+				setModels(await listProviderModels(provider.id));
+			} catch (err) {
+				toast.error(err instanceof Error ? err.message : String(err));
+				setModels([]);
+			} finally {
+				setLoadingModels(false);
+			}
+		}
+	};
 
 	const save = async () => {
 		const key = apiKey.trim();
@@ -58,7 +95,13 @@ function ProviderRow({ provider, onChanged }: { provider: ProviderSummary; onCha
 				<span
 					className={`size-1.5 shrink-0 rounded-full ${provider.configured ? "bg-green-500" : "bg-muted-foreground/30"}`}
 				/>
-				<span className="min-w-0 flex-1 truncate text-sm">{provider.name}</span>
+				<button
+					type="button"
+					className="min-w-0 flex-1 truncate text-left text-sm hover:underline"
+					onClick={() => void toggleModels()}
+				>
+					{provider.name}
+				</button>
 				<span className="text-xs text-muted-foreground">{provider.modelCount} 模型</span>
 				{provider.configured ? (
 					confirmingDelete ? (
@@ -116,23 +159,79 @@ function ProviderRow({ provider, onChanged }: { provider: ProviderSummary; onCha
 					</Button>
 				</form>
 			)}
+			{showModels && (
+				<div className="mt-2 space-y-1 border-l border-border pl-4">
+					<div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+						{provider.baseUrl ? (
+							<span className="font-mono" title="API endpoint">
+								端点：{provider.baseUrl}
+							</span>
+						) : null}
+						<span>认证：{provider.oauth ? "OAuth" : provider.configured ? "API Key" : "未配置"}</span>
+					</div>
+					{loadingModels ? (
+						<p className="py-1 text-xs text-muted-foreground">加载中…</p>
+					) : models === null ? null : models.length === 0 ? (
+						<p className="py-1 text-xs text-muted-foreground">无模型</p>
+					) : (
+						models.map((m) => {
+							const isDefault = m.id === defaultModelRef;
+							return (
+								<div key={m.id} className="flex items-center gap-2 py-0.5">
+									<span className="min-w-0 flex-1 truncate text-xs">
+										<span className="font-medium">{m.name}</span>
+										<span className="text-muted-foreground">
+											{" · "}
+											{m.id}
+											{m.reasoning ? " · 思考" : ""}
+										</span>
+									</span>
+									<Button
+										type="button"
+										size="sm"
+										variant={isDefault ? "outline" : "ghost"}
+										disabled={isDefault}
+										onClick={() => void onSetDefault(provider.id, m.id.split("/").slice(1).join("/"))}
+									>
+										{isDefault ? "默认" : "设为默认"}
+									</Button>
+								</div>
+							);
+						})
+					)}
+				</div>
+			)}
 		</div>
 	);
 }
 
 export function ProviderSettings() {
 	const [providers, setProviders] = useState<ProviderSummary[] | null>(null);
+	const [defaultModelRef, setDefaultModelRef] = useState<string | undefined>();
 	const [filter, setFilter] = useState("");
 
 	const refresh = () => {
 		listProviders()
 			.then(setProviders)
 			.catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)));
+		getSettings()
+			.then((s) => setDefaultModelRef(defaultRef(s.defaultProvider, s.defaultModel)))
+			.catch(() => undefined);
 	};
 
 	useEffect(() => {
 		refresh();
 	}, []);
+
+	const setDefault = async (provider: string, model: string) => {
+		try {
+			await setDefaultModel(provider, model);
+			setDefaultModelRef(`${provider}/${model}`);
+			toast.success("已设为默认模型");
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		}
+	};
 
 	const keyword = filter.trim().toLowerCase();
 	const visible = (providers ?? []).filter(
@@ -140,7 +239,7 @@ export function ProviderSettings() {
 	);
 
 	return (
-		<div className="flex min-h-0 flex-1 flex-col gap-3">
+		<div className={cn("flex min-h-0 flex-1 flex-col gap-3")}>
 			<Input
 				placeholder="过滤 provider…"
 				value={filter}
@@ -153,7 +252,15 @@ export function ProviderSettings() {
 						{providers === null ? "加载中…" : "没有匹配的 provider"}
 					</p>
 				) : (
-					visible.map((p) => <ProviderRow key={p.id} provider={p} onChanged={refresh} />)
+					visible.map((p) => (
+						<ProviderRow
+							key={p.id}
+							provider={p}
+							defaultModelRef={defaultModelRef}
+							onSetDefault={setDefault}
+							onChanged={refresh}
+						/>
+					))
 				)}
 			</div>
 		</div>

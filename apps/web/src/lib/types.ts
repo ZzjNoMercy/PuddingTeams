@@ -14,6 +14,9 @@ export interface ModelSummary {
 	id: string;
 	name: string;
 	provider: string;
+	reasoning?: boolean;
+	contextWindow?: number;
+	maxTokens?: number;
 }
 
 export interface ProviderSummary {
@@ -22,6 +25,8 @@ export interface ProviderSummary {
 	modelCount: number;
 	configured: boolean;
 	oauth: boolean;
+	/** API endpoint (base URL) the provider talks to, when it has one. */
+	baseUrl?: string;
 }
 
 // ---- pi event subset (as received over the WS) ----
@@ -105,6 +110,8 @@ export interface ToolCallView {
 	status: ToolCallStatus;
 	result?: string;
 	isError?: boolean;
+	/** Structured metadata folded from the tool result (team_task details). */
+	details?: unknown;
 }
 
 export type ChatMessageRole = "user" | "assistant" | "toolResult";
@@ -123,3 +130,51 @@ export interface ChatMessage {
 }
 
 export type ChatStatus = "idle" | "connecting" | "connected" | "reconnecting" | "error";
+
+// ---- teams / rooms (phase 2) ----
+
+export interface AgentInvoke {
+	type: "command";
+	command: string;
+	runArgs: string[];
+	probeArgs?: string[];
+}
+
+export interface AgentConfig {
+	/** Unique id used by team_task. */
+	name: string;
+	description: string;
+	invoke: AgentInvoke;
+	env?: Record<string, string>;
+	enabled?: boolean;
+	capabilities?: string[];
+}
+
+export interface WorkerProbeResult {
+	name: string;
+	command: string;
+	ok: boolean;
+	exitCode: number;
+	error?: string;
+	raw: Record<string, unknown>;
+}
+
+export interface RoomSession {
+	id: string;
+	firstMessage: string;
+	modifiedAt: string;
+	active: boolean;
+}
+
+export interface RoomSummary {
+	sessionId: string;
+	name: string;
+	firstMessage: string;
+	modifiedAt: string;
+	agents?: string[];
+	members: AgentConfig[];
+	/** pi sessions belonging to this room (newest first). */
+	sessions: RoomSession[];
+	/** The pi session currently shown in the chat. */
+	activeSession: string;
+}
