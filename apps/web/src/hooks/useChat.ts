@@ -1,0 +1,99 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { abortSession, fetchMessages, sendMessage, sessionWsUrl } from "@/lib/api";
+import { reducePiEvent, renderHistory } from "@/lib/events";
+import type { ChatMessage, ChatStatus, PiMessage } from "@/lib/types";
+
+export function useChat(sessionId: string) {
+	// ChatPane is mounted with `key={sessionId}`, so a session switch remounts
+	// this hook and the initial state below is already the "fresh session" state.
+	const [messages, setMessages] = useState<ChatMessage[]>([]);
+	const [status, setStatus] = useState<ChatStatus>("connecting");
+	const [running, setRunning] = useState(false);
+	const [error, setError] = useState<string | null>(null);
+	const wsRef = useRef<WebSocket | null>(null);
+
+	useEffect(() => {
+		if (!sessionId) return;
+		let disposed = false;
+		let attempt = 0;
+		let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+		const loadHistory = () =>
+			fetchMessages(sessionId)
+				.then((msgs) => {
+					if (!disposed) setMessages(renderHistory(msgs as PiMessage[]));
+				})
+				.catch((err: unknown) => {
+					if (!disposed) setError(err instanceof Error ? err.message : String(err));
+				});
+
+		void loadHistory();
+
+		const connect = () => {
+			if (disposed) return;
+			setStatus(attempt === 0 ? "connecting" : "reconnecting");
+			const ws = new WebSocket(sessionWsUrl(sessionId));
+			wsRef.current = ws;
+
+			ws.onopen = () => {
+				if (disposed) return;
+				const wasReconnect = attempt > 0;
+				attempt = 0;
+				setStatus("connected");
+				// Re-align with the server after a drop: events emitted while the
+				// socket was down were never delivered.
+				if (wasReconnect) void loadHistory();
+			};
+			ws.onmessage = (m) => {
+				let event: { type: string; [k: string]: unknown };
+				try {
+					event = JSON.parse(m.data as string);
+				} catch {
+					return;
+				}
+				setMessages((prev) => reducePiEvent(prev, event));
+				if (event.type === "agent_start" || event.type === "turn_start") setRunning(true);
+				if (event.type === "agent_settled" || event.type === "error") setRunning(false);
+			};
+			ws.onclose = () => {
+				if (disposed) return;
+				// Exponential backoff: 1s, 2s, 4s, … capped at 15s. Retries never
+				// stop; after a few failures the UI switches to the "disconnected"
+				// hint while reconnecting continues in the background.
+				const delay = Math.min(15000, 1000 * 2 ** attempt);
+				attempt += 1;
+				setStatus(attempt >= 5 ? "error" : "reconnecting");
+				retryTimer = setTimeout(connect, delay);
+			};
+		};
+		connect();
+
+		return () => {
+			disposed = true;
+			if (retryTimer) clearTimeout(retryTimer);
+			wsRef.current?.close();
+			wsRef.current = null;
+		};
+	}, [sessionId]);
+
+	const send = useCallback(
+		async (text: string) => {
+			const content = text.trim();
+			if (!content || running) return;
+			try {
+				await sendMessage(sessionId, content);
+			} catch (err) {
+				setError(err instanceof Error ? err.message : String(err));
+			}
+		},
+		[sessionId, running],
+	);
+
+	const stop = useCallback(() => {
+		void abortSession(sessionId).catch(() => undefined);
+	}, [sessionId]);
+
+	return { messages, status, running, error, send, stop };
+}

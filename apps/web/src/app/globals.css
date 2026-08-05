@@ -1,0 +1,118 @@
+@import "tailwindcss";
+
+/* streamdown renders its code-block/chrome components with Tailwind classes
+   from node_modules — not scanned by default, so whitelist its dist */
+@source "../../node_modules/streamdown/dist";
+
+/* dark: utilities respond to the .dark class (set by the theme provider), not OS preference */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+	--radius-sm: calc(var(--radius) - 4px);
+	--radius-md: calc(var(--radius) - 2px);
+	--radius-lg: var(--radius);
+	--radius-xl: calc(var(--radius) + 4px);
+	--radius-2xl: calc(var(--radius) + 8px);
+	--radius-3xl: calc(var(--radius) + 12px);
+	--radius-4xl: calc(var(--radius) + 16px);
+	--color-background: var(--background);
+	--color-foreground: var(--foreground);
+	--color-card: var(--card);
+	--color-card-foreground: var(--card-foreground);
+	--color-popover: var(--popover);
+	--color-popover-foreground: var(--popover-foreground);
+	--color-primary: var(--primary);
+	--color-primary-foreground: var(--primary-foreground);
+	--color-secondary: var(--secondary);
+	--color-secondary-foreground: var(--secondary-foreground);
+	--color-muted: var(--muted);
+	--color-muted-foreground: var(--muted-foreground);
+	--color-accent: var(--accent);
+	--color-accent-foreground: var(--accent-foreground);
+	--color-destructive: var(--destructive);
+	--color-border: var(--border);
+	--color-input: var(--input);
+	--color-ring: var(--ring);
+	/* streamdown code-block chrome uses shadcn sidebar tokens; map to our palette */
+	--color-sidebar: var(--muted);
+	--color-sidebar-foreground: var(--foreground);
+	--color-sidebar-border: var(--border);
+	--font-sans: var(--font-geist-sans);
+	--font-mono: var(--font-geist-mono);
+}
+
+:root {
+	color-scheme: light;
+	--radius: 0.625rem;
+	--background: oklch(0.9855 0.0098 87.47);
+	--foreground: oklch(0.145 0 0);
+	--card: oklch(1 0.0098 87.47);
+	--card-foreground: oklch(0.145 0 0);
+	--popover: oklch(1 0.0098 87.47);
+	--popover-foreground: oklch(0.145 0 0);
+	--primary: oklch(0 0 0);
+	--primary-foreground: oklch(0.985 0 0);
+	--secondary: oklch(0.9455 0.0098 87.47);
+	--secondary-foreground: oklch(0.205 0 0);
+	--muted: oklch(0.97 0.0098 87.47);
+	--muted-foreground: oklch(0.556 0 0);
+	--accent: oklch(0.94 0.0098 87.47);
+	--accent-foreground: oklch(0.205 0 0);
+	--destructive: oklch(0.577 0.245 27.325);
+	--border: oklch(0.922 0.0098 87.47);
+	--input: oklch(0.88 0.0098 87.47);
+	--ring: oklch(0.58 0.18 255);
+}
+
+.dark {
+	color-scheme: dark;
+	--background: oklch(0.24 0.0036 106.64);
+	--foreground: oklch(0.985 0 0);
+	--card: oklch(0.238 0.0036 106.64);
+	--card-foreground: oklch(0.985 0 0);
+	--popover: oklch(0.205 0.0036 106.64);
+	--popover-foreground: oklch(0.985 0 0);
+	--primary: oklch(1 0 0);
+	--primary-foreground: oklch(0.205 0 0);
+	--secondary: oklch(0.3 0.0036 106.64);
+	--secondary-foreground: oklch(0.985 0 0);
+	--muted: oklch(0.269 0.0036 106.64);
+	--muted-foreground: oklch(0.708 0 0);
+	--accent: oklch(0.32 0.0036 106.64);
+	--accent-foreground: oklch(0.985 0 0);
+	--destructive: oklch(0.704 0.191 22.216);
+	--border: oklch(1 0 0 / 10%);
+	--input: oklch(1 0 0 / 15%);
+	--ring: oklch(0.74 0.16 255);
+}
+
+@keyframes text-shimmer {
+	from {
+		background-position: 100% center;
+	}
+	to {
+		background-position: 0% center;
+	}
+}
+
+body {
+	background: var(--background);
+	color: var(--foreground);
+	font-family: Arial, Helvetica, sans-serif;
+}
+
+/* Flatten streamdown code-block chrome to match the site's borderless style:
+   outer box keeps its muted bg but drops the border, and the floating
+   copy/download pill loses its own outline. */
+[data-streamdown="code-block"] {
+	border: none;
+	border-radius: var(--radius-lg);
+}
+
+[data-streamdown="code-block-actions"] {
+	border: none;
+}
+
+[data-streamdown="code-block-body"] {
+	border: none;
+}
