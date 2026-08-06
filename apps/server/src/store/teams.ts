@@ -1,9 +1,9 @@
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { CredentialsStore } from "./credentials.js";
+import { spawnWorker } from "../agent-runtime/transport/spawn.js";
 
 export interface CommandInvoke {
 	type: "command";
@@ -42,6 +42,12 @@ export type WindowType = "solo" | "direct" | "group";
  * docs/2026-08-05-房间即群聊-产品模型方案.md §1–2. Sessions are resources
  * *inside* a window, not top-level entries.
  */
+/** 会话绑定：每个 worker 不透明的 Session handle（Phase 1，替换旧 workerSessions）。 */
+export interface WorkerBinding {
+	sessionHandle?: string;
+	updatedAt: string;
+}
+
 export interface WindowConfig {
 	/** Stable window id. The solo singleton always uses "solo". */
 	id: string;
@@ -60,8 +66,13 @@ export interface WindowConfig {
 	 * relay guidance when set; empty = default relay guidance.
 	 */
 	prompt?: string;
-	/** Per-worker last session id, for multi-turn continuity. */
-	workerSessions?: Record<string, string>;
+	/** Per-worker last session handle, for multi-turn continuity (§7.1). */
+	workerBindings?: Record<string, WorkerBinding>;
+	/**
+	 * 房间绑定的工作区根目录（绝对路径）；缺省 <平台数据目录>/workspaces/<windowId>/。
+	 * coding agent 以此为 cwd，同时作为各 agent 写权限的收敛边界（§15）。
+	 */
+	workspace?: string;
 	/** Solo only: pinned singleton, never deletable. */
 	pinned?: boolean;
 	createdAt: string;
@@ -75,18 +86,6 @@ interface TeamsFile {
 interface WindowsFile {
 	version: number;
 	windows: Record<string, WindowConfig>;
-}
-
-export interface WorkerRunResult {
-	worker: string;
-	/** Worker-reported status: completed | needs_input | failed | blocked | error | … */
-	status: string;
-	/** Human-readable result: final_response, else reply, else raw stdout. */
-	content: string;
-	/** Full parsed worker JSON payload (metadata + content). */
-	raw: Record<string, unknown>;
-	exitCode: number;
-	elapsedMs: number;
 }
 
 export interface WorkerProbeResult {
@@ -114,9 +113,6 @@ export const DEFAULT_TEAMS: AgentConfig[] = [
 		enabled: true,
 	},
 ];
-
-/** Cap on accumulated worker stdout so a runaway process can't OOM the server. */
-const MAX_STDOUT = 2 * 1024 * 1024;
 
 // ---- avatars (§11) ----
 
@@ -150,15 +146,6 @@ const AVATAR_TYPES: AvatarType[] = [
 
 /** Agent names become file names, so they must not carry path separators. */
 const SAFE_AGENT_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
-
-interface SpawnResult {
-	exitCode: number;
-	stdout: string;
-	stderr: string;
-	timedOut: boolean;
-	killed: boolean;
-	spawnError?: Error;
-}
 
 /**
  * Registry + window store for phase 2. Owns `teams.json` (the worker registry)
@@ -403,52 +390,8 @@ export class TeamsStore {
 			return { version: 1, windows: parsed.windows ?? {} };
 		} catch (err: unknown) {
 			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-			// Legacy rooms.json (keyed by pi sessionId) → windows migration.
-			const legacy = await this.migrateRoomsFile();
-			if (legacy) return legacy;
+			// 决策 20：无兼容、无历史数据迁移。旧 rooms.json 直接忽略。
 			return { version: 1, windows: {} };
-		}
-	}
-
-	/** One-time migration of the phase-2 rooms.json shape to windows.json. */
-	private async migrateRoomsFile(): Promise<WindowsFile | undefined> {
-		const legacyFile = path.join(this.teamsDir, "rooms.json");
-		try {
-			const raw = await readFile(legacyFile, "utf-8");
-			const parsed = JSON.parse(raw) as { rooms?: Record<string, unknown> };
-			const rooms = parsed.rooms ?? {};
-			if (Object.keys(rooms).length === 0) return undefined;
-			const windows: Record<string, WindowConfig> = {};
-			for (const [key, room] of Object.entries(rooms)) {
-				const r = room as {
-					agents?: string[];
-					name?: string;
-					sessions?: string[];
-					activeSession?: string;
-					workerSessions?: Record<string, string>;
-				};
-				const members = r.agents ?? [];
-				const type: WindowType = members.length === 0 ? "solo" : members.length === 1 ? "direct" : "group";
-				const sessions = r.sessions && r.sessions.length ? r.sessions : [key];
-				windows[key] = {
-					id: key,
-					type,
-					name: r.name,
-					members,
-					sessions,
-					activeSession: r.activeSession && sessions.includes(r.activeSession) ? r.activeSession : sessions[0]!,
-					workerSessions: r.workerSessions,
-					pinned: type === "solo",
-					createdAt: new Date().toISOString(),
-				};
-			}
-			await this.writeWindows({ version: 1, windows });
-			// Migration succeeded — remove the legacy file so it is not
-			// re-migrated (and possibly clobbering windows.json) on next boot.
-			await unlink(legacyFile).catch(() => undefined);
-			return { version: 1, windows };
-		} catch {
-			return undefined;
 		}
 	}
 
@@ -700,202 +643,34 @@ export class TeamsStore {
 
 	private async readWorkerSession(windowId: string, worker: string): Promise<string | undefined> {
 		const w = await this.getWindow(windowId);
-		return w?.workerSessions?.[worker];
+		return w?.workerBindings?.[worker]?.sessionHandle;
 	}
 
-	/** Record the worker session id for continuity. Best-effort, non-fatal. */
-	private rememberWorkerSession(
+	/** Record the worker session handle for continuity. Best-effort, non-fatal. */
+	async rememberWorkerSession(
 		windowId: string,
 		worker: string,
-		workerSessionId: string | undefined,
-	): void {
-		if (!workerSessionId) return;
-		void this.serialize(async () => {
+		sessionHandle: string | undefined,
+	): Promise<void> {
+		if (!sessionHandle) return;
+		await this.serialize(async () => {
 			const data = await this.loadWindowsFile();
 			const w = data.windows[windowId];
 			if (!w) return;
-			w.workerSessions = { ...(w.workerSessions ?? {}), [worker]: workerSessionId };
+			w.workerBindings = {
+				...(w.workerBindings ?? {}),
+				[worker]: { sessionHandle, updatedAt: new Date().toISOString() },
+			};
 			await this.writeWindows(data);
 		}).catch(() => undefined);
 	}
 
 	/**
-	 * Spawn a worker subprocess and wait for it to exit. Guarantees cleanup on
-	 * timeout/abort: SIGTERM, then SIGKILL after a grace period unless the
-	 * process has actually exited.
+	 * Run the worker's probe command and return a normalized status. Uses the
+	 * shared spawn transport (Phase 1 extraction); driver behavior lives in the
+	 * AgentRuntime layer but the agent registry probe is kept here so the
+	 * management UI can check health without an enabled Agent binding.
 	 */
-	private async spawnWorker(opts: {
-		command: string;
-		args: string[];
-		env: NodeJS.ProcessEnv;
-		timeoutMs?: number;
-		signal?: AbortSignal;
-		stdinJson?: unknown;
-		onStdout?: (chunk: string) => void;
-	}): Promise<SpawnResult> {
-		const { command, args, env, timeoutMs = this.defaultTimeoutMs, signal, stdinJson, onStdout } = opts;
-		const proc = spawn(command, args, { cwd: this.cwd, shell: false, stdio: ["pipe", "pipe", "pipe"], env });
-
-		if (stdinJson !== undefined) {
-			proc.stdin.write(JSON.stringify(stdinJson));
-			proc.stdin.end();
-		}
-		// A fast-exiting child can close stdin early; swallow EPIPE instead of
-		// an unhandled 'error' on the stream.
-		proc.stdin.on("error", () => undefined);
-
-		let stdout = "";
-		let stderr = "";
-		let timedOut = false;
-		let killed = false;
-		let exited = false;
-		let spawnError: Error | undefined;
-
-		proc.stdout.setEncoding("utf-8");
-		proc.stderr.setEncoding("utf-8");
-		proc.stdout.on("data", (chunk: string) => {
-			if (stdout.length < MAX_STDOUT) stdout += chunk;
-			onStdout?.(chunk);
-		});
-		proc.stderr.on("data", (chunk: string) => {
-			stderr += chunk;
-		});
-
-		let killTimer: NodeJS.Timeout | undefined;
-		const killProc = () => {
-			killed = true;
-			if (exited) return;
-			proc.kill("SIGTERM");
-			killTimer = setTimeout(() => {
-				// `proc.killed` only says SIGTERM was sent, not that the
-				// process exited — a worker that ignores SIGTERM must still be
-				// SIGKILLed, otherwise the promise below never resolves.
-				if (!exited) proc.kill("SIGKILL");
-			}, 5000);
-			killTimer.unref();
-		};
-		const onAbort = () => killProc();
-		if (signal?.aborted) killProc();
-		else signal?.addEventListener("abort", onAbort, { once: true });
-
-		const timeoutTimer = setTimeout(() => {
-			timedOut = true;
-			killProc();
-		}, timeoutMs);
-		timeoutTimer.unref();
-
-		const exitCode = await new Promise<number>((resolve) => {
-			proc.on("error", (err: Error) => {
-				spawnError = err;
-				resolve(-1);
-			});
-			proc.on("close", (code) => {
-				exited = true;
-				if (killTimer) clearTimeout(killTimer);
-				resolve(code ?? 0);
-			});
-		});
-
-		clearTimeout(timeoutTimer);
-		signal?.removeEventListener("abort", onAbort);
-
-		return { exitCode, stdout, stderr, timedOut, killed, spawnError };
-	}
-
-	/**
-	 * Run one worker delegation: feed the task JSON on stdin, wait for its
-	 * single stdout JSON and map it to a WorkerRunResult. A parseable payload
-	 * with a `status` field is honored regardless of exit code (e.g. exit 1 =
-	 * needs_input/blocked/failed); only CLI-level failures are errors.
-	 */
-	async runAgent(opts: {
-		agent: AgentConfig;
-		task: string;
-		model?: string;
-		windowId: string;
-		/** "new" starts a fresh worker session instead of continuing the
-		 * window's recorded one (solo routing `session` parameter, §4.2). */
-		workerSession?: "new" | "continue";
-		signal?: AbortSignal;
-		onUpdate?: (content: string, details: unknown) => void;
-	}): Promise<WorkerRunResult> {
-		const { agent, task, model, windowId, signal } = opts;
-		const invoke = agent.invoke;
-		if (invoke.type !== "command") {
-			throw new Error(`worker "${agent.name}": invoke type "${invoke.type}" not supported`);
-		}
-		const prevSession =
-			opts.workerSession === "new" ? undefined : await this.readWorkerSession(windowId, agent.name);
-		const started = Date.now();
-		const input: Record<string, unknown> = { message: task };
-		if (model) input.model = model;
-		if (prevSession) input.session_id = prevSession;
-
-		// Encrypted worker secrets (e.g. PUDDINGCLAW_TOKEN) win over teams.json
-		// env and process env: they are the canonical credential source.
-		const secrets = this.credentials ? await this.credentials.getSecrets(agent.name) : {};
-		const env = { ...process.env, ...(agent.env ?? {}), ...secrets };
-		let lastUpdate = 0;
-		const { exitCode, stdout, stderr, timedOut, killed, spawnError } = await this.spawnWorker({
-			command: invoke.command,
-			args: invoke.runArgs,
-			env,
-			signal,
-			stdinJson: input,
-			onStdout: () => {
-				// Throttle live progress: worker CLIs often emit nothing until
-				// the end, so a heartbeat every ~1s is plenty.
-				const now = Date.now();
-				if (now - lastUpdate > 1000) {
-					lastUpdate = now;
-					opts.onUpdate?.(`${agent.name} 正在执行…`, { running: true });
-				}
-			},
-		});
-		const elapsedMs = Date.now() - started;
-
-		if (timedOut) {
-			throw new Error(
-				`worker "${agent.name}" timed out after ${Math.round(this.defaultTimeoutMs / 1000)}s`,
-			);
-		}
-		if (killed) {
-			throw new Error(`worker "${agent.name}" was cancelled`);
-		}
-		if (exitCode === -1 && spawnError) {
-			throw new Error(`worker "${agent.name}" failed to start: ${spawnError.message}`);
-		}
-
-		let raw: Record<string, unknown> | undefined;
-		try {
-			raw = JSON.parse(stdout.trim()) as Record<string, unknown>;
-		} catch {
-			raw = undefined;
-		}
-
-		if (raw && typeof raw.status === "string") {
-			const reply = typeof raw.reply === "string" ? raw.reply : "";
-			const finalResponse = typeof raw.final_response === "string" ? raw.final_response : "";
-			const content = finalResponse || reply || stdout.trim();
-			this.rememberWorkerSession(windowId, agent.name, raw.session_id as string | undefined);
-			return { worker: agent.name, status: raw.status, content, raw, exitCode, elapsedMs };
-		}
-
-		if (exitCode !== 0) {
-			const detail = stderr.trim() || (spawnError ? spawnError.message : `exit code ${exitCode}`);
-			throw new Error(`worker "${agent.name}" failed: ${detail}`);
-		}
-		if (!raw) {
-			throw new Error(
-				`worker "${agent.name}" returned non-JSON output${stderr ? `: ${stderr.trim()}` : ""}`,
-			);
-		}
-
-		this.rememberWorkerSession(windowId, agent.name, raw.session_id as string | undefined);
-		return { worker: agent.name, status: "completed", content: stdout.trim(), raw, exitCode, elapsedMs };
-	}
-
-	/** Run the worker's probe command and return a normalized status. */
 	async probeAgent(name: string): Promise<WorkerProbeResult> {
 		const agent = await this.getAgent(name);
 		if (!agent) throw new Error(`agent not found: ${name}`);
@@ -906,10 +681,12 @@ export class TeamsStore {
 		const args = invoke.probeArgs ?? ["doctor", "--json"];
 		const secrets = this.credentials ? await this.credentials.getSecrets(agent.name) : {};
 		const env = { ...process.env, ...(agent.env ?? {}), ...secrets };
-		const { exitCode, stdout, stderr, timedOut, spawnError } = await this.spawnWorker({
+		const { exitCode, stdout, stderr, timedOut, spawnError } = await spawnWorker({
 			command: invoke.command,
 			args,
 			env,
+			cwd: this.cwd,
+			timeoutMs: 15_000,
 		});
 		if (timedOut) {
 			return { name, command: `${invoke.command} ${args.join(" ")}`, ok: false, raw: {}, exitCode: -1, error: "probe timed out" };
@@ -931,4 +708,5 @@ export class TeamsStore {
 			...(ok ? {} : { error: stderr.trim() || (spawnError ? spawnError.message : `exit code ${exitCode}`) }),
 		};
 	}
+
 }

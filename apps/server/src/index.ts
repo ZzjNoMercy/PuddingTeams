@@ -10,6 +10,12 @@ import { registerChatRoutes } from "./routes/chat.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
 import { registerAgentsRoutes } from "./routes/agents.js";
 import { registerRoomsRoutes } from "./routes/rooms.js";
+import { registerInteractionsRoutes } from "./routes/interactions.js";
+import { AgentRuntime } from "./agent-runtime/runtime.js";
+import { DriverRegistry } from "./agent-runtime/driver-registry.js";
+import { DelegationStore } from "./agent-runtime/delegation-store.js";
+import { InteractionSecretStore } from "./agent-runtime/interaction-secret-store.js";
+import { AgentInvoker } from "./agent-runtime/invoker.js";
 
 const app = Fastify({ logger: { level: "warn" } });
 
@@ -30,7 +36,19 @@ const credentials = new CredentialsStore(config.secretsDir);
 await credentials.init();
 const teams = new TeamsStore(config.teamsDir, config.agentCwd, config.workerTimeoutMs, credentials);
 await teams.init();
-const store = new PiSessionStore(config.agentCwd, config.sessionDir, teams);
+
+// Phase 1：Runtime/Driver 抽取。委托、交互与加密 provider state 独立存储。
+const delegations = new DelegationStore(config.teamsDir);
+await delegations.init();
+const interactionSecrets = new InteractionSecretStore(config.secretsDir);
+await interactionSecrets.init();
+const drivers = new DriverRegistry();
+const runtime = new AgentRuntime(delegations, interactionSecrets, (agentId) => drivers.get(agentId), {
+	ttlMs: 24 * 60 * 60 * 1000,
+});
+const invoker = new AgentInvoker(teams, runtime, drivers, credentials, config.agentCwd);
+
+const store = new PiSessionStore(config.agentCwd, config.sessionDir, teams, invoker);
 // §1/§2 产品模型：solo 窗口是置顶单例，服务端启动即保证存在。
 await teams.ensureSoloWindow(
 	() => store.create(),
@@ -40,6 +58,7 @@ await registerChatRoutes(app, store, teams);
 await registerSettingsRoutes(app);
 await registerAgentsRoutes(app, teams, credentials);
 await registerRoomsRoutes(app, store, teams);
+await registerInteractionsRoutes(app, runtime, invoker, teams);
 
 // §4 health: startup smoke check — create + destroy an in-memory session.
 // Validates pi SDK wiring (packages load, resource loader resolves). Model

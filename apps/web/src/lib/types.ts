@@ -201,8 +201,10 @@ export interface RoomSummary {
 	activeSession: string;
 	/** Solo only: pinned singleton, never deletable. */
 	pinned: boolean;
-	/** Per-worker last session id (multi-turn continuity). */
-	workerSessions: Record<string, string>;
+	/** Per-worker last session handle (multi-turn continuity). */
+	workerBindings: Record<string, { sessionHandle?: string; updatedAt: string }>;
 	/** User-edited window system prompt ('' = default relay guidance). */
 	prompt: string;
+	/** 房间绑定的工作区根目录（绝对路径），可能为空字符串（未显式绑定）。 */
+	workspace?: string;
 }

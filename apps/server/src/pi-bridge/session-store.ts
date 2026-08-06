@@ -11,6 +11,7 @@ import {
 import { unlink } from "node:fs/promises";
 import type { TeamsStore, WindowType } from "../store/teams.js";
 import { createTeamTaskTool } from "./team-task.js";
+import type { AgentInvoker } from "../agent-runtime/invoker.js";
 
 export interface SessionSummary {
 	id: string;
@@ -60,6 +61,7 @@ export class PiSessionStore {
 		private readonly cwd: string,
 		private readonly sessionDir: string,
 		private readonly teamsStore?: TeamsStore,
+		private readonly invoker?: AgentInvoker,
 	) {}
 
 	/** Custom tools registered into every manager session (team_task). `solo`
@@ -69,8 +71,8 @@ export class PiSessionStore {
 		getSessionId: () => string,
 		ctx?: { type: WindowType; members: string[] },
 	): CreateAgentSessionOptions["customTools"] {
-		return this.teamsStore
-			? [createTeamTaskTool(this.teamsStore, this, getSessionId, { solo: !ctx || ctx.type === "solo" })]
+		return this.teamsStore && this.invoker
+			? [createTeamTaskTool(this.teamsStore, this, getSessionId, this.invoker, { solo: !ctx || ctx.type === "solo" })]
 			: undefined;
 	}
 

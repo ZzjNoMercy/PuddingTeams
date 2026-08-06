@@ -5,6 +5,7 @@ import { writeFileSync } from "node:fs";
 import { Type, type Static } from "typebox";
 import { TeamsStore, type AgentConfig, type WindowConfig } from "../store/teams.js";
 import type { PiSessionStore } from "./session-store.js";
+import type { AgentInvoker } from "../agent-runtime/invoker.js";
 
 const MAX_RESULT_CHARS = 30_000;
 
@@ -44,19 +45,6 @@ const TeamTaskParams = Type.Object(
 
 type TeamTaskInput = Static<typeof TeamTaskParams>;
 
-const WORKER_META_KEYS = [
-	"run_id",
-	"session_id",
-	"project_id",
-	"analytics_model_id",
-	"approval_mode",
-	"outcome",
-	"verification",
-	"auto_resolved",
-	"interrupt_summary",
-	"model_call_count",
-] as const;
-
 function truncate(text: string): string {
 	if (text.length <= MAX_RESULT_CHARS) return text;
 	return `${text.slice(0, MAX_RESULT_CHARS)}\n\n…(输出过长，已截断)`;
@@ -66,26 +54,11 @@ function workerList(workers: AgentConfig[]): string {
 	return workers.map((w) => `- ${w.name}: ${w.description || "（无描述）"}`).join("\n");
 }
 
-function needsInputText(worker: string, needsInput: unknown): string {
-	if (needsInput && typeof needsInput === "object" && "prompt" in needsInput) {
-		const prompt = String((needsInput as { prompt?: unknown }).prompt ?? "");
-		const rawOptions = (needsInput as { options?: unknown }).options;
-		const options = Array.isArray(rawOptions)
-			? rawOptions
-					.filter((o): o is { name?: string; id?: string } => Boolean(o) && typeof o === "object")
-					.map((o) => `- ${o.name ?? o.id ?? ""}`)
-					.join("\n")
-			: "";
-		return `worker「${worker}」需要更多输入才能执行：${prompt}${options ? `\n可选：\n${options}` : ""}`;
-	}
-	return `worker「${worker}」需要更多输入才能执行。`;
-}
-
 const BASE_DESCRIPTION = [
 	"Delegate a task to a team worker (a specialized subprocess agent) and return its final result.",
 	"Use this when the user asks for work that belongs to a team member (e.g. data analysis via puddingclaw) instead of doing it yourself.",
 	"Specify `worker` when the user names a worker. If omitted, the only worker in the current window is used.",
-	"When a worker needs more input to proceed, the result reports what is required; relay it to the user and retry with the chosen value.",
+	"When a worker needs approval to proceed, the result reports a pending interaction; do NOT retry the task — the approval card handles it.",
 ].join(" ");
 
 /**
@@ -109,6 +82,7 @@ export function createTeamTaskTool(
 	store: TeamsStore,
 	sessions: PiSessionStore,
 	getSessionId: () => string,
+	invoker: AgentInvoker,
 	opts?: { solo?: boolean; log?: (msg: string) => void },
 ) {
 	const solo = opts?.solo ?? false;
@@ -290,26 +264,25 @@ export function createTeamTaskTool(
 			opts?.log?.(`team_task: ${sessionId} → ${worker.name} (task len ${params.task.length})`);
 
 			const taskId = randomUUID();
-			const result = await store.runAgent({
+			const result = await invoker.delegate({
 				agent: worker,
-				task: params.task,
+				message: params.task,
 				model: params.model,
 				windowId: targetWindow?.id ?? "",
-				workerSession: isSoloContext ? (params.session ?? "continue") : undefined,
+				managerSessionId: sessionId,
+				managerToolCallId: taskId,
+				mode: isSoloContext ? (params.session === "new" ? "run" : "continue") : "continue",
 				signal,
 				onUpdate: (content) => onUpdate?.({ content: [{ type: "text", text: content }], details: {} }),
 			});
 
 			const meta: Record<string, unknown> = {
-				worker: result.worker,
+				worker: result.details.worker ?? worker.name,
 				status: result.status,
-				exitCode: result.exitCode,
-				elapsedMs: result.elapsedMs,
+				delegationId: result.delegationId,
+				interactionId: result.interactionId,
 			};
-			const picked: Record<string, unknown> = {};
-			for (const key of WORKER_META_KEYS) {
-				if (key in result.raw) picked[key] = result.raw[key];
-			}
+			const picked = result.details;
 
 			// §4.4: mirror into the direct window's message stream. Best-effort —
 			// a busy target session yields synced:false instead of blocking.
@@ -331,19 +304,19 @@ export function createTeamTaskTool(
 						? `\n\n（已同步到与 ${worker.name} 的单聊）`
 						: `\n\n（未能同步到与 ${worker.name} 的单聊：对方会话忙碌）`;
 
-			if (result.status === "needs_input") {
-				const text = needsInputText(result.worker, result.raw.needs_input);
-				const extra = await soloMeta("needs_input", text);
+			// HITL（§6.2）：needs_input 时保存待处理 Interaction，返回“等待审批”
+			// 结构，manager 本轮正常结束，绝不指导它重跑任务。
+			if (result.status === "needs_input" || result.status === "conflict") {
+				const text = result.content;
+				const extra = await soloMeta(result.status, text);
 				return {
 					content: [{ type: "text", text: `${text}${syncNote(extra.synced as boolean | undefined)}` }],
 					details: { ...meta, ...picked, ...extra },
 				};
 			}
 
-			if (result.status === "error") {
-				const errorCode = typeof result.raw.error_code === "string" ? result.raw.error_code : "";
-				const message = typeof result.raw.error === "string" ? result.raw.error : "";
-				const text = `worker「${result.worker}」执行出错${errorCode ? `（${errorCode}）` : ""}${message ? `：${message}` : ""}`;
+			if (result.status === "failed") {
+				const text = result.content;
 				await soloMeta("error", text);
 				throw new Error(text);
 			}

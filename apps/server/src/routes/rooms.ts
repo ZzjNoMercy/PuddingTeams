@@ -21,9 +21,12 @@ export interface RoomSummary {
 	sessions: RoomSessionSummary[];
 	activeSession: string;
 	pinned: boolean;
-	workerSessions: Record<string, string>;
+	/** Per-worker last session handle (multi-turn continuity). */
+	workerBindings: Record<string, { sessionHandle?: string; updatedAt: string }>;
 	/** User-edited window system prompt ('' = default relay guidance). */
 	prompt: string;
+	/** 房间绑定的工作区根目录（绝对路径），可能为空字符串（未显式绑定）。 */
+	workspace?: string;
 }
 
 const TYPE_ORDER: Record<WindowType, number> = { solo: 0, direct: 1, group: 2 };
@@ -65,8 +68,9 @@ async function buildWindowSummary(
 		}),
 		activeSession: active,
 		pinned: Boolean(w.pinned),
-		workerSessions: w.workerSessions ?? {},
+		workerBindings: w.workerBindings ?? {},
 		prompt: w.prompt ?? "",
+		workspace: w.workspace ?? "",
 	};
 }
 

@@ -340,7 +340,7 @@ export function ChatPane({
 							) : (
 								members.map((m) => {
 									const cmd = [m.invoke?.command, ...(m.invoke?.runArgs ?? [])].join(" ");
-									const workerSession = room?.workerSessions?.[m.name];
+									const workerSession = room?.workerBindings?.[m.name]?.sessionHandle;
 									const enabled = m.enabled !== false;
 									return (
 										<div key={m.name} className="flex items-start gap-2 px-2 py-1.5">
