@@ -14,7 +14,7 @@
   },
   "scripts": {
     "predev": "node scripts/kill-ports.mjs",
-    "dev": "pnpm --parallel -r run dev",
+    "dev": "ulimit -n 10240 2>/dev/null; pnpm --parallel -r run dev",
     "dev:server": "pnpm --filter @puddingteams/server run dev",
     "dev:web": "pnpm --filter @puddingteams/web run dev",
     "build": "pnpm -r run build",

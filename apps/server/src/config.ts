@@ -1,5 +1,6 @@
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { homedir } from "node:os";
 
 function resolveFromThisFile(...parts: string[]): string {
 	return path.resolve(path.dirname(fileURLToPath(import.meta.url)), ...parts);
@@ -14,6 +15,8 @@ export const config = {
 	agentCwd: process.env.PUDDINGTEAMS_AGENT_CWD ?? process.cwd(),
 	/** Directory holding the worker registry (teams.json) and room configs. */
 	teamsDir: process.env.PUDDINGTEAMS_TEAMS_DIR ?? resolveFromThisFile("../.teams"),
+	/** Directory for encrypted worker secrets (~/.puddingteams). */
+	secretsDir: process.env.PUDDINGTEAMS_SECRETS_DIR ?? path.join(homedir(), ".puddingteams"),
 	/** Max time a worker subprocess may run before team_task aborts it. */
 	workerTimeoutMs: Number(process.env.PUDDINGTEAMS_WORKER_TIMEOUT_MS ?? 900_000),
 	/** Browser origins allowed to call the HTTP API and open WebSockets. */

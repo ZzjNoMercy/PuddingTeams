@@ -117,12 +117,12 @@ export async function registerChatRoutes(
 
 	app.delete<{ Params: { id: string } }>("/api/sessions/:id", async (req, reply) => {
 		const removed = await store.remove(req.params.id);
-		// A fresh room may only exist as a config (pi writes the session file
-		// lazily) — clean the room store regardless, and only 404 when nothing
-		// existed at all.
-		const hadRoom = teams ? await teams.hasRoomConfig(req.params.id) : false;
-		await teams?.removeSessionFromRooms(req.params.id);
-		if (!removed && !hadRoom) return reply.code(404).send({ error: "session not found" });
+		// A fresh window session may only exist as a config (pi writes the
+		// session file lazily) — clean the window store regardless, and only
+		// 404 when nothing existed at all.
+		const inWindow = teams ? await teams.windowForSession(req.params.id) : undefined;
+		await teams?.removeSessionFromWindows(req.params.id);
+		if (!removed && !inWindow) return reply.code(404).send({ error: "session not found" });
 		return reply.code(204).send();
 	});
 
@@ -149,10 +149,18 @@ export async function registerChatRoutes(
 				return reply.code(400).send({ error: "content is required" });
 			}
 			const session = await store.open(req.params.id);
+			// 第一条消息到达时，异步调 LLM 生成会话标题（session_info），
+			// 不阻塞消息发送本身。
+			const isFirstMessage = session.messages.length === 0;
 			void session.prompt(content).catch((err: unknown) => {
 				app.log.error({ err, sessionId: req.params.id }, "prompt failed");
 				forwardError(req.params.id, err instanceof Error ? err.message : String(err));
 			});
+			if (isFirstMessage) {
+				void store.generateSessionTitle(req.params.id, content).catch((err: unknown) => {
+					app.log.warn({ err, sessionId: req.params.id }, "title generation failed");
+				});
+			}
 			return { accepted: true };
 		},
 	);

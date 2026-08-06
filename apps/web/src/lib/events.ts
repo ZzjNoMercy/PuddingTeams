@@ -2,6 +2,7 @@ import type {
 	ChatMessage,
 	PiAssistantMessage,
 	PiContentBlock,
+	PiCustomMessage,
 	PiMessage,
 	PiTextBlock,
 	PiToolCallBlock,
@@ -45,10 +46,29 @@ export function renderPiMessage(m: PiAssistantMessage): {
 	};
 }
 
+/** Map a pi custom_message (e.g. pudding:task_assign/result) to chat view state. */
+function renderCustom(m: PiCustomMessage): ChatMessage {
+	return {
+		id: uid(),
+		role: "custom",
+		customType: m.customType,
+		details: m.details,
+		content: typeof m.content === "string" ? m.content : textOf(m.content),
+		toolCalls: [],
+		timestamp: m.timestamp ?? Date.now(),
+		streaming: false,
+	};
+}
+
 /** Build the initial message list when a session is opened (history from file). */
 export function renderHistory(msgs: PiMessage[]): ChatMessage[] {
 	const out: ChatMessage[] = [];
 	for (const m of msgs) {
+		if (m.role === "custom") {
+			if (m.display === false) continue;
+			out.push(renderCustom(m));
+			continue;
+		}
 		if (m.role === "toolResult") {
 			// Fold tool results into the matching tool call of the latest assistant message.
 			let idx = -1;
@@ -64,7 +84,7 @@ export function renderHistory(msgs: PiMessage[]): ChatMessage[] {
 					...assistant,
 					toolCalls: assistant.toolCalls.map((t) =>
 						t.id === m.toolCallId
-							? { ...t, status: m.isError ? "error" : "done", result: textOf(m.content), isError: m.isError }
+							? { ...t, status: m.isError ? "error" : "done", result: textOf(m.content), details: m.details, isError: m.isError }
 							: t,
 					),
 				};
@@ -188,6 +208,10 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 		case "message_start": {
 			const m = event.message as PiMessage;
 			if (!m) return messages;
+			if (m.role === "custom") {
+				if (m.display === false) return messages;
+				return [...messages, renderCustom(m)];
+			}
 			if (m.role === "user") {
 				return [
 					...messages,
@@ -296,6 +320,7 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 												...t,
 												status: tr.isError ? "error" : "done",
 												result: textOf(tr.content),
+												details: tr.details ?? t.details,
 												isError: tr.isError,
 											}
 										: t,

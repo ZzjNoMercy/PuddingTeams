@@ -93,7 +93,7 @@ function ProviderRow({
 		<div className="rounded-md px-3 py-2 hover:bg-muted/60">
 			<div className="flex items-center gap-3">
 				<span
-					className={`size-1.5 shrink-0 rounded-full ${provider.configured ? "bg-green-500" : "bg-muted-foreground/30"}`}
+					className={`size-1.5 shrink-0 rounded-full ${provider.configured ? "bg-foreground" : "bg-muted-foreground/30"}`}
 				/>
 				<button
 					type="button"
@@ -163,8 +163,8 @@ function ProviderRow({
 				<div className="mt-2 space-y-1 border-l border-border pl-4">
 					<div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
 						{provider.baseUrl ? (
-							<span className="font-mono" title="API endpoint">
-								端点：{provider.baseUrl}
+							<span title="API endpoint">
+								端点：<span className="font-mono">{provider.baseUrl}</span>
 							</span>
 						) : null}
 						<span>认证：{provider.oauth ? "OAuth" : provider.configured ? "API Key" : "未配置"}</span>
@@ -189,7 +189,7 @@ function ProviderRow({
 									<Button
 										type="button"
 										size="sm"
-										variant={isDefault ? "outline" : "ghost"}
+										variant="ghost"
 										disabled={isDefault}
 										onClick={() => void onSetDefault(provider.id, m.id.split("/").slice(1).join("/"))}
 									>

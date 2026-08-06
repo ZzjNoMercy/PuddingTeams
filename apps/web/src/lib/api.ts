@@ -177,7 +177,68 @@ export async function probeAgent(name: string): Promise<WorkerProbeResult> {
 	return ((await res.json()) as { probe: WorkerProbeResult }).probe;
 }
 
-// ---- rooms ----
+// ---- encrypted secrets (~/.puddingteams) ----
+
+/** Names of env keys configured for a worker (never the values). */
+export async function getAgentSecrets(name: string): Promise<string[]> {
+	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}/secrets`);
+	if (!res.ok) throw new Error(`get secrets failed: ${res.status}`);
+	return ((await res.json()) as { configured: string[] }).configured;
+}
+
+/** Set env secrets for a worker (AES-256 encrypted at rest). */
+export async function setAgentSecrets(name: string, secrets: Record<string, string>): Promise<string[]> {
+	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}/secrets`, {
+		method: "PUT",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ secrets }),
+	});
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `set secrets failed: ${res.status}`);
+	}
+	return ((await res.json()) as { configured: string[] }).configured;
+}
+
+/** Remove one env secret for a worker. */
+export async function deleteAgentSecret(name: string, key: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}/secrets/${encodeURIComponent(key)}`, {
+		method: "DELETE",
+	});
+	if (!res.ok) throw new Error(`delete secret failed: ${res.status}`);
+}
+
+// ---- avatars (§11) ----
+
+/** URL for an agent's uploaded avatar; `v` busts the cache after changes. */
+export function agentAvatarUrl(name: string, v = 0): string {
+	return `${SERVER_URL}/api/agents/${encodeURIComponent(name)}/avatar?v=${v}`;
+}
+
+export async function uploadAgentAvatar(name: string, file: File): Promise<AgentConfig> {
+	const buf = new Uint8Array(await file.arrayBuffer());
+	let bin = "";
+	for (let i = 0; i < buf.length; i += 0x8000) {
+		bin += String.fromCharCode(...buf.subarray(i, i + 0x8000));
+	}
+	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}/avatar`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ data: btoa(bin), mediaType: file.type }),
+	});
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `upload avatar failed: ${res.status}`);
+	}
+	return ((await res.json()) as { agent: AgentConfig }).agent;
+}
+
+export async function deleteAgentAvatar(name: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}/avatar`, { method: "DELETE" });
+	if (!res.ok) throw new Error(`delete avatar failed: ${res.status}`);
+}
+
+// ---- rooms / windows ----
 
 export async function listRooms(): Promise<RoomSummary[]> {
 	const res = await fetch(`${SERVER_URL}/api/rooms`);
@@ -185,35 +246,74 @@ export async function listRooms(): Promise<RoomSummary[]> {
 	return ((await res.json()) as { rooms: RoomSummary[] }).rooms;
 }
 
-export async function getRoom(sessionId: string): Promise<RoomSummary> {
-	const res = await fetch(`${SERVER_URL}/api/rooms/${sessionId}`);
+export async function getRoom(id: string): Promise<RoomSummary> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${id}`);
 	if (!res.ok) throw new Error(`get room failed: ${res.status}`);
 	return ((await res.json()) as { room: RoomSummary }).room;
 }
 
+/** 发起对话：direct（单聊）/ group（群聊）。单聊按 worker 去重，命中返回 existed。 */
+export async function createRoom(input: {
+	type: "direct" | "group";
+	members: string[];
+	name?: string;
+}): Promise<{ room: RoomSummary; existed: boolean }> {
+	const res = await fetch(`${SERVER_URL}/api/rooms`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(input),
+	});
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `create room failed: ${res.status}`);
+	}
+	return (await res.json()) as { room: RoomSummary; existed: boolean };
+}
+
 export async function updateRoom(
-	sessionId: string,
-	patch: { name?: string; agents?: string[] },
-): Promise<void> {
-	const res = await fetch(`${SERVER_URL}/api/rooms/${sessionId}`, {
+	id: string,
+	patch: { name?: string; members?: string[]; prompt?: string },
+): Promise<RoomSummary> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${id}`, {
 		method: "PATCH",
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify(patch),
 	});
 	if (!res.ok) throw new Error(`update room failed: ${res.status}`);
+	return ((await res.json()) as { room: RoomSummary }).room;
 }
 
-/** Create a new pi session inside a room and make it the active one. */
+/** 删除窗口（级联删除其全部 pi session）。solo 会被后端拒绝。 */
+export async function deleteRoom(id: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${id}`, { method: "DELETE" });
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `delete room failed: ${res.status}`);
+	}
+}
+
+/** Create a new pi session inside a window and make it the active one. */
 export async function createRoomSession(roomId: string): Promise<SessionSummary> {
 	const res = await fetch(`${SERVER_URL}/api/rooms/${roomId}/sessions`, { method: "POST" });
 	if (!res.ok) throw new Error(`create room session failed: ${res.status}`);
 	return ((await res.json()) as { session: SessionSummary }).session;
 }
 
-/** Switch the active pi session of a room. */
+/** Switch the active pi session of a window. */
 export async function setActiveRoomSession(roomId: string, sessionId: string): Promise<void> {
 	const res = await fetch(`${SERVER_URL}/api/rooms/${roomId}/sessions/${sessionId}/activate`, {
 		method: "POST",
 	});
 	if (!res.ok) throw new Error(`switch session failed: ${res.status}`);
+}
+
+/** Delete a pi session inside a window (the last one is protected). */
+export async function deleteRoomSession(roomId: string, sessionId: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${roomId}/sessions/${sessionId}`, {
+		method: "DELETE",
+	});
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `delete room session failed: ${res.status}`);
+	}
 }

@@ -68,10 +68,22 @@ export interface PiToolResultMessage {
 	toolName: string;
 	content: PiContentBlock[];
 	isError: boolean;
+	/** Structured metadata from custom tools (team_task details). */
+	details?: unknown;
 	timestamp?: number;
 }
 
-export type PiMessage = PiUserMessage | PiAssistantMessage | PiToolResultMessage;
+/** pi custom_message (sendCustomMessage): persisted, replayed, no LLM turn. */
+export interface PiCustomMessage {
+	role: "custom";
+	customType: string;
+	content: string | PiContentBlock[];
+	display?: boolean;
+	details?: unknown;
+	timestamp?: number;
+}
+
+export type PiMessage = PiUserMessage | PiAssistantMessage | PiToolResultMessage | PiCustomMessage;
 
 export type PiEvent =
 	| { type: "session_ready"; sessionId: string }
@@ -114,7 +126,7 @@ export interface ToolCallView {
 	details?: unknown;
 }
 
-export type ChatMessageRole = "user" | "assistant" | "toolResult";
+export type ChatMessageRole = "user" | "assistant" | "toolResult" | "custom";
 
 export interface ChatMessage {
 	id: string;
@@ -127,6 +139,9 @@ export interface ChatMessage {
 	error?: boolean;
 	name?: string;
 	isError?: boolean;
+	/** role === "custom": pi customType (e.g. pudding:task_assign) + details. */
+	customType?: string;
+	details?: unknown;
 }
 
 export type ChatStatus = "idle" | "connecting" | "connected" | "reconnecting" | "error";
@@ -148,6 +163,8 @@ export interface AgentConfig {
 	env?: Record<string, string>;
 	enabled?: boolean;
 	capabilities?: string[];
+	/** Avatar file name under server `.teams/avatars/` (§11); absent = default. */
+	avatar?: string;
 }
 
 export interface WorkerProbeResult {
@@ -161,20 +178,31 @@ export interface WorkerProbeResult {
 
 export interface RoomSession {
 	id: string;
+	/** LLM-generated title (set on first query), else firstMessage. */
+	name?: string;
 	firstMessage: string;
 	modifiedAt: string;
 	active: boolean;
 }
 
+export type WindowType = "solo" | "direct" | "group";
+
 export interface RoomSummary {
-	sessionId: string;
+	/** Window id (not a pi session id). */
+	id: string;
+	type: WindowType;
 	name: string;
 	firstMessage: string;
 	modifiedAt: string;
-	agents?: string[];
 	members: AgentConfig[];
-	/** pi sessions belonging to this room (newest first). */
+	/** pi sessions belonging to this window (newest first). */
 	sessions: RoomSession[];
 	/** The pi session currently shown in the chat. */
 	activeSession: string;
+	/** Solo only: pinned singleton, never deletable. */
+	pinned: boolean;
+	/** Per-worker last session id (multi-turn continuity). */
+	workerSessions: Record<string, string>;
+	/** User-edited window system prompt ('' = default relay guidance). */
+	prompt: string;
 }

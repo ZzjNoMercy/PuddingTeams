@@ -32,7 +32,7 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
 					</DialogClose>
 				</header>
 				<div className="flex min-h-0 flex-1">
-					<nav className="flex w-44 shrink-0 flex-col gap-0.5 border-r bg-muted/30 p-3">
+					<nav className="flex w-44 shrink-0 flex-col gap-0.5 border-r p-3">
 						{TABS.map((t) => (
 							<button
 								type="button"

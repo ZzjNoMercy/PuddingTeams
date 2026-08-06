@@ -4,13 +4,14 @@ import websocket from "@fastify/websocket";
 import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { config } from "./config.js";
 import { PiSessionStore } from "./pi-bridge/session-store.js";
+import { CredentialsStore } from "./store/credentials.js";
 import { TeamsStore } from "./store/teams.js";
 import { registerChatRoutes } from "./routes/chat.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
 import { registerAgentsRoutes } from "./routes/agents.js";
 import { registerRoomsRoutes } from "./routes/rooms.js";
 
-const app = Fastify({ logger: true });
+const app = Fastify({ logger: { level: "warn" } });
 
 // Browser UI runs on a different origin (Next dev on :8934), so cross-origin
 // requests and WebSocket upgrades to this server must be allowed. DELETE must
@@ -24,12 +25,20 @@ await app.register(cors, {
 });
 await app.register(websocket);
 
-const teams = new TeamsStore(config.teamsDir, config.agentCwd, config.workerTimeoutMs);
+// Worker 密钥（如 PUDDINGCLAW_TOKEN）加密存于 ~/.puddingteams，不进 teams.json。
+const credentials = new CredentialsStore(config.secretsDir);
+await credentials.init();
+const teams = new TeamsStore(config.teamsDir, config.agentCwd, config.workerTimeoutMs, credentials);
 await teams.init();
 const store = new PiSessionStore(config.agentCwd, config.sessionDir, teams);
+// §1/§2 产品模型：solo 窗口是置顶单例，服务端启动即保证存在。
+await teams.ensureSoloWindow(
+	() => store.create(),
+	async (id) => (await store.list()).some((s) => s.id === id),
+);
 await registerChatRoutes(app, store, teams);
 await registerSettingsRoutes(app);
-await registerAgentsRoutes(app, teams);
+await registerAgentsRoutes(app, teams, credentials);
 await registerRoomsRoutes(app, store, teams);
 
 // §4 health: startup smoke check — create + destroy an in-memory session.

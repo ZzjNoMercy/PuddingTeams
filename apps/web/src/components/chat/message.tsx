@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ChevronDownIcon, ChevronRightIcon } from "lucide-react";
+import { ChevronDownIcon, ChevronRightIcon, ExternalLinkIcon } from "lucide-react";
 import {
 	Message as AiMessage,
 	MessageContent,
@@ -17,7 +17,7 @@ import { Badge } from "@/components/ui/badge";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { streamdownPlugins } from "@/core/streamdown/plugins";
 import { teamTaskWorker } from "@/lib/events";
-import type { ChatMessage, ToolCallView } from "@/lib/types";
+import type { ChatMessage, ToolCallView, WindowType } from "@/lib/types";
 import { WorkerAvatar } from "./worker-avatar";
 
 const TOOL_STATUS_LABEL: Record<ToolCallView["status"], string> = {
@@ -44,43 +44,102 @@ function Elapsed({ active }: { active: boolean }) {
 function statusBadge(call: ToolCallView) {
 	if (call.status === "running")
 		return (
-			<Badge className="gap-1 border-amber-500/50 text-amber-600">
-				<span className="size-1.5 animate-pulse rounded-full bg-amber-500" />
+			<Badge variant="secondary" className="gap-1">
+				<span className="size-1.5 animate-pulse rounded-full bg-muted-foreground" />
 				执行中 <Elapsed active />
 			</Badge>
 		);
-	if (call.status === "error") return <Badge className="border-destructive/50 text-destructive">失败</Badge>;
+	if (call.status === "error") return <Badge variant="destructive">失败</Badge>;
 	const details = call.details as { status?: string } | undefined;
-	if (details?.status === "needs_input")
-		return <Badge className="border-amber-500/50 text-amber-600">等待输入</Badge>;
-	return <Badge className="border-emerald-500/50 text-emerald-600">完成</Badge>;
+	if (details?.status === "needs_input") return <Badge variant="secondary">等待输入</Badge>;
+	return <Badge variant="secondary">完成</Badge>;
+}
+
+/** Badge for a worker-reported status string (custom_message details). */
+function workerStatusBadge(status?: string) {
+	if (status === "needs_input") return <Badge variant="secondary">等待输入</Badge>;
+	if (status && status !== "completed") return <Badge variant="destructive">{status}</Badge>;
+	return <Badge variant="secondary">完成</Badge>;
+}
+
+/**
+ * A worker-authored entry in the member message flow (§7): avatar + name +
+ * status badge + task + result markdown, standing on its own instead of being
+ * wrapped inside the manager bubble. Shared by direct/group team_task blocks
+ * and solo-synced pudding:task_result custom messages.
+ */
+function WorkerTaskEntry({
+	worker,
+	task,
+	result,
+	badge,
+	running,
+	isError,
+	meta,
+}: {
+	worker: string;
+	task?: string;
+	result?: string;
+	badge: React.ReactNode;
+	running?: boolean;
+	isError?: boolean;
+	meta?: string;
+}) {
+	return (
+		<div className="flex w-full items-start gap-2.5">
+			<WorkerAvatar name={worker} size={28} className="mt-0.5 shrink-0" />
+			<div className="min-w-0 flex-1">
+				<div className="flex items-center gap-2">
+					<span className="truncate font-mono text-sm font-medium">{worker}</span>
+					{badge}
+				</div>
+				{task ? (
+					<p className="mt-1 text-xs text-muted-foreground">
+						<span className="mr-1.5 text-muted-foreground/60">任务：</span>
+						<span className="whitespace-pre-wrap">{task}</span>
+					</p>
+				) : null}
+				{running ? <p className="mt-1 text-xs text-muted-foreground">等待 worker 完成…</p> : null}
+				{result !== undefined && result !== "" && (
+					<div className={`mt-1 text-sm ${isError ? "text-destructive" : ""}`}>
+						<MessageResponse {...streamdownPlugins}>{result}</MessageResponse>
+					</div>
+				)}
+				{meta ? <p className="mt-1 text-xs text-muted-foreground/70 tabular-nums">{meta}</p> : null}
+			</div>
+		</div>
+	);
+}
+
+function toolCallMeta(call: ToolCallView): string | undefined {
+	const details = call.details as
+		| { status?: string; outcome?: string; exitCode?: number; elapsedMs?: number }
+		| undefined;
+	if (!details || (!details.status && details.outcome === undefined)) return undefined;
+	return [
+		details.status,
+		details.outcome,
+		details.elapsedMs !== undefined ? `${(details.elapsedMs / 1000).toFixed(0)}s` : undefined,
+		details.exitCode !== undefined ? `exit ${details.exitCode}` : undefined,
+	]
+		.filter((x): x is string => Boolean(x))
+		.join(" · ");
 }
 
 /** Specialized card for team_task delegation — rendered as a member message
  * (worker avatar + name + result), with the raw tool call kept expandable. */
-function TeamTaskCard({ call }: { call: ToolCallView }) {
+function TeamTaskCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow?: (windowId: string) => void }) {
 	const args = call.args as { task?: string; model?: string } | undefined;
 	const worker = teamTaskWorker(call);
 	const details = call.details as
-		| { status?: string; outcome?: string; exitCode?: number; elapsedMs?: number }
+		| { status?: string; synced?: boolean; windowId?: string }
 		| undefined;
 	const [open, setOpen] = useState(false);
-
-	const meta =
-		details && (details.status || details.outcome !== undefined)
-			? [
-					details.status,
-					details.outcome,
-					details.elapsedMs !== undefined ? `${(details.elapsedMs / 1000).toFixed(0)}s` : undefined,
-					details.exitCode !== undefined ? `exit ${details.exitCode}` : undefined,
-				]
-					.filter((x): x is string => Boolean(x))
-					.join(" · ")
-			: undefined;
+	const meta = toolCallMeta(call);
 
 	return (
-		<div className="w-full overflow-hidden rounded-lg border bg-card">
-			<div className="flex items-center justify-between gap-2 border-b px-3 py-2">
+		<div className="w-full overflow-hidden rounded-lg bg-muted">
+			<div className="flex items-center justify-between gap-2 px-3 pt-2">
 				<div className="flex min-w-0 items-center gap-2">
 					<WorkerAvatar name={worker ?? "team_task"} size={20} />
 					<span className="truncate font-mono text-sm font-medium">{worker ?? "team_task"}</span>
@@ -88,7 +147,19 @@ function TeamTaskCard({ call }: { call: ToolCallView }) {
 						<span className="truncate text-xs text-muted-foreground">model: {args.model}</span>
 					) : null}
 				</div>
-				{statusBadge(call)}
+				<div className="flex shrink-0 items-center gap-2">
+					{details?.synced && details.windowId ? (
+						<button
+							type="button"
+							onClick={() => onOpenWindow?.(details.windowId!)}
+							className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+						>
+							已同步到单聊
+							<ExternalLinkIcon className="size-3" />
+						</button>
+					) : null}
+					{statusBadge(call)}
+				</div>
 			</div>
 			<div className="flex flex-col gap-2 p-3">
 				{args?.task ? (
@@ -105,7 +176,7 @@ function TeamTaskCard({ call }: { call: ToolCallView }) {
 						<MessageResponse {...streamdownPlugins}>{call.result}</MessageResponse>
 					</div>
 				)}
-				{meta ? <p className="text-xs text-muted-foreground/70">{meta}</p> : null}
+				{meta ? <p className="text-xs text-muted-foreground/70 tabular-nums">{meta}</p> : null}
 				<Collapsible open={open} onOpenChange={setOpen}>
 					<CollapsibleTrigger className="flex items-center gap-1 text-xs text-muted-foreground/70 hover:text-foreground">
 						{open ? <ChevronDownIcon className="size-3.5" /> : <ChevronRightIcon className="size-3.5" />}
@@ -131,8 +202,33 @@ function TeamTaskCard({ call }: { call: ToolCallView }) {
 	);
 }
 
-function ToolCallItem({ call }: { call: ToolCallView }) {
-	if (call.name === "team_task") return <TeamTaskCard call={call} />;
+function ToolCallItem({
+	call,
+	windowType,
+	onOpenWindow,
+}: {
+	call: ToolCallView;
+	windowType?: WindowType;
+	onOpenWindow?: (windowId: string) => void;
+}) {
+	if (call.name === "team_task") {
+		// §7 成员消息流：direct/group 下脱离 manager 气泡，渲染为 worker 独立条目。
+		if (windowType && windowType !== "solo") {
+			const args = call.args as { task?: string } | undefined;
+			return (
+				<WorkerTaskEntry
+					worker={teamTaskWorker(call) ?? "team_task"}
+					task={args?.task}
+					result={call.result}
+					badge={statusBadge(call)}
+					running={call.status === "running"}
+					isError={call.isError}
+					meta={toolCallMeta(call)}
+				/>
+			);
+		}
+		return <TeamTaskCard call={call} onOpenWindow={onOpenWindow} />;
+	}
 	return (
 		<Task defaultOpen={call.status === "running" || call.status === "error"}>
 			<TaskTrigger title={`${TOOL_STATUS_LABEL[call.status]} · ${call.name}`} />
@@ -159,7 +255,51 @@ function ToolCallItem({ call }: { call: ToolCallView }) {
 	);
 }
 
-export function Message({ message }: { message: ChatMessage }) {
+/** role:"custom" entries written by the platform (solo task sync, §4.4). */
+function CustomMessageEntry({ message }: { message: ChatMessage }) {
+	const details = message.details as
+		| { worker?: string; status?: string; windowId?: string }
+		| undefined;
+
+	if (message.customType === "pudding:task_assign") {
+		return (
+			<AiMessage from="user">
+				<MessageContent>
+					<p className="text-xs text-muted-foreground">派给 {details?.worker ?? "worker"}</p>
+					<p className="text-sm whitespace-pre-wrap">{message.content}</p>
+				</MessageContent>
+			</AiMessage>
+		);
+	}
+
+	if (message.customType === "pudding:task_result") {
+		return (
+			<WorkerTaskEntry
+				worker={details?.worker ?? "worker"}
+				result={message.content}
+				badge={workerStatusBadge(details?.status)}
+				isError={Boolean(details?.status && details.status !== "completed")}
+			/>
+		);
+	}
+
+	// Unknown custom types stay visible but unobtrusive.
+	return (
+		<p className="text-xs text-muted-foreground">
+			[{message.customType ?? "custom"}] {message.content}
+		</p>
+	);
+}
+
+export function Message({
+	message,
+	windowType,
+	onOpenWindow,
+}: {
+	message: ChatMessage;
+	windowType?: WindowType;
+	onOpenWindow?: (windowId: string) => void;
+}) {
 	if (message.role === "user") {
 		return (
 			<AiMessage from="user">
@@ -168,6 +308,10 @@ export function Message({ message }: { message: ChatMessage }) {
 				</MessageContent>
 			</AiMessage>
 		);
+	}
+
+	if (message.role === "custom") {
+		return <CustomMessageEntry message={message} />;
 	}
 
 	if (message.role === "toolResult") {
@@ -185,29 +329,43 @@ export function Message({ message }: { message: ChatMessage }) {
 		Boolean(message.thinking) || (message.streaming && !message.content && message.toolCalls.length === 0);
 	const showContent = Boolean(message.content) || message.error;
 
+	// §7: in direct/group windows team_task blocks leave the manager bubble and
+	// render as standalone worker entries; other tools stay inside.
+	const memberFlow = windowType === "direct" || windowType === "group";
+	const bubbleCalls = memberFlow ? message.toolCalls.filter((c) => c.name !== "team_task") : message.toolCalls;
+	const workerCalls = memberFlow ? message.toolCalls.filter((c) => c.name === "team_task") : [];
+	const showBubble = showThinking || showContent || bubbleCalls.length > 0;
+
 	return (
-		<AiMessage from="assistant">
-			<MessageContent>
-				{showThinking && (
-					<AssistantReasoning streaming={message.streaming} thinking={message.thinking} />
-				)}
-				{message.toolCalls.length > 0 && (
-					<div className="flex w-full flex-col gap-2">
-						{message.toolCalls.map((call) => (
-							<ToolCallItem key={call.id} call={call} />
-						))}
-					</div>
-				)}
-				{showContent && (
-					<MessageResponse
-						className={message.error ? "text-destructive" : undefined}
-						{...streamdownPlugins}
-					>
-						{message.content}
-					</MessageResponse>
-				)}
-			</MessageContent>
-		</AiMessage>
+		<>
+			{showBubble && (
+				<AiMessage from="assistant">
+					<MessageContent>
+						{showThinking && (
+							<AssistantReasoning streaming={message.streaming} thinking={message.thinking} />
+						)}
+						{bubbleCalls.length > 0 && (
+							<div className="flex w-full flex-col gap-2">
+								{bubbleCalls.map((call) => (
+									<ToolCallItem key={call.id} call={call} windowType={windowType} onOpenWindow={onOpenWindow} />
+								))}
+							</div>
+						)}
+						{showContent && (
+							<MessageResponse
+								className={message.error ? "text-destructive" : undefined}
+								{...streamdownPlugins}
+							>
+								{message.content}
+							</MessageResponse>
+						)}
+					</MessageContent>
+				</AiMessage>
+			)}
+			{workerCalls.map((call) => (
+				<ToolCallItem key={call.id} call={call} windowType={windowType} onOpenWindow={onOpenWindow} />
+			))}
+		</>
 	);
 }
 

@@ -36,3 +36,27 @@ for (const port of ports) {
 		}
 	}
 }
+
+// Reap orphaned dev watchers from previous runs. Ctrl+C on `pnpm --parallel`
+// does not propagate to children, so `tsx watch` / `next dev` processes leak
+// and keep holding thousands of file descriptors (EMFILE) unless killed.
+// The pattern is anchored to this project's root so other projects' dev
+// servers (e.g. PuddingClaw running in parallel) are never touched.
+if (!isWindows) {
+	const projectRoot = new URL("..", import.meta.url).pathname.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const pattern = `${projectRoot}.*(tsx/dist/cli\\.mjs watch|node_modules/\\.bin/next dev)`;
+	try {
+		const out = execFileSync("pgrep", ["-f", pattern], { encoding: "utf8" });
+		for (const pid of out.trim().split("\n").filter(Boolean)) {
+			if (Number(pid) === process.pid) continue;
+			try {
+				process.kill(Number(pid), "SIGKILL");
+				console.log(`[kill-ports] killed orphaned dev watcher (pid ${pid})`);
+			} catch {
+				// already gone
+			}
+		}
+	} catch {
+		// pgrep found nothing
+	}
+}

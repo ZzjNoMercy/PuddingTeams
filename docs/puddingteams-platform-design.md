@@ -137,12 +137,10 @@ PuddingTeams/
 │   │   ├── src/components/chat/   #    deer-flow ai-elements 抄改组件落这
 │   │   └── src/lib/               #   事件流客户端（WS/SSE → pi 事件映射）
 │   └── server/                    # ☐ thin backend（Node + Fastify/Express 均可）
-│       ├── src/pi-bridge/         #   pi SDK 封装：会话生命周期、事件订阅转发
-│       ├── src/routes/            #   HTTP/WS 端点（chat、sessions）
-│       └── src/store/             #   ◻ teams.json / 房间配置读写（阶段二）
-├── packages/
-│   └── teams-extension/           # ◻ pi extension（team_task 等，阶段二）
-│       └── teams.json             #   agents 注册表（阶段二）
+│       ├── src/pi-bridge/         #   pi SDK 封装：会话生命周期、事件订阅转发、team_task 工具（SDK customTools 注入）
+│       ├── src/routes/            #   HTTP/WS 端点（chat、sessions、rooms、agents、settings）
+│       ├── src/store/             #   teams.json / windows.json 读写 + worker spawn（阶段二已落地）
+│       └── .teams/                #   运行时数据：teams.json/windows.json/avatars/（gitignore）
 ├── electron/                      # ◻ 阶段三：壳 + 打包配置（mac/win）
 ├── workers/                       # ◻ 运行时生成的共享工作目录（gitignore，阶段二）
 └── docs/reference/                # ☐ PuddingClaw 侧文档参考拷贝（已有）
@@ -152,7 +150,7 @@ PuddingTeams/
 
 - **只有两个常驻 app**（web/server）+ 按需出现的包；pi 是 npm 依赖不是源码 fork，不建 `vendor/pi` 之类目录；
 - pi 相关的全部复杂度收敛在 `server/src/pi-bridge/` 一个目录，web 只面对平台自己的事件契约——将来换 agent 内核只动这一层；
-- `teams-extension` 独立成包是因为它要能被 pi 的扩展加载路径直接引用（开发期 `pi -e` 指向它，分发时随 backend 一起装）；
+- **team_task 未独立成包（实际形态，2026-08-05 更新）**：以 pi SDK `customTools` 方式由 server 进程内注入每个 manager session（`server/src/pi-bridge/team-task.ts`），不建 `packages/teams-extension/`——进程内嵌入下扩展加载路径没有意义；将来若要走 pi `npm:` 扩展分发通道再抽包；
 - `workers/` 是运行时产物目录，入 gitignore，结构 `workers/<name>/` 由 platform 按需创建。
-- **纯 TypeScript 项目**：web（Next.js）/ server（Node）/ teams-extension（pi 经 jiti 原生加载 TS，无需编译）/ electron 壳全部 TS；pi 本体也是 TS npm 依赖。无其他语言运行时（workers 如 PuddingClaw 是独立项目，经 CLI/MCP 契约调用，不在本仓）。
-- **分发形态**：开发态前后端分离（两进程），分发态合体——主分发物为一个 npm CLI 包（server + web 构建产物内嵌，`npx puddingteams` 一条命令起服务）；`teams-extension` 可单独发包走 pi 的 `npm:` 扩展通道；Electron 安装包（阶段三）是同一套 server+web 的并列分发物，不改架构。server 从阶段一就需支持「开发期代理 Next dev server / 生产期 serve 构建产物」一套代码两种形态。
+- **纯 TypeScript 项目**：web（Next.js）/ server（Node）/ electron 壳全部 TS；pi 本体也是 TS npm 依赖。无其他语言运行时（workers 如 PuddingClaw 是独立项目，经 CLI/MCP 契约调用，不在本仓）。
+- **分发形态**：开发态前后端分离（两进程），分发态合体——主分发物为一个 npm CLI 包（server + web 构建产物内嵌，`npx puddingteams` 一条命令起服务）；Electron 安装包（阶段三）是同一套 server+web 的并列分发物，不改架构。server 从阶段一就需支持「开发期代理 Next dev server / 生产期 serve 构建产物」一套代码两种形态。
