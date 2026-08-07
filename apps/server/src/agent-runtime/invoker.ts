@@ -46,6 +46,22 @@ export interface AgentInvokeResult {
  * - needs_input 时返回“等待审批”结构，绝不指导 manager 重跑任务。
  */
 export class AgentInvoker {
+	/**
+	 * 完成后通知 manager Session（§6.3）：sendCustomMessage(triggerTurn:true)
+	 * 让 manager 在同一 pi Session 继续汇总。由 index.ts 注入，避免循环依赖。
+	 */
+	private managerSender:
+		| ((
+				managerSessionId: string,
+				message: {
+					customType: string;
+					content: string;
+					details?: Record<string, unknown>;
+				},
+				options: { triggerTurn: boolean },
+		  ) => Promise<void>)
+		| undefined;
+
 	constructor(
 		private readonly teams: TeamsStore,
 		private readonly runtime: AgentRuntime,
@@ -53,6 +69,13 @@ export class AgentInvoker {
 		private readonly credentials?: CredentialsStore,
 		private readonly defaultCwd?: string,
 	) {}
+
+	/** 注入 manager 会话通知器（PiSessionStore），启动时由 index.ts 调用。 */
+	setManagerSender(
+		sender: AgentInvoker["managerSender"],
+	): void {
+		this.managerSender = sender;
+	}
 
 	private async envFor(agent: AgentConfig): Promise<NodeJS.ProcessEnv> {
 		const secrets = this.credentials ? await this.credentials.getSecrets(agent.name) : {};
@@ -145,6 +168,33 @@ export class AgentInvoker {
 		switch (delegation.status) {
 			case "needs_input": {
 				const interaction = delegation.interaction!;
+				// §6.5：向 manager session 追加安全投影（无 token），前端按
+				// interactionId 渲染/折叠审批卡。
+				if (this.managerSender && managerSessionId) {
+					void this.managerSender(
+						managerSessionId,
+						{
+							customType: "pudding:interaction_required",
+							content: `worker「${agent.name}」需要人工审批才能继续。`,
+							details: {
+								interactionId: interaction.id,
+								delegationId: d.id,
+								worker: agent.name,
+								status: "pending",
+								revision: interaction.revision,
+								requests: interaction.requests.map((r) => ({
+									requestId: r.requestId,
+									prompt: r.prompt,
+									...(r.command ? { command: r.command } : {}),
+									...(r.path ? { path: r.path } : {}),
+									risk: r.risk,
+									options: r.options,
+								})),
+							},
+						},
+						{ triggerTurn: false },
+					).catch(() => undefined);
+				}
 				return {
 					...base,
 					status: "needs_input",
@@ -239,17 +289,48 @@ export class AgentInvoker {
 		const d = outcome.delegation;
 		if (d.sessionHandle) this.rememberSession(d.windowId, d.agentId, d.sessionHandle);
 		switch (outcome.status) {
-			case "completed":
+			case "completed": {
+				// §6.3/§6.2：respond 完成后触发 manager follow-up 汇总（triggerTurn），
+				// 并把结果作为 pudding:interaction_resolved 追加，前端折叠原审批卡。
+				const details = { ...(outcome.result.meta ?? {}), artifacts: outcome.result.artifacts, usage: outcome.result.usage };
+				if (this.managerSender && d.managerSessionId) {
+					void this.managerSender(
+						d.managerSessionId,
+						{
+							customType: "pudding:interaction_resolved",
+							content: `worker「${d.agentId}」的审批已通过，任务已完成。`,
+							details: {
+								interactionId,
+								delegationId: d.id,
+								worker: d.agentId,
+								status: "approved",
+							},
+						},
+						{ triggerTurn: true },
+					).catch(() => undefined);
+				}
 				return {
 					status: "completed",
 					content: outcome.result.content ?? "",
-					details: { ...(outcome.result.meta ?? {}), artifacts: outcome.result.artifacts, usage: outcome.result.usage },
+					details,
 					delegationId: d.id,
 					runHandle: d.runHandle,
 					sessionHandle: d.sessionHandle,
 					waitingInput: false,
 				};
+			}
 			case "rejected":
+				if (this.managerSender && d.managerSessionId) {
+					void this.managerSender(
+						d.managerSessionId,
+						{
+							customType: "pudding:interaction_resolved",
+							content: `worker「${d.agentId}」的审批被拒绝，任务已取消。`,
+							details: { interactionId, delegationId: d.id, worker: d.agentId, status: "rejected" },
+						},
+						{ triggerTurn: true },
+					).catch(() => undefined);
+				}
 				return {
 					status: "cancelled",
 					content: "审批被拒绝，任务已取消。",

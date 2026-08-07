@@ -19,6 +19,7 @@ import { streamdownPlugins } from "@/core/streamdown/plugins";
 import { teamTaskWorker } from "@/lib/events";
 import type { ChatMessage, ToolCallView, WindowType } from "@/lib/types";
 import { WorkerAvatar } from "./worker-avatar";
+import { InteractionCard } from "./interaction-card";
 
 const TOOL_STATUS_LABEL: Record<ToolCallView["status"], string> = {
 	pending: "待运行",
@@ -76,6 +77,7 @@ function WorkerTaskEntry({
 	running,
 	isError,
 	meta,
+	children,
 }: {
 	worker: string;
 	task?: string;
@@ -84,6 +86,7 @@ function WorkerTaskEntry({
 	running?: boolean;
 	isError?: boolean;
 	meta?: string;
+	children?: React.ReactNode;
 }) {
 	return (
 		<div className="flex w-full items-start gap-2.5">
@@ -100,6 +103,7 @@ function WorkerTaskEntry({
 					</p>
 				) : null}
 				{running ? <p className="mt-1 text-xs text-muted-foreground">等待 worker 完成…</p> : null}
+				{children}
 				{result !== undefined && result !== "" && (
 					<div className={`mt-1 text-sm ${isError ? "text-destructive" : ""}`}>
 						<MessageResponse {...streamdownPlugins}>{result}</MessageResponse>
@@ -132,10 +136,53 @@ function TeamTaskCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow
 	const args = call.args as { task?: string; model?: string } | undefined;
 	const worker = teamTaskWorker(call);
 	const details = call.details as
-		| { status?: string; synced?: boolean; windowId?: string }
+		| {
+				status?: string;
+				synced?: boolean;
+				windowId?: string;
+				conflict?: boolean;
+				interactionId?: string;
+				delegationId?: string;
+				revision?: number;
+				requests?: Array<{ requestId: string; prompt: string; command?: string; path?: string; risk?: string; options?: string[] }>;
+		  }
 		| undefined;
 	const [open, setOpen] = useState(false);
 	const meta = toolCallMeta(call);
+
+	// HITL：等待审批 → 渲染审批卡。
+	if (details?.interactionId) {
+		return (
+			<div className="flex w-full flex-col gap-2">
+				<InteractionCard
+					interactionId={details.interactionId}
+					worker={worker ?? "worker"}
+					requests={details.requests}
+					revision={details.revision}
+					windowId={details.windowId}
+					onOpenWindow={onOpenWindow}
+				/>
+				{args?.task ? (
+					<p className="px-1 text-xs text-muted-foreground">
+						<span className="mr-1.5 text-muted-foreground/60">任务：</span>
+						<span className="whitespace-pre-wrap">{args.task}</span>
+					</p>
+				) : null}
+			</div>
+		);
+	}
+
+	// 409 冲突：渲染带「去处理」跳转的占用卡。
+	if (details?.status === "conflict" || details?.conflict) {
+		return (
+			<InteractionCard
+				worker={worker ?? "worker"}
+				statusHint="conflict"
+				windowId={details?.windowId}
+				onOpenWindow={onOpenWindow}
+			/>
+		);
+	}
 
 	return (
 		<div className="w-full overflow-hidden rounded-lg bg-muted">
@@ -214,6 +261,30 @@ function ToolCallItem({
 	if (call.name === "team_task") {
 		// §7 成员消息流：direct/group 下脱离 manager 气泡，渲染为 worker 独立条目。
 		if (windowType && windowType !== "solo") {
+			const details = call.details as
+				| { interactionId?: string; revision?: number; windowId?: string; requests?: Array<{ requestId: string; prompt: string; command?: string; path?: string; risk?: string; options?: string[] }> }
+				| undefined;
+			// HITL：审批卡优先（等待审批），不做成普通 worker 结果条目。
+			if (details?.interactionId) {
+				return (
+					<WorkerTaskEntry
+						worker={teamTaskWorker(call) ?? "worker"}
+						task={(call.args as { task?: string } | undefined)?.task}
+						badge={statusBadge(call)}
+					>
+						<div className="mt-1">
+							<InteractionCard
+								interactionId={details.interactionId}
+								worker={teamTaskWorker(call) ?? "worker"}
+								requests={details.requests}
+								revision={details.revision}
+								windowId={details.windowId}
+								onOpenWindow={onOpenWindow}
+							/>
+						</div>
+					</WorkerTaskEntry>
+				);
+			}
 			const args = call.args as { task?: string } | undefined;
 			return (
 				<WorkerTaskEntry
@@ -258,7 +329,15 @@ function ToolCallItem({
 /** role:"custom" entries written by the platform (solo task sync, §4.4). */
 function CustomMessageEntry({ message }: { message: ChatMessage }) {
 	const details = message.details as
-		| { worker?: string; status?: string; windowId?: string }
+		| {
+				worker?: string;
+				status?: string;
+				windowId?: string;
+				interactionId?: string;
+				delegationId?: string;
+				revision?: number;
+				requests?: Array<{ requestId: string; prompt: string; command?: string; path?: string; risk?: string; options?: string[] }>;
+		  }
 		| undefined;
 
 	if (message.customType === "pudding:task_assign") {
@@ -280,6 +359,29 @@ function CustomMessageEntry({ message }: { message: ChatMessage }) {
 				badge={workerStatusBadge(details?.status)}
 				isError={Boolean(details?.status && details.status !== "completed")}
 			/>
+		);
+	}
+
+	// HITL：审批卡（§6.5）——历史中只存安全投影（无 token），状态由服务端对账。
+	if (message.customType === "pudding:interaction_required") {
+		return (
+			<InteractionCard
+				interactionId={details?.interactionId}
+				worker={details?.worker ?? "worker"}
+				requests={details?.requests}
+				revision={details?.revision}
+				windowId={details?.windowId}
+				onOpenWindow={undefined}
+			/>
+		);
+	}
+
+	// 状态变化追加一条 resolved 事件；前端按 interactionId 折叠到原卡片。
+	if (message.customType === "pudding:interaction_resolved") {
+		return (
+			<p className="text-xs text-muted-foreground">
+				审批已{details?.status === "approved" ? "批准" : details?.status === "rejected" ? "拒绝" : "处理"}，任务继续执行中。
+			</p>
 		);
 	}
 

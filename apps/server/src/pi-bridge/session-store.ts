@@ -318,8 +318,7 @@ export class PiSessionStore {
 	}
 
 	/** Dispose the session (aborting an in-flight run) and delete its JSONL file. */
-	async remove(id: string): Promise<boolean> {
-		const session = this.active.get(id);
+	async remove(id: string): Promise<boolean> {		const session = this.active.get(id);
 		if (session?.isStreaming) {
 			await session.abort().catch(() => undefined);
 		}
@@ -346,6 +345,37 @@ export class PiSessionStore {
 	 * no file on disk yet — pi persists lazily on the first assistant message). */
 	isOpen(id: string): boolean {
 		return this.active.has(id);
+	}
+
+	/**
+	 * Send a custom message into a manager session and optionally trigger a new
+	 * LLM turn (§6.3). Best-effort: the session may be busy streaming; failures
+	 * are swallowed so an approval can never block the caller.
+	 */
+	async sendCustomMessage(
+		id: string,
+		message: { customType: string; content: string; details?: Record<string, unknown> },
+		options: { triggerTurn: boolean },
+	): Promise<void> {
+		try {
+			const session = await this.open(id);
+			await session.sendCustomMessage(
+				{
+					customType: message.customType,
+					content: message.content,
+					display: true,
+					details: message.details,
+				},
+				options,
+			);
+		} catch (err) {
+			this.debugLog?.(`sendCustomMessage failed: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+
+	private debugLog?: (msg: string) => void;
+	setDebugLog(fn: (msg: string) => void): void {
+		this.debugLog = fn;
 	}
 
 	async disposeAll(): Promise<void> {

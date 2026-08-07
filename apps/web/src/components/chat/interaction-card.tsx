@@ -1,0 +1,238 @@
+"use client";
+
+import { useCallback, useEffect, useState } from "react";
+import { CheckIcon, ExternalLinkIcon, ShieldAlertIcon, XIcon } from "lucide-react";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { cancelInteraction, getInteraction, submitInteractionResponse } from "@/lib/api";
+import { WorkerAvatar } from "./worker-avatar";
+
+type CardStatus = "pending" | "busy" | "approved" | "rejected" | "expired" | "failed";
+
+function statusLabel(status: CardStatus): string {
+	switch (status) {
+		case "pending":
+			return "等待审批";
+		case "busy":
+			return "处理中…";
+		case "approved":
+			return "已批准";
+		case "rejected":
+			return "已拒绝";
+		case "expired":
+			return "已过期";
+		default:
+			return "已完成";
+	}
+}
+
+/**
+ * HITL 审批卡（§6.5）。两种来源共用：
+ * 1. team_task 工具结果里的 waitingInput details（当前窗口内）；
+ * 2. `pudding:interaction_required` custom message（solo 同步进对方单聊窗口）。
+ *
+ * 状态以服务端为事实源：挂载时和每次操作后通过 GET /api/interactions/:id 对账，
+ * 支持页面刷新后恢复（pending/approved/rejected/expired 都可重放）。
+ */
+export function InteractionCard({
+	interactionId,
+	worker,
+	requests,
+	revision,
+	windowId,
+	statusHint,
+	compact,
+	onOpenWindow,
+}: {
+	interactionId?: string;
+	worker: string;
+	requests?: Array<{ requestId: string; prompt: string; command?: string; path?: string; risk?: string; options?: string[] }>;
+	revision?: number;
+	windowId?: string;
+	statusHint?: string;
+	compact?: boolean;
+	onOpenWindow?: (windowId: string) => void;
+}) {
+	const [status, setStatus] = useState<CardStatus>(
+		statusHint === "conflict" || (statusHint && !["needs_input"].includes(statusHint)) ? (statusHint as CardStatus) : "pending",
+	);
+	const [busy, setBusy] = useState(false);
+	const [scope, setScope] = useState<string>("once");
+
+	// 对账：有 interactionId 时以服务端为准，刷新/重放后恢复状态。
+	useEffect(() => {
+		if (!interactionId) return;
+		let cancelled = false;
+		getInteraction(interactionId)
+			.then(({ interaction }) => {
+				if (cancelled) return;
+				const s = interaction.status as CardStatus;
+				if (s === "approved" || s === "rejected" || s === "expired" || s === "failed") {
+					setStatus(s);
+					setBusy(false);
+				}
+			})
+			.catch(() => undefined);
+		return () => {
+			cancelled = true;
+		};
+	}, [interactionId]);
+
+	const submit = useCallback(
+		async (action: "approve" | "reject" | "confirm", chosenScope?: string) => {
+			if (!interactionId) return;
+			setBusy(true);
+			try {
+				await submitInteractionResponse(interactionId, {
+					requestId: crypto.randomUUID(),
+					revision: revision ?? 0,
+					...(windowId ? { windowId } : {}),
+					responses: (requests ?? []).map((r) => ({
+						requestId: r.requestId,
+						action,
+						scope: action === "reject" ? undefined : chosenScope ?? scope,
+					})),
+				});
+				setStatus(action === "reject" ? "rejected" : "approved");
+				toast.success(action === "reject" ? "已拒绝该请求" : "已批准");
+			} catch (err) {
+				toast.error(err instanceof Error ? err.message : String(err));
+				// 409 等错误后重新对账，避免状态卡死。
+				if (interactionId) {
+					getInteraction(interactionId)
+						.then(({ interaction }) => setStatus(interaction.status as CardStatus))
+						.catch(() => undefined);
+				}
+			} finally {
+				setBusy(false);
+			}
+		},
+		[interactionId, revision, requests, scope, windowId],
+	);
+
+	const cancel = useCallback(async () => {
+		if (!interactionId) return;
+		setBusy(true);
+		try {
+			await cancelInteraction(interactionId);
+			setStatus("expired");
+			toast.success("已取消该审批");
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		} finally {
+			setBusy(false);
+		}
+	}, [interactionId]);
+
+	const resolved = status !== "pending" && status !== "busy";
+	const reqs = requests ?? [];
+	const firstReq = reqs[0];
+	const allowedScopes = firstReq?.options?.length ? firstReq.options : ["once", "run", "session"];
+
+	return (
+		<div className="w-full overflow-hidden rounded-lg border border-border/60 bg-muted/60">
+			<div className="flex items-center justify-between gap-2 px-3 pt-2">
+				<div className="flex min-w-0 items-center gap-2">
+					<WorkerAvatar name={worker} size={20} />
+					<span className="truncate font-mono text-sm font-medium">{worker}</span>
+					{statusHint === "conflict" ? (
+						<Badge variant="destructive" className="gap-1">
+							<ShieldAlertIcon className="size-3" />
+							会话占用
+						</Badge>
+					) : null}
+				</div>
+				<div className="flex shrink-0 items-center gap-2">
+					{statusHint === "conflict" && windowId && onOpenWindow ? (
+						<button
+							type="button"
+							onClick={() => onOpenWindow(windowId)}
+							className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+						>
+							去处理
+							<ExternalLinkIcon className="size-3" />
+						</button>
+					) : null}
+					<Badge
+						variant={
+							status === "rejected" || status === "expired"
+								? "destructive"
+								: status === "approved"
+									? "secondary"
+									: "secondary"
+						}
+					>
+						{statusLabel(status)}
+					</Badge>
+				</div>
+			</div>
+			<div className="flex flex-col gap-2.5 p-3">
+				{reqs.map((r) => (
+					<div key={r.requestId} className="flex flex-col gap-1">
+						<p className="text-sm whitespace-pre-wrap">{r.prompt}</p>
+						{(r.command || r.path || r.risk) && !compact ? (
+							<pre className="overflow-x-auto rounded-md bg-muted/60 p-2 text-xs">
+								{[r.command ? `命令：${r.command}` : "", r.path ? `路径：${r.path}` : "", r.risk ? `风险：${r.risk}` : ""]
+									.filter(Boolean)
+									.join("\n")}
+							</pre>
+						) : null}
+					</div>
+				))}
+
+				{!resolved && !statusHint?.includes("conflict") ? (
+					<>
+						{allowedScopes.length > 1 && status !== "busy" ? (
+							<div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+								<span>授权范围：</span>
+								{allowedScopes.map((s) => (
+									<button
+										key={s}
+										type="button"
+										onClick={() => setScope(s)}
+										className={`rounded-full px-2 py-0.5 ${
+											scope === s ? "bg-foreground text-background" : "bg-muted hover:bg-accent"
+										}`}
+									>
+										{s === "once" ? "仅本次" : s === "run" ? "本次任务" : s === "session" ? "本次会话" : s}
+									</button>
+								))}
+							</div>
+						) : null}
+						<div className="flex items-center gap-2">
+							<Button type="button" size="sm" disabled={busy} onClick={() => void submit("approve", scope)}>
+								{busy ? null : <CheckIcon className="size-3.5" />}
+								允许
+							</Button>
+							<Button
+								type="button"
+								size="sm"
+								variant="outline"
+								disabled={busy}
+								onClick={() => void submit("reject")}
+							>
+								<XIcon className="size-3.5" />
+								拒绝
+							</Button>
+							{interactionId ? (
+								<Button
+									type="button"
+									size="sm"
+									variant="ghost"
+									className="ml-auto text-xs text-muted-foreground"
+									disabled={busy}
+									onClick={() => void cancel()}
+								>
+									取消
+								</Button>
+							) : null}
+						</div>
+					</>
+				) : resolved ? (
+					<p className="text-xs text-muted-foreground">{statusLabel(status)}</p>
+				) : null}
+			</div>
+		</div>
+	);
+}

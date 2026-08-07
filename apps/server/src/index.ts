@@ -49,6 +49,9 @@ const runtime = new AgentRuntime(delegations, interactionSecrets, (agentId) => d
 const invoker = new AgentInvoker(teams, runtime, drivers, credentials, config.agentCwd);
 
 const store = new PiSessionStore(config.agentCwd, config.sessionDir, teams, invoker);
+invoker.setManagerSender((managerSessionId, message, options) =>
+	store.sendCustomMessage(managerSessionId, message, options),
+);
 // §1/§2 产品模型：solo 窗口是置顶单例，服务端启动即保证存在。
 await teams.ensureSoloWindow(
 	() => store.create(),

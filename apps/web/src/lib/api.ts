@@ -317,3 +317,86 @@ export async function deleteRoomSession(roomId: string, sessionId: string): Prom
 		throw new Error(body?.error ?? `delete room session failed: ${res.status}`);
 	}
 }
+
+// ---- interactions（HITL 审批，§6.4）----
+
+export interface InteractionRequestView {
+	requestId: string;
+	prompt: string;
+	command?: string;
+	path?: string;
+	risk?: string;
+	options?: string[];
+}
+
+export interface InteractionView {
+	id: string;
+	delegationId: string;
+	kind: "permission" | "question" | "confirmation";
+	requests: InteractionRequestView[];
+	status: "pending" | "responding" | "approved" | "rejected" | "expired" | "failed";
+	revision: number;
+	expiresAt?: string;
+}
+
+export interface InteractionDelegationView {
+	id: string;
+	windowId: string;
+	agentId: string;
+	status: string;
+	createdAt: string;
+	updatedAt: string;
+}
+
+/** 列出窗口下的审批卡（页面刷新/对账恢复）。 */
+export async function listInteractions(windowId?: string): Promise<InteractionView[]> {
+	const qs = windowId ? `?windowId=${encodeURIComponent(windowId)}` : "";
+	const res = await fetch(`${SERVER_URL}/api/interactions${qs}`);
+	if (!res.ok) throw new Error(`list interactions failed: ${res.status}`);
+	return ((await res.json()) as { interactions: InteractionView[] }).interactions;
+}
+
+/** 单个审批卡（含 delegation，供刷新恢复）。 */
+export async function getInteraction(
+	id: string,
+): Promise<{ interaction: InteractionView; delegation?: InteractionDelegationView }> {
+	const res = await fetch(`${SERVER_URL}/api/interactions/${id}`);
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `get interaction failed: ${res.status}`);
+	}
+	return (await res.json()) as { interaction: InteractionView; delegation?: InteractionDelegationView };
+}
+
+export interface InteractionResponseSubmit {
+	requestId: string;
+	revision: number;
+	windowId?: string;
+	responses: Array<{ requestId: string; action: string; scope?: string }>;
+}
+
+/** 提交审批（approve / reject / confirm）。 */
+export async function submitInteractionResponse(
+	id: string,
+	input: InteractionResponseSubmit,
+): Promise<unknown> {
+	const res = await fetch(`${SERVER_URL}/api/interactions/${id}/responses`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(input),
+	});
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string; code?: string } | null;
+		throw new Error(body?.error ?? `submit response failed: ${res.status}`);
+	}
+	return res.json();
+}
+
+/** 取消一个 pending 审批。 */
+export async function cancelInteraction(id: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/interactions/${id}/cancel`, { method: "POST" });
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `cancel interaction failed: ${res.status}`);
+	}
+}
