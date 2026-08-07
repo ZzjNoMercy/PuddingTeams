@@ -150,6 +150,34 @@ function TeamTaskCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow
 	const [open, setOpen] = useState(false);
 	const meta = toolCallMeta(call);
 
+	// 409 冲突 + 带 pending interactionId：冲突优先显示，并保留对账的 interactionId。
+	const conflict = details?.status === "conflict" || details?.conflict;
+	if (conflict && details?.interactionId) {
+		return (
+			<div className="flex w-full flex-col gap-2">
+				<div className="w-full overflow-hidden rounded-lg border border-destructive/40 bg-muted/60 px-3 py-2">
+					<p className="text-xs text-destructive">
+						该 worker 的会话仍在等待上一个任务的审批，不能发起新任务（409）。
+					</p>
+					{args?.task ? (
+						<p className="mt-1 text-xs text-muted-foreground">
+							<span className="mr-1.5 text-muted-foreground/60">任务：</span>
+							<span className="whitespace-pre-wrap">{args.task}</span>
+						</p>
+					) : null}
+				</div>
+				<InteractionCard
+					interactionId={details.interactionId}
+					worker={worker ?? "worker"}
+					requests={details.requests}
+					revision={details.revision}
+					windowId={details.windowId}
+					onOpenWindow={onOpenWindow}
+				/>
+			</div>
+		);
+	}
+
 	// HITL：等待审批 → 渲染审批卡。
 	if (details?.interactionId) {
 		return (
@@ -172,8 +200,8 @@ function TeamTaskCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow
 		);
 	}
 
-	// 409 冲突：渲染带「去处理」跳转的占用卡。
-	if (details?.status === "conflict" || details?.conflict) {
+	// 409 冲突（无 interactionId）：渲染带「去处理」跳转的占用卡。
+	if (conflict) {
 		return (
 			<InteractionCard
 				worker={worker ?? "worker"}

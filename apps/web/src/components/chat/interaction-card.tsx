@@ -22,8 +22,10 @@ function statusLabel(status: CardStatus): string {
 			return "已拒绝";
 		case "expired":
 			return "已过期";
+		case "failed":
+			return "处理失败";
 		default:
-			return "已完成";
+			return status;
 	}
 }
 
@@ -58,7 +60,14 @@ export function InteractionCard({
 		statusHint === "conflict" || (statusHint && !["needs_input"].includes(statusHint)) ? (statusHint as CardStatus) : "pending",
 	);
 	const [busy, setBusy] = useState(false);
-	const [scope, setScope] = useState<string>("once");
+	const reqs = requests ?? [];
+	const firstReq = reqs[0];
+	// M4：授权范围从服务端 options 派生，去掉 "reject"（那是动作不是范围），
+	// 默认取第一个合法范围，避免 options 不含 "once" 时 409。
+	const allowedScopes = (firstReq?.options?.length ? firstReq.options : ["once", "run", "session"]).filter(
+		(s) => s !== "reject",
+	);
+	const [scope, setScope] = useState<string>(allowedScopes[0] ?? "once");
 
 	// 对账：有 interactionId 时以服务端为准，刷新/重放后恢复状态。
 	useEffect(() => {
@@ -73,7 +82,13 @@ export function InteractionCard({
 					setBusy(false);
 				}
 			})
-			.catch(() => undefined);
+			.catch((err: unknown) => {
+				// L3：服务端明确 404（已删除/过期）→ 卡片转已过期；网络错误保留 pending。
+				if (!cancelled && err instanceof Error && /404|not found/i.test(err.message)) {
+					setStatus("expired");
+					setBusy(false);
+				}
+			});
 		return () => {
 			cancelled = true;
 		};
@@ -84,7 +99,7 @@ export function InteractionCard({
 			if (!interactionId) return;
 			setBusy(true);
 			try {
-				await submitInteractionResponse(interactionId, {
+				const outcome = (await submitInteractionResponse(interactionId, {
 					requestId: crypto.randomUUID(),
 					revision: revision ?? 0,
 					...(windowId ? { windowId } : {}),
@@ -93,7 +108,18 @@ export function InteractionCard({
 						action,
 						scope: action === "reject" ? undefined : chosenScope ?? scope,
 					})),
-				});
+				})) as { outcome?: { status?: string; result?: { error?: string } } };
+				const status = outcome?.outcome?.status;
+				if (status === "failed" || status === "rejected") {
+					// M1：失败/被拒不能显示成功。
+					toast.error(outcome.outcome!.result?.error ?? "审批处理失败");
+					if (interactionId) {
+						getInteraction(interactionId)
+							.then(({ interaction }) => setStatus(interaction.status as CardStatus))
+							.catch(() => undefined);
+					}
+					return;
+				}
 				setStatus(action === "reject" ? "rejected" : "approved");
 				toast.success(action === "reject" ? "已拒绝该请求" : "已批准");
 			} catch (err) {
@@ -126,9 +152,6 @@ export function InteractionCard({
 	}, [interactionId]);
 
 	const resolved = status !== "pending" && status !== "busy";
-	const reqs = requests ?? [];
-	const firstReq = reqs[0];
-	const allowedScopes = firstReq?.options?.length ? firstReq.options : ["once", "run", "session"];
 
 	return (
 		<div className="w-full overflow-hidden rounded-lg border border-border/60 bg-muted/60">

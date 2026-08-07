@@ -350,12 +350,13 @@ export class PiSessionStore {
 	/**
 	 * Send a custom message into a manager session and optionally trigger a new
 	 * LLM turn (§6.3). Best-effort: the session may be busy streaming; failures
-	 * are swallowed so an approval can never block the caller.
+	 * are swallowed so an approval can never block the caller. `deliverAs:
+	 * "followUp"` queues instead of steering when the session is mid-stream.
 	 */
 	async sendCustomMessage(
 		id: string,
 		message: { customType: string; content: string; details?: Record<string, unknown> },
-		options: { triggerTurn: boolean },
+		options: { triggerTurn: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
 		try {
 			const session = await this.open(id);
@@ -366,7 +367,7 @@ export class PiSessionStore {
 					display: true,
 					details: message.details,
 				},
-				options,
+				{ ...options, deliverAs: options.deliverAs ?? "followUp" },
 			);
 		} catch (err) {
 			this.debugLog?.(`sendCustomMessage failed: ${err instanceof Error ? err.message : String(err)}`);

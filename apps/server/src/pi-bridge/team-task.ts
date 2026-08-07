@@ -132,6 +132,7 @@ export function createTeamTaskTool(
 		task: string,
 		status: string,
 		resultText: string,
+		interaction?: { interactionId: string; revision?: number; requests?: unknown[] },
 	): Promise<boolean> => {
 		try {
 			// Re-read the window: the active session may have moved since the
@@ -183,6 +184,29 @@ export function createTeamTaskTool(
 				},
 				{ triggerTurn: false },
 			);
+			if (interaction) {
+				// §6.5：等待审批时，把安全投影的审批卡镜像进对方单聊窗口，用户可在
+				// 该窗口直接允许/拒绝（H2：409「去处理」跳转过去后可操作）。
+				await target.sendCustomMessage(
+					{
+						customType: "pudding:interaction_required",
+						content: resultText,
+						display: true,
+						details: {
+							taskId,
+							worker: workerName,
+							windowId: window.id,
+							interactionId: interaction.interactionId,
+							delegationId: taskId,
+							status: "pending",
+							revision: interaction.revision,
+							requests: interaction.requests,
+						},
+					},
+					{ triggerTurn: false },
+				);
+				return true;
+			}
 			await target.sendCustomMessage(
 				{
 					customType: "pudding:task_result",
@@ -286,15 +310,23 @@ export function createTeamTaskTool(
 
 			// §4.4: mirror into the direct window's message stream. Best-effort —
 			// a busy target session yields synced:false instead of blocking.
-			const sync = async (status: string, text: string): Promise<boolean> => {
+			const sync = async (
+				status: string,
+				text: string,
+				interaction?: { interactionId: string; revision?: number; requests?: unknown[] },
+			): Promise<boolean> => {
 				if (!isSoloContext || !targetWindow) return false;
-				const ok = await syncToWindow(targetWindow, taskId, worker.name, params.task, status, text);
+				const ok = await syncToWindow(targetWindow, taskId, worker.name, params.task, status, text, interaction);
 				void refreshSoloSummary();
 				return ok;
 			};
-			const soloMeta = async (status: string, text: string) => {
+			const soloMeta = async (
+				status: string,
+				text: string,
+				interaction?: { interactionId: string; revision?: number; requests?: unknown[] },
+			) => {
 				if (!isSoloContext || !targetWindow) return {};
-				const synced = await sync(status, text);
+				const synced = await sync(status, text, interaction);
 				return { taskId, windowId: targetWindow.id, synced };
 			};
 			const syncNote = (synced: boolean | undefined) =>
@@ -308,7 +340,15 @@ export function createTeamTaskTool(
 			// 结构，manager 本轮正常结束，绝不指导它重跑任务。
 			if (result.status === "needs_input" || result.status === "conflict") {
 				const text = result.content;
-				const extra = await soloMeta(result.status, text);
+				const interaction =
+					result.interactionId && result.status === "needs_input"
+						? {
+								interactionId: result.interactionId,
+								revision: (picked as { revision?: number }).revision,
+								requests: (picked as { requests?: unknown[] }).requests,
+							}
+						: undefined;
+				const extra = await soloMeta(result.status, text, interaction);
 				return {
 					content: [{ type: "text", text: `${text}${syncNote(extra.synced as boolean | undefined)}` }],
 					details: { ...meta, ...picked, ...extra },

@@ -5,6 +5,41 @@ import { InteractionError } from "../agent-runtime/interaction-broker.js";
 import { TeamsStore } from "../store/teams.js";
 
 /**
+ * M3：浏览器只拿 interaction.id；runHandle/sessionHandle 是 worker 私有句柄，
+ * 不在审批 API 响应里暴露（决策 4 的边界延伸）。
+ */
+function stripHandles<T extends { runHandle?: string; sessionHandle?: string }>(outcome: T): Omit<T, "runHandle" | "sessionHandle"> {
+	const { runHandle: _run, sessionHandle: _session, ...rest } = outcome;
+	void _run;
+	void _session;
+	return rest;
+}
+
+/**
+ * L4：浏览器只需 interaction 的公开投影——内部 providerStateRef / consumedRequestId
+ * 是服务端实现细节，不下发。
+ */
+function projectInteraction(interaction: {
+	id: string;
+	delegationId: string;
+	kind: string;
+	requests: unknown[];
+	status: string;
+	revision: number;
+	expiresAt?: string;
+}) {
+	return {
+		id: interaction.id,
+		delegationId: interaction.delegationId,
+		kind: interaction.kind,
+		requests: interaction.requests,
+		status: interaction.status,
+		revision: interaction.revision,
+		expiresAt: interaction.expiresAt,
+	};
+}
+
+/**
  * /api/interactions/*（§6.4）。
  *
  * 浏览器只拿 PuddingTeams 生成的本地 interaction.id；continuation token 等
@@ -21,7 +56,7 @@ export function registerInteractionsRoutes(
 	app.get<{ Querystring: { windowId?: string; sessionId?: string } }>("/api/interactions", async (req) => {
 		const { windowId } = req.query;
 		const interactions = await runtime.listInteractions(windowId);
-		return { interactions };
+		return { interactions: interactions.map(projectInteraction) };
 	});
 
 	// 单个 interaction（含请求集合，供审批卡对账/刷新恢复）。H3：按 interaction id。
@@ -29,7 +64,7 @@ export function registerInteractionsRoutes(
 		const interaction = await runtime.getInteraction(req.params.id);
 		if (!interaction) return reply.code(404).send({ error: "interaction not found" });
 		const delegation = await runtime.getDelegationById(req.params.id);
-		return { interaction, delegation };
+		return { interaction: projectInteraction(interaction), delegation };
 	});
 
 	// 提交审批：POST /api/interactions/:id/responses
@@ -65,7 +100,14 @@ export function registerInteractionsRoutes(
 				},
 				undefined,
 			);
-			return { outcome };
+			// M1：失败/仍在处理的审批不返回 200，前端不能显示成「已批准」。
+			if (outcome.status === "failed" && (outcome.details as { errorCode?: string }).errorCode === "responding") {
+				return reply.code(409).send({ error: "该审批正在处理中，请稍候", code: "responding", outcome });
+			}
+			if (outcome.status === "failed" || outcome.status === "cancelled") {
+				return reply.code(502).send({ error: outcome.content ?? "审批处理失败", code: outcome.status, outcome });
+			}
+			return { outcome: stripHandles(outcome) };
 		} catch (err) {
 			if (err instanceof InteractionError) {
 				const status = err.code === "not_found" ? 404 : err.code === "not_pending" ? 409 : 400;

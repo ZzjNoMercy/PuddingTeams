@@ -58,7 +58,7 @@ export class AgentInvoker {
 					content: string;
 					details?: Record<string, unknown>;
 				},
-				options: { triggerTurn: boolean },
+				options: { triggerTurn: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 		  ) => Promise<void>)
 		| undefined;
 
@@ -290,15 +290,15 @@ export class AgentInvoker {
 		if (d.sessionHandle) this.rememberSession(d.windowId, d.agentId, d.sessionHandle);
 		switch (outcome.status) {
 			case "completed": {
-				// §6.3/§6.2：respond 完成后触发 manager follow-up 汇总（triggerTurn），
-				// 并把结果作为 pudding:interaction_resolved 追加，前端折叠原审批卡。
+				// §6.2/§6.3：完成后触发 manager follow-up 汇总（triggerTurn + followUp），
+				// 并把 worker 的真实结果带给 manager，否则汇总轮无内容可转述。
 				const details = { ...(outcome.result.meta ?? {}), artifacts: outcome.result.artifacts, usage: outcome.result.usage };
 				if (this.managerSender && d.managerSessionId) {
 					void this.managerSender(
 						d.managerSessionId,
 						{
 							customType: "pudding:interaction_resolved",
-							content: `worker「${d.agentId}」的审批已通过，任务已完成。`,
+							content: `worker「${d.agentId}」的审批已通过。`,
 							details: {
 								interactionId,
 								delegationId: d.id,
@@ -306,7 +306,17 @@ export class AgentInvoker {
 								status: "approved",
 							},
 						},
-						{ triggerTurn: true },
+						{ triggerTurn: false },
+					).catch(() => undefined);
+					void this.managerSender(
+						d.managerSessionId,
+						{
+							customType: "pudding:task_result",
+							content: outcome.result.content ?? "",
+							details: { interactionId, delegationId: d.id, worker: d.agentId, status: "completed", ...details },
+						},
+						// M5：manager 若在流式中，用 followUp 排队而不是 steer 打断。
+						{ triggerTurn: true, deliverAs: "followUp" },
 					).catch(() => undefined);
 				}
 				return {
