@@ -25,6 +25,17 @@ export interface PuddingClawDriverOptions {
 	continuationToken?: string;
 }
 
+/** 有界的 stderr 诊断摘要（§8.1）：截断 + 脱敏 token 形字符串。 */
+function stderrSummary(stderr: string): string {
+	if (!stderr.trim()) return "";
+	const max = 400;
+	let s = stderr.trim().slice(0, max);
+	// 脱敏形如 token/sk-.../Bearer ... 的敏感片段，绝不进模型上下文。
+	s = s.replace(/\b(?:token|sk-)[a-zA-Z0-9_\-\.]{6,}\b/gi, "[redacted]");
+	s = s.replace(/\b(?:PUDDINGCLAW_TOKEN|Authorization)\s*[:=]\s*"?[^\s"\]]+/gi, "$1=[redacted]");
+	return `：${s}${stderr.length > max ? "…" : ""}`;
+}
+
 /**
  * First-party PuddingClaw Driver (§5).
  *
@@ -88,6 +99,20 @@ export class PuddingClawDriver implements AgentDriver {
 				result: { agentId: this.id, status: "cancelled", errorCode: "cancelled", error: "任务已取消", recoverable: true },
 			};
 		}
+		// M1：启动超时（30s 内没有任何 stdout）且无输出时，判启动失败而不是干等到
+		// 活跃超时（§8.3 启动超时）。
+		if (res.startupTimedOut && !res.stdout.trim() && res.lines.length === 0) {
+			return {
+				type: "failed",
+				result: {
+					agentId: this.id,
+					status: "failed",
+					errorCode: "startup_timeout",
+					error: `worker「${this.cmd()}」在 ${Math.round((ctx.timeouts?.startupMs ?? 30_000) / 1000)}s 内未输出任何内容`,
+					recoverable: false,
+				},
+			};
+		}
 		if (res.exitCode === -1 && res.spawnError) {
 			return {
 				type: "failed",
@@ -123,7 +148,9 @@ export class PuddingClawDriver implements AgentDriver {
 				agentId: this.id,
 				status: "failed",
 				errorCode: "protocol_error",
-				error: `worker「${this.cmd()}」返回非 JSON 输出${res.stderr ? `：${res.stderr.trim()}` : ""}`,
+				// M2：stderr 只取有界摘要（§8.1），并脱敏 token 形字符串，避免敏感
+				// 诊断进入模型上下文/JSONL。
+				error: `worker「${this.cmd()}」返回非 JSON 输出${stderrSummary(res.stderr)}`,
 				recoverable: false,
 			},
 		};

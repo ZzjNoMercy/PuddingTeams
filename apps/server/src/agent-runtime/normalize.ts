@@ -3,7 +3,6 @@ import type {
 	CompletedResult,
 	DriverCapabilities,
 	FailedResult,
-	InteractionRequest,
 	NeedsInputResult,
 } from "./types.js";
 
@@ -84,38 +83,47 @@ function pickMeta(payload: Record<string, unknown>): Record<string, unknown> {
 }
 
 function needsInputResult(payload: Record<string, unknown>, needs?: Record<string, unknown> | null): NeedsInputResult {
-	let requests: InteractionRequest[] = [];
+	// H4：每次只构造一个 request，needs.options 是答案选项（choices），不是并行
+	// 请求。真实 request_id 优先取 needs.request_id，否则取顶层 request_id。
+	const requestId =
+		(typeof needs?.request_id === "string" && (needs.request_id as string)) ||
+		(typeof payload.request_id === "string" ? (payload.request_id as string) : "") ||
+		"req-1";
+	const prompt = needs && typeof needs.prompt === "string" ? needs.prompt : "需要更多输入才能执行";
+
+	// permission / 业务确认类：选项是授权范围；question 类：选项是答案。
+	const options = Array.isArray(needs?.options)
+		? (needs.options as Array<{ id?: string; name?: string }>)
+				.map((o) => (typeof o.id === "string" ? o.id : typeof o.name === "string" ? o.name : ""))
+				.filter(Boolean)
+		: [];
 	const kind: NeedsInputResult["interaction"]["kind"] =
 		needs && needs.type === "permission"
 			? "permission"
 			: needs && (needs.type === "confirmation" || needs.type === "skill_plan_confirmation_request")
 				? "confirmation"
 				: "question";
-	const prompt = needs && typeof needs.prompt === "string" ? needs.prompt : "需要更多输入才能执行";
-	const options = Array.isArray(needs?.options)
-		? (needs.options as Array<{ id?: string; name?: string }>).map((o) => ({
-				requestId: typeof o.id === "string" ? o.id : "",
-				prompt: typeof o.name === "string" ? o.name : "",
-			}))
-		: [];
-	requests = [
-		{
-			requestId: typeof needs?.request_id === "string" ? (needs.request_id as string) : "req-1",
-			prompt,
-			options: ["once", "run", "reject"],
-			...(options.length ? {} : {}),
-		},
-	];
-	if (options.length > 0) {
-		requests = options;
-	}
+
 	return {
 		...resultBase(payload),
 		status: "needs_input",
 		interaction: {
 			id: "",
 			kind,
-			requests,
+			requests: [
+				{
+					requestId,
+					prompt,
+					...(typeof needs?.command === "string" ? { command: needs.command } : {}),
+					...(typeof needs?.path === "string" ? { path: needs.path } : {}),
+					...(kind === "permission" || kind === "confirmation"
+						? { options: (["once", "run", "session", "reject"] as const).filter((s) => !options.length || options.includes(s)) }
+						: options.length
+							? { options: options.map((o) => o as "once") }
+							: undefined),
+					reason: typeof needs?.reason === "string" ? needs.reason : undefined,
+				},
+			],
 		},
 	};
 }

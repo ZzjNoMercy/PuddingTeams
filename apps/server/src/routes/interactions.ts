@@ -8,7 +8,8 @@ import { TeamsStore } from "../store/teams.js";
  * /api/interactions/*（§6.4）。
  *
  * 浏览器只拿 PuddingTeams 生成的本地 interaction.id；continuation token 等
- * provider state 永不离开 Runtime/SecretStore。
+ * provider state 永不离开 Runtime/SecretStore。所有路由都以 interaction id 为
+ * 主键（不是 delegation id，二者是不同 id 命名空间）。
  */
 export function registerInteractionsRoutes(
 	app: FastifyInstance,
@@ -16,24 +17,19 @@ export function registerInteractionsRoutes(
 	invoker: AgentInvoker,
 	teams: TeamsStore,
 ): void {
-	// 列出某个窗口（或 manager session）下的 pending 审批。
+	// 列出某个窗口下的 pending 审批卡。
 	app.get<{ Querystring: { windowId?: string; sessionId?: string } }>("/api/interactions", async (req) => {
-		const { windowId, sessionId } = req.query;
-		const list = await runtime.listDelegations(windowId, sessionId);
-		return { interactions: list };
+		const { windowId } = req.query;
+		const interactions = await runtime.listInteractions(windowId);
+		return { interactions };
 	});
 
-	// 单个 interaction（含请求集合，供审批卡对账/刷新恢复）。
+	// 单个 interaction（含请求集合，供审批卡对账/刷新恢复）。H3：按 interaction id。
 	app.get<{ Params: { id: string } }>("/api/interactions/:id", async (req, reply) => {
-		const interaction = await runtime.getDelegation(req.params.id);
-		if (!interaction) {
-			// interaction 与 delegation 同 id 集合；也尝试按 interaction id 查。
-			const all = await runtime.listDelegations();
-			const hit = all.find((d) => d.id === req.params.id);
-			if (!hit) return reply.code(404).send({ error: "interaction not found" });
-			return { interaction: hit };
-		}
-		return { interaction };
+		const interaction = await runtime.getInteraction(req.params.id);
+		if (!interaction) return reply.code(404).send({ error: "interaction not found" });
+		const delegation = await runtime.getDelegationById(req.params.id);
+		return { interaction, delegation };
 	});
 
 	// 提交审批：POST /api/interactions/:id/responses
@@ -50,10 +46,9 @@ export function registerInteractionsRoutes(
 		if (!Array.isArray(responses) || responses.length === 0) {
 			return reply.code(400).send({ error: "responses must be a non-empty array" });
 		}
-		// 非当前窗口不能审批该 Interaction（§12.3）。
-		const delegation = await runtime.getDelegation(req.params.id);
-		const windowId = req.body?.windowId;
-		if (windowId && delegation && delegation.windowId !== windowId) {
+		// §12.3 非当前窗口不能审批：windowId 从服务端 delegation 派生，不信任 body。
+		const delegation = await runtime.getDelegationById(req.params.id);
+		if (delegation && req.body?.windowId && delegation.windowId !== req.body.windowId) {
 			return reply.code(403).send({ error: "interaction belongs to another window" });
 		}
 		try {
@@ -80,10 +75,12 @@ export function registerInteractionsRoutes(
 		}
 	});
 
-	// 取消一个 delegation（用户主动取消，非静默）。
+	// 取消一个 pending interaction（用户主动取消，非静默）。H3：按 interaction id。
 	app.post<{ Params: { id: string } }>("/api/interactions/:id/cancel", async (req, reply) => {
+		const delegation = await runtime.getDelegationById(req.params.id);
+		if (!delegation) return reply.code(404).send({ error: "interaction not found" });
 		try {
-			await invoker.cancel(req.params.id, undefined);
+			await invoker.cancel(delegation.id, undefined);
 			return { ok: true };
 		} catch (err) {
 			return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });

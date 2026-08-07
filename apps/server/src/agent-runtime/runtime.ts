@@ -64,6 +64,8 @@ export class SessionConflictError extends Error {
  */
 export class AgentRuntime {
 	private readonly activeRuns = new Map<string, string>();
+	/** 正在执行的 respond（per-interaction 防并发，M3）。 */
+	private readonly responding = new Set<string>();
 	private readonly broker: InteractionBroker;
 
 	constructor(
@@ -90,10 +92,16 @@ export class AgentRuntime {
 		const driver = this.resolveDriver(input.agentId);
 		if (!driver) throw new Error(`agent not found or no driver: ${input.agentId}`);
 
-		// 会话锁：continue 必须确认目标 session 空闲（§1.3：continue 只允许空闲时调用）。
-		// 如果已有 waiting_input/active Run，直接以 409 语义拒绝，不发起第二次 spawn。
-		if (input.sessionHandle && this.activeRuns.has(input.sessionHandle)) {
-			throw new SessionConflictError(input.sessionHandle);
+		// 会话锁（H2 修复）：continue 必须确认目标 session 空闲（§1.3）。
+		// 检查 + 占位必须是原子的：JS 单线程保证这里在同步段内完成，两个并发
+		// continue 不会同时通过检查后各自 spawn。
+		const knownSession = input.sessionHandle;
+		if (knownSession) {
+			if (this.activeRuns.has(knownSession)) {
+				throw new SessionConflictError(knownSession);
+			}
+			// 先占位（值待 delegation 创建后更新），阻止并发的第二次 delegate。
+			this.activeRuns.set(knownSession, "pending");
 		}
 
 		const delegation = await this.delegations.createDelegation({
@@ -102,17 +110,18 @@ export class AgentRuntime {
 			managerToolCallId: input.managerToolCallId,
 			agentId: input.agentId,
 			operation: input.mode,
-			sessionHandle: input.sessionHandle,
+			sessionHandle: knownSession,
 		});
+		if (knownSession) this.activeRuns.set(knownSession, delegation.id);
 
 		const requestId = input.requestId ?? randomUUID();
-		let sessionHandle = input.sessionHandle;
+		let sessionHandle = knownSession;
 		try {
 			const events =
-				input.mode === "run" || !input.sessionHandle
+				input.mode === "run" || !knownSession
 					? driver.run({ message: input.message, requestId, options: input.options }, ctx)
 					: driver.continue(
-							{ message: input.message, requestId, sessionHandle: input.sessionHandle, options: input.options },
+							{ message: input.message, requestId, sessionHandle: knownSession, options: input.options },
 							ctx,
 						);
 
@@ -126,10 +135,12 @@ export class AgentRuntime {
 			}
 		} catch (err) {
 			if (sessionHandle) this.releaseSession(sessionHandle, delegation.id);
+			else if (knownSession) this.activeRuns.delete(knownSession);
 			throw err;
 		}
 		// 驱动没有产生边界事件（协议错误）。
 		if (sessionHandle) this.releaseSession(sessionHandle, delegation.id);
+		else if (knownSession) this.activeRuns.delete(knownSession);
 		const failed: NormalizedResult = {
 			agentId: input.agentId,
 			status: "failed",
@@ -169,12 +180,19 @@ export class AgentRuntime {
 			}
 			case "input_required": {
 				const interaction = await this.persistInteraction(delegation, event.result, event.providerState);
+				// C1/H1：runHandle/sessionHandle 只可能出现在 boundary result 里
+				// （真实 driver 的 started 事件不带这些），必须从这里落盘，否则
+				// respond 无 runHandle、续接无 sessionHandle。
+				const effectiveRun = event.result.runHandle ?? delegation.runHandle;
+				const effectiveSession = event.result.sessionHandle ?? sessionHandle ?? delegation.sessionHandle;
 				const updated = await this.delegations.updateDelegation(delegation.id, {
 					status: "waiting_input",
 					revision: (delegation.revision ?? 0) + 1,
-					sessionHandle,
+					sessionHandle: effectiveSession,
+					runHandle: effectiveRun,
 					result: undefined,
 				});
+				if (effectiveSession) this.activeRuns.set(effectiveSession, delegation.id);
 				return {
 					terminal: true,
 					outcome: {
@@ -186,23 +204,30 @@ export class AgentRuntime {
 				};
 			}
 			case "completed": {
+				// H1：优先采用 boundary result 的 sessionHandle（run 模式 started
+				// 不带 session），否则续接会丢失 worker session。
+				const effectiveSession = event.result.sessionHandle ?? sessionHandle ?? delegation.sessionHandle;
 				await this.delegations.updateDelegation(delegation.id, {
 					status: "completed",
-					sessionHandle,
+					sessionHandle: effectiveSession,
 					runHandle: event.result.runHandle ?? delegation.runHandle,
 					revision: (delegation.revision ?? 0) + 1,
 					result: event.result,
 				});
-				if (sessionHandle) this.releaseSession(sessionHandle, delegation.id);
+				if (effectiveSession) this.releaseSession(effectiveSession, delegation.id);
 				return { terminal: true, outcome: { status: "completed", result: event.result, delegation } };
 			}
 			case "failed": {
+				// H1：采用 boundary result 的 sessionHandle，避免 run 模式丢 session。
+				const effectiveSession = event.result.sessionHandle ?? sessionHandle ?? delegation.sessionHandle;
 				await this.delegations.updateDelegation(delegation.id, {
 					status: event.result.status === "cancelled" ? "cancelled" : "failed",
+					sessionHandle: effectiveSession,
+					runHandle: event.result.runHandle ?? delegation.runHandle,
 					revision: (delegation.revision ?? 0) + 1,
 					result: event.result,
 				});
-				if (sessionHandle) this.releaseSession(sessionHandle, delegation.id);
+				if (effectiveSession) this.releaseSession(effectiveSession, delegation.id);
 				return {
 					terminal: true,
 					outcome: { status: "failed", result: event.result, delegation },
@@ -254,6 +279,17 @@ export class AgentRuntime {
 		if (!interaction) throw new InteractionError("not_found", "interaction not found");
 		const delegation = await this.delegations.getDelegation(interaction.delegationId);
 		if (!delegation) throw new InteractionError("not_found", "delegation not found");
+
+		// M3：同一 interaction 同时在飞（双签 / 两个标签页）时，拒绝第二次调用，
+		// 绝不并发调 driver.respond。
+		if (this.responding.has(interactionId)) {
+			return {
+				status: "failed",
+				result: { agentId: delegation.agentId, status: "failed", errorCode: "responding", error: "该审批正在处理中，请稍候", recoverable: true },
+				delegation,
+				interaction,
+			};
+		}
 
 		const driver = this.resolveDriver(delegation.agentId);
 		if (!driver) throw new InteractionError("not_found", `no driver for agent ${delegation.agentId}`);
@@ -316,6 +352,7 @@ export class AgentRuntime {
 		invocationCtx.providerState = providerState;
 
 		let sessionHandle = delegation.sessionHandle;
+		this.responding.add(interactionId);
 		try {
 			for await (const event of driver.respond!(
 				{
@@ -333,6 +370,8 @@ export class AgentRuntime {
 		} catch (err) {
 			if (sessionHandle) this.releaseSession(sessionHandle, delegation.id);
 			throw err;
+		} finally {
+			this.responding.delete(interactionId);
 		}
 		return {
 			status: "failed",
@@ -389,12 +428,15 @@ export class AgentRuntime {
 					status: "pending",
 					revision: interaction.revision + 1,
 					requests: event.result.interaction.requests,
+					// L1：回到 pending 必须清掉 consumedRequestId，否则第二轮提交
+					// 复用同一 requestId 会被误判为幂等重放。
+					consumedRequestId: undefined,
 				});
 				if (event.providerState) {
 					await this.secrets.setProviderState(interaction.id, {
 						delegationId: delegation.id,
 						agentId: delegation.agentId,
-						runHandle: delegation.runHandle,
+						runHandle: delegation.runHandle ?? event.result.runHandle,
 						needsId: event.result.interaction.id,
 						...event.providerState,
 					});
@@ -415,7 +457,8 @@ export class AgentRuntime {
 		}
 	}
 
-	/** 取消当前 Run（不删除 Session）。 */
+	/** 取消当前 Run（不删除 Session）。M4：同时清理 pending interaction 与
+	 * 加密 continuation token，否则审批卡永远 pending、token 遗留磁盘。 */
 	async cancel(delegationId: string, ctx: InvocationContext): Promise<void> {
 		const delegation = await this.delegations.getDelegation(delegationId);
 		if (!delegation) throw new Error("delegation not found");
@@ -425,6 +468,14 @@ export class AgentRuntime {
 			await driver.cancel({ runHandle: delegation.runHandle }, ctx);
 		}
 		await this.delegations.updateDelegation(delegationId, { status: "cancelled" });
+		// 清理该 delegation 名下所有 pending interactions 及其加密 token。
+		for (const interaction of await this.delegations.listInteractions()) {
+			if (interaction.delegationId !== delegationId) continue;
+			if (interaction.status === "pending" || interaction.status === "responding") {
+				await this.delegations.updateInteraction(interaction.id, { status: "expired" });
+			}
+			await this.secrets.removeProviderState(interaction.id).catch(() => undefined);
+		}
 		if (delegation.sessionHandle) this.releaseSession(delegation.sessionHandle, delegationId);
 	}
 
@@ -440,7 +491,24 @@ export class AgentRuntime {
 		return this.delegations.listDelegations(windowId, managerSessionId);
 	}
 
+	/** 列出窗口下的 interactions（审批卡列表对账，H3）。 */
+	async listInteractions(windowId?: string): Promise<InteractionRecord[]> {
+		return this.delegations.listInteractions(windowId);
+	}
+
+	/** 按 interaction id 查（审批卡刷新/对账）。 */
+	async getInteraction(id: string): Promise<InteractionRecord | undefined> {
+		return this.delegations.getInteraction(id);
+	}
+
 	async getDelegation(id: string): Promise<DelegationRecord | undefined> {
 		return this.delegations.getDelegation(id);
+	}
+
+	/** 按 interaction id 反查 delegation（H3/H5）。 */
+	async getDelegationById(id: string): Promise<DelegationRecord | undefined> {
+		const interaction = await this.delegations.getInteraction(id);
+		if (!interaction) return undefined;
+		return this.delegations.getDelegation(interaction.delegationId);
 	}
 }

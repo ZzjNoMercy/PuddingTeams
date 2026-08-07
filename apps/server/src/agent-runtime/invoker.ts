@@ -110,10 +110,18 @@ export class AgentInvoker {
 			);
 		} catch (err) {
 			if (err instanceof SessionConflictError) {
+				// M5：冲突时把该 session 已有的 pending interaction 一起带出，
+				// 前端才能折叠/跳转到真正的审批卡（solo 派活时卡片在对方的单聊窗口）。
+				const pending = await this.pendingInteractionFor(agent.name, windowId);
 				return {
 					status: "conflict",
 					content: `worker「${agent.name}」的会话仍在等待上一个任务的审批，不能发起新任务（409）。请先在上一个审批卡上操作。`,
-					details: { conflict: true, sessionHandle },
+					details: {
+						conflict: true,
+						sessionHandle,
+						...pending,
+					},
+					interactionId: pending?.interactionId,
 					waitingInput: true,
 					conflict: true,
 				};
@@ -202,6 +210,19 @@ export class AgentInvoker {
 		input: { requestId: string; revision: number; responses: Array<{ requestId: string; action: string; scope?: string }> },
 		signal?: AbortSignal,
 	): Promise<AgentInvokeResult> {
+		// H5：respond 也要用该 agent 的凭证 + workspace cwd，否则子进程裸环境
+		// 无 token、无 PATH，且跑错目录。
+		let ctxEnv: NodeJS.ProcessEnv = process.env;
+		let cwd = this.defaultCwd ?? process.cwd();
+		const delegation = await this.runtime.getDelegationById(interactionId);
+		if (delegation) {
+			const agent = await this.teams.getAgent(delegation.agentId);
+			if (agent) {
+				ctxEnv = await this.envFor(agent);
+				const window = await this.teams.getWindow(delegation.windowId);
+				cwd = window?.workspace ?? this.defaultCwd ?? process.cwd();
+			}
+		}
 		const outcome = await this.runtime.respond(
 			interactionId,
 			{
@@ -213,7 +234,7 @@ export class AgentInvoker {
 					scope: r.scope as "once" | "run" | "session" | undefined,
 				})),
 			},
-			{ cwd: process.cwd(), env: {}, signal },
+			{ cwd, env: ctxEnv, signal },
 		);
 		const d = outcome.delegation;
 		if (d.sessionHandle) this.rememberSession(d.windowId, d.agentId, d.sessionHandle);
@@ -267,6 +288,25 @@ export class AgentInvoker {
 	/** 取消一个 delegation（用户主动取消，非静默）。 */
 	async cancel(delegationId: string, signal?: AbortSignal): Promise<void> {
 		await this.runtime.cancel(delegationId, { cwd: process.cwd(), env: {}, signal });
+	}
+
+	/** 查找某 worker 在该窗口下当前 pending 的 interaction（M5：409 时带出）。 */
+	private async pendingInteractionFor(
+		agentName: string,
+		windowId: string,
+	): Promise<{ interactionId?: string; revision?: number; requests?: unknown[] }> {
+		const interactions = await this.runtime.listInteractions(windowId);
+		for (const interaction of interactions) {
+			if (interaction.status !== "pending" && interaction.status !== "responding") continue;
+			const delegation = await this.runtime.getDelegation(interaction.delegationId);
+			if (delegation?.agentId !== agentName) continue;
+			return {
+				interactionId: interaction.id,
+				revision: interaction.revision,
+				requests: interaction.requests,
+			};
+		}
+		return {};
 	}
 
 	private rememberSession(windowId: string, agentName: string, sessionHandle: string): void {

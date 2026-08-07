@@ -63,16 +63,15 @@ export class InteractionBroker {
 			);
 		}
 
-		// scope 必须在 request options 内。
+		// scope 必须在 request options 内（L3：options 为空时只允许不带 scope）。
 		const byId = new Map(interaction.requests.map((r) => [r.requestId, r]));
 		for (const r of input.responses) {
 			const req = byId.get(r.requestId);
 			if (!req) continue;
 			if (r.action === "reject") continue;
 			const options = req.options ?? [];
-			if (r.scope && options.length > 0 && !options.includes(r.scope as "once")) {
-				// options 是 ["once"|"run"|"session"|"reject"]；未列出时拒绝。
-				if (!(options as string[]).includes(r.scope as string)) {
+			if (r.scope) {
+				if (options.length === 0 || !(options as string[]).includes(r.scope as string)) {
 					throw new InteractionError("invalid_scope", `scope "${r.scope}" not allowed for ${r.requestId}`);
 				}
 			}

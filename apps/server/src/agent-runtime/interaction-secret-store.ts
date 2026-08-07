@@ -93,6 +93,8 @@ export class InteractionSecretStore {
 		const tmp = `${this.secretsFile}.${randomUUID().slice(0, 8)}.tmp`;
 		await writeFile(tmp, JSON.stringify(data, null, 2) + "\n", "utf-8");
 		await rename(tmp, this.secretsFile);
+		// L2：密文文件同样收紧到 0600（§7.2）。
+		await chmod(this.secretsFile, 0o600).catch(() => undefined);
 		this.filePromise = Promise.resolve(data);
 	}
 
