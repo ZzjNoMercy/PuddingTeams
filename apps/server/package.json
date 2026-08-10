@@ -21,6 +21,7 @@
     "@puddingteams/connector-codex": "workspace:*",
     "@puddingteams/pwcp": "workspace:*",
     "fastify": "^5.11.2",
+    "fflate": "^0.8.3",
     "semver": "^7.8.5",
     "typebox": "^1.3.7"
   },

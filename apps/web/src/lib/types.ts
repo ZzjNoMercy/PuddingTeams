@@ -344,6 +344,13 @@ export interface SkillDocument extends SkillEntry {
 	content: string;
 }
 
+/** zip 批量导入技能的响应（POST /api/resources/skills/import-zip 或 import 带 .zip 路径）。 */
+export interface SkillsZipImportResult {
+	imported: SkillEntry[];
+	skipped: { name: string; reason: string }[];
+	diagnostics: ResourceDiagnostic[];
+}
+
 export interface TemplateEntry {
 	name: string;
 	description: string;

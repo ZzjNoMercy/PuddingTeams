@@ -1,5 +1,6 @@
-import { cp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { unzipSync } from "fflate";
 import {
 	DefaultResourceLoader,
 	getAgentDir,
@@ -268,6 +269,139 @@ export async function importSkill(sourcePath: string, baseDir: string = getAgent
 	if (info.isDirectory()) await cp(source, dir, { recursive: true });
 	else await cp(source, path.join(dir, "SKILL.md"));
 	return readSkill(name, baseDir);
+}
+
+// ---- zip 批量导入 ----
+
+export interface ZipImportSkipped {
+	name: string;
+	reason: string;
+}
+
+export interface ZipImportResult {
+	imported: SkillEntry[];
+	skipped: ZipImportSkipped[];
+	diagnostics: ResourceDiagnostic[];
+}
+
+/** zip 里技能根（SKILL.md 所在目录）允许的最大深度（相对 zip 根的目录段数）。 */
+const ZIP_SKILL_ROOT_MAX_DEPTH = 3;
+
+/**
+ * 从 zip 批量导入技能：以 SKILL.md 所在目录为技能根整组拷贝（保留根内相对
+ * 路径，helper 脚本一并落盘）；技能名取 SKILL.md frontmatter name，缺省用根
+ * 目录名。重名记 skipped 继续；空 zip / 无技能 400；含 `..` 或绝对路径的
+ * zip-slip 条目整包拒绝。
+ */
+export async function importSkillsFromZip(zipBuffer: Uint8Array, baseDir: string = getAgentDir()): Promise<ZipImportResult> {
+	let archive: Record<string, Uint8Array>;
+	try {
+		archive = unzipSync(zipBuffer);
+	} catch {
+		throw new ResourceLibraryError(400, "无效的 zip 文件");
+	}
+
+	// 规范化条目：统一分隔符、去 ./ 前缀；忽略目录项、__MACOSX/ 与 . 开头文件；
+	// zip-slip（绝对路径 / .. 段）整包拒绝。
+	const files = new Map<string, Uint8Array>();
+	for (const [rawName, data] of Object.entries(archive)) {
+		let name = rawName.replace(/\\/g, "/");
+		while (name.startsWith("./")) name = name.slice(2);
+		if (!name || name.endsWith("/")) continue; // 目录项
+		const segments = name.split("/");
+		if (name.startsWith("/") || /^[A-Za-z]:\//.test(name) || segments.includes("..")) {
+			throw new ResourceLibraryError(400, `zip 含非法路径条目：${rawName}`);
+		}
+		const base = segments[segments.length - 1]!;
+		if (segments[0] === "__MACOSX" || base.startsWith(".")) continue;
+		files.set(name, data);
+	}
+	if (files.size === 0) throw new ResourceLibraryError(400, "zip 中没有可导入的技能");
+
+	const libDir = skillsDir(baseDir);
+	await mkdir(libDir, { recursive: true });
+	const libRoot = await realpath(libDir);
+
+	const imported: SkillEntry[] = [];
+	const skipped: ZipImportSkipped[] = [];
+	const taken = new Set<string>();
+
+	/** 拷贝一个技能根到 skills/<name>/；entries 为 [根内相对路径, 内容]。 */
+	const copySkill = async (name: string, entries: [string, Uint8Array][]): Promise<void> => {
+		if (!RESOURCE_NAME_PATTERN.test(name)) {
+			skipped.push({ name, reason: `无效名称：须匹配 ${RESOURCE_NAME_PATTERN.source}` });
+			return;
+		}
+		if (taken.has(name) || (await exists(path.join(libDir, name)))) {
+			skipped.push({ name, reason: "skill 已存在" });
+			return;
+		}
+		// libRoot 已 realpath（macOS /var→/private/var），目标路径基于它构造，
+		// 保证 isUnderDir 的 realpath 比较一致。
+		const target = path.resolve(libRoot, name);
+		if (!isUnderDir(target, libRoot)) {
+			skipped.push({ name, reason: "目标路径越出技能库" });
+			return;
+		}
+		for (const [rel, data] of entries) {
+			const dest = path.resolve(target, rel);
+			if (!isUnderDir(dest, libRoot)) {
+				throw new ResourceLibraryError(400, `zip 条目目标越出技能库：${rel}`);
+			}
+			await mkdir(path.dirname(dest), { recursive: true });
+			await writeFile(dest, data);
+		}
+		taken.add(name);
+	};
+
+	// 找技能根：SKILL.md 条目，根深度 ≤ ZIP_SKILL_ROOT_MAX_DEPTH；被更浅技能根
+	// 覆盖的嵌套 SKILL.md 不单独成技能（属于根内文件，整组拷贝时自然带上）。
+	const candidates: string[] = [];
+	for (const name of files.keys()) {
+		if (path.posix.basename(name) !== "SKILL.md") continue;
+		const root = path.posix.dirname(name);
+		if (root !== "." && root.split("/").length > ZIP_SKILL_ROOT_MAX_DEPTH) continue;
+		candidates.push(root === "." ? "" : root);
+	}
+	const skillRoots = candidates.filter(
+		(root) => !candidates.some((other) => root !== other && root.startsWith(other ? `${other}/` : "")),
+	);
+
+	if (skillRoots.length === 0) {
+		// 无 SKILL.md 结构：zip 根下有单个 .md → 按单文件技能导入。
+		const mdFiles = [...files.keys()].filter((n) => !n.includes("/") && n.endsWith(".md"));
+		if (mdFiles.length !== 1) {
+			throw new ResourceLibraryError(400, "zip 中没有可导入的技能（未找到 SKILL.md）");
+		}
+		const zipName = mdFiles[0]!;
+		await copySkill(path.posix.basename(zipName, ".md"), [["SKILL.md", files.get(zipName)!]]);
+	} else {
+		for (const root of skillRoots.sort()) {
+			const prefix = root ? `${root}/` : "";
+			const skillMd = files.get(`${prefix}SKILL.md`)!;
+			const { fields } = parseFrontmatter(Buffer.from(skillMd).toString("utf-8"));
+			const name = fields.name?.trim() || (root ? path.posix.basename(root) : "");
+			if (!name) {
+				skipped.push({ name: root || "(zip 根)", reason: "缺少技能名（frontmatter name 与目录名均不可用）" });
+				continue;
+			}
+			const entries = [...files.entries()]
+				.filter(([n]) => n.startsWith(prefix))
+				.map(([n, d]): [string, Uint8Array] => [n.slice(prefix.length), d]);
+			await copySkill(name, entries);
+		}
+	}
+
+	const { skills, diagnostics } = await listSkills(baseDir);
+	for (const name of taken) {
+		const entry = skills.find((s) => s.name === name);
+		if (entry) imported.push(entry);
+		else imported.push({ name, description: "", disableModelInvocation: false, path: path.join(libDir, name, "SKILL.md") });
+	}
+	if (imported.length === 0 && skipped.length === 0) {
+		throw new ResourceLibraryError(400, "zip 中没有可导入的技能");
+	}
+	return { imported, skipped, diagnostics };
 }
 
 // ---- templates ----

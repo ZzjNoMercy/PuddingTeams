@@ -1,11 +1,26 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-import { FolderOpenIcon, LoaderIcon, PencilIcon, PlusIcon, TrashIcon, UploadIcon } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+	ChevronDownIcon,
+	FileArchiveIcon,
+	FileTextIcon,
+	FolderOpenIcon,
+	LoaderIcon,
+	PencilIcon,
+	PlusIcon,
+	SparklesIcon,
+	Trash2Icon,
+	TriangleAlertIcon,
+	UploadIcon,
+} from "lucide-react";
 import { toast } from "sonner";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import {
 	createSkillResource,
@@ -15,6 +30,7 @@ import {
 	getSkillResource,
 	getTemplateResource,
 	importSkillResource,
+	importSkillsZip,
 	importTemplateResource,
 	listSkillLibrary,
 	listTemplateLibrary,
@@ -46,19 +62,32 @@ const NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
 const KIND_TEXT: Record<
 	Kind,
-	{ title: string; libraryHint: string; importHint: string; contentPlaceholder: string; workspaceToggle: string; pathsLabel: string }
+	{
+		title: string;
+		label: string;
+		headerHint: string;
+		emptyHint: string;
+		importHint: string;
+		contentPlaceholder: string;
+		workspaceToggle: string;
+		pathsLabel: string;
+	}
 > = {
 	skills: {
 		title: "技能（Skills）",
-		libraryHint: "库 = pi 全局目录（与 pi CLI 共享）。勾选「选用」才把该技能交给此 Agent 加载。",
-		importHint: "导入含 SKILL.md 的目录（或单个 SKILL.md 文件）到库；重名会拒绝。",
+		label: "技能",
+		headerHint: "库 = pi 全局目录，与 pi CLI 共享；勾选选用的才会加载给此 Agent。",
+		emptyHint: "新建一个技能，或从本地目录导入含 SKILL.md 的技能。",
+		importHint: "导入含 SKILL.md 的目录 / 单个 .md 文件 / .zip 包（可多技能批量，重名自动跳过）。",
 		contentPlaceholder: "SKILL.md 正文（frontmatter 由上方字段生成）",
 		workspaceToggle: "加载 Workspace Skills（项目目录 .pi/skills）",
 		pathsLabel: "额外 Skill 挂载路径（每行一个；不受白名单管，始终加载）",
 	},
 	templates: {
 		title: "模板（Prompt templates）",
-		libraryHint: "库 = pi 全局目录（与 pi CLI 共享）。勾选「选用」后此 Agent 才能在聊天里用 /模板名 展开。",
+		label: "模板",
+		headerHint: "库 = pi 全局目录，与 pi CLI 共享；勾选选用的才能在聊天里用 /模板名 展开。",
+		emptyHint: "新建一个模板，或导入单个 .md 模板文件。",
 		importHint: "导入单个 .md 模板文件到库；重名会拒绝。",
 		contentPlaceholder: "模板正文。占位符：$1、$2… 取第 N 个参数；$@ 取全部参数；${1:-default} 带默认值。",
 		workspaceToggle: "加载 Workspace Prompt templates（项目目录 .pi/prompts）",
@@ -103,6 +132,7 @@ export function ResourceLibrarySection({
 	const [importOpen, setImportOpen] = useState(false);
 	const [importPath, setImportPath] = useState("");
 	const [importing, setImporting] = useState(false);
+	const zipInputRef = useRef<HTMLInputElement>(null);
 	const [pendingDelete, setPendingDelete] = useState<string | null>(null);
 	const [deleting, setDeleting] = useState(false);
 
@@ -248,6 +278,24 @@ export function ResourceLibrarySection({
 		}
 	};
 
+	const handleImportZip = async (file: File) => {
+		setImporting(true);
+		try {
+			const result = await importSkillsZip(file);
+			setDiagnostics(result.diagnostics);
+			if (result.imported.length > 0) toast.success(`已导入 ${result.imported.length} 个技能`);
+			for (const item of result.skipped) toast.warning(`跳过「${item.name}」：${item.reason}`);
+			if (result.imported.length === 0 && result.skipped.length === 0) toast.warning("zip 中没有可导入的技能");
+			setImportOpen(false);
+			setImportPath("");
+			void refresh();
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		} finally {
+			setImporting(false);
+		}
+	};
+
 	const handleDelete = async () => {
 		if (!pendingDelete) return;
 		setDeleting(true);
@@ -266,118 +314,175 @@ export function ResourceLibrarySection({
 		}
 	};
 
+	const EmptyIcon = kind === "skills" ? SparklesIcon : FileTextIcon;
+
 	return (
 		<div className="flex flex-col gap-3">
-			<p className="text-xs text-muted-foreground">{text.libraryHint}</p>
-
-			{/* workspace 开关 + 额外挂载路径（草稿，随统一保存提交） */}
-			<div className="flex flex-col gap-2 rounded-md bg-muted/60 p-3">
-				<label className="flex items-center gap-2 text-sm">
-					<input
-						type="checkbox"
-						checked={kind === "skills" ? draft.loadWorkspaceSkills : draft.loadWorkspacePrompts}
-						onChange={(e) =>
-							onChange(kind === "skills" ? { loadWorkspaceSkills: e.target.checked } : { loadWorkspacePrompts: e.target.checked })
-						}
-						className="size-4 accent-foreground"
-					/>
-					{text.workspaceToggle}
-				</label>
-				<label className="flex flex-col gap-1 text-sm">
-					<span className="text-muted-foreground">{text.pathsLabel}</span>
-					<Textarea
-						value={kind === "skills" ? draft.skillPaths : draft.promptTemplatePaths}
-						onChange={(e) =>
-							onChange(kind === "skills" ? { skillPaths: e.target.value } : { promptTemplatePaths: e.target.value })
-						}
-						rows={2}
-						className="font-mono text-xs"
-					/>
-				</label>
+			{/* 分区头：标题 + 一句说明，右侧操作 */}
+			<div className="flex items-start justify-between gap-3">
+				<div className="flex flex-col gap-0.5">
+					<h2 className="text-sm font-semibold">{text.title}</h2>
+					<p className="text-xs text-muted-foreground">{text.headerHint}</p>
+				</div>
+				<div className="flex shrink-0 items-center gap-2">
+					<Button size="sm" variant="outline" onClick={() => setImportOpen(true)}>
+						<UploadIcon className="size-3.5" />
+						导入
+					</Button>
+					<Button size="sm" onClick={openCreate}>
+						<PlusIcon className="size-3.5" />
+						新建
+					</Button>
+				</div>
 			</div>
 
-			<div className="flex items-center gap-2">
-				<Button size="sm" variant="outline" onClick={openCreate}>
-					<PlusIcon className="size-3.5" />
-					新建
-				</Button>
-				<Button size="sm" variant="outline" onClick={() => setImportOpen(true)}>
-					<UploadIcon className="size-3.5" />
-					导入
-				</Button>
-			</div>
+			{/* 库加载诊断 */}
+			{diagnostics.length > 0 ? (
+				<div className="flex flex-col gap-1 rounded-md border border-amber-500/40 bg-amber-500/10 p-2.5 text-xs text-amber-600 dark:text-amber-400">
+					{diagnostics.map((item, index) => (
+						<div key={index} className="flex items-start gap-1.5">
+							<TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
+							<span>
+								{item.message}
+								{item.path ? ` · ${item.path}` : ""}
+							</span>
+						</div>
+					))}
+				</div>
+			) : null}
 
-			{/* 库资源表格 */}
+			{/* 库资源列表 */}
 			{rows === null ? (
 				<div className="flex items-center gap-2 py-4 text-sm text-muted-foreground">
 					<LoaderIcon className="size-4 animate-spin" />
 					加载库资源…
 				</div>
 			) : rows.length === 0 ? (
-				<p className="text-xs text-muted-foreground">库中还没有{kind === "skills" ? "技能" : "模板"}，点击「新建」或「导入」。</p>
+				<div className="flex flex-col items-center gap-2 rounded-lg border border-dashed px-4 py-8 text-center">
+					<EmptyIcon className="size-8 text-muted-foreground/60" />
+					<p className="text-sm font-medium">库中还没有{text.label}</p>
+					<p className="text-xs text-muted-foreground">{text.emptyHint}</p>
+					<div className="mt-1 flex items-center gap-2">
+						<Button size="sm" onClick={openCreate}>
+							<PlusIcon className="size-3.5" />
+							新建
+						</Button>
+						<Button size="sm" variant="outline" onClick={() => setImportOpen(true)}>
+							<UploadIcon className="size-3.5" />
+							导入
+						</Button>
+					</div>
+				</div>
 			) : (
-				<div className="flex flex-col divide-y rounded-md border">
-					{rows.map((row) => (
-						<div key={row.name} className="flex items-center gap-2 px-3 py-2">
-							<input
-								type="checkbox"
-								title="本 Agent 选用"
-								checked={enabled.includes(row.name)}
-								onChange={(e) => toggle(row.name, e.target.checked)}
-								className="size-4 shrink-0 accent-foreground"
-							/>
-							<div className="min-w-0 flex-1">
-								<div className="flex items-center gap-1.5">
-									<code className="font-mono text-sm">{row.name}</code>
-									{row.disableModelInvocation ? (
-										<span className="text-xs text-muted-foreground">（仅手动调用）</span>
-									) : null}
+				<>
+					<div className="flex flex-col divide-y rounded-lg border">
+						{rows.map((row) => (
+							<div key={row.name} className="flex items-center gap-2.5 px-3 py-2 hover:bg-muted/50">
+								<input
+									type="checkbox"
+									title="本 Agent 选用"
+									checked={enabled.includes(row.name)}
+									onChange={(e) => toggle(row.name, e.target.checked)}
+									className="size-4 shrink-0 accent-foreground"
+								/>
+								<div className="min-w-0 flex-1">
+									<div className="flex items-center gap-1.5">
+										<span className="truncate font-mono text-sm font-medium">{row.name}</span>
+										{row.disableModelInvocation ? <Badge variant="secondary">仅手动调用</Badge> : null}
+									</div>
+									<p className="truncate text-sm text-muted-foreground" title={row.description}>
+										{row.description || "（无描述）"}
+									</p>
 								</div>
-								<p className="truncate text-xs text-muted-foreground" title={row.description}>
-									{row.description || "（无描述）"}
-								</p>
+								<Button
+									size="icon-sm"
+									variant="ghost"
+									title="编辑"
+									className="text-muted-foreground hover:text-foreground"
+									onClick={() => void openEdit(row.name)}
+								>
+									<PencilIcon className="size-3.5" />
+								</Button>
+								<Button
+									size="icon-sm"
+									variant="ghost"
+									title="删除"
+									className="text-muted-foreground hover:text-destructive"
+									onClick={() => setPendingDelete(row.name)}
+								>
+									<Trash2Icon className="size-3.5" />
+								</Button>
 							</div>
-							<Button size="sm" variant="ghost" onClick={() => void openEdit(row.name)}>
-								<PencilIcon className="size-3.5" />
-							</Button>
-							<Button size="sm" variant="ghost" onClick={() => setPendingDelete(row.name)}>
-								<TrashIcon className="size-3.5" />
-							</Button>
-						</div>
-					))}
-				</div>
+						))}
+					</div>
+					<p className="text-xs text-muted-foreground/70">
+						勾选只改本 Agent 的选用名单（草稿），随页面「保存」提交；新建/编辑/删除/导入即时写入库。
+					</p>
+				</>
 			)}
-			<p className="text-xs text-muted-foreground/70">勾选只改本 Agent 的选用名单（草稿），随页面「保存」提交；新建/编辑/删除/导入即时写入库。</p>
 
-			{diagnostics.length > 0 ? (
-				<div className="flex flex-col gap-0.5 rounded-md border border-destructive/40 bg-destructive/10 p-2.5 text-xs text-destructive">
-					{diagnostics.map((item, index) => (
-						<div key={index}>
-							{item.message}
-							{item.path ? ` · ${item.path}` : ""}
-						</div>
-					))}
-				</div>
-			) : null}
-
+			{/* 额外来源（~/.agents/skills 等）：始终启用、不受选用名单管，默认收起 */}
 			{extras.length > 0 ? (
-				<div className="flex flex-col gap-1 text-xs text-muted-foreground">
-					<span>额外来源（始终启用，不受选用名单管）：</span>
-					{extras.map((item) => (
-						<div key={`${item.path}-${item.name}`} className="flex items-center gap-1.5">
-							<code className="font-mono">{item.name}</code>
-							<span className="truncate">{item.description}</span>
-							<span className="ml-auto shrink-0 text-muted-foreground/60">{item.path}</span>
-						</div>
-					))}
-				</div>
+				<Collapsible>
+					<CollapsibleTrigger className="group flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground">
+						<ChevronDownIcon className="size-3.5 transition-transform group-data-[state=open]:rotate-180" />
+						额外来源 · {extras.length} 个 · 始终启用，不受选用名单管
+					</CollapsibleTrigger>
+					<CollapsibleContent className="flex flex-col gap-1 pt-1.5 pl-5">
+						{extras.map((item) => (
+							<div key={`${item.path}-${item.name}`} className="flex items-center gap-2 text-xs">
+								<Tooltip>
+									<TooltipTrigger asChild>
+										<Badge variant="secondary" className="max-w-48 truncate font-mono">
+											{item.name}
+										</Badge>
+									</TooltipTrigger>
+									<TooltipContent className="max-w-md font-mono break-all">{item.path}</TooltipContent>
+								</Tooltip>
+								<span className="truncate text-muted-foreground">{item.description}</span>
+							</div>
+						))}
+					</CollapsibleContent>
+				</Collapsible>
 			) : null}
+
+			{/* 高级加载选项：workspace 开关 + 额外挂载路径（草稿，随统一保存提交） */}
+			<Collapsible>
+				<CollapsibleTrigger className="group flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground">
+					<ChevronDownIcon className="size-3.5 transition-transform group-data-[state=open]:rotate-180" />
+					高级加载选项
+				</CollapsibleTrigger>
+				<CollapsibleContent className="flex flex-col gap-2 pt-2 pl-5">
+					<label className="flex items-center gap-2 text-sm">
+						<input
+							type="checkbox"
+							checked={kind === "skills" ? draft.loadWorkspaceSkills : draft.loadWorkspacePrompts}
+							onChange={(e) =>
+								onChange(kind === "skills" ? { loadWorkspaceSkills: e.target.checked } : { loadWorkspacePrompts: e.target.checked })
+							}
+							className="size-4 accent-foreground"
+						/>
+						{text.workspaceToggle}
+					</label>
+					<label className="flex flex-col gap-1 text-sm">
+						<span className="text-muted-foreground">{text.pathsLabel}</span>
+						<Textarea
+							value={kind === "skills" ? draft.skillPaths : draft.promptTemplatePaths}
+							onChange={(e) =>
+								onChange(kind === "skills" ? { skillPaths: e.target.value } : { promptTemplatePaths: e.target.value })
+							}
+							rows={2}
+							className="font-mono text-xs"
+						/>
+					</label>
+				</CollapsibleContent>
+			</Collapsible>
 
 			{/* 新建 / 编辑对话框 */}
 			<Dialog open={editorOpen} onOpenChange={setEditorOpen}>
 				<DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
 					<DialogHeader>
-						<DialogTitle>{editing ? `编辑「${editing}」` : `新建${kind === "skills" ? "技能" : "模板"}`}</DialogTitle>
+						<DialogTitle>{editing ? `编辑「${editing}」` : `新建${text.label}`}</DialogTitle>
 						<DialogDescription>保存即写入 pi 全局目录的库，与 pi CLI 共享。</DialogDescription>
 					</DialogHeader>
 					<div className="flex flex-col gap-3">
@@ -455,7 +560,7 @@ export function ResourceLibrarySection({
 							<Input
 								value={importPath}
 								onChange={(e) => setImportPath(e.target.value)}
-								placeholder={kind === "skills" ? "/path/to/skill-dir（含 SKILL.md）" : "/path/to/template.md"}
+								placeholder={kind === "skills" ? "/path/to/skill-dir（含 SKILL.md）或 skills.zip" : "/path/to/template.md"}
 								className="flex-1 font-mono text-xs"
 							/>
 							{kind === "skills" ? (
@@ -465,6 +570,36 @@ export function ResourceLibrarySection({
 								</Button>
 							) : null}
 						</div>
+						{kind === "skills" ? (
+							<>
+								<div className="flex items-center gap-2 text-xs text-muted-foreground/70">
+									<span className="h-px flex-1 bg-border" />
+									或从 zip 批量导入
+									<span className="h-px flex-1 bg-border" />
+								</div>
+								<input
+									ref={zipInputRef}
+									type="file"
+									accept=".zip,application/zip"
+									className="hidden"
+									onChange={(e) => {
+										const file = e.target.files?.[0];
+										e.target.value = "";
+										if (file) void handleImportZip(file);
+									}}
+								/>
+								<Button
+									type="button"
+									size="sm"
+									variant="outline"
+									disabled={importing}
+									onClick={() => zipInputRef.current?.click()}
+								>
+									{importing ? <LoaderIcon className="size-3.5 animate-spin" /> : <FileArchiveIcon className="size-3.5" />}
+									选择 zip 文件
+								</Button>
+							</>
+						) : null}
 						<DialogFooter>
 							<Button type="button" variant="ghost" onClick={() => setImportOpen(false)}>
 								取消

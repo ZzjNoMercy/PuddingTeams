@@ -1,9 +1,10 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import Fastify, { type FastifyInstance } from "fastify";
+import { strToU8, zipSync } from "fflate";
 import { registerResourcesRoutes } from "./resources.js";
 
 /**
@@ -128,6 +129,127 @@ test("resources: skill 导入（目录 / 单文件 / 缺 SKILL.md / 重名）", 
 	);
 	assert.equal(
 		(await app.inject({ method: "POST", url: "/api/resources/skills/import", payload: { path: path.join(dir, "nope") } })).statusCode,
+		400,
+	);
+});
+
+function postZip(app: FastifyInstance, url: string, zip: Uint8Array | Buffer) {
+	return app.inject({
+		method: "POST",
+		url,
+		headers: { "content-type": "application/zip" },
+		payload: Buffer.from(zip),
+	});
+}
+
+function skillMd(name: string, description = "zip 导入"): string {
+	return `---\nname: ${name}\ndescription: ${description}\n---\n\n正文\n`;
+}
+
+test("resources: zip 导入单技能（含 helper 脚本整组落盘）", async (t) => {
+	const dir = useAgentDir(t);
+	const app = makeApp();
+
+	const zip = zipSync({
+		"yt-transcript/SKILL.md": strToU8(skillMd("yt-transcript")),
+		"yt-transcript/scripts/fetch.py": strToU8("print('fetch')\n"),
+		"yt-transcript/references/format.md": strToU8("# 格式\n"),
+		"yt-transcript/.DS_Store": strToU8("junk"),
+		"__MACOSX/yt-transcript/._SKILL.md": strToU8("junk"),
+	});
+	const res = await postZip(app, "/api/resources/skills/import-zip", zip);
+	assert.equal(res.statusCode, 201, res.body);
+	const body = res.json();
+	assert.deepEqual(body.imported.map((s: { name: string }) => s.name), ["yt-transcript"]);
+	assert.deepEqual(body.skipped, []);
+	assert.equal(body.imported[0].description, "zip 导入");
+
+	// helper 脚本与嵌套文件一并落盘；垃圾文件被忽略。
+	const root = path.join(dir, "skills", "yt-transcript");
+	assert.equal(readFileSync(path.join(root, "scripts", "fetch.py"), "utf-8"), "print('fetch')\n");
+	assert.ok(existsSync(path.join(root, "references", "format.md")));
+	assert.ok(!existsSync(path.join(root, ".DS_Store")));
+	assert.ok(!existsSync(path.join(dir, "skills", "__MACOSX")));
+
+	// 导入的技能进 list。
+	const list = await app.inject({ method: "GET", url: "/api/resources/skills" });
+	assert.deepEqual(list.json().skills.map((s: { name: string }) => s.name), ["yt-transcript"]);
+});
+
+test("resources: zip 批量导入（多技能 / 嵌套根目录 / frontmatter name / 重名跳过）", async (t) => {
+	const dir = useAgentDir(t);
+	const app = makeApp();
+	// 预置一个重名技能。
+	mkdirSync(path.join(dir, "skills", "dup-skill"), { recursive: true });
+	writeFileSync(path.join(dir, "skills", "dup-skill", "SKILL.md"), skillMd("dup-skill", "已有"));
+
+	const zip = zipSync({
+		// 嵌套一层根目录打包。
+		"bundle/alpha/SKILL.md": strToU8(skillMd("alpha")),
+		"bundle/alpha/notes.md": strToU8("notes\n"),
+		// 目录名与 frontmatter name 不一致时以 frontmatter 为准。
+		"bundle/dir-name/SKILL.md": strToU8(skillMd("fm-name")),
+		// 与库中已有技能重名 → skipped，不影响其他技能。
+		"bundle/dup-skill/SKILL.md": strToU8(skillMd("dup-skill")),
+	});
+	const res = await postZip(app, "/api/resources/skills/import-zip", zip);
+	assert.equal(res.statusCode, 201, res.body);
+	const body = res.json();
+	assert.deepEqual(body.imported.map((s: { name: string }) => s.name).sort(), ["alpha", "fm-name"]);
+	assert.deepEqual(body.skipped, [{ name: "dup-skill", reason: "skill 已存在" }]);
+	assert.ok(existsSync(path.join(dir, "skills", "alpha", "notes.md")));
+	assert.ok(existsSync(path.join(dir, "skills", "fm-name", "SKILL.md")));
+	assert.ok(!existsSync(path.join(dir, "skills", "bundle")));
+});
+
+test("resources: zip 单 .md 文件按单文件技能导入", async (t) => {
+	const dir = useAgentDir(t);
+	const app = makeApp();
+	const zip = zipSync({ "solo.md": strToU8("---\ndescription: 单文件\n---\n\n内容\n") });
+	const res = await postZip(app, "/api/resources/skills/import-zip", zip);
+	assert.equal(res.statusCode, 201, res.body);
+	assert.deepEqual(res.json().imported.map((s: { name: string }) => s.name), ["solo"]);
+	assert.ok(existsSync(path.join(dir, "skills", "solo", "SKILL.md")));
+});
+
+test("resources: zip 无技能 / 坏 zip / zip-slip → 400", async (t) => {
+	const dir = useAgentDir(t);
+	const app = makeApp();
+
+	// 无 SKILL.md 且多个 .md → 400。
+	const multi = zipSync({ "a.md": strToU8("a"), "b.md": strToU8("b") });
+	assert.equal((await postZip(app, "/api/resources/skills/import-zip", multi)).statusCode, 400);
+	// 空 zip → 400。
+	assert.equal((await postZip(app, "/api/resources/skills/import-zip", zipSync({}))).statusCode, 400);
+	// 坏 zip → 400。
+	assert.equal((await postZip(app, "/api/resources/skills/import-zip", Buffer.from("not a zip"))).statusCode, 400);
+	// zip-slip 条目 → 整包拒绝 400，且不落盘任何文件。
+	const slip = zipSync({
+		"good/SKILL.md": strToU8(skillMd("good")),
+		"../evil.txt": strToU8("pwned"),
+	});
+	const slipRes = await postZip(app, "/api/resources/skills/import-zip", slip);
+	assert.equal(slipRes.statusCode, 400, slipRes.body);
+	assert.ok(!existsSync(path.join(dir, "skills", "good")));
+	assert.ok(!existsSync(path.join(dir, "evil.txt")));
+});
+
+test("resources: import 端点 path 以 .zip 结尾时走 zip 导入", async (t) => {
+	const dir = useAgentDir(t);
+	const app = makeApp();
+	const staging = mkdtempSync(path.join(tmpdir(), "pt-import-zip-"));
+	const zipPath = path.join(staging, "skills.zip");
+	writeFileSync(zipPath, zipSync({ "path-zip/SKILL.md": strToU8(skillMd("path-zip")) }));
+
+	const res = await app.inject({ method: "POST", url: "/api/resources/skills/import", payload: { path: zipPath } });
+	assert.equal(res.statusCode, 201, res.body);
+	assert.deepEqual(res.json().imported.map((s: { name: string }) => s.name), ["path-zip"]);
+	assert.ok(existsSync(path.join(dir, "skills", "path-zip", "SKILL.md")));
+
+	// .zip 路径不存在 → 400。
+	assert.equal(
+		(await app.inject({ method: "POST", url: "/api/resources/skills/import", payload: { path: path.join(staging, "nope.zip") } }))
+			.statusCode,
 		400,
 	);
 });

@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import type { FastifyInstance, FastifyReply } from "fastify";
 import {
 	ResourceLibraryError,
@@ -6,6 +7,7 @@ import {
 	deleteSkill,
 	deleteTemplate,
 	importSkill,
+	importSkillsFromZip,
 	importTemplate,
 	listSkills,
 	listTemplates,
@@ -23,6 +25,9 @@ import {
  * 写操作响应带 list 复扫的 diagnostics。
  */
 export function registerResourcesRoutes(app: FastifyInstance): void {
+	// zip 上传走 raw Buffer；parser 只能注册一次，统一放在这里。
+	app.addContentTypeParser("application/zip", { parseAs: "buffer" }, (_req, body, done) => done(null, body));
+
 	function sendError(reply: FastifyReply, err: unknown): unknown {
 		if (err instanceof ResourceLibraryError) return reply.code(err.status).send({ error: err.message });
 		const msg = err instanceof Error ? err.message : String(err);
@@ -117,13 +122,37 @@ export function registerResourcesRoutes(app: FastifyInstance): void {
 
 	app.post<{ Body: Partial<Record<string, unknown>> }>("/api/resources/skills/import", async (req, reply) => {
 		try {
-			const skill = await importSkill(parseImportPath(req.body));
+			const source = parseImportPath(req.body);
+			if (source.trim().toLowerCase().endsWith(".zip")) {
+				const buffer = await readFile(source.trim()).catch(() => {
+					throw new ResourceLibraryError(400, `导入路径不存在：${source}`);
+				});
+				const result = await importSkillsFromZip(new Uint8Array(buffer));
+				return reply.code(201).send(result);
+			}
+			const skill = await importSkill(source);
 			const { diagnostics } = await listSkills();
 			return reply.code(201).send({ skill, diagnostics });
 		} catch (err) {
 			return sendError(reply, err);
 		}
 	});
+
+	app.post(
+		"/api/resources/skills/import-zip",
+		{ bodyLimit: 20 * 1024 * 1024 },
+		async (req, reply) => {
+			try {
+				if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+					throw new ResourceLibraryError(400, "body 须为 application/zip 的 zip 文件内容");
+				}
+				const result = await importSkillsFromZip(new Uint8Array(req.body));
+				return reply.code(201).send(result);
+			} catch (err) {
+				return sendError(reply, err);
+			}
+		},
+	);
 
 	// ---- templates ----
 

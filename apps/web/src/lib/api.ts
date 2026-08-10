@@ -24,6 +24,7 @@ import type {
 	SessionSummary,
 	SkillDocument,
 	SkillEntry,
+	SkillsZipImportResult,
 	TemplateDocument,
 	TemplateEntry,
 	ToolActivation,
@@ -537,6 +538,18 @@ export function deleteSkillResource(name: string): Promise<void> {
 
 export function importSkillResource(path: string): Promise<{ skill: SkillEntry; diagnostics: ResourceDiagnostic[] }> {
 	return postJson("/api/resources/skills/import", { path }, "import skill failed");
+}
+
+/** 上传 zip 批量导入技能：body 直接传 File/Blob（application/zip）。 */
+export async function importSkillsZip(file: Blob): Promise<SkillsZipImportResult> {
+	const res = await fetch(`${SERVER_URL}/api/resources/skills/import-zip`, {
+		method: "POST",
+		headers: { "content-type": "application/zip" },
+		body: file,
+	});
+	const body = (await res.json().catch(() => null)) as (Partial<SkillsZipImportResult> & { error?: string }) | null;
+	if (!res.ok) throw new Error(body?.error ?? `import skills zip failed: ${res.status}`);
+	return { imported: body?.imported ?? [], skipped: body?.skipped ?? [], diagnostics: body?.diagnostics ?? [] };
 }
 
 export async function listTemplateLibrary(): Promise<{ templates: TemplateEntry[]; diagnostics: ResourceDiagnostic[] }> {
