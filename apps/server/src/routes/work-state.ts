@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import type { PiSessionStore } from "../pi-bridge/session-store.js";
 import type { TeamsStore } from "../store/teams.js";
-import { WorkStateConflictError, type SessionWorkStatus, type WorkStateStore } from "../store/work-state.js";
+import { WorkStateConflictError, type CompletionReviewMode, type SessionWorkStatus, type WorkStateStore } from "../store/work-state.js";
 import type { AgentRuntime } from "../agent-runtime/runtime.js";
 
 export function registerWorkStateRoutes(
@@ -36,6 +36,8 @@ export function registerWorkStateRoutes(
 			revision?: number;
 			goal?: string;
 			completionBoundary?: string;
+			reviewMode?: CompletionReviewMode;
+			reviewerModel?: string;
 			participantAgentIds?: string[];
 			currentBrief?: string;
 			waitingOn?: string;
@@ -57,11 +59,16 @@ export function registerWorkStateRoutes(
 						sessionId: req.params.id,
 						goal: req.body.goal,
 						completionBoundary: req.body.completionBoundary,
+						reviewMode: req.body.reviewMode,
+						reviewerModel: req.body.reviewerModel,
 						participantAgentIds,
 					}),
 				};
 			}
 			if (req.body?.revision === undefined) return reply.code(400).send({ error: "更新 Session Goal 需要 revision" });
+			if (req.body.status === "resolved") {
+				return reply.code(400).send({ error: "Goal 完成必须由 responsible manager 通过完成申请提交" });
+			}
 			const { revision, ...patch } = req.body;
 			return { workState: await workStates.update(req.params.id, revision, patch) };
 		} catch (err) {

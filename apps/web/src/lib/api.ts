@@ -15,6 +15,7 @@ import type {
 	PiResourcePreview,
 	ProviderSummary,
 	PuddingTeamsExtensionManifest,
+	RoomSession,
 	RoomSummary,
 	SessionWorkState,
 	DecisionRequest,
@@ -653,7 +654,7 @@ export async function deleteRoom(id: string): Promise<void> {
 /** Create a new pi session inside a window and make it the active one. */
 export async function createRoomSession(
 	roomId: string,
-	goal?: { goal: string; completionBoundary: string },
+	goal?: { goal: string; completionBoundary: string; reviewMode?: "manager" | "independent"; reviewerModel?: string },
 ): Promise<SessionSummary> {
 	const res = await fetch(`${SERVER_URL}/api/rooms/${roomId}/sessions`, {
 		method: "POST",
@@ -721,6 +722,20 @@ export async function deleteRoomSession(roomId: string, sessionId: string): Prom
 		const body = (await res.json().catch(() => null)) as { error?: string } | null;
 		throw new Error(body?.error ?? `delete room session failed: ${res.status}`);
 	}
+}
+
+/** Rename a session inside a window without changing the window name. */
+export async function renameRoomSession(roomId: string, sessionId: string, name: string): Promise<RoomSession> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${roomId}/sessions/${sessionId}`, {
+		method: "PATCH",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ name }),
+	});
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `rename room session failed: ${res.status}`);
+	}
+	return ((await res.json()) as { session: RoomSession }).session;
 }
 
 // ---- interactions（HITL 审批，§6.4）----

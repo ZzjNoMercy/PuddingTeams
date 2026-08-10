@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { CheckIcon, CopyIcon, FileTextIcon, FolderGit2Icon, FolderOpenIcon, LayersIcon, PencilIcon, PlusIcon, UsersIcon, XIcon } from "lucide-react";
+import { FolderGit2Icon, FolderOpenIcon, InfoIcon, LayersIcon } from "lucide-react";
 import { toast } from "sonner";
 import {
 	Conversation,
@@ -20,14 +20,6 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import {
-	DropdownMenu,
-	DropdownMenuContent,
-	DropdownMenuItem,
-	DropdownMenuSeparator,
-	DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import { writeTextToClipboard } from "@/core/clipboard";
 import { useChat } from "@/hooks/useChat";
 import {
 	createRoomSession,
@@ -35,6 +27,7 @@ import {
 	deleteRoomSession,
 	getRoom,
 	listWorkspaces,
+	renameRoomSession,
 	setActiveRoomSession,
 	switchRoomWorkspace,
 	updateRoom,
@@ -44,6 +37,8 @@ import { Composer } from "./composer";
 import { Message } from "./message";
 import { ManagerAvatar, MemberStack, WorkerAvatar } from "./worker-avatar";
 import { DirectoryPickerDialog } from "./directory-picker-dialog";
+import { ChatInfoDialog } from "./chat-info-dialog";
+import { SessionMenu } from "./session-menu";
 import { SessionWorkCard } from "./session-work-card";
 
 function statusLabelOf(status: ChatStatus): string {
@@ -67,6 +62,10 @@ function SessionChat({
 	windowType,
 	onStatus,
 	onOpenWindow,
+	workspaceLabel,
+	workspacePath,
+	workspaceAvailable,
+	onOpenWorkspace,
 	blocked,
 }: {
 	sessionId: string;
@@ -74,35 +73,74 @@ function SessionChat({
 	windowType: RoomSummary["type"];
 	onStatus: (s: ChatStatus) => void;
 	onOpenWindow?: (windowId: string) => void;
+	workspaceLabel: string;
+	workspacePath: string;
+	workspaceAvailable: boolean;
+	onOpenWorkspace: () => void;
 	blocked?: boolean;
 }) {
-	const { messages, status, running, send, stop } = useChat(sessionId);
+	const { messages, historyLoading, status, running, send, stop } = useChat(sessionId);
+	const [goalCreateOpen, setGoalCreateOpen] = useState(false);
+	const [goalDraft, setGoalDraft] = useState("");
+	const [hasGoal, setHasGoal] = useState(false);
+	const [workStateReady, setWorkStateReady] = useState(false);
 	useEffect(() => onStatus(status), [status, onStatus]);
+	const markWorkStateReady = useCallback(() => setWorkStateReady(true), []);
+	const openGoalCommand = useCallback((initialGoal: string) => {
+		setGoalDraft(initialGoal);
+		setGoalCreateOpen(true);
+	}, []);
+	const layoutReady = !historyLoading && workStateReady;
 
 	return (
-		<>
-			<SessionWorkCard sessionId={sessionId} />
-			<Conversation>
-				<ConversationContent className="mx-auto w-full max-w-3xl gap-6">
-					{messages.length === 0 ? (
-						<div className="flex flex-1 items-center justify-center pt-20 text-sm text-muted-foreground">
-							{emptyHint ?? "开始和 pi manager 对话"}
-						</div>
-					) : (
-						messages.map((m) => (
-							<Message key={m.id} message={m} windowType={windowType} onOpenWindow={onOpenWindow} />
-						))
-					)}
-				</ConversationContent>
-				<ConversationScrollButton className="z-10" />
-			</Conversation>
-			{blocked ? (
-				<div className="border-t border-destructive/20 bg-destructive/5 px-4 py-2 text-center text-xs text-destructive">
-					项目路径已失效，重新绑定或切换项目后才能继续对话与派活。
+		<div className="relative flex min-h-0 flex-1 flex-col" aria-busy={!layoutReady}>
+			<div className={`flex min-h-0 flex-1 flex-col ${layoutReady ? "visible" : "invisible"}`}>
+				<SessionWorkCard
+					sessionId={sessionId}
+					createOpen={goalCreateOpen}
+					onCreateOpenChange={setGoalCreateOpen}
+					initialGoal={goalDraft}
+					onGoalStateChange={setHasGoal}
+					onReady={markWorkStateReady}
+				/>
+				<Conversation initial="instant" resize={layoutReady ? "smooth" : "instant"}>
+					<ConversationContent className="mx-auto w-full max-w-3xl gap-6">
+						{messages.length === 0 ? (
+							<div className="flex flex-1 items-center justify-center pt-20 text-sm text-muted-foreground">
+								{emptyHint ?? "开始和 pi manager 对话"}
+							</div>
+						) : (
+							messages.map((m) => (
+								<Message key={m.id} message={m} windowType={windowType} onOpenWindow={onOpenWindow} />
+							))
+						)}
+					</ConversationContent>
+					<ConversationScrollButton className="z-10" />
+				</Conversation>
+				{blocked ? (
+					<div className="border-t border-destructive/20 bg-destructive/5 px-4 py-2 text-center text-xs text-destructive">
+						项目路径已失效，重新绑定或切换项目后才能继续对话与派活。
+					</div>
+				) : null}
+				<Composer
+					sessionId={sessionId}
+					disabled={running || Boolean(blocked)}
+					hasGoal={hasGoal}
+					workspaceLabel={workspaceLabel}
+					workspacePath={workspacePath}
+					workspaceAvailable={workspaceAvailable}
+					onSend={send}
+					onStop={stop}
+					onGoalCommand={openGoalCommand}
+					onOpenWorkspace={onOpenWorkspace}
+				/>
+			</div>
+			{!layoutReady ? (
+				<div className="absolute inset-0 flex items-center justify-center" role="status">
+					<div className="flex items-center gap-2 text-xs text-muted-foreground"><Loader size={14} />正在加载对话…</div>
 				</div>
 			) : null}
-			<Composer sessionId={sessionId} disabled={running || Boolean(blocked)} onSend={send} onStop={stop} />
-		</>
+		</div>
 	);
 }
 
@@ -118,11 +156,15 @@ export function ChatPane({
 	const [room, setRoom] = useState<RoomSummary | null>(null);
 	const [activeId, setActiveId] = useState<string>("");
 	const [status, setStatus] = useState<ChatStatus>("connecting");
+	const [delayedConnectionStatus, setDelayedConnectionStatus] = useState<ChatStatus | null>(null);
 	const [renaming, setRenaming] = useState(false);
 	const [renameValue, setRenameValue] = useState("");
 	const [promptOpen, setPromptOpen] = useState(false);
 	const [promptValue, setPromptValue] = useState("");
+	const [chatInfoOpen, setChatInfoOpen] = useState(false);
 	const [pendingDeleteSession, setPendingDeleteSession] = useState<RoomSession | null>(null);
+	const [renamingSession, setRenamingSession] = useState<RoomSession | null>(null);
+	const [sessionRenameValue, setSessionRenameValue] = useState("");
 	const [workspaceOpen, setWorkspaceOpen] = useState(false);
 	const [workspaceOptions, setWorkspaceOptions] = useState<WorkspaceRecord[]>([]);
 	const [targetWorkspaceId, setTargetWorkspaceId] = useState("");
@@ -158,6 +200,15 @@ export function ChatPane({
 		}, 8000);
 		return () => clearInterval(timer);
 	}, [roomId]);
+
+	// Session 切换会创建一条新 WebSocket，正常握手通常在一瞬间完成。
+	// 延迟展示非 connected 状态，避免把正常切换误报成一次可见的连接故障；
+	// 真正持续的首次连接/重连仍会出现，error 则立即提示。
+	useEffect(() => {
+		if (status === "connected" || status === "error") return;
+		const timer = setTimeout(() => setDelayedConnectionStatus(status), 700);
+		return () => clearTimeout(timer);
+	}, [status]);
 
 	const patchSessions = useCallback((sessions: RoomSession[], active: string) => {
 		setRoom((prev) => (prev ? { ...prev, sessions, activeSession: active } : prev));
@@ -224,6 +275,27 @@ export function ChatPane({
 		},
 		[roomId],
 	);
+
+	const openSessionRename = useCallback((session: RoomSession) => {
+		setRenamingSession(session);
+		setSessionRenameValue(session.name || session.firstMessage || "新对话");
+	}, []);
+
+	const saveSessionRename = useCallback(async () => {
+		if (!renamingSession || !sessionRenameValue.trim()) return;
+		try {
+			const updated = await renameRoomSession(roomId, renamingSession.id, sessionRenameValue.trim());
+			setRoom((prev) =>
+				prev
+					? { ...prev, sessions: prev.sessions.map((session) => (session.id === updated.id ? updated : session)) }
+					: prev,
+			);
+			setRenamingSession(null);
+			toast.success("会话已重命名");
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		}
+	}, [renamingSession, roomId, sessionRenameValue]);
 
 	const openRename = useCallback(() => {
 		setRenameValue(room?.name ?? "");
@@ -312,6 +384,8 @@ export function ChatPane({
 	const subtitle = sessionTitle || (typeText !== headerTitle ? typeText : "");
 	const workspaceTargetReady = switchToDefault || Boolean(targetWorkspaceId || workspacePath.trim());
 	const currentContextLabel = room?.workspace ? `${room.workspace.name} · ${room.workspace.rootPath}` : `默认目录 · ${room?.cwdSnapshot ?? ""}`;
+	const workspaceLabel = room?.workspace ? `项目 · ${room.workspace.name}` : "默认目录";
+	const currentWorkspacePath = room?.workspace?.rootPath ?? room?.cwdSnapshot ?? "";
 	const newWindowLabel = type === "group" ? "新建群聊" : "新建/打开单聊";
 	const directoryPickerInitialPath =
 		workspacePath || workspaceOptions.find((item) => item.id === targetWorkspaceId)?.rootPath || room?.cwdSnapshot || "";
@@ -344,140 +418,27 @@ export function ChatPane({
 						) : null}
 					</div>
 				</div>
-				<div className="flex shrink-0 items-center gap-2">
-					<Button
-						type="button"
-						size="sm"
-						variant={room?.contextAvailable === false ? "destructive" : "outline"}
-						onClick={openWorkspaceSwitch}
-						aria-label={room?.workspace ? `打开项目，当前项目 ${room.workspace.name}` : "打开项目，当前使用默认目录"}
-						title={`当前运行目录：${room?.workspace?.rootPath ?? room?.cwdSnapshot ?? ""}`}
-					>
-						<FolderGit2Icon className="size-3.5" />
-						<span className="max-w-36 truncate">{room?.workspace ? `项目 · ${room.workspace.name}` : "默认目录"}</span>
-					</Button>
-					<DropdownMenu>
-						<DropdownMenuTrigger asChild>
+				<div className="relative flex shrink-0 items-center gap-2">
+					<SessionMenu
+						sessions={room?.sessions ?? []}
+						trigger={(
 							<Button type="button" size="sm" variant="outline">
 								<LayersIcon className="size-3.5" />
 								会话
 							</Button>
-						</DropdownMenuTrigger>
-						<DropdownMenuContent align="end" className="max-h-80 w-72 overflow-y-auto">
-							<div className="px-2 py-1.5 text-xs text-muted-foreground">
-								{room?.sessions.length ?? 1} 个会话
-							</div>
-							{(room?.sessions ?? []).map((s) => (
-								<DropdownMenuItem key={s.id} onSelect={() => void switchSession(s.id)} className="gap-2">
-									<span className="min-w-0 flex-1 truncate">
-										{s.name || s.firstMessage || "新对话"}
-									</span>
-									{s.active ? <CheckIcon className="size-3.5 shrink-0" /> : null}
-									<button
-										type="button"
-										aria-label="删除会话"
-										onClick={(e) => {
-											e.stopPropagation();
-											setPendingDeleteSession(s);
-										}}
-										className="shrink-0 rounded p-0.5 text-muted-foreground hover:text-destructive"
-									>
-										<XIcon className="size-3" />
-									</button>
-								</DropdownMenuItem>
-							))}
-							<DropdownMenuSeparator />
-							<DropdownMenuItem onSelect={() => void newSession()}>
-								<PlusIcon className="size-3.5" />
-								新建会话
-							</DropdownMenuItem>
-						</DropdownMenuContent>
-					</DropdownMenu>
-					<DropdownMenu>
-						<DropdownMenuTrigger asChild>
-							<Button type="button" size="sm" variant="outline">
-								<UsersIcon className="size-3.5" />
-								成员
-							</Button>
-						</DropdownMenuTrigger>
-						<DropdownMenuContent align="end" className="w-80">
-							<div className="px-2 py-1.5 text-xs text-muted-foreground">
-								{type === "solo" ? "solo 对话：仅与 pi manager 对话" : `${members.length} 个成员`}
-							</div>
-							{members.length === 0 ? (
-								<div className="px-2 py-2 text-xs text-muted-foreground">
-									没有成员。选一个有 worker 的单聊/群聊窗口来派活。
-								</div>
-							) : (
-								members.map((m) => {
-									// invoke 变为联合类型后：命令接入显示命令行，Connector 接入显示绑定。
-									const cmd =
-										m.invoke?.type === "command"
-											? [m.invoke.command, ...m.invoke.runArgs].join(" ")
-											: m.connector
-												? `connector:${m.connector.connectorId}`
-												: "—";
-									const workerSession = room?.workerBindings?.[m.name]?.sessionHandle;
-									const enabled = m.enabled !== false;
-									return (
-										<div key={m.name} className="flex items-start gap-2 px-2 py-1.5">
-											<WorkerAvatar name={m.name} size={22} className="mt-0.5 shrink-0" />
-											<div className="min-w-0 flex-1">
-												<div className="flex items-center gap-1.5">
-													<div className="font-mono text-sm font-medium">{m.name}</div>
-													<span
-														className={`size-1.5 rounded-full ${enabled ? "bg-foreground" : "bg-muted-foreground/40"}`}
-														title={enabled ? "已启用" : "已停用"}
-													/>
-													<span className="text-xs text-muted-foreground">{enabled ? "已启用" : "已停用"}</span>
-												</div>
-												<div className="mt-0.5 flex items-center gap-1">
-													<div className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground" title={cmd}>
-														{cmd}
-													</div>
-													<button
-														type="button"
-														aria-label="复制命令"
-														onClick={() =>
-															void writeTextToClipboard(cmd).then((ok) =>
-																ok ? toast.success("命令已复制") : toast.error("复制失败"),
-															)
-														}
-														className="shrink-0 rounded p-0.5 text-muted-foreground hover:text-foreground"
-													>
-														<CopyIcon className="size-3" />
-													</button>
-												</div>
-												<div className="mt-0.5 text-xs text-muted-foreground/70">
-													{workerSession ? (
-														<>
-															续接 worker 会话 <span className="font-mono">{workerSession.slice(0, 8)}…</span>
-														</>
-													) : (
-														"新会话（下次派活启动新 worker 会话）"
-													)}
-												</div>
-											</div>
-										</div>
-									);
-								})
-							)}
-							<DropdownMenuSeparator />
-							<DropdownMenuItem onSelect={openRename}>
-								<PencilIcon className="size-3.5" />
-								重命名
-							</DropdownMenuItem>
-							{type !== "solo" ? (
-								<DropdownMenuItem onSelect={openPrompt}>
-									<FileTextIcon className="size-3.5" />
-									提示词{room?.prompt ? "（已自定义）" : ""}
-								</DropdownMenuItem>
-							) : null}
-						</DropdownMenuContent>
-					</DropdownMenu>
-					{status !== "connected" ? (
+						)}
+						onSwitch={switchSession}
+						onNew={newSession}
+						onRename={openSessionRename}
+						onDelete={setPendingDeleteSession}
+					/>
+					<Button type="button" size="sm" variant="outline" onClick={() => setChatInfoOpen(true)}>
+						<InfoIcon className="size-3.5" />
+						聊天信息
+					</Button>
+					{(status === "error" || delayedConnectionStatus === status) && status !== "connected" ? (
 						<span
-							className={`hidden items-center gap-2 text-xs sm:flex ${
+							className={`absolute right-0 top-[calc(100%+0.375rem)] z-30 hidden items-center gap-2 whitespace-nowrap rounded-full border bg-background/95 px-2.5 py-1.5 text-xs shadow-sm backdrop-blur sm:flex ${
 								status === "connecting" || status === "reconnecting"
 									? "text-muted-foreground/70"
 									: "text-destructive"
@@ -497,7 +458,26 @@ export function ChatPane({
 					windowType={type}
 					onStatus={setStatus}
 					onOpenWindow={onOpenWindow}
+					workspaceLabel={workspaceLabel}
+					workspacePath={currentWorkspacePath}
+					workspaceAvailable={room.contextAvailable}
+					onOpenWorkspace={openWorkspaceSwitch}
 					blocked={!room.contextAvailable}
+				/>
+			) : null}
+
+			{room ? (
+				<ChatInfoDialog
+					room={room}
+					open={chatInfoOpen}
+					onOpenChange={setChatInfoOpen}
+					onRename={openRename}
+					onEditPrompt={openPrompt}
+					onSwitchWorkspace={openWorkspaceSwitch}
+					onSwitchSession={switchSession}
+					onNewSession={newSession}
+					onRenameSession={openSessionRename}
+					onDeleteSession={setPendingDeleteSession}
 				/>
 			) : null}
 
@@ -530,10 +510,36 @@ export function ChatPane({
 				</DialogContent>
 			</Dialog>
 
+			<Dialog open={renamingSession !== null} onOpenChange={(open) => !open && setRenamingSession(null)}>
+				<DialogContent className="sm:max-w-sm">
+					<DialogHeader>
+						<DialogTitle>重命名会话</DialogTitle>
+					</DialogHeader>
+					<Input
+						value={sessionRenameValue}
+						onChange={(e) => setSessionRenameValue(e.target.value)}
+						placeholder="输入会话名称"
+						maxLength={60}
+						autoFocus
+						onKeyDown={(e) => {
+							if (e.key === "Enter") void saveSessionRename();
+						}}
+					/>
+					<DialogFooter>
+						<Button type="button" variant="ghost" onClick={() => setRenamingSession(null)}>
+							取消
+						</Button>
+						<Button type="button" disabled={!sessionRenameValue.trim()} onClick={() => void saveSessionRename()}>
+							保存
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
+
 			<Dialog open={promptOpen} onOpenChange={setPromptOpen}>
 				<DialogContent className="sm:max-w-lg">
 					<DialogHeader>
-						<DialogTitle>窗口提示词</DialogTitle>
+						<DialogTitle>协作提示词</DialogTitle>
 					</DialogHeader>
 					<Textarea
 						value={promptValue}
@@ -543,7 +549,7 @@ export function ChatPane({
 						className="text-sm"
 					/>
 					<p className="text-xs text-muted-foreground">
-						这段文字会作为该窗口 manager 的附加系统提示。留空 = 使用默认 relay 提示词（委托给 worker 并转述结果）。保存后，本窗口新开的会话按此提示词运行。
+						定义这个聊天中 Manager 如何分工与汇总。留空使用默认协作规则；保存后从新会话开始生效。
 					</p>
 					<DialogFooter>
 						<Button type="button" variant="ghost" onClick={() => setPromptOpen(false)}>

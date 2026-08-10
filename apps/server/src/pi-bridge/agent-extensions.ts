@@ -14,6 +14,7 @@ import {
 	type ExtensionCatalog,
 } from "../agent-runtime/extensions.js";
 import type { PiSessionStore } from "./session-store.js";
+import type { ArtifactStore } from "../agent-runtime/artifact-store.js";
 
 /**
  * Phase 4：manager Session 的 Extension 装配（方案 §3.3）。
@@ -119,6 +120,7 @@ export interface ManagerExtensionDeps {
 	invoker: AgentInvoker;
 	catalog: ExtensionCatalog;
 	workStates?: WorkStateStore;
+	artifacts?: ArtifactStore;
 	/** 可变绑定：createAgentSession 内部生成 session id，工具执行期惰性读取。 */
 	getSessionId: () => string;
 	/** 装配时的窗口上下文（描述文案用；执行期一律经 resolveContext 重读）。 */
@@ -248,23 +250,47 @@ export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowCon
 
 function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => void {
 	return (pi) => {
-		pi.on("before_agent_start", async (event) => {
-			const ctx = await deps.resolveContext();
-			const plan = await planManagerTools(deps.store, deps.catalog, ctx);
+		// Work state is request-scoped rather than a sticky system-prompt
+		// override. pi's sendCustomMessage(triggerTurn) starts an agent turn
+		// without emitting before_agent_start; keeping Goal state only in that
+		// hook therefore leaves automated Decision/delegation follow-ups with
+		// the previous turn's state. The context event runs before every model
+		// request, including custom-message turns, and its injected message is
+		// not persisted into the conversation history.
+		pi.on("context", async (event) => {
 			const workState = deps.workStates ? await deps.workStates.get(deps.getSessionId()) : undefined;
 			const workSection = workState
 				? [
+						"[PuddingTeams 当前工作上下文]",
 						"当前 Session 是一个需要持续负责的 Goal。manager 是唯一可更新当前工作状态的责任主体。",
 						`目标：${workState.goal}`,
 						`完成边界：${workState.completionBoundary}`,
+						`完成复核：${workState.reviewMode === "independent" ? `独立 reviewer${workState.reviewerModel ? `（${workState.reviewerModel}）` : "（自动选择模型）"}` : "manager 自审"}`,
 						`状态：${workState.status}｜revision：${workState.revision}`,
 						`当前摘要：${workState.currentBrief || "（尚未记录）"}`,
 						`等待：${workState.waitingOn || "无"}`,
 						`下一步：${workState.nextAction || "尚未记录"}`,
-						`每次取得实质进展后调用 ${CORE_TOOL_UPDATE_WORK_STATE}；遇到产品/业务取舍时调用 ${CORE_TOOL_REQUEST_DECISION}，不要把它伪装成 Connector 权限审批。`,
+						`每次取得实质进展后调用 ${CORE_TOOL_UPDATE_WORK_STATE}；只有完成边界已满足且证据充分时才提交 status=resolved。独立复核 Goal 会在提交后启动隔离 reviewer，未通过时按 gaps 继续工作。遇到产品/业务取舍时调用 ${CORE_TOOL_REQUEST_DECISION}，不要把它伪装成 Connector 权限审批。`,
 					].join("\n")
-				: `当前 Session 尚未设置 Goal；不要调用 ${CORE_TOOL_UPDATE_WORK_STATE} 或 ${CORE_TOOL_REQUEST_DECISION}。`;
-			return { systemPrompt: `${event.systemPrompt}\n\n${workSection}\n\n${rosterPromptSection(plan, ctx)}` };
+				: `[PuddingTeams 当前工作上下文]\n当前 Session 尚未设置 Goal；不要调用 ${CORE_TOOL_UPDATE_WORK_STATE} 或 ${CORE_TOOL_REQUEST_DECISION}。`;
+			return {
+				messages: [
+					...event.messages,
+					{
+						role: "custom" as const,
+						customType: "pudding:work_state_context",
+						content: workSection,
+						display: false,
+						timestamp: Date.now(),
+					},
+				],
+			};
+		});
+
+		pi.on("before_agent_start", async (event) => {
+			const ctx = await deps.resolveContext();
+			const plan = await planManagerTools(deps.store, deps.catalog, ctx);
+			return { systemPrompt: `${event.systemPrompt}\n\n${rosterPromptSection(plan, ctx)}` };
 		});
 
 		pi.registerTool({
@@ -325,10 +351,76 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 				if (!deps.workStates) throw new Error("Session Work State 未启用");
 				try {
 					const { revision, ...patch } = params;
+					if (patch.status === "resolved") {
+						const sessionId = deps.getSessionId();
+						const current = await deps.workStates.get(sessionId);
+						if (!current) throw new Error("Session Goal 不存在");
+						if (current.revision !== revision) throw new WorkStateConflictError(current);
+						const delegations = await deps.invoker.delegationsForManagerSession(sessionId);
+						const active = delegations.filter((item) => item.status === "running" || item.status === "waiting_input");
+						if (active.length > 0) throw new Error(`仍有 ${active.length} 个委托正在执行或等待输入，不能完成 Goal`);
+						const pendingDecisions = (await deps.workStates.listDecisions(sessionId)).filter((item) => item.status === "pending");
+						if (pendingDecisions.length > 0) throw new Error(`仍有 ${pendingDecisions.length} 个待回答的人类决策，不能完成 Goal`);
+
+						if (current.reviewMode === "independent") {
+							const currentBrief = patch.currentBrief?.trim() || current.currentBrief;
+							if (!currentBrief) throw new Error("提交独立复核前必须填写最终 currentBrief");
+							const artifactIds = patch.artifactIds ?? current.artifactIds;
+							const artifacts = deps.artifacts
+								? (await Promise.all(artifactIds.map((id) => deps.artifacts!.get(id))))
+								: [];
+							const missingArtifactIds = artifactIds.filter((_id, index) => !artifacts[index]);
+							if (missingArtifactIds.length > 0) throw new Error(`引用了不存在的 Artifact：${missingArtifactIds.join("、")}`);
+							const review = await deps.sessions.reviewGoalCompletion(
+								sessionId,
+								{
+									goal: current.goal,
+									completionBoundary: current.completionBoundary,
+									goalRevision: current.goalRevision,
+									currentBrief,
+									delegations: delegations.map((item) => ({
+										id: item.id,
+										agentId: item.agentId,
+										status: item.status,
+										intent: item.intent,
+										expectedOutcome: item.expectedOutcome,
+										completionBoundary: item.completionBoundary,
+										result: item.result ? truncate(JSON.stringify(item.result)) : undefined,
+									})),
+									artifactIds,
+									artifacts: artifacts.filter((item) => item !== undefined).map((item) => ({
+										id: item.id,
+										name: item.name,
+										kind: item.kind,
+										size: item.size,
+										contentHash: item.contentHash,
+										producer: item.producer,
+										delegationId: item.delegationId,
+									})),
+									humanDecisions: (await deps.workStates.listDecisions(sessionId))
+										.filter((item) => item.status === "answered")
+										.map((item) => ({ id: item.id, question: item.question, answer: item.answer, authorizationScope: item.grantedAuthorizationScope })),
+									managerEvidence: [],
+								},
+								current.reviewerModel,
+							);
+							const state = await deps.workStates.applyCompletionReview(sessionId, revision, {
+								currentBrief,
+								artifactIds: patch.artifactIds,
+								review,
+							});
+							const text = review.verdict === "satisfied"
+								? `独立复核通过，Goal 已完成（revision ${state.revision}）。`
+								: review.verdict === "needs_human"
+									? `独立复核需要人类确认，Goal 保持 active。请根据复核结果调用 ${CORE_TOOL_REQUEST_DECISION}。`
+									: `独立复核未通过，Goal 保持 active。缺口：${review.gaps.join("；") || "见逐项复核结果"}`;
+							return { content: [{ type: "text", text }], details: { workState: state, completionReview: review } as Record<string, unknown> };
+						}
+					}
 					const state = await deps.workStates.update(deps.getSessionId(), revision, patch);
 					return {
 						content: [{ type: "text", text: `当前工作已更新（${state.status}，revision ${state.revision}）。` }],
-						details: { workState: state },
+						details: { workState: state } as Record<string, unknown>,
 					};
 				} catch (err) {
 					if (err instanceof WorkStateConflictError) {

@@ -430,6 +430,26 @@ export interface RoomSession {
 }
 
 export type SessionWorkStatus = "active" | "waiting_human" | "resolved" | "cancelled";
+export type CompletionReviewMode = "manager" | "independent";
+
+export interface CompletionReviewCriterion {
+	criterion: string;
+	status: "satisfied" | "unsatisfied" | "uncertain";
+	evidenceRefs: string[];
+	explanation: string;
+}
+
+export interface CompletionReview {
+	id: string;
+	goalRevision: number;
+	mode: "independent";
+	verdict: "satisfied" | "not_satisfied" | "needs_human";
+	criteria: CompletionReviewCriterion[];
+	gaps: string[];
+	reviewerModel: string;
+	reviewerSessionId: string;
+	reviewedAt: string;
+}
 
 export interface SessionWorkState {
 	sessionId: string;
@@ -440,6 +460,10 @@ export interface SessionWorkState {
 	waitingOn?: string;
 	nextAction?: string;
 	completionBoundary: string;
+	goalRevision: number;
+	reviewMode: CompletionReviewMode;
+	reviewerModel?: string;
+	completionReviews: CompletionReview[];
 	status: SessionWorkStatus;
 	artifactIds: string[];
 	revision: number;

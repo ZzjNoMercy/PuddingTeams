@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { mkdirSync, mkdtempSync, realpathSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { TeamsStore } from "../store/teams.js";
@@ -180,6 +180,53 @@ test("P3-1: manager 与 worker 在显式 Workspace 和未选项目模式都使�
 		mode: "run",
 	});
 	assert.equal(workerCwd, defaultCwd);
+	await sessions.disposeAll();
+});
+
+test("产品验收冻结: 共享 sessionDir 可发现并恢复不同 Workspace 的 manager Session", async () => {
+	const { teams, sessions, dir } = await makeStack();
+	const workspaceA = await teams.workspaces.createManaged("A");
+	const workspaceB = await teams.workspaces.createManaged("B");
+	const sessionDir = path.join(dir, "sessions");
+	mkdirSync(sessionDir, { recursive: true });
+
+	const persisted = [
+		{ id: "acceptance-workspace-a", cwd: workspaceA.canonicalPath },
+		{ id: "acceptance-workspace-b", cwd: workspaceB.canonicalPath },
+	];
+	for (const [index, entry] of persisted.entries()) {
+		writeFileSync(
+			path.join(sessionDir, `2026-08-10T00-00-0${index}-000Z_${entry.id}.jsonl`),
+			`${JSON.stringify({
+				type: "session",
+				version: 3,
+				id: entry.id,
+				timestamp: `2026-08-10T00:00:0${index}.000Z`,
+				cwd: entry.cwd,
+			})}\n`,
+		);
+	}
+	await teams.createWindow({
+		type: "direct",
+		members: ["alpha"],
+		workspaceId: workspaceA.id,
+		sessionId: persisted[0]!.id,
+	});
+	await teams.createWindow({
+		type: "direct",
+		members: ["beta"],
+		workspaceId: workspaceB.id,
+		sessionId: persisted[1]!.id,
+	});
+
+	const listed = await sessions.list();
+	assert.deepEqual(
+		new Set(listed.map((session) => session.id)),
+		new Set(persisted.map((session) => session.id)),
+		"共享目录的发现不能按默认 cwd 丢掉其他 Workspace",
+	);
+	assert.equal((await sessions.open(persisted[0]!.id)).sessionManager.getCwd(), workspaceA.canonicalPath);
+	assert.equal((await sessions.open(persisted[1]!.id)).sessionManager.getCwd(), workspaceB.canonicalPath);
 	await sessions.disposeAll();
 });
 

@@ -9,6 +9,7 @@ export function useChat(sessionId: string) {
 	// ChatPane is mounted with `key={sessionId}`, so a session switch remounts
 	// this hook and the initial state below is already the "fresh session" state.
 	const [messages, setMessages] = useState<ChatMessage[]>([]);
+	const [historyLoading, setHistoryLoading] = useState(true);
 	const [status, setStatus] = useState<ChatStatus>("connecting");
 	const [running, setRunning] = useState(false);
 	const [error, setError] = useState<string | null>(null);
@@ -19,17 +20,27 @@ export function useChat(sessionId: string) {
 		let disposed = false;
 		let attempt = 0;
 		let retryTimer: ReturnType<typeof setTimeout> | null = null;
+		let historyReadyFrame: number | null = null;
 
-		const loadHistory = () =>
+		const markHistoryReady = () => {
+			if (historyReadyFrame !== null) cancelAnimationFrame(historyReadyFrame);
+			historyReadyFrame = requestAnimationFrame(() => {
+				if (!disposed) setHistoryLoading(false);
+			});
+		};
+
+		const loadHistory = (initial = false) =>
 			fetchMessages(sessionId)
 				.then((msgs) => {
 					if (!disposed) setMessages(renderHistory(msgs as PiMessage[]));
+					if (initial) markHistoryReady();
 				})
 				.catch((err: unknown) => {
 					if (!disposed) setError(err instanceof Error ? err.message : String(err));
+					if (initial) markHistoryReady();
 				});
 
-		void loadHistory();
+		void loadHistory(true);
 
 		const connect = () => {
 			if (disposed) return;
@@ -81,6 +92,7 @@ export function useChat(sessionId: string) {
 		return () => {
 			disposed = true;
 			if (retryTimer) clearTimeout(retryTimer);
+			if (historyReadyFrame !== null) cancelAnimationFrame(historyReadyFrame);
 			wsRef.current?.close();
 			wsRef.current = null;
 		};
@@ -103,5 +115,5 @@ export function useChat(sessionId: string) {
 		void abortSession(sessionId).catch(() => undefined);
 	}, [sessionId]);
 
-	return { messages, status, running, error, send, stop };
+	return { messages, historyLoading, status, running, error, send, stop };
 }

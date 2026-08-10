@@ -6,6 +6,8 @@ import path from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { TeamsStore, type AgentConfig } from "../store/teams.js";
+import { WorkStateStore } from "../store/work-state.js";
+import type { PiSessionStore } from "./session-store.js";
 import { AgentRuntime } from "../agent-runtime/runtime.js";
 import { DelegationStore } from "../agent-runtime/delegation-store.js";
 import { InteractionSecretStore } from "../agent-runtime/interaction-secret-store.js";
@@ -425,4 +427,79 @@ test("Phase4: rosterPromptSection 空 roster 时明确提示没有 worker", asyn
 		{ type: "group", members: [] },
 	);
 	assert.ok(empty.includes("没有可委托的 worker"));
+});
+
+test("产品验收冻结: Goal 上下文在 custom-message turn 前按最新状态刷新", async () => {
+	const teams = await makeTeams([agentConfig("alpha")]);
+	const catalog = new ExtensionCatalog();
+	const invoker = await makeInvoker(teams, "alpha");
+	const workStates = new WorkStateStore(freshDir("pt-goal-context-"));
+	await workStates.init();
+	const deps = { ...makeDeps(teams, invoker, catalog, undefined), workStates };
+	const plan = await planManagerTools(teams, catalog, undefined);
+	const { pi, handlers } = mockPi();
+	for (const ext of buildManagerExtensionFactories(plan, deps)) {
+		const factory = typeof ext === "function" ? ext : ext.factory;
+		await factory(pi);
+	}
+	const context = handlers.get("context")?.[0];
+	assert.ok(context, "core extension 必须注册逐请求 context handler");
+	const textOf = async () => {
+		const result = await context!({ messages: [] }, {}) as { messages: Array<{ content?: unknown }> };
+		return String(result.messages.at(-1)?.content);
+	};
+	assert.match(await textOf(), /尚未设置 Goal/);
+	await workStates.create({
+		sessionId: "sess-test",
+		goal: "冻结验收",
+		completionBoundary: "全部核心路径通过",
+		participantAgentIds: ["alpha"],
+	});
+	assert.match(await textOf(), /目标：冻结验收/);
+	assert.doesNotMatch(await textOf(), /尚未设置 Goal/);
+});
+
+test("P3-G: independent Goal 的 resolved 提交先走隔离 reviewer 再原子完成", async () => {
+	const teams = await makeTeams([]);
+	const catalog = new ExtensionCatalog();
+	const invoker = await makeInvoker(teams);
+	const states = new WorkStateStore(freshDir("pt-review-state-"));
+	await states.init();
+	await states.create({ sessionId: "sess-test", goal: "交付页面", completionBoundary: "页面验证通过" });
+	let reviewCalls = 0;
+	const sessions = {
+		async reviewGoalCompletion() {
+			reviewCalls++;
+			return {
+				id: "review-1",
+				goalRevision: 0,
+				mode: "independent" as const,
+				verdict: "satisfied" as const,
+				criteria: [{ criterion: "页面验证通过", status: "satisfied" as const, evidenceRefs: ["tool-1"], explanation: "验证成功" }],
+				gaps: [],
+				reviewerModel: "provider/reviewer",
+				reviewerSessionId: "review-session",
+				reviewedAt: new Date().toISOString(),
+			};
+		},
+	} as unknown as PiSessionStore;
+	const ctx: ManagerWindowContext = { type: "solo", members: [] };
+	const plan = await planManagerTools(teams, catalog, ctx);
+	const deps = { ...makeDeps(teams, invoker, catalog, ctx), sessions, workStates: states };
+	const { pi, tools } = mockPi();
+	for (const ext of buildManagerExtensionFactories(plan, deps)) {
+		const factory = typeof ext === "function" ? ext : ext.factory;
+		await factory(pi);
+	}
+	const update = tools.get(CORE_TOOL_UPDATE_WORK_STATE)!;
+	const result = await update.execute(
+		"call-resolve",
+		{ revision: 0, status: "resolved", currentBrief: "页面已生成并验证" },
+		undefined,
+		undefined,
+		{} as ExtensionContext,
+	);
+	assert.equal(reviewCalls, 1);
+	assert.equal((result.details as { workState: { status: string } }).workState.status, "resolved");
+	assert.equal((await states.get("sess-test"))?.completionReviews.at(-1)?.id, "review-1");
 });

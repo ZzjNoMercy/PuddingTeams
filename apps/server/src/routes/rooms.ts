@@ -114,7 +114,10 @@ export function registerRoomsRoutes(
 					cwd: cwdSnapshot,
 				});
 			},
-			async (id) => (await sessions.list()).some((s) => s.id === id),
+			// pi lazily persists a new Session on its first assistant message.
+			// A freshly created solo Session is therefore alive in memory before
+			// it appears in list(); do not replace it on the next GET /rooms.
+			async (id) => sessions.isOpen(id) || (await sessions.list()).some((s) => s.id === id),
 		);
 
 	/** A window must own ≥1 live pi session and its active session must be
@@ -372,7 +375,7 @@ export function registerRoomsRoutes(
 	});
 
 	/** 窗口内新建一个 pi session 并激活。 */
-	app.post<{ Params: { id: string }; Body: { goal?: string; completionBoundary?: string } }>("/api/rooms/:id/sessions", async (req, reply) => {
+	app.post<{ Params: { id: string }; Body: { goal?: string; completionBoundary?: string; reviewMode?: "manager" | "independent"; reviewerModel?: string } }>("/api/rooms/:id/sessions", async (req, reply) => {
 		const w = await teams.getWindow(req.params.id);
 		if (!w) return reply.code(404).send({ error: "window not found" });
 		try {
@@ -390,6 +393,8 @@ export function registerRoomsRoutes(
 						sessionId: created.id,
 						goal,
 						completionBoundary,
+						reviewMode: req.body.reviewMode,
+						reviewerModel: req.body.reviewerModel,
 						participantAgentIds: w.members,
 					})
 				: null;
@@ -409,6 +414,29 @@ export function registerRoomsRoutes(
 			await sessions.remove(req.params.sid);
 			await workStates?.removeSession(req.params.sid);
 			return reply.code(204).send();
+		},
+	);
+
+	/** 重命名窗口内的 session；名称写入 session 自身，不改变窗口名称。 */
+	app.patch<{ Params: { id: string; sid: string }; Body: { name?: string } }>(
+		"/api/rooms/:id/sessions/:sid",
+		async (req, reply) => {
+			const w = await teams.getWindow(req.params.id);
+			if (!w) return reply.code(404).send({ error: "window not found" });
+			const { sessions: sessionIds } = await teams.windowSessionList(w.id);
+			if (!sessionIds.includes(req.params.sid)) {
+				return reply.code(404).send({ error: "session not found in window" });
+			}
+			if (typeof req.body?.name !== "string") {
+				return reply.code(400).send({ error: "body must be { name: string }" });
+			}
+			try {
+				await sessions.rename(req.params.sid, req.body.name);
+				const summary = await buildWindowSummary(sessions, teams, w);
+				return { session: summary.sessions.find((item) => item.id === req.params.sid)! };
+			} catch (err) {
+				return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+			}
 		},
 	);
 

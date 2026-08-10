@@ -65,6 +65,60 @@ test("未选择 Workspace 时保持默认 cwd，且与显式项目的 direct Ses
 	await app.close();
 });
 
+test("产品验收冻结: 首启未落盘的 solo Session 不会被连续房间读取换号", async () => {
+	const { app, sessions } = await makeStack();
+	const first = await app.inject({ method: "GET", url: "/api/rooms" });
+	assert.equal(first.statusCode, 200, first.body);
+	const firstSolo = first.json().rooms.find((room: { type: string }) => room.type === "solo") as { activeSession: string };
+	assert.ok(sessions.isOpen(firstSolo.activeSession));
+
+	const second = await app.inject({ method: "GET", url: "/api/rooms" });
+	assert.equal(second.statusCode, 200, second.body);
+	const secondSolo = second.json().rooms.find((room: { type: string }) => room.type === "solo") as { activeSession: string };
+	assert.equal(secondSolo.activeSession, firstSolo.activeSession);
+	await sessions.disposeAll();
+	await app.close();
+});
+
+test("窗口内 Session 可重命名，且只接受所属 Session 与非空名称", async () => {
+	const { app, sessions } = await makeStack();
+	const created = await app.inject({
+		method: "POST",
+		url: "/api/rooms",
+		payload: { type: "direct", members: ["alpha"] },
+	});
+	assert.equal(created.statusCode, 200, created.body);
+	const room = created.json().room as { id: string; activeSession: string };
+
+	const renamed = await app.inject({
+		method: "PATCH",
+		url: `/api/rooms/${room.id}/sessions/${room.activeSession}`,
+		payload: { name: "新的会话名称" },
+	});
+	assert.equal(renamed.statusCode, 200, renamed.body);
+	assert.equal(renamed.json().session.name, "新的会话名称");
+
+	const fetched = await app.inject({ method: "GET", url: `/api/rooms/${room.id}` });
+	assert.equal(fetched.json().room.sessions[0].name, "新的会话名称");
+
+	const empty = await app.inject({
+		method: "PATCH",
+		url: `/api/rooms/${room.id}/sessions/${room.activeSession}`,
+		payload: { name: "   " },
+	});
+	assert.equal(empty.statusCode, 400);
+
+	const outsider = await app.inject({
+		method: "PATCH",
+		url: `/api/rooms/${room.id}/sessions/not-owned`,
+		payload: { name: "x" },
+	});
+	assert.equal(outsider.statusCode, 404);
+
+	await sessions.disposeAll();
+	await app.close();
+});
+
 test("项目目录浏览只返回可进入的服务端文件夹", async () => {
 	const { app, sessions, dir } = await makeStack();
 	mkdirSync(path.join(dir, "project-a"));

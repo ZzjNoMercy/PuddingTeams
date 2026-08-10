@@ -89,7 +89,7 @@ const runtime: AgentRuntime = new AgentRuntime(
 );
 const invoker = new AgentInvoker(teams, runtime, drivers, credentials, config.agentCwd);
 
-const store = new PiSessionStore(config.agentCwd, config.sessionDir, teams, invoker, catalog, workStates);
+const store = new PiSessionStore(config.agentCwd, config.sessionDir, teams, invoker, catalog, workStates, artifacts);
 invoker.setManagerSender((managerSessionId, message, options) =>
 	store.sendCustomMessage(managerSessionId, message, options),
 );
@@ -103,7 +103,7 @@ await teams.ensureSoloWindow(
 			cwd: cwdSnapshot,
 		});
 	},
-	async (id) => (await store.list()).some((s) => s.id === id),
+	async (id) => store.isOpen(id) || (await store.list()).some((s) => s.id === id),
 );
 await registerChatRoutes(app, store, teams, workStates, uploads);
 await registerSettingsRoutes(app);

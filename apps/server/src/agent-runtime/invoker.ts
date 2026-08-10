@@ -135,6 +135,11 @@ export class AgentInvoker {
 		);
 	}
 
+	/** Goal reviewer 的只读证据投影：只返回属于该 manager Session 的委托。 */
+	async delegationsForManagerSession(managerSessionId: string) {
+		return this.runtime.listDelegations(undefined, managerSessionId);
+	}
+
 	/**
 	 * Stop every Run owned by the window (including solo→direct routed Runs),
 	 * create a manager Session from the latest window state, then commit the

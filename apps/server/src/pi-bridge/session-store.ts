@@ -14,16 +14,26 @@ import { existsSync } from "node:fs";
 import type { PiManagerSettings, PiResourceConfig, TeamsStore } from "../store/teams.js";
 import type { WorkStateStore } from "../store/work-state.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
+import type { ArtifactStore } from "../agent-runtime/artifact-store.js";
 import { ExtensionCatalog, delegateToolName, toolSafeId } from "../agent-runtime/extensions.js";
 import {
 	planManagerTools,
 	buildManagerExtensionFactories,
 	CORE_TOOL_SEARCH,
+	CORE_TOOL_UPDATE_WORK_STATE,
+	CORE_TOOL_REQUEST_DECISION,
 	type ManagedToolPlan,
 	type ManagerWindowContext,
 } from "./agent-extensions.js";
 import { sharedModelRuntime } from "./model-runtime.js";
 import { combinePiPrompt, piResourceLoaderOptions } from "./pi-resources.js";
+import {
+	buildCompletionReviewPrompt,
+	COMPLETION_REVIEWER_SYSTEM_PROMPT,
+	parseCompletionReview,
+	type CompletionReviewInput,
+} from "./completion-review.js";
+import type { CompletionReview } from "../store/work-state.js";
 
 export interface SessionSummary {
 	id: string;
@@ -81,6 +91,7 @@ export class PiSessionStore {
 		private readonly invoker?: AgentInvoker,
 		catalog?: ExtensionCatalog,
 		private readonly workStates?: WorkStateStore,
+		private readonly artifacts?: ArtifactStore,
 	) {
 		this.catalog = catalog ?? new ExtensionCatalog();
 		if (this.teamsStore && this.invoker) {
@@ -164,6 +175,7 @@ export class PiSessionStore {
 				invoker: this.invoker,
 				catalog: this.catalog,
 				workStates: this.workStates,
+				artifacts: this.artifacts,
 				getSessionId,
 				ctx,
 				resolveContext: () => this.windowContextOf(getSessionId()),
@@ -432,8 +444,14 @@ export class PiSessionStore {
 	}
 
 	async list(): Promise<SessionSummary[]> {
-		const sessions = await SessionManager.list(this.cwd, this.sessionDir);
-		return sessions.map((info) => ({
+		// `sessionDir` is shared by every manager Window, including Windows that
+		// belong to different Workspaces. SessionManager.list(cwd, sessionDir)
+		// filters that directory by one cwd, which makes sessions from other
+		// Workspaces invisible after restart (and can also miss macOS /tmp ->
+		// /private/tmp canonical-path aliases). Discover by the owned directory;
+		// Window ownership remains the authority when a session is opened.
+		const sessions = await SessionManager.listAll(this.sessionDir);
+		const summaries = sessions.map((info) => ({
 			id: info.id,
 			sessionFile: info.path,
 			firstMessage: info.firstMessage,
@@ -441,6 +459,25 @@ export class PiSessionStore {
 			modifiedAt: info.modified.toISOString(),
 			active: this.active.has(info.id),
 		}));
+		const byId = new Map(summaries.map((summary) => [summary.id, summary]));
+		for (const session of this.active.values()) {
+			const existing = byId.get(session.sessionId);
+			if (existing) {
+				// 内存中的名称可能比尚未 flush 的磁盘 session_info 更新。
+				existing.name = session.sessionName;
+				existing.active = true;
+				continue;
+			}
+			summaries.push({
+				id: session.sessionId,
+				sessionFile: session.sessionFile ?? "",
+				firstMessage: "",
+				name: session.sessionName,
+				modifiedAt: new Date().toISOString(),
+				active: true,
+			});
+		}
+		return summaries;
 	}
 
 	/** Return the live AgentSession for a session id, opening it from file if needed. */
@@ -464,7 +501,7 @@ export class PiSessionStore {
 		}
 		this.runtimeDirty.delete(id);
 
-		const info = (await SessionManager.list(this.cwd, this.sessionDir)).find((s) => s.id === id);
+		const info = (await SessionManager.listAll(this.sessionDir)).find((s) => s.id === id);
 		if (!info) throw new Error(`Session not found: ${id}`);
 
 		const ctx = await this.windowContextOf(id);
@@ -497,13 +534,23 @@ export class PiSessionStore {
 		return PiSessionStore.summarizeModel(model);
 	}
 
+	/** Set the user-facing session name and persist it as a session_info entry. */
+	async rename(id: string, name: string): Promise<SessionSummary> {
+		const trimmed = name.trim();
+		if (!trimmed) throw new Error("会话名称不能为空");
+		if (trimmed.length > 60) throw new Error("会话名称不能超过 60 个字符");
+		const session = await this.open(id);
+		session.setSessionName(trimmed);
+		return this.summarize(session);
+	}
+
 	/** Dispose the session (aborting an in-flight run) and delete its JSONL file. */
 	async remove(id: string): Promise<boolean> {		const session = this.active.get(id);
 		if (session?.isStreaming) {
 			await session.abort().catch(() => undefined);
 		}
 		await this.dispose(id);
-		const info = (await SessionManager.list(this.cwd, this.sessionDir)).find((s) => s.id === id);
+		const info = (await SessionManager.listAll(this.sessionDir)).find((s) => s.id === id);
 		const file = info?.path ?? session?.sessionFile;
 		if (!file) return false;
 		// A session with no messages yet may never have been written to disk.
@@ -554,6 +601,72 @@ export class PiSessionStore {
 		} catch (err) {
 			this.debugLog?.(`sendCustomMessage failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
+	}
+
+	/**
+	 * 在全新的 Pi SDK in-memory Session 中执行只读完成复核。Reviewer 不装载
+	 * Extension、Skill、项目上下文或任何工具，也不继承 manager 消息历史。
+	 */
+	async reviewGoalCompletion(
+		managerSessionId: string,
+		input: CompletionReviewInput,
+		modelRef?: string,
+	): Promise<CompletionReview> {
+		const manager = this.active.get(managerSessionId) ?? await this.open(managerSessionId);
+		const model = modelRef ? await this.resolveModel(modelRef) : manager.model as PiModel | undefined;
+		if (!model) throw new Error("没有可用于独立复核的模型");
+		const reviewInput: CompletionReviewInput = {
+			...input,
+			managerEvidence: PiSessionStore.toolEvidence(manager),
+		};
+		const reviewSession = await this.completionReviewerSession(model);
+		try {
+			await reviewSession.prompt(buildCompletionReviewPrompt(reviewInput));
+			const output = PiSessionStore.assistantText(reviewSession);
+			if (!output) throw new Error("独立 reviewer 没有返回判定");
+			return parseCompletionReview(output, reviewInput, {
+				reviewerModel: `${model.provider}/${model.id}`,
+				reviewerSessionId: reviewSession.sessionId,
+			});
+		} finally {
+			reviewSession.dispose();
+		}
+	}
+
+	/** 只投影可复核 ToolResult，不把 manager 的推理或完整聊天历史交给 reviewer。 */
+	private static toolEvidence(session: AgentSession): Array<Record<string, unknown>> {
+		const messages = session.messages as unknown as Array<{
+			role?: string;
+			toolCallId?: string;
+			toolName?: string;
+			content?: unknown;
+			details?: unknown;
+			isError?: boolean;
+		}>;
+		return messages
+			.filter((message) =>
+				message.role === "toolResult" &&
+				typeof message.toolCallId === "string" &&
+				message.toolName !== CORE_TOOL_UPDATE_WORK_STATE &&
+				message.toolName !== CORE_TOOL_REQUEST_DECISION &&
+				message.toolName !== CORE_TOOL_SEARCH,
+			)
+			.slice(-80)
+			.map((message) => {
+				const text = Array.isArray(message.content)
+					? message.content
+						.filter((item): item is { type: "text"; text: string } => Boolean(item) && typeof item === "object" && (item as { type?: unknown }).type === "text" && typeof (item as { text?: unknown }).text === "string")
+						.map((item) => item.text)
+						.join("\n")
+					: typeof message.content === "string" ? message.content : "";
+				return {
+					id: message.toolCallId!,
+					toolName: message.toolName,
+					isError: message.isError === true,
+					content: text.slice(0, 12_000),
+					...(message.details !== undefined ? { details: JSON.stringify(message.details).slice(0, 8_000) } : {}),
+				};
+			});
 	}
 
 	private debugLog?: (msg: string) => void;
@@ -650,6 +763,33 @@ export class PiSessionStore {
 		})();
 	}
 
+	/** Reviewer 使用完全空白的只读上下文；唯一输入由 completion snapshot 提供。 */
+	private completionReviewerSession(model: PiModel): Promise<AgentSession> {
+		const agentDir = getAgentDir();
+		return (async () => {
+			const loader = new DefaultResourceLoader({
+				cwd: this.cwd,
+				agentDir,
+				settingsManager: SettingsManager.create(this.cwd, agentDir),
+				noExtensions: true,
+				noSkills: true,
+				noPromptTemplates: true,
+				noThemes: true,
+				noContextFiles: true,
+				systemPromptOverride: () => COMPLETION_REVIEWER_SYSTEM_PROMPT,
+			});
+			await loader.reload();
+			const { session } = await createAgentSession({
+				cwd: this.cwd,
+				sessionManager: SessionManager.inMemory(this.cwd),
+				model,
+				resourceLoader: loader,
+				noTools: "all",
+			});
+			return session;
+		})();
+	}
+
 	/**
 	 * Generate a short Chinese title for a conversation from its first user
 	 * message and persist it as the pi session name (session_info entry). Runs
@@ -660,6 +800,8 @@ export class PiSessionStore {
 		try {
 			const session = this.active.get(sessionId);
 			if (!session) return undefined;
+			// 手动重命名或已生成过标题时不再覆盖。
+			if (session.sessionName?.trim()) return session.sessionName;
 			const model = session.model as PiModel | undefined;
 			if (!model || !firstMessage.trim()) return undefined;
 			const titleSession = await this.titleSession(model);
