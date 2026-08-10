@@ -292,11 +292,25 @@ export interface PiResourceConfig {
 	systemPrompt?: string;
 	skillPaths?: string[];
 	promptTemplatePaths?: string[];
-	loadGlobalSkills?: boolean;
+	/** 库资源白名单（按 name）：缺省 = 不启用任何库技能/模板。 */
+	enabledSkills?: string[];
+	enabledPrompts?: string[];
 	loadWorkspaceSkills?: boolean;
-	loadGlobalPrompts?: boolean;
 	loadWorkspacePrompts?: boolean;
 	loadWorkspaceContext?: boolean;
+}
+
+/** preview 条目的来源：global=库（pi 全局目录）、workspace、extra=额外挂载路径。 */
+export type PiResourceSource = "global" | "workspace" | "extra";
+
+export interface PiPreviewResource {
+	name: string;
+	description: string;
+	argumentHint?: string;
+	path: string;
+	source: PiResourceSource;
+	/** extra 来源始终启用；global 库资源由白名单决定。 */
+	enabled: boolean;
 }
 
 export interface PiResourcePreview {
@@ -304,10 +318,41 @@ export interface PiResourcePreview {
 	segments: Array<{ source: string; path?: string; content: string; collapsed: boolean }>;
 	effectivePrompt: string;
 	estimatedCharacters: number;
-	skills: Array<{ name: string; path: string }>;
-	prompts: Array<{ name: string; path: string }>;
+	skills: PiPreviewResource[];
+	prompts: PiPreviewResource[];
 	contextFiles: string[];
 	diagnostics: Array<{ type: string; message: string; path?: string }>;
+}
+
+// ---- pi 资源库（/api/resources/*，库根 = pi 全局目录） ----
+
+export interface ResourceDiagnostic {
+	type: string;
+	message: string;
+	path?: string;
+}
+
+export interface SkillEntry {
+	name: string;
+	description: string;
+	disableModelInvocation: boolean;
+	path: string;
+}
+
+export interface SkillDocument extends SkillEntry {
+	/** SKILL.md 正文（frontmatter 之外的部分）。 */
+	content: string;
+}
+
+export interface TemplateEntry {
+	name: string;
+	description: string;
+	argumentHint?: string;
+	path: string;
+}
+
+export interface TemplateDocument extends TemplateEntry {
+	content: string;
 }
 
 export interface AgentResponsibilityProfile {

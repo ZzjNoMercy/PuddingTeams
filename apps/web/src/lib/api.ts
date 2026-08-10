@@ -15,12 +15,17 @@ import type {
 	PiResourcePreview,
 	ProviderSummary,
 	PuddingTeamsExtensionManifest,
+	ResourceDiagnostic,
 	RoomSession,
 	RoomSummary,
 	SessionWorkState,
 	DecisionRequest,
 	DelegationTrace,
 	SessionSummary,
+	SkillDocument,
+	SkillEntry,
+	TemplateDocument,
+	TemplateEntry,
 	ToolActivation,
 	WorkspaceRecord,
 	WorkspaceDirectoryListing,
@@ -462,6 +467,114 @@ export function putAgentPiResources(name: string, piResources: PiResourceConfig 
 		"save pi resources failed",
 		"PUT",
 	);
+}
+
+/**
+ * 统一配置接口（独立配置页，§10.5）：manager 与 pi worker 同构的合并更新。
+ * pinned manager 用 manager 键级合并（传 connector 会 400）；pi worker 用
+ * connector.config（传 manager 会 400）；piResources 为整体替换，null 清除。
+ */
+export function putAgentConfig(
+	name: string,
+	input: {
+		description?: string;
+		responsibility?: AgentConfig["responsibility"] | null;
+		manager?: Partial<PiManagerSettings>;
+		connector?: { config?: Record<string, unknown> };
+		piResources?: PiResourceConfig | null;
+	},
+): Promise<MutationResponse> {
+	return postJson<MutationResponse>(
+		`/api/agents/${encodeURIComponent(name)}/config`,
+		input,
+		"save agent config failed",
+		"PUT",
+	);
+}
+
+// ---- pi 资源库（/api/resources/*）：错误统一 { error }，400/404/409 ----
+
+async function deleteResource(url: string, fallback: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}${url}`, { method: "DELETE" });
+	if (res.status === 204) return;
+	const body = (await res.json().catch(() => null)) as { error?: string } | null;
+	throw new Error(body?.error ?? `${fallback}: ${res.status}`);
+}
+
+export async function listSkillLibrary(): Promise<{ skills: SkillEntry[]; diagnostics: ResourceDiagnostic[] }> {
+	const res = await fetch(`${SERVER_URL}/api/resources/skills`);
+	const body = (await res.json()) as { skills?: SkillEntry[]; diagnostics?: ResourceDiagnostic[]; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `list skill library failed: ${res.status}`);
+	return { skills: body.skills ?? [], diagnostics: body.diagnostics ?? [] };
+}
+
+export function createSkillResource(input: {
+	name: string;
+	content: string;
+	description?: string;
+	disableModelInvocation?: boolean;
+}): Promise<{ skill: SkillEntry; diagnostics: ResourceDiagnostic[] }> {
+	return postJson("/api/resources/skills", input, "create skill failed");
+}
+
+export async function getSkillResource(name: string): Promise<SkillDocument> {
+	const res = await fetch(`${SERVER_URL}/api/resources/skills/${encodeURIComponent(name)}`);
+	const body = (await res.json()) as { skill?: SkillDocument; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `get skill failed: ${res.status}`);
+	return body.skill!;
+}
+
+export function updateSkillResource(
+	name: string,
+	input: { content: string; description?: string; disableModelInvocation?: boolean },
+): Promise<{ skill: SkillEntry; diagnostics: ResourceDiagnostic[] }> {
+	return postJson(`/api/resources/skills/${encodeURIComponent(name)}`, input, "update skill failed", "PUT");
+}
+
+export function deleteSkillResource(name: string): Promise<void> {
+	return deleteResource(`/api/resources/skills/${encodeURIComponent(name)}`, "delete skill failed");
+}
+
+export function importSkillResource(path: string): Promise<{ skill: SkillEntry; diagnostics: ResourceDiagnostic[] }> {
+	return postJson("/api/resources/skills/import", { path }, "import skill failed");
+}
+
+export async function listTemplateLibrary(): Promise<{ templates: TemplateEntry[]; diagnostics: ResourceDiagnostic[] }> {
+	const res = await fetch(`${SERVER_URL}/api/resources/templates`);
+	const body = (await res.json()) as { templates?: TemplateEntry[]; diagnostics?: ResourceDiagnostic[]; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `list template library failed: ${res.status}`);
+	return { templates: body.templates ?? [], diagnostics: body.diagnostics ?? [] };
+}
+
+export function createTemplateResource(input: {
+	name: string;
+	content: string;
+	description?: string;
+	argumentHint?: string;
+}): Promise<{ template: TemplateEntry; diagnostics: ResourceDiagnostic[] }> {
+	return postJson("/api/resources/templates", input, "create template failed");
+}
+
+export async function getTemplateResource(name: string): Promise<TemplateDocument> {
+	const res = await fetch(`${SERVER_URL}/api/resources/templates/${encodeURIComponent(name)}`);
+	const body = (await res.json()) as { template?: TemplateDocument; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `get template failed: ${res.status}`);
+	return body.template!;
+}
+
+export function updateTemplateResource(
+	name: string,
+	input: { content: string; description?: string; argumentHint?: string },
+): Promise<{ template: TemplateEntry; diagnostics: ResourceDiagnostic[] }> {
+	return postJson(`/api/resources/templates/${encodeURIComponent(name)}`, input, "update template failed", "PUT");
+}
+
+export function deleteTemplateResource(name: string): Promise<void> {
+	return deleteResource(`/api/resources/templates/${encodeURIComponent(name)}`, "delete template failed");
+}
+
+export function importTemplateResource(path: string): Promise<{ template: TemplateEntry; diagnostics: ResourceDiagnostic[] }> {
+	return postJson("/api/resources/templates/import", { path }, "import template failed");
 }
 
 // ---- encrypted secrets (~/.puddingteams) ----

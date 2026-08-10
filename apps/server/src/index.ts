@@ -12,6 +12,7 @@ import { registerChatRoutes } from "./routes/chat.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
 import { registerProvidersRoutes } from "./routes/providers.js";
 import { registerAgentsRoutes } from "./routes/agents.js";
+import { registerResourcesRoutes } from "./routes/resources.js";
 import { registerRoomsRoutes } from "./routes/rooms.js";
 import { registerInteractionsRoutes } from "./routes/interactions.js";
 import { AgentRuntime } from "./agent-runtime/runtime.js";
@@ -116,6 +117,7 @@ await registerAgentsRoutes(app, teams, {
 	sessions: store,
 });
 await registerExtensionsRoutes(app, { registry: extensionRegistry, teams, runtime, sessions: store, settings: productSettings });
+registerResourcesRoutes(app);
 registerWorkspacesRoutes(app, teams.workspaces);
 await registerRoomsRoutes(app, store, teams, invoker, workStates);
 await registerInteractionsRoutes(app, runtime, invoker, teams);

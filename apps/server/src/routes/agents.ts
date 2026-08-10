@@ -218,6 +218,74 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		},
 	);
 
+	/**
+	 * 统一配置接口（独立配置页，§10.5）：manager 与 pi worker 同构的合并更新。
+	 * pinned manager 走 updateManager（description/responsibility/manager/
+	 * piResources）；worker 走 upsertAgent，connector 字段只允许 pi 绑定的
+	 * config 更新，非 pinned 条目传 manager 字段一律 400。
+	 */
+	app.put<{
+		Params: { name: string };
+		Body: {
+			description?: string;
+			responsibility?: AgentConfig["responsibility"] | null;
+			manager?: Record<string, unknown>;
+			connector?: { config?: Record<string, unknown> } | null;
+			piResources?: AgentConfig["piResources"] | null;
+		};
+	}>("/api/agents/:name/config", async (req, reply) => {
+		const agent = await teams.getAgent(req.params.name);
+		if (!agent) return reply.code(404).send({ error: "agent not found" });
+		const body = req.body ?? {};
+		if (agent.pinned) {
+			if (body.connector !== undefined) {
+				return reply.code(400).send({ error: "pinned manager 不绑定 Connector" });
+			}
+			try {
+				const updated = await teams.updateManager({
+					...(body.description !== undefined ? { description: body.description } : {}),
+					...(body.responsibility !== undefined ? { responsibility: body.responsibility } : {}),
+					...(body.manager !== undefined ? { manager: body.manager } : {}),
+					...(body.piResources !== undefined ? { piResources: body.piResources } : {}),
+				});
+				return mutationReply(updated);
+			} catch (err) {
+				return notFoundOr400(reply, err);
+			}
+		}
+		if (body.manager !== undefined) {
+			return reply.code(400).send({ error: "manager 配置区仅适用于 pinned manager" });
+		}
+		if (body.description !== undefined && typeof body.description !== "string") {
+			return reply.code(400).send({ error: "description 必须是字符串" });
+		}
+		if (body.connector !== undefined && agent.connector?.connectorId !== "pi") {
+			return reply.code(400).send({ error: "connector 配置区仅适用于 pi Connector 绑定的 Agent" });
+		}
+		const connectorConfig = body.connector?.config;
+		if (connectorConfig !== undefined && (typeof connectorConfig !== "object" || connectorConfig === null || Array.isArray(connectorConfig))) {
+			return reply.code(400).send({ error: "connector.config 必须是对象" });
+		}
+		try {
+			const next: AgentConfig = { ...agent };
+			if (body.description !== undefined) next.description = body.description;
+			if (body.responsibility !== undefined) {
+				if (body.responsibility === null) delete next.responsibility;
+				else next.responsibility = body.responsibility;
+			}
+			if (body.piResources !== undefined) {
+				if (body.piResources === null) delete next.piResources;
+				else next.piResources = body.piResources;
+			}
+			if (body.connector !== undefined && agent.connector) {
+				next.connector = { ...agent.connector, ...(connectorConfig !== undefined ? { config: connectorConfig } : {}) };
+			}
+			return mutationReply(await teams.upsertAgent(next));
+		} catch (err) {
+			return notFoundOr400(reply, err);
+		}
+	});
+
 	app.delete<{ Params: { name: string } }>("/api/agents/:name", async (req, reply) => {
 		const existing = await teams.getAgent(req.params.name);
 		if (!existing) return reply.code(404).send({ error: "agent not found" });

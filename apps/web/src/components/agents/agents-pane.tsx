@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { LoaderIcon, PlusIcon, RefreshCwIcon, TrashIcon, UserCheckIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -25,13 +26,13 @@ import { isConnectorProbe } from "@/lib/types";
 import { WorkerAvatar } from "@/components/chat/worker-avatar";
 import { ConfigSchemaForm, SecretSchemaFields } from "@/components/agents/form-parts";
 import { AgentManageDialog } from "@/components/agents/agent-manage-dialog";
-import { ManagerDialog } from "@/components/agents/manager-dialog";
 import { ExtensionsPane } from "@/components/agents/extensions-pane";
 
 /**
  * 智能体管理页（Phase 5）：
  * - 列表含 pinned 内置 Pi manager（pinned 标识，无删除/禁用/探测按钮）；
- * - worker 卡片点击进入三分区管理抽屉（§10.1），manager 进入 SDK 配置编辑（§10.5）；
+ * - pinned manager 与 pi worker 卡片跳转独立配置页（/agents/<name>，§10.5），
+ *   其余 worker 进入三分区管理抽屉（§10.1）；
  * - 启用/禁用走 PUT /enabled：禁用有进行中 Run 时 409，弹窗选择保留（keep）或
  *   取消（cancel），绝不静默杀死；
  * - 「扩展目录」页签管理 Connector/Capability Extension 的安装/更新/卸载。
@@ -321,6 +322,7 @@ function CreateAgentDialog({
 // ---- 主面板 ----
 
 export function AgentsPane() {
+	const router = useRouter();
 	const [tab, setTab] = useState<"agents" | "extensions">("agents");
 	const [agents, setAgents] = useState<AgentConfig[]>([]);
 	const [connectorCatalog, setConnectorCatalog] = useState<CatalogEntry[]>([]);
@@ -409,7 +411,12 @@ export function AgentsPane() {
 		setManageAgent((prev) => (prev && prev.name === updated.name ? updated : prev));
 	}, []);
 
+	/** pinned manager 与 pi worker 进独立配置页；其余 worker 仍开三分区管理抽屉。 */
 	const openManage = (agent: AgentConfig) => {
+		if (agent.pinned || agent.connector?.connectorId === "pi") {
+			router.push(`/agents/${encodeURIComponent(agent.name)}`);
+			return;
+		}
 		setManageAgent(agent);
 		setManageOpen(true);
 	};
@@ -573,23 +580,14 @@ export function AgentsPane() {
 				)}
 			</div>
 
-			{/* worker 三分区管理抽屉 / pinned manager SDK 配置编辑 */}
-			{manageAgent ? (
-				manageAgent.pinned ? (
-					<ManagerDialog
-						agent={manageAgent}
-						open={manageOpen}
-						onOpenChange={setManageOpen}
-						onAgentChanged={handleAgentChanged}
-					/>
-				) : (
-					<AgentManageDialog
-						agent={manageAgent}
-						open={manageOpen}
-						onOpenChange={setManageOpen}
-						onAgentChanged={handleAgentChanged}
-					/>
-				)
+			{/* 非 pi worker 的三分区管理抽屉；pi Agent 已跳独立配置页（manager-dialog.tsx 留档备用） */}
+			{manageAgent && !manageAgent.pinned ? (
+				<AgentManageDialog
+					agent={manageAgent}
+					open={manageOpen}
+					onOpenChange={setManageOpen}
+					onAgentChanged={handleAgentChanged}
+				/>
 			) : null}
 
 			<CreateAgentDialog open={createOpen} onOpenChange={setCreateOpen} onCreated={refresh} />

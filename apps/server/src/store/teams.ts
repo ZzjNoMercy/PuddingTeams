@@ -38,11 +38,13 @@ export interface PiManagerSettings {
 
 export interface PiResourceConfig {
 	systemPrompt?: string;
+	/** 资源库（pi 全局目录）技能选用名单，按 name；缺省 = 不启用任何库技能。 */
+	enabledSkills?: string[];
+	/** 资源库（pi 全局目录）模板选用名单，按 name；缺省 = 不启用任何库模板。 */
+	enabledPrompts?: string[];
 	skillPaths?: string[];
 	promptTemplatePaths?: string[];
-	loadGlobalSkills?: boolean;
 	loadWorkspaceSkills?: boolean;
-	loadGlobalPrompts?: boolean;
 	loadWorkspacePrompts?: boolean;
 	loadWorkspaceContext?: boolean;
 }
@@ -408,7 +410,16 @@ export class TeamsStore {
 				result[key] = [...new Set(value.map((item) => item.trim()).filter(Boolean))];
 			}
 		}
-		for (const key of ["loadGlobalSkills", "loadWorkspaceSkills", "loadGlobalPrompts", "loadWorkspacePrompts", "loadWorkspaceContext"] as const) {
+		// 选用名单：非字符串项丢弃，去重后排序，空名单不保留。
+		for (const key of ["enabledSkills", "enabledPrompts"] as const) {
+			const value = input[key];
+			if (value !== undefined) {
+				if (!Array.isArray(value)) throw new Error(`piResources.${key} 必须是字符串数组`);
+				const names = [...new Set(value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean))].sort();
+				if (names.length) result[key] = names;
+			}
+		}
+		for (const key of ["loadWorkspaceSkills", "loadWorkspacePrompts", "loadWorkspaceContext"] as const) {
 			if (input[key] !== undefined) {
 				if (typeof input[key] !== "boolean") throw new Error(`piResources.${key} 必须是布尔值`);
 				result[key] = input[key];

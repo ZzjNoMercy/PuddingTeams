@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import { LoaderIcon, RefreshCwIcon, TrashIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -34,7 +35,6 @@ import type {
 } from "@/lib/types";
 import { isConnectorProbe } from "@/lib/types";
 import { AffectedNote, AvatarEditor, ConfigSchemaForm, SecretSchemaFields, SecretsEditor } from "@/components/agents/form-parts";
-import { PiResourcesSection } from "@/components/agents/pi-resources-section";
 
 /**
  * Agent 管理抽屉（§10.1），固定三分区：
@@ -1110,13 +1110,12 @@ export function AgentManageDialog({
 				</div>
 
 				{agent.connector?.connectorId === "pi" ? (
-					<PiResourcesSection
-						agent={agent}
-						onSaved={(updated, mutation) => {
-							onAgentChanged(updated);
-							if (mutation) setLastMutation(mutation);
-						}}
-					/>
+					<div className="rounded-md bg-muted/60 p-3 text-xs text-muted-foreground">
+						提示词与资源（systemPrompt / 技能 / 模板）已移至独立配置页：
+						<Link href={`/agents/${encodeURIComponent(agent.name)}`} className="ml-1 underline hover:text-foreground">
+							打开「{agent.name}」配置页
+						</Link>
+					</div>
 				) : null}
 
 				{/* 三分区页签 */}

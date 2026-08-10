@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { LoaderIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -11,7 +12,6 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { listModels, updateManager } from "@/lib/api";
 import type { AgentConfig, MutationResponse, PiManagerSettings } from "@/lib/types";
 import { AffectedNote, AvatarEditor } from "@/components/agents/form-parts";
-import { PiResourcesSection } from "@/components/agents/pi-resources-section";
 
 /**
  * pinned Pi Manager 编辑（§10.5）：与 worker 共用编辑 UI 的外壳（头像/描述），
@@ -228,13 +228,12 @@ export function ManagerDialog({
 					</label>
 				</div>
 
-				<PiResourcesSection
-					agent={agent}
-					onSaved={(updated, mutation) => {
-						onAgentChanged(updated);
-						if (mutation) setLastMutation(mutation);
-					}}
-				/>
+				<div className="rounded-md bg-muted/60 p-3 text-xs text-muted-foreground">
+					提示词与资源（systemPrompt / 技能 / 模板）已移至独立配置页：
+					<Link href={`/agents/${encodeURIComponent(agent.name)}`} className="ml-1 underline hover:text-foreground">
+						打开「{agent.name}」配置页
+					</Link>
+				</div>
 
 				{lastMutation ? <AffectedNote affected={lastMutation.affectedSessions} /> : null}
 
