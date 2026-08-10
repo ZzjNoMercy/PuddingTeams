@@ -1,0 +1,41 @@
+# __PACKAGE_NAME__
+
+__DISPLAY_NAME__ 声明式 Connector：纯 manifest 包，无代码接入 CLI（方案 §10.3
+两级模型第 1 级）。PuddingTeams 核心的 DeclarativeDriver 按 manifest 声明执行
+spawn/解码/归一，包内不需要任何 Driver 代码。
+
+## declarative schema 逐字段简表
+
+| 字段 | 含义 |
+| --- | --- |
+| `command` | 可执行文件名/路径（如 `node`、你的 CLI 名） |
+| `probe.args` | 探测 argv（如 `--version`），支持占位符 |
+| `probe.versionRegex` | 可选，从探测 stdout 提取上游版本号的正则 |
+| `operations.run.args` | run（新开 session）argv 模板 |
+| `operations.continue.args` | 可选，continue（续接 session）argv 模板 |
+| `operations.*.stdin` | `none`（默认，立即 EOF）/ `json`（写入 `{message, sessionHandle, requestId}` 后 EOF） |
+| `output.mode` | `jsonl`（逐行事件流）/ `single-json`（整个 stdout 是一个 JSON） |
+| `output.mapping` | 字段映射 DSL：`"$.<dot.path>@<eventType>[<filterPath>=<filterValue>]"`；key 只允许 `sessionHandle` / `runHandle` / `content` / `progress` / `error` / `usage.inputTokens` / `usage.outputTokens` |
+| `capabilities.operations` | 声明实际支持的操作子集（`run` 必选） |
+| `capabilities.interactionKinds` | 必须是空数组（见下方限制） |
+
+argv 模板占位符：`{message}`（任务文本）、`{sessionHandle}`（续接会话句柄）、
+`{requestId}`（幂等键）、`{packageDir}`（包安装目录，用于引用包内脚本如
+`{packageDir}/cli.mjs`）。
+
+## 限制
+
+- **不支持 respond / HITL**：声明式 Connector 无法做跨进程审批，
+  `capabilities.operations` 不得含 `respond`，`interactionKinds` 必须为空；
+  需要 HITL 的 Agent 请用代码型 Connector（`puddingteams extension init
+  --type connector`，不加 `--declarative`）；
+- 输出归一靠 mapping DSL 的固定子集，复杂协议（多路流、二进制、交互式
+  终端）超出表达能力时同样需要代码型 Connector；
+- 声明了 `operations.continue` 时 `capabilities.operations` 才能含
+  `continue`（声明与能力一致性由 manifest 校验强制）。
+
+## 安装
+
+在 PuddingTeams 里「安装 Extension」指向本目录即可；先跑
+`puddingteams extension validate <本目录>` 校验 manifest 与 `{packageDir}`
+引用文件是否齐全。

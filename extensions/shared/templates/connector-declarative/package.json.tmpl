@@ -1,0 +1,50 @@
+{
+	"name": "__PACKAGE_NAME__",
+	"version": "0.1.0",
+	"description": "__DESCRIPTION__",
+	"type": "module",
+	"files": [
+		"cli.mjs"
+	],
+	"puddingteams": {
+		"id": "__CONNECTOR_ID__",
+		"publisher": "puddingteams",
+		"displayName": "__DISPLAY_NAME__",
+		"version": "0.1.0",
+		"source": "external",
+		"kind": "connector",
+		"engines": {
+			"puddingteams": ">=0.1 <1"
+		},
+		"permissions": ["spawn"],
+		"connector": {
+			"id": "__CONNECTOR_ID__",
+			"displayName": "__DISPLAY_NAME__",
+			"apiVersion": "1",
+			"defaultTransport": "spawn",
+			"supportedTransports": ["spawn"],
+			"declarative": {
+				"command": "node",
+				"probe": { "args": ["{packageDir}/cli.mjs", "--version"], "versionRegex": "(\\d+\\.\\d+\\.\\d+)" },
+				"operations": {
+					"run": { "args": ["{packageDir}/cli.mjs", "run", "{message}"] },
+					"continue": { "args": ["{packageDir}/cli.mjs", "resume", "{sessionHandle}", "{message}"] }
+				},
+				"output": {
+					"mode": "jsonl",
+					"mapping": {
+						"sessionHandle": "$.session_id@session.started",
+						"runHandle": "$.run_id@session.started",
+						"progress": "$.text@progress",
+						"content": "$.text@message.completed",
+						"usage.inputTokens": "$.usage.input_tokens@done",
+						"usage.outputTokens": "$.usage.output_tokens@done"
+					}
+				},
+				"capabilities": { "operations": ["run", "continue", "cancel"], "interactionKinds": [] }
+			}
+		}
+	},
+	"keywords": ["puddingteams", "pwcp", "connector", "declarative"],
+	"license": "MIT"
+}

@@ -26,7 +26,9 @@ function ensureLoaded(): void {
 	loading ??= listAgents()
 		.then((agents) => {
 			for (const a of agents) {
-				hasAvatar.set(a.name, Boolean(a.avatar));
+				// 上传头像或 connector 包内默认头像（hasDefaultAvatar）都走 avatar URL；
+				// GET avatar 路由会上传优先、回退包内资源。
+				hasAvatar.set(a.name, Boolean(a.avatar || a.hasDefaultAvatar));
 				if (!versions.has(a.name)) versions.set(a.name, 0);
 			}
 			emit();

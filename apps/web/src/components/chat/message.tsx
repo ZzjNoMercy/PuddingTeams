@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { ChevronDownIcon, ChevronRightIcon, ExternalLinkIcon } from "lucide-react";
+import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
 	Message as AiMessage,
 	MessageContent,
@@ -16,7 +17,7 @@ import { Task, TaskContent, TaskTrigger } from "@/components/ai-elements/task";
 import { Badge } from "@/components/ui/badge";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { streamdownPlugins } from "@/core/streamdown/plugins";
-import { teamTaskWorker } from "@/lib/events";
+import { delegateWorker, isDelegateCall } from "@/lib/events";
 import type { ChatMessage, ToolCallView, WindowType } from "@/lib/types";
 import { WorkerAvatar } from "./worker-avatar";
 import { InteractionCard } from "./interaction-card";
@@ -64,9 +65,22 @@ function workerStatusBadge(status?: string) {
 }
 
 /**
+ * 展开/折叠前解除 StickToBottom 的吸底锁定：内容变高时它的 ResizeObserver
+ * 会把底部吸住（scrollTop 增大），导致被点击的卡片跳到视口顶部。官方 API
+ * stopScroll() 同步置 escapedFromLock + isAtBottom=false，随后的高度变化
+ * 不再触发吸底，标题保持原位、内容向下展开；用户向下滚动或折叠（负向
+ * resize）时库会自动恢复吸底。isNearBottom 不受影响，「回到底部」浮钮
+ * 也不会误现。
+ */
+function useEscapeBottomLock() {
+	const { stopScroll } = useStickToBottomContext();
+	return stopScroll;
+}
+
+/**
  * A worker-authored entry in the member message flow (§7): avatar + name +
  * status badge + task + result markdown, standing on its own instead of being
- * wrapped inside the manager bubble. Shared by direct/group team_task blocks
+ * wrapped inside the manager bubble. Shared by direct/group delegate tool blocks
  * and solo-synced pudding:task_result custom messages.
  */
 function WorkerTaskEntry({
@@ -88,28 +102,59 @@ function WorkerTaskEntry({
 	meta?: string;
 	children?: React.ReactNode;
 }) {
+	// worker 工作过程：运行中/无结果时展开，拿到结果后自动折叠（可手动再展开）。
+	const finished = !running && result !== undefined && result !== "";
+	const [open, setOpen] = useState(!finished);
+	const [wasFinished, setWasFinished] = useState(finished);
+	if (finished !== wasFinished) {
+		// render 期间按 props 变化调整 state：running→done 折叠一次。
+		setWasFinished(finished);
+		if (finished) setOpen(false);
+	}
+	const escapeBottomLock = useEscapeBottomLock();
 	return (
 		<div className="flex w-full items-start gap-2.5">
 			<WorkerAvatar name={worker} size={28} className="mt-0.5 shrink-0" />
 			<div className="min-w-0 flex-1">
-				<div className="flex items-center gap-2">
+				<button
+					type="button"
+					onClick={() => {
+						escapeBottomLock();
+						setOpen((v) => !v);
+					}}
+					className="flex items-center gap-2 text-left"
+				>
+					{open ? (
+						<ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground" />
+					) : (
+						<ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground" />
+					)}
 					<span className="truncate font-mono text-sm font-medium">{worker}</span>
 					{badge}
-				</div>
-				{task ? (
-					<p className="mt-1 text-xs text-muted-foreground">
+				</button>
+				{open ? (
+					<>
+						{task ? (
+							<p className="mt-1 text-xs text-muted-foreground">
+								<span className="mr-1.5 text-muted-foreground/60">任务：</span>
+								<span className="whitespace-pre-wrap">{task}</span>
+							</p>
+						) : null}
+						{running ? <p className="mt-1 text-xs text-muted-foreground">等待 worker 完成…</p> : null}
+						{children}
+						{result !== undefined && result !== "" && (
+							<div className={`mt-1 text-sm ${isError ? "text-destructive" : ""}`}>
+								<MessageResponse {...streamdownPlugins}>{result}</MessageResponse>
+							</div>
+						)}
+						{meta ? <p className="mt-1 text-xs text-muted-foreground/70 tabular-nums">{meta}</p> : null}
+					</>
+				) : task ? (
+					<p className="mt-1 truncate text-xs text-muted-foreground">
 						<span className="mr-1.5 text-muted-foreground/60">任务：</span>
-						<span className="whitespace-pre-wrap">{task}</span>
+						{task}
 					</p>
 				) : null}
-				{running ? <p className="mt-1 text-xs text-muted-foreground">等待 worker 完成…</p> : null}
-				{children}
-				{result !== undefined && result !== "" && (
-					<div className={`mt-1 text-sm ${isError ? "text-destructive" : ""}`}>
-						<MessageResponse {...streamdownPlugins}>{result}</MessageResponse>
-					</div>
-				)}
-				{meta ? <p className="mt-1 text-xs text-muted-foreground/70 tabular-nums">{meta}</p> : null}
 			</div>
 		</div>
 	);
@@ -127,14 +172,15 @@ function toolCallMeta(call: ToolCallView): string | undefined {
 		details.exitCode !== undefined ? `exit ${details.exitCode}` : undefined,
 	]
 		.filter((x): x is string => Boolean(x))
+		.filter((x, i, arr) => arr.indexOf(x) === i)
 		.join(" · ");
 }
 
-/** Specialized card for team_task delegation — rendered as a member message
+/** Specialized card for a delegate tool call — rendered as a member message
  * (worker avatar + name + result), with the raw tool call kept expandable. */
-function TeamTaskCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow?: (windowId: string) => void }) {
-	const args = call.args as { task?: string; model?: string } | undefined;
-	const worker = teamTaskWorker(call);
+function DelegateCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow?: (windowId: string) => void }) {
+	const args = call.args as { task?: string } | undefined;
+	const worker = delegateWorker(call);
 	const details = call.details as
 		| {
 				status?: string;
@@ -148,7 +194,17 @@ function TeamTaskCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow
 		  }
 		| undefined;
 	const [open, setOpen] = useState(false);
+	// 任务/结果主体：运行中展开看进度，完成后自动折叠（可手动再展开）。
+	const finished = call.status === "done" || call.status === "error";
+	const [bodyOpen, setBodyOpen] = useState(!finished);
+	const [wasFinished, setWasFinished] = useState(finished);
+	if (finished !== wasFinished) {
+		// render 期间按 props 变化调整 state（React 推荐模式）：running→done 折叠一次。
+		setWasFinished(finished);
+		if (finished) setBodyOpen(false);
+	}
 	const meta = toolCallMeta(call);
+	const escapeBottomLock = useEscapeBottomLock();
 
 	// 409 冲突 + 带 pending interactionId：冲突优先显示，并保留对账的 interactionId。
 	const conflict = details?.status === "conflict" || details?.conflict;
@@ -215,13 +271,22 @@ function TeamTaskCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow
 	return (
 		<div className="w-full overflow-hidden rounded-lg bg-muted">
 			<div className="flex items-center justify-between gap-2 px-3 pt-2">
-				<div className="flex min-w-0 items-center gap-2">
-					<WorkerAvatar name={worker ?? "team_task"} size={20} />
-					<span className="truncate font-mono text-sm font-medium">{worker ?? "team_task"}</span>
-					{args?.model ? (
-						<span className="truncate text-xs text-muted-foreground">model: {args.model}</span>
-					) : null}
-				</div>
+				<button
+					type="button"
+					onClick={() => {
+						escapeBottomLock();
+						setBodyOpen((v) => !v);
+					}}
+					className="flex min-w-0 items-center gap-2 text-left"
+				>
+					{bodyOpen ? (
+						<ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground" />
+					) : (
+						<ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground" />
+					)}
+					<WorkerAvatar name={worker ?? "worker"} size={20} />
+					<span className="truncate font-mono text-sm font-medium">{worker ?? "worker"}</span>
+				</button>
 				<div className="flex shrink-0 items-center gap-2">
 					{details?.synced && details.windowId ? (
 						<button
@@ -236,43 +301,53 @@ function TeamTaskCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow
 					{statusBadge(call)}
 				</div>
 			</div>
-			<div className="flex flex-col gap-2 p-3">
-				{args?.task ? (
-					<p className="text-xs text-muted-foreground">
-						<span className="mr-1.5 text-muted-foreground/60">任务：</span>
-						<span className="whitespace-pre-wrap">{args.task}</span>
-					</p>
-				) : null}
-				{call.status === "running" ? (
-					<p className="text-xs text-muted-foreground">等待 worker 完成…</p>
-				) : null}
-				{call.result !== undefined && (
-					<div className={`text-sm ${call.isError ? "text-destructive" : ""}`}>
-						<MessageResponse {...streamdownPlugins}>{call.result}</MessageResponse>
-					</div>
-				)}
-				{meta ? <p className="text-xs text-muted-foreground/70 tabular-nums">{meta}</p> : null}
-				<Collapsible open={open} onOpenChange={setOpen}>
-					<CollapsibleTrigger className="flex items-center gap-1 text-xs text-muted-foreground/70 hover:text-foreground">
-						{open ? <ChevronDownIcon className="size-3.5" /> : <ChevronRightIcon className="size-3.5" />}
-						工具详情
-					</CollapsibleTrigger>
-					<CollapsibleContent className="mt-2">
-						<pre className="overflow-x-auto rounded-md bg-muted/60 p-2 text-xs">
-							{JSON.stringify(
-								{
-									worker,
-									status: details?.status,
-									task: args?.task,
-									model: args?.model,
-								},
-								null,
-								2,
-							)}
-						</pre>
-					</CollapsibleContent>
-				</Collapsible>
-			</div>
+			{bodyOpen ? (
+				<div className="flex flex-col gap-2 p-3">
+					{args?.task ? (
+						<p className="text-xs text-muted-foreground">
+							<span className="mr-1.5 text-muted-foreground/60">任务：</span>
+							<span className="whitespace-pre-wrap">{args.task}</span>
+						</p>
+					) : null}
+					{call.status === "running" ? (
+						<p className="text-xs text-muted-foreground">等待 worker 完成…</p>
+					) : null}
+					{call.result !== undefined && (
+						<div className={`text-sm ${call.isError ? "text-destructive" : ""}`}>
+							<MessageResponse {...streamdownPlugins}>{call.result}</MessageResponse>
+						</div>
+					)}
+					{meta ? <p className="text-xs text-muted-foreground/70 tabular-nums">{meta}</p> : null}
+					<Collapsible open={open} onOpenChange={setOpen}>
+						<CollapsibleTrigger className="flex items-center gap-1 text-xs text-muted-foreground/70 hover:text-foreground">
+							{open ? <ChevronDownIcon className="size-3.5" /> : <ChevronRightIcon className="size-3.5" />}
+							工具详情
+						</CollapsibleTrigger>
+						<CollapsibleContent className="mt-2">
+							<pre className="overflow-x-auto rounded-md bg-muted/60 p-2 text-xs">
+								{JSON.stringify(
+									{
+										worker,
+										status: details?.status,
+										task: args?.task,
+									},
+									null,
+									2,
+								)}
+							</pre>
+						</CollapsibleContent>
+					</Collapsible>
+				</div>
+			) : (
+				<div className="px-3 pb-2 pt-1">
+					{args?.task ? (
+						<p className="truncate text-xs text-muted-foreground">
+							<span className="mr-1.5 text-muted-foreground/60">任务：</span>
+							{args.task}
+						</p>
+					) : null}
+				</div>
+			)}
 		</div>
 	);
 }
@@ -286,7 +361,7 @@ function ToolCallItem({
 	windowType?: WindowType;
 	onOpenWindow?: (windowId: string) => void;
 }) {
-	if (call.name === "team_task") {
+	if (isDelegateCall(call)) {
 		// §7 成员消息流：direct/group 下脱离 manager 气泡，渲染为 worker 独立条目。
 		if (windowType && windowType !== "solo") {
 			const details = call.details as
@@ -296,14 +371,14 @@ function ToolCallItem({
 			if (details?.interactionId) {
 				return (
 					<WorkerTaskEntry
-						worker={teamTaskWorker(call) ?? "worker"}
+						worker={delegateWorker(call) ?? "worker"}
 						task={(call.args as { task?: string } | undefined)?.task}
 						badge={statusBadge(call)}
 					>
 						<div className="mt-1">
 							<InteractionCard
 								interactionId={details.interactionId}
-								worker={teamTaskWorker(call) ?? "worker"}
+								worker={delegateWorker(call) ?? "worker"}
 								requests={details.requests}
 								revision={details.revision}
 								windowId={details.windowId}
@@ -316,7 +391,7 @@ function ToolCallItem({
 			const args = call.args as { task?: string } | undefined;
 			return (
 				<WorkerTaskEntry
-					worker={teamTaskWorker(call) ?? "team_task"}
+					worker={delegateWorker(call) ?? "worker"}
 					task={args?.task}
 					result={call.result}
 					badge={statusBadge(call)}
@@ -326,7 +401,7 @@ function ToolCallItem({
 				/>
 			);
 		}
-		return <TeamTaskCard call={call} onOpenWindow={onOpenWindow} />;
+		return <DelegateCard call={call} onOpenWindow={onOpenWindow} />;
 	}
 	return (
 		<Task defaultOpen={call.status === "running" || call.status === "error"}>
@@ -459,11 +534,11 @@ export function Message({
 		Boolean(message.thinking) || (message.streaming && !message.content && message.toolCalls.length === 0);
 	const showContent = Boolean(message.content) || message.error;
 
-	// §7: in direct/group windows team_task blocks leave the manager bubble and
-	// render as standalone worker entries; other tools stay inside.
+	// §7: in direct/group windows delegate tool blocks leave the manager bubble
+	// and render as standalone worker entries; other tools stay inside.
 	const memberFlow = windowType === "direct" || windowType === "group";
-	const bubbleCalls = memberFlow ? message.toolCalls.filter((c) => c.name !== "team_task") : message.toolCalls;
-	const workerCalls = memberFlow ? message.toolCalls.filter((c) => c.name === "team_task") : [];
+	const bubbleCalls = memberFlow ? message.toolCalls.filter((c) => !isDelegateCall(c)) : message.toolCalls;
+	const workerCalls = memberFlow ? message.toolCalls.filter((c) => isDelegateCall(c)) : [];
 	const showBubble = showThinking || showContent || bubbleCalls.length > 0;
 
 	return (

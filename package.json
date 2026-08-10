@@ -18,6 +18,10 @@
     "dev:server": "pnpm --filter @puddingteams/server run dev",
     "dev:web": "pnpm --filter @puddingteams/web run dev",
     "build": "pnpm -r run build",
-    "typecheck": "pnpm -r run typecheck"
+    "typecheck": "pnpm -r run typecheck",
+    "smoke:golden": "pnpm --filter @puddingteams/server exec tsx scripts/connector-smoke.ts echo",
+    "smoke:real:codex": "pnpm --filter @puddingteams/server exec tsx scripts/connector-smoke.ts codex",
+    "smoke:real:claude": "pnpm --filter @puddingteams/server exec tsx scripts/connector-smoke.ts claude-code",
+    "verify:baseline": "pnpm --filter @puddingteams/server test && pnpm --filter @puddingteams/server typecheck && pnpm --filter @puddingteams/web typecheck && pnpm --filter @puddingteams/web lint && pnpm run smoke:golden && pnpm --filter @puddingteams/web build"
   }
 }

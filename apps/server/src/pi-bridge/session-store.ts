@@ -7,11 +7,23 @@ import {
 	SettingsManager,
 	type AgentSession,
 	type CreateAgentSessionOptions,
+	type InlineExtension,
 } from "@earendil-works/pi-coding-agent";
 import { unlink } from "node:fs/promises";
-import type { TeamsStore, WindowType } from "../store/teams.js";
-import { createTeamTaskTool } from "./team-task.js";
+import { existsSync } from "node:fs";
+import type { PiManagerSettings, PiResourceConfig, TeamsStore } from "../store/teams.js";
+import type { WorkStateStore } from "../store/work-state.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
+import { ExtensionCatalog, delegateToolName, toolSafeId } from "../agent-runtime/extensions.js";
+import {
+	planManagerTools,
+	buildManagerExtensionFactories,
+	CORE_TOOL_SEARCH,
+	type ManagedToolPlan,
+	type ManagerWindowContext,
+} from "./agent-extensions.js";
+import { sharedModelRuntime } from "./model-runtime.js";
+import { combinePiPrompt, piResourceLoaderOptions } from "./pi-resources.js";
 
 export interface SessionSummary {
 	id: string;
@@ -55,53 +67,62 @@ type PiModel = NonNullable<CreateAgentSessionOptions["model"]>;
  */
 export class PiSessionStore {
 	private active = new Map<string, AgentSession>();
-	private runtimePromise: Promise<ModelRuntime> | null = null;
+	private readonly catalog: ExtensionCatalog;
+	/** 装配时已注册到会话的受管工具名（撤权时据此识别“该会话自己的”工具）。 */
+	private assembledManaged = new Map<string, Set<string>>();
+	/** 配置变化标记（§3.3.5）：Session 空闲时重建 ResourceLoader/AgentSession。 */
+	private runtimeDirty = new Set<string>();
+	private unsubscribeTeams?: () => void;
 
 	constructor(
 		private readonly cwd: string,
 		private readonly sessionDir: string,
 		private readonly teamsStore?: TeamsStore,
 		private readonly invoker?: AgentInvoker,
-	) {}
-
-	/** Custom tools registered into every manager session (team_task). `solo`
-	 * decides whether the tool routes tasks to direct windows (§4) — the
-	 * caller already resolved the window context for guidance shaping. */
-	private customToolsFor(
-		getSessionId: () => string,
-		ctx?: { type: WindowType; members: string[] },
-	): CreateAgentSessionOptions["customTools"] {
-		return this.teamsStore && this.invoker
-			? [createTeamTaskTool(this.teamsStore, this, getSessionId, this.invoker, { solo: !ctx || ctx.type === "solo" })]
-			: undefined;
+		catalog?: ExtensionCatalog,
+		private readonly workStates?: WorkStateStore,
+	) {
+		this.catalog = catalog ?? new ExtensionCatalog();
+		if (this.teamsStore && this.invoker) {
+			// 撤权（§3.3.6）：Agent/绑定/窗口成员变化后立即收紧活跃会话的
+			// active tools 并标记 runtimeDirty。
+			this.unsubscribeTeams = this.teamsStore.onChange(() => {
+				void this.revokeChangedTools().catch((err) =>
+					this.debugLog?.(`revokeChangedTools failed: ${err instanceof Error ? err.message : String(err)}`),
+				);
+			});
+		}
 	}
 
 	/**
-	 * System-prompt shaping for a window's manager sessions. solo → no
-	 * shaping (manager answers freely and may delegate); direct/group → the
-	 * manager is a relay: it must hand every user message to a worker via
-	 * team_task and never do the work itself. A user-edited window prompt
-	 * (`WindowConfig.prompt`) replaces the built-in relay guidance entirely.
+	 * System-prompt shaping for a window's manager sessions（§10.5 优先级：
+	 * window.prompt > manager 全局 prompt > 内置 relay guidance；solo 从此
+	 * 也有 prompt 入口——manager settings 的 prompt）。direct/group → the
+	 * manager is a relay: it must hand every user message to a worker via the
+	 * per-agent delegate tool and never do the work itself. A user-edited
+	 * window prompt (`WindowConfig.prompt`) replaces the built-in relay
+	 * guidance entirely.
 	 */
-	private guidanceFor(ctx?: { type: WindowType; members: string[]; prompt?: string }): string | undefined {
+	static resolveGuidance(ctx: ManagerWindowContext | undefined, _legacySettings?: PiManagerSettings): string | undefined {
 		if (!ctx || ctx.type === "solo") return undefined;
 		const members = ctx.members.filter(Boolean);
 		if (members.length === 0) return undefined;
 		if (ctx.prompt?.trim()) return ctx.prompt.trim();
 		if (ctx.type === "direct") {
 			const w = members[0]!;
+			const tool = delegateToolName(w);
 			return [
 				`当前是单聊窗口，用户的消息是发给 worker「${w}」的。`,
 				"规则：",
-				`1. 用户的每一条请求都用 team_task 工具委托给 worker「${w}」（worker 参数填 ${w}），不要自己动手执行，也不要直接作答。`,
+				`1. 用户的每一条请求都用 ${tool} 工具委托给 worker「${w}」，不要自己动手执行，也不要直接作答。`,
 				"2. 拿到 worker 结果后把结果转述给用户（可简要概括），不要额外发挥。",
-				"3. 若 worker 需要更多输入（如选择分析模型），把可选内容转述给用户，等用户回复后再用 team_task 重试。",
+				`3. 若 worker 需要更多输入（如选择分析模型），把可选内容转述给用户，等用户回复后再用 ${tool} 续接。`,
 			].join("\n");
 		}
 		return [
 			`当前是群聊窗口，pi manager 是调度者，成员：${members.join("、")}。多个 worker 需要配合完成用户的整体目标。`,
 			"规则：",
-			"1. 把用户的整体目标拆解成可执行的子任务，逐个用 team_task 委托给最合适的 worker（可调用多个 worker、可分多步执行）。",
+			`1. 把用户的整体目标拆解成可执行的子任务；成员的委托工具默认未激活，先用 ${CORE_TOOL_SEARCH} 按 worker 名激活对应的 agent_<id>__delegate 工具，再逐个委托给最合适的 worker（可调用多个 worker、可分多步执行）。`,
 			"2. 用户指名 worker 时，优先把相关子任务委托给它。",
 			"3. 结合之前 worker 返回的结果决定下一步：后续子任务可引用/续接先前结果，需要接力时安排好 worker 之间的顺序。",
 			"4. 需求或关键参数模糊时先向用户澄清，不要自行臆测。",
@@ -109,34 +130,175 @@ export class PiSessionStore {
 		].join("\n");
 	}
 
-	/** Resource loader that appends the window relay guidance to the manager's
-	 * system prompt. Only built when a session belongs to a direct/group window. */
-	private async relayLoader(guidance: string): Promise<DefaultResourceLoader> {
+	/** pinned manager 的可编辑配置（§10.5）；未配置 TeamsStore 时为空。 */
+	private async managerSettings(): Promise<PiManagerSettings | undefined> {
+		return (await this.teamsStore?.getManager())?.manager;
+	}
+
+	private async managerResources(): Promise<PiResourceConfig | undefined> {
+		return (await this.teamsStore?.getManager())?.piResources;
+	}
+
+	/**
+	 * manager Session 的统一装配（§3.3）：对 solo/direct/group 创建同一类
+	 * ResourceLoader——组合窗口 relay guidance、core Extension（roster prompt
+	 * 注入 + search_agent_tools）以及 roster Agent 的基础/专属 Extension
+	 * factories。`create()` 与从 JSONL `open()` 都走这里，保证重启前后
+	 * Extension 集合一致。
+	 */
+	private async managerResourceLoader(
+		ctx: ManagerWindowContext | undefined,
+		getSessionId: () => string,
+		cwd: string,
+		settings?: PiManagerSettings,
+		resources?: PiResourceConfig,
+	): Promise<{ loader: DefaultResourceLoader; plan: ManagedToolPlan }> {
 		const agentDir = getAgentDir();
+		let plan: ManagedToolPlan = { managed: new Set(), active: new Set(), agents: [] };
+		let factories: InlineExtension[] = [];
+		if (this.teamsStore && this.invoker) {
+			plan = await planManagerTools(this.teamsStore, this.catalog, ctx);
+			factories = buildManagerExtensionFactories(plan, {
+				store: this.teamsStore,
+				sessions: this,
+				invoker: this.invoker,
+				catalog: this.catalog,
+				workStates: this.workStates,
+				getSessionId,
+				ctx,
+				resolveContext: () => this.windowContextOf(getSessionId()),
+				log: (msg) => this.debugLog?.(msg),
+			});
+		}
+		const guidance = PiSessionStore.resolveGuidance(ctx);
 		const loader = new DefaultResourceLoader({
-			cwd: this.cwd,
+			cwd,
 			agentDir,
-			settingsManager: SettingsManager.create(this.cwd, agentDir),
-			systemPromptOverride: (base) => `${base ?? ""}\n\n${guidance}`,
+			settingsManager: SettingsManager.create(cwd, agentDir),
+			extensionFactories: factories,
+			...piResourceLoaderOptions(resources, cwd, agentDir),
+			// noExtensions 只控制 pi-native Extension；平台 inline core/delegation
+			// factories 不受影响。Skills/templates/context 全部由 piResources 决定。
+			...(settings?.noExtensions ? { noExtensions: true } : {}),
+			systemPromptOverride: (base) => combinePiPrompt(base, resources, guidance),
 		});
 		await loader.reload();
-		return loader;
+		return { loader, plan };
+	}
+
+	/** create()/open() 共用的会话装配：loader + 初始 active tools 策略。 */
+	private async assembleSession(opts: {
+		sessionManager: SessionManager;
+		model?: PiModel;
+		ctx?: ManagerWindowContext;
+		cwd: string;
+		getSessionId: () => string;
+	}): Promise<AgentSession> {
+		const settings = await this.managerSettings();
+		const resources = await this.managerResources();
+		const { loader, plan } = await this.managerResourceLoader(opts.ctx, opts.getSessionId, opts.cwd, settings, resources);
+		const guidance = PiSessionStore.resolveGuidance(opts.ctx);
+		// 单聊/群聊 relay：manager 只保留委托工具，不能自己动手。solo 的
+		// manager prompt 只是人格/规则，不影响内置工具；§10.5 的
+		// builtinTools:false 则在任何窗口都关闭内置工具。
+		const isRelay = opts.ctx !== undefined && opts.ctx.type !== "solo";
+		const stripBuiltin = (isRelay && guidance !== undefined) || settings?.builtinTools === false;
+		// §10.5 默认模型：显式选择的模型优先，否则用 manager 配置的默认模型
+		// （解析失败不阻断建会话，回退 SDK 默认）。
+		let model = opts.model;
+		if (!model && settings?.model) {
+			model = await this.resolveModel(settings.model).catch((err: unknown) => {
+				this.debugLog?.(`manager 默认模型解析失败：${err instanceof Error ? err.message : String(err)}`);
+				return undefined;
+			});
+		}
+		const { session } = await createAgentSession({
+			cwd: opts.cwd,
+			sessionManager: opts.sessionManager,
+			...(model ? { model } : {}),
+			...(settings?.thinkingLevel ? { thinkingLevel: settings.thinkingLevel } : {}),
+			resourceLoader: loader,
+			...(stripBuiltin ? { noTools: "builtin" as const } : {}),
+		});
+		// 激活策略（§3.3）：direct 默认激活该 Agent 的基础委托工具 + always
+		// 工具；solo/group 默认只激活 core search 工具，其余预注册但
+		// inactive，由 search_agent_tools 按需纯加法激活。
+		const current = session.getActiveToolNames();
+		session.setActiveToolsByName(current.filter((n) => !plan.managed.has(n) || plan.active.has(n)));
+		this.assembledManaged.set(session.sessionId, plan.managed);
+		return session;
+	}
+
+	/**
+	 * 立即撤权（§3.3.6）：配置变化后，活跃会话里不再允许的工具立刻从
+	 * active tools 移除（新增 Agent 的工具要等空闲重建才会出现）；所有活跃
+	 * 会话标记 runtimeDirty，下次空闲 open 时彻底重建。
+	 * §10.5：manager 的 thinking level 是运行时即改项，这里同步应用到
+	 * 所有活跃会话。
+	 */
+	private async revokeChangedTools(): Promise<void> {
+		if (!this.teamsStore) return;
+		const thinkingLevel = (await this.managerSettings())?.thinkingLevel;
+		for (const [id, session] of this.active) {
+			const ctx = await this.windowContextOf(id);
+			const plan = await planManagerTools(this.teamsStore, this.catalog, ctx);
+			const assembled = this.assembledManaged.get(id) ?? new Set<string>();
+			const active = session.getActiveToolNames();
+			const next = active.filter((n) => !assembled.has(n) || plan.active.has(n));
+			if (next.length !== active.length) session.setActiveToolsByName(next);
+			if (thinkingLevel && session.thinkingLevel !== thinkingLevel) {
+				session.setThinkingLevel(thinkingLevel);
+			}
+			this.runtimeDirty.add(id);
+		}
+	}
+
+	/**
+	 * 配置写操作后的同步入口（路由调用）：等待撤权/标记完成再计算统计，
+	 * 保证 API 响应里的 affectedSessions 是确定值而不是竞态快照。
+	 */
+	async syncAgentConfigChange(): Promise<void> {
+		await this.revokeChangedTools();
+	}
+
+	/** Extension 包更新/卸载后，所有活跃会话空闲时重建装配。 */
+	markAllDirty(): void {
+		for (const id of this.active.keys()) this.runtimeDirty.add(id);
+	}
+
+	/**
+	 * 受影响 manager Session 统计（§10.1 响应字段）：该 Agent 的工具出现在
+	 * 多少活跃会话的装配里（active_now=已立即撤权）、其中多少已标
+	 * runtimeDirty 等空闲重建（reload_pending）。
+	 */
+	agentSessionStats(agentName: string): { affectedSessions: number; activeNow: number; reloadPending: number } {
+		const prefix = `agent_${toolSafeId(agentName)}__`;
+		let affectedSessions = 0;
+		let reloadPending = 0;
+		for (const [id, assembled] of this.assembledManaged) {
+			if (!this.active.has(id)) continue;
+			if (![...assembled].some((n) => n.startsWith(prefix))) continue;
+			affectedSessions++;
+			if (this.runtimeDirty.has(id)) reloadPending++;
+		}
+		return { affectedSessions, activeNow: affectedSessions, reloadPending };
 	}
 
 	/** Window context for a session, resolved from the window store. */
 	private async windowContextOf(
 		sessionId: string,
-	): Promise<{ type: WindowType; members: string[]; prompt?: string } | undefined> {
+	): Promise<ManagerWindowContext | undefined> {
 		if (!this.teamsStore) return undefined;
 		const w = await this.teamsStore.windowForSession(sessionId);
 		if (!w) return undefined;
-		return { type: w.type, members: w.members, prompt: w.prompt };
+		const cwd = await this.teamsStore.workspaceFor(w.id);
+		return { type: w.type, members: w.members, prompt: w.prompt, workspaceId: w.workspaceId, cwd };
 	}
 
-	/** Shared model runtime (auth + model catalog), created on first use. */
+	/** Shared model runtime (auth + model catalog)：进程级单例（model-runtime.ts），
+	 * models.json/auth.json 变更后由写路径 reset，这里永远取最新装配。 */
 	private runtime(): Promise<ModelRuntime> {
-		this.runtimePromise ??= ModelRuntime.create();
-		return this.runtimePromise;
+		return sharedModelRuntime();
 	}
 
 	private static summarizeModel(model: PiModel): ModelSummary {
@@ -253,18 +415,17 @@ export class PiSessionStore {
 
 	async create(
 		modelRef?: string,
-		window?: { type: WindowType; members: string[]; prompt?: string },
+		window?: ManagerWindowContext,
 	): Promise<SessionSummary> {
 		const model = modelRef ? await this.resolveModel(modelRef) : undefined;
-		const guidance = this.guidanceFor(window);
+		const cwd = window?.cwd ?? this.cwd;
 		const binding: { sessionId: string } = { sessionId: "" };
-		const { session } = await createAgentSession({
-			cwd: this.cwd,
-			sessionManager: SessionManager.create(this.cwd, this.sessionDir),
-			...(model ? { model } : {}),
-			// 单聊/群聊：manager 只保留 team_task（relay），不能自己动手。
-			...(guidance ? { resourceLoader: await this.relayLoader(guidance), noTools: "builtin" as const } : {}),
-			customTools: this.customToolsFor(() => binding.sessionId, window),
+		const session = await this.assembleSession({
+			sessionManager: SessionManager.create(cwd, this.sessionDir),
+			model,
+			ctx: window,
+			cwd,
+			getSessionId: () => binding.sessionId,
 		});
 		binding.sessionId = session.sessionId;
 		return this.summarize(session);
@@ -285,18 +446,37 @@ export class PiSessionStore {
 	/** Return the live AgentSession for a session id, opening it from file if needed. */
 	async open(id: string): Promise<AgentSession> {
 		const existing = this.active.get(id);
-		if (existing) return existing;
+		if (existing) {
+			// 空闲安全 reload（§3.3.6）：配置变化标记过 runtimeDirty 的会话在
+			// 空闲时重建 ResourceLoader/AgentSession，彻底移除遗留 hooks；原
+			// JSONL 历史不动，重建只改变运行时装配。文件尚未落盘的会话（从未
+			// 收到消息）无法从 JSONL 重建——撤权已由 active tools 收紧完成，
+			// 保持内存会话，等首次落盘后的下次 open 再重建。
+			const rebuildable =
+				this.runtimeDirty.has(id) &&
+				existing.isIdle &&
+				Boolean(existing.sessionFile) &&
+				existsSync(existing.sessionFile!);
+			if (!rebuildable) return existing;
+			existing.dispose();
+			this.active.delete(id);
+			this.assembledManaged.delete(id);
+		}
+		this.runtimeDirty.delete(id);
 
 		const info = (await SessionManager.list(this.cwd, this.sessionDir)).find((s) => s.id === id);
 		if (!info) throw new Error(`Session not found: ${id}`);
 
 		const ctx = await this.windowContextOf(id);
-		const guidance = this.guidanceFor(ctx);
-		const { session } = await createAgentSession({
-			cwd: this.cwd,
+		if (this.teamsStore && !ctx) {
+			throw new Error(`Session has no Window owner: ${id}`);
+		}
+		const cwd = ctx?.cwd ?? this.cwd;
+		const session = await this.assembleSession({
 			sessionManager: SessionManager.open(info.path, this.sessionDir),
-			...(guidance ? { resourceLoader: await this.relayLoader(guidance), noTools: "builtin" as const } : {}),
-			customTools: this.customToolsFor(() => id, ctx),
+			ctx,
+			cwd,
+			getSessionId: () => id,
 		});
 		this.active.set(session.sessionId, session);
 		return session;
@@ -339,6 +519,8 @@ export class PiSessionStore {
 			session.dispose();
 			this.active.delete(id);
 		}
+		this.assembledManaged.delete(id);
+		this.runtimeDirty.delete(id);
 	}
 
 	/** True when the session is currently open in this process (even if it has
@@ -380,10 +562,14 @@ export class PiSessionStore {
 	}
 
 	async disposeAll(): Promise<void> {
+		this.unsubscribeTeams?.();
+		this.unsubscribeTeams = undefined;
 		for (const [id, session] of this.active) {
 			session.dispose();
 			this.active.delete(id);
 		}
+		this.assembledManaged.clear();
+		this.runtimeDirty.clear();
 	}
 
 	private async summarize(session: AgentSession): Promise<SessionSummary> {

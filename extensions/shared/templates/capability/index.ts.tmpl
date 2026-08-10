@@ -1,0 +1,28 @@
+const Params = {
+	type: "object",
+	required: ["input"],
+	properties: { input: { type: "string" } },
+} as const;
+
+export const extension = {
+	manifest: {
+		id: "__CONNECTOR_ID__",
+		kind: "capability" as const,
+		name: "__DISPLAY_NAME__",
+		version: "0.1.0",
+		tools: [{ name: "example", activation: "searchable" as const }],
+	},
+	register(ctx: { registerTool(tool: unknown): void }) {
+		ctx.registerTool({
+			name: "example",
+			label: "__DISPLAY_NAME__ Example",
+			description: "示例工具",
+			parameters: Params,
+			async execute(_toolCallId: string, params: { input: string }) {
+				return { content: [{ type: "text", text: params.input }], details: {} };
+			},
+		});
+	},
+};
+
+export default extension;

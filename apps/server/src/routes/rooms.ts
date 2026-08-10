@@ -1,6 +1,10 @@
 import type { FastifyInstance } from "fastify";
 import { TeamsStore, type AgentConfig, type WindowConfig, type WindowType } from "../store/teams.js";
 import { PiSessionStore } from "../pi-bridge/session-store.js";
+import type { AgentInvoker } from "../agent-runtime/invoker.js";
+import { isWorkspaceDirectoryAvailable, type WorkspaceSummary } from "../store/workspaces.js";
+import type { WorkerBinding } from "../store/teams.js";
+import type { WorkStateStore } from "../store/work-state.js";
 
 export interface RoomSessionSummary {
 	id: string;
@@ -22,11 +26,14 @@ export interface RoomSummary {
 	activeSession: string;
 	pinned: boolean;
 	/** Per-worker last session handle (multi-turn continuity). */
-	workerBindings: Record<string, { sessionHandle?: string; updatedAt: string }>;
+	workerBindings: Record<string, WorkerBinding>;
 	/** User-edited window system prompt ('' = default relay guidance). */
 	prompt: string;
-	/** 房间绑定的工作区根目录（绝对路径），可能为空字符串（未显式绑定）。 */
-	workspace?: string;
+	/** Window 创建时冻结的实际运行目录；无项目模式也有。 */
+	cwdSnapshot: string;
+	contextAvailable: boolean;
+	/** null means the intentional default-cwd chat mode. */
+	workspace: WorkspaceSummary | null;
 }
 
 const TYPE_ORDER: Record<WindowType, number> = { solo: 0, direct: 1, group: 2 };
@@ -46,7 +53,14 @@ async function buildWindowSummary(
 	const byId = new Map(list.map((s) => [s.id, s]));
 	const { sessions: ids, active } = await teams.windowSessionList(w.id);
 	const members = await teams.windowMembers(w.id);
+	const workspace = w.workspaceId
+		? (await teams.workspaces.list()).find((item) => item.id === w.workspaceId)
+		: undefined;
+	if (w.workspaceId && !workspace) throw new Error(`workspace not found: ${w.workspaceId}`);
 	const activeInfo = byId.get(active);
+	const contextAvailable = workspace
+		? workspace.available && workspace.canonicalPath === w.cwdSnapshot
+		: await isWorkspaceDirectoryAvailable(w.cwdSnapshot, w.cwdSnapshot);
 	// 窗口名：自定义名优先，否则按类型派生（"与 X 单聊"等）。active session 的
 	// LLM 标题不混入窗口名——侧栏/头部把它作为第二行的会话上下文展示。
 	return {
@@ -70,14 +84,36 @@ async function buildWindowSummary(
 		pinned: Boolean(w.pinned),
 		workerBindings: w.workerBindings ?? {},
 		prompt: w.prompt ?? "",
-		workspace: w.workspace ?? "",
+		cwdSnapshot: w.cwdSnapshot,
+		contextAvailable,
+		workspace: workspace ?? null,
 	};
 }
 
-export function registerRoomsRoutes(app: FastifyInstance, sessions: PiSessionStore, teams: TeamsStore): void {
+export function registerRoomsRoutes(
+	app: FastifyInstance,
+	sessions: PiSessionStore,
+	teams: TeamsStore,
+	invoker?: AgentInvoker,
+	workStates?: WorkStateStore,
+): void {
+	const contextFor = async (w: WindowConfig) => ({
+		type: w.type,
+		members: w.members,
+		prompt: w.prompt,
+		workspaceId: w.workspaceId,
+		cwd: await teams.workspaceFor(w.id),
+	});
 	const ensureSolo = () =>
 		teams.ensureSoloWindow(
-			() => sessions.create(),
+			async (workspaceId, cwdSnapshot) => {
+				return sessions.create(undefined, {
+					type: "solo",
+					members: [],
+					workspaceId,
+					cwd: cwdSnapshot,
+				});
+			},
 			async (id) => (await sessions.list()).some((s) => s.id === id),
 		);
 
@@ -98,7 +134,7 @@ export function registerRoomsRoutes(app: FastifyInstance, sessions: PiSessionSto
 		if (dead.length === 0) return;
 		const live = w.sessions.filter((id) => isLive(id));
 		if (live.length === 0) {
-			const created = await sessions.create(undefined, { type: w.type, members: w.members, prompt: w.prompt });
+			const created = await sessions.create(undefined, await contextFor(w));
 			await teams.addWindowSession(w.id, created.id);
 		} else if (!isLive(w.activeSession)) {
 			await teams.setActiveWindowSession(w.id, live[0]!);
@@ -118,7 +154,7 @@ export function registerRoomsRoutes(app: FastifyInstance, sessions: PiSessionSto
 				TYPE_ORDER[a.type] - TYPE_ORDER[b.type] ||
 				new Date(b.modifiedAt).getTime() - new Date(a.modifiedAt).getTime(),
 		);
-		return { rooms };
+		return { rooms, defaultCwdSnapshot: teams.defaultContextCwd() };
 	});
 
 	app.get<{ Params: { id: string } }>("/api/rooms/:id", async (req, reply) => {
@@ -130,11 +166,20 @@ export function registerRoomsRoutes(app: FastifyInstance, sessions: PiSessionSto
 
 	/** 发起对话：direct（单聊）或 group（群聊）。solo 是置顶单例，不在此创建；
 	 * 单聊按 worker 去重——已存在则直接返回既有窗口。 */
-	app.post<{ Body: { type?: string; members?: string[]; name?: string; prompt?: string } }>(
+	app.post<{ Body: { type?: string; members?: string[]; name?: string; prompt?: string; workspaceId?: string } }>(
 		"/api/rooms",
 		async (req, reply) => {
 			const type = req.body?.type;
 			const members = [...new Set(req.body?.members ?? [])];
+			const workspaceId = req.body?.workspaceId?.trim() || undefined;
+			if (workspaceId) {
+				try {
+					await teams.workspaces.require(workspaceId);
+				} catch (err) {
+					return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+				}
+			}
+			const context = await teams.contextForWorkspace(workspaceId);
 			if (type !== "direct" && type !== "group") {
 				return reply
 					.code(400)
@@ -142,7 +187,7 @@ export function registerRoomsRoutes(app: FastifyInstance, sessions: PiSessionSto
 			}
 			if (type === "direct") {
 				if (members.length !== 1) return reply.code(400).send({ error: "单聊需要恰好 1 个 worker" });
-				const existing = await teams.findDirectWindow(members[0]!);
+				const existing = await teams.findDirectWindow(members[0]!, workspaceId);
 				if (existing) {
 					return { room: await buildWindowSummary(sessions, teams, existing), existed: true };
 				}
@@ -151,14 +196,38 @@ export function registerRoomsRoutes(app: FastifyInstance, sessions: PiSessionSto
 			}
 			const agents = await teams.listAgents();
 			const known = new Set(agents.map((a) => a.name));
+			const pinned = new Set(agents.filter((a) => a.pinned).map((a) => a.name));
 			for (const m of members) {
 				if (!known.has(m)) return reply.code(400).send({ error: `worker not found: ${m}` });
+				if (pinned.has(m)) return reply.code(400).send({ error: `「${m}」是内置 manager，不能作为窗口成员` });
 			}
 			try {
-				const created = await sessions.create(undefined, { type, members, prompt: req.body?.prompt });
+				if (type === "direct") {
+					let createdHere = false;
+					const w = await teams.ensureDirectWindow(members[0]!, workspaceId, async () => {
+						createdHere = true;
+						return sessions.create(undefined, {
+							type,
+							members,
+							prompt: req.body?.prompt,
+							workspaceId,
+							cwd: context.cwdSnapshot,
+						});
+					}, { name: req.body?.name, prompt: req.body?.prompt, cwdSnapshot: context.cwdSnapshot });
+					return { room: await buildWindowSummary(sessions, teams, w), existed: !createdHere };
+				}
+				const created = await sessions.create(undefined, {
+					type,
+					members,
+					prompt: req.body?.prompt,
+					workspaceId,
+					cwd: context.cwdSnapshot,
+				});
 				const w = await teams.createWindow({
 					type,
 					members,
+					workspaceId,
+					cwdSnapshot: context.cwdSnapshot,
 					name: req.body?.name,
 					prompt: req.body?.prompt,
 					sessionId: created.id,
@@ -175,7 +244,9 @@ export function registerRoomsRoutes(app: FastifyInstance, sessions: PiSessionSto
 		async (req, reply) => {
 			if (
 				!req.body ||
-				(req.body.name === undefined && req.body.members === undefined && req.body.prompt === undefined)
+				(req.body.name === undefined &&
+					req.body.members === undefined &&
+					req.body.prompt === undefined)
 			) {
 				return reply.code(400).send({ error: "nothing to update (name, members or prompt)" });
 			}
@@ -192,6 +263,90 @@ export function registerRoomsRoutes(app: FastifyInstance, sessions: PiSessionSto
 		},
 	);
 
+	/** 切项目默认克隆窗口；显式 in_place 才停止任务并重建全部 manager/worker Session。 */
+	app.post<{ Params: { id: string }; Body: { workspaceId?: string | null; mode?: "new_window" | "in_place" } }>(
+		"/api/rooms/:id/switch-workspace",
+		async (req, reply) => {
+			const source = await teams.getWindow(req.params.id);
+			if (!source) return reply.code(404).send({ error: "window not found" });
+			if (!req.body || !("workspaceId" in req.body)) {
+				return reply.code(400).send({ error: "workspaceId is required; use null for no workspace" });
+			}
+			const rawWorkspaceId = req.body.workspaceId;
+			if (rawWorkspaceId !== null && (typeof rawWorkspaceId !== "string" || !rawWorkspaceId.trim())) {
+				return reply.code(400).send({ error: "workspaceId must be a non-empty string or null" });
+			}
+			const workspaceId = rawWorkspaceId === null ? undefined : rawWorkspaceId!.trim();
+			let target;
+			try {
+				target = await teams.contextForWorkspace(workspaceId);
+			} catch (err) {
+				return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+			}
+			if (workspaceId === source.workspaceId && target.cwdSnapshot === source.cwdSnapshot) {
+				return { room: await buildWindowSummary(sessions, teams, source), existed: true };
+			}
+			if (req.body?.mode === "in_place" && source.type === "direct") {
+				const existing = await teams.findDirectWindow(source.members[0]!, workspaceId, target.cwdSnapshot);
+				if (existing && existing.id !== source.id) {
+					return reply.code(409).send({ error: "该 worker 在目标项目已有单聊；请使用默认切换打开既有窗口" });
+				}
+			}
+			try {
+				if (req.body?.mode !== "in_place") {
+					const ctx = {
+						type: source.type,
+						members: source.members,
+						prompt: source.prompt,
+						workspaceId,
+					cwd: target.cwdSnapshot,
+					};
+					if (source.type === "direct") {
+						const existing = await teams.findDirectWindow(source.members[0]!, workspaceId, target.cwdSnapshot);
+						const next = await teams.ensureDirectWindow(
+							source.members[0]!,
+							workspaceId,
+							() => sessions.create(undefined, ctx),
+							{ name: source.name, prompt: source.prompt, cwdSnapshot: target.cwdSnapshot },
+						);
+						return { room: await buildWindowSummary(sessions, teams, next), existed: Boolean(existing) };
+					}
+					if (source.type === "solo") {
+						return reply.code(400).send({ error: "solo 项目切换必须使用 in_place" });
+					}
+					const created = await sessions.create(undefined, ctx);
+					const next = await teams.createWindow({
+						type: source.type,
+						members: source.members,
+						name: source.name,
+						prompt: source.prompt,
+						workspaceId,
+						cwdSnapshot: target.cwdSnapshot,
+						sessionId: created.id,
+					});
+					return { room: await buildWindowSummary(sessions, teams, next), existed: false };
+				}
+				if (!invoker) throw new Error("in-place workspace switching is unavailable");
+				const switched = await invoker.switchWorkspaceInPlace(
+					source.id,
+					workspaceId,
+					(fresh, cwd) =>
+						sessions.create(undefined, {
+							type: fresh.type,
+							members: fresh.members,
+							prompt: fresh.prompt,
+							workspaceId,
+							cwd,
+						}),
+					(id) => sessions.remove(id),
+				);
+				return { room: await buildWindowSummary(sessions, teams, switched.window), existed: switched.existed };
+			} catch (err) {
+				return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+			}
+		},
+	);
+
 	/** 删除窗口（级联删除其全部 pi session）。solo 拒绝（405）。 */
 	app.delete<{ Params: { id: string } }>("/api/rooms/:id", async (req, reply) => {
 		const w = await teams.getWindow(req.params.id);
@@ -199,7 +354,10 @@ export function registerRoomsRoutes(app: FastifyInstance, sessions: PiSessionSto
 		if (w.pinned) return reply.code(405).send({ error: "solo 窗口不可删除" });
 		try {
 			const sessionIds = await teams.removeWindow(req.params.id);
-			for (const sid of sessionIds) await sessions.remove(sid);
+			for (const sid of sessionIds) {
+				await sessions.remove(sid);
+				await workStates?.removeSession(sid);
+			}
 			return reply.code(204).send();
 		} catch (err) {
 			return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
@@ -214,13 +372,28 @@ export function registerRoomsRoutes(app: FastifyInstance, sessions: PiSessionSto
 	});
 
 	/** 窗口内新建一个 pi session 并激活。 */
-	app.post<{ Params: { id: string } }>("/api/rooms/:id/sessions", async (req, reply) => {
+	app.post<{ Params: { id: string }; Body: { goal?: string; completionBoundary?: string } }>("/api/rooms/:id/sessions", async (req, reply) => {
 		const w = await teams.getWindow(req.params.id);
 		if (!w) return reply.code(404).send({ error: "window not found" });
 		try {
-			const created = await sessions.create(undefined, { type: w.type, members: w.members, prompt: w.prompt });
+			const created = await sessions.create(undefined, await contextFor(w));
 			await teams.addWindowSession(req.params.id, created.id);
-			return { session: created };
+			const goal = req.body?.goal?.trim();
+			const completionBoundary = req.body?.completionBoundary?.trim();
+			if ((goal && !completionBoundary) || (!goal && completionBoundary)) {
+				await teams.removeWindowSession(req.params.id, created.id);
+				await sessions.remove(created.id);
+				return reply.code(400).send({ error: "Goal 会话必须同时填写 goal 与 completionBoundary" });
+			}
+			const workState = goal && completionBoundary && workStates
+				? await workStates.create({
+						sessionId: created.id,
+						goal,
+						completionBoundary,
+						participantAgentIds: w.members,
+					})
+				: null;
+			return { session: created, workState };
 		} catch (err) {
 			return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
 		}
@@ -234,6 +407,7 @@ export function registerRoomsRoutes(app: FastifyInstance, sessions: PiSessionSto
 			if (blocked) return reply.code(400).send({ error: blocked });
 			if (!removed) return reply.code(404).send({ error: "session not found in window" });
 			await sessions.remove(req.params.sid);
+			await workStates?.removeSession(req.params.sid);
 			return reply.code(204).send();
 		},
 	);

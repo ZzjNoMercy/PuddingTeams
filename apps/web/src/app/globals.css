@@ -38,8 +38,10 @@
 	--color-sidebar: var(--muted);
 	--color-sidebar-foreground: var(--foreground);
 	--color-sidebar-border: var(--border);
-	--font-sans: var(--font-geist-sans);
-	--font-mono: var(--font-geist-mono);
+	/* System font stacks keep production builds deterministic and offline: no
+	   remote font fetch is required during `next build`. */
+	--font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Arial, sans-serif;
+	--font-mono: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
 }
 
 :root {
@@ -103,9 +105,8 @@
 body {
 	background: var(--background);
 	color: var(--foreground);
-	/* Geist Sans everywhere (loaded via next/font in layout.tsx); Geist Mono is
-	   applied selectively via the font-mono utility on code/identifiers only. */
-	font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+	/* `font-mono` remains available for code/identifiers through the theme stack. */
+	font-family: var(--font-sans);
 }
 
 /* Flatten streamdown code-block chrome to match the site's borderless style:

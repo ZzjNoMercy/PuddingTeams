@@ -1,6 +1,8 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { config } from "./config.js";
 import { PiSessionStore } from "./pi-bridge/session-store.js";
@@ -8,6 +10,7 @@ import { CredentialsStore } from "./store/credentials.js";
 import { TeamsStore } from "./store/teams.js";
 import { registerChatRoutes } from "./routes/chat.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
+import { registerProvidersRoutes } from "./routes/providers.js";
 import { registerAgentsRoutes } from "./routes/agents.js";
 import { registerRoomsRoutes } from "./routes/rooms.js";
 import { registerInteractionsRoutes } from "./routes/interactions.js";
@@ -15,7 +18,19 @@ import { AgentRuntime } from "./agent-runtime/runtime.js";
 import { DriverRegistry } from "./agent-runtime/driver-registry.js";
 import { DelegationStore } from "./agent-runtime/delegation-store.js";
 import { InteractionSecretStore } from "./agent-runtime/interaction-secret-store.js";
+import { ArtifactStore } from "./agent-runtime/artifact-store.js";
 import { AgentInvoker } from "./agent-runtime/invoker.js";
+import { ExtensionCatalog } from "./agent-runtime/extensions.js";
+import { ExtensionRegistry } from "./agent-runtime/extension-registry.js";
+import { puddingClawConnectorManifest, puddingClawExtensionHooks } from "./agent-runtime/puddingclaw-extension.js";
+import { piConnectorManifest, piExtensionHooks } from "./agent-runtime/pi-extension.js";
+import { registerExtensionsRoutes } from "./routes/extensions.js";
+import { registerArtifactsRoutes } from "./routes/artifacts.js";
+import { registerWorkspacesRoutes } from "./routes/workspaces.js";
+import { ProductSettingsStore } from "./store/product-settings.js";
+import { WorkStateStore } from "./store/work-state.js";
+import { registerWorkStateRoutes } from "./routes/work-state.js";
+import { UploadStore } from "./store/uploads.js";
 
 const app = Fastify({ logger: { level: "warn" } });
 
@@ -42,26 +57,88 @@ const delegations = new DelegationStore(config.teamsDir);
 await delegations.init();
 const interactionSecrets = new InteractionSecretStore(config.secretsDir);
 await interactionSecrets.init();
+// §15.6 交付物登记：Runtime 完成时写入，API 可查。
+const artifacts = new ArtifactStore(config.teamsDir);
+await artifacts.init();
+const workStates = new WorkStateStore(config.teamsDir);
+await workStates.init();
+const uploads = new UploadStore(config.teamsDir);
+await uploads.init();
 const drivers = new DriverRegistry();
-const runtime = new AgentRuntime(delegations, interactionSecrets, (agentId) => drivers.get(agentId), {
-	ttlMs: 24 * 60 * 60 * 1000,
-});
+// Phase 5：Extension 目录与安装。PuddingClaw 以 builtin Connector 进入目录；
+// 上次安装的本地 Extension 在 init 时重新注册（capability→catalog，connector→drivers）。
+const catalog = new ExtensionCatalog();
+const productSettings = new ProductSettingsStore(config.teamsDir);
+const extensionRegistry = new ExtensionRegistry(config.teamsDir, catalog, drivers);
+extensionRegistry.registerBuiltin(puddingClawConnectorManifest, puddingClawExtensionHooks());
+extensionRegistry.registerBuiltin(piConnectorManifest, piExtensionHooks());
+await extensionRegistry.init({ developerMode: (await productSettings.get()).developerMode });
+// P2（§9.5 双宿主包）：codex / claude-code Connector 本体在 extensions/connectors/*，
+// 第一方预置 = 启动时按仓库内路径安装/更新，不再代码内嵌 builtin。
+const REPO_CONNECTORS_DIR = fileURLToPath(new URL("../../../extensions/connectors", import.meta.url));
+const REPO_CAPABILITIES_DIR = fileURLToPath(new URL("../../../extensions/capabilities", import.meta.url));
+await extensionRegistry.installOrUpdateFromDir(path.join(REPO_CONNECTORS_DIR, "codex"));
+await extensionRegistry.installOrUpdateFromDir(path.join(REPO_CONNECTORS_DIR, "claude-code"));
+await extensionRegistry.installOrUpdateFromDir(path.join(REPO_CAPABILITIES_DIR, "minimal-tool"));
+const runtime: AgentRuntime = new AgentRuntime(
+	delegations,
+	interactionSecrets,
+	(agentId) => invoker.driverFor(agentId),
+	{ ttlMs: 24 * 60 * 60 * 1000 },
+	artifacts,
+);
 const invoker = new AgentInvoker(teams, runtime, drivers, credentials, config.agentCwd);
 
-const store = new PiSessionStore(config.agentCwd, config.sessionDir, teams, invoker);
+const store = new PiSessionStore(config.agentCwd, config.sessionDir, teams, invoker, catalog, workStates);
 invoker.setManagerSender((managerSessionId, message, options) =>
 	store.sendCustomMessage(managerSessionId, message, options),
 );
 // §1/§2 产品模型：solo 窗口是置顶单例，服务端启动即保证存在。
 await teams.ensureSoloWindow(
-	() => store.create(),
+	async (workspaceId, cwdSnapshot) => {
+		return store.create(undefined, {
+			type: "solo",
+			members: [],
+			workspaceId,
+			cwd: cwdSnapshot,
+		});
+	},
 	async (id) => (await store.list()).some((s) => s.id === id),
 );
-await registerChatRoutes(app, store, teams);
+await registerChatRoutes(app, store, teams, workStates, uploads);
 await registerSettingsRoutes(app);
-await registerAgentsRoutes(app, teams, credentials);
-await registerRoomsRoutes(app, store, teams);
+await registerProvidersRoutes(app, store);
+await registerAgentsRoutes(app, teams, {
+	credentials,
+	runtime,
+	invoker,
+	extensions: extensionRegistry,
+	sessions: store,
+});
+await registerExtensionsRoutes(app, { registry: extensionRegistry, teams, runtime, sessions: store, settings: productSettings });
+registerWorkspacesRoutes(app, teams.workspaces);
+await registerRoomsRoutes(app, store, teams, invoker, workStates);
 await registerInteractionsRoutes(app, runtime, invoker, teams);
+registerArtifactsRoutes(app, artifacts);
+registerWorkStateRoutes(app, workStates, teams, store, runtime);
+
+// §15.6 artifact.created 事件：与现有审批/任务结果同一通道——manager session
+// 的 custom message（pi JSONL → 订阅中的 websocket 下发浏览器），不触发新轮次。
+artifacts.onCreated((record) => {
+	void (async () => {
+		const delegation = await runtime.getDelegation(record.delegationId);
+		if (!delegation?.managerSessionId) return;
+		await store.sendCustomMessage(
+			delegation.managerSessionId,
+			{
+				customType: "pudding:artifact_created",
+				content: `worker「${record.producer}」产出交付物：${record.name}`,
+				details: { artifact: record },
+			},
+			{ triggerTurn: false },
+		);
+	})().catch(() => undefined);
+});
 
 // §4 health: startup smoke check — create + destroy an in-memory session.
 // Validates pi SDK wiring (packages load, resource loader resolves). Model

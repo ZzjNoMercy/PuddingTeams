@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { AgentRuntime, SessionConflictError } from "../agent-runtime/runtime.js";
@@ -9,11 +9,13 @@ import { InteractionSecretStore } from "../agent-runtime/interaction-secret-stor
 import { InteractionError } from "../agent-runtime/interaction-broker.js";
 import type { AgentDriver, AgentEvent, DriverCapabilities, InvocationContext } from "../agent-runtime/types.js";
 
+const PROJECT = { workspaceId: "workspace-1", cwdSnapshot: process.cwd(), agentRevision: 0 } as const;
+
 /**
- * Phase 0 锚测试：needs_input → manager 重试 team_task → 409 的失败复现。
+ * Phase 0 锚测试：needs_input → manager 重试委托 → 409 的失败复现。
  *
  * 现在（Phase 3 前）的行为是：manager 把 needs_input 当文字告诉用户，用户回复后
- * 再次调用 team_task，导致同一 PuddingClaw Session 上创建新 Run → 409。
+ * 再次调用委托工具，导致同一 PuddingClaw Session 上创建新 Run → 409。
  *
  * 修正后的状态机（§1.3）：waiting_input 不是 failed，正确路径是保存 pending
  * Interaction，用户审批后调用 Driver.respond 恢复**同一条 Run**，绝不重跑。
@@ -94,7 +96,7 @@ test("Phase0 anchor: needs_input 后同一 Session 二次 delegate 返回 409 �
 	const runtime = new AgentRuntime(delegations, secrets, () => driver, { ttlMs: 24 * 60 * 60 * 1000 });
 
 	const first = await runtime.delegate(
-		{ windowId: "win-1", managerSessionId: "sess-1", agentId: "puddingclaw", message: "分析上月销售", mode: "run" },
+		{ ...PROJECT, windowId: "win-1", managerSessionId: "sess-1", agentId: "puddingclaw", message: "分析上月销售", mode: "run" },
 		{ cwd: process.cwd(), env: {} },
 	);
 	assert.equal(first.status, "needs_input");
@@ -105,12 +107,12 @@ test("Phase0 anchor: needs_input 后同一 Session 二次 delegate 返回 409 �
 	assert.notEqual(interactionId, "", "interaction 必须有公开 id");
 
 	// 第二次 delegate：同一 Session 已有 waiting_input，Runtime 锁拒绝（409 语义）。
-	// 这是现在（Phase 3 前）manager 重试 team_task 得到 409 的等价复现：
+	// 这是现在（Phase 3 前）manager 重试委托工具得到 409 的等价复现：
 	// 同一 Session 已占用，绝不能重跑任务。
 	await assert.rejects(
 		() =>
 			runtime.delegate(
-				{ windowId: "win-1", managerSessionId: "sess-1", agentId: "puddingclaw", message: "分析上月销售", mode: "continue", sessionHandle: "worker-session-1" },
+				{ ...PROJECT, windowId: "win-1", managerSessionId: "sess-1", agentId: "puddingclaw", message: "分析上月销售", mode: "continue", sessionHandle: "worker-session-1" },
 				{ cwd: process.cwd(), env: {} },
 			),
 		(err) => err instanceof SessionConflictError && /active Run or pending input/.test(err.message),
@@ -145,7 +147,7 @@ test("Phase0 anchor: 非 pending 状态拒绝二次消费（revision 校验）",
 	const runtime = new AgentRuntime(delegations, secrets, () => driver, { ttlMs: 24 * 60 * 60 * 1000 });
 
 	const first = await runtime.delegate(
-		{ windowId: "win-1", managerSessionId: "sess-1", agentId: "puddingclaw", message: "x", mode: "run" },
+		{ ...PROJECT, windowId: "win-1", managerSessionId: "sess-1", agentId: "puddingclaw", message: "x", mode: "run" },
 		{ cwd: process.cwd(), env: {} },
 	);
 	const id = first.interaction!.id;
@@ -168,7 +170,7 @@ test("Phase0 anchor: 拒绝也是合法响应，Run 进入可解释终态", asyn
 	const runtime = new AgentRuntime(delegations, secrets, () => driver.driver, { ttlMs: 24 * 60 * 60 * 1000 });
 
 	const first = await runtime.delegate(
-		{ windowId: "win-1", managerSessionId: "sess-1", agentId: "puddingclaw", message: "x", mode: "run" },
+		{ ...PROJECT, windowId: "win-1", managerSessionId: "sess-1", agentId: "puddingclaw", message: "x", mode: "run" },
 		{ cwd: process.cwd(), env: {} },
 	);
 	const id = first.interaction!.id;
@@ -180,6 +182,71 @@ test("Phase0 anchor: 拒绝也是合法响应，Run 进入可解释终态", asyn
 	);
 	assert.equal(outcome.status, "rejected", "用户拒绝是合法响应");
 	assert.equal(driver.responded.length, 0, "拒绝不调用 driver.respond");
+});
+
+/**
+ * 安全收口回归：reject 是终态，必须释放 input_required 占的 session 锁
+ * （否则该 session 永久 409 直到重启），并清理加密 continuation token。
+ */
+test("安全收口: reject 释放 session 锁并清理 provider state", async () => {
+	const { delegations, secrets } = await makeRuntime();
+	const sessionId = "sess-rej-1";
+	const driver: AgentDriver = {
+		id: "puddingclaw",
+		async capabilities(): Promise<DriverCapabilities> {
+			return { operations: ["run", "continue", "respond", "cancel"], interactionKinds: ["permission"], progress: "none", transport: "spawn" };
+		},
+		async *run(): AsyncIterable<AgentEvent> {
+			yield { type: "started" };
+			yield {
+				type: "input_required",
+				result: {
+					agentId: "puddingclaw",
+					status: "needs_input",
+					sessionHandle: sessionId,
+					runHandle: "run-rej-1",
+					interaction: { id: "int_placeholder", kind: "permission", requests: [{ requestId: "perm-1", prompt: "允许？", options: ["once", "reject"] }] },
+				},
+				providerState: { continuation_token: "secret-token-rej" },
+			};
+		},
+		async *respond(): AsyncIterable<AgentEvent> {
+			yield { type: "failed", result: { agentId: "puddingclaw", status: "failed", errorCode: "x", error: "不应被调用", recoverable: false } };
+		},
+		async *continue(): AsyncIterable<AgentEvent> {
+			yield { type: "failed", result: { agentId: "puddingclaw", status: "failed", errorCode: "x", error: "x", recoverable: false } };
+		},
+		async probe(ctx: InvocationContext) {
+			return {
+				extensionInstalled: true, detected: true, configured: true, authenticated: "unknown", enabled: true,
+				compatibility: "supported" as const, capabilities: { operations: ["run", "continue", "respond"], interactionKinds: ["permission"], progress: "none" as const, transport: "spawn" as const }, issues: [],
+			};
+		},
+	};
+	const runtime = new AgentRuntime(delegations, secrets, () => driver, { ttlMs: 24 * 60 * 60 * 1000 });
+
+	const first = await runtime.delegate(
+		{ ...PROJECT, windowId: "win-1", managerSessionId: "sess-1", agentId: "puddingclaw", message: "x", mode: "run" },
+		{ cwd: process.cwd(), env: {} },
+	);
+	const interactionId = first.interaction!.id;
+	assert.ok(await secrets.getProviderState(interactionId), "needs_input 时 token 必须已加密落盘");
+
+	const outcome = await runtime.respond(
+		interactionId,
+		{ requestId: "rej-1", revision: 0, responses: [{ requestId: "perm-1", action: "reject" }] },
+		{ cwd: process.cwd(), env: {} },
+	);
+	assert.equal(outcome.status, "rejected");
+	assert.equal(outcome.delegation.status, "cancelled", "reject 后 delegation 进入 cancelled 终态");
+	assert.equal(await secrets.getProviderState(interactionId), undefined, "reject 后必须清理加密 token");
+
+	// 锁已释放：同一 session 可再次 delegate，不再抛 SessionConflictError。
+	const second = await runtime.delegate(
+		{ ...PROJECT, windowId: "win-1", managerSessionId: "sess-1", agentId: "puddingclaw", message: "y", mode: "continue", sessionHandle: sessionId },
+		{ cwd: process.cwd(), env: {} },
+	);
+	assert.ok(second.status !== "failed" || (second.result as { errorCode?: string }).errorCode !== "session_conflict", "reject 后同 session 必须可再次使用");
 });
 
 /**
@@ -229,7 +296,7 @@ test("Phase1 回归: boundary result 的 runHandle/sessionHandle 被持久化（
 	const runtime = new AgentRuntime(delegations, secrets, () => driver, { ttlMs: 24 * 60 * 60 * 1000 });
 
 	const first = await runtime.delegate(
-		{ windowId: "win-1", managerSessionId: "sess-1", agentId: "puddingclaw", message: "x", mode: "run" },
+		{ ...PROJECT, windowId: "win-1", managerSessionId: "sess-1", agentId: "puddingclaw", message: "x", mode: "run" },
 		{ cwd: process.cwd(), env: {} },
 	);
 	assert.equal(first.status, "needs_input");
@@ -280,3 +347,213 @@ test("Phase1 回归: needs_input 归一化只产生一个 request，选项不破
 	assert.equal(ps.continuation_token, undefined, "无 continuation_token 时 providerState 不含 token");
 });
 
+
+/**
+ * Phase6 回归：run 模式 completed outcome 必须携带更新后的 delegation
+ * （sessionHandle/runHandle）。invoker 据 outcome.delegation.sessionHandle
+ * 写 workerBindings 续接记忆——返回创建时的旧对象会让 run 模式永远丢
+ * sessionHandle，第二次委托退化成新会话（pi connector 实测复现）。
+ */
+test("Phase6 回归: run 模式 completed outcome 的 delegation 带 sessionHandle/runHandle", async () => {
+	const { delegations, secrets } = await makeRuntime();
+	const runId = "run-pi-1";
+	const sessionId = "sess-pi-1";
+	const driver: AgentDriver = {
+		id: "pi",
+		async capabilities(): Promise<DriverCapabilities> {
+			return { operations: ["run", "continue", "cancel"], interactionKinds: [], progress: "stream", transport: "sdk" };
+		},
+		async *run(): AsyncIterable<AgentEvent> {
+			// pi driver：started 才给出 handle，boundary result 也带（H1）。
+			yield { type: "started", sessionHandle: sessionId, runHandle: runId };
+			yield {
+				type: "completed",
+				result: { agentId: "pi", status: "completed", sessionHandle: sessionId, runHandle: runId, content: "完成" },
+			};
+		},
+		async *continue(): AsyncIterable<AgentEvent> {
+			yield { type: "started", sessionHandle: sessionId, runHandle: runId };
+			yield {
+				type: "completed",
+				result: { agentId: "pi", status: "completed", sessionHandle: sessionId, runHandle: runId, content: "完成" },
+			};
+		},
+		async *respond(): AsyncIterable<AgentEvent> {
+			yield { type: "failed", result: { agentId: "pi", status: "failed", errorCode: "interaction_unsupported", error: "x", recoverable: false } };
+		},
+		async probe(ctx: InvocationContext) {
+			return {
+				extensionInstalled: true, detected: true, configured: true, authenticated: "unknown", enabled: true,
+				compatibility: "supported" as const, capabilities: { operations: ["run", "continue", "cancel"], interactionKinds: [], progress: "stream" as const, transport: "sdk" as const }, issues: [],
+			};
+		},
+	};
+	const runtime = new AgentRuntime(delegations, secrets, () => driver, { ttlMs: 24 * 60 * 60 * 1000 });
+
+	const outcome = await runtime.delegate(
+		{ ...PROJECT, windowId: "win-1", managerSessionId: "sess-1", agentId: "pi", message: "x", mode: "run" },
+		{ cwd: process.cwd(), env: {} },
+	);
+	assert.equal(outcome.status, "completed");
+	assert.equal(outcome.delegation.sessionHandle, sessionId, "completed outcome 必须带更新后的 sessionHandle");
+	assert.equal(outcome.delegation.runHandle, runId, "completed outcome 必须带更新后的 runHandle");
+
+	// failed 终态同样不能返回创建时的旧 delegation。
+	const failedDriver: AgentDriver = {
+		...driver,
+		async *run(): AsyncIterable<AgentEvent> {
+			yield { type: "started", sessionHandle: "sess-pi-2", runHandle: "run-pi-2" };
+			yield {
+				type: "failed",
+				result: { agentId: "pi", status: "failed", sessionHandle: "sess-pi-2", runHandle: "run-pi-2", errorCode: "x", error: "x", recoverable: true },
+			};
+		},
+	};
+	const runtime2 = new AgentRuntime(delegations, secrets, () => failedDriver, { ttlMs: 24 * 60 * 60 * 1000 });
+	const failed = await runtime2.delegate(
+		{ ...PROJECT, windowId: "win-1", managerSessionId: "sess-1", agentId: "pi", message: "x", mode: "run" },
+		{ cwd: process.cwd(), env: {} },
+	);
+	assert.equal(failed.status, "failed");
+	assert.equal(failed.delegation.sessionHandle, "sess-pi-2", "failed outcome 同样必须带 sessionHandle");
+});
+
+test("P3-1: respond 忽略调用方的新 cwd，始终恢复到 Delegation.cwdSnapshot", async () => {
+	const { delegations, secrets, dir } = await makeRuntime();
+	const a = path.join(dir, "project-a");
+	const b = path.join(dir, "project-b");
+	mkdirSync(a);
+	mkdirSync(b);
+	let respondCwd = "";
+	const driver: AgentDriver = {
+		id: "snapshot",
+		async capabilities() {
+			return { operations: ["run", "respond"], interactionKinds: ["permission"], progress: "none", transport: "spawn" };
+		},
+		async *run(): AsyncIterable<AgentEvent> {
+			yield {
+				type: "input_required",
+				result: {
+					agentId: "snapshot", status: "needs_input", runHandle: "run-a", sessionHandle: "session-a",
+					interaction: { id: "placeholder", kind: "permission", requests: [{ requestId: "p1", prompt: "允许？" }] },
+				},
+			};
+		},
+		async *continue(): AsyncIterable<AgentEvent> { throw new Error("unused"); },
+		async *respond(_input, ctx): AsyncIterable<AgentEvent> {
+			respondCwd = ctx.cwd;
+			yield { type: "completed", result: { agentId: "snapshot", status: "completed", content: "ok" } };
+		},
+		async probe() { throw new Error("unused"); },
+	};
+	const runtime = new AgentRuntime(delegations, secrets, () => driver, { ttlMs: 60_000 });
+	const cwdSnapshot = realpathSync(a);
+	const delegated = await runtime.delegate(
+		{ workspaceId: "workspace-a", cwdSnapshot, windowId: "window-a", managerSessionId: "manager-a", agentId: "snapshot", agentRevision: 0, message: "x", mode: "run" },
+		{ cwd: cwdSnapshot, env: {} },
+	);
+	await runtime.respond(
+		delegated.interaction!.id,
+		{ requestId: "approve-a", revision: 0, responses: [{ requestId: "p1", action: "approve" }] },
+		{ cwd: realpathSync(b), env: {} },
+	);
+	assert.equal(respondCwd, cwdSnapshot);
+});
+
+test("P3-1: cancel abort 真实 Run，迟到 completed 不能复活 cancelled Delegation", async () => {
+	const dir = freshDir();
+	const store = new DelegationStore(dir);
+	await store.init();
+	const secrets = new InteractionSecretStore(dir);
+	await secrets.init();
+	let observedAbort = false;
+	const driver: AgentDriver = {
+		id: "slow",
+		async capabilities() {
+			return { operations: ["run", "cancel"], interactionKinds: [], progress: "stream", transport: "spawn" };
+		},
+		async *run(_input, ctx) {
+			await new Promise<void>((resolve) => {
+				if (ctx.signal?.aborted) return resolve();
+				ctx.signal?.addEventListener("abort", () => {
+					observedAbort = true;
+					resolve();
+				}, { once: true });
+			});
+			yield { type: "completed", result: { agentId: "slow", status: "completed", content: "late" } };
+		},
+		async *continue() {},
+		async *respond() {},
+		async probe() {
+			return { extensionInstalled: true, detected: true, configured: true, authenticated: "unknown", enabled: true, compatibility: "supported", capabilities: await this.capabilities(), issues: [] };
+		},
+	};
+	const runtime = new AgentRuntime(store, secrets, () => driver);
+	const outcomePromise = runtime.delegate(
+		{ ...PROJECT, windowId: "window-cancel", managerSessionId: "manager-cancel", agentId: "slow", message: "x", mode: "run" },
+		{ cwd: process.cwd(), env: {} },
+	);
+	let delegation;
+	for (let i = 0; i < 20 && !delegation; i += 1) {
+		delegation = (await runtime.listDelegations("window-cancel"))[0];
+		if (!delegation) await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	assert.ok(delegation);
+	await runtime.cancel(delegation.id, { cwd: process.cwd(), env: {} });
+	const outcome = await outcomePromise;
+	assert.equal(observedAbort, true);
+	assert.equal(outcome.delegation.status, "cancelled");
+	assert.equal((await runtime.getDelegation(delegation.id))?.status, "cancelled");
+});
+
+test("P3-1: terminal CAS 阻止 cancelled 被 completed 覆盖", async () => {
+	const store = new DelegationStore(freshDir());
+	await store.init();
+	const delegation = await store.createDelegation({
+		...PROJECT,
+		windowId: "window-cas",
+		managerSessionId: "manager-cas",
+		agentId: "slow",
+		operation: "run",
+	});
+	const cancelled = await store.transitionDelegation(delegation.id, ["running"], { status: "cancelled" });
+	const completed = await store.transitionDelegation(delegation.id, ["running"], {
+		status: "completed",
+		result: { agentId: "slow", status: "completed", content: "late" },
+	});
+	assert.equal(cancelled.applied, true);
+	assert.equal(completed.applied, false);
+	assert.equal(completed.record?.status, "cancelled");
+});
+
+test("P3-1: Driver throw 与无边界流都落持久化 failed，不留下 running 幽灵", async () => {
+	for (const behavior of ["throw", "empty"] as const) {
+		const dir = freshDir();
+		const store = new DelegationStore(dir);
+		await store.init();
+		const secrets = new InteractionSecretStore(dir);
+		await secrets.init();
+		const driver: AgentDriver = {
+			id: behavior,
+			async capabilities() {
+				return { operations: ["run"], interactionKinds: [], progress: "none", transport: "spawn" };
+			},
+			async *run() {
+				if (behavior === "throw") throw new Error("driver exploded");
+			},
+			async *continue() {},
+			async *respond() {},
+			async probe() {
+				return { extensionInstalled: true, detected: true, configured: true, authenticated: "unknown", enabled: true, compatibility: "supported", capabilities: await this.capabilities(), issues: [] };
+			},
+		};
+		const runtime = new AgentRuntime(store, secrets, () => driver);
+		const promise = runtime.delegate(
+			{ ...PROJECT, windowId: `window-${behavior}`, managerSessionId: "manager", agentId: behavior, message: "x", mode: "run" },
+			{ cwd: process.cwd(), env: {} },
+		);
+		if (behavior === "throw") await assert.rejects(() => promise, /driver exploded/);
+		else assert.equal((await promise).status, "failed");
+		assert.equal((await runtime.listDelegations(`window-${behavior}`))[0]?.status, "failed");
+	}
+});

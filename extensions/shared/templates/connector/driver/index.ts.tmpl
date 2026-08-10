@@ -1,0 +1,176 @@
+import type {
+	AgentDriver,
+	AgentEvent,
+	ContinueInput,
+	DriverCapabilities,
+	InvocationContext,
+	ProbeResult,
+	RespondInput,
+	RunInput,
+} from "@puddingteams/pwcp/types";
+import { spawnWorker } from "@puddingteams/pwcp/spawn";
+import { JsonlLineParser } from "@puddingteams/pwcp/jsonl-lines";
+
+export interface __CONNECTOR_ID_PASCAL__DriverOptions {
+	/** 可执行文件名/路径（默认 "__CONNECTOR_ID__"）。 */
+	command?: string;
+	/** 单次 run/continue 超时。 */
+	timeoutMs?: number;
+}
+
+/**
+ * 能力声明必须与实现一致（防虚标）：本骨架只演示 run，continue/respond
+ * 明确 failed，所以 operations 不含 respond；补全实现后在这里加回对应能力。
+ */
+const CAPABILITIES: DriverCapabilities = {
+	operations: ["run", "cancel"],
+	interactionKinds: [],
+	progress: "stream",
+	transport: "spawn",
+};
+
+function failedResult(agentId: string, errorCode: string, error: string, recoverable: boolean): AgentEvent {
+	return { type: "failed", result: { agentId, status: "failed", errorCode, error, recoverable } };
+}
+
+/**
+ * __DISPLAY_NAME__ Driver（Driver SPI 本体，双宿主包的 PuddingTeams 半边）。
+ *
+ * 骨架约定上游 CLI 输出 JSONL 事件流，每行形如：
+ *   {"type":"session.started","session_id":"..."}
+ *   {"type":"progress","text":"..."}
+ *   {"type":"message","text":"..."}
+ * TODO: 按你的 CLI 的真实参数与事件格式改 run 里的归约逻辑。
+ */
+export class __CONNECTOR_ID_PASCAL__Driver implements AgentDriver {
+	readonly id = "__CONNECTOR_ID__";
+
+	constructor(private readonly opts: __CONNECTOR_ID_PASCAL__DriverOptions = {}) {}
+
+	async capabilities(): Promise<DriverCapabilities> {
+		return CAPABILITIES;
+	}
+
+	private cmd(): string {
+		return this.opts.command ?? "__CONNECTOR_ID__";
+	}
+
+	/**
+	 * run 的最小流程演示：spawnWorker 拉起 CLI，JsonlLineParser 在 onStdout
+	 * 回调里逐行归约（progress 实时外送），进程退出后按退出码定边界事件。
+	 */
+	async *run(input: RunInput, ctx: InvocationContext): AsyncIterable<AgentEvent> {
+		ctx.onUpdate?.("worker 正在执行…", { running: true });
+		yield { type: "started" };
+
+		const parser = new JsonlLineParser();
+		let sessionHandle: string | undefined;
+		let content = "";
+		const feed = (chunk: string) => {
+			for (const raw of parser.push(chunk)) {
+				// TODO: 换成你的 CLI 的事件归一；这里按骨架约定的 JSONL 格式解析。
+				const evt = raw as { type?: string; text?: string; session_id?: string };
+				if (evt.type === "session.started" && evt.session_id) sessionHandle = evt.session_id;
+				if (evt.type === "progress" && evt.text) ctx.onUpdate?.(evt.text, { streaming: true });
+				if (evt.type === "message" && evt.text) content = evt.text;
+			}
+		};
+		const res = await spawnWorker({
+			command: this.cmd(),
+			// TODO: 换成你的 CLI 的真实 argv。
+			args: ["run", input.message],
+			env: ctx.env,
+			cwd: ctx.cwd ?? process.cwd(),
+			signal: ctx.signal,
+			timeoutMs: this.opts.timeoutMs ?? ctx.timeouts?.activeMs ?? 900_000,
+			startupMs: ctx.timeouts?.startupMs ?? 30_000,
+			onStdout: feed,
+		});
+		for (const raw of parser.flush()) {
+			const evt = raw as { type?: string; text?: string };
+			if (evt.type === "message" && evt.text) content = evt.text;
+		}
+
+		if (res.timedOut) {
+			yield failedResult(this.id, "timeout", "worker 超时，已终止", false);
+			return;
+		}
+		if (res.killed) {
+			yield { type: "failed", result: { agentId: this.id, status: "cancelled", errorCode: "cancelled", error: "任务已取消", recoverable: true } };
+			return;
+		}
+		if (res.spawnError) {
+			yield failedResult(this.id, "spawn_error", `无法启动 worker「${this.cmd()}」：${res.spawnError.message}`, true);
+			return;
+		}
+		if (res.exitCode !== 0) {
+			yield failedResult(this.id, "worker_failed", `worker 退出码 ${res.exitCode}：${res.stderr.trim().slice(0, 400)}`, true);
+			return;
+		}
+		yield {
+			type: "completed",
+			result: {
+				agentId: this.id,
+				...(sessionHandle ? { sessionHandle } : {}),
+				status: "completed",
+				content: content || res.stdout.trim() || "（worker 无文本输出）",
+			},
+		};
+	}
+
+	async *continue(input: ContinueInput, _ctx: InvocationContext): AsyncIterable<AgentEvent> {
+		// TODO: 实现续接会话后，把 "continue" 加回 CAPABILITIES.operations。
+		yield { type: "started", sessionHandle: input.sessionHandle };
+		yield failedResult(this.id, "operation_unsupported", "本骨架尚未实现 continue，请在 driver/index.ts 补全", false);
+	}
+
+	async *respond(input: RespondInput, _ctx: InvocationContext): AsyncIterable<AgentEvent> {
+		// 防御性失败：capabilities 不声明 respond，Runtime 正常不会路由到这里。
+		yield {
+			type: "failed",
+			result: {
+				agentId: this.id,
+				status: "failed",
+				runHandle: input.runHandle,
+				errorCode: "interaction_unsupported",
+				error: "__DISPLAY_NAME__ 不支持 HITL 交互（无 respond 能力）",
+				recoverable: false,
+			},
+		};
+	}
+
+	async cancel(_input: { runHandle: string }, _ctx: InvocationContext): Promise<void> {
+		// no-op：运行时取消经 AbortSignal → SIGTERM→SIGKILL（spawnWorker 保证）。
+	}
+
+	async probe(ctx: InvocationContext): Promise<ProbeResult> {
+		const res = await spawnWorker({ command: this.cmd(), args: ["--version"], env: ctx.env, timeoutMs: 15_000 });
+		const detected = res.exitCode !== -1 && !res.spawnError;
+		return {
+			extensionInstalled: true,
+			extensionVersion: undefined,
+			detected,
+			configured: detected,
+			authenticated: "unknown",
+			enabled: true,
+			compatibility: detected ? "supported" : "unknown",
+			upstreamVersion: res.stdout.trim() || undefined,
+			version: undefined,
+			transport: "spawn",
+			capabilities: CAPABILITIES,
+			issues: detected
+				? []
+				: [{ code: "not_detected", message: `__DISPLAY_NAME__ CLI 未检测到`, fixAction: `安装 __DISPLAY_NAME__ CLI 并确认「${this.cmd()}」在 PATH 中` }],
+		};
+	}
+}
+
+/**
+ * Driver 工厂（Driver SPI 入口）：同一 Connector 多 Agent 实例，每实例一份
+ * config。ExtensionRegistry 加载 entry 时识别此导出。
+ */
+export function createDriver(config: Record<string, unknown>): AgentDriver {
+	return new __CONNECTOR_ID_PASCAL__Driver({
+		command: typeof config.command === "string" && config.command.trim() ? config.command.trim() : undefined,
+	});
+}

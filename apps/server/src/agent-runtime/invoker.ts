@@ -3,12 +3,18 @@ import { CredentialsStore } from "../store/credentials.js";
 import { AgentRuntime, SessionConflictError } from "./runtime.js";
 import { DriverRegistry } from "./driver-registry.js";
 import { PuddingClawDriver } from "./puddingclaw-driver.js";
-import type { AgentDriver, InvocationContext } from "./types.js";
+import type { AgentDriver, DriverCapabilities, InvocationContext } from "./types.js";
 
 export interface AgentInvokeParams {
 	windowId: string;
 	managerSessionId: string;
 	managerToolCallId?: string;
+	parentDelegationId?: string;
+	handoffKind?: "request" | "followup";
+	intent?: string;
+	expectedOutcome?: string;
+	evidenceRequirements?: string[];
+	completionBoundary?: string;
 	agent: AgentConfig;
 	message: string;
 	/** "new" starts a fresh worker session; "continue" resumes the recorded one. */
@@ -17,8 +23,6 @@ export interface AgentInvokeParams {
 	model?: string;
 	signal?: AbortSignal;
 	onUpdate?: (content: string, details?: unknown) => void;
-	/** Workspace root override (defaults to window workspace or platform default). */
-	cwd?: string;
 }
 
 export interface AgentInvokeResult {
@@ -36,16 +40,19 @@ export interface AgentInvokeResult {
 }
 
 /**
- * AgentInvoker：pi 工具（team_task / per-agent delegation）与 AgentRuntime 之间
+ * AgentInvoker：pi 工具（per-agent delegation Extension）与 AgentRuntime 之间
  * 的唯一业务通道。
  *
  * 职责（§1.1 责任边界）：
  * - 解析 worker 的会话连续性（window.workerBindings）、加密密钥与 workspace cwd；
+ * - 入口二次校验启用状态与窗口成员关系（§10.2 两层门控）：旧 Session 的陈旧
+ *   tool schema 也可能到达这里，必须拒绝越权/已撤权的调用；
  * - 调用 Runtime.delegate / respond；
  * - 把归一化结果投影成工具可读的 result + details；
  * - needs_input 时返回“等待审批”结构，绝不指导 manager 重跑任务。
  */
 export class AgentInvoker {
+	private readonly windowLifecycle = new Map<string, Promise<unknown>>();
 	/**
 	 * 完成后通知 manager Session（§6.3）：sendCustomMessage(triggerTurn:true)
 	 * 让 manager 在同一 pi Session 继续汇总。由 index.ts 注入，避免循环依赖。
@@ -77,15 +84,44 @@ export class AgentInvoker {
 		this.managerSender = sender;
 	}
 
+	/** Serialize the short transition boundary for one window. */
+	private withWindowLifecycle<T>(windowId: string, fn: () => Promise<T>): Promise<T> {
+		const previous = this.windowLifecycle.get(windowId) ?? Promise.resolve();
+		const run = previous.then(fn, fn);
+		const tail = run.then(
+			() => undefined,
+			() => undefined,
+		);
+		this.windowLifecycle.set(windowId, tail);
+		void tail.finally(() => {
+			if (this.windowLifecycle.get(windowId) === tail) this.windowLifecycle.delete(windowId);
+		});
+		return run;
+	}
+
+	private withWindowLifecycles<T>(windowIds: string[], fn: () => Promise<T>): Promise<T> {
+		const ids = [...new Set(windowIds)].sort();
+		const enter = (index: number): Promise<T> =>
+			index >= ids.length
+				? fn()
+				: this.withWindowLifecycle(ids[index]!, () => enter(index + 1));
+		return enter(0);
+	}
+
 	private async envFor(agent: AgentConfig): Promise<NodeJS.ProcessEnv> {
 		const secrets = this.credentials ? await this.credentials.getSecrets(agent.name) : {};
 		return { ...process.env, ...(agent.env ?? {}), ...secrets };
 	}
 
 	/** 解析 worker 最近一次会话 handle（continue 用）。 */
-	async sessionHandleFor(windowId: string, agentName: string): Promise<string | undefined> {
+	async sessionHandleFor(windowId: string, agent: AgentConfig): Promise<string | undefined> {
 		const w = await this.teams.getWindow(windowId);
-		return w?.workerBindings?.[agentName]?.sessionHandle;
+		const binding = w?.workerBindings?.[agent.name];
+		if (!w || !binding) return undefined;
+		if (binding.workspaceId !== w.workspaceId) return undefined;
+		if (binding.cwdSnapshot !== (await this.teams.workspaceFor(windowId))) return undefined;
+		if (binding.agentRevision !== (agent.extensionRevision ?? 0)) return undefined;
+		return binding.sessionHandle;
 	}
 
 	/** 该窗口可委托的 Agent（启用的成员）。 */
@@ -93,52 +129,182 @@ export class AgentInvoker {
 		return this.teams.windowMembers(windowId);
 	}
 
+	async activeDelegations(windowId: string) {
+		return (await this.runtime.listDelegations(windowId)).filter(
+			(d) => d.status === "running" || d.status === "waiting_input",
+		);
+	}
+
+	/**
+	 * Stop every Run owned by the window (including solo→direct routed Runs),
+	 * create a manager Session from the latest window state, then commit the
+	 * workspace swap. New delegate/respond/cancel transitions share this gate.
+	 */
+	async switchWorkspaceInPlace(
+		windowId: string,
+		workspaceId: string | undefined,
+		createSession: (source: WindowConfig, cwd: string) => Promise<{ id: string }>,
+		removeSession: (sessionId: string) => Promise<unknown>,
+	): Promise<{ window: WindowConfig; previousSessionIds: string[]; existed: boolean }> {
+		const initial = await this.teams.getWindow(windowId);
+		if (!initial) throw new Error(`window not found: ${windowId}`);
+		const initialRelated = (await this.runtime.listDelegations()).filter(
+			(item) => item.windowId === initial.id || initial.sessions.includes(item.managerSessionId),
+		);
+		return this.withWindowLifecycles(
+			[windowId, ...initialRelated.map((item) => item.windowId)],
+			async () => {
+				const source = await this.teams.getWindow(windowId);
+				if (!source) throw new Error(`window not found: ${windowId}`);
+				const target = await this.teams.contextForWorkspace(workspaceId);
+				if (source.workspaceId === workspaceId && source.cwdSnapshot === target.cwdSnapshot) {
+					return { window: source, previousSessionIds: [], existed: true };
+				}
+				const related = (await this.runtime.listDelegations()).filter(
+					(item) =>
+						(item.windowId === source.id || source.sessions.includes(item.managerSessionId)) &&
+						(item.status === "running" || item.status === "waiting_input"),
+				);
+				for (const delegation of related) await this.cancelUnlocked(delegation.id);
+
+				const created = await createSession(source, target.cwdSnapshot);
+				let switched;
+				try {
+					switched = await this.teams.replaceWindowWorkspace(source.id, workspaceId, created.id, source);
+				} catch (err) {
+					await removeSession(created.id).catch(() => undefined);
+					throw err;
+				}
+				for (const id of switched.previousSessionIds) {
+					await removeSession(id).catch(() => undefined);
+				}
+				return { ...switched, existed: false };
+			},
+		);
+	}
+
+	/**
+	 * 读取最新 Agent 配置并校验启用状态（撤权入口，§3.3.6）。Extension 的
+	 * ScopedAgentInvoker 与 delegate 入口都经此校验，禁用的 Agent 立即被拒；
+	 * pinned 内置 manager 不是可委托的 worker（§10.5）。
+	 */
+	async requireAgent(agentName: string): Promise<AgentConfig> {
+		const agent = await this.teams.getAgent(agentName);
+		if (!agent) throw new Error(`agent「${agentName}」不存在，委托被拒绝`);
+		if (agent.pinned || agent.invoke?.type === "pi") throw new Error(`agent「${agentName}」是内置 manager，不能被委托`);
+		if (agent.enabled === false) throw new Error(`agent「${agentName}」已被禁用，委托被拒绝`);
+		return agent;
+	}
+
+	/** 该 Agent 的 Driver capabilities（registry 命中或第一方 fallback）。 */
+	async capabilitiesFor(agentName: string): Promise<DriverCapabilities | undefined> {
+		const agent = await this.teams.getAgent(agentName);
+		if (!agent) return undefined;
+		const driver = this.drivers.get(agent.name) ?? this.resolveDriverFor(agent);
+		return driver?.capabilities();
+	}
+
+	/**
+	 * 解析某个 Agent 当前可用的 Driver（§10 Connector 绑定优先；legacy
+	 * command invoke 走第一方 fallback）。Runtime 的 resolveDriver、probe
+	 * 路由都走这里；未安装对应 Connector 时返回 undefined（connector_missing，
+	 * 不静默回退 Generic CLI，§9.3.8）。
+	 */
+	async driverFor(agentName: string): Promise<AgentDriver | undefined> {
+		const agent = await this.teams.getAgent(agentName);
+		if (!agent || agent.pinned) return undefined;
+		return this.drivers.get(agent.name) ?? this.resolveDriverFor(agent);
+	}
+
 	/** 发起一次委托（run/continue）。 */
 	async delegate(params: AgentInvokeParams): Promise<AgentInvokeResult> {
-		const { agent, windowId, managerSessionId, message, mode } = params;
-		const driver = this.drivers.get(agent.name) ?? this.resolveDriverFor(agent);
-		if (!driver) {
-			throw new Error(`agent「${agent.name}」没有可用的 Driver（未安装对应 Connector）`);
-		}
-
-		// workspace cwd：显式 > window.workspace > 平台默认。
-		const window = await this.teams.getWindow(windowId);
-		const cwd = params.cwd ?? window?.workspace ?? this.defaultCwd ?? process.cwd();
-
-		const sessionHandle =
-			mode === "continue" ? await this.sessionHandleFor(windowId, agent.name) : undefined;
-
-		const ctx: InvocationContext = {
-			cwd,
-			env: await this.envFor(agent),
-			signal: params.signal,
-			onUpdate: params.onUpdate,
-		};
-
+		const { windowId, managerSessionId, message, mode } = params;
+		let agent: AgentConfig | undefined;
+		let sessionHandle: string | undefined;
 		let delegation;
 		try {
-			delegation = await this.runtime.delegate(
-				{
-					windowId,
-					managerSessionId,
-					managerToolCallId: params.managerToolCallId,
-					agentId: agent.name,
-					message,
-					mode,
-					sessionHandle,
-					requestId: undefined,
-					options: params.model ? { model: params.model } : undefined,
-				},
-				ctx,
-			);
+			if (params.parentDelegationId) {
+				const parent = await this.runtime.getDelegation(params.parentDelegationId);
+				if (!parent || parent.managerSessionId !== managerSessionId) {
+					throw new Error("parentDelegationId 必须指向当前 Session 的既有委托");
+				}
+			}
+			const managerOwner = await this.teams.windowForSession(managerSessionId);
+			if (!managerOwner) throw new Error("manager Session 不属于任何窗口，委托被拒绝");
+			const prepared = await this.withWindowLifecycles([windowId, managerOwner.id], async () => {
+				// The gate covers the last authoritative window read and persistence of
+				// the Run record. A switch therefore sees every accepted delegation.
+				const freshAgent = await this.requireAgent(params.agent.name);
+				const window = await this.teams.getWindow(windowId);
+				if (!window) throw new Error(`窗口「${windowId}」不存在，委托被拒绝`);
+				const freshManagerOwner = await this.teams.windowForSession(managerSessionId);
+				if (!freshManagerOwner || freshManagerOwner.id !== managerOwner.id) {
+					throw new Error("manager Session 的窗口生命周期已变化，委托被拒绝");
+				}
+				if (window.type !== "solo" && !window.members.includes(freshAgent.name)) {
+					throw new Error(`agent「${freshAgent.name}」不是当前窗口的成员，委托被拒绝`);
+				}
+				const driver = this.drivers.get(freshAgent.name) ?? this.resolveDriverFor(freshAgent);
+				if (!driver) throw new Error(`agent「${freshAgent.name}」没有可用的 Driver（未安装对应 Connector）`);
+				const cwd = await this.teams.workspaceFor(windowId);
+				const nextSession = mode === "continue" ? await this.sessionHandleFor(windowId, freshAgent) : undefined;
+				let createdResolve!: () => void;
+				let createdReject!: (reason: unknown) => void;
+				const created = new Promise<void>((resolve, reject) => {
+					createdResolve = resolve;
+					createdReject = reject;
+				});
+				const env = await this.envFor(freshAgent);
+				const revisionCheck = await this.teams.getAgent(freshAgent.name);
+				if ((revisionCheck?.extensionRevision ?? -1) !== (freshAgent.extensionRevision ?? 0)) {
+					throw new Error(`agent「${freshAgent.name}」配置在委托创建时发生变化，请重试`);
+				}
+				const runPromise = this.runtime.delegate(
+					{
+						windowId,
+						workspaceId: window.workspaceId,
+						cwdSnapshot: cwd,
+						managerSessionId,
+						managerToolCallId: params.managerToolCallId,
+						parentDelegationId: params.parentDelegationId,
+						handoffKind: params.handoffKind,
+						intent: params.intent,
+						expectedOutcome: params.expectedOutcome,
+						evidenceRequirements: params.evidenceRequirements,
+						completionBoundary: params.completionBoundary,
+						agentId: freshAgent.name,
+						agentRevision: freshAgent.extensionRevision ?? 0,
+						message,
+						mode,
+						sessionHandle: nextSession,
+						requestId: undefined,
+						options: params.model ? { model: params.model } : undefined,
+						onCreated: () => createdResolve(),
+						driver,
+					},
+					{
+						cwd,
+						env,
+						signal: params.signal,
+						onUpdate: params.onUpdate,
+					},
+				);
+				void runPromise.catch(createdReject);
+				await created;
+				return { agent: freshAgent, sessionHandle: nextSession, runPromise };
+			});
+			agent = prepared.agent;
+			sessionHandle = prepared.sessionHandle;
+			delegation = await prepared.runPromise;
 		} catch (err) {
 			if (err instanceof SessionConflictError) {
 				// M5：冲突时把该 session 已有的 pending interaction 一起带出，
 				// 前端才能折叠/跳转到真正的审批卡（solo 派活时卡片在对方的单聊窗口）。
-				const pending = await this.pendingInteractionFor(agent.name, windowId);
+				const agentName = agent?.name ?? params.agent.name;
+				const pending = await this.pendingInteractionFor(agentName, windowId);
 				return {
 					status: "conflict",
-					content: `worker「${agent.name}」的会话仍在等待上一个任务的审批，不能发起新任务（409）。请先在上一个审批卡上操作。`,
+					content: `worker「${agentName}」的会话仍在等待上一个任务的审批，不能发起新任务（409）。请先在上一个审批卡上操作。`,
 					details: {
 						conflict: true,
 						sessionHandle,
@@ -151,10 +317,11 @@ export class AgentInvoker {
 			}
 			throw err;
 		}
+		if (!agent) throw new Error("delegation accepted without an agent snapshot");
 
 		// 记录新的 session handle 到 window（multi-turn continuity）。
 		if (delegation.delegation.sessionHandle) {
-			this.rememberSession(windowId, agent.name, delegation.delegation.sessionHandle);
+			this.rememberSession(delegation.delegation);
 		}
 
 		const d = delegation.delegation;
@@ -260,17 +427,63 @@ export class AgentInvoker {
 		input: { requestId: string; revision: number; responses: Array<{ requestId: string; action: string; scope?: string }> },
 		signal?: AbortSignal,
 	): Promise<AgentInvokeResult> {
+		const delegation = await this.runtime.getDelegationById(interactionId);
+		if (!delegation) throw new Error("interaction or delegation not found");
+		const managerOwner = await this.teams.windowForSession(delegation.managerSessionId);
+		const prepared = await this.withWindowLifecycles(
+			[delegation.windowId, ...(managerOwner ? [managerOwner.id] : [])],
+			async () => {
+				let admittedResolve!: () => void;
+				let admittedReject!: (reason: unknown) => void;
+				const admitted = new Promise<void>((resolve, reject) => {
+					admittedResolve = resolve;
+					admittedReject = reject;
+				});
+				const responsePromise = this.respondUnlocked(interactionId, input, signal, admittedResolve);
+				void responsePromise.catch(admittedReject);
+				await Promise.race([admitted, responsePromise.then(() => undefined)]);
+				return { responsePromise };
+			},
+		);
+		return prepared.responsePromise;
+	}
+
+	private async respondUnlocked(
+		interactionId: string,
+		input: { requestId: string; revision: number; responses: Array<{ requestId: string; action: string; scope?: string }> },
+		signal?: AbortSignal,
+		onAdmitted?: () => void,
+	): Promise<AgentInvokeResult> {
 		// H5：respond 也要用该 agent 的凭证 + workspace cwd，否则子进程裸环境
 		// 无 token、无 PATH，且跑错目录。
 		let ctxEnv: NodeJS.ProcessEnv = process.env;
 		let cwd = this.defaultCwd ?? process.cwd();
+		let driverSnapshot: AgentDriver | undefined;
 		const delegation = await this.runtime.getDelegationById(interactionId);
 		if (delegation) {
 			const agent = await this.teams.getAgent(delegation.agentId);
 			if (agent) {
-				ctxEnv = await this.envFor(agent);
+				if ((agent.extensionRevision ?? 0) !== delegation.agentRevision) {
+					throw new Error("Agent 配置已变化，不能用新配置恢复旧 Run；请取消旧任务后重试");
+				}
 				const window = await this.teams.getWindow(delegation.windowId);
-				cwd = window?.workspace ?? this.defaultCwd ?? process.cwd();
+				if (
+					!window ||
+					window.workspaceId !== delegation.workspaceId ||
+					window.cwdSnapshot !== delegation.cwdSnapshot
+				) {
+					throw new Error("窗口项目已变化，不能恢复旧 Run");
+				}
+				await this.teams.workspaceFor(window.id);
+				ctxEnv = await this.envFor(agent);
+				driverSnapshot = this.drivers.get(agent.name) ?? this.resolveDriverFor(agent);
+				if (!driverSnapshot) throw new Error(`agent「${agent.name}」没有可用的 Driver`);
+				const revisionCheck = await this.teams.getAgent(agent.name);
+				if ((revisionCheck?.extensionRevision ?? -1) !== delegation.agentRevision) {
+					throw new Error("Agent 配置在恢复 Run 时发生变化，请重试");
+				}
+				// 恢复同一条 Run 必须使用 Delegation 创建时的不可变快照。
+				cwd = delegation.cwdSnapshot;
 			}
 		}
 		const outcome = await this.runtime.respond(
@@ -285,9 +498,13 @@ export class AgentInvoker {
 				})),
 			},
 			{ cwd, env: ctxEnv, signal },
+			driverSnapshot,
+			onAdmitted,
 		);
 		const d = outcome.delegation;
-		if (d.sessionHandle) this.rememberSession(d.windowId, d.agentId, d.sessionHandle);
+		if (d.sessionHandle) {
+			this.rememberSession(d);
+		}
 		switch (outcome.status) {
 			case "completed": {
 				// §6.2/§6.3：完成后触发 manager follow-up 汇总（triggerTurn + followUp），
@@ -378,7 +595,24 @@ export class AgentInvoker {
 
 	/** 取消一个 delegation（用户主动取消，非静默）。 */
 	async cancel(delegationId: string, signal?: AbortSignal): Promise<void> {
-		await this.runtime.cancel(delegationId, { cwd: process.cwd(), env: {}, signal });
+		const delegation = await this.runtime.getDelegation(delegationId);
+		if (!delegation) throw new Error("delegation not found");
+		const managerOwner = await this.teams.windowForSession(delegation.managerSessionId);
+		await this.withWindowLifecycles(
+			[delegation.windowId, ...(managerOwner ? [managerOwner.id] : [])],
+			() => this.cancelUnlocked(delegationId, signal),
+		);
+	}
+
+	private async cancelUnlocked(delegationId: string, signal?: AbortSignal): Promise<void> {
+		const delegation = await this.runtime.getDelegation(delegationId);
+		if (!delegation) throw new Error("delegation not found");
+		const agent = await this.teams.getAgent(delegation.agentId);
+		await this.runtime.cancel(delegationId, {
+			cwd: delegation.cwdSnapshot,
+			env: agent ? await this.envFor(agent) : process.env,
+			signal,
+		});
 	}
 
 	/** 查找某 worker 在该窗口下当前 pending 的 interaction（M5：409 时带出）。 */
@@ -400,14 +634,33 @@ export class AgentInvoker {
 		return {};
 	}
 
-	private rememberSession(windowId: string, agentName: string, sessionHandle: string): void {
-		void this.teams.rememberWorkerSession(windowId, agentName, sessionHandle).catch(() => undefined);
+	private rememberSession(delegation: { windowId: string; agentId: string; sessionHandle?: string; workspaceId?: string; cwdSnapshot: string; agentRevision: number }): void {
+		if (!delegation.sessionHandle) return;
+		void this.teams.rememberWorkerSession(
+			delegation.windowId,
+			delegation.agentId,
+			delegation.sessionHandle,
+			delegation.workspaceId,
+			delegation.cwdSnapshot,
+			delegation.agentRevision,
+		).catch(() => undefined);
 	}
 
-	/** Fallback driver resolution: registry by agent name, else first-party
-	 * PuddingClaw Driver bound to the agent's configured executable. */
+	/**
+	 * Fallback driver 解析：Connector 绑定优先（factory 按 binding config
+	 * 构造，支持同一 Connector 多 Agent 实例）；legacy command invoke 退回
+	 * 第一方 PuddingClaw Driver。
+	 */
 	private resolveDriverFor(agent: AgentConfig): AgentDriver | undefined {
-		if (agent.invoke.type === "command") {
+		if (agent.connector) {
+			const { connectorId, config } = agent.connector;
+			return this.drivers.create(
+				connectorId,
+				connectorId === "pi" ? { ...(config ?? {}), piResources: agent.piResources } : (config ?? {}),
+				agent.connector.extensionId,
+			);
+		}
+		if (agent.invoke?.type === "command") {
 			const registered = this.drivers.get(agent.name) ?? this.drivers.get("puddingclaw");
 			// 用户只配置 executable；命令参数是 Driver 代码的一部分（决策 §10）。
 			return registered ?? new PuddingClawDriver({ command: agent.invoke.command, cwd: this.defaultCwd });

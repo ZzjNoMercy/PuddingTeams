@@ -1,4 +1,29 @@
-import type { AgentConfig, ModelSummary, ProviderSummary, RoomSummary, SessionSummary, WorkerProbeResult } from "./types";
+import type {
+	AgentCapabilityBinding,
+	AgentConfig,
+	AgentConnectorBinding,
+	AgentProbeResult,
+	BindingProbeResult,
+	CatalogEntry,
+	ConflictRun,
+	CustomProviderInput,
+	CustomProviderRecord,
+	ModelSummary,
+	MutationResponse,
+	PiManagerSettings,
+	PiResourceConfig,
+	PiResourcePreview,
+	ProviderSummary,
+	PuddingTeamsExtensionManifest,
+	RoomSummary,
+	SessionWorkState,
+	DecisionRequest,
+	DelegationTrace,
+	SessionSummary,
+	ToolActivation,
+	WorkspaceRecord,
+	WorkspaceDirectoryListing,
+} from "./types";
 
 const SERVER_URL = process.env.NEXT_PUBLIC_SERVER_URL ?? "http://127.0.0.1:8933";
 
@@ -61,14 +86,64 @@ export async function deleteProviderKey(providerId: string): Promise<void> {
 /** Fired on window after provider keys change so the composer picker refetches. */
 export const MODELS_CHANGED_EVENT = "puddingteams:models-changed";
 
-export async function createSession(model?: string): Promise<SessionSummary> {
-	const res = await fetch(`${SERVER_URL}/api/sessions`, {
+// ---- 自定义 Provider（models.json 控制面） ----
+
+export async function listCustomProviders(): Promise<CustomProviderRecord[]> {
+	const res = await fetch(`${SERVER_URL}/api/providers/custom`);
+	if (!res.ok) throw new Error(`list custom providers failed: ${res.status}`);
+	return ((await res.json()) as { providers: CustomProviderRecord[] }).providers;
+}
+
+export async function upsertCustomProvider(id: string, input: CustomProviderInput): Promise<CustomProviderRecord> {
+	const res = await fetch(`${SERVER_URL}/api/providers/custom/${encodeURIComponent(id)}`, {
+		method: "PUT",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(input),
+	});
+	const data = (await res.json()) as { provider?: CustomProviderRecord; error?: string };
+	if (!res.ok) throw new Error(data.error ?? `save custom provider failed: ${res.status}`);
+	return data.provider!;
+}
+
+export async function deleteCustomProvider(id: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/providers/custom/${encodeURIComponent(id)}`, { method: "DELETE" });
+	if (!res.ok) {
+		const data = (await res.json().catch(() => ({}))) as { error?: string };
+		throw new Error(data.error ?? `delete custom provider failed: ${res.status}`);
+	}
+}
+
+export interface ProviderProbeResult {
+	ok: boolean;
+	status?: number;
+	latencyMs?: number;
+	error?: string;
+}
+
+export async function testProviderConnection(input: {
+	baseUrl: string;
+	apiKey?: string;
+	providerId?: string;
+}): Promise<ProviderProbeResult> {
+	const res = await fetch(`${SERVER_URL}/api/providers/test`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
-		body: JSON.stringify(model ? { model } : {}),
+		body: JSON.stringify(input),
 	});
-	if (!res.ok) throw new Error(`create session failed: ${res.status}`);
-	return ((await res.json()) as { session: SessionSummary }).session;
+	return (await res.json()) as ProviderProbeResult;
+}
+
+export async function discoverProviderModels(input: {
+	baseUrl: string;
+	apiKey?: string;
+	providerId?: string;
+}): Promise<{ ok: boolean; error?: string; models: Array<{ id: string; name?: string }> }> {
+	const res = await fetch(`${SERVER_URL}/api/providers/discover`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(input),
+	});
+	return (await res.json()) as { ok: boolean; error?: string; models: Array<{ id: string; name?: string }> };
 }
 
 export async function deleteSession(sessionId: string): Promise<void> {
@@ -94,11 +169,17 @@ export async function fetchMessages(sessionId: string): Promise<unknown[]> {
 	return ((await res.json()) as { messages: unknown[] }).messages;
 }
 
-export async function sendMessage(sessionId: string, content: string): Promise<void> {
+export interface MessageAttachmentInput {
+	filename: string;
+	mediaType?: string;
+	data: string;
+}
+
+export async function sendMessage(sessionId: string, content: string, attachments: MessageAttachmentInput[] = []): Promise<void> {
 	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/messages`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ content }),
+		body: JSON.stringify({ content, attachments }),
 	});
 	if (!res.ok) throw new Error(`send message failed: ${res.status}`);
 }
@@ -168,13 +249,218 @@ export async function deleteAgent(name: string): Promise<void> {
 	if (!res.ok) throw new Error(`delete agent failed: ${res.status}`);
 }
 
-export async function probeAgent(name: string): Promise<WorkerProbeResult> {
+export async function probeAgent(name: string): Promise<AgentProbeResult> {
 	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}/probe`, { method: "POST" });
 	if (!res.ok) {
 		const body = (await res.json().catch(() => null)) as { error?: string } | null;
 		throw new Error(body?.error ?? `probe failed: ${res.status}`);
 	}
-	return ((await res.json()) as { probe: WorkerProbeResult }).probe;
+	return ((await res.json()) as { probe: AgentProbeResult }).probe;
+}
+
+// ---- Phase 5：Extension 目录与 Connector/Capability 绑定（§10.1） ----
+
+/** 409 冲突错误：附带后端返回的引用方 agents / 进行中 runs（启停、卸载用）。 */
+export class ApiConflictError extends Error {
+	readonly payload: { agents?: string[]; runs?: ConflictRun[] };
+	constructor(message: string, payload: { agents?: string[]; runs?: ConflictRun[] }) {
+		super(message);
+		this.name = "ApiConflictError";
+		this.payload = payload;
+	}
+}
+
+/** 统一错误解析：409 抛 ApiConflictError，其余抛带后端 error 文案的 Error。 */
+async function ensureOk(res: Response, fallback: string): Promise<void> {
+	if (res.ok) return;
+	const body = (await res.json().catch(() => null)) as
+		| { error?: string; agents?: string[]; runs?: ConflictRun[] }
+		| null;
+	const message = body?.error ?? `${fallback}: ${res.status}`;
+	if (res.status === 409) throw new ApiConflictError(message, { agents: body?.agents, runs: body?.runs });
+	throw new Error(message);
+}
+
+async function postJson<T>(url: string, body: unknown, fallback: string, method = "POST"): Promise<T> {
+	const res = await fetch(`${SERVER_URL}${url}`, {
+		method,
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	await ensureOk(res, fallback);
+	return (await res.json()) as T;
+}
+
+/** Extension 目录：kind 必传，Connector 与 Capability 不得混在同一选择器（§10.1）。 */
+export async function listExtensionCatalog(kind: "connector" | "capability"): Promise<CatalogEntry[]> {
+	const res = await fetch(`${SERVER_URL}/api/extensions/catalog?kind=${kind}`);
+	if (!res.ok) throw new Error(`list extension catalog failed: ${res.status}`);
+	return ((await res.json()) as { extensions: CatalogEntry[] }).extensions;
+}
+
+/** 从本地目录安装 Extension。 */
+export async function installExtension(input: { path: string; versionPin?: string }): Promise<CatalogEntry> {
+	const data = await postJson<{ extension: CatalogEntry }>("/api/extensions/install", input, "install extension failed");
+	return data.extension;
+}
+
+/** 更新已安装 Extension（可换路径/固定版本）。 */
+export async function updateExtension(
+	extensionId: string,
+	input: { path?: string; versionPin?: string },
+): Promise<CatalogEntry> {
+	const data = await postJson<{ extension: CatalogEntry }>(
+		`/api/extensions/${encodeURIComponent(extensionId)}/update`,
+		input,
+		"update extension failed",
+	);
+	return data.extension;
+}
+
+/** 卸载 Extension；409 时抛 ApiConflictError（含引用它的 agents/runs）。 */
+export async function uninstallExtension(extensionId: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/extensions/${encodeURIComponent(extensionId)}`, { method: "DELETE" });
+	await ensureOk(res, "uninstall extension failed");
+}
+
+/** 读取 Agent 的 Connector 绑定与对应扩展 manifest（未绑定时均为 null）。 */
+export async function getAgentConnector(
+	name: string,
+): Promise<{ connector: AgentConnectorBinding | null; extension: PuddingTeamsExtensionManifest | null; securityWarnings: string[] }> {
+	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}/connector`);
+	if (!res.ok) throw new Error(`get connector failed: ${res.status}`);
+	return (await res.json()) as { connector: AgentConnectorBinding | null; extension: PuddingTeamsExtensionManifest | null; securityWarnings: string[] };
+}
+
+/** 设置/更换 Connector 绑定（secrets 明文提交，服务端只存 secretRefs）。 */
+export function putAgentConnector(
+	name: string,
+	input: {
+		extensionId: string;
+		connectorId: string;
+		config?: Record<string, unknown>;
+		secrets?: Record<string, string>;
+		versionPin?: string;
+	},
+): Promise<MutationResponse> {
+	return postJson<MutationResponse>(
+		`/api/agents/${encodeURIComponent(name)}/connector`,
+		input,
+		"set connector failed",
+		"PUT",
+	);
+}
+
+/** Capability 绑定列表。 */
+export async function listAgentBindings(
+	name: string,
+): Promise<{ bindings: AgentCapabilityBinding[]; revision: number }> {
+	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}/extensions`);
+	if (!res.ok) throw new Error(`list bindings failed: ${res.status}`);
+	return (await res.json()) as { bindings: AgentCapabilityBinding[]; revision: number };
+}
+
+/** 新增 Capability 绑定。 */
+export function addAgentBinding(
+	name: string,
+	input: {
+		extensionId: string;
+		capabilityId: string;
+		enabled?: boolean;
+		config?: Record<string, unknown>;
+		activation?: ToolActivation;
+		versionPin?: string;
+		secrets?: Record<string, string>;
+	},
+): Promise<MutationResponse> {
+	return postJson<MutationResponse>(`/api/agents/${encodeURIComponent(name)}/extensions`, input, "add binding failed");
+}
+
+/** 更新 Capability 绑定（enabled/config/activation/versionPin/secrets）。 */
+export function patchAgentBinding(
+	name: string,
+	bindingId: string,
+	patch: {
+		enabled?: boolean;
+		config?: Record<string, unknown>;
+		activation?: ToolActivation;
+		versionPin?: string;
+		secrets?: Record<string, string>;
+	},
+): Promise<MutationResponse> {
+	return postJson<MutationResponse>(
+		`/api/agents/${encodeURIComponent(name)}/extensions/${encodeURIComponent(bindingId)}`,
+		patch,
+		"patch binding failed",
+		"PATCH",
+	);
+}
+
+/** 删除 Capability 绑定（保留安装包本身）。 */
+export async function deleteAgentBinding(name: string, bindingId: string): Promise<MutationResponse> {
+	const res = await fetch(
+		`${SERVER_URL}/api/agents/${encodeURIComponent(name)}/extensions/${encodeURIComponent(bindingId)}`,
+		{ method: "DELETE" },
+	);
+	await ensureOk(res, "delete binding failed");
+	return (await res.json()) as MutationResponse;
+}
+
+/** Capability 绑定探测：安装/加载/启用状态与将注册的工具清单。 */
+export async function probeAgentBinding(name: string, bindingId: string): Promise<BindingProbeResult> {
+	const res = await fetch(
+		`${SERVER_URL}/api/agents/${encodeURIComponent(name)}/extensions/${encodeURIComponent(bindingId)}/probe`,
+		{ method: "POST" },
+	);
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `binding probe failed: ${res.status}`);
+	}
+	return ((await res.json()) as { probe: BindingProbeResult }).probe;
+}
+
+/**
+ * 启用/禁用（§9.3.6）：禁用时有进行中 Run 必须显式传 resolve（"keep" 保留 /
+ * "cancel" 取消），否则后端 409，抛 ApiConflictError 由 UI 弹确认。
+ */
+export function setAgentEnabled(
+	name: string,
+	enabled: boolean,
+	resolve?: "keep" | "cancel",
+): Promise<MutationResponse> {
+	return postJson<MutationResponse>(
+		`/api/agents/${encodeURIComponent(name)}/enabled`,
+		{ enabled, ...(resolve ? { resolve } : {}) },
+		"set enabled failed",
+		"PUT",
+	);
+}
+
+/** pinned manager 可编辑配置（§10.5）：描述 + manager settings 合并更新。 */
+export function updateManager(input: {
+	description?: string;
+	manager?: Partial<PiManagerSettings>;
+	responsibility?: AgentConfig["responsibility"] | null;
+	piResources?: PiResourceConfig | null;
+}): Promise<MutationResponse> {
+	return postJson<MutationResponse>("/api/agents/manager/manager", input, "update manager failed", "PATCH");
+}
+
+export async function previewAgentPiResources(name: string, workspaceId?: string): Promise<PiResourcePreview> {
+	const query = workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : "";
+	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}/pi-resources/preview${query}`);
+	const body = (await res.json()) as { preview?: PiResourcePreview; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `preview pi resources failed: ${res.status}`);
+	return body.preview!;
+}
+
+export function putAgentPiResources(name: string, piResources: PiResourceConfig | null): Promise<MutationResponse> {
+	return postJson<MutationResponse>(
+		`/api/agents/${encodeURIComponent(name)}/pi-resources`,
+		{ piResources },
+		"save pi resources failed",
+		"PUT",
+	);
 }
 
 // ---- encrypted secrets (~/.puddingteams) ----
@@ -240,10 +526,14 @@ export async function deleteAgentAvatar(name: string): Promise<void> {
 
 // ---- rooms / windows ----
 
-export async function listRooms(): Promise<RoomSummary[]> {
+export async function listRoomsWithContext(): Promise<{ rooms: RoomSummary[]; defaultCwdSnapshot: string }> {
 	const res = await fetch(`${SERVER_URL}/api/rooms`);
 	if (!res.ok) throw new Error(`list rooms failed: ${res.status}`);
-	return ((await res.json()) as { rooms: RoomSummary[] }).rooms;
+	return (await res.json()) as { rooms: RoomSummary[]; defaultCwdSnapshot: string };
+}
+
+export async function listRooms(): Promise<RoomSummary[]> {
+	return (await listRoomsWithContext()).rooms;
 }
 
 export async function getRoom(id: string): Promise<RoomSummary> {
@@ -256,6 +546,7 @@ export async function getRoom(id: string): Promise<RoomSummary> {
 export async function createRoom(input: {
 	type: "direct" | "group";
 	members: string[];
+	workspaceId?: string;
 	name?: string;
 }): Promise<{ room: RoomSummary; existed: boolean }> {
 	const res = await fetch(`${SERVER_URL}/api/rooms`, {
@@ -283,6 +574,73 @@ export async function updateRoom(
 	return ((await res.json()) as { room: RoomSummary }).room;
 }
 
+export async function listWorkspaces(): Promise<WorkspaceRecord[]> {
+	const res = await fetch(`${SERVER_URL}/api/workspaces`);
+	if (!res.ok) throw new Error(`list workspaces failed: ${res.status}`);
+	return ((await res.json()) as { workspaces: WorkspaceRecord[] }).workspaces;
+}
+
+export async function browseWorkspaceDirectories(path: string): Promise<WorkspaceDirectoryListing> {
+	const res = await fetch(`${SERVER_URL}/api/workspaces/browse?path=${encodeURIComponent(path)}`);
+	const body = (await res.json()) as WorkspaceDirectoryListing & { error?: string };
+	if (!res.ok) throw new Error(body.error ?? `browse workspace directories failed: ${res.status}`);
+	return body;
+}
+
+export async function pickWorkspaceDirectory(initialPath: string): Promise<string | undefined> {
+	const res = await fetch(`${SERVER_URL}/api/workspaces/pick-directory`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ initialPath }),
+	});
+	const body = (await res.json()) as { path?: string; cancelled?: boolean; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `pick workspace directory failed: ${res.status}`);
+	return body.cancelled ? undefined : body.path;
+}
+
+export async function createWorkspace(input: { path?: string; name?: string; managed?: boolean }): Promise<WorkspaceRecord> {
+	const res = await fetch(`${SERVER_URL}/api/workspaces`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(input),
+	});
+	const body = (await res.json()) as { workspace?: WorkspaceRecord; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `create workspace failed: ${res.status}`);
+	return body.workspace!;
+}
+
+export async function switchRoomWorkspace(
+	roomId: string,
+	workspaceId: string | null,
+	mode: "new_window" | "in_place" = "new_window",
+): Promise<{ room: RoomSummary; existed: boolean }> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${roomId}/switch-workspace`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ workspaceId, mode }),
+	});
+	const body = (await res.json()) as { room?: RoomSummary; existed?: boolean; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `switch workspace failed: ${res.status}`);
+	return { room: body.room!, existed: body.existed === true };
+}
+
+export async function getDeveloperMode(): Promise<boolean> {
+	const res = await fetch(`${SERVER_URL}/api/extensions/developer-mode`);
+	if (!res.ok) throw new Error(`get developer mode failed: ${res.status}`);
+	return ((await res.json()) as { developerMode: boolean }).developerMode;
+}
+
+export async function setDeveloperMode(enabled: boolean): Promise<boolean> {
+	const res = await fetch(`${SERVER_URL}/api/extensions/developer-mode`, {
+		method: "PUT",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ enabled }),
+	});
+	const body = (await res.json()) as { developerMode?: boolean; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `set developer mode failed: ${res.status}`);
+	return body.developerMode === true;
+}
+
 /** 删除窗口（级联删除其全部 pi session）。solo 会被后端拒绝。 */
 export async function deleteRoom(id: string): Promise<void> {
 	const res = await fetch(`${SERVER_URL}/api/rooms/${id}`, { method: "DELETE" });
@@ -293,10 +651,57 @@ export async function deleteRoom(id: string): Promise<void> {
 }
 
 /** Create a new pi session inside a window and make it the active one. */
-export async function createRoomSession(roomId: string): Promise<SessionSummary> {
-	const res = await fetch(`${SERVER_URL}/api/rooms/${roomId}/sessions`, { method: "POST" });
+export async function createRoomSession(
+	roomId: string,
+	goal?: { goal: string; completionBoundary: string },
+): Promise<SessionSummary> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${roomId}/sessions`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(goal ?? {}),
+	});
 	if (!res.ok) throw new Error(`create room session failed: ${res.status}`);
 	return ((await res.json()) as { session: SessionSummary }).session;
+}
+
+export async function getSessionWorkState(sessionId: string): Promise<{
+	workState: SessionWorkState | null;
+	decisions: DecisionRequest[];
+	delegations: DelegationTrace[];
+}> {
+	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/work-state`);
+	const body = (await res.json()) as { workState?: SessionWorkState | null; decisions?: DecisionRequest[]; delegations?: DelegationTrace[]; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `get work state failed: ${res.status}`);
+	return { workState: body.workState ?? null, decisions: body.decisions ?? [], delegations: body.delegations ?? [] };
+}
+
+export async function putSessionWorkState(
+	sessionId: string,
+	input: Partial<SessionWorkState> & { goal?: string; completionBoundary?: string; revision?: number },
+): Promise<SessionWorkState> {
+	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/work-state`, {
+		method: "PUT",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(input),
+	});
+	const body = (await res.json()) as { workState?: SessionWorkState; current?: SessionWorkState; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `update work state failed: ${res.status}`);
+	return body.workState!;
+}
+
+export async function answerDecisionRequest(
+	decisionId: string,
+	answer: string,
+	grantedAuthorizationScope?: string,
+): Promise<DecisionRequest> {
+	const res = await fetch(`${SERVER_URL}/api/decision-requests/${decisionId}/answer`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ answer, grantedAuthorizationScope }),
+	});
+	const body = (await res.json()) as { decision?: DecisionRequest; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `answer decision failed: ${res.status}`);
+	return body.decision!;
 }
 
 /** Switch the active pi session of a window. */

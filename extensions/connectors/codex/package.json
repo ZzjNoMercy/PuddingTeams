@@ -1,0 +1,73 @@
+{
+	"name": "@puddingteams/connector-codex",
+	"version": "1.0.0",
+	"description": "Codex Connector 双宿主包：PuddingTeams Driver SPI 本体 + pi extension 门面（pi install 可装）。",
+	"type": "module",
+	"exports": {
+		".": "./driver/index.ts",
+		"./driver": "./driver/index.ts",
+		"./core/codex-normalize": "./core/codex-normalize.ts",
+		"./pi": "./pi/index.ts"
+	},
+	"files": [
+		"pi",
+		"driver",
+		"core",
+		"assets"
+	],
+	"pi": {
+		"extensions": [
+			"./pi/index.ts"
+		]
+	},
+	"puddingteams": {
+		"id": "codex",
+		"publisher": "puddingteams",
+		"displayName": "Codex Connector",
+		"version": "1.0.0",
+		"source": "trusted",
+		"kind": "connector",
+		"engines": {
+			"puddingteams": ">=0.1 <1"
+		},
+		"permissions": ["spawn", "secrets"],
+		"entry": "driver/index.ts",
+		"connector": {
+			"id": "codex",
+			"displayName": "Codex",
+			"apiVersion": "1",
+			"defaultTransport": "spawn",
+			"supportedTransports": ["spawn"],
+			"configSchema": {
+				"type": "object",
+				"properties": {
+					"command": { "type": "string", "description": "Codex 可执行文件名或路径", "default": "codex" },
+					"model": { "type": "string", "description": "worker 使用的模型（-m）；留空用 codex 默认" },
+					"sandbox": {
+						"type": "string",
+						"enum": ["read-only", "workspace-write", "danger-full-access"],
+						"description": "Codex 自身沙箱模式（-s，默认 workspace-write）。workspace-write 将写入限制在 Codex 认可的工作区；danger-full-access 会关闭该保护。PuddingTeams 的项目目录本身不是通用权限沙箱。"
+					}
+				}
+			},
+			"secretSchema": [{ "key": "OPENAI_API_KEY", "label": "OpenAI API Key（可选）", "required": false }],
+			"avatar": "assets/codex.svg"
+		}
+	},
+	"keywords": ["pi-package", "puddingteams", "pwcp", "codex", "connector"],
+	"license": "MIT",
+	"scripts": {
+		"typecheck": "tsc -p tsconfig.json --noEmit"
+	},
+	"dependencies": {
+		"@puddingteams/pwcp": "workspace:*",
+		"typebox": "^1.3.7"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@types/node": "^24.13.3",
+		"typescript": "^5.9.3"
+	}
+}

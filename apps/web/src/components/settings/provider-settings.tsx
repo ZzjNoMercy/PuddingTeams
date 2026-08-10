@@ -2,19 +2,23 @@
 
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
+import { PencilIcon, PlusIcon, Trash2Icon } from "lucide-react";
 import {
+	deleteCustomProvider,
 	deleteProviderKey,
 	getSettings,
+	listCustomProviders,
 	listProviderModels,
 	listProviders,
 	MODELS_CHANGED_EVENT,
 	setDefaultModel,
 	setProviderKey,
 } from "@/lib/api";
-import type { ModelSummary, ProviderSummary } from "@/lib/types";
+import type { CustomProviderRecord, ModelSummary, ProviderSummary } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
+import { CustomProviderDialog } from "./custom-provider-dialog";
 
 function defaultRef(provider?: string, model?: string): string | undefined {
 	return provider && model ? `${provider}/${model}` : undefined;
@@ -207,13 +211,21 @@ function ProviderRow({
 
 export function ProviderSettings() {
 	const [providers, setProviders] = useState<ProviderSummary[] | null>(null);
+	const [customProviders, setCustomProviders] = useState<CustomProviderRecord[]>([]);
 	const [defaultModelRef, setDefaultModelRef] = useState<string | undefined>();
 	const [filter, setFilter] = useState("");
+	const [dialogOpen, setDialogOpen] = useState(false);
+	const [editingCustom, setEditingCustom] = useState<CustomProviderRecord | undefined>();
+	const [deletingCustom, setDeletingCustom] = useState<string | null>(null);
+	const [busyDelete, setBusyDelete] = useState(false);
 
 	const refresh = () => {
 		listProviders()
 			.then(setProviders)
 			.catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)));
+		listCustomProviders()
+			.then(setCustomProviders)
+			.catch(() => undefined);
 		getSettings()
 			.then((s) => setDefaultModelRef(defaultRef(s.defaultProvider, s.defaultModel)))
 			.catch(() => undefined);
@@ -233,6 +245,21 @@ export function ProviderSettings() {
 		}
 	};
 
+	const removeCustom = async (id: string) => {
+		setBusyDelete(true);
+		try {
+			await deleteCustomProvider(id);
+			toast.success(`自定义 provider「${id}」已删除（含其凭证）`);
+			setDeletingCustom(null);
+			window.dispatchEvent(new Event(MODELS_CHANGED_EVENT));
+			refresh();
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		} finally {
+			setBusyDelete(false);
+		}
+	};
+
 	const keyword = filter.trim().toLowerCase();
 	const visible = (providers ?? []).filter(
 		(p) => !keyword || p.id.toLowerCase().includes(keyword) || p.name.toLowerCase().includes(keyword),
@@ -246,6 +273,80 @@ export function ProviderSettings() {
 				onChange={(e) => setFilter(e.target.value)}
 				className="h-8 text-xs"
 			/>
+			<div className="rounded-md border border-border px-3 py-2">
+				<div className="flex items-center gap-2">
+					<span className="flex-1 text-sm text-muted-foreground">
+						自定义 Provider（OpenAI-compatible 端点，{customProviders.length}）
+					</span>
+					<Button
+						type="button"
+						size="sm"
+						variant="outline"
+						onClick={() => {
+							setEditingCustom(undefined);
+							setDialogOpen(true);
+						}}
+					>
+						<PlusIcon className="size-3.5" />
+						添加
+					</Button>
+				</div>
+				{customProviders.length > 0 ? (
+					<div className="mt-1 flex flex-col">
+						{customProviders.map((p) => (
+							<div key={p.id} className="flex items-center gap-2 py-1">
+								<span className="min-w-0 flex-1 truncate text-xs">
+									<span className="font-medium">{p.name}</span>
+									<span className="text-muted-foreground">
+										{" · "}
+										{p.id} · {p.models.length} 模型
+									</span>
+								</span>
+								{deletingCustom === p.id ? (
+									<span className="flex items-center gap-1">
+										<Button
+											type="button"
+											size="sm"
+											variant="destructive"
+											disabled={busyDelete}
+											onClick={() => void removeCustom(p.id)}
+										>
+											确认删除
+										</Button>
+										<Button type="button" size="sm" variant="ghost" onClick={() => setDeletingCustom(null)}>
+											取消
+										</Button>
+									</span>
+								) : (
+									<span className="flex items-center gap-1">
+										<Button
+											type="button"
+											size="sm"
+											variant="ghost"
+											onClick={() => {
+												setEditingCustom(p);
+												setDialogOpen(true);
+											}}
+										>
+											<PencilIcon className="size-3.5" />
+											编辑
+										</Button>
+										<Button
+											type="button"
+											size="sm"
+											variant="ghost"
+											className="text-muted-foreground hover:text-destructive"
+											onClick={() => setDeletingCustom(p.id)}
+										>
+											<Trash2Icon className="size-3.5" />
+										</Button>
+									</span>
+								)}
+							</div>
+						))}
+					</div>
+				) : null}
+			</div>
 			<div className="min-h-0 flex-1 overflow-y-auto">
 				{visible.length === 0 ? (
 					<p className="py-8 text-center text-xs text-muted-foreground">
@@ -263,6 +364,12 @@ export function ProviderSettings() {
 					))
 				)}
 			</div>
+			<CustomProviderDialog
+				open={dialogOpen}
+				onOpenChange={setDialogOpen}
+				editing={editingCustom}
+				onSaved={refresh}
+			/>
 		</div>
 	);
 }

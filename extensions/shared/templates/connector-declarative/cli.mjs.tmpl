@@ -1,0 +1,36 @@
+#!/usr/bin/env node
+/**
+ * __CONNECTOR_ID__ CLI：声明式 Connector 骨架的本地可执行脚本，零依赖。
+ * 输出 JSONL 事件流，配合包 manifest 的 declarative mapping 被核心
+ * DeclarativeDriver 归一成 PWCP 边界事件。
+ *
+ *   node cli.mjs --version                  → 打印 __CONNECTOR_ID__-cli 0.1.0
+ *   node cli.mjs run <message>              → 新 session 的 JSONL 事件流
+ *   node cli.mjs resume <sessionId> <msg>   → 复用传入 sessionId 的事件流
+ *
+ * TODO: 这只是演示骨架——真实场景把你的上游 CLI 命令/参数填进 manifest 的
+ * declarative.args，本文件可删除（如果上游 CLI 本身就能输出 JSONL）。
+ */
+const [, , cmd, ...rest] = process.argv;
+
+if (cmd === "--version") {
+	console.log("__CONNECTOR_ID__-cli 0.1.0");
+	process.exit(0);
+}
+
+function emit(obj) {
+	process.stdout.write(JSON.stringify(obj) + "\n");
+}
+
+if (cmd === "run" || cmd === "resume") {
+	const message = cmd === "run" ? (rest[0] ?? "") : (rest[1] ?? "");
+	const sessionId = cmd === "resume" ? rest[0] : `__CONNECTOR_ID__-${Date.now()}`;
+	emit({ type: "session.started", session_id: sessionId, run_id: `run-${Math.random().toString(36).slice(2, 10)}` });
+	emit({ type: "progress", text: "__CONNECTOR_ID__ 处理中" });
+	emit({ type: "message.completed", text: `__CONNECTOR_ID__: ${message}` });
+	emit({ type: "done", usage: { input_tokens: 10, output_tokens: 5 } });
+	process.exit(0);
+}
+
+console.error(`未知命令：${cmd ?? "(空)"}（支持 --version / run / resume）`);
+process.exit(2);

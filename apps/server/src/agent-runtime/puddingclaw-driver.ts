@@ -9,6 +9,7 @@ import type {
 	RunInput,
 } from "./types.js";
 import { normalizePuddingClawJson, PUDDINGCLAW_CAPABILITIES } from "./normalize.js";
+import { handoffDirFor, handoffRelativePath } from "./handoff.js";
 import { spawnWorker } from "./transport/spawn.js";
 
 export interface PuddingClawDriverOptions {
@@ -39,12 +40,15 @@ function stderrSummary(stderr: string): string {
 /**
  * First-party PuddingClaw Driver (§5).
  *
- * - run         → puddingclaw run --input-json - --json   {message, request_id}
+ * - run         → puddingclaw run --input-json - --json [--export <handoffDir>]
  * - continue    → same, plus {session_id}
- * - respond     → puddingclaw respond <run_id> --input-json - --json
+ * - respond     → puddingclaw respond <run_id> --input-json - --json [--export …]
  *                  {continuation_token, request_id, decisions}
  * - cancel      → puddingclaw cancel <run_id> (best-effort; the CLI may not
  *                  have a public cancel yet, so absence degrades to SIGTERM)
+ *
+ * --export 目录按 §15.3 约定生成为 <cwd>/.pudding/handoff/<delegationId>/
+ * （delegationId 由 Runtime 经 InvocationContext 注入）。
  *
  * The CLI's stdout carries a single JSON boundary in phase 1 (§8.2); a future
  * JSONL endpoint flows through the same normalize path per line.
@@ -64,6 +68,32 @@ export class PuddingClawDriver implements AgentDriver {
 
 	private ctxCwd(ctx: InvocationContext): string {
 		return ctx.cwd ?? this.opts.cwd ?? process.cwd();
+	}
+
+	/**
+	 * §15.3/§15.7：导出路径由 Driver 按约定生成并传入 CLI（CLI 不知道平台
+	 * 目录结构）。没有 delegationId（如 probe/cancel）就不导出。
+	 */
+	private exportArgs(ctx: InvocationContext): string[] {
+		if (!ctx.delegationId) return [];
+		return ["--export", handoffDirFor(this.ctxCwd(ctx), ctx.delegationId)];
+	}
+
+	/**
+	 * normalize 给出的 artifact.path 是导出目录相对路径（exported_path）；
+	 * 这里改写成 workspace 相对路径（.pudding/handoff/<delegationId>/…），
+	 * 登记与接力文本引用统一用 workspace 相对路径。
+	 */
+	private withHandoffPaths(event: AgentEvent, ctx: InvocationContext): AgentEvent {
+		if (event.type !== "completed" || !ctx.delegationId || !event.result.artifacts?.length) return event;
+		const delegationId = ctx.delegationId;
+		return {
+			...event,
+			result: {
+				...event.result,
+				artifacts: event.result.artifacts.map((a) => ({ ...a, path: handoffRelativePath(delegationId, a.path) })),
+			},
+		};
 	}
 
 	private async runCli(
@@ -130,7 +160,7 @@ export class PuddingClawDriver implements AgentDriver {
 		if (lastLine !== undefined) {
 			const event = normalizePuddingClawJson(lastLine);
 			ctx.onUpdate?.("worker 执行完成", { exitCode: res.exitCode });
-			return event;
+			return this.withHandoffPaths(event, ctx);
 		}
 		// Fall back to the accumulated stdout as a single JSON.
 		if (res.stdout.trim()) {
@@ -140,7 +170,7 @@ export class PuddingClawDriver implements AgentDriver {
 			} catch {
 				raw = undefined;
 			}
-			if (raw !== undefined) return normalizePuddingClawJson(raw);
+			if (raw !== undefined) return this.withHandoffPaths(normalizePuddingClawJson(raw), ctx);
 		}
 		return {
 			type: "failed",
@@ -162,7 +192,7 @@ export class PuddingClawDriver implements AgentDriver {
 			type: "started",
 		};
 		yield await this.runCli(
-			["run", "--input-json", "-", "--json"],
+			["run", "--input-json", "-", "--json", ...this.exportArgs(ctx)],
 			{ message: input.message, request_id: input.requestId, ...(input.options ?? {}) },
 			ctx,
 		);
@@ -172,7 +202,7 @@ export class PuddingClawDriver implements AgentDriver {
 		ctx.onUpdate?.("worker 正在续接会话…", { running: true });
 		yield { type: "started", sessionHandle: input.sessionHandle };
 		yield await this.runCli(
-			["run", "--input-json", "-", "--json"],
+			["run", "--input-json", "-", "--json", ...this.exportArgs(ctx)],
 			{ message: input.message, session_id: input.sessionHandle, request_id: input.requestId, ...(input.options ?? {}) },
 			ctx,
 		);
@@ -201,7 +231,7 @@ export class PuddingClawDriver implements AgentDriver {
 		ctx.onUpdate?.("正在提交审批…", { running: true });
 		yield { type: "started", runHandle: input.runHandle };
 		yield await this.runCli(
-			["respond", input.runHandle, "--input-json", "-", "--json"],
+			["respond", input.runHandle, "--input-json", "-", "--json", ...this.exportArgs(ctx)],
 			{
 				continuation_token: token,
 				request_id: input.requestId,

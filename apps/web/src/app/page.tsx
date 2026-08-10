@@ -54,7 +54,7 @@ export default function Home() {
 
 	const handleNew = useCallback(() => setCreateOpen(true), []);
 
-	// Open a window from inside the chat (e.g. solo TeamTaskCard "已同步到单聊"
+	// Open a window from inside the chat (e.g. solo DelegateCard "已同步到单聊"
 	// link). The window may be brand-new (auto-created by solo routing), so the
 	// sidebar list is refetched to pick it up.
 	const openWindow = useCallback((id: string) => {

@@ -1,0 +1,62 @@
+{
+	"name": "__PACKAGE_NAME__",
+	"version": "0.1.0",
+	"description": "__DESCRIPTION__",
+	"type": "module",
+	"exports": {
+		".": "./driver/index.ts",
+		"./driver": "./driver/index.ts",
+		"./pi": "./pi/index.ts"
+	},
+	"files": [
+		"pi",
+		"driver"
+	],
+	"pi": {
+		"extensions": [
+			"./pi/index.ts"
+		]
+	},
+	"puddingteams": {
+		"id": "__CONNECTOR_ID__",
+		"publisher": "puddingteams",
+		"displayName": "__DISPLAY_NAME__",
+		"version": "0.1.0",
+		"source": "external",
+		"kind": "connector",
+		"engines": {
+			"puddingteams": ">=0.1 <1"
+		},
+		"permissions": ["spawn"],
+		"entry": "driver/index.ts",
+		"connector": {
+			"id": "__CONNECTOR_ID__",
+			"displayName": "__DISPLAY_NAME__",
+			"apiVersion": "1",
+			"defaultTransport": "spawn",
+			"supportedTransports": ["spawn"],
+			"configSchema": {
+				"type": "object",
+				"properties": {
+					"command": { "type": "string", "description": "__DISPLAY_NAME__ 可执行文件名或路径", "default": "__CONNECTOR_ID__" }
+				}
+			}
+		}
+	},
+	"keywords": ["pi-package", "puddingteams", "pwcp", "connector"],
+	"license": "MIT",
+	"scripts": {
+		"typecheck": "tsc -p tsconfig.json --noEmit"
+	},
+	"dependencies": {
+		"@puddingteams/pwcp": "workspace:*",
+		"typebox": "^1.3.7"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@types/node": "^24.13.3",
+		"typescript": "^5.9.3"
+	}
+}

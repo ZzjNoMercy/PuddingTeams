@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { CheckIcon, CopyIcon, FileTextIcon, LayersIcon, PencilIcon, PlusIcon, UsersIcon, XIcon } from "lucide-react";
+import { CheckIcon, CopyIcon, FileTextIcon, FolderGit2Icon, FolderOpenIcon, LayersIcon, PencilIcon, PlusIcon, UsersIcon, XIcon } from "lucide-react";
 import { toast } from "sonner";
 import {
 	Conversation,
@@ -31,15 +31,20 @@ import { writeTextToClipboard } from "@/core/clipboard";
 import { useChat } from "@/hooks/useChat";
 import {
 	createRoomSession,
+	createWorkspace,
 	deleteRoomSession,
 	getRoom,
+	listWorkspaces,
 	setActiveRoomSession,
+	switchRoomWorkspace,
 	updateRoom,
 } from "@/lib/api";
-import type { ChatStatus, RoomSession, RoomSummary } from "@/lib/types";
+import type { ChatStatus, RoomSession, RoomSummary, WorkspaceRecord } from "@/lib/types";
 import { Composer } from "./composer";
 import { Message } from "./message";
 import { ManagerAvatar, MemberStack, WorkerAvatar } from "./worker-avatar";
+import { DirectoryPickerDialog } from "./directory-picker-dialog";
+import { SessionWorkCard } from "./session-work-card";
 
 function statusLabelOf(status: ChatStatus): string {
 	switch (status) {
@@ -62,18 +67,21 @@ function SessionChat({
 	windowType,
 	onStatus,
 	onOpenWindow,
+	blocked,
 }: {
 	sessionId: string;
 	emptyHint?: string;
 	windowType: RoomSummary["type"];
 	onStatus: (s: ChatStatus) => void;
 	onOpenWindow?: (windowId: string) => void;
+	blocked?: boolean;
 }) {
 	const { messages, status, running, send, stop } = useChat(sessionId);
 	useEffect(() => onStatus(status), [status, onStatus]);
 
 	return (
 		<>
+			<SessionWorkCard sessionId={sessionId} />
 			<Conversation>
 				<ConversationContent className="mx-auto w-full max-w-3xl gap-6">
 					{messages.length === 0 ? (
@@ -88,7 +96,12 @@ function SessionChat({
 				</ConversationContent>
 				<ConversationScrollButton className="z-10" />
 			</Conversation>
-			<Composer sessionId={sessionId} disabled={running} onSend={send} onStop={stop} />
+			{blocked ? (
+				<div className="border-t border-destructive/20 bg-destructive/5 px-4 py-2 text-center text-xs text-destructive">
+					项目路径已失效，重新绑定或切换项目后才能继续对话与派活。
+				</div>
+			) : null}
+			<Composer sessionId={sessionId} disabled={running || Boolean(blocked)} onSend={send} onStop={stop} />
 		</>
 	);
 }
@@ -110,6 +123,13 @@ export function ChatPane({
 	const [promptOpen, setPromptOpen] = useState(false);
 	const [promptValue, setPromptValue] = useState("");
 	const [pendingDeleteSession, setPendingDeleteSession] = useState<RoomSession | null>(null);
+	const [workspaceOpen, setWorkspaceOpen] = useState(false);
+	const [workspaceOptions, setWorkspaceOptions] = useState<WorkspaceRecord[]>([]);
+	const [targetWorkspaceId, setTargetWorkspaceId] = useState("");
+	const [workspacePath, setWorkspacePath] = useState("");
+	const [switchToDefault, setSwitchToDefault] = useState(false);
+	const [directoryPickerOpen, setDirectoryPickerOpen] = useState(false);
+	const [switchingWorkspace, setSwitchingWorkspace] = useState(false);
 
 	useEffect(() => {
 		let cancelled = false;
@@ -238,6 +258,41 @@ export function ChatPane({
 		}
 	}, [roomId, promptValue]);
 
+	const openWorkspaceSwitch = useCallback(() => {
+		setWorkspaceOpen(true);
+		setWorkspacePath("");
+		setTargetWorkspaceId("");
+		setSwitchToDefault(false);
+		setDirectoryPickerOpen(false);
+		void listWorkspaces()
+			.then((items) => {
+				setWorkspaceOptions(items);
+			})
+			.catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)));
+	}, []);
+
+	const saveWorkspaceSwitch = useCallback(async (mode: "new_window" | "in_place") => {
+		setSwitchingWorkspace(true);
+		try {
+			let workspaceId: string | null = switchToDefault ? null : targetWorkspaceId;
+			if (!switchToDefault && workspacePath.trim()) workspaceId = (await createWorkspace({ path: workspacePath.trim() })).id;
+			if (!switchToDefault && !workspaceId) throw new Error("请选择项目文件夹或最近项目");
+			const result = await switchRoomWorkspace(roomId, workspaceId, mode);
+			setWorkspaceOpen(false);
+			if (result.room.id === roomId) {
+				setRoom(result.room);
+				onRoomUpdated?.(result.room);
+			} else {
+				onOpenWindow?.(result.room.id);
+			}
+			toast.success(mode === "in_place" ? "已切换项目并开始新会话" : result.existed ? "已打开已有单聊" : "已创建新对话");
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		} finally {
+			setSwitchingWorkspace(false);
+		}
+	}, [targetWorkspaceId, workspacePath, switchToDefault, roomId, onRoomUpdated, onOpenWindow]);
+
 	const members = room?.members ?? [];
 	const type = room?.type ?? "solo";
 	const isSingle = type === "direct";
@@ -255,6 +310,11 @@ export function ChatPane({
 				? `与 ${members[0]?.name} 单聊`
 				: "与 pi manager 对话";
 	const subtitle = sessionTitle || (typeText !== headerTitle ? typeText : "");
+	const workspaceTargetReady = switchToDefault || Boolean(targetWorkspaceId || workspacePath.trim());
+	const currentContextLabel = room?.workspace ? `${room.workspace.name} · ${room.workspace.rootPath}` : `默认目录 · ${room?.cwdSnapshot ?? ""}`;
+	const newWindowLabel = type === "group" ? "新建群聊" : "新建/打开单聊";
+	const directoryPickerInitialPath =
+		workspacePath || workspaceOptions.find((item) => item.id === targetWorkspaceId)?.rootPath || room?.cwdSnapshot || "";
 	const emptyHint = isGroup
 		? `群聊：${members.map((m) => m.name).join("、")} 在窗口里，pi manager 负责调度。试试对 manager 说：让 ${members[0]?.name} 分析一个任务…`
 		: isSingle
@@ -285,6 +345,17 @@ export function ChatPane({
 					</div>
 				</div>
 				<div className="flex shrink-0 items-center gap-2">
+					<Button
+						type="button"
+						size="sm"
+						variant={room?.contextAvailable === false ? "destructive" : "outline"}
+						onClick={openWorkspaceSwitch}
+						aria-label={room?.workspace ? `打开项目，当前项目 ${room.workspace.name}` : "打开项目，当前使用默认目录"}
+						title={`当前运行目录：${room?.workspace?.rootPath ?? room?.cwdSnapshot ?? ""}`}
+					>
+						<FolderGit2Icon className="size-3.5" />
+						<span className="max-w-36 truncate">{room?.workspace ? `项目 · ${room.workspace.name}` : "默认目录"}</span>
+					</Button>
 					<DropdownMenu>
 						<DropdownMenuTrigger asChild>
 							<Button type="button" size="sm" variant="outline">
@@ -339,7 +410,13 @@ export function ChatPane({
 								</div>
 							) : (
 								members.map((m) => {
-									const cmd = [m.invoke?.command, ...(m.invoke?.runArgs ?? [])].join(" ");
+									// invoke 变为联合类型后：命令接入显示命令行，Connector 接入显示绑定。
+									const cmd =
+										m.invoke?.type === "command"
+											? [m.invoke.command, ...m.invoke.runArgs].join(" ")
+											: m.connector
+												? `connector:${m.connector.connectorId}`
+												: "—";
 									const workerSession = room?.workerBindings?.[m.name]?.sessionHandle;
 									const enabled = m.enabled !== false;
 									return (
@@ -420,6 +497,7 @@ export function ChatPane({
 					windowType={type}
 					onStatus={setStatus}
 					onOpenWindow={onOpenWindow}
+					blocked={!room.contextAvailable}
 				/>
 			) : null}
 
@@ -460,7 +538,7 @@ export function ChatPane({
 					<Textarea
 						value={promptValue}
 						onChange={(e) => setPromptValue(e.target.value)}
-						placeholder="例如：派活给 puddingclaw 前，先列出它的可用分析模型，选好 id 填进 team_task 的 model 参数。"
+						placeholder="例如：派活给 puddingclaw 前，先让它列出可用分析模型，把用户选定的 id 写进任务描述再委托。"
 						rows={8}
 						className="text-sm"
 					/>
@@ -475,6 +553,111 @@ export function ChatPane({
 					</DialogFooter>
 				</DialogContent>
 			</Dialog>
+
+			<Dialog
+				open={workspaceOpen}
+				onOpenChange={(open) => {
+					setWorkspaceOpen(open);
+					if (!open) setDirectoryPickerOpen(false);
+				}}
+			>
+				<DialogContent className="sm:max-w-lg">
+					<DialogHeader>
+						<DialogTitle>打开项目</DialogTitle>
+						<DialogDescription className="truncate" title={currentContextLabel}>当前：{currentContextLabel}</DialogDescription>
+					</DialogHeader>
+					{switchToDefault ? (
+						<div className="flex items-center gap-3 rounded-md border bg-muted/30 px-3 py-2.5">
+							<FolderGit2Icon className="size-4 text-muted-foreground" />
+							<div className="min-w-0 flex-1">
+								<div className="text-sm font-medium">默认目录</div>
+								<div className="text-xs text-muted-foreground">使用平台默认运行目录</div>
+							</div>
+							<Button type="button" size="sm" variant="ghost" onClick={() => setSwitchToDefault(false)}>更改</Button>
+						</div>
+					) : (
+						<div className="flex flex-col gap-4">
+							<label className="flex flex-col gap-1.5 text-sm">
+								<span className="font-medium">项目文件夹</span>
+								<div className="flex gap-2">
+									<Input
+										value={workspacePath}
+										onChange={(e) => {
+											setWorkspacePath(e.target.value);
+											if (e.target.value) setTargetWorkspaceId("");
+										}}
+										placeholder="选择文件夹或输入绝对目录"
+										className="min-w-0 font-mono text-xs"
+									/>
+									<Button type="button" variant="outline" onClick={() => setDirectoryPickerOpen(true)}>
+										<FolderOpenIcon className="size-4" />
+										浏览…
+									</Button>
+								</div>
+							</label>
+							{workspaceOptions.some((item) => item.id !== room?.workspace?.id) ? (
+								<label className="flex flex-col gap-1.5 text-sm">
+									<span className="text-muted-foreground">最近项目</span>
+									<select
+										value={targetWorkspaceId}
+										onChange={(e) => {
+											setTargetWorkspaceId(e.target.value);
+											if (e.target.value) setWorkspacePath("");
+										}}
+										className="h-9 rounded-md border bg-background px-2"
+									>
+										<option value="">选择最近项目</option>
+										{workspaceOptions.filter((item) => item.id !== room?.workspace?.id).map((item) => (
+											<option key={item.id} value={item.id} disabled={!item.available}>{item.name} — {item.rootPath}{item.available ? "" : "（失效）"}</option>
+										))}
+									</select>
+								</label>
+							) : null}
+							{room?.workspace ? (
+								<Button
+									type="button"
+									variant="link"
+									className="h-auto w-fit px-0 text-muted-foreground"
+									onClick={() => {
+										setSwitchToDefault(true);
+										setWorkspacePath("");
+										setTargetWorkspaceId("");
+									}}
+								>
+									不使用项目，切回默认目录
+								</Button>
+							) : null}
+						</div>
+					)}
+					<p className="text-xs text-muted-foreground">
+						{type === "solo"
+							? "切换后会停止当前任务，并开始一个新会话。"
+							: `“${newWindowLabel}”会保留当前对话；“替换当前”会停止当前任务，并开始一个新会话。`}
+					</p>
+					<DialogFooter>
+						<Button type="button" variant="ghost" onClick={() => setWorkspaceOpen(false)}>取消</Button>
+						{type !== "solo" ? (
+							<Button type="button" variant="outline" disabled={switchingWorkspace || !workspaceTargetReady} onClick={() => void saveWorkspaceSwitch("in_place")}>
+								替换当前
+							</Button>
+						) : null}
+						<Button type="button" disabled={switchingWorkspace || !workspaceTargetReady} onClick={() => void saveWorkspaceSwitch(type === "solo" ? "in_place" : "new_window")}>
+							{switchingWorkspace ? "处理中…" : type === "solo" ? "切换并开始新会话" : newWindowLabel}
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
+
+			<DirectoryPickerDialog
+				open={directoryPickerOpen}
+				initialPath={directoryPickerInitialPath}
+				onOpenChange={setDirectoryPickerOpen}
+				onSelect={(path) => {
+					setWorkspacePath(path);
+					setTargetWorkspaceId("");
+					setSwitchToDefault(false);
+				}}
+			/>
 
 			<Dialog open={renaming} onOpenChange={setRenaming}>
 				<DialogContent className="sm:max-w-sm">

@@ -1,10 +1,115 @@
 import type { FastifyInstance } from "fastify";
-import { AVATAR_MAX_BYTES, TeamsStore, type AgentConfig } from "../store/teams.js";
+import {
+	AVATAR_MAX_BYTES,
+	MANAGER_AGENT_NAME,
+	TeamsStore,
+	type AgentConfig,
+} from "../store/teams.js";
 import { CredentialsStore } from "../store/credentials.js";
+import type { AgentRuntime } from "../agent-runtime/runtime.js";
+import type { AgentInvoker } from "../agent-runtime/invoker.js";
+import type { ExtensionRegistry } from "../agent-runtime/extension-registry.js";
+import type { PiSessionStore } from "../pi-bridge/session-store.js";
+import type { AgentCapabilityBinding } from "../agent-runtime/extensions.js";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { previewPiResources } from "../pi-bridge/pi-resources.js";
 
-/** Thin HTTP facade over the worker registry (teams.json). */
-export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, credentials?: CredentialsStore): void {
-	app.get("/api/agents", async () => ({ agents: await teams.listAgents() }));
+export interface AgentsRouteDeps {
+	credentials?: CredentialsStore;
+	/** 禁用保护需要查询/取消 active/waiting Run（§9.3.6）。 */
+	runtime?: AgentRuntime;
+	/** Connector 绑定的 Driver probe 与 driverFor 解析。 */
+	invoker?: AgentInvoker;
+	/** Connector/Capability 绑定校验安装包存在与 kind。 */
+	extensions?: ExtensionRegistry;
+	/** 写操作后同步撤权并统计受影响 manager Session（§10.1）。 */
+	sessions?: PiSessionStore;
+}
+
+interface MutationResponse {
+	agent: AgentConfig;
+	revision: number;
+	affectedSessions: { affectedSessions: number; activeNow: number; reloadPending: number };
+	securityWarnings: string[];
+}
+
+const SECRET_KEY = /^[A-Z0-9_]+$/;
+
+/** Connector config 的用户可见风险。cwd 是运行上下文，不能替代 Agent 自身权限机制。 */
+function connectorSecurityWarnings(agent: AgentConfig): string[] {
+	const binding = agent.connector;
+	if (!binding) return [];
+	if (binding.connectorId === "claude-code") {
+		const mode = typeof binding.config.permissionMode === "string" ? binding.config.permissionMode : "bypassPermissions";
+		if (mode === "bypassPermissions") {
+			return [
+				"Claude Code 当前使用 bypassPermissions：它会绕过 Claude 自身的权限确认。Workspace/cwd 只决定工作目录，不构成强制文件访问边界。仅在信任项目与任务时使用。",
+			];
+		}
+	}
+	if (binding.connectorId === "codex") {
+		const sandbox = typeof binding.config.sandbox === "string" ? binding.config.sandbox : "workspace-write";
+		if (sandbox === "danger-full-access") {
+			return [
+				"Codex 当前使用 danger-full-access：Codex 自身沙箱已关闭，Workspace/cwd 不能限制它访问项目外文件。",
+			];
+		}
+	}
+	return [];
+}
+
+/** Thin HTTP facade over the worker registry (teams.json) + Phase 5 管理 API（§10.1）。 */
+export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, deps: AgentsRouteDeps = {}): void {
+	const { credentials, runtime, invoker, extensions, sessions } = deps;
+
+	/**
+	 * 写操作统一响应（§10.1）：先同步撤权，再带 extensionRevision 与受影响
+	 * manager Session 统计（active_now / reload_pending）。
+	 */
+	async function mutationReply(agent: AgentConfig): Promise<MutationResponse> {
+		if (sessions) await sessions.syncAgentConfigChange();
+		const affectedSessions = sessions
+			? sessions.agentSessionStats(agent.name)
+			: { affectedSessions: 0, activeNow: 0, reloadPending: 0 };
+		return { agent, revision: agent.extensionRevision ?? 0, affectedSessions, securityWarnings: connectorSecurityWarnings(agent) };
+	}
+
+	function notFoundOr400(reply: { code: (n: number) => { send: (b: unknown) => unknown } }, err: unknown): unknown {
+		const msg = err instanceof Error ? err.message : String(err);
+		return reply.code(msg.includes("not found") || msg.includes("不存在") ? 404 : 400).send({ error: msg });
+	}
+
+	/** secret 明文只进 CredentialsStore，Agent 配置里只留 secretRefs（key→key 引用）。 */
+	async function applySecrets(
+		name: string,
+		secrets: Record<string, string> | undefined,
+		existingRefs: Record<string, string> | undefined,
+	): Promise<Record<string, string> | undefined> {
+		if (secrets === undefined) return existingRefs;
+		if (!credentials) throw new Error("secrets store not configured");
+		for (const [k, v] of Object.entries(secrets)) {
+			if (typeof v !== "string") throw new Error(`secret "${k}" must be a string`);
+			if (!SECRET_KEY.test(k)) throw new Error(`secret key "${k}" must be UPPER_SNAKE (env var name)`);
+		}
+		await credentials.setSecrets(name, secrets);
+		const refs = { ...(existingRefs ?? {}) };
+		for (const k of Object.keys(secrets)) refs[k] = k;
+		return refs;
+	}
+
+	app.get("/api/agents", async () => {
+		const agents = await teams.listAgents();
+		// §11：未上传头像但 connector 声明了包内默认头像时，标记 hasDefaultAvatar，
+		// 前端据此走 avatar URL（GET avatar 路由会回退到包内资源）。
+		if (!extensions) return { agents };
+		return {
+			agents: agents.map((a) =>
+				!a.avatar && a.connector && extensions.hasConnectorAvatar(a.connector.connectorId)
+					? { ...a, hasDefaultAvatar: true }
+					: a,
+			),
+		};
+	});
 
 	app.post<{ Body: Partial<Record<string, unknown>> }>("/api/agents", async (req, reply) => {
 		try {
@@ -19,18 +124,105 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, cr
 		"/api/agents/:name",
 		async (req, reply) => {
 			try {
+				// pinned manager 的可编辑项走专用通道（§10.5）。
+				if (req.params.name === MANAGER_AGENT_NAME) {
+					const agent = await teams.updateManager({
+						...(typeof req.body?.description === "string" ? { description: req.body.description } : {}),
+						...(req.body?.responsibility === null || (req.body?.responsibility && typeof req.body.responsibility === "object")
+							? { responsibility: req.body.responsibility as AgentConfig["responsibility"] | null }
+							: {}),
+						...(req.body?.manager && typeof req.body.manager === "object"
+							? { manager: req.body.manager as Record<string, unknown> }
+							: {}),
+						...(req.body?.piResources === null || (req.body?.piResources && typeof req.body.piResources === "object")
+							? { piResources: req.body.piResources as AgentConfig["piResources"] | null }
+							: {}),
+					});
+					return mutationReply(agent);
+				}
 				const agent = await teams.upsertAgent({
 					...(req.body as unknown as AgentConfig),
 					name: req.params.name,
 				});
 				return { agent };
 			} catch (err) {
+				return notFoundOr400(reply, err);
+			}
+		},
+	);
+
+	/** pinned manager 可编辑配置（§10.5）：描述 + manager settings 合并更新。 */
+	app.patch<{ Params: { name: string }; Body: { description?: string; manager?: Record<string, unknown>; responsibility?: AgentConfig["responsibility"] | null; piResources?: AgentConfig["piResources"] | null } }>(
+		"/api/agents/:name/manager",
+		async (req, reply) => {
+			if (req.params.name !== MANAGER_AGENT_NAME) {
+				return reply.code(400).send({ error: "只有 pinned manager 支持该配置区" });
+			}
+			try {
+				const agent = await teams.updateManager({
+					...(req.body?.description !== undefined ? { description: req.body.description } : {}),
+					...(req.body?.responsibility !== undefined ? { responsibility: req.body.responsibility } : {}),
+					...(req.body?.manager !== undefined ? { manager: req.body.manager } : {}),
+					...(req.body?.piResources !== undefined ? { piResources: req.body.piResources } : {}),
+				});
+				return mutationReply(agent);
+			} catch (err) {
+				return notFoundOr400(reply, err);
+			}
+		},
+	);
+
+	app.get<{ Params: { name: string }; Querystring: { workspaceId?: string } }>(
+		"/api/agents/:name/pi-resources/preview",
+		async (req, reply) => {
+			const agent = await teams.getAgent(req.params.name);
+			if (!agent) return reply.code(404).send({ error: "agent not found" });
+			if (!agent.pinned && agent.connector?.connectorId !== "pi") {
+				return reply.code(400).send({ error: "只有 pi Agent 支持资源预览" });
+			}
+			try {
+				const context = await teams.contextForWorkspace(req.query.workspaceId?.trim() || undefined);
+				return {
+					preview: await previewPiResources({
+						cwd: context.cwdSnapshot,
+						agentDir: getAgentDir(),
+						resources: agent.piResources,
+					}),
+				};
+			} catch (err) {
 				return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
 			}
 		},
 	);
 
+	app.put<{ Params: { name: string }; Body: { piResources?: AgentConfig["piResources"] | null } }>(
+		"/api/agents/:name/pi-resources",
+		async (req, reply) => {
+			const agent = await teams.getAgent(req.params.name);
+			if (!agent) return reply.code(404).send({ error: "agent not found" });
+			if (!agent.pinned && agent.connector?.connectorId !== "pi") {
+				return reply.code(400).send({ error: "只有 pi Agent 支持资源配置" });
+			}
+			try {
+				if (agent.pinned) {
+					return mutationReply(await teams.updateManager({ piResources: req.body?.piResources ?? null }));
+				}
+				const updated = await teams.upsertAgent({
+					...agent,
+					piResources: req.body?.piResources ?? undefined,
+				});
+				return mutationReply(updated);
+			} catch (err) {
+				return notFoundOr400(reply, err);
+			}
+		},
+	);
+
 	app.delete<{ Params: { name: string } }>("/api/agents/:name", async (req, reply) => {
+		const existing = await teams.getAgent(req.params.name);
+		if (!existing) return reply.code(404).send({ error: "agent not found" });
+		// pinned 双层拒绝（§10.5）：路由先挡，store 再兜底。
+		if (existing.pinned) return reply.code(400).send({ error: `agent「${existing.name}」是 pinned 内置 Agent，不可删除` });
 		const removed = await teams.removeAgent(req.params.name);
 		if (!removed) return reply.code(404).send({ error: "agent not found" });
 		// 连带清除该 worker 的加密密钥。
@@ -38,8 +230,272 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, cr
 		return reply.code(204).send();
 	});
 
+	/**
+	 * 启用/禁用（§9.3.6）：禁用时若该 Agent 有 active/waiting Run，必须显式
+	 * 传 resolve——"keep" 保留 Run 但拒绝新委托，"cancel" 走 Runtime 取消；
+	 * 否则 409 + 受影响 Run 清单，绝不静默杀死。
+	 */
+	app.put<{ Params: { name: string }; Body: { enabled?: boolean; resolve?: string } }>(
+		"/api/agents/:name/enabled",
+		async (req, reply) => {
+			const agent = await teams.getAgent(req.params.name);
+			if (!agent) return reply.code(404).send({ error: "agent not found" });
+			const enabled = req.body?.enabled;
+			if (typeof enabled !== "boolean") return reply.code(400).send({ error: "body must be { enabled: boolean }" });
+			if (agent.pinned && !enabled) {
+				return reply.code(400).send({ error: `agent「${agent.name}」是 pinned 内置 Agent，不可禁用` });
+			}
+			if (enabled) {
+				return mutationReply(await teams.setEnabled(agent.name, true));
+			}
+			const resolve = req.body?.resolve;
+			const active = runtime
+				? (await runtime.listDelegations()).filter(
+						(d) => d.agentId === agent.name && (d.status === "running" || d.status === "waiting_input"),
+					)
+				: [];
+			if (active.length > 0 && resolve !== "keep" && resolve !== "cancel") {
+				return reply.code(409).send({
+					error: `agent「${agent.name}」有 ${active.length} 个进行中/等待审批的 Run；显式传 resolve: "keep" | "cancel"`,
+					runs: active.map((d) => ({
+						delegationId: d.id,
+						status: d.status,
+						windowId: d.windowId,
+						managerSessionId: d.managerSessionId,
+					})),
+				});
+			}
+			if (resolve === "cancel" && runtime) {
+				for (const d of active) {
+					await runtime.cancel(d.id, { cwd: process.cwd(), env: {} }).catch(() => undefined);
+				}
+			}
+			// "keep"：保留 Run，新委托由 Invoker 门控拒绝（§9.3.6）。
+			return mutationReply(await teams.setEnabled(agent.name, false));
+		},
+	);
+
+	// ---- Connector 绑定（§10.1 基础接入） ----
+
+	app.get<{ Params: { name: string } }>("/api/agents/:name/connector", async (req, reply) => {
+		const agent = await teams.getAgent(req.params.name);
+		if (!agent) return reply.code(404).send({ error: "agent not found" });
+		const binding = agent.connector ?? null;
+		const contribution =
+			binding && extensions ? (extensions.manifestOf(binding.extensionId) ?? null) : null;
+		return { connector: binding, extension: contribution, securityWarnings: connectorSecurityWarnings(agent) };
+	});
+
+	app.put<{
+		Params: { name: string };
+		Body: {
+			extensionId?: string;
+			connectorId?: string;
+			config?: Record<string, unknown>;
+			secrets?: Record<string, string>;
+			versionPin?: string;
+		};
+	}>("/api/agents/:name/connector", async (req, reply) => {
+		const agent = await teams.getAgent(req.params.name);
+		if (!agent) return reply.code(404).send({ error: "agent not found" });
+		if (agent.pinned) return reply.code(400).send({ error: "pinned manager 不绑定 Connector" });
+		const { extensionId, connectorId, config } = req.body ?? {};
+		if (!extensionId?.trim() || !connectorId?.trim()) {
+			return reply.code(400).send({ error: "body must be { extensionId, connectorId, config?, secrets? }" });
+		}
+		if (config !== undefined && (typeof config !== "object" || config === null || Array.isArray(config))) {
+			return reply.code(400).send({ error: "connector.config 必须是对象" });
+		}
+		// 校验安装包存在且 contribution 匹配（§9.3：先安装再绑定）。
+		const manifest = extensions?.manifestOf(extensionId);
+		if (extensions && (!manifest || manifest.kind !== "connector" || manifest.connector.id !== connectorId)) {
+			return reply.code(400).send({ error: `extension「${extensionId}」未安装或不包含 connector「${connectorId}」` });
+		}
+		try {
+			const secretRefs = await applySecrets(agent.name, req.body?.secrets, agent.connector?.secretRefs);
+			const updated = await teams.setConnectorBinding(agent.name, {
+				extensionId: extensionId.trim(),
+				connectorId: connectorId.trim(),
+				config: config ?? {},
+				...(secretRefs ? { secretRefs } : {}),
+				...(typeof req.body?.versionPin === "string" ? { versionPin: req.body.versionPin } : {}),
+			});
+			return mutationReply(updated);
+		} catch (err) {
+			return notFoundOr400(reply, err);
+		}
+	});
+
+	// ---- Capability Extension 绑定（§10.1 Extensions 页签） ----
+
+	app.get<{ Params: { name: string } }>("/api/agents/:name/extensions", async (req, reply) => {
+		const agent = await teams.getAgent(req.params.name);
+		if (!agent) return reply.code(404).send({ error: "agent not found" });
+		return { bindings: agent.capabilityExtensions ?? [], revision: agent.extensionRevision ?? 0 };
+	});
+
+	app.post<{
+		Params: { name: string };
+		Body: {
+			extensionId?: string;
+			capabilityId?: string;
+			enabled?: boolean;
+			config?: Record<string, unknown>;
+			activation?: string;
+			versionPin?: string;
+			secrets?: Record<string, string>;
+		};
+	}>("/api/agents/:name/extensions", async (req, reply) => {
+		const agent = await teams.getAgent(req.params.name);
+		if (!agent) return reply.code(404).send({ error: "agent not found" });
+		if (agent.pinned) return reply.code(400).send({ error: "pinned manager 不绑定 Capability Extension" });
+		const { extensionId, capabilityId, enabled, config, activation, versionPin } = req.body ?? {};
+		if (!extensionId?.trim() || !capabilityId?.trim()) {
+			return reply.code(400).send({ error: "body must be { extensionId, capabilityId, enabled?, config? }" });
+		}
+		if (activation !== undefined && activation !== "always" && activation !== "searchable") {
+			return reply.code(400).send({ error: 'activation 必须是 "always" | "searchable"' });
+		}
+		const manifest = extensions?.manifestOf(extensionId);
+		if (extensions && (!manifest || manifest.kind !== "capability" || manifest.capability.id !== capabilityId)) {
+			return reply.code(400).send({ error: `extension「${extensionId}」未安装或不包含 capability「${capabilityId}」` });
+		}
+		try {
+			const secretRefs = await applySecrets(agent.name, req.body?.secrets, undefined);
+			const updated = await teams.addCapabilityBinding(agent.name, {
+				extensionId: extensionId.trim(),
+				capabilityId: capabilityId.trim(),
+				enabled: enabled ?? true,
+				config: config ?? {},
+				...(secretRefs ? { secretRefs } : {}),
+				...(activation ? { activation } : {}),
+				...(typeof versionPin === "string" ? { versionPin } : {}),
+			});
+			return mutationReply(updated);
+		} catch (err) {
+			return notFoundOr400(reply, err);
+		}
+	});
+
+	app.patch<{
+		Params: { name: string; bindingId: string };
+		Body: {
+			enabled?: boolean;
+			config?: Record<string, unknown>;
+			activation?: string;
+			versionPin?: string;
+			secrets?: Record<string, string>;
+		};
+	}>("/api/agents/:name/extensions/:bindingId", async (req, reply) => {
+		const agent = await teams.getAgent(req.params.name);
+		if (!agent) return reply.code(404).send({ error: "agent not found" });
+		const binding = (agent.capabilityExtensions ?? []).find((b) => b.id === req.params.bindingId);
+		if (!binding) return reply.code(404).send({ error: `binding not found: ${req.params.bindingId}` });
+		const { enabled, config, activation, versionPin } = req.body ?? {};
+		if (activation !== undefined && activation !== "always" && activation !== "searchable") {
+			return reply.code(400).send({ error: 'activation 必须是 "always" | "searchable"' });
+		}
+		try {
+			const secretRefs = await applySecrets(agent.name, req.body?.secrets, binding.secretRefs);
+			const patch: Partial<Omit<AgentCapabilityBinding, "id" | "extensionId" | "capabilityId">> = {
+				...(enabled !== undefined ? { enabled } : {}),
+				...(config !== undefined ? { config } : {}),
+				...(activation !== undefined ? { activation } : {}),
+				...(versionPin !== undefined ? { versionPin } : {}),
+				...(secretRefs !== undefined ? { secretRefs } : {}),
+			};
+			return mutationReply(await teams.patchCapabilityBinding(agent.name, binding.id, patch));
+		} catch (err) {
+			return notFoundOr400(reply, err);
+		}
+	});
+
+	app.delete<{ Params: { name: string; bindingId: string } }>(
+		"/api/agents/:name/extensions/:bindingId",
+		async (req, reply) => {
+			try {
+				return mutationReply(await teams.removeCapabilityBinding(req.params.name, req.params.bindingId));
+			} catch (err) {
+				return notFoundOr400(reply, err);
+			}
+		},
+	);
+
+	/** Capability 绑定探测：安装/加载/启用状态与将注册的工具清单。 */
+	app.post<{ Params: { name: string; bindingId: string } }>(
+		"/api/agents/:name/extensions/:bindingId/probe",
+		async (req, reply) => {
+			const agent = await teams.getAgent(req.params.name);
+			if (!agent) return reply.code(404).send({ error: "agent not found" });
+			const binding = (agent.capabilityExtensions ?? []).find((b) => b.id === req.params.bindingId);
+			if (!binding) return reply.code(404).send({ error: `binding not found: ${req.params.bindingId}` });
+			const entry = extensions?.get(binding.extensionId);
+			const issues: Array<{ code: string; message: string }> = [];
+			if (!entry) issues.push({ code: "not_installed", message: `extension「${binding.extensionId}」未安装` });
+			else if (!entry.loaded) issues.push({ code: "load_failed", message: entry.loadError ?? "模块加载失败" });
+			if (!binding.enabled) issues.push({ code: "disabled", message: "该绑定已禁用" });
+			const tools =
+				entry?.manifest.kind === "capability"
+					? entry.manifest.capability.tools.map((t) => `agent_${agent.name}__${entry.manifest.id}__${t.name}`)
+					: [];
+			return {
+				probe: {
+					extensionInstalled: Boolean(entry),
+					extensionVersion: entry?.version,
+					loaded: entry?.loaded ?? false,
+					enabled: binding.enabled,
+					activation: binding.activation ?? null,
+					tools,
+					issues,
+				},
+			};
+		},
+	);
+
+	/**
+	 * Agent 健康探测：Connector 接入的 Agent 走 Driver.probe（§9.4，返回
+	 * 结构化 ProbeResult）；legacy command invoke 走注册表探测。
+	 */
 	app.post<{ Params: { name: string } }>("/api/agents/:name/probe", async (req, reply) => {
 		try {
+			const agent = await teams.getAgent(req.params.name);
+			if (!agent) return reply.code(404).send({ error: "agent not found" });
+			if (agent.pinned || agent.invoke?.type === "pi") {
+				return reply.code(400).send({ error: "pinned manager 无 Connector probe" });
+			}
+			if (agent.connector && invoker) {
+				const driver = await invoker.driverFor(agent.name);
+				const manifest = extensions?.manifestOf(agent.connector.extensionId);
+				if (!driver) {
+					// connector_missing：不静默回退（§9.3.8）。
+					return {
+						probe: {
+							extensionInstalled: Boolean(manifest),
+							extensionVersion: manifest?.version,
+							detected: false,
+							configured: false,
+							authenticated: "unknown",
+							enabled: agent.enabled !== false,
+							compatibility: "unknown",
+							issues: [{ code: "connector_missing", message: `Connector「${agent.connector.connectorId}」不可用（未安装或加载失败）` }],
+						},
+					};
+				}
+				const secrets = credentials ? await credentials.getSecrets(agent.name) : {};
+				const probe = await driver.probe({
+					cwd: process.cwd(),
+					env: { ...process.env, ...(agent.env ?? {}), ...secrets },
+				});
+				probe.enabled = agent.enabled !== false;
+				if (manifest) {
+					probe.extensionInstalled = true;
+					probe.extensionVersion = manifest.version;
+				}
+				for (const message of connectorSecurityWarnings(agent)) {
+					probe.issues.push({ code: "permission_risk", message, fixAction: "在 Connector 配置中选择更严格的权限模式" });
+				}
+				return { probe };
+			}
 			return { probe: await teams.probeAgent(req.params.name) };
 		} catch (err) {
 			return reply.code(404).send({ error: err instanceof Error ? err.message : String(err) });
@@ -65,11 +521,14 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, cr
 			}
 			for (const [k, v] of Object.entries(secrets)) {
 				if (typeof v !== "string") return reply.code(400).send({ error: `secret "${k}" must be a string` });
-				if (!/^[A-Z0-9_]+$/.test(k)) {
+				if (!SECRET_KEY.test(k)) {
 					return reply.code(400).send({ error: `secret key "${k}" must be UPPER_SNAKE (env var name)` });
 				}
 			}
-			return { configured: await credentials.setSecrets(req.params.name, secrets) };
+			const configured = await credentials.setSecrets(req.params.name, secrets);
+			await teams.bumpAgentRevision(req.params.name);
+			await sessions?.syncAgentConfigChange();
+			return { configured };
 		},
 	);
 
@@ -77,7 +536,10 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, cr
 		"/api/agents/:name/secrets/:key",
 		async (req, reply) => {
 			if (!credentials) return reply.code(501).send({ error: "secrets store not configured" });
+			if (!(await teams.getAgent(req.params.name))) return reply.code(404).send({ error: "agent not found" });
 			await credentials.removeSecret(req.params.name, req.params.key);
+			await teams.bumpAgentRevision(req.params.name);
+			await sessions?.syncAgentConfigChange();
 			return reply.code(204).send();
 		},
 	);
@@ -102,8 +564,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, cr
 				const agent = await teams.saveAvatar(req.params.name, Buffer.from(data, "base64"));
 				return { agent };
 			} catch (err) {
-				const msg = err instanceof Error ? err.message : String(err);
-				return reply.code(msg.includes("not found") ? 404 : 400).send({ error: msg });
+				return notFoundOr400(reply, err);
 			}
 		},
 	);
@@ -113,14 +574,26 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, cr
 			await teams.removeAvatar(req.params.name);
 			return reply.code(204).send();
 		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			return reply.code(msg.includes("not found") ? 404 : 400).send({ error: msg });
+			return notFoundOr400(reply, err);
 		}
 	});
 
 	app.get<{ Params: { name: string } }>("/api/agents/:name/avatar", async (req, reply) => {
 		const avatar = await teams.readAvatar(req.params.name);
-		if (!avatar) return reply.code(404).send({ error: "no avatar" });
+		// 未上传头像时回退到 connector manifest 声明的包内默认头像（§11）。
+		if (!avatar) {
+			if (extensions) {
+				const agent = (await teams.listAgents()).find((a) => a.name === req.params.name);
+				const fallback = agent?.connector ? await extensions.readConnectorAvatar(agent.connector.connectorId) : null;
+				if (fallback) {
+					return reply
+						.header("content-type", fallback.mime)
+						.header("cache-control", "public, max-age=3600")
+						.send(fallback.buf);
+				}
+			}
+			return reply.code(404).send({ error: "no avatar" });
+		}
 		// Frontend busts the cache with ?v=<n> on upload/delete, so a long
 		// max-age is safe.
 		return reply

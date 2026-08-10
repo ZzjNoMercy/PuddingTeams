@@ -7,6 +7,9 @@ import { serializePiEvent } from "../pi-bridge/bridge.js";
 import { PiSessionStore } from "../pi-bridge/session-store.js";
 import type { TeamsStore } from "../store/teams.js";
 import { config } from "../config.js";
+import type { WorkStateStore } from "../store/work-state.js";
+import type { UploadInput, UploadStore } from "../store/uploads.js";
+import type { PromptOptions } from "@earendil-works/pi-coding-agent";
 
 /**
  * Version of the bundled pi SDK, surfaced via /api/health for the About
@@ -64,6 +67,8 @@ export async function registerChatRoutes(
 	app: FastifyInstance,
 	store: PiSessionStore,
 	teams?: TeamsStore,
+	workStates?: WorkStateStore,
+	uploads?: UploadStore,
 ): Promise<void> {
 	app.get("/api/health", async () => ({ ok: true, service: "puddingteams-server", piVersion }));
 
@@ -107,14 +112,6 @@ export async function registerChatRoutes(
 
 	app.get("/api/sessions", async () => ({ sessions: await store.list() }));
 
-	app.post<{ Body: { model?: string } }>("/api/sessions", async (req, reply) => {
-		try {
-			return { session: await store.create(req.body?.model) };
-		} catch (err) {
-			return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
-		}
-	});
-
 	app.delete<{ Params: { id: string } }>("/api/sessions/:id", async (req, reply) => {
 		const removed = await store.remove(req.params.id);
 		// A fresh window session may only exist as a config (pi writes the
@@ -122,6 +119,7 @@ export async function registerChatRoutes(
 		// 404 when nothing existed at all.
 		const inWindow = teams ? await teams.windowForSession(req.params.id) : undefined;
 		await teams?.removeSessionFromWindows(req.params.id);
+		await workStates?.removeSession(req.params.id);
 		if (!removed && !inWindow) return reply.code(404).send({ error: "session not found" });
 		return reply.code(204).send();
 	});
@@ -141,27 +139,43 @@ export async function registerChatRoutes(
 		},
 	);
 
-	app.post<{ Params: { id: string }; Body: { content?: string } }>(
+	app.post<{ Params: { id: string }; Body: { content?: string; attachments?: UploadInput[] } }>(
 		"/api/sessions/:id/messages",
+		{ bodyLimit: 28 * 1024 * 1024 },
 		async (req, reply) => {
 			const content = req.body?.content?.trim();
-			if (!content) {
-				return reply.code(400).send({ error: "content is required" });
+			const attachments = req.body?.attachments ?? [];
+			if (!content && attachments.length === 0) {
+				return reply.code(400).send({ error: "content or attachments is required" });
+			}
+			if (!Array.isArray(attachments)) return reply.code(400).send({ error: "attachments must be an array" });
+			let stored = [] as Awaited<ReturnType<UploadStore["save"]>>;
+			try {
+				stored = attachments.length ? await uploads?.save(req.params.id, attachments) ?? [] : [];
+			} catch (err) {
+				return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
 			}
 			const session = await store.open(req.params.id);
+			const attachmentText = stored.length
+				? `\n\n用户附件（平台冻结路径，可按需读取并在委托任务中原样传递）：\n${stored.map((item) => `- ${item.name} (${item.mediaType}, ${item.size} bytes): ${item.path}`).join("\n")}`
+				: "";
+			const promptText = `${content || "请处理所附文件。"}${attachmentText}`;
+			const images = stored
+				.filter((item) => item.mediaType.startsWith("image/"))
+				.map((item) => ({ type: "image" as const, data: item.base64, mimeType: item.mediaType }));
 			// 第一条消息到达时，异步调 LLM 生成会话标题（session_info），
 			// 不阻塞消息发送本身。
 			const isFirstMessage = session.messages.length === 0;
-			void session.prompt(content).catch((err: unknown) => {
+			void session.prompt(promptText, images.length ? ({ images } as PromptOptions) : undefined).catch((err: unknown) => {
 				app.log.error({ err, sessionId: req.params.id }, "prompt failed");
 				forwardError(req.params.id, err instanceof Error ? err.message : String(err));
 			});
 			if (isFirstMessage) {
-				void store.generateSessionTitle(req.params.id, content).catch((err: unknown) => {
+				void store.generateSessionTitle(req.params.id, content || stored.map((item) => item.name).join("、")).catch((err: unknown) => {
 					app.log.warn({ err, sessionId: req.params.id }, "title generation failed");
 				});
 			}
-			return { accepted: true };
+			return { accepted: true, attachments: stored.map(({ base64: _base64, ...item }) => item) };
 		},
 	);
 

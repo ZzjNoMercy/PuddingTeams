@@ -31,7 +31,7 @@ function statusLabel(status: CardStatus): string {
 
 /**
  * HITL 审批卡（§6.5）。两种来源共用：
- * 1. team_task 工具结果里的 waitingInput details（当前窗口内）；
+ * 1. 委托工具（agent_<id>__delegate）结果里的 waitingInput details（当前窗口内）；
  * 2. `pudding:interaction_required` custom message（solo 同步进对方单聊窗口）。
  *
  * 状态以服务端为事实源：挂载时和每次操作后通过 GET /api/interactions/:id 对账，
@@ -159,6 +159,9 @@ export function InteractionCard({
 				<div className="flex min-w-0 items-center gap-2">
 					<WorkerAvatar name={worker} size={20} />
 					<span className="truncate font-mono text-sm font-medium">{worker}</span>
+					<Badge variant="outline" className="shrink-0 text-muted-foreground">
+						实验
+					</Badge>
 					{statusHint === "conflict" ? (
 						<Badge variant="destructive" className="gap-1">
 							<ShieldAlertIcon className="size-3" />

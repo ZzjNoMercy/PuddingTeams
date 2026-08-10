@@ -1,0 +1,50 @@
+{
+	"name": "@puddingteams/connector-echo",
+	"version": "0.1.0",
+	"description": "声明式 Connector 样例（§10.3 两级模型第 1 级）：纯 manifest 包，无代码接入 echo CLI，验证「用户不写代码也能接 CLI」。",
+	"type": "module",
+	"files": [
+		"cli.mjs"
+	],
+	"puddingteams": {
+		"id": "echo",
+		"publisher": "puddingteams",
+		"displayName": "Echo Connector",
+		"version": "0.1.0",
+		"source": "trusted",
+		"kind": "connector",
+		"engines": {
+			"puddingteams": ">=0.1 <1"
+		},
+		"permissions": ["spawn"],
+		"connector": {
+			"id": "echo",
+			"displayName": "Echo",
+			"apiVersion": "1",
+			"defaultTransport": "spawn",
+			"supportedTransports": ["spawn"],
+			"declarative": {
+				"command": "node",
+				"probe": { "args": ["{packageDir}/cli.mjs", "--version"], "versionRegex": "(\\d+\\.\\d+\\.\\d+)" },
+				"operations": {
+					"run": { "args": ["{packageDir}/cli.mjs", "run", "{message}"] },
+					"continue": { "args": ["{packageDir}/cli.mjs", "resume", "{sessionHandle}", "{message}"] }
+				},
+				"output": {
+					"mode": "jsonl",
+					"mapping": {
+						"sessionHandle": "$.session_id@session.started",
+						"runHandle": "$.run_id@session.started",
+						"progress": "$.text@progress",
+						"content": "$.text@message.completed",
+						"usage.inputTokens": "$.usage.input_tokens@done",
+						"usage.outputTokens": "$.usage.output_tokens@done"
+					}
+				},
+				"capabilities": { "operations": ["run", "continue", "cancel"], "interactionKinds": [] }
+			}
+		}
+	},
+	"keywords": ["puddingteams", "pwcp", "echo", "connector", "declarative"],
+	"license": "MIT"
+}

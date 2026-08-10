@@ -1,0 +1,25 @@
+{
+	"name": "__PACKAGE_NAME__",
+	"version": "0.1.0",
+	"description": "__DESCRIPTION__",
+	"type": "module",
+	"exports": "./index.ts",
+	"files": ["index.ts"],
+	"puddingteams": {
+		"id": "__CONNECTOR_ID__",
+		"publisher": "puddingteams",
+		"displayName": "__DISPLAY_NAME__",
+		"version": "0.1.0",
+		"source": "external",
+		"kind": "capability",
+		"engines": { "puddingteams": ">=0.1 <1" },
+		"permissions": [],
+		"entry": "index.ts",
+		"capability": {
+			"id": "__CONNECTOR_ID__",
+			"displayName": "__DISPLAY_NAME__",
+			"apiVersion": "1",
+			"tools": [{ "name": "example", "activation": "searchable", "description": "示例工具" }]
+		}
+	}
+}

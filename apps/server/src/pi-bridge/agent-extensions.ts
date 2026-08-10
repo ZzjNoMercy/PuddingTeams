@@ -1,0 +1,711 @@
+import { existsSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { Type, type Static } from "typebox";
+import type { ExtensionAPI, InlineExtension } from "@earendil-works/pi-coding-agent";
+import type { TeamsStore, AgentConfig, WindowConfig, WindowType } from "../store/teams.js";
+import { WorkStateConflictError, type WorkStateStore } from "../store/work-state.js";
+import type { AgentInvoker } from "../agent-runtime/invoker.js";
+import {
+	ScopedAgentInvoker,
+	delegateToolName,
+	extensionToolName,
+	toolSafeId,
+	type CapabilityRegistration,
+	type ExtensionCatalog,
+} from "../agent-runtime/extensions.js";
+import type { PiSessionStore } from "./session-store.js";
+
+/**
+ * Phase 4：manager Session 的 Extension 装配（方案 §3.3）。
+ *
+ * - core Extension：`search_agent_tools` 工具 + roster 注入（成员名单是窗口
+ *   绑定的静态事实，不做成工具，由 before_agent_start 每轮重读并写进 system
+ *   prompt，成员/启用变化下一轮即生效）；
+ * - 每个 roster Agent 一个平台生成的 agent-delegation Extension（基础委托工具
+ *   `agent_<agentId>__delegate`，内部走 ScopedAgentInvoker → AgentInvoker）；
+ * - 专属 Capability Extension 按 enabled binding 装配在基础 Extension 之后；
+ * - 工具命名空间与 always/searchable 激活策略见 planManagerTools。
+ */
+
+const MAX_RESULT_CHARS = 30_000;
+
+/**
+ * How long solo task sync waits for the direct window's manager session to
+ * become idle before giving up. sendCustomMessage during streaming degrades
+ * to a steer injection (semantics change), so we never force it — 15s covers
+ * normal relay runs while keeping the tool result timely; on timeout the
+ * result is still returned with `synced: false`.
+ */
+const SYNC_IDLE_TIMEOUT_MS = 15_000;
+
+export const CORE_TOOL_SEARCH = "search_agent_tools";
+export const CORE_TOOL_UPDATE_WORK_STATE = "update_session_work_state";
+export const CORE_TOOL_REQUEST_DECISION = "request_human_decision";
+
+/** manager Session 的窗口上下文（装配时解析，工具执行期按需重读）。 */
+export interface ManagerWindowContext {
+	type: WindowType;
+	members: string[];
+	prompt?: string;
+	workspaceId?: string;
+	/** manager 与 worker 必须共享的项目 cwd。 */
+	cwd?: string;
+}
+
+function truncate(text: string): string {
+	if (text.length <= MAX_RESULT_CHARS) return text;
+	return `${text.slice(0, MAX_RESULT_CHARS)}\n\n…(输出过长，已截断)`;
+}
+
+// ---- 工具集规划（命名空间 + always/searchable 激活策略） ----
+
+export interface ManagedToolPlan {
+	/** 本次装配注册的全部受管工具名（core + per-agent）。 */
+	managed: Set<string>;
+	/** 默认激活的受管工具子集。 */
+	active: Set<string>;
+	/** 参与装配的 roster Agent（启用 + 窗口成员过滤后）。 */
+	agents: AgentConfig[];
+}
+
+/**
+ * 计算一个窗口上下文的受管工具集（§3.3）：
+ * - roster：solo 为全部启用 Agent；direct/group 仅启用的窗口成员；
+ * - 命名空间：`agent_<agentId>__delegate`、`agent_<agentId>__<extId>__<tool>`；
+ * - 激活：direct 默认激活该 Agent 的基础委托工具 + 绑定的 always 工具；
+ *   solo/group 默认只激活 core（search），其余预注册但 inactive；
+ * - roster 本身不进工具集，由 core Extension 的 before_agent_start 注入 prompt。
+ */
+export async function planManagerTools(
+	store: TeamsStore,
+	catalog: ExtensionCatalog,
+	ctx: ManagerWindowContext | undefined,
+): Promise<ManagedToolPlan> {
+	// pinned 内置 manager 不是可委托的 worker（§10.5），不进 roster。
+	const enabled = (await store.listAgents()).filter((a) => a.enabled !== false && !a.pinned);
+	const solo = !ctx || ctx.type === "solo";
+	const agents = solo ? enabled : enabled.filter((a) => ctx.members.includes(a.name));
+	const managed = new Set<string>([
+		CORE_TOOL_SEARCH,
+		CORE_TOOL_UPDATE_WORK_STATE,
+		CORE_TOOL_REQUEST_DECISION,
+	]);
+	const active = new Set<string>(managed);
+	for (const agent of agents) {
+		const delegate = delegateToolName(agent.name);
+		managed.add(delegate);
+		if (ctx?.type === "direct") active.add(delegate);
+		for (const binding of agent.capabilityExtensions ?? []) {
+			if (!binding.enabled) continue;
+			const module = catalog.get(binding.extensionId);
+			if (!module) continue;
+			for (const tool of module.manifest.tools) {
+				const name = extensionToolName(agent.name, module.manifest.id, tool.name);
+				managed.add(name);
+				// 绑定的 activation 覆盖模块声明的默认激活策略（§10）。
+				const activation = binding.activation ?? tool.activation;
+				if (activation === "always" && ctx?.type === "direct") active.add(name);
+			}
+		}
+	}
+	return { managed, active, agents };
+}
+
+// ---- 装配 ----
+
+export interface ManagerExtensionDeps {
+	store: TeamsStore;
+	sessions: PiSessionStore;
+	invoker: AgentInvoker;
+	catalog: ExtensionCatalog;
+	workStates?: WorkStateStore;
+	/** 可变绑定：createAgentSession 内部生成 session id，工具执行期惰性读取。 */
+	getSessionId: () => string;
+	/** 装配时的窗口上下文（描述文案用；执行期一律经 resolveContext 重读）。 */
+	ctx: ManagerWindowContext | undefined;
+	/** 执行期重读最新窗口上下文（成员变化立即生效）。 */
+	resolveContext: () => Promise<ManagerWindowContext | undefined>;
+	log?: (msg: string) => void;
+}
+
+/** 按 plan 构造具名 extensionFactories：core 在前，per-agent 基础委托随后，专属最后。 */
+export function buildManagerExtensionFactories(
+	plan: ManagedToolPlan,
+	deps: ManagerExtensionDeps,
+): InlineExtension[] {
+	const factories: InlineExtension[] = [{ name: "pudding-core-roster", factory: coreRosterFactory(deps) }];
+	for (const agent of plan.agents) {
+		factories.push({
+			name: `agent-${toolSafeId(agent.name)}-delegation`,
+			factory: agentDelegationFactory(agent, deps),
+		});
+		for (const binding of agent.capabilityExtensions ?? []) {
+			if (!binding.enabled) continue;
+			const module = deps.catalog.get(binding.extensionId);
+			if (!module) continue;
+			factories.push({
+				name: `agent-${toolSafeId(agent.name)}-${toolSafeId(module.manifest.id)}`,
+				factory: (pi) => {
+					const scoped = new ScopedAgentInvoker(agent.name, deps.invoker);
+					const registration: CapabilityRegistration = {
+						agent: {
+							id: agent.name,
+							name: agent.name,
+							description: agent.description,
+							capabilities: agent.capabilities ?? [],
+						},
+						config: binding.config ?? {},
+						invoker: scoped,
+						events: {
+							// 事件命名空间与工具一致，Extension 不能冒发其他 Agent 的事件。
+							publish: (event, payload) =>
+								pi.events.emit(`pudding:${toolSafeId(agent.name)}:${toolSafeId(module.manifest.id)}:${event}`, payload),
+						},
+						registerTool: (tool) =>
+							pi.registerTool({
+								...tool,
+								name: extensionToolName(agent.name, module.manifest.id, tool.name),
+							}),
+					};
+					return module.register(registration);
+				},
+			});
+		}
+	}
+	return factories;
+}
+
+// ---- core Extension（roster prompt 注入 + search_agent_tools） ----
+
+const SearchParams = Type.Object({
+	query: Type.String({ description: "搜索关键词（匹配工具名或描述，如 worker 名）。" }),
+});
+
+const UpdateWorkStateParams = Type.Object({
+	revision: Type.Integer({ minimum: 0, description: "系统提示中当前工作状态的 revision。" }),
+	currentBrief: Type.Optional(Type.String({ description: "截至目前已确认的事实、结果与进展摘要。" })),
+	waitingOn: Type.Optional(Type.String({ description: "当前具体在等待谁或什么；空字符串表示清除。" })),
+	nextAction: Type.Optional(Type.String({ description: "下一步最小可执行动作；空字符串表示清除。" })),
+	status: Type.Optional(
+		Type.Union([
+			Type.Literal("active"),
+			Type.Literal("waiting_human"),
+			Type.Literal("resolved"),
+			Type.Literal("cancelled"),
+		]),
+	),
+	artifactIds: Type.Optional(Type.Array(Type.String(), { description: "支撑当前结论的稳定 Artifact ID。" })),
+});
+
+const RequestDecisionParams = Type.Object({
+	revision: Type.Integer({ minimum: 0, description: "系统提示中当前工作状态的 revision。" }),
+	question: Type.String({ description: "必须由人类作出的业务决定。" }),
+	context: Type.String({ description: "做决定所需的最小充分背景。" }),
+	options: Type.Optional(
+		Type.Array(
+			Type.Object({ id: Type.String(), label: Type.String() }),
+			{ description: "互斥的推荐选项；开放问题可省略。" },
+		),
+	),
+	blockedAction: Type.String({ description: "在答案到来前不得执行的动作。" }),
+	resumeHint: Type.String({ description: "答案到来后应如何恢复工作。" }),
+	authorizationScope: Type.Optional(Type.String({ description: "若决定同时授予权限，精确定义其范围。" })),
+});
+
+/**
+ * roster 的 system prompt 段落（每轮由 before_agent_start 重算）。成员名单是
+ * 窗口绑定的静态事实，不做成工具让模型多调一轮；执行期重读保证成员/启用
+ * 变化下一轮即反映到 prompt，安全性仍由 AgentInvoker 入口校验兜底。
+ */
+export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowContext | undefined): string {
+	if (plan.agents.length === 0) {
+		return (
+			"当前没有可委托的 worker。请先在智能体管理中启用 worker" +
+			(ctx && ctx.type !== "solo" ? "，并确认它是本窗口成员。" : "。") +
+			"不要承诺派活。"
+		);
+	}
+	const lines = plan.agents.map((a) => {
+		const tools = [...plan.managed].filter((n) => n.startsWith(`agent_${toolSafeId(a.name)}__`));
+		const caps = a.capabilities?.length ? `｜能力：${a.capabilities.join("、")}` : "";
+		const responsibility = a.responsibility
+			? [
+					`｜责任领域：${a.responsibility.domain}`,
+					a.responsibility.owns.length ? `｜负责：${a.responsibility.owns.join("、")}` : "",
+					a.responsibility.excludes.length ? `｜不负责：${a.responsibility.excludes.join("、")}` : "",
+					a.responsibility.escalateWhen?.length ? `｜升级条件：${a.responsibility.escalateWhen.join("、")}` : "",
+				].join("")
+			: "";
+		const toolList = tools.map((n) => (plan.active.has(n) ? `${n}（已激活）` : n)).join("、");
+		return `- ${a.name}：${a.description || "（无描述）"}${caps}${responsibility}\n  工具：${toolList}`;
+	});
+	return [
+		"当前可委托的 worker（按窗口成员与启用状态每轮刷新）：",
+		lines.join("\n"),
+		`标注「已激活」的工具可直接调用，不要再搜索；未激活的先用 ${CORE_TOOL_SEARCH} 按名称激活后再调用；若调用被拒绝，说明该 worker 已不可用，不要重试。`,
+	].join("\n");
+}
+
+function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => void {
+	return (pi) => {
+		pi.on("before_agent_start", async (event) => {
+			const ctx = await deps.resolveContext();
+			const plan = await planManagerTools(deps.store, deps.catalog, ctx);
+			const workState = deps.workStates ? await deps.workStates.get(deps.getSessionId()) : undefined;
+			const workSection = workState
+				? [
+						"当前 Session 是一个需要持续负责的 Goal。manager 是唯一可更新当前工作状态的责任主体。",
+						`目标：${workState.goal}`,
+						`完成边界：${workState.completionBoundary}`,
+						`状态：${workState.status}｜revision：${workState.revision}`,
+						`当前摘要：${workState.currentBrief || "（尚未记录）"}`,
+						`等待：${workState.waitingOn || "无"}`,
+						`下一步：${workState.nextAction || "尚未记录"}`,
+						`每次取得实质进展后调用 ${CORE_TOOL_UPDATE_WORK_STATE}；遇到产品/业务取舍时调用 ${CORE_TOOL_REQUEST_DECISION}，不要把它伪装成 Connector 权限审批。`,
+					].join("\n")
+				: `当前 Session 尚未设置 Goal；不要调用 ${CORE_TOOL_UPDATE_WORK_STATE} 或 ${CORE_TOOL_REQUEST_DECISION}。`;
+			return { systemPrompt: `${event.systemPrompt}\n\n${workSection}\n\n${rosterPromptSection(plan, ctx)}` };
+		});
+
+		pi.registerTool({
+			name: CORE_TOOL_SEARCH,
+			label: "Search Agent Tools",
+			description:
+				"按关键词搜索当前窗口内 Agent 的工具，并纯加法激活匹配项（setActiveTools）。找到后要先用返回的工具名发起调用。",
+			promptGuidelines: [
+				`需要调用未激活的 Agent 工具时，先用 ${CORE_TOOL_SEARCH} 搜索并激活，再发起调用。`,
+			],
+			parameters: SearchParams,
+			async execute(_toolCallId, params: Static<typeof SearchParams>) {
+				// 成员/启用状态每次重读：被禁用的 Agent 工具不会被重新激活（§3.3 撤权）。
+				const ctx = await deps.resolveContext();
+				const plan = await planManagerTools(deps.store, deps.catalog, ctx);
+				const query = params.query.toLowerCase();
+				// 匹配全量受管工具（含已激活的）：模型搜一个已激活的工具名时，
+				// 要明确告诉它"已激活可直接调用"，而不是"没有匹配"把它绕晕。
+				const matches = pi
+					.getAllTools()
+					.filter(
+						(t) =>
+							plan.managed.has(t.name) &&
+							(t.name.toLowerCase().includes(query) || t.description.toLowerCase().includes(query)),
+					)
+					.map((t) => t.name);
+				if (matches.length === 0) {
+					return {
+						content: [{ type: "text", text: `没有匹配「${params.query}」的工具。当前窗口可用的 worker 与工具见系统提示中的 worker 清单（标注「已激活」的可直接调用）。` }],
+						details: { matches: [], added: [] },
+					};
+				}
+				const active = pi.getActiveTools();
+				const added = matches.filter((n) => !active.includes(n));
+				// 纯加法加载（§3.3）：不得在同一调用里移除现有工具。
+				if (added.length > 0) pi.setActiveTools([...new Set([...active, ...added])]);
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								added.length > 0
+									? `已激活工具：${added.join("、")}。现在可以直接调用它们。`
+									: `匹配的工具已是激活状态，无需再激活，可直接调用：${matches.join("、")}。`,
+						},
+					],
+					details: { matches, added },
+				};
+			},
+		});
+
+		pi.registerTool({
+			name: CORE_TOOL_UPDATE_WORK_STATE,
+			label: "Update Session Work State",
+			description: "更新当前 Goal 的权威工作摘要、等待项、下一步和完成状态；使用 revision 做乐观并发控制。",
+			parameters: UpdateWorkStateParams,
+			async execute(_toolCallId, params: Static<typeof UpdateWorkStateParams>) {
+				if (!deps.workStates) throw new Error("Session Work State 未启用");
+				try {
+					const { revision, ...patch } = params;
+					const state = await deps.workStates.update(deps.getSessionId(), revision, patch);
+					return {
+						content: [{ type: "text", text: `当前工作已更新（${state.status}，revision ${state.revision}）。` }],
+						details: { workState: state },
+					};
+				} catch (err) {
+					if (err instanceof WorkStateConflictError) {
+						throw new Error(`当前工作已被更新，请按 revision ${err.current.revision} 的最新状态重新判断后再提交。`);
+					}
+					throw err;
+				}
+			},
+		});
+
+		pi.registerTool({
+			name: CORE_TOOL_REQUEST_DECISION,
+			label: "Request Human Decision",
+			description: "创建业务级人类决策请求并暂停当前 Goal；它不替代 Connector 的 permission/confirmation 审批。",
+			parameters: RequestDecisionParams,
+			async execute(_toolCallId, params: Static<typeof RequestDecisionParams>) {
+				if (!deps.workStates) throw new Error("Session Work State 未启用");
+				const sessionId = deps.getSessionId();
+				const decision = await deps.workStates.createDecision({
+					sessionId,
+					requestedBy: "manager",
+					question: params.question,
+					context: params.context,
+					options: params.options,
+					blockedAction: params.blockedAction,
+					resumeHint: params.resumeHint,
+					authorizationScope: params.authorizationScope,
+				});
+				try {
+					await deps.workStates.update(sessionId, params.revision, {
+						status: "waiting_human",
+						waitingOn: params.question,
+						nextAction: params.resumeHint,
+					});
+				} catch (err) {
+					if (!(err instanceof WorkStateConflictError)) throw err;
+				}
+				return {
+					content: [{ type: "text", text: `已创建人类决策请求：${decision.question}。等待回答，不要执行被阻塞动作。` }],
+					details: { decision },
+				};
+			},
+		});
+	};
+}
+
+// ---- per-agent 基础 delegation Extension ----
+
+const DelegateParams = Type.Object(
+	{
+		task: Type.String({ description: "委托给该 worker 的任务。" }),
+		parentDelegationId: Type.Optional(Type.String({ description: "若这是接力/追问，填写直接前序 delegationId。" })),
+		handoffKind: Type.Optional(
+			Type.Union([Type.Literal("request"), Type.Literal("followup")], {
+				description: "request=新的有返回义务的子任务；followup=沿 parentDelegationId 继续。",
+			}),
+		),
+		intent: Type.Optional(Type.String({ description: "本次委托为何是实现 Session Goal 的必要步骤。" })),
+		expectedOutcome: Type.Optional(Type.String({ description: "期望 worker 返回的可验证结果。" })),
+		evidenceRequirements: Type.Optional(Type.Array(Type.String(), { description: "结果必须附带的证据。" })),
+		completionBoundary: Type.Optional(Type.String({ description: "本次子任务何时算完成。" })),
+		session: Type.Optional(
+			Type.Union([Type.Literal("new"), Type.Literal("continue")], {
+				description:
+					'仅 solo 对话有效："continue"（默认）续接该 worker 单聊中正在进行的会话；任务与现有会话无关时传 "new"。',
+			}),
+		),
+	},
+	{ description: "把任务委托给这个 worker 并返回最终结果。" },
+);
+
+type DelegateInput = Static<typeof DelegateParams>;
+
+/**
+ * 平台生成的基础 agent-delegation Extension（§10.2）：每个 roster Agent 一个，
+ * 只注册稳定的委托工具 `agent_<agentId>__delegate`。工具绑定 agentId，参数里
+ * 没有 agent 字段，无法改投其他 Agent；启用状态与成员关系由 AgentInvoker
+ * 入口二次校验。
+ */
+function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps): (pi: ExtensionAPI) => void {
+	const solo = !deps.ctx || deps.ctx.type === "solo";
+	let soloSummary = "";
+
+	/** solo 摘要：该 worker 单聊窗口的现有会话，供 session: "new"|"continue" 选择。 */
+	const refreshSoloSummary = async (): Promise<void> => {
+		if (!solo) return;
+		try {
+			const workspaceId = deps.ctx?.workspaceId;
+			const direct = await deps.store.findDirectWindow(agent.name, workspaceId, deps.ctx?.cwd);
+			let windowInfo = "单聊：无（首次派活时自动创建）";
+			if (direct) {
+				const byId = new Map((await deps.sessions.list()).map((s) => [s.id, s]));
+				const infos = direct.sessions.map((id) => byId.get(id)).filter((s): s is NonNullable<typeof s> => Boolean(s));
+				windowInfo = infos.length
+					? `单聊现有会话：${infos
+							.slice(0, 3)
+							.map(
+								(s) =>
+									`「${s.firstMessage || "新对话"}」（最近活跃 ${s.modifiedAt.slice(0, 16).replace("T", " ")}）`,
+							)
+							.join("；")}`
+					: "单聊：已有窗口，暂无历史会话";
+			}
+			soloSummary = windowInfo;
+		} catch {
+			// Best-effort: a stale/empty summary never blocks delegation.
+		}
+	};
+	void refreshSoloSummary();
+
+	const baseDescription = [
+		`把任务委托给 worker「${agent.name}」（${agent.description || "无描述"}）并返回最终结果。`,
+		agent.responsibility
+			? `责任领域：${agent.responsibility.domain}；负责：${agent.responsibility.owns.join("、") || "未细分"}；不负责：${agent.responsibility.excludes.join("、") || "未声明"}。`
+			: "",
+		"当用户的请求属于这个 worker 的职责时使用，不要自己动手执行。",
+		"当 worker 需要审批才能继续时，结果会报告一个待处理的审批；不要重试任务——审批卡会处理它。",
+	].filter(Boolean).join(" ");
+
+	return (pi) => {
+		pi.registerTool({
+			name: delegateToolName(agent.name),
+			label: `${agent.name} · 委托`,
+			get description() {
+				if (!solo) return baseDescription;
+				return [
+					baseDescription,
+					"当前是 solo 对话：派活会自动路由到该 worker 的单聊窗口（没有则自动创建），并把任务与结果同步到该单聊的消息流。",
+					'参数 `session`：默认 "continue" 续接该 worker 单聊中正在进行的会话；任务与现有会话无关时传 "new"。',
+					`该 worker 的单聊现状：${soloSummary || "（摘要加载中）"}`,
+				].join(" ");
+			},
+			parameters: DelegateParams,
+			async execute(toolCallId, params: DelegateInput, signal, onUpdate) {
+				const sessionId = deps.getSessionId();
+				const goal = deps.workStates ? await deps.workStates.get(sessionId) : undefined;
+				if (goal && (!params.intent?.trim() || !params.expectedOutcome?.trim() || !params.completionBoundary?.trim())) {
+					throw new Error("Goal Session 的委托必须声明 intent、expectedOutcome 与 completionBoundary，避免无因果派活。");
+				}
+				if (params.handoffKind === "followup" && !params.parentDelegationId) {
+					throw new Error("followup 委托必须填写 parentDelegationId");
+				}
+				// 撤权前置校验（执行期重读，AgentInvoker 入口还有第二道）：
+				// 禁用/删除的 Agent 不能发起新委托，也不为它自动创建单聊窗口。
+				const fresh = await deps.store.getAgent(agent.name);
+				if (!fresh || fresh.enabled === false) {
+					throw new Error(`worker「${agent.name}」不存在或已被禁用，委托被拒绝。`);
+				}
+				const window = await deps.store.windowForSession(sessionId);
+				// Sessions outside any window behave like solo: the task routes to
+				// the worker's direct window (auto-created if missing).
+				const isSoloContext = !window || window.type === "solo";
+				if (!isSoloContext && !window.members.includes(agent.name)) {
+					throw new Error(`worker「${agent.name}」不在当前窗口的成员中，委托被拒绝。`);
+				}
+
+				// §4.1: solo tasks run inside the worker's direct window, so the
+				// worker session continuity lives where the user can see it.
+				let targetWindow = window;
+				if (isSoloContext) {
+					if (!window) throw new Error("当前 manager Session 不属于任何窗口，不能派活");
+					const workspaceId = window.workspaceId;
+					const cwd = await deps.store.workspaceFor(window.id);
+					targetWindow = await deps.store.ensureDirectWindow(agent.name, workspaceId, () =>
+						deps.sessions.create(undefined, {
+							type: "direct",
+							members: [agent.name],
+							workspaceId,
+							cwd,
+						}),
+						{ cwdSnapshot: cwd },
+					);
+				}
+
+				deps.log?.(`${delegateToolName(agent.name)}: ${sessionId} → ${agent.name} (task len ${params.task.length})`);
+
+				const taskId = toolCallId || randomUUID();
+				const scoped = new ScopedAgentInvoker(agent.name, deps.invoker);
+				const result = await scoped.delegate({
+					message: params.task,
+					windowId: targetWindow?.id ?? "",
+					managerSessionId: sessionId,
+					managerToolCallId: taskId,
+					parentDelegationId: params.parentDelegationId,
+					handoffKind: params.handoffKind ?? (params.parentDelegationId ? "followup" : "request"),
+					intent: params.intent,
+					expectedOutcome: params.expectedOutcome,
+					evidenceRequirements: params.evidenceRequirements,
+					completionBoundary: params.completionBoundary,
+					mode: isSoloContext ? (params.session === "new" ? "run" : "continue") : "continue",
+					signal,
+					onUpdate: (content) => onUpdate?.({ content: [{ type: "text", text: content }], details: {} }),
+				});
+
+				const meta: Record<string, unknown> = {
+					worker: result.details.worker ?? agent.name,
+					status: result.status,
+					delegationId: result.delegationId,
+					interactionId: result.interactionId,
+				};
+				const picked = result.details;
+
+				// §4.4: mirror into the direct window's message stream. Best-effort —
+				// a busy target session yields synced:false instead of blocking.
+				const sync = async (
+					status: string,
+					text: string,
+					interaction?: { interactionId: string; revision?: number; requests?: unknown[] },
+				): Promise<boolean> => {
+					if (!isSoloContext || !targetWindow) return false;
+					const ok = await syncToWindow(
+						deps,
+						targetWindow,
+						taskId,
+						agent.name,
+						params.task,
+						status,
+						text,
+						interaction,
+					);
+					void refreshSoloSummary();
+					return ok;
+				};
+				const soloMeta = async (
+					status: string,
+					text: string,
+					interaction?: { interactionId: string; revision?: number; requests?: unknown[] },
+				) => {
+					if (!isSoloContext || !targetWindow) return {};
+					const synced = await sync(status, text, interaction);
+					return { taskId, windowId: targetWindow.id, synced };
+				};
+				const syncNote = (synced: boolean | undefined) =>
+					synced === undefined
+						? ""
+						: synced
+							? `\n\n（已同步到与 ${agent.name} 的单聊）`
+							: `\n\n（未能同步到与 ${agent.name} 的单聊：对方会话忙碌）`;
+
+				// HITL（§6.2）：needs_input 时保存待处理 Interaction，返回“等待审批”
+				// 结构，manager 本轮正常结束，绝不指导它重跑任务。
+				if (result.status === "needs_input" || result.status === "conflict") {
+					const text = result.content;
+					const interaction =
+						result.interactionId && result.status === "needs_input"
+							? {
+									interactionId: result.interactionId,
+									revision: (picked as { revision?: number }).revision,
+									requests: (picked as { requests?: unknown[] }).requests,
+								}
+							: undefined;
+					const extra = await soloMeta(result.status, text, interaction);
+					return {
+						content: [{ type: "text", text: `${text}${syncNote(extra.synced as boolean | undefined)}` }],
+						details: { ...meta, ...picked, ...extra },
+					};
+				}
+
+				if (result.status === "failed") {
+					const text = result.content;
+					await soloMeta("error", text);
+					throw new Error(text);
+				}
+
+				const text = truncate(result.content);
+				// §15.6 接力：交付物清单附在结果文本末尾（传路径不传内容），
+				// details 里已有结构化 artifacts（invoker 投影），供 manager 在
+				// 接力任务文本中按路径引用。
+				const artifacts = (picked as { artifacts?: Array<{ name: string; path: string }> }).artifacts;
+				const artifactNote = artifacts?.length
+					? `\n\n交付物（可在接力任务中按路径引用）：\n${artifacts.map((a) => `- ${a.name}：${a.path}`).join("\n")}`
+					: "";
+				const extra = await soloMeta(result.status, result.content);
+				return {
+					content: [{ type: "text", text: `${text}${artifactNote}${syncNote(extra.synced as boolean | undefined)}` }],
+					details: { ...meta, ...picked, ...extra },
+				};
+			},
+		});
+	};
+}
+
+/** Mirror assignment + result into the direct window's message stream (§4.4). */
+async function syncToWindow(
+	deps: Pick<ManagerExtensionDeps, "store" | "sessions">,
+	window: WindowConfig,
+	taskId: string,
+	workerName: string,
+	task: string,
+	status: string,
+	resultText: string,
+	interaction?: { interactionId: string; revision?: number; requests?: unknown[] },
+): Promise<boolean> {
+	try {
+		// Re-read the window: the active session may have moved since the
+		// delegation started.
+		const fresh = await deps.store.getWindow(window.id);
+		const activeSession = fresh?.activeSession ?? window.activeSession;
+		const target = await deps.sessions.open(activeSession);
+		if (!target.isIdle) {
+			await Promise.race([
+				target.waitForIdle(),
+				new Promise<void>((_resolve, reject) =>
+					setTimeout(() => reject(new Error("waitForIdle timeout")), SYNC_IDLE_TIMEOUT_MS),
+				),
+			]);
+		}
+		if (!target.isIdle) return false;
+		// SDK _persist writes nothing until the first assistant message
+		// exists, so on a freshly auto-created window the sync would stay
+		// memory-only (lost on restart, and the fileless session makes
+		// ensureWindowAlive mint replacements). When the session file does
+		// not exist yet, replicate the SDK's first flush — header entry
+		// plus pending entries, `wx` so we never clobber — and mark the
+		// SessionManager flushed so later entries append normally.
+		// Private-field poke, best-effort: failure just means memory-only
+		// sync, as before.
+		try {
+			const sm = target.sessionManager as unknown as {
+				flushed?: boolean;
+				sessionFile?: string;
+				fileEntries?: unknown[];
+			};
+			if (sm.sessionFile && !existsSync(sm.sessionFile) && Array.isArray(sm.fileEntries)) {
+				writeFileSync(
+					sm.sessionFile,
+					sm.fileEntries.map((e) => JSON.stringify(e)).join("\n") + "\n",
+					{ encoding: "utf-8", flag: "wx" },
+				);
+				sm.flushed = true;
+			}
+		} catch {
+			// ignore — memory-only sync is the fallback
+		}
+		await target.sendCustomMessage(
+			{
+				customType: "pudding:task_assign",
+				content: task,
+				display: true,
+				details: { taskId, worker: workerName, windowId: window.id, from: "solo" },
+			},
+			{ triggerTurn: false },
+		);
+		if (interaction) {
+			// §6.5：等待审批时，把安全投影的审批卡镜像进对方单聊窗口，用户可在
+			// 该窗口直接允许/拒绝（H2：409「去处理」跳转过去后可操作）。
+			await target.sendCustomMessage(
+				{
+					customType: "pudding:interaction_required",
+					content: resultText,
+					display: true,
+					details: {
+						taskId,
+						worker: workerName,
+						windowId: window.id,
+						interactionId: interaction.interactionId,
+						delegationId: taskId,
+						status: "pending",
+						revision: interaction.revision,
+						requests: interaction.requests,
+					},
+				},
+				{ triggerTurn: false },
+			);
+			return true;
+		}
+		await target.sendCustomMessage(
+			{
+				customType: "pudding:task_result",
+				content: resultText,
+				display: true,
+				details: { taskId, worker: workerName, status, windowId: window.id },
+			},
+			{ triggerTurn: false },
+		);
+		return true;
+	} catch {
+		return false;
+	}
+}

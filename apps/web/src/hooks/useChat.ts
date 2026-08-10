@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { abortSession, fetchMessages, sendMessage, sessionWsUrl } from "@/lib/api";
+import { abortSession, fetchMessages, sendMessage, sessionWsUrl, type MessageAttachmentInput } from "@/lib/api";
 import { reducePiEvent, renderHistory } from "@/lib/events";
 import type { ChatMessage, ChatStatus, PiMessage } from "@/lib/types";
 
@@ -87,11 +87,11 @@ export function useChat(sessionId: string) {
 	}, [sessionId]);
 
 	const send = useCallback(
-		async (text: string) => {
+		async (text: string, attachments: MessageAttachmentInput[] = []) => {
 			const content = text.trim();
-			if (!content || running) return;
+			if ((!content && attachments.length === 0) || running) return;
 			try {
-				await sendMessage(sessionId, content);
+				await sendMessage(sessionId, content, attachments);
 			} catch (err) {
 				setError(err instanceof Error ? err.message : String(err));
 			}

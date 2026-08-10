@@ -1,5 +1,6 @@
 import type {
 	AgentEvent,
+	ArtifactRef,
 	CompletedResult,
 	DriverCapabilities,
 	FailedResult,
@@ -49,10 +50,39 @@ export function normalizePuddingClawJson(raw: unknown): AgentEvent {
 			: typeof payload.reply === "string"
 				? payload.reply
 				: JSON.stringify(payload));
+	const artifacts = parseExportedArtifacts(payload);
 	return {
 		type: "completed",
-		result: { ...resultBase(payload), status: "completed", content },
+		result: { ...resultBase(payload), status: "completed", content, ...(artifacts.length ? { artifacts } : {}) },
 	};
+}
+
+/**
+ * §15.4 push 轨：--export 终态的 `export.exported` 是「backend 声明的原始
+ * item + exported_path」（exported_path 相对导出目录）。只认显式导出结果，
+ * 不做目录扫描兜底；path 由 Driver 按 §15.3 约定改写成 workspace 相对路径。
+ */
+export function parseExportedArtifacts(payload: Record<string, unknown>): ArtifactRef[] {
+	const exportInfo = payload.export as Record<string, unknown> | undefined;
+	const exported = Array.isArray(exportInfo?.exported) ? (exportInfo!.exported as unknown[]) : [];
+	const out: ArtifactRef[] = [];
+	for (const item of exported) {
+		if (!item || typeof item !== "object") continue;
+		const raw = item as Record<string, unknown>;
+		const exportedPath = typeof raw.exported_path === "string" ? raw.exported_path : "";
+		if (!exportedPath) continue;
+		out.push({
+			name:
+				typeof raw.name === "string" && raw.name
+					? raw.name
+					: (exportedPath.split(/[\\/]+/).filter(Boolean).pop() ?? exportedPath),
+			path: exportedPath,
+			...(typeof raw.kind === "string" ? { kind: raw.kind } : {}),
+			...(typeof raw.size === "number" ? { size: raw.size } : {}),
+			origin: "push",
+		});
+	}
+	return out;
 }
 
 export function resultBase(payload: Record<string, unknown>): Omit<CompletedResult, "status"> {

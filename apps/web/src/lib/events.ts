@@ -173,13 +173,20 @@ function extractToolResult(result: unknown): { text: string; details?: unknown }
 	return { text: stringifyResult(result) };
 }
 
-/** The team_task worker a tool call was delegated to (args or result details). */
-export function teamTaskWorker(call: ToolCallView): string | undefined {
-	if (call.name !== "team_task") return undefined;
-	const args = call.args as { worker?: string } | undefined;
-	if (args?.worker) return args.worker;
+/** per-agent 委托工具名（agent_<id>__delegate，Phase 4 起取代 team_task）。 */
+const DELEGATE_TOOL_RE = /^agent_(.+)__delegate$/;
+
+/** 是否为 per-agent 委托工具调用。 */
+export function isDelegateCall(call: ToolCallView): boolean {
+	return DELEGATE_TOOL_RE.test(call.name);
+}
+
+/** The worker a delegate call was sent to (result details first, else tool name). */
+export function delegateWorker(call: ToolCallView): string | undefined {
+	if (!isDelegateCall(call)) return undefined;
 	const details = call.details as { worker?: string } | undefined;
-	return details?.worker;
+	if (details?.worker) return details.worker;
+	return DELEGATE_TOOL_RE.exec(call.name)?.[1];
 }
 
 /**
@@ -226,8 +233,11 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 				];
 			}
 			if (m.role === "assistant") {
+				// Backstop: a new assistant message means any earlier one finished
+				// — clear leftover streaming flags even if its message_end was lost.
+				const settled = messages.map((msg) => (msg.streaming ? { ...msg, streaming: false } : msg));
 				return [
-					...messages,
+					...settled,
 					{
 						id: uid(),
 						role: "assistant",
@@ -281,7 +291,7 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 			});
 		}
 		case "tool_execution_update": {
-			// Live progress from tools (team_task onUpdate). The tool call is
+			// Live progress from tools (delegate tool onUpdate). The tool call is
 			// already running; keep it visible in case a start was missed.
 			return upsertToolCall(messages, {
 				id: event.toolCallId as string,
@@ -329,7 +339,13 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 						: m,
 				);
 			}
-			return next;
+			// Backstop: the turn is over — nothing can still be streaming, even
+			// if a message_end event was lost or misaligned in the live stream.
+			return next.map((m) => (m.streaming ? { ...m, streaming: false } : m));
+		}
+		case "agent_end": {
+			// Whole agent run finished — final backstop for streaming flags.
+			return messages.map((m) => (m.streaming ? { ...m, streaming: false } : m));
 		}
 		default:
 			return messages;

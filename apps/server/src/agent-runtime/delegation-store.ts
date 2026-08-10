@@ -6,9 +6,23 @@ import type { InteractionRequest, NormalizedResult } from "./types.js";
 export interface DelegationRecord {
 	id: string;
 	windowId: string;
+	/** 缺省表示该 Run 使用平台默认 cwd，而非显式项目。 */
+	workspaceId?: string;
+	/** Run/continue/respond/artifact 永远使用的不可变项目 cwd。 */
+	cwdSnapshot: string;
 	managerSessionId: string;
 	managerToolCallId?: string;
+	/** Optional causal edge to an earlier delegation in the same manager Session. */
+	parentDelegationId?: string;
+	handoffKind?: "request" | "followup";
+	/** Why this delegation exists, separate from the worker-facing task text. */
+	intent?: string;
+	expectedOutcome?: string;
+	evidenceRequirements?: string[];
+	completionBoundary?: string;
 	agentId: string;
+	/** Agent/Connector configuration generation captured when the Run starts. */
+	agentRevision: number;
 	operation: "run" | "continue";
 	sessionHandle?: string;
 	runHandle?: string;
@@ -145,6 +159,36 @@ export class DelegationStore {
 			await this.writeFile(this.delegationsFile, { version: 1, delegations: all });
 		});
 		return updated;
+	}
+
+	/** Atomic status compare-and-set used by Runtime terminal transitions. */
+	async transitionDelegation(
+		id: string,
+		allowed: readonly DelegationRecord["status"][],
+		patch: Partial<Omit<DelegationRecord, "id" | "createdAt" | "status">> & { status: DelegationRecord["status"] },
+	): Promise<{ applied: boolean; record?: DelegationRecord }> {
+		let result: { applied: boolean; record?: DelegationRecord } = { applied: false };
+		await this.serialize(async () => {
+			const all = await this.loadDelegations();
+			const rec = all[id];
+			if (!rec) return;
+			if (!allowed.includes(rec.status)) {
+				result = { applied: false, record: rec };
+				return;
+			}
+			const next: DelegationRecord = {
+				...rec,
+				...patch,
+				id: rec.id,
+				createdAt: rec.createdAt,
+				revision: patch.revision ?? rec.revision,
+				updatedAt: new Date().toISOString(),
+			};
+			all[id] = next;
+			await this.writeFile(this.delegationsFile, { version: 1, delegations: all });
+			result = { applied: true, record: next };
+		});
+		return result;
 	}
 
 	async listDelegations(windowId?: string, managerSessionId?: string): Promise<DelegationRecord[]> {

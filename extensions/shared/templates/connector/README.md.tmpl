@@ -1,0 +1,43 @@
+# __PACKAGE_NAME__
+
+__DISPLAY_NAME__ Connector 双宿主包：PuddingTeams Driver SPI 本体 + pi extension 门面。
+
+## 双宿主概念
+
+这个包同时是两个宿主的可安装产物（方案 §9.5）：
+
+- **pi 半边**（`pi/index.ts`）：`pi install` 可装的 pi extension，注册
+  `__CONNECTOR_ID___delegate` 工具，让 pi 能把任务委托给本机 __DISPLAY_NAME__ CLI；
+- **PuddingTeams 半边**（`driver/index.ts`）：Driver SPI 本体，`createDriver`
+  工厂注册进 Driver Registry，由房间 Runtime 编排。
+
+完整的房间能力（manager-worker 编排、HITL 审批闭环、workspace 交接）只有
+PuddingTeams 提供——pi 入口是包的门面，Driver 才是 Connector 的本体。
+
+## 包结构
+
+```text
+├── package.json      # pi.extensions + puddingteams 折叠 manifest + exports
+├── pi/index.ts       # pi 门面：__CONNECTOR_ID___delegate 工具（只用 ExtensionAPI）
+├── driver/index.ts   # Driver SPI：__CONNECTOR_ID_PASCAL__Driver + createDriver（只用 @puddingteams/pwcp）
+└── tsconfig.json
+```
+
+`package.json` 的 `puddingteams` 字段是折叠 manifest（等价于独立的
+`pudding-extension.json`），安装时由 PuddingTeams 读取。
+
+## 安装方式
+
+- **PuddingTeams 本地路径安装**：在 PuddingTeams 里「安装 Extension」指向本目录
+  （或 `puddingteams extension validate <本目录>` 先校验）；
+- **pi 试用**：`pi -e <本目录>` 本地加载，或发布后 `pi install __PACKAGE_NAME__`；
+- **npm 发布**：带 `pi-package` keyword 发布后即可被 pi 社区检索安装。
+
+## 发布前注意
+
+- `dependencies["@puddingteams/pwcp"]` 当前是 `workspace:*`（仓库内开发用），
+  **发布到 npm 前必须改成 semver 版本号**（如 `^0.1.0`）；
+- `tsconfig.json` 的 `extends: ../../../tsconfig.base.json` 假定包放在
+  PuddingTeams 仓库 `extensions/connectors/` 下；独立仓库维护时请改成自己的
+  基础 tsconfig 或内联编译选项；
+- `puddingteams.publisher` 默认 `puddingteams`，第三方发布请改成自己的署名。

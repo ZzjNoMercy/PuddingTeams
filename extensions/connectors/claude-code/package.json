@@ -1,0 +1,75 @@
+{
+	"name": "@puddingteams/connector-claude-code",
+	"version": "1.0.0",
+	"description": "Claude Code Connector 双宿主包：PuddingTeams Driver SPI 本体 + pi extension 门面（pi install 可装）。",
+	"type": "module",
+	"exports": {
+		".": "./driver/index.ts",
+		"./driver": "./driver/index.ts",
+		"./core/claude-code-normalize": "./core/claude-code-normalize.ts",
+		"./pi": "./pi/index.ts"
+	},
+	"files": [
+		"pi",
+		"driver",
+		"core",
+		"assets"
+	],
+	"pi": {
+		"extensions": [
+			"./pi/index.ts"
+		]
+	},
+	"puddingteams": {
+		"id": "claude-code",
+		"publisher": "puddingteams",
+		"displayName": "Claude Code Connector",
+		"version": "1.0.0",
+		"source": "trusted",
+		"kind": "connector",
+		"engines": {
+			"puddingteams": ">=0.1 <1"
+		},
+		"permissions": ["spawn", "secrets"],
+		"entry": "driver/index.ts",
+		"connector": {
+			"id": "claude-code",
+			"displayName": "Claude Code",
+			"apiVersion": "1",
+			"defaultTransport": "spawn",
+			"supportedTransports": ["spawn"],
+			"configSchema": {
+				"type": "object",
+				"properties": {
+					"command": { "type": "string", "description": "Claude Code 可执行文件名或路径", "default": "claude" },
+					"model": { "type": "string", "description": "worker 使用的模型（--model）；留空用 claude 默认" },
+					"permissionMode": {
+						"type": "string",
+						"enum": ["default", "acceptEdits", "plan", "bypassPermissions"],
+						"description": "Claude Code 权限模式（--permission-mode）。默认 bypassPermissions 适合无头执行但会绕过 Claude 权限确认，属于高风险；PuddingTeams 的项目目录只提供 cwd，不构成强制文件访问边界。"
+					},
+					"systemPrompt": { "type": "string", "description": "追加到系统提示的自定义指令（--append-system-prompt）" },
+					"allowedTools": { "type": "string", "description": "工具白名单（--allowedTools），如 \"Bash(git *) Edit\"；留空不限" }
+				}
+			},
+			"secretSchema": [{ "key": "ANTHROPIC_API_KEY", "label": "Anthropic API Key（可选）", "required": false }],
+			"avatar": "assets/claude-code.svg"
+		}
+	},
+	"keywords": ["pi-package", "puddingteams", "pwcp", "claude-code", "connector"],
+	"license": "MIT",
+	"scripts": {
+		"typecheck": "tsc -p tsconfig.json --noEmit"
+	},
+	"dependencies": {
+		"@puddingteams/pwcp": "workspace:*",
+		"typebox": "^1.3.7"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@types/node": "^24.13.3",
+		"typescript": "^5.9.3"
+	}
+}
