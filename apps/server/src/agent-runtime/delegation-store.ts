@@ -69,13 +69,13 @@ export class DelegationStore {
 	private readonly delegationsFile: string;
 	private readonly interactionsFile: string;
 
-	constructor(private readonly teamsDir: string) {
-		this.delegationsFile = path.join(teamsDir, "delegations.json");
-		this.interactionsFile = path.join(teamsDir, "interactions.json");
+	constructor(private readonly stateDir: string) {
+		this.delegationsFile = path.join(stateDir, "delegations.json");
+		this.interactionsFile = path.join(stateDir, "interactions.json");
 	}
 
 	async init(): Promise<void> {
-		await mkdir(this.teamsDir, { recursive: true });
+		await mkdir(this.stateDir, { recursive: true });
 	}
 
 	/** Run `fn` after all previously queued mutations (in-process mutex). */
@@ -100,7 +100,7 @@ export class DelegationStore {
 	}
 
 	private async writeFile(file: string, data: unknown): Promise<void> {
-		await mkdir(this.teamsDir, { recursive: true });
+		await mkdir(this.stateDir, { recursive: true });
 		const tmp = `${file}.${randomUUID().slice(0, 8)}.tmp`;
 		await writeFile(tmp, JSON.stringify(data, null, 2) + "\n", "utf-8");
 		await rename(tmp, file);

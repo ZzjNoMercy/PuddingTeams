@@ -65,9 +65,9 @@ async function promptNames(fixture: Fixture, resources?: PiResourceConfig): Prom
 }
 
 /** 成员断言：本机 ~/.agents/skills 等额外来源可能混入清单，只校验关注项。 */
-function assertMembership(names: string[], present: string[], absent: string[]): void {
+function assertMembership(names: string[], present: string[], absent: string[], message?: string): void {
 	for (const name of present) assert.ok(names.includes(name), `应包含 ${name}，实际：${names.join(", ")}`);
-	for (const name of absent) assert.ok(!names.includes(name), `不应包含 ${name}，实际：${names.join(", ")}`);
+	for (const name of absent) assert.ok(!names.includes(name), message ?? `不应包含 ${name}，实际：${names.join(", ")}`);
 }
 
 test("pi-resources: 缺省不启用任何库资源，workspace 资源不受影响", async () => {
@@ -136,4 +136,79 @@ test("pi-resources: preview 标注 description/source/enabled", async () => {
 		enabled: false,
 		description: "库模板",
 	});
+});
+
+/**
+ * 信任门（迁移方案 §7.2/§6.3）：workspaceAccess 与 Agent 开关取与；
+ * denied 来源不进装配/预览候选集，global/extra 来源不受影响。
+ */
+const ALL_ALLOWED = { context: true, skills: true, prompts: true } as const;
+const ALL_DENIED = { context: false, skills: false, prompts: false } as const;
+
+function makeContextFixture(): Fixture & { agentDir: string; cwd: string } {
+	const fixture = makeFixture();
+	writeFileSync(path.join(fixture.cwd, "AGENTS.md"), "工作区上下文");
+	return fixture;
+}
+
+test("pi-resources: 信任门全关时 workspace 来源被剔除，global/extra 不受影响", async () => {
+	const fixture = makeContextFixture();
+	const loader = await loadPiResources({
+		cwd: fixture.cwd,
+		agentDir: fixture.agentDir,
+		resources: { skillPaths: [fixture.extraSkills], promptTemplatePaths: [fixture.extraPrompts] },
+		workspaceAccess: ALL_DENIED,
+	});
+	const skills = loader.getSkills().skills.map((s) => s.name);
+	assertMembership(skills, ["ext-skill"], ["ws-skill"]);
+	const prompts = loader.getPrompts().prompts.map((p) => p.name);
+	assertMembership(prompts, ["ext-tpl"], ["ws-tpl"]);
+	assert.equal(loader.getAgentsFiles().agentsFiles.length, 0, "context denied 时不得读 workspace AGENTS.md");
+});
+
+test("pi-resources: 信任门逐类放行——只批 skills 时 context/prompts 不进候选集", async () => {
+	const fixture = makeContextFixture();
+	const loader = await loadPiResources({
+		cwd: fixture.cwd,
+		agentDir: fixture.agentDir,
+		workspaceAccess: { context: false, skills: true, prompts: false },
+	});
+	assertMembership(loader.getSkills().skills.map((s) => s.name), ["ws-skill"], []);
+	assertMembership(loader.getPrompts().prompts.map((p) => p.name), [], ["ws-tpl"]);
+	assert.equal(loader.getAgentsFiles().agentsFiles.length, 0);
+});
+
+test("pi-resources: 信任门全开等价于旧行为；Agent 开关仍可单独关闭", async () => {
+	const fixture = makeContextFixture();
+	const open = await loadPiResources({ cwd: fixture.cwd, agentDir: fixture.agentDir, workspaceAccess: ALL_ALLOWED });
+	assertMembership(open.getSkills().skills.map((s) => s.name), ["ws-skill"], []);
+	assert.ok(open.getAgentsFiles().agentsFiles.length > 0);
+
+	const agentOff = await loadPiResources({
+		cwd: fixture.cwd,
+		agentDir: fixture.agentDir,
+		resources: { loadWorkspaceSkills: false },
+		workspaceAccess: ALL_ALLOWED,
+	});
+	assertMembership(agentOff.getSkills().skills.map((s) => s.name), [], ["ws-skill"], "Agent 开关与信任门取与");
+});
+
+test("pi-resources: preview 按信任门过滤 workspace 来源并回显 workspace 标识", async () => {
+	const fixture = makeContextFixture();
+	const denied = await previewPiResources({
+		cwd: fixture.cwd,
+		agentDir: fixture.agentDir,
+		workspaceAccess: ALL_DENIED,
+		workspace: { id: "ws1", trust: { state: "pending", policyVersion: 1 } },
+	});
+	assert.equal(denied.skills.some((s) => s.source === "workspace"), false);
+	assert.equal(denied.prompts.some((p) => p.source === "workspace"), false);
+	assert.equal(denied.segments.some((s) => s.source === "workspace-context"), false);
+	assert.deepEqual(denied.contextFiles, []);
+	assert.equal(denied.workspace?.id, "ws1");
+
+	const open = await previewPiResources({ cwd: fixture.cwd, agentDir: fixture.agentDir, workspaceAccess: ALL_ALLOWED });
+	assert.ok(open.segments.some((s) => s.source === "workspace-context"));
+	assert.ok(open.skills.some((s) => s.source === "workspace"));
+	assert.equal(open.workspace, null, "未传 workspace 标识时 preview.workspace = null（§6.3）");
 });

@@ -57,6 +57,14 @@ const TAB_LABELS: Record<ManageTab, string> = {
 	status: "运行状态",
 };
 
+/** 安装来源三态（文档 §8）。 */
+const ORIGIN_LABELS: Record<CatalogEntry["origin"], string> = {
+	builtin: "平台内置",
+	bundled: "随产品预置",
+	user: "用户安装",
+	"local-link": "开发者本地链接",
+};
+
 // ---- probe 展示 ----
 
 /** 探测完成的即时反馈：结果卡渲染在按钮下方、可能在视区外，用 toast 兜底。 */
@@ -350,7 +358,7 @@ function ConnectorSection({
 				<div className="flex flex-col gap-1.5 rounded-md bg-muted/60 p-2.5 text-xs text-muted-foreground">
 					<div className="flex flex-wrap items-center gap-1.5">
 						<Badge variant="outline">来源：{selected.manifest.source}</Badge>
-						<Badge variant="outline">{selected.origin === "builtin" ? "平台内置" : "本地安装"}</Badge>
+						<Badge variant="outline">{ORIGIN_LABELS[selected.origin]}</Badge>
 						<Badge variant="outline">发布者：{selected.manifest.publisher}</Badge>
 						<Badge variant="outline">引擎：{selected.manifest.engines.puddingteams}</Badge>
 					</div>
@@ -601,7 +609,7 @@ function BindingCard({
 			<div className="flex flex-wrap items-center gap-1.5">
 				<span className="text-sm font-medium">{manifest?.displayName ?? binding.extensionId}</span>
 				{entry ? <Badge variant="outline">v{entry.version}{entry.versionPin ? `（固定 ${entry.versionPin}）` : ""}</Badge> : null}
-				{entry ? <Badge variant="outline">{entry.origin === "builtin" ? "平台内置" : "本地安装"}</Badge> : null}
+				{entry ? <Badge variant="outline">{ORIGIN_LABELS[entry.origin]}</Badge> : null}
 				{!entry ? <Badge variant="destructive">扩展未安装</Badge> : !entry.loaded ? <Badge variant="destructive">加载失败</Badge> : null}
 				<Badge variant={binding.enabled ? "secondary" : "outline"}>{binding.enabled ? "已启用" : "已停用"}</Badge>
 			</div>
@@ -865,7 +873,7 @@ function BindingsSection({
 							<div className="flex flex-col gap-1.5 rounded-md bg-muted/60 p-2.5 text-xs text-muted-foreground">
 								<div className="flex flex-wrap items-center gap-1.5">
 									<Badge variant="outline">来源：{addManifest.source}</Badge>
-									<Badge variant="outline">{addEntry.origin === "builtin" ? "平台内置" : "本地安装"}</Badge>
+									<Badge variant="outline">{ORIGIN_LABELS[addEntry.origin]}</Badge>
 									<Badge variant="outline">发布者：{addManifest.publisher}</Badge>
 									<Badge variant="outline">版本：v{addEntry.version}</Badge>
 									<Badge variant="outline">引擎：{addManifest.engines.puddingteams}</Badge>

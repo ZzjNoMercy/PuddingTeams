@@ -74,7 +74,12 @@ async function makeStack(): Promise<Stack> {
 	const dir = freshDir("pt-p5-routes-");
 	const credentials = new CredentialsStore(path.join(dir, "sec"));
 	await credentials.init();
-	const teams = new TeamsStore(path.join(dir, "teams"), dir, 900_000, credentials);
+	const teams = new TeamsStore(
+		{ state: path.join(dir, "teams"), assets: path.join(dir, "teams"), managedWorkspaces: path.join(dir, "managed") },
+		dir,
+		900_000,
+		credentials,
+	);
 	await teams.init();
 	const catalog = new ExtensionCatalog();
 	const drivers = new DriverRegistry();
@@ -166,7 +171,7 @@ test("Phase5: DEFAULT_TEAMS 新结构——pinned manager + PuddingClaw connecto
 	const res = await app.inject({ method: "GET", url: "/api/agents" });
 	const { agents } = res.json() as { agents: Array<Record<string, unknown>> };
 	const manager = agents.find((a) => a.name === "manager");
-	assert.ok(manager, "teams.json 必须含 pinned manager 条目");
+	assert.ok(manager, "agents.json 必须含 pinned manager 条目");
 	assert.equal(manager!.pinned, true);
 	assert.deepEqual(manager!.invoke, { type: "pi" });
 	const claw = agents.find((a) => a.name === "puddingclaw");
@@ -473,5 +478,60 @@ test("Phase5: catalog 必须 kind 过滤且两类不混（§10.1）", async () =
 	assert.equal(connBody.extensions[0]!.origin, "builtin");
 	const capabilities = await app.inject({ method: "GET", url: "/api/extensions/catalog?kind=capability" });
 	assert.equal((capabilities.json() as { extensions: unknown[] }).extensions.length, 0, "预装零个用户 Capability（§10.4）");
+	await app.close();
+});
+
+test("P4 API: install mode=copy 安装 user 包；三态冲突 409；bundled 不可卸载、user 可卸载", async () => {
+	const { app, registry, dir } = await makeStack();
+	// bundled 预置 cap-ext → 同 id user 安装 409，不静默覆盖。
+	await registry.installOrUpdateFromDir(writeCapabilityPackage(path.join(dir, "bundled-cap")));
+	const conflict = await app.inject({
+		method: "POST",
+		url: "/api/extensions/install",
+		payload: { path: writeCapabilityPackage(path.join(dir, "user-cap-same")), mode: "copy" },
+	});
+	assert.equal(conflict.statusCode, 409, conflict.body);
+	assert.match(conflict.body, /互不覆盖/);
+	// local-link 与 bundled 同 id 同样 409。
+	const linkConflict = await app.inject({
+		method: "POST",
+		url: "/api/extensions/install",
+		payload: { path: writeCapabilityPackage(path.join(dir, "link-cap-same")) },
+	});
+	assert.equal(linkConflict.statusCode, 409, linkConflict.body);
+
+	// 不同 id 的 user 安装成功。
+	const userDir = path.join(dir, "user-cap-pkg");
+	mkdirSync(userDir, { recursive: true });
+	writeFileSync(
+		path.join(userDir, EXTENSION_MANIFEST_FILE),
+		JSON.stringify({
+			id: "user-cap", publisher: "test", displayName: "用户 Capability", version: "1.0.0", source: "external",
+			kind: "capability", engines: { puddingteams: ">=0.1 <1" }, entry: "index.mjs",
+			capability: { id: "user-cap", displayName: "用户 Capability", apiVersion: "1", tools: [{ name: "do_thing", activation: "always" }] },
+		}),
+	);
+	writeFileSync(
+		path.join(userDir, "index.mjs"),
+		`export const extension = {
+			manifest: { id: "user-cap", kind: "capability", name: "user cap", version: "1", tools: [{ name: "do_thing", activation: "always" }] },
+			register(ctx) {},
+		};`,
+	);
+	const ok = await app.inject({ method: "POST", url: "/api/extensions/install", payload: { path: userDir, mode: "copy" } });
+	assert.equal(ok.statusCode, 200, ok.body);
+	assert.equal((ok.json() as { extension: { origin: string } }).extension.origin, "user");
+
+	// 重复安装 → 409；mode 非法 → 400。
+	const dup = await app.inject({ method: "POST", url: "/api/extensions/install", payload: { path: userDir, mode: "copy" } });
+	assert.equal(dup.statusCode, 409, dup.body);
+	const badMode = await app.inject({ method: "POST", url: "/api/extensions/install", payload: { path: userDir, mode: "sideload" } });
+	assert.equal(badMode.statusCode, 400);
+
+	// bundled 不可卸载（400）；user 无绑定可卸载（204）。
+	const delBundled = await app.inject({ method: "DELETE", url: "/api/extensions/cap-ext" });
+	assert.equal(delBundled.statusCode, 400, delBundled.body);
+	const del = await app.inject({ method: "DELETE", url: "/api/extensions/user-cap" });
+	assert.equal(del.statusCode, 204, del.body);
 	await app.close();
 });

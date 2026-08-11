@@ -32,6 +32,14 @@ const SOURCE_LABELS: Record<string, string> = {
 	external: "外部来源",
 };
 
+/** 安装来源三态（文档 §8）：builtin 代码内嵌 / bundled 随发行物 / user 复制安装 / local-link 开发者链接。 */
+const ORIGIN_LABELS: Record<CatalogEntry["origin"], string> = {
+	builtin: "平台内置",
+	bundled: "随产品预置",
+	user: "用户安装",
+	"local-link": "开发者本地链接",
+};
+
 function EntryCard({ entry, onChanged }: { entry: CatalogEntry; onChanged: () => void }) {
 	const { manifest } = entry;
 	const [updateOpen, setUpdateOpen] = useState(false);
@@ -89,9 +97,8 @@ function EntryCard({ entry, onChanged }: { entry: CatalogEntry; onChanged: () =>
 
 			{/* 目录信息：来源 / 权限 / 版本范围 / 将注册的能力 */}
 			<div className="flex flex-wrap items-center gap-1.5">
-				<Badge variant="outline">
-					{entry.origin === "builtin" ? "平台内置" : entry.origin === "bundled" ? "随产品预置" : "开发者本地安装"}
-				</Badge>
+				<Badge variant="outline">{ORIGIN_LABELS[entry.origin]}</Badge>
+				{entry.drifted ? <Badge variant="destructive">本地源已变更</Badge> : null}
 				<Badge variant="outline">{SOURCE_LABELS[manifest.source] ?? manifest.source}</Badge>
 				<Badge variant="outline">
 					v{entry.version}
@@ -147,8 +154,8 @@ function EntryCard({ entry, onChanged }: { entry: CatalogEntry; onChanged: () =>
 
 			{entry.loadError ? <p className="text-xs text-destructive">{entry.loadError}</p> : null}
 
-			{/* 安装 / 更新 / 卸载是不同动作；builtin 不可卸载、不走安装流程 */}
-			{entry.origin === "local" ? (
+			{/* 安装 / 更新 / 卸载是不同动作；builtin/bundled 不可卸载、不走安装流程 */}
+			{entry.origin === "local-link" || entry.origin === "user" ? (
 				<div className="mt-auto flex items-center gap-1 pt-1">
 					<Button
 						type="button"
@@ -167,7 +174,9 @@ function EntryCard({ entry, onChanged }: { entry: CatalogEntry; onChanged: () =>
 					</Button>
 				</div>
 			) : (
-				<p className="mt-auto pt-1 text-xs text-muted-foreground/70">平台内置，不可卸载。</p>
+				<p className="mt-auto pt-1 text-xs text-muted-foreground/70">
+					{entry.origin === "bundled" ? "随产品预置，不可卸载。" : "平台内置，不可卸载。"}
+				</p>
 			)}
 
 			{/* 更新对话框 */}
@@ -175,7 +184,9 @@ function EntryCard({ entry, onChanged }: { entry: CatalogEntry; onChanged: () =>
 				<DialogContent>
 					<DialogHeader>
 						<DialogTitle>更新「{manifest.id}」</DialogTitle>
-						<DialogDescription>从原路径（或指定新路径）重读 manifest 与模块；固定版本时新版本必须与 pin 一致。</DialogDescription>
+						<DialogDescription>
+							本地链接从原路径（或指定新路径）重读；用户包必须指定新来源目录重新复制。固定版本时新版本必须与 pin 一致。
+						</DialogDescription>
 					</DialogHeader>
 					<label className="flex flex-col gap-1 text-sm">
 						<span className="text-muted-foreground">扩展目录路径（留空 = 原安装路径）</span>
@@ -260,6 +271,7 @@ export function ExtensionsPane() {
 	const [entries, setEntries] = useState<CatalogEntry[] | null>(null);
 	const [installPath, setInstallPath] = useState("");
 	const [installPin, setInstallPin] = useState("");
+	const [installCopy, setInstallCopy] = useState(false);
 	const [installing, setInstalling] = useState(false);
 	const [installOpen, setInstallOpen] = useState(false);
 	const [developerMode, setDeveloperModeState] = useState(false);
@@ -308,10 +320,12 @@ export function ExtensionsPane() {
 			const entry = await installExtension({
 				path: installPath.trim(),
 				...(installPin.trim() ? { versionPin: installPin.trim() } : {}),
+				mode: installCopy ? "copy" : "link",
 			});
 			toast.success(`「${entry.manifest.displayName}」已安装（kind=${entry.manifest.kind}）`);
 			setInstallPath("");
 			setInstallPin("");
+			setInstallCopy(false);
 			setInstallOpen(false);
 			// 安装的 kind 由 manifest 决定；若与当前页签不同则切过去。
 			if (entry.manifest.kind !== kind) setKind(entry.manifest.kind);
@@ -390,7 +404,7 @@ export function ExtensionsPane() {
 					<DialogHeader>
 						<DialogTitle>安装扩展</DialogTitle>
 						<DialogDescription>
-							从本地目录安装：读取目录下的 pudding-extension.json，校验 kind / engines / permissions 后注册。安装后可在目录查看来源、权限与版本范围。
+							从本地目录安装：读取目录下的 pudding-extension.json，校验 kind / engines / permissions 后注册。默认本地链接（不复制源码）；勾选复制安装则作为用户包复制进数据目录。
 						</DialogDescription>
 					</DialogHeader>
 					<label className="flex flex-col gap-1 text-sm">
@@ -401,6 +415,10 @@ export function ExtensionsPane() {
 							placeholder="/abs/path/to/extension"
 							className="font-mono text-xs"
 						/>
+					</label>
+					<label className="flex items-center gap-2 text-sm">
+						<input type="checkbox" checked={installCopy} onChange={(e) => setInstallCopy(e.target.checked)} />
+						<span className="text-muted-foreground">复制安装（用户包，不随源目录变化）</span>
 					</label>
 					<label className="flex flex-col gap-1 text-sm">
 						<span className="text-muted-foreground">固定版本（可选）</span>

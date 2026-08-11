@@ -55,7 +55,7 @@ function agentConfig(name: string, extra?: Partial<AgentConfig>): AgentConfig {
 
 async function makeTeams(agents: AgentConfig[]): Promise<TeamsStore> {
 	const dir = freshDir("pt-ext-teams-");
-	const store = new TeamsStore(dir, dir);
+	const store = new TeamsStore({ state: dir, assets: dir, managedWorkspaces: path.join(dir, "managed") }, dir);
 	await store.init();
 	for (const agent of agents) await store.upsertAgent(agent);
 	return store;

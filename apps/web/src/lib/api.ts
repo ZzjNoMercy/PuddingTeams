@@ -30,6 +30,8 @@ import type {
 	ToolActivation,
 	WorkspaceRecord,
 	WorkspaceDirectoryListing,
+	WorkspaceResourceKind,
+	WorkspaceTrustState,
 } from "./types";
 
 const SERVER_URL = process.env.NEXT_PUBLIC_SERVER_URL ?? "http://127.0.0.1:8933";
@@ -305,8 +307,8 @@ export async function listExtensionCatalog(kind: "connector" | "capability"): Pr
 	return ((await res.json()) as { extensions: CatalogEntry[] }).extensions;
 }
 
-/** 从本地目录安装 Extension。 */
-export async function installExtension(input: { path: string; versionPin?: string }): Promise<CatalogEntry> {
+/** 从本地目录安装 Extension：link（默认）= 开发者本地链接；copy = 用户安装（复制进数据目录）。 */
+export async function installExtension(input: { path: string; versionPin?: string; mode?: "link" | "copy" }): Promise<CatalogEntry> {
 	const data = await postJson<{ extension: CatalogEntry }>("/api/extensions/install", input, "install extension failed");
 	return data.extension;
 }
@@ -734,6 +736,21 @@ export async function createWorkspace(input: { path?: string; name?: string; man
 	const body = (await res.json()) as { workspace?: WorkspaceRecord; error?: string };
 	if (!res.ok) throw new Error(body.error ?? `create workspace failed: ${res.status}`);
 	return body.workspace!;
+}
+
+/** 信任决策（§7.2）：trusted/denied/pending + approvedResources；响应带撤销影响的活跃会话数。 */
+export async function putWorkspaceTrust(
+	id: string,
+	input: { state: WorkspaceTrustState; approvedResources?: WorkspaceResourceKind[] },
+): Promise<{ workspace: WorkspaceRecord; dirtySessions: number }> {
+	const res = await fetch(`${SERVER_URL}/api/workspaces/${encodeURIComponent(id)}/trust`, {
+		method: "PUT",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(input),
+	});
+	const body = (await res.json()) as { workspace?: WorkspaceRecord; dirtySessions?: number; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `put workspace trust failed: ${res.status}`);
+	return { workspace: body.workspace!, dirtySessions: body.dirtySessions ?? 0 };
 }
 
 export async function switchRoomWorkspace(

@@ -9,6 +9,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { listWorkspaces, previewAgentPiResources } from "@/lib/api";
 import type { AgentConfig, PiPreviewResource, PiResourcePreview, WorkspaceRecord } from "@/lib/types";
 import type { ConfigDraft } from "@/components/agent-config/draft";
+import { WorkspaceTrustBadge, workspaceTrustSuffix } from "@/components/chat/workspace-trust-badge";
 
 function ResourceLine({ item }: { item: PiPreviewResource }) {
 	return (
@@ -55,6 +56,15 @@ export function PromptSection({
 		}
 	}, [agent.name, previewWorkspaceId]);
 
+	const selectedWorkspace = workspaces.find((item) => item.id === previewWorkspaceId);
+	// §6.3：无显式 Workspace 时开关禁用；§7.2：未受信任的项目开关不生效。
+	const workspaceSwitchDisabled = !selectedWorkspace;
+	const workspaceSwitchNote = !selectedWorkspace
+		? "无显式 Workspace，开关不生效（不会加载任何目录的上下文文件）"
+		: selectedWorkspace.trust.state !== "trusted"
+			? `该项目${selectedWorkspace.trust.state === "denied" ? "已被拒绝" : "尚未信任"}，信任前开关不生效`
+			: "关闭后不注入项目目录里的上下文文件";
+
 	return (
 		<div className="flex flex-col gap-3">
 			<p className="text-xs text-muted-foreground">
@@ -75,12 +85,13 @@ export function PromptSection({
 				<input
 					type="checkbox"
 					checked={draft.loadWorkspaceContext}
+					disabled={workspaceSwitchDisabled}
 					onChange={(e) => onChange({ loadWorkspaceContext: e.target.checked })}
 					className="mt-0.5 size-4 accent-foreground"
 				/>
 				<span className="flex flex-col">
 					<span>加载 Workspace context（AGENTS.md / CLAUDE.md）</span>
-					<span className="text-xs text-muted-foreground/70">关闭后不注入项目目录里的上下文文件</span>
+					<span className="text-xs text-muted-foreground/70">{workspaceSwitchNote}</span>
 				</span>
 			</label>
 
@@ -93,7 +104,7 @@ export function PromptSection({
 					<option value="">无显式 Workspace（平台默认目录）</option>
 					{workspaces.map((workspace) => (
 						<option key={workspace.id} value={workspace.id} disabled={!workspace.available}>
-							{workspace.name} · {workspace.rootPath}
+							{workspace.name} · {workspace.rootPath}{workspaceTrustSuffix(workspace.trust)}
 						</option>
 					))}
 				</select>
@@ -105,8 +116,9 @@ export function PromptSection({
 
 			{preview ? (
 				<div className="space-y-2 rounded-md border bg-background/70 p-2.5 text-xs">
-					<div>
+					<div className="flex items-center gap-2">
 						运行目录：<code>{preview.cwd}</code>
+						{preview.workspace ? <WorkspaceTrustBadge trust={preview.workspace.trust} /> : null}
 					</div>
 					<div>
 						Skills {preview.skills.filter((s) => s.enabled).length}/{preview.skills.length} 启用 · Templates{" "}

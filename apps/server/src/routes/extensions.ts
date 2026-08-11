@@ -50,7 +50,7 @@ export function registerExtensionsRoutes(app: FastifyInstance, deps: ExtensionRo
 		return serializeDeveloperMode(async () => {
 			const settings = await deps.settings.setDeveloperMode(req.body.enabled!);
 			await registry.setDeveloperMode(settings.developerMode);
-			await invalidateBoundAgents(new Set(registry.list().filter((item) => item.origin === "local").map((item) => item.manifest.id)));
+			await invalidateBoundAgents(new Set(registry.list().filter((item) => item.origin === "local-link").map((item) => item.manifest.id)));
 			deps.sessions?.markAllDirty();
 			return settings;
 		});
@@ -64,20 +64,27 @@ export function registerExtensionsRoutes(app: FastifyInstance, deps: ExtensionRo
 		return { extensions: registry.list(kind as ExtensionKind | undefined) };
 	});
 
-	app.post<{ Body: { path?: string; versionPin?: string } }>("/api/extensions/install", async (req, reply) => {
+	app.post<{ Body: { path?: string; versionPin?: string; mode?: string } }>("/api/extensions/install", async (req, reply) => {
 		const dir = req.body?.path;
 		if (typeof dir !== "string" || !dir.trim()) {
 			return reply.code(400).send({ error: "body must be { path: 本地扩展目录 }" });
 		}
+		// link（默认）= 开发者本地链接，受开发者模式闸门；copy = 用户安装，
+		// 内容复制到 PUDDINGTEAMS_HOME/extensions/packages/<id>/<version>/。
+		const mode = req.body?.mode ?? "link";
+		if (mode !== "link" && mode !== "copy") {
+			return reply.code(400).send({ error: 'mode 必须是 "link" | "copy"' });
+		}
 		return serializeDeveloperMode(async () => {
 			try {
-				const entry = await registry.install(dir.trim(), {
-					...(typeof req.body?.versionPin === "string" ? { versionPin: req.body.versionPin } : {}),
-				});
+				const opts = typeof req.body?.versionPin === "string" ? { versionPin: req.body.versionPin } : {};
+				const entry =
+					mode === "copy" ? await registry.installUserPackage(dir.trim(), opts) : await registry.install(dir.trim(), opts);
 				return { extension: entry };
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
-				return reply.code(msg.includes("已安装") ? 409 : 400).send({ error: msg });
+				const conflict = msg.includes("已安装") || msg.includes("互不覆盖") || msg.includes("builtin");
+				return reply.code(conflict ? 409 : 400).send({ error: msg });
 			}
 		});
 	});
@@ -88,7 +95,7 @@ export function registerExtensionsRoutes(app: FastifyInstance, deps: ExtensionRo
 			return serializeDeveloperMode(async () => {
 				const current = registry.get(req.params.extensionId);
 				if (!current) return reply.code(404).send({ error: `extension not installed: ${req.params.extensionId}` });
-				if (current.origin !== "local") {
+				if (current.origin === "builtin" || current.origin === "bundled") {
 					return reply.code(400).send({ error: `平台预置 extension「${req.params.extensionId}」不能从外部路径更新` });
 				}
 				try {
@@ -113,7 +120,9 @@ export function registerExtensionsRoutes(app: FastifyInstance, deps: ExtensionRo
 			const id = req.params.extensionId;
 			const entry = registry.get(id);
 			if (!entry) return reply.code(404).send({ error: `extension not installed: ${id}` });
-			if (entry.origin !== "local") return reply.code(400).send({ error: `平台预置 extension「${id}」不可卸载` });
+			if (entry.origin === "builtin" || entry.origin === "bundled") {
+				return reply.code(400).send({ error: `平台预置 extension「${id}」不可卸载` });
+			}
 
 			// 卸载保护（§9.3.8）：有启用 Agent 绑定该 Extension，或这些 Agent 还有
 			// active/waiting Run 时返回 409，不静默回退。

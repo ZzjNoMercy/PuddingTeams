@@ -26,7 +26,7 @@ function freshDir(prefix: string): string {
 async function makeStack() {
 	process.env.PI_CODING_AGENT_DIR = freshDir("pt-mgr-agentdir-");
 	const dir = freshDir("pt-mgr-");
-	const teams = new TeamsStore(path.join(dir, "teams"), dir);
+	const teams = new TeamsStore({ state: path.join(dir, "teams"), assets: path.join(dir, "teams"), managedWorkspaces: path.join(dir, "managed") }, dir);
 	await teams.init();
 	const delegations = new DelegationStore(path.join(dir, "rt"));
 	await delegations.init();

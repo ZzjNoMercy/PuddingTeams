@@ -252,11 +252,13 @@ export type PuddingTeamsExtensionManifest = ConnectorExtensionManifest | Capabil
 export interface CatalogEntry {
 	manifest: PuddingTeamsExtensionManifest;
 	installed: boolean;
-	origin: "builtin" | "bundled" | "local";
+	origin: "builtin" | "bundled" | "user" | "local-link";
 	version: string;
 	versionPin?: string;
 	loaded: boolean;
 	loadError?: string;
+	/** local-link 源目录内容与登记 digest 不一致（漂移提示）。 */
+	drifted?: boolean;
 }
 
 /** Agent 的 Connector 绑定（§10）；secret 明文只进 CredentialsStore。 */
@@ -315,6 +317,8 @@ export interface PiPreviewResource {
 
 export interface PiResourcePreview {
 	cwd: string;
+	/** 显式 workspace 标识（含信任状态）；无 workspaceId 的窗口为 null（§6.3）。 */
+	workspace: { id: string; trust: WorkspaceTrust } | null;
 	segments: Array<{ source: string; path?: string; content: string; collapsed: boolean }>;
 	effectivePrompt: string;
 	estimatedCharacters: number;
@@ -581,6 +585,26 @@ export interface RoomSummary {
 	workspace: WorkspaceRecord | null;
 }
 
+export type WorkspaceTrustState = "pending" | "trusted" | "denied";
+export type WorkspaceResourceKind = "context" | "skills" | "prompts";
+
+/** Workspace 信任门（迁移方案 §7.1）：信任决定只保存在用户 Home。 */
+export interface WorkspaceTrust {
+	state: WorkspaceTrustState;
+	decidedAt?: string;
+	policyVersion: number;
+	canonicalPathAtDecision?: string;
+	/** 缺省 = 全三类都批准。 */
+	approvedResources?: WorkspaceResourceKind[];
+}
+
+/** 可注入资源摘要（信任卡用）：只报类型与数量，不含正文（§7.2）。 */
+export interface WorkspaceResourceSummary {
+	contextFiles: number;
+	skills: number;
+	prompts: number;
+}
+
 export interface WorkspaceRecord {
 	id: string;
 	name: string;
@@ -588,6 +612,8 @@ export interface WorkspaceRecord {
 	canonicalPath: string;
 	gitRoot?: string;
 	managed: boolean;
+	trust: WorkspaceTrust;
+	resources: WorkspaceResourceSummary;
 	createdAt: string;
 	lastOpenedAt: string;
 	available: boolean;

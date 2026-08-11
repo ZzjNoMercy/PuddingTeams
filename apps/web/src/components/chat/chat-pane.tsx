@@ -37,6 +37,8 @@ import { Composer } from "./composer";
 import { Message } from "./message";
 import { ManagerAvatar, MemberStack, WorkerAvatar } from "./worker-avatar";
 import { DirectoryPickerDialog } from "./directory-picker-dialog";
+import { WorkspaceTrustDialog, needsTrustDecision } from "./workspace-trust-dialog";
+import { WorkspaceTrustBadge, workspaceTrustSuffix } from "./workspace-trust-badge";
 import { ChatInfoDialog } from "./chat-info-dialog";
 import { SessionMenu } from "./session-menu";
 import { SessionWorkCard } from "./session-work-card";
@@ -172,6 +174,7 @@ export function ChatPane({
 	const [switchToDefault, setSwitchToDefault] = useState(false);
 	const [directoryPickerOpen, setDirectoryPickerOpen] = useState(false);
 	const [switchingWorkspace, setSwitchingWorkspace] = useState(false);
+	const [trustCandidate, setTrustCandidate] = useState<{ workspace: WorkspaceRecord; mode: "new_window" | "in_place" } | null>(null);
 
 	useEffect(() => {
 		let cancelled = false;
@@ -343,12 +346,8 @@ export function ChatPane({
 			.catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)));
 	}, []);
 
-	const saveWorkspaceSwitch = useCallback(async (mode: "new_window" | "in_place") => {
-		setSwitchingWorkspace(true);
-		try {
-			let workspaceId: string | null = switchToDefault ? null : targetWorkspaceId;
-			if (!switchToDefault && workspacePath.trim()) workspaceId = (await createWorkspace({ path: workspacePath.trim() })).id;
-			if (!switchToDefault && !workspaceId) throw new Error("请选择项目文件夹或最近项目");
+	const doWorkspaceSwitch = useCallback(
+		async (workspaceId: string | null, mode: "new_window" | "in_place") => {
 			const result = await switchRoomWorkspace(roomId, workspaceId, mode);
 			setWorkspaceOpen(false);
 			if (result.room.id === roomId) {
@@ -358,12 +357,34 @@ export function ChatPane({
 				onOpenWindow?.(result.room.id);
 			}
 			toast.success(mode === "in_place" ? "已切换项目并开始新会话" : result.existed ? "已打开已有单聊" : "已创建新对话");
+		},
+		[roomId, onRoomUpdated, onOpenWindow],
+	);
+
+	const saveWorkspaceSwitch = useCallback(async (mode: "new_window" | "in_place") => {
+		setSwitchingWorkspace(true);
+		try {
+			let workspace: WorkspaceRecord | undefined;
+			if (!switchToDefault) {
+				if (workspacePath.trim()) {
+					workspace = await createWorkspace({ path: workspacePath.trim() });
+				} else {
+					workspace = workspaceOptions.find((item) => item.id === targetWorkspaceId);
+					if (!workspace) throw new Error("请选择项目文件夹或最近项目");
+				}
+			}
+			// 信任门（§7.2）：含可注入资源的外部项目先弹信任卡，再执行切换。
+			if (workspace && needsTrustDecision(workspace)) {
+				setTrustCandidate({ workspace, mode });
+				return;
+			}
+			await doWorkspaceSwitch(workspace?.id ?? null, mode);
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
 			setSwitchingWorkspace(false);
 		}
-	}, [targetWorkspaceId, workspacePath, switchToDefault, roomId, onRoomUpdated, onOpenWindow]);
+	}, [targetWorkspaceId, workspacePath, switchToDefault, workspaceOptions, doWorkspaceSwitch]);
 
 	const members = room?.members ?? [];
 	const type = room?.type ?? "solo";
@@ -412,6 +433,7 @@ export function ChatPane({
 							{type === "solo" ? (
 								<span className="shrink-0 text-xs text-muted-foreground">solo</span>
 							) : null}
+							{room?.workspace ? <WorkspaceTrustBadge trust={room.workspace.trust} /> : null}
 						</div>
 						{subtitle ? (
 							<div className="truncate text-xs text-muted-foreground">{subtitle}</div>
@@ -570,7 +592,10 @@ export function ChatPane({
 				<DialogContent className="sm:max-w-lg">
 					<DialogHeader>
 						<DialogTitle>打开项目</DialogTitle>
-						<DialogDescription className="truncate" title={currentContextLabel}>当前：{currentContextLabel}</DialogDescription>
+						<DialogDescription className="flex items-center gap-2 truncate" title={currentContextLabel}>
+							<span className="truncate">当前：{currentContextLabel}</span>
+							{room?.workspace ? <WorkspaceTrustBadge trust={room.workspace.trust} /> : null}
+						</DialogDescription>
 					</DialogHeader>
 					{switchToDefault ? (
 						<div className="flex items-center gap-3 rounded-md border bg-muted/30 px-3 py-2.5">
@@ -614,7 +639,7 @@ export function ChatPane({
 									>
 										<option value="">选择最近项目</option>
 										{workspaceOptions.filter((item) => item.id !== room?.workspace?.id).map((item) => (
-											<option key={item.id} value={item.id} disabled={!item.available}>{item.name} — {item.rootPath}{item.available ? "" : "（失效）"}</option>
+											<option key={item.id} value={item.id} disabled={!item.available}>{item.name} — {item.rootPath}{item.available ? "" : "（失效）"}{workspaceTrustSuffix(item.trust)}</option>
 										))}
 									</select>
 								</label>
@@ -664,6 +689,20 @@ export function ChatPane({
 					setSwitchToDefault(false);
 				}}
 			/>
+
+			{trustCandidate ? (
+				<WorkspaceTrustDialog
+					workspace={trustCandidate.workspace}
+					onCancel={() => setTrustCandidate(null)}
+					onDecided={(workspace) => {
+						const { mode } = trustCandidate;
+						setTrustCandidate(null);
+						void doWorkspaceSwitch(workspace.id, mode).catch((err: unknown) =>
+							toast.error(err instanceof Error ? err.message : String(err)),
+						);
+					}}
+				/>
+			) : null}
 
 			<Dialog open={renaming} onOpenChange={setRenaming}>
 				<DialogContent className="sm:max-w-sm">

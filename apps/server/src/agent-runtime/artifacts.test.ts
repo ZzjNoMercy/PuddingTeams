@@ -134,7 +134,7 @@ test("ArtifactStore：登记（size 缺省 stat 补齐）与按 windowId/delegat
 	const dir = freshDir();
 	const file = path.join(dir, "report.md");
 	writeFileSync(file, "abc");
-	const store = new ArtifactStore(dir);
+	const store = new ArtifactStore(dir, path.join(dir, "blobs"));
 	await store.init();
 
 	const seen: string[] = [];
@@ -216,7 +216,7 @@ test("Runtime：Run 完成时把 CompletedResult.artifacts 登记进 ArtifactSto
 	await delegations.init();
 	const secrets = new InteractionSecretStore(dir);
 	await secrets.init();
-	const artifacts = new ArtifactStore(dir);
+	const artifacts = new ArtifactStore(dir, path.join(dir, "blobs"));
 	await artifacts.init();
 	const created: string[] = [];
 	artifacts.onCreated((r) => created.push(r.id));

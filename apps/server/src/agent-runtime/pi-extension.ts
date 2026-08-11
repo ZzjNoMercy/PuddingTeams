@@ -1,6 +1,6 @@
 import type { ConnectorExtensionManifest } from "./extensions.js";
 import type { BuiltinExtensionHooks } from "./extension-registry.js";
-import { LocalPiDriver } from "./pi-driver.js";
+import { LocalPiDriver, type LocalPiDriverOptions } from "./pi-driver.js";
 
 /**
  * 第一方本地 pi Connector Extension（§9.1 Pi 调 Pi）：child pi 以进程内
@@ -57,7 +57,7 @@ function str(value: unknown): string | undefined {
 }
 
 /** Driver 工厂：同一 Connector 多 Agent 实例（§9.3.7），每实例一份 config。 */
-export function piExtensionHooks(): BuiltinExtensionHooks {
+export function piExtensionHooks(defaults: { sessionDir?: string } = {}): BuiltinExtensionHooks {
 	return {
 		driverFactory: (config) =>
 			new LocalPiDriver({
@@ -67,7 +67,13 @@ export function piExtensionHooks(): BuiltinExtensionHooks {
 					config.piResources && typeof config.piResources === "object" && !Array.isArray(config.piResources)
 						? (config.piResources as import("../store/teams.js").PiResourceConfig)
 						: undefined,
-				sessionDir: str(config.sessionDir),
+				// 信任门判定由平台（Invoker）注入；独立使用时不带，维持旧语义。
+				workspaceAccessFor:
+					typeof config.workspaceAccessFor === "function"
+						? (config.workspaceAccessFor as LocalPiDriverOptions["workspaceAccessFor"])
+						: undefined,
+				// Agent 未显式配置时用平台默认（PUDDINGTEAMS_HOME/sessions/workers）。
+				sessionDir: str(config.sessionDir) ?? defaults.sessionDir,
 			}),
 	};
 }

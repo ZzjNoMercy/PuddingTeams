@@ -176,7 +176,13 @@ export class AgentRuntime {
 		this.runControllers.set(delegation.id, controller);
 		const settleRun = this.trackRun(delegation.id);
 		const signal = ctx.signal ? AbortSignal.any([ctx.signal, controller.signal]) : controller.signal;
-		const runCtx: InvocationContext = { ...ctx, cwd: delegation.cwdSnapshot, delegationId: delegation.id, signal };
+		const runCtx: InvocationContext = {
+			...ctx,
+			cwd: delegation.cwdSnapshot,
+			delegationId: delegation.id,
+			...(delegation.workspaceId ? { workspaceId: delegation.workspaceId } : {}),
+			signal,
+		};
 		const requestId = input.requestId ?? randomUUID();
 		let sessionHandle = knownSession;
 		try {
@@ -525,6 +531,7 @@ export class AgentRuntime {
 			...ctx,
 			signal,
 			cwd: delegation.cwdSnapshot,
+			...(delegation.workspaceId ? { workspaceId: delegation.workspaceId } : {}),
 			onUpdate: ctx.onUpdate,
 			// respond 恢复的是同一条 Run，导出目录仍按原 delegation 约定（§15.3）。
 			delegationId: delegation.id,

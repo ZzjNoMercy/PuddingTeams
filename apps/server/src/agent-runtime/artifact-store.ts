@@ -36,23 +36,24 @@ interface ArtifactsFile {
 /**
  * ArtifactStore：交付物的登记与查询（§15.6）。只登记、不扫描 workspace
  * 猜测交付物；没有 --export 产物的 Run 不会在这里留下任何记录。
- * 持久化为 teamsDir 下 artifacts.json，写路径与 DelegationStore 一致
- * （进程内互斥 + tmp 原子 rename）。
+ * 登记表持久化为 stateDir 下 artifacts.json，冻结副本（blob）放独立的
+ * blobsDir；写路径与 DelegationStore 一致（进程内互斥 + tmp 原子 rename）。
  */
 export class ArtifactStore {
 	private queue: Promise<unknown> = Promise.resolve();
 	private readonly file: string;
-	private readonly snapshotsDir: string;
 	/** artifact.created 事件订阅方（index.ts 挂到 manager session 通知通道）。 */
 	private listeners = new Set<(record: ArtifactRecord) => void>();
 
-	constructor(private readonly teamsDir: string) {
-		this.file = path.join(teamsDir, "artifacts.json");
-		this.snapshotsDir = path.join(teamsDir, "artifact-snapshots");
+	constructor(
+		private readonly stateDir: string,
+		private readonly blobsDir: string,
+	) {
+		this.file = path.join(stateDir, "artifacts.json");
 	}
 
 	async init(): Promise<void> {
-		await mkdir(this.snapshotsDir, { recursive: true });
+		await mkdir(this.blobsDir, { recursive: true });
 	}
 
 	/** 订阅 artifact.created；返回退订函数。 */
@@ -92,7 +93,7 @@ export class ArtifactStore {
 	}
 
 	private async write(all: Record<string, ArtifactRecord>): Promise<void> {
-		await mkdir(this.teamsDir, { recursive: true });
+		await mkdir(this.stateDir, { recursive: true });
 		const tmp = `${this.file}.${randomUUID().slice(0, 8)}.tmp`;
 		await writeFile(tmp, JSON.stringify({ version: 1, artifacts: all }, null, 2) + "\n", "utf-8");
 		await rename(tmp, this.file);
@@ -110,7 +111,7 @@ export class ArtifactStore {
 		const info = await stat(target);
 		if (!info.isFile()) throw new Error("artifact is not a file");
 		const id = randomUUID();
-		const snapshotPath = path.join(await realpath(this.snapshotsDir), id);
+		const snapshotPath = path.join(await realpath(this.blobsDir), id);
 		await copyFile(target, snapshotPath);
 		const snapshotInfo = await stat(snapshotPath);
 		const contentHash = await new Promise<string>((resolve, reject) => {

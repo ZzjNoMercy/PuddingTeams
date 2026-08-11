@@ -7,6 +7,7 @@ import {
 	type ConnectorExtensionManifest,
 	type PuddingTeamsExtensionManifest,
 } from "../agent-runtime/extensions.js";
+import { runDataImportCli } from "./data-import.js";
 
 /**
  * `puddingteams extension` CLI（路线图 P2-d）：Extension 包的脚手架与校验。
@@ -22,15 +23,17 @@ import {
 
 const TEMPLATES_DIR = fileURLToPath(new URL("../../../../extensions/shared/templates", import.meta.url));
 
-const USAGE = `puddingteams extension — Extension 包脚手架与校验
+const USAGE = `puddingteams — Extension 包脚手架/校验 + 一次性数据导入
 
 用法：
   puddingteams extension init --type connector|capability [--declarative] --id <id> [--name <packageName>] [--display <displayName>] <dir>
   puddingteams extension validate <path>
+  puddingteams data import-legacy --from <repo>/apps/server [--home <dir>] [--secrets-from <dir>] [--execute|--dry-run]
 
 子命令：
-  init       从模板生成 Extension 包骨架（--declarative 生成纯 manifest 声明式包）
-  validate   校验包的 manifest、entry 与 Driver 导出，全部通过退出码 0
+  init          从模板生成 Extension 包骨架（--declarative 生成纯 manifest 声明式包）
+  validate      校验包的 manifest、entry 与 Driver 导出，全部通过退出码 0
+  import-legacy 旧开发数据（.teams/.sessions/旧 secrets）一次性导入用户数据目录（§9，默认 dry-run）
 `;
 
 function log(msg: string): void {
@@ -329,6 +332,14 @@ function printResults(results: CheckResult[]): void {
 
 export async function runExtensionCli(argv: string[]): Promise<number> {
 	const [scope, cmd, ...rest] = argv;
+	if (scope === "data") {
+		try {
+			return await runDataImportCli([cmd ?? "", ...rest]);
+		} catch (e) {
+			err(`✗ ${e instanceof Error ? e.message : String(e)}`);
+			return 1;
+		}
+	}
 	if (scope !== "extension" || (cmd !== "init" && cmd !== "validate")) {
 		err(USAGE);
 		return 1;

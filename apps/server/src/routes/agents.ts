@@ -58,7 +58,7 @@ function connectorSecurityWarnings(agent: AgentConfig): string[] {
 	return [];
 }
 
-/** Thin HTTP facade over the worker registry (teams.json) + Phase 5 管理 API（§10.1）。 */
+/** Thin HTTP facade over the worker registry (agents.json) + Phase 5 管理 API（§10.1）。 */
 export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, deps: AgentsRouteDeps = {}): void {
 	const { credentials, runtime, invoker, extensions, sessions } = deps;
 
@@ -181,12 +181,21 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 				return reply.code(400).send({ error: "只有 pi Agent 支持资源预览" });
 			}
 			try {
-				const context = await teams.contextForWorkspace(req.query.workspaceId?.trim() || undefined);
+				const workspaceId = req.query.workspaceId?.trim() || undefined;
+				const context = await teams.contextForWorkspace(workspaceId);
+				// 信任门（§7.2/§6.3）：无 workspaceId = 全关且 workspace:null；
+				// pending/denied 的 workspace 来源不进预览候选集。
+				const workspaceAccess = await teams.workspaces.resourceAccessFor(workspaceId);
 				return {
 					preview: await previewPiResources({
 						cwd: context.cwdSnapshot,
 						agentDir: getAgentDir(),
 						resources: agent.piResources,
+						workspaceAccess,
+						workspace:
+							context.workspaceId && context.trust
+								? { id: context.workspaceId, trust: context.trust }
+								: null,
 					}),
 				};
 			} catch (err) {
@@ -335,7 +344,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 			}
 			if (resolve === "cancel" && runtime) {
 				for (const d of active) {
-					await runtime.cancel(d.id, { cwd: process.cwd(), env: {} }).catch(() => undefined);
+					await runtime.cancel(d.id, { cwd: teams.defaultContextCwd(), env: {} }).catch(() => undefined);
 				}
 			}
 			// "keep"：保留 Run，新委托由 Invoker 门控拒绝（§9.3.6）。
@@ -551,7 +560,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 				}
 				const secrets = credentials ? await credentials.getSecrets(agent.name) : {};
 				const probe = await driver.probe({
-					cwd: process.cwd(),
+					cwd: teams.defaultContextCwd(),
 					env: { ...process.env, ...(agent.env ?? {}), ...secrets },
 				});
 				probe.enabled = agent.enabled !== false;
@@ -612,7 +621,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		},
 	);
 
-	// ---- avatars (§11): files under .teams/avatars/, field on teams.json ----
+	// ---- avatars (§11): files under <assets>/avatars/, field on agents.json ----
 
 	// base64 of a 2MB image is ~2.7MB; Fastify's default 1MB body limit would
 	// reject legitimate uploads, so this route opts into a larger cap.

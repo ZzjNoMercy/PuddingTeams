@@ -63,7 +63,7 @@ test("Phase4 集成: 真实 manager Session 只暴露成员工具，禁用后立
 	// 隔离 pi 的全局 agentDir（settings/extensions），测试不写用户 home。
 	process.env.PI_CODING_AGENT_DIR = freshDir("pt-ext-agentdir-");
 	const dir = freshDir("pt-ext-int-");
-	const teams = new TeamsStore(path.join(dir, "teams"), dir);
+	const teams = new TeamsStore({ state: path.join(dir, "teams"), assets: path.join(dir, "teams"), managedWorkspaces: path.join(dir, "managed") }, dir);
 	await teams.init();
 	await teams.upsertAgent(agentConfig("alpha"));
 	await teams.upsertAgent(agentConfig("beta"));

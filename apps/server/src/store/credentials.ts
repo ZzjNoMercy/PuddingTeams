@@ -18,14 +18,14 @@ const PAYLOAD_PREFIX = "v1.";
 
 /**
  * Encrypted, per-agent secret store for worker env tokens (e.g. PuddingClaw's
- * PUDDINGCLAW_TOKEN). Lives outside teams.json — values are AES-256-GCM
- * encrypted with a random 32-byte key at `~/.puddingteams/secret.key` and
- * written to `~/.puddingteams/credentials.json`. The plaintext is never
+ * PUDDINGCLAW_TOKEN). Lives outside agents.json — values are AES-256-GCM
+ * encrypted with a random 32-byte key at `<secrets>/credentials.key` and
+ * written to `<secrets>/credentials.json`. The plaintext is never
  * persisted and never returned to the browser; the backend injects it into the
  * worker subprocess env at spawn time.
  *
  * The key file is the protection boundary: at-rest secrecy against casual
- * reads of teams.json / credentials.json. Anyone with access to the user's
+ * reads of agents.json / credentials.json. Anyone with access to the user's
  * home directory can also read the key file, so this is not a substitute for
  * OS keychain — it is the "don't put secrets in plaintext registry/config"
  * guarantee.
@@ -38,7 +38,7 @@ export class CredentialsStore {
 	private readonly credsFile: string;
 
 	constructor(private readonly dir: string) {
-		this.keyFile = path.join(dir, "secret.key");
+		this.keyFile = path.join(dir, "credentials.key");
 		this.credsFile = path.join(dir, "credentials.json");
 	}
 

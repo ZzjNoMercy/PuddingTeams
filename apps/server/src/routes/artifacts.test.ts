@@ -11,7 +11,7 @@ import { registerArtifactsRoutes } from "./artifacts.js";
 
 async function makeStack() {
 	const dir = mkdtempSync(path.join(tmpdir(), "pt-artifacts-api-"));
-	const store = new ArtifactStore(dir);
+	const store = new ArtifactStore(dir, path.join(dir, "blobs"));
 	await store.init();
 	const app = Fastify({ logger: false });
 	registerArtifactsRoutes(app, store);

@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import semver from "semver";
@@ -17,25 +17,82 @@ import { PUDDINGTEAMS_HOST_VERSION } from "./host-version.js";
 import type { AgentDriver } from "./types.js";
 
 /**
- * Phase 5：Extension 持久化目录与安装（方案 §9.3/§10，决策 16）。
+ * Phase 5：Extension 持久化目录与安装（方案 §9.3/§10，决策 16；
+ * 用户数据目录迁移方案 §8 来源三态）。
  *
- * - 目录项 = 平台内置（builtin，代码提供，第一版唯一预装：PuddingClaw
- *   Connector；用户 Capability 预装零个）+ 本地安装的 Extension
- *   （持久化在 `<teamsDir>/extensions.json`）；
- * - 安装来源本地路径：读 `pudding-extension.json`、校验 kind/engines/
- *   permissions，capability 模块进程内注册进 ExtensionCatalog，connector
- *   注册进 DriverRegistry（隔离 Extension Host 是 Phase 6，本期进程内）；
+ * - origin 三态（互不静默覆盖，同 id 冲突必须显式卸载其一）：
+ *   - `bundled`：随发行物的第一方包（开发态 = 仓库 extensions/*）。记录以
+ *     manifest id+版本为事实，sourcePath 每次启动由发行投影重新解析自愈；
+ *   - `user`：用户安装，内容复制到 `<extensionsDir>/packages/<id>/<version>/`，
+ *     记录 digest/版本/来源/安装时间；更新先 staging 校验再原子切换记录，
+ *     失败保留旧版本；
+ *   - `local-link`：开发者模式专属，只登记规范化绝对路径 + 最近 digest
+ *     （启动/重载校验漂移），不复制源码；关闭开发者模式立即停用，不静默
+ *     回退到同名 bundled/user 包。
+ * - builtin（puddingclaw/pi）代码内嵌，不落盘。
  * - 卸载不做静默回退：有启用 Agent 或 active/waiting Run 的保护判断在
  *   路由层（409），这里只负责移除模块与记录；对应 Agent 保留绑定，
  *   调用时进入 connector_missing。
  */
 
+/** 已安装 Extension 的物理来源（文档 §8）。 */
+export type ExtensionOrigin = "bundled" | "user" | "local-link";
+
+/** 冲突提示用的来源文案。 */
+const ORIGIN_LABELS: Record<ExtensionOrigin, string> = {
+	bundled: "随发行物预置（bundled）",
+	user: "用户安装（user）",
+	"local-link": "开发者本地链接（local-link）",
+};
+
+/** 复制/ digest 时跳过的目录名（依赖与 VCS 不属于包内容事实）。 */
+const PACKAGE_COPY_EXCLUDES = new Set(["node_modules", ".git"]);
+
+/** 递归复制包目录（跳过 node_modules/.git）。 */
+async function copyPackageDir(src: string, dest: string): Promise<void> {
+	await mkdir(dest, { recursive: true });
+	for (const entry of await readdir(src, { withFileTypes: true })) {
+		if (PACKAGE_COPY_EXCLUDES.has(entry.name)) continue;
+		const from = path.join(src, entry.name);
+		const to = path.join(dest, entry.name);
+		if (entry.isDirectory()) await copyPackageDir(from, to);
+		else if (entry.isFile()) await writeFile(to, await readFile(from));
+	}
+}
+
+/**
+ * 包内容 digest：递归收集文件（跳过 node_modules/.git），对每个文件算
+ * sha256，再对「相对路径 + 文件 hash」排序清单算总 sha256。
+ */
+async function computePackageDigest(dir: string): Promise<string> {
+	const files: string[] = [];
+	async function walk(current: string, prefix: string): Promise<void> {
+		for (const entry of await readdir(current, { withFileTypes: true })) {
+			if (PACKAGE_COPY_EXCLUDES.has(entry.name)) continue;
+			const abs = path.join(current, entry.name);
+			const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+			if (entry.isDirectory()) await walk(abs, rel);
+			else if (entry.isFile()) files.push(rel);
+		}
+	}
+	await walk(dir, "");
+	files.sort();
+	const manifestHash = createHash("sha256");
+	for (const rel of files) {
+		const fileHash = createHash("sha256").update(await readFile(path.join(dir, rel))).digest("hex");
+		manifestHash.update(rel).update("\0").update(fileHash).update("\n");
+	}
+	return `sha256:${manifestHash.digest("hex")}`;
+}
+
 /** 已安装 Extension 的持久化记录（builtin 不落盘）。 */
 export interface InstalledExtensionRecord {
 	manifest: PuddingTeamsExtensionManifest & { entry?: string };
-	/** bundled=随发行物审核的第一方包；local=开发者模式本地路径。 */
-	origin: "bundled" | "local";
+	origin: ExtensionOrigin;
+	/** bundled=发行投影解析路径；user=packages/<id>/<version>/；local-link=规范化绝对路径。 */
 	sourcePath: string;
+	/** user/local-link 必记的包内容 digest（local-link 用于漂移检测）。 */
+	digest?: string;
 	installedAt: string;
 	updatedAt: string;
 	version: string;
@@ -51,12 +108,14 @@ interface ExtensionsFile {
 export interface CatalogEntry {
 	manifest: PuddingTeamsExtensionManifest;
 	installed: boolean;
-	origin: "builtin" | "bundled" | "local";
+	origin: "builtin" | ExtensionOrigin;
 	version: string;
 	versionPin?: string;
 	/** 模块/driver 已注册进运行时（重启后重载失败为 false）。 */
 	loaded: boolean;
 	loadError?: string;
+	/** local-link 源目录内容与登记的 digest 不一致（漂移提示，不阻断加载）。 */
+	drifted?: boolean;
 }
 
 /** builtin Extension 的运行时挂载（代码提供，不经安装流程）。 */
@@ -99,19 +158,24 @@ export class ExtensionRegistry {
 	private queue: Promise<unknown> = Promise.resolve();
 	private developerMode = false;
 	private readonly activeLocal = new Set<string>();
+	/** local-link 源目录 digest 与登记值不一致的 extension id。 */
+	private readonly driftedLinks = new Set<string>();
 	/** Runtime contribution key -> owning package manifest id. */
 	private readonly contributionOwners = new Map<string, string>();
 	private readonly moduleActivationCounts = new Map<string, number>();
 	/** 最近一次成功激活的运行时对象；更新失败时不依赖已被覆盖的源目录即可恢复。 */
 	private readonly activeHooks = new Map<string, BuiltinExtensionHooks | null>();
+	/** user 包的落地根目录：`<extensionsDir>/packages/<id>/<version>/`。 */
+	private readonly packagesDir: string;
 
 	constructor(
-		teamsDir: string,
+		extensionsDir: string,
 		private readonly catalog: ExtensionCatalog,
 		private readonly drivers: DriverRegistry,
 		private readonly hostVersion = PUDDINGTEAMS_HOST_VERSION,
 	) {
-		this.file = path.join(teamsDir, "extensions.json");
+		this.file = path.join(extensionsDir, "registry.json");
+		this.packagesDir = path.join(extensionsDir, "packages");
 	}
 
 	/** 落盘目录 + 重新注册上次安装的本地 Extension（重启恢复）。 */
@@ -119,14 +183,19 @@ export class ExtensionRegistry {
 		this.developerMode = opts.developerMode === true;
 		for (const record of await this.readFile()) {
 			this.installed.set(record.manifest.id, record);
-			if (record.origin === "local" && !this.developerMode) {
-				this.loadErrors.set(record.manifest.id, "开发者模式未开启，本地代码 Extension 未加载");
-				continue;
+			if (record.origin === "local-link") {
+				await this.checkLinkDrift(record);
+				if (!this.developerMode) {
+					this.loadErrors.set(record.manifest.id, "开发者模式未开启，本地代码 Extension 未加载");
+					continue;
+				}
 			}
+			// bundled 的 sourcePath 是发行投影事实：路径失效时激活失败只记
+			// loadError，由启动预装流程（installOrUpdateFromDir）重新解析自愈。
 			await this.activate(record).catch((err: unknown) => {
 				this.loadErrors.set(record.manifest.id, err instanceof Error ? err.message : String(err));
 			});
-			if (record.origin === "local" && !this.loadErrors.has(record.manifest.id)) this.activeLocal.add(record.manifest.id);
+			if (record.origin === "local-link" && !this.loadErrors.has(record.manifest.id)) this.activeLocal.add(record.manifest.id);
 		}
 	}
 
@@ -136,13 +205,14 @@ export class ExtensionRegistry {
 			if (enabled === this.developerMode) return;
 			this.developerMode = enabled;
 			for (const record of this.installed.values()) {
-				if (record.origin !== "local") continue;
+				if (record.origin !== "local-link") continue;
 				if (!enabled) {
 					if (this.activeLocal.has(record.manifest.id)) this.deactivate(record.manifest);
 					this.activeLocal.delete(record.manifest.id);
 					this.loadErrors.set(record.manifest.id, "开发者模式未开启，本地代码 Extension 未加载");
 					continue;
 				}
+				await this.checkLinkDrift(record);
 				try {
 					await this.activate(record);
 					this.activeLocal.add(record.manifest.id);
@@ -166,15 +236,21 @@ export class ExtensionRegistry {
 		try {
 			const raw = await readFile(this.file, "utf-8");
 			const parsed = JSON.parse(raw) as Partial<ExtensionsFile>;
-			if (!Array.isArray(parsed.extensions)) throw new Error("extensions.json 缺少 extensions 数组");
+			if (!Array.isArray(parsed.extensions)) throw new Error("registry.json 缺少 extensions 数组");
 			return parsed.extensions.map((value, index) => {
-				if (!value || typeof value !== "object") throw new Error(`extensions.json[${index}] 不是对象`);
+				if (!value || typeof value !== "object") throw new Error(`registry.json[${index}] 不是对象`);
 				const record = value as Partial<InstalledExtensionRecord>;
-				if (record.origin !== "bundled" && record.origin !== "local") {
-					throw new Error(`extensions.json[${index}] origin 非法；清理 pre-developer-mode 数据`);
+				if (record.origin !== "bundled" && record.origin !== "user" && record.origin !== "local-link") {
+					throw new Error(`registry.json[${index}] origin 非法（支持 bundled/user/local-link）；清理旧版 registry.json`);
 				}
 				if (typeof record.sourcePath !== "string" || !path.isAbsolute(record.sourcePath)) {
-					throw new Error(`extensions.json[${index}] sourcePath 必须是绝对路径`);
+					throw new Error(`registry.json[${index}] sourcePath 必须是绝对路径`);
+				}
+				if ((record.origin === "user" || record.origin === "local-link") && typeof record.digest !== "string") {
+					throw new Error(`registry.json[${index}] ${record.origin} 记录缺少 digest`);
+				}
+				if (record.origin === "user" && !record.sourcePath.startsWith(this.packagesDir + path.sep)) {
+					throw new Error(`registry.json[${index}] user 包必须位于 packages 目录内`);
 				}
 				const manifest = parseExtensionManifest(record.manifest);
 				if (record.version !== manifest.version) throw new Error(`extension「${manifest.id}」版本记录不一致`);
@@ -221,6 +297,7 @@ export class ExtensionRegistry {
 				...(record.versionPin ? { versionPin: record.versionPin } : {}),
 				loaded: !this.loadErrors.has(record.manifest.id),
 				...(this.loadErrors.has(record.manifest.id) ? { loadError: this.loadErrors.get(record.manifest.id) } : {}),
+				...(this.driftedLinks.has(record.manifest.id) ? { drifted: true } : {}),
 			});
 		}
 		return entries.sort((a, b) => a.manifest.id.localeCompare(b.manifest.id));
@@ -284,8 +361,10 @@ export class ExtensionRegistry {
 
 	/**
 	 * 第一方预置包（仓库内 extensions/connectors/*，§9.5 双宿主包）：
-	 * 未安装则安装；已安装则从同一路径重读 manifest 与模块（更新到最新代码）。
-	 * 每次启动调用，保证仓库代码改动即时生效；builtin 同 id 拒绝覆盖。
+	 * 未安装则安装；已安装则从发行投影（当前解析出的包路径）重读 manifest
+	 * 与模块，并把 sourcePath 自愈更新为最新解析结果——bundled 记录以
+	 * manifest id+版本为事实，旧绝对路径失效不阻断启动。
+	 * 与 user/local-link 同 id 冲突时拒绝，不静默覆盖。
 	 */
 	async installOrUpdateFromDir(dirPath: string): Promise<CatalogEntry> {
 		return this.serialize(async () => {
@@ -297,20 +376,37 @@ export class ExtensionRegistry {
 				}
 				await this.activate(record);
 				this.installed.set(manifest.id, record);
+				await this.writeFile([...this.installed.values()]);
 			} else {
+				if (existing.origin !== "bundled") {
+					throw new Error(
+						`extension「${manifest.id}」已以${ORIGIN_LABELS[existing.origin]}来源安装；来源三态互不覆盖，请先显式卸载`,
+					);
+				}
 				await this.replaceInstalled(existing, record);
 			}
-			if (!existing) await this.writeFile([...this.installed.values()]);
 			return this.get(manifest.id)!;
 		});
 	}
 
-	/** 从本地目录安装：读 manifest、校验、加载模块、持久化记录。 */
+	/**
+	 * 开发者本地链接安装（local-link，文档 §8.3）：只登记规范化绝对路径 +
+	 * 最近 digest，不复制源码；仅在开发者模式可用。
+	 */
 	async install(dirPath: string, opts: { versionPin?: string } = {}): Promise<CatalogEntry> {
 		return this.serialize(async () => {
 			if (!this.developerMode) throw new Error("本地 Extension 安装仅在开发者模式下可用");
-			const { manifest, record } = await this.loadFromDir(dirPath, { ...opts, origin: "local" });
-			if (this.builtins.has(manifest.id) || this.installed.has(manifest.id)) {
+			const { manifest, record } = await this.loadFromDir(dirPath, { ...opts, origin: "local-link" });
+			if (this.builtins.has(manifest.id)) {
+				throw new Error(`extension「${manifest.id}」是 builtin，不能用本地链接覆盖`);
+			}
+			const existing = this.installed.get(manifest.id);
+			if (existing) {
+				if (existing.origin !== "local-link") {
+					throw new Error(
+						`extension「${manifest.id}」已以${ORIGIN_LABELS[existing.origin]}来源安装；来源三态互不覆盖，请先显式卸载`,
+					);
+				}
 				throw new Error(`extension「${manifest.id}」已安装；升级请用 update`);
 			}
 			await this.activate(record);
@@ -322,19 +418,82 @@ export class ExtensionRegistry {
 	}
 
 	/**
-	 * 更新已安装 Extension：从原路径（或新路径）重读 manifest 与模块。
+	 * 用户安装（user，文档 §8.2）：staging 复制到 packages/<id>/<version>/ →
+	 * 校验 manifest/engines/permissions → 记录 digest 并原子切换 registry。
+	 * 任一步失败清理 staging/目标目录，不留半成品。
+	 */
+	async installUserPackage(sourceDir: string, opts: { versionPin?: string } = {}): Promise<CatalogEntry> {
+		return this.serialize(async () => {
+			const dir = path.resolve(sourceDir);
+			// manifest 读取与校验与 CLI validate 共用 readManifestFromDir（extensions.ts）。
+			const manifest = await readManifestFromDir(dir);
+			this.assertEngineCompatible(manifest);
+			if (opts.versionPin && manifest.version !== opts.versionPin) {
+				throw new Error(`已固定版本 ${opts.versionPin}，目录中的版本 ${manifest.version} 不匹配`);
+			}
+			if (this.builtins.has(manifest.id)) {
+				throw new Error(`extension「${manifest.id}」是 builtin，不能安装同 id 用户包`);
+			}
+			const existing = this.installed.get(manifest.id);
+			if (existing) {
+				if (existing.origin !== "user") {
+					throw new Error(
+						`extension「${manifest.id}」已以${ORIGIN_LABELS[existing.origin]}来源安装；来源三态互不覆盖，请先显式卸载`,
+					);
+				}
+				throw new Error(`extension「${manifest.id}」已安装；升级请用 update`);
+			}
+			const staged = await this.stageUserPackage(dir, manifest.id, manifest.version);
+			const now = new Date().toISOString();
+			const record: InstalledExtensionRecord = {
+				manifest,
+				origin: "user",
+				sourcePath: staged.finalDir,
+				digest: staged.digest,
+				installedAt: now,
+				updatedAt: now,
+				version: manifest.version,
+				...(opts.versionPin ? { versionPin: opts.versionPin } : {}),
+			};
+			try {
+				await this.activate(record);
+				this.installed.set(manifest.id, record);
+				await this.writeFile([...this.installed.values()]);
+			} catch (err) {
+				this.installed.delete(manifest.id);
+				this.deactivate(manifest);
+				this.loadErrors.delete(manifest.id);
+				await rm(staged.finalDir, { recursive: true, force: true }).catch(() => undefined);
+				throw err;
+			}
+			return this.get(manifest.id)!;
+		});
+	}
+
+	/**
+	 * 更新已安装 Extension：local-link 从原路径（或新路径）重读；user 必须给
+	 * 新来源目录，走 staging 复制 + 原子切换，失败保留旧版本目录与记录；
+	 * bundled 随发行物升级，不能用外部路径更新。
 	 * 固定版本（versionPin）时新版本必须等于 pin，否则拒绝（不静默换版）。
 	 */
 	async update(id: string, opts: { path?: string; versionPin?: string } = {}): Promise<CatalogEntry> {
 		return this.serialize(async () => {
 			const existing = this.installed.get(id);
 			if (!existing) throw new Error(`extension not installed: ${id}`);
-			if (existing.origin === "local" && !this.developerMode) {
+			if (existing.origin === "bundled") {
+				throw new Error(`bundled extension「${id}」随发行物升级，不能用路径更新`);
+			}
+			const pin = opts.versionPin ?? existing.versionPin;
+			if (existing.origin === "user") {
+				if (!opts.path) throw new Error(`user extension「${id}」更新必须提供来源目录 path`);
+				await this.updateUserPackage(existing, opts.path, pin);
+				return this.get(id)!;
+			}
+			if (!this.developerMode) {
 				throw new Error("本地 Extension 更新仅在开发者模式下可用");
 			}
 			const dir = opts.path ?? existing.sourcePath;
-			const pin = opts.versionPin ?? existing.versionPin;
-			const { manifest, record } = await this.loadFromDir(dir, { versionPin: pin, origin: existing.origin });
+			const { manifest, record } = await this.loadFromDir(dir, { versionPin: pin, origin: "local-link" });
 			if (manifest.id !== id) throw new Error(`目录中的 manifest id「${manifest.id}」与「${id}」不一致`);
 			if (pin && manifest.version !== pin) {
 				throw new Error(`extension「${id}」已固定版本 ${pin}，目录中的版本 ${manifest.version} 不匹配`);
@@ -345,23 +504,29 @@ export class ExtensionRegistry {
 	}
 
 	/**
-	 * 卸载：移除模块注册与持久化记录。启用 Agent / active Run 的保护判断
-	 * 在路由层完成（§9.3.8）；builtin 不可卸载。
+	 * 卸载：移除模块注册与持久化记录；user 包同时删除 packages/<id>/ 目录。
+	 * 启用 Agent / active Run 的保护判断在路由层完成（§9.3.8）；
+	 * builtin/bundled 不可卸载。
 	 */
 	async uninstall(id: string): Promise<void> {
 		await this.serialize(async () => {
 			if (this.builtins.has(id)) throw new Error(`builtin extension「${id}」不可卸载`);
 			const record = this.installed.get(id);
 			if (!record) throw new Error(`extension not installed: ${id}`);
-			if (record.origin === "local" && !this.developerMode) {
+			if (record.origin === "bundled") throw new Error(`bundled extension「${id}」随发行物预置，不可卸载`);
+			if (record.origin === "local-link" && !this.developerMode) {
 				throw new Error("本地 Extension 卸载仅在开发者模式下可用");
 			}
 			this.deactivate(record.manifest);
 			this.activeHooks.delete(id);
 			this.activeLocal.delete(id);
+			this.driftedLinks.delete(id);
 			this.installed.delete(id);
 			this.loadErrors.delete(id);
 			await this.writeFile([...this.installed.values()]);
+			if (record.origin === "user") {
+				await rm(path.join(this.packagesDir, id), { recursive: true, force: true }).catch(() => undefined);
+			}
 		});
 	}
 
@@ -369,7 +534,7 @@ export class ExtensionRegistry {
 
 	private async loadFromDir(
 		dirPath: string,
-		opts: { versionPin?: string; origin?: "bundled" | "local" },
+		opts: { versionPin?: string; origin: ExtensionOrigin },
 	): Promise<{ manifest: PuddingTeamsExtensionManifest & { entry?: string }; record: InstalledExtensionRecord }> {
 		const dir = path.resolve(dirPath);
 		// manifest 读取与校验与 CLI validate 共用 readManifestFromDir（extensions.ts）。
@@ -383,14 +548,114 @@ export class ExtensionRegistry {
 			manifest,
 			record: {
 				manifest,
-				origin: opts.origin ?? "local",
+				origin: opts.origin,
 				sourcePath: dir,
+				// bundled 以 manifest id+版本为事实，不记 digest。
+				...(opts.origin === "local-link" ? { digest: await computePackageDigest(dir) } : {}),
 				installedAt: now,
 				updatedAt: now,
 				version: manifest.version,
 				...(opts.versionPin ? { versionPin: opts.versionPin } : {}),
 			},
 		};
+	}
+
+	/** staging 复制 → digest → 原子落位 packages/<id>/<version>/；失败清理 staging。 */
+	private async stageUserPackage(sourceDir: string, id: string, version: string): Promise<{ finalDir: string; digest: string }> {
+		const finalDir = path.join(this.packagesDir, id, version);
+		const stagingDir = path.join(this.packagesDir, `.staging-${randomUUID().slice(0, 8)}`);
+		try {
+			await copyPackageDir(sourceDir, stagingDir);
+			const digest = await computePackageDigest(stagingDir);
+			await rm(finalDir, { recursive: true, force: true });
+			await mkdir(path.dirname(finalDir), { recursive: true });
+			await rename(stagingDir, finalDir);
+			return { finalDir, digest };
+		} catch (err) {
+			await rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
+			throw err;
+		}
+	}
+
+	/**
+	 * user 包更新：staging 校验后原子切换 registry 记录。目标版本目录与当前
+	 * 激活版本相同（同版本重装）时先把旧目录改名备份，切换失败恢复；不同
+	 * 版本则旧版本目录原样保留。
+	 */
+	private async updateUserPackage(
+		existing: InstalledExtensionRecord,
+		sourceDir: string,
+		pin: string | undefined,
+	): Promise<void> {
+		const dir = path.resolve(sourceDir);
+		const manifest = await readManifestFromDir(dir);
+		this.assertEngineCompatible(manifest);
+		const id = existing.manifest.id;
+		if (manifest.id !== id) throw new Error(`目录中的 manifest id「${manifest.id}」与「${id}」不一致`);
+		if (pin && manifest.version !== pin) {
+			throw new Error(`extension「${id}」已固定版本 ${pin}，目录中的版本 ${manifest.version} 不匹配`);
+		}
+		const staged = await this.stageUserPackageForUpdate(dir, existing, manifest.version);
+		const record: InstalledExtensionRecord = {
+			manifest,
+			origin: "user",
+			sourcePath: staged.finalDir,
+			digest: staged.digest,
+			installedAt: existing.installedAt,
+			updatedAt: new Date().toISOString(),
+			version: manifest.version,
+			...(pin ? { versionPin: pin } : {}),
+		};
+		try {
+			await this.replaceInstalled(existing, record);
+		} catch (err) {
+			// 记录仍指向旧 sourcePath：清掉新目录并恢复备份（如有）。
+			await rm(staged.finalDir, { recursive: true, force: true }).catch(() => undefined);
+			if (staged.backupDir) {
+				await rename(staged.backupDir, staged.finalDir).catch(() => undefined);
+			}
+			throw err;
+		}
+		if (staged.backupDir) await rm(staged.backupDir, { recursive: true, force: true }).catch(() => undefined);
+	}
+
+	private async stageUserPackageForUpdate(
+		sourceDir: string,
+		existing: InstalledExtensionRecord,
+		version: string,
+	): Promise<{ finalDir: string; digest: string; backupDir?: string }> {
+		const finalDir = path.join(this.packagesDir, existing.manifest.id, version);
+		const stagingDir = path.join(this.packagesDir, `.staging-${randomUUID().slice(0, 8)}`);
+		let backupDir: string | undefined;
+		try {
+			await copyPackageDir(sourceDir, stagingDir);
+			const digest = await computePackageDigest(stagingDir);
+			if (finalDir === existing.sourcePath) {
+				backupDir = `${finalDir}.backup-${randomUUID().slice(0, 8)}`;
+				await rename(finalDir, backupDir);
+			} else {
+				await rm(finalDir, { recursive: true, force: true });
+			}
+			await mkdir(path.dirname(finalDir), { recursive: true });
+			await rename(stagingDir, finalDir);
+			return backupDir ? { finalDir, digest, backupDir } : { finalDir, digest };
+		} catch (err) {
+			await rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
+			if (backupDir) await rename(backupDir, finalDir).catch(() => undefined);
+			throw err;
+		}
+	}
+
+	/** local-link 漂移检测：源目录 digest 与登记值不一致时标记（提示用，不阻断）。 */
+	private async checkLinkDrift(record: InstalledExtensionRecord): Promise<void> {
+		if (record.origin !== "local-link" || !record.digest) return;
+		try {
+			const digest = await computePackageDigest(record.sourcePath);
+			if (digest === record.digest) this.driftedLinks.delete(record.manifest.id);
+			else this.driftedLinks.add(record.manifest.id);
+		} catch {
+			this.driftedLinks.delete(record.manifest.id);
+		}
 	}
 
 	private assertEngineCompatible(manifest: PuddingTeamsExtensionManifest): void {
@@ -512,7 +777,8 @@ export class ExtensionRegistry {
 		try {
 			this.activatePrepared(candidate.manifest, candidateHooks);
 			this.installed.set(id, replacement);
-			if (existing.origin === "local") this.activeLocal.add(id);
+			if (existing.origin === "local-link") this.activeLocal.add(id);
+			this.driftedLinks.delete(id);
 			await this.writeFile([...this.installed.values()]);
 		} catch (err) {
 			this.deactivate(candidate.manifest);

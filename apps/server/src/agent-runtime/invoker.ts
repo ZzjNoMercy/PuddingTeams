@@ -661,7 +661,14 @@ export class AgentInvoker {
 			const { connectorId, config } = agent.connector;
 			return this.drivers.create(
 				connectorId,
-				connectorId === "pi" ? { ...(config ?? {}), piResources: agent.piResources } : (config ?? {}),
+				connectorId === "pi"
+					? {
+							...(config ?? {}),
+							piResources: agent.piResources,
+							// 信任门判定单点（§7.2）：Driver 装配会话时按 workspaceId 实时判定。
+							workspaceAccessFor: (workspaceId?: string) => this.teams.workspaces.resourceAccessFor(workspaceId),
+						}
+					: (config ?? {}),
 				agent.connector.extensionId,
 			);
 		}

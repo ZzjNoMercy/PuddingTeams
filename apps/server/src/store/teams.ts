@@ -6,7 +6,7 @@ import { CredentialsStore } from "./credentials.js";
 import { spawnWorker } from "../agent-runtime/transport/spawn.js";
 import { ensureHandoffGuidance } from "../agent-runtime/handoff.js";
 import type { AgentCapabilityBinding, AgentConnectorBinding } from "../agent-runtime/extensions.js";
-import { WorkspaceStore } from "./workspaces.js";
+import { WorkspaceStore, type WorkspaceTrust } from "./workspaces.js";
 
 export interface CommandInvoke {
 	type: "command";
@@ -79,7 +79,7 @@ export interface AgentConfig {
 	capabilities?: string[];
 	/** 长期责任与停止边界；用于 manager 路由，不是能力或权限证明。 */
 	responsibility?: AgentResponsibilityProfile;
-	/** Avatar image file name inside `.teams/avatars/` (§11); absent = default. */
+	/** Avatar image file name inside `<assets>/avatars/` (§11); absent = default. */
 	avatar?: string;
 	/** pinned 内置条目（manager）：不可删除、不可禁用。 */
 	pinned?: boolean;
@@ -220,13 +220,24 @@ const AVATAR_TYPES: AvatarType[] = [
 const SAFE_AGENT_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
 /**
- * Registry + window store for phase 2. Owns `teams.json` (the worker registry)
- * and `windows.json` (chat windows: solo / direct / group). Worker subprocess
+ * Registry + window store for phase 2. Owns `agents.json` (the worker registry)
+ * and `windows.json` (chat windows: solo / direct / group) under `dirs.state`;
+ * avatar 图片在 `dirs.assets/avatars/`，平台管理项目根在
+ * `dirs.managedWorkspaces/`（内含 WorkspaceStore）。Worker subprocess
  * 的生命周期由 AgentRuntime/Driver 层负责，本类只承担注册表与窗口存储。
  *
  * Every mutation runs under an in-process mutex and re-reads the file fresh,
  * so concurrent writes cannot lose updates (all-or-nothing per mutation).
  */
+export interface TeamsStoreDirs {
+	/** agents.json / windows.json / workspaces.json 所在目录。 */
+	state: string;
+	/** 头像等用户资源根（avatars/ 子目录）。 */
+	assets: string;
+	/** 平台管理项目（managed workspace）根目录。 */
+	managedWorkspaces: string;
+}
+
 export class TeamsStore {
 	private agentsPromise: Promise<AgentConfig[]> | null = null;
 	private windowsPromise: Promise<WindowsFile> | null = null;
@@ -256,19 +267,19 @@ export class TeamsStore {
 	}
 
 	constructor(
-		private readonly teamsDir: string,
+		private readonly dirs: TeamsStoreDirs,
 		private readonly cwd: string,
 		private readonly defaultTimeoutMs = 900_000,
 		private readonly credentials?: CredentialsStore,
 	) {
-		this.agentsFile = path.join(teamsDir, "teams.json");
-		this.windowsFile = path.join(teamsDir, "windows.json");
-		this.workspaces = new WorkspaceStore(teamsDir);
+		this.agentsFile = path.join(dirs.state, "agents.json");
+		this.windowsFile = path.join(dirs.state, "windows.json");
+		this.workspaces = new WorkspaceStore(dirs.state, dirs.managedWorkspaces);
 	}
 
-	/** Ensure the registry dir exists; seed teams.json with defaults on first run. */
+	/** Ensure the state dir exists; seed agents.json with defaults on first run. */
 	async init(): Promise<void> {
-		await mkdir(this.teamsDir, { recursive: true });
+		await mkdir(this.dirs.state, { recursive: true });
 		this.defaultCwdSnapshot = await realpath(path.resolve(this.cwd));
 		await this.workspaces.init();
 		if (!existsSync(this.agentsFile)) {
@@ -277,7 +288,7 @@ export class TeamsStore {
 		const agents = await this.loadAgentsFile();
 		const manager = agents.find((agent) => agent.name === MANAGER_AGENT_NAME);
 		if (!manager || !manager.pinned || manager.invoke?.type !== "pi") {
-			throw new Error("teams.json uses pre-P3 data; pinned manager is required, clear development data");
+			throw new Error("agents.json uses pre-P3 data; pinned manager is required, clear development data");
 		}
 		// Workspace selection is optional. When present it must be a non-empty
 		// identity; absence is the intentional legacy/default-cwd chat mode.
@@ -328,7 +339,7 @@ export class TeamsStore {
 	}
 
 	private async writeJsonFile(file: string, data: unknown): Promise<void> {
-		await mkdir(this.teamsDir, { recursive: true });
+		await mkdir(path.dirname(file), { recursive: true });
 		const tmp = `${file}.${randomUUID().slice(0, 8)}.tmp`;
 		await writeFile(tmp, JSON.stringify(data, null, 2) + "\n", "utf-8");
 		await rename(tmp, file);
@@ -715,7 +726,7 @@ export class TeamsStore {
 	// ---- avatars (§11) ----
 
 	private avatarsDir(): string {
-		return path.join(this.teamsDir, "avatars");
+		return path.join(this.dirs.assets, "avatars");
 	}
 
 	/** Remove any existing avatar files for `name` (all whitelisted extensions). */
@@ -827,10 +838,12 @@ export class TeamsStore {
 	}
 
 	/** Resolve the identity used by a newly created Window. */
-	async contextForWorkspace(workspaceId?: string): Promise<{ workspaceId?: string; cwdSnapshot: string }> {
+	async contextForWorkspace(
+		workspaceId?: string,
+	): Promise<{ workspaceId?: string; cwdSnapshot: string; trust?: WorkspaceTrust }> {
 		if (!workspaceId) return { cwdSnapshot: this.defaultCwdSnapshot };
 		const workspace = await this.workspaces.require(workspaceId);
-		return { workspaceId, cwdSnapshot: workspace.canonicalPath };
+		return { workspaceId, cwdSnapshot: workspace.canonicalPath, trust: workspace.trust };
 	}
 
 	defaultContextCwd(): string {

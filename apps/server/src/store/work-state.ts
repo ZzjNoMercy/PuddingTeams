@@ -104,12 +104,12 @@ export class WorkStateStore {
 	private readonly file: string;
 	private queue: Promise<unknown> = Promise.resolve();
 
-	constructor(private readonly teamsDir: string) {
-		this.file = path.join(teamsDir, "work-states.json");
+	constructor(private readonly stateDir: string) {
+		this.file = path.join(stateDir, "work-states.json");
 	}
 
 	async init(): Promise<void> {
-		await mkdir(this.teamsDir, { recursive: true });
+		await mkdir(this.stateDir, { recursive: true });
 	}
 
 	private serialize<T>(fn: () => Promise<T>): Promise<T> {

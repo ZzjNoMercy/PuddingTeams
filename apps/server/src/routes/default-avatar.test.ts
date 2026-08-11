@@ -55,7 +55,12 @@ async function makeStack() {
 
 	const credentials = new CredentialsStore(path.join(dir, "sec"));
 	await credentials.init();
-	const teams = new TeamsStore(path.join(dir, "teams"), dir, 900_000, credentials);
+	const teams = new TeamsStore(
+		{ state: path.join(dir, "teams"), assets: path.join(dir, "teams"), managedWorkspaces: path.join(dir, "managed") },
+		dir,
+		900_000,
+		credentials,
+	);
 	await teams.init();
 	const registry = new ExtensionRegistry(path.join(dir, "teams"), new ExtensionCatalog(), new DriverRegistry());
 	registry.registerBuiltin(avatarConnectorManifest(), {}, { assetsDir });

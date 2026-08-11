@@ -139,8 +139,10 @@ PuddingTeams/
 │   └── server/                    # ☐ thin backend（Node + Fastify/Express 均可）
 │       ├── src/pi-bridge/         #   pi SDK 封装：会话生命周期、事件订阅转发、team_task 工具（SDK customTools 注入）
 │       ├── src/routes/            #   HTTP/WS 端点（chat、sessions、rooms、agents、settings）
-│       ├── src/store/             #   teams.json / windows.json 读写 + worker spawn（阶段二已落地）
-│       └── .teams/                #   运行时数据：teams.json/windows.json/avatars/（gitignore）
+│       ├── src/store/             #   平台状态 Store 读写 + worker spawn（阶段二已落地）
+│       └── （无运行时数据目录）    #   用户数据自 2026-08-11 起统一在 PUDDINGTEAMS_HOME（默认 ~/.puddingteams），
+│                                  #   目录树见 docs/2026-08-11-用户数据目录与Workspace上下文迁移方案.md §4；
+│                                  #   早期 apps/server/.teams/ 仅为历史说明
 ├── electron/                      # ◻ 阶段三：壳 + 打包配置（mac/win）
 ├── workers/                       # ◻ 运行时生成的共享工作目录（gitignore，阶段二）
 └── docs/reference/                # ☐ PuddingClaw 侧文档参考拷贝（已有）

@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { config } from "./config.js";
+import { acquireLease, ensurePaths, resolvePuddingTeamsPaths } from "./paths.js";
 import { PiSessionStore } from "./pi-bridge/session-store.js";
 import { CredentialsStore } from "./store/credentials.js";
 import { TeamsStore } from "./store/teams.js";
@@ -47,32 +48,51 @@ await app.register(cors, {
 });
 await app.register(websocket);
 
-// Worker 密钥（如 PUDDINGCLAW_TOKEN）加密存于 ~/.puddingteams，不进 teams.json。
-const credentials = new CredentialsStore(config.secretsDir);
+// 用户数据目录（文档 §4）：一切平台状态落在 PUDDINGTEAMS_HOME（缺省
+// ~/.puddingteams）下；单写者 Lease 保证同一数据目录只有一个后端实例。
+const paths = resolvePuddingTeamsPaths();
+await ensurePaths(paths);
+const releaseLease = await acquireLease(paths).catch((err: unknown) => {
+	app.log.error(err, "failed to acquire backend lease — exiting");
+	process.exit(1);
+});
+app.log.info({ home: paths.home }, "puddingteams home resolved");
+
+// 无项目 Window 的中立 cwd：缺省 <home>/workspaces/unscoped（天然无 .pi/*、
+// 无 AGENTS.md）；config.agentCwd 仅作显式诊断覆盖。
+const defaultCwd = config.agentCwd ?? paths.unscopedWorkspace;
+
+// Worker 密钥（如 PUDDINGCLAW_TOKEN）加密存于 <home>/secrets，不进 agents.json。
+const credentials = new CredentialsStore(paths.secrets);
 await credentials.init();
-const teams = new TeamsStore(config.teamsDir, config.agentCwd, config.workerTimeoutMs, credentials);
+const teams = new TeamsStore(
+	{ state: paths.state, assets: paths.assets, managedWorkspaces: paths.managedWorkspaces },
+	defaultCwd,
+	config.workerTimeoutMs,
+	credentials,
+);
 await teams.init();
 
 // Phase 1：Runtime/Driver 抽取。委托、交互与加密 provider state 独立存储。
-const delegations = new DelegationStore(config.teamsDir);
+const delegations = new DelegationStore(paths.state);
 await delegations.init();
-const interactionSecrets = new InteractionSecretStore(config.secretsDir);
+const interactionSecrets = new InteractionSecretStore(paths.secrets);
 await interactionSecrets.init();
 // §15.6 交付物登记：Runtime 完成时写入，API 可查。
-const artifacts = new ArtifactStore(config.teamsDir);
+const artifacts = new ArtifactStore(paths.state, paths.artifactBlobs);
 await artifacts.init();
-const workStates = new WorkStateStore(config.teamsDir);
+const workStates = new WorkStateStore(paths.state);
 await workStates.init();
-const uploads = new UploadStore(config.teamsDir);
+const uploads = new UploadStore(paths.uploads);
 await uploads.init();
 const drivers = new DriverRegistry();
 // Phase 5：Extension 目录与安装。PuddingClaw 以 builtin Connector 进入目录；
 // 上次安装的本地 Extension 在 init 时重新注册（capability→catalog，connector→drivers）。
 const catalog = new ExtensionCatalog();
-const productSettings = new ProductSettingsStore(config.teamsDir);
-const extensionRegistry = new ExtensionRegistry(config.teamsDir, catalog, drivers);
+const productSettings = new ProductSettingsStore(paths.config);
+const extensionRegistry = new ExtensionRegistry(paths.extensions, catalog, drivers);
 extensionRegistry.registerBuiltin(puddingClawConnectorManifest, puddingClawExtensionHooks());
-extensionRegistry.registerBuiltin(piConnectorManifest, piExtensionHooks());
+extensionRegistry.registerBuiltin(piConnectorManifest, piExtensionHooks({ sessionDir: paths.workerSessions }));
 await extensionRegistry.init({ developerMode: (await productSettings.get()).developerMode });
 // P2（§9.5 双宿主包）：codex / claude-code Connector 本体在 extensions/connectors/*，
 // 第一方预置 = 启动时按仓库内路径安装/更新，不再代码内嵌 builtin。
@@ -88,9 +108,9 @@ const runtime: AgentRuntime = new AgentRuntime(
 	{ ttlMs: 24 * 60 * 60 * 1000 },
 	artifacts,
 );
-const invoker = new AgentInvoker(teams, runtime, drivers, credentials, config.agentCwd);
+const invoker = new AgentInvoker(teams, runtime, drivers, credentials, defaultCwd);
 
-const store = new PiSessionStore(config.agentCwd, config.sessionDir, teams, invoker, catalog, workStates, artifacts);
+const store = new PiSessionStore(defaultCwd, paths.sessions, teams, invoker, catalog, workStates, artifacts);
 invoker.setManagerSender((managerSessionId, message, options) =>
 	store.sendCustomMessage(managerSessionId, message, options),
 );
@@ -107,7 +127,7 @@ await teams.ensureSoloWindow(
 	async (id) => store.isOpen(id) || (await store.list()).some((s) => s.id === id),
 );
 await registerChatRoutes(app, store, teams, workStates, uploads);
-await registerSettingsRoutes(app);
+await registerSettingsRoutes(app, defaultCwd);
 await registerProvidersRoutes(app, store);
 await registerAgentsRoutes(app, teams, {
 	credentials,
@@ -118,7 +138,7 @@ await registerAgentsRoutes(app, teams, {
 });
 await registerExtensionsRoutes(app, { registry: extensionRegistry, teams, runtime, sessions: store, settings: productSettings });
 registerResourcesRoutes(app);
-registerWorkspacesRoutes(app, teams.workspaces);
+registerWorkspacesRoutes(app, teams.workspaces, undefined, store);
 await registerRoomsRoutes(app, store, teams, invoker, workStates);
 await registerInteractionsRoutes(app, runtime, invoker, teams);
 registerArtifactsRoutes(app, artifacts);
@@ -148,11 +168,11 @@ artifacts.onCreated((record) => {
 // error event, per the "cheap, event-driven" health strategy.
 try {
 	const { session } = await createAgentSession({
-		cwd: config.agentCwd,
-		sessionManager: SessionManager.inMemory(config.agentCwd),
+		cwd: defaultCwd,
+		sessionManager: SessionManager.inMemory(defaultCwd),
 	});
 	session.dispose();
-	app.log.info({ sessionDir: config.sessionDir, agentCwd: config.agentCwd }, "pi SDK smoke check passed");
+	app.log.info({ home: paths.home, sessions: paths.sessions, agentCwd: defaultCwd }, "pi SDK smoke check passed");
 } catch (err) {
 	app.log.error(err, "pi SDK smoke check failed — exiting");
 	process.exit(1);
@@ -162,6 +182,7 @@ async function shutdown(): Promise<void> {
 	app.log.info("shutting down");
 	await store.disposeAll();
 	await app.close();
+	await releaseLease();
 }
 
 process.on("SIGINT", () => void shutdown().then(() => process.exit(0)));

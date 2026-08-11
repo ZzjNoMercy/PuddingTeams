@@ -10,8 +10,8 @@ export class ProductSettingsStore {
 	private readonly file: string;
 	private queue: Promise<unknown> = Promise.resolve();
 
-	constructor(private readonly teamsDir: string) {
-		this.file = path.join(teamsDir, "product-settings.json");
+	constructor(private readonly configDir: string) {
+		this.file = path.join(configDir, "product.json");
 	}
 
 	async get(): Promise<ProductSettings> {
@@ -27,7 +27,7 @@ export class ProductSettingsStore {
 	async setDeveloperMode(enabled: boolean): Promise<ProductSettings> {
 		const run = this.queue.then(async () => {
 			const settings = { developerMode: enabled };
-			await mkdir(this.teamsDir, { recursive: true });
+			await mkdir(this.configDir, { recursive: true });
 			const tmp = `${this.file}.${randomUUID().slice(0, 8)}.tmp`;
 			await writeFile(tmp, JSON.stringify(settings, null, 2) + "\n", "utf-8");
 			await rename(tmp, this.file);

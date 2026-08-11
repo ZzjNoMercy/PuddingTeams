@@ -7,7 +7,7 @@ import { TeamsStore } from "./teams.js";
 
 async function makeStore(): Promise<{ store: TeamsStore; dir: string }> {
 	const dir = mkdtempSync(path.join(tmpdir(), "pt-workspace-"));
-	const store = new TeamsStore(dir, dir);
+	const store = new TeamsStore({ state: dir, assets: dir, managedWorkspaces: path.join(dir, "managed") }, dir);
 	await store.init();
 	return { store, dir };
 }
@@ -64,7 +64,7 @@ test("无项目 Window 的 cwdSnapshot 跨重启保持，新的默认 cwd 使用
 	mkdirSync(cwdA);
 	mkdirSync(cwdB);
 
-	const first = new TeamsStore(teamsDir, cwdA);
+	const first = new TeamsStore({ state: teamsDir, assets: teamsDir, managedWorkspaces: path.join(teamsDir, "managed") }, cwdA);
 	await first.init();
 	const soloA = await first.ensureSoloWindow(async () => ({ id: "solo-a" }), async () => false);
 	const directA = await first.ensureDirectWindow("alpha", undefined, async () => ({ id: "direct-a" }), {
@@ -73,7 +73,7 @@ test("无项目 Window 的 cwdSnapshot 跨重启保持，新的默认 cwd 使用
 	assert.equal(soloA.cwdSnapshot, realpathSync(cwdA));
 	assert.equal(directA.cwdSnapshot, realpathSync(cwdA));
 
-	const restarted = new TeamsStore(teamsDir, cwdB);
+	const restarted = new TeamsStore({ state: teamsDir, assets: teamsDir, managedWorkspaces: path.join(teamsDir, "managed") }, cwdB);
 	await restarted.init();
 	assert.equal(await restarted.workspaceFor(soloA.id), realpathSync(cwdA));
 	assert.equal((await restarted.findDirectWindow("alpha", undefined, realpathSync(cwdA)))?.id, directA.id);

@@ -9,6 +9,7 @@ import {
 	type Skill,
 } from "@earendil-works/pi-coding-agent";
 import type { PiResourceConfig } from "../store/teams.js";
+import type { WorkspaceResourceAccess, WorkspaceTrust } from "../store/workspaces.js";
 
 type SkillsPayload = { skills: Skill[]; diagnostics: ResourceDiagnostic[] };
 type PromptsPayload = { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] };
@@ -47,11 +48,16 @@ function isUnderDir(filePath: string, dir: string): boolean {
  * 全局目录下且 name 不在名单内的条目被剔除；workspace（.pi/）与 skillPaths
  * 额外挂载的资源不受白名单管，仍由 loadWorkspace* 开关控制。diagnostics
  * 原样透传。
+ *
+ * workspaceAccess（信任门 §7.2）：服务端按 workspaceId + trust 计算的三类
+ * 放行结果；传入后与 Agent 自己的 loadWorkspace* 开关取与（两个都开才加载）。
+ * 不传 = 无服务端判定（probe 等非窗口上下文），维持只看 Agent 开关的旧语义。
  */
 export function piResourceLoaderOptions(
 	resources: PiResourceConfig | undefined,
 	cwd: string,
 	agentDir: string,
+	workspaceAccess?: WorkspaceResourceAccess,
 ): {
 	additionalSkillPaths?: string[];
 	additionalPromptTemplatePaths?: string[];
@@ -62,8 +68,9 @@ export function piResourceLoaderOptions(
 	promptsOverride?: (base: PromptsPayload) => PromptsPayload;
 } {
 	const r = resources ?? {};
-	const workspaceSkills = r.loadWorkspaceSkills !== false;
-	const workspacePrompts = r.loadWorkspacePrompts !== false;
+	const workspaceContext = r.loadWorkspaceContext !== false && (workspaceAccess?.context ?? true);
+	const workspaceSkills = r.loadWorkspaceSkills !== false && (workspaceAccess?.skills ?? true);
+	const workspacePrompts = r.loadWorkspacePrompts !== false && (workspaceAccess?.prompts ?? true);
 	const skillPaths = [...(r.skillPaths ?? [])];
 	const promptPaths = [...(r.promptTemplatePaths ?? [])];
 	// 关闭 workspace 来源时，全局目录改为显式挂载（filePath 不变，白名单照常生效）。
@@ -78,7 +85,7 @@ export function piResourceLoaderOptions(
 		...(promptPaths.length ? { additionalPromptTemplatePaths: promptPaths } : {}),
 		...(!workspaceSkills ? { noSkills: true } : {}),
 		...(!workspacePrompts ? { noPromptTemplates: true } : {}),
-		...(r.loadWorkspaceContext === false ? { noContextFiles: true } : {}),
+		...(!workspaceContext ? { noContextFiles: true } : {}),
 		skillsOverride: (base) => ({
 			skills: base.skills.filter((s) => !isUnderDir(s.filePath, globalSkillsDir) || enabledSkills.has(s.name)),
 			diagnostics: base.diagnostics,
@@ -106,10 +113,12 @@ export async function loadPiResources(input: {
 	collaboration?: string;
 	extensionFactories?: InlineExtension[];
 	noExtensions?: boolean;
+	/** 信任门判定结果（§7.2）；传入后与 Agent 开关取与。 */
+	workspaceAccess?: WorkspaceResourceAccess;
 	/** false 时跳过白名单过滤（preview 需要列出全部资源并标注启用状态）。 */
 	applyWhitelist?: boolean;
 }) {
-	const options = piResourceLoaderOptions(input.resources, input.cwd, input.agentDir);
+	const options = piResourceLoaderOptions(input.resources, input.cwd, input.agentDir, input.workspaceAccess);
 	if (input.applyWhitelist === false) {
 		delete options.skillsOverride;
 		delete options.promptsOverride;
@@ -134,6 +143,10 @@ export async function previewPiResources(input: {
 	agentDir: string;
 	resources?: PiResourceConfig;
 	collaboration?: string;
+	/** 信任门判定结果（§7.2）；denied 的来源不进入预览候选集。 */
+	workspaceAccess?: WorkspaceResourceAccess;
+	/** 显式 workspace 标识（含信任状态）；无 workspaceId 的窗口为 null（§6.3）。 */
+	workspace?: { id: string; trust: WorkspaceTrust } | null;
 }) {
 	// 不过滤地扫全部资源，再按白名单标注 enabled，供配置页渲染选用开关。
 	const loader = await loadPiResources({ ...input, applyWhitelist: false });
@@ -149,8 +162,12 @@ export async function previewPiResources(input: {
 	const enabledPrompts = new Set(input.resources?.enabledPrompts ?? []);
 	const sourceOf = (filePath: string, globalDir: string, workspaceDir: string): PiResourceSource =>
 		isUnderDir(filePath, globalDir) ? "global" : isUnderDir(filePath, workspaceDir) ? "workspace" : "extra";
+	// 信任门拒绝的来源不进候选集（global/extra 不受影响）。
+	const skillAllowed = (source: PiResourceSource): boolean => source !== "workspace" || (input.workspaceAccess?.skills ?? true);
+	const promptAllowed = (source: PiResourceSource): boolean => source !== "workspace" || (input.workspaceAccess?.prompts ?? true);
 	return {
 		cwd: input.cwd,
+		workspace: input.workspace ?? null,
 		segments: [
 			{ source: "pi-base", content: "（Pi SDK 内置基础提示词在请求装配时注入）", collapsed: true },
 			...(input.resources?.systemPrompt?.trim()
@@ -163,27 +180,31 @@ export async function previewPiResources(input: {
 		],
 		effectivePrompt,
 		estimatedCharacters: effectivePrompt.length + context.reduce((sum, item) => sum + item.content.length, 0),
-		skills: skills.skills.map((item) => {
-			const source = sourceOf(item.filePath, globalSkillsDir, workspaceSkillsDir);
-			return {
-				name: item.name,
-				description: item.description,
-				path: item.filePath,
-				source,
-				enabled: source !== "global" || enabledSkills.has(item.name),
-			};
-		}),
-		prompts: prompts.prompts.map((item) => {
-			const source = sourceOf(item.filePath, globalPromptsDir, workspacePromptsDir);
-			return {
-				name: item.name,
-				description: item.description,
-				...(item.argumentHint ? { argumentHint: item.argumentHint } : {}),
-				path: item.filePath,
-				source,
-				enabled: source !== "global" || enabledPrompts.has(item.name),
-			};
-		}),
+		skills: skills.skills
+			.map((item) => {
+				const source = sourceOf(item.filePath, globalSkillsDir, workspaceSkillsDir);
+				return {
+					name: item.name,
+					description: item.description,
+					path: item.filePath,
+					source,
+					enabled: source !== "global" || enabledSkills.has(item.name),
+				};
+			})
+			.filter((item) => skillAllowed(item.source)),
+		prompts: prompts.prompts
+			.map((item) => {
+				const source = sourceOf(item.filePath, globalPromptsDir, workspacePromptsDir);
+				return {
+					name: item.name,
+					description: item.description,
+					...(item.argumentHint ? { argumentHint: item.argumentHint } : {}),
+					path: item.filePath,
+					source,
+					enabled: source !== "global" || enabledPrompts.has(item.name),
+				};
+			})
+			.filter((item) => promptAllowed(item.source)),
 		contextFiles: context.map((item) => item.path),
 		diagnostics: [...skills.diagnostics, ...prompts.diagnostics],
 	};

@@ -1,10 +1,9 @@
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { FastifyInstance } from "fastify";
-import { config } from "../config.js";
 
-export async function registerSettingsRoutes(app: FastifyInstance): Promise<void> {
+export async function registerSettingsRoutes(app: FastifyInstance, cwd: string): Promise<void> {
 	app.get("/api/settings", async () => {
-		const settings = SettingsManager.create(config.agentCwd, getAgentDir());
+		const settings = SettingsManager.create(cwd, getAgentDir());
 		return {
 			defaultProvider: settings.getDefaultProvider(),
 			defaultModel: settings.getDefaultModel(),
@@ -19,7 +18,7 @@ export async function registerSettingsRoutes(app: FastifyInstance): Promise<void
 			if (!provider || !model) {
 				return reply.code(400).send({ error: "provider and model are required" });
 			}
-			const settings = SettingsManager.create(config.agentCwd, getAgentDir());
+			const settings = SettingsManager.create(cwd, getAgentDir());
 			settings.setDefaultModelAndProvider(provider, model);
 			return { ok: true, defaultProvider: provider, defaultModel: model };
 		},

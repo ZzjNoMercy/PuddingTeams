@@ -183,12 +183,17 @@ export class PiSessionStore {
 			});
 		}
 		const guidance = PiSessionStore.resolveGuidance(ctx);
+		// 信任门（§7.2/§6.3）：服务端按窗口 workspaceId 计算三类放行，
+		// 与 manager 自己的资源开关取与；无 workspaceId = 全关。
+		const workspaceAccess = this.teamsStore
+			? await this.teamsStore.workspaces.resourceAccessFor(ctx?.workspaceId)
+			: undefined;
 		const loader = new DefaultResourceLoader({
 			cwd,
 			agentDir,
 			settingsManager: SettingsManager.create(cwd, agentDir),
 			extensionFactories: factories,
-			...piResourceLoaderOptions(resources, cwd, agentDir),
+			...piResourceLoaderOptions(resources, cwd, agentDir, workspaceAccess),
 			// noExtensions 只控制 pi-native Extension；平台 inline core/delegation
 			// factories 不受影响。Skills/templates/context 全部由 piResources 决定。
 			...(settings?.noExtensions ? { noExtensions: true } : {}),
@@ -276,6 +281,24 @@ export class PiSessionStore {
 	/** Extension 包更新/卸载后，所有活跃会话空闲时重建装配。 */
 	markAllDirty(): void {
 		for (const id of this.active.keys()) this.runtimeDirty.add(id);
+	}
+
+	/**
+	 * 信任撤销（§7.3）：引用该 workspace 的活跃窗口 Session 标
+	 * runtimeDirty，当前轮结束后空闲重建；返回受影响会话数。
+	 */
+	async markWorkspaceDirty(workspaceId: string): Promise<number> {
+		if (!this.teamsStore) return 0;
+		let marked = 0;
+		for (const w of await this.teamsStore.listWindows()) {
+			if (w.workspaceId !== workspaceId) continue;
+			for (const id of w.sessions) {
+				if (!this.active.has(id)) continue;
+				this.runtimeDirty.add(id);
+				marked++;
+			}
+		}
+		return marked;
 	}
 
 	/**

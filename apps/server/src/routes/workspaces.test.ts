@@ -17,7 +17,7 @@ import { registerWorkspacesRoutes } from "./workspaces.js";
 async function makeStack(nativePicker?: (initialPath: string) => Promise<string | undefined>) {
 	const dir = mkdtempSync(path.join(tmpdir(), "pt-workspace-routes-"));
 	process.env.PI_CODING_AGENT_DIR = path.join(dir, "agent-dir");
-	const teams = new TeamsStore(path.join(dir, "teams"), dir);
+	const teams = new TeamsStore({ state: path.join(dir, "teams"), assets: path.join(dir, "teams"), managedWorkspaces: path.join(dir, "managed") }, dir);
 	await teams.init();
 	await teams.upsertAgent({ name: "alpha", description: "alpha", invoke: { type: "command", command: "alpha", runArgs: [] } });
 	const delegations = new DelegationStore(path.join(dir, "runtime"));
@@ -174,7 +174,7 @@ test("历史 cwd 失效不阻断启动，且只有可读目录才标记为可用
 	const moved = `${dir}-moved`;
 	renameSync(dir, moved);
 	writeFileSync(dir, "not a directory");
-	const restarted = new TeamsStore(path.join(moved, "teams"), moved);
+	const restarted = new TeamsStore({ state: path.join(moved, "teams"), assets: path.join(moved, "teams"), managedWorkspaces: path.join(moved, "managed") }, moved);
 	await restarted.init();
 	const restartedSessions = new PiSessionStore(moved, path.join(moved, "sessions"), restarted);
 	const restartedApp = Fastify({ logger: false });

@@ -9,6 +9,8 @@ import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "
 import { createRoom, createWorkspace, listAgents, listRoomsWithContext, listWorkspaces } from "@/lib/api";
 import type { AgentConfig, RoomSummary, WorkspaceRecord } from "@/lib/types";
 import { DirectoryPickerDialog } from "./directory-picker-dialog";
+import { WorkspaceTrustDialog, needsTrustDecision } from "./workspace-trust-dialog";
+import { workspaceTrustSuffix } from "./workspace-trust-badge";
 
 function createLabel(checked: Set<string>, directExists: boolean): string {
 	if (checked.size === 0) return "发起对话";
@@ -37,6 +39,7 @@ export function CreateWindowDialog({
 	const [workspacePath, setWorkspacePath] = useState("");
 	const [defaultCwdSnapshot, setDefaultCwdSnapshot] = useState("");
 	const [directoryPickerOpen, setDirectoryPickerOpen] = useState(false);
+	const [trustCandidate, setTrustCandidate] = useState<WorkspaceRecord | null>(null);
 	const [saving, setSaving] = useState(false);
 	const [loading, setLoading] = useState(true);
 
@@ -81,17 +84,9 @@ export function CreateWindowDialog({
 		});
 	}, []);
 
-	const handleCreate = useCallback(async () => {
-		if (checked.size === 0) return;
-		setSaving(true);
-		try {
+	const createRoomFinal = useCallback(
+		async (selectedWorkspaceId?: string) => {
 			const members = [...checked];
-			let selectedWorkspaceId: string | undefined = workspaceMode === "recent" ? workspaceId || undefined : undefined;
-			if (workspaceMode === "path") {
-				selectedWorkspaceId = (await createWorkspace({ path: workspacePath.trim() })).id;
-			} else if (workspaceMode === "managed") {
-				selectedWorkspaceId = (await createWorkspace({ managed: true, name: name.trim() || "临时项目" })).id;
-			}
 			const { room, existed: hit } = await createRoom({
 				type: members.length === 1 ? "direct" : "group",
 				members,
@@ -101,12 +96,34 @@ export function CreateWindowDialog({
 			toast.success(hit ? "已有与该 worker 的单聊，已打开" : "对话已发起");
 			onCreated?.(room, hit);
 			onOpenChange(false);
+		},
+		[checked, name, onCreated, onOpenChange],
+	);
+
+	const handleCreate = useCallback(async () => {
+		if (checked.size === 0) return;
+		setSaving(true);
+		try {
+			let workspace: WorkspaceRecord | undefined;
+			if (workspaceMode === "recent") {
+				workspace = workspaces.find((item) => item.id === workspaceId);
+			} else if (workspaceMode === "path") {
+				workspace = await createWorkspace({ path: workspacePath.trim() });
+			} else if (workspaceMode === "managed") {
+				workspace = await createWorkspace({ managed: true, name: name.trim() || "临时项目" });
+			}
+			// 信任门（§7.2）：含可注入资源的外部项目先弹信任卡，再建窗口。
+			if (workspace && needsTrustDecision(workspace)) {
+				setTrustCandidate(workspace);
+				return;
+			}
+			await createRoomFinal(workspace?.id);
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
 			setSaving(false);
 		}
-	}, [checked, name, workspaceMode, workspaceId, workspacePath, onCreated, onOpenChange]);
+	}, [checked, name, workspaces, workspaceMode, workspaceId, workspacePath, createRoomFinal]);
 
 	return (
 		<>
@@ -126,6 +143,7 @@ export function CreateWindowDialog({
 					setWorkspacePath("");
 					setDefaultCwdSnapshot("");
 					setDirectoryPickerOpen(false);
+					setTrustCandidate(null);
 					setLoading(true);
 				}
 				onOpenChange(next);
@@ -179,6 +197,7 @@ export function CreateWindowDialog({
 									{workspaces.map((workspace) => (
 										<option key={workspace.id} value={workspace.id} disabled={!workspace.available}>
 											{workspace.name} — {workspace.rootPath}{workspace.available ? "" : "（路径失效）"}
+											{workspaceTrustSuffix(workspace.trust)}
 										</option>
 									))}
 								</select>
@@ -267,6 +286,18 @@ export function CreateWindowDialog({
 			onOpenChange={setDirectoryPickerOpen}
 			onSelect={(path) => setWorkspacePath(path)}
 		/>
+		{trustCandidate ? (
+			<WorkspaceTrustDialog
+				workspace={trustCandidate}
+				onCancel={() => setTrustCandidate(null)}
+				onDecided={(workspace) => {
+					setTrustCandidate(null);
+					void createRoomFinal(workspace.id).catch((err: unknown) =>
+						toast.error(err instanceof Error ? err.message : String(err)),
+					);
+				}}
+			/>
+		) : null}
 		</>
 	);
 }

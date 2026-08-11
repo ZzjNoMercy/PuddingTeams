@@ -29,8 +29,8 @@ function safeName(value: string): string {
 export class UploadStore {
 	private readonly root: string;
 
-	constructor(teamsDir: string) {
-		this.root = path.join(teamsDir, "uploads");
+	constructor(uploadsDir: string) {
+		this.root = uploadsDir;
 	}
 
 	async init(): Promise<void> {

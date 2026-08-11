@@ -261,9 +261,9 @@ export function ProviderSettings() {
 	};
 
 	const keyword = filter.trim().toLowerCase();
-	const visible = (providers ?? []).filter(
-		(p) => !keyword || p.id.toLowerCase().includes(keyword) || p.name.toLowerCase().includes(keyword),
-	);
+	const visible = (providers ?? [])
+		.filter((p) => !keyword || p.id.toLowerCase().includes(keyword) || p.name.toLowerCase().includes(keyword))
+		.sort((a, b) => Number(b.configured) - Number(a.configured));
 
 	return (
 		<div className={cn("flex min-h-0 flex-1 flex-col gap-3")}>

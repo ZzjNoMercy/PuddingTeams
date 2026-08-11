@@ -23,6 +23,7 @@ import type {
 } from "./types.js";
 import { sharedModelRuntime } from "../pi-bridge/model-runtime.js";
 import type { PiResourceConfig } from "../store/teams.js";
+import type { WorkspaceResourceAccess } from "../store/workspaces.js";
 import { combinePiPrompt, piResourceLoaderOptions } from "../pi-bridge/pi-resources.js";
 
 export interface LocalPiDriverOptions {
@@ -32,7 +33,13 @@ export interface LocalPiDriverOptions {
 	thinkingLevel?: string;
 	/** Agent 级提示词与资源；不属于 Connector 运行参数。 */
 	piResources?: PiResourceConfig;
-	/** 会话存储目录；默认 `<pi agentDir>/puddingteams-worker-sessions`。 */
+	/**
+	 * 信任门判定（迁移方案 §7.2）：按 workspaceId 计算三类资源放行，
+	 * 与 piResources 的 Agent 开关取与；无 workspaceId（unscoped）= 全关（§6.3）。
+	 * 未注入（独立使用）时维持只看 Agent 开关的旧语义。
+	 */
+	workspaceAccessFor?: (workspaceId?: string) => Promise<WorkspaceResourceAccess>;
+	/** 会话存储目录；平台注入 `PUDDINGTEAMS_HOME/sessions/workers`，缺省（独立使用）派生 `<pi agentDir>/puddingteams-worker-sessions`。 */
 	sessionDir?: string;
 }
 
@@ -172,13 +179,17 @@ export class LocalPiDriver implements AgentDriver {
 		return model as PiModel;
 	}
 
-	private async newSession(sessionManager: SessionManager, cwd: string): Promise<AgentSession> {
+	private async newSession(
+		sessionManager: SessionManager,
+		cwd: string,
+		workspaceAccess?: WorkspaceResourceAccess,
+	): Promise<AgentSession> {
 		const agentDir = getAgentDir();
 		const loader = new DefaultResourceLoader({
 			cwd,
 			agentDir,
 			settingsManager: SettingsManager.create(cwd, agentDir),
-			...piResourceLoaderOptions(this.opts.piResources, cwd, agentDir),
+			...piResourceLoaderOptions(this.opts.piResources, cwd, agentDir, workspaceAccess),
 			// 无 extensionFactories：child pi 不挂载团队委托工具（§9.1 默认不递归）。
 			systemPromptOverride: (base) => combinePiPrompt(base, this.opts.piResources),
 		});
@@ -201,16 +212,20 @@ export class LocalPiDriver implements AgentDriver {
 		ctx: InvocationContext,
 		sessionHandle?: string,
 	): Promise<{ session: AgentSession; sessionHandle: string }> {
+		// 信任门在会话装配时判定（不是构造时）：撤销信任后新开会话立即生效。
+		const access = this.opts.workspaceAccessFor
+			? await this.opts.workspaceAccessFor(ctx.workspaceId)
+			: undefined;
 		if (sessionHandle) {
 			const live = sessionsByHandle.get(sessionHandle);
 			if (live) return { session: live, sessionHandle };
 			const info = (await SessionManager.list(ctx.cwd, this.sessionDir())).find((s) => s.id === sessionHandle);
 			if (!info) throw new Error(`pi worker 会话不存在：${sessionHandle}`);
-			const session = await this.newSession(SessionManager.open(info.path, this.sessionDir()), ctx.cwd);
+			const session = await this.newSession(SessionManager.open(info.path, this.sessionDir()), ctx.cwd, access);
 			retainSession(session);
 			return { session, sessionHandle: session.sessionId };
 		}
-		const session = await this.newSession(SessionManager.create(ctx.cwd, this.sessionDir()), ctx.cwd);
+		const session = await this.newSession(SessionManager.create(ctx.cwd, this.sessionDir()), ctx.cwd, access);
 		retainSession(session);
 		return { session, sessionHandle: session.sessionId };
 	}

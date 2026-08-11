@@ -19,9 +19,9 @@ const PAYLOAD_PREFIX = "v1.";
 /**
  * Encrypted provider-state store for pending interactions.
  *
- * Public records live in `.teams/interactions.json` (DelegationStore); the
+ * Public records live in `state/interactions.json` (DelegationStore); the
  * *raw continuation token* that can resume a PuddingClaw Run lives here,
- * AES-256-GCM encrypted under `~/.puddingteams/interaction.key` with 0600
+ * AES-256-GCM encrypted under `<secrets>/interactions.key` with 0600
  * permissions (决策 4: token 不进 LLM/浏览器/Session 历史).
  *
  * Reuses the same crypto primitives as CredentialsStore but is a distinct
@@ -36,7 +36,7 @@ export class InteractionSecretStore {
 	private readonly secretsFile: string;
 
 	constructor(private readonly dir: string) {
-		this.keyFile = path.join(dir, "interaction.key");
+		this.keyFile = path.join(dir, "interactions.key");
 		// 与 DelegationStore 的公开 interactions.json 分开（同名会互相覆盖）。
 		this.secretsFile = path.join(dir, "interaction-secrets.json");
 	}

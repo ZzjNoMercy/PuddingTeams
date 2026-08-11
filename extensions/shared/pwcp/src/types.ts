@@ -135,6 +135,8 @@ export interface InvocationContext {
 	cwd: string;
 	/** 本次委托的 delegation id（Runtime 注入）：Driver 据此生成 handoff 导出目录（§15.3）。 */
 	delegationId?: string;
+	/** 窗口的显式 workspaceId（Runtime 注入）：进程内 Driver 的信任门资源判定用（迁移方案 §7.2）。 */
+	workspaceId?: string;
 	/** 已注入凭证的环境变量。 */
 	env: NodeJS.ProcessEnv;
 	signal?: AbortSignal;
