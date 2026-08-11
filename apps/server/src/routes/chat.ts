@@ -184,9 +184,16 @@ export async function registerChatRoutes(
 		return { aborted };
 	});
 
-	app.get<{ Params: { id: string } }>("/api/sessions/:id/messages", async (req) => {
-		const session = await store.open(req.params.id);
-		return { messages: session.messages };
+	app.get<{ Params: { id: string } }>("/api/sessions/:id/messages", async (req, reply) => {
+		try {
+			const session = await store.open(req.params.id);
+			return { messages: session.messages };
+		} catch (err) {
+			if (err instanceof Error && err.message.startsWith("Session not found")) {
+				return reply.code(404).send({ error: "session not found" });
+			}
+			throw err;
+		}
 	});
 
 	app.get<WsHandlerParams>(
@@ -225,9 +232,16 @@ export async function registerChatRoutes(
 				});
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
+				sockets.delete(socket);
+				if (message.startsWith("Session not found")) {
+					// 4404 lets the client tell "session is gone" (deleted or not
+					// migrated) apart from a transient drop, so it stops
+					// reconnecting instead of looping the same failure forever.
+					socket.close(4404, "session not found");
+					return;
+				}
 				socket.send(JSON.stringify({ type: "error", message }));
 				socket.close();
-				sockets.delete(socket);
 			}
 		},
 	);

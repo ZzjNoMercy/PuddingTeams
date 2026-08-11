@@ -18,6 +18,10 @@ export function useChat(sessionId: string) {
 	useEffect(() => {
 		if (!sessionId) return;
 		let disposed = false;
+		// Set when the server says the session does not exist (HTTP 404 on
+		// /messages or WS close code 4404): stop reconnecting — retrying
+		// would just loop the same failure forever.
+		let gone = false;
 		let attempt = 0;
 		let retryTimer: ReturnType<typeof setTimeout> | null = null;
 		let historyReadyFrame: number | null = null;
@@ -36,14 +40,23 @@ export function useChat(sessionId: string) {
 					if (initial) markHistoryReady();
 				})
 				.catch((err: unknown) => {
-					if (!disposed) setError(err instanceof Error ? err.message : String(err));
+					const message = err instanceof Error ? err.message : String(err);
+					if (message.endsWith(": 404")) {
+						gone = true;
+						if (!disposed) {
+							setStatus("gone");
+							setError("会话不存在或已被删除");
+						}
+					} else if (!disposed) {
+						setError(message);
+					}
 					if (initial) markHistoryReady();
 				});
 
 		void loadHistory(true);
 
 		const connect = () => {
-			if (disposed) return;
+			if (disposed || gone) return;
 			setStatus(attempt === 0 ? "connecting" : "reconnecting");
 			const ws = new WebSocket(sessionWsUrl(sessionId));
 			wsRef.current = ws;
@@ -73,11 +86,18 @@ export function useChat(sessionId: string) {
 				if (event.type === "agent_start" || event.type === "turn_start") setRunning(true);
 				if (event.type === "agent_settled" || event.type === "error") setRunning(false);
 			};
-			ws.onclose = () => {
+			ws.onclose = (ev) => {
 				if (disposed) return;
 				// A dropped socket can't deliver agent_settled; unblock the UI
 				// so the user isn't stuck with a permanently disabled input.
 				setRunning(false);
+				if (ev.code === 4404) {
+					// Server says the session is gone — do not retry.
+					gone = true;
+					setStatus("gone");
+					setError("会话不存在或已被删除");
+					return;
+				}
 				// Exponential backoff: 1s, 2s, 4s, … capped at 15s. Retries never
 				// stop; after a few failures the UI switches to the "disconnected"
 				// hint while reconnecting continues in the background.

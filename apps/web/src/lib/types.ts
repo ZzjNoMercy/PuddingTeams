@@ -165,7 +165,7 @@ export interface ChatMessage {
 	details?: unknown;
 }
 
-export type ChatStatus = "idle" | "connecting" | "connected" | "reconnecting" | "error";
+export type ChatStatus = "idle" | "connecting" | "connected" | "reconnecting" | "error" | "gone";
 
 // ---- teams / rooms (phase 2) ----
 

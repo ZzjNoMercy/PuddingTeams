@@ -51,6 +51,8 @@ function statusLabelOf(status: ChatStatus): string {
 			return "连接中…";
 		case "reconnecting":
 			return "连接中断，重连中…";
+		case "gone":
+			return "会话不存在或已被删除";
 		default:
 			return "连接已断开，仍在后台重试";
 	}
@@ -206,9 +208,9 @@ export function ChatPane({
 
 	// Session 切换会创建一条新 WebSocket，正常握手通常在一瞬间完成。
 	// 延迟展示非 connected 状态，避免把正常切换误报成一次可见的连接故障；
-	// 真正持续的首次连接/重连仍会出现，error 则立即提示。
+	// 真正持续的首次连接/重连仍会出现，error/gone 则立即提示。
 	useEffect(() => {
-		if (status === "connected" || status === "error") return;
+		if (status === "connected" || status === "error" || status === "gone") return;
 		const timer = setTimeout(() => setDelayedConnectionStatus(status), 700);
 		return () => clearTimeout(timer);
 	}, [status]);
@@ -458,7 +460,7 @@ export function ChatPane({
 						<InfoIcon className="size-3.5" />
 						聊天信息
 					</Button>
-					{(status === "error" || delayedConnectionStatus === status) && status !== "connected" ? (
+					{(status === "error" || status === "gone" || delayedConnectionStatus === status) && status !== "connected" ? (
 						<span
 							className={`absolute right-0 top-[calc(100%+0.375rem)] z-30 hidden items-center gap-2 whitespace-nowrap rounded-full border bg-background/95 px-2.5 py-1.5 text-xs shadow-sm backdrop-blur sm:flex ${
 								status === "connecting" || status === "reconnecting"
@@ -484,7 +486,7 @@ export function ChatPane({
 					workspacePath={currentWorkspacePath}
 					workspaceAvailable={room.contextAvailable}
 					onOpenWorkspace={openWorkspaceSwitch}
-					blocked={!room.contextAvailable}
+					blocked={!room.contextAvailable || status === "gone"}
 				/>
 			) : null}
 
