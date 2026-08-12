@@ -7,7 +7,7 @@ import {
 	type ConnectorExtensionManifest,
 	type PuddingTeamsExtensionManifest,
 } from "../agent-runtime/extensions.js";
-import { runDataImportCli } from "./data-import.js";
+import { runDoctorCli, runInitCli } from "./init-cli.js";
 
 /**
  * `puddingteams extension` CLI（路线图 P2-d）：Extension 包的脚手架与校验。
@@ -23,17 +23,20 @@ import { runDataImportCli } from "./data-import.js";
 
 const TEMPLATES_DIR = fileURLToPath(new URL("../../../../extensions/shared/templates", import.meta.url));
 
-const USAGE = `puddingteams — Extension 包脚手架/校验 + 一次性数据导入
+const USAGE = `puddingteams — 初始化引导 / 环境体检 / Extension 包脚手架与校验
 
 用法：
+  puddingteams init [--json]
+  puddingteams doctor [--json]
   puddingteams extension init --type connector|capability [--declarative] --id <id> [--name <packageName>] [--display <displayName>] <dir>
   puddingteams extension validate <path>
-  puddingteams data import-legacy --from <repo>/apps/server [--home <dir>] [--secrets-from <dir>] [--execute|--dry-run]
 
 子命令：
-  init          从模板生成 Extension 包骨架（--declarative 生成纯 manifest 声明式包）
-  validate      校验包的 manifest、entry 与 Driver 导出，全部通过退出码 0
-  import-legacy 旧开发数据（.teams/.sessions/旧 secrets）一次性导入用户数据目录（§9，默认 dry-run）
+  init          首次初始化：环境探测 + 缺失 worker（puddingclaw/codex/claude-code）的确认式安装引导；
+                非 TTY 只提示不安装，跳过不阻塞（退出码 0）
+  doctor        只读体检：Node、数据目录、各 worker 可用性与修复建议；worker 缺失不影响退出码
+  extension init     从模板生成 Extension 包骨架（--declarative 生成纯 manifest 声明式包）
+  extension validate 校验包的 manifest、entry 与 Driver 导出，全部通过退出码 0
 `;
 
 function log(msg: string): void {
@@ -332,9 +335,9 @@ function printResults(results: CheckResult[]): void {
 
 export async function runExtensionCli(argv: string[]): Promise<number> {
 	const [scope, cmd, ...rest] = argv;
-	if (scope === "data") {
+	if (scope === "init" || scope === "doctor") {
 		try {
-			return await runDataImportCli([cmd ?? "", ...rest]);
+			return scope === "init" ? await runInitCli(argv.slice(1)) : await runDoctorCli(argv.slice(1));
 		} catch (e) {
 			err(`✗ ${e instanceof Error ? e.message : String(e)}`);
 			return 1;
