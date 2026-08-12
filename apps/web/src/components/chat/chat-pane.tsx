@@ -177,6 +177,8 @@ export function ChatPane({
 	const [directoryPickerOpen, setDirectoryPickerOpen] = useState(false);
 	const [switchingWorkspace, setSwitchingWorkspace] = useState(false);
 	const [trustCandidate, setTrustCandidate] = useState<{ workspace: WorkspaceRecord; mode: "new_window" | "in_place" } | null>(null);
+	/** 头部「待信任/已拒绝」badge 点开的信任复核（与切换项目流程分开）。 */
+	const [trustReview, setTrustReview] = useState<WorkspaceRecord | null>(null);
 
 	useEffect(() => {
 		let cancelled = false;
@@ -435,7 +437,25 @@ export function ChatPane({
 							{type === "solo" ? (
 								<span className="shrink-0 text-xs text-muted-foreground">solo</span>
 							) : null}
-							{room?.workspace ? <WorkspaceTrustBadge trust={room.workspace.trust} /> : null}
+							{room?.workspace ? (
+								room.workspace.trust.state === "trusted" ? (
+									<WorkspaceTrustBadge trust={room.workspace.trust} />
+								) : (
+									<button
+										type="button"
+										title="项目资源尚未放行，点击处理信任"
+										onClick={() => {
+											const id = room.workspace!.id;
+											void listWorkspaces()
+												.then((list) => setTrustReview(list.find((item) => item.id === id) ?? null))
+												.catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)));
+										}}
+										className="outline-none"
+									>
+										<WorkspaceTrustBadge trust={room.workspace.trust} />
+									</button>
+								)
+							) : null}
 						</div>
 						{subtitle ? (
 							<div className="truncate text-xs text-muted-foreground">{subtitle}</div>
@@ -573,7 +593,8 @@ export function ChatPane({
 						className="text-sm"
 					/>
 					<p className="text-xs text-muted-foreground">
-						定义这个聊天中 Manager 如何分工与汇总。留空使用默认协作规则；保存后从新会话开始生效。
+						定义这个群聊中 Manager 如何分工与汇总；只作用于本群聊的 Manager，不会发给 Worker。
+						留空使用默认协作规则；保存后从新会话开始生效。
 					</p>
 					<DialogFooter>
 						<Button type="button" variant="ghost" onClick={() => setPromptOpen(false)}>
@@ -702,6 +723,20 @@ export function ChatPane({
 						void doWorkspaceSwitch(workspace.id, mode).catch((err: unknown) =>
 							toast.error(err instanceof Error ? err.message : String(err)),
 						);
+					}}
+				/>
+			) : null}
+
+			{trustReview ? (
+				<WorkspaceTrustDialog
+					workspace={trustReview}
+					onCancel={() => setTrustReview(null)}
+					onDecided={() => {
+						setTrustReview(null);
+						// 决定已保存（撤销会标记活跃会话 dirty）；刷新房间让 badge 即时更新。
+						void getRoom(roomId)
+							.then((r) => setRoom((prev) => (prev ? { ...r } : prev)))
+							.catch(() => undefined);
 					}}
 				/>
 			) : null}

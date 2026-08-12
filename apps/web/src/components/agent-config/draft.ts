@@ -62,13 +62,13 @@ export function serializeDraft(draft: ConfigDraft): string {
 	return JSON.stringify(draft);
 }
 
-/** 责任 Profile：全空 = null（清除）；填了任一字段则 domain 必填。 */
+/** 责任边界：全空 = null（清除）；填了任一字段则 domain 必填。 */
 export function buildResponsibility(draft: ConfigDraft): AgentResponsibilityProfile | null {
 	const has = Boolean(
 		draft.identity.trim() || draft.domain.trim() || draft.owns.trim() || draft.excludes.trim() || draft.escalateWhen.trim(),
 	);
 	if (!has) return null;
-	if (!draft.domain.trim()) throw new Error("填写责任 Profile 时，责任领域不能为空");
+	if (!draft.domain.trim()) throw new Error("填写责任边界时，责任领域不能为空");
 	return {
 		...(draft.identity.trim() ? { identity: draft.identity.trim() } : {}),
 		domain: draft.domain.trim(),

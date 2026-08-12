@@ -1039,7 +1039,7 @@ export function AgentManageDialog({
 		try {
 			// 全量 upsert：带上现有 connector/绑定，避免覆盖（§10 upsert 语义）。
 			const hasResponsibility = Boolean(identity.trim() || domain.trim() || owns.trim() || excludes.trim() || escalateWhen.trim());
-			if (hasResponsibility && !domain.trim()) throw new Error("填写责任 Profile 时，责任领域不能为空");
+			if (hasResponsibility && !domain.trim()) throw new Error("填写责任边界时，责任领域不能为空");
 			const responsibility = hasResponsibility
 				? {
 						...(identity.trim() ? { identity: identity.trim() } : {}),
@@ -1051,7 +1051,7 @@ export function AgentManageDialog({
 				: undefined;
 			const updated = await updateAgent(agent.name, { ...agent, description: description.trim(), responsibility });
 			onAgentChanged(updated);
-			toast.success("说明与责任 Profile 已保存");
+			toast.success("说明与责任边界已保存");
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
@@ -1073,7 +1073,7 @@ export function AgentManageDialog({
 					<DialogDescription>基础接入、Capability Extensions 与运行状态（§10.1）。</DialogDescription>
 				</DialogHeader>
 
-				{/* 通用信息：头像 + 描述 + 责任 Profile（全量 upsert，保留现有绑定） */}
+				{/* 通用信息：头像 + 描述 + 责任边界（全量 upsert，保留现有绑定） */}
 				<div className="flex flex-col gap-2">
 					<AvatarEditor agent={agent} onUpdated={onAgentChanged} />
 					<label className="flex flex-col gap-1 text-sm">
@@ -1101,7 +1101,7 @@ export function AgentManageDialog({
 							<span className="text-muted-foreground">升级给 Human/manager 的条件（每行一项）</span>
 							<Textarea value={escalateWhen} onChange={(e) => setEscalateWhen(e.target.value)} rows={2} />
 						</label>
-						<p className="text-xs text-muted-foreground sm:col-span-2">责任 Profile 用于 manager 路由与停止边界，不证明技术能力，也不会授予任何运行权限。</p>
+						<p className="text-xs text-muted-foreground sm:col-span-2">责任边界只提供给 Manager 做路由、停止与升级判断；不授予权限，也不会发给 Worker。</p>
 					</div>
 					<div>
 						<Button

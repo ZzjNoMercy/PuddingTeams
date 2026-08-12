@@ -59,7 +59,7 @@ function probeSummary(probe: AgentProbeResult): string {
 	return probe.ok ? "探测健康" : `探测异常：${probe.error ?? `exit ${probe.exitCode}`}`;
 }
 
-/** 导出 / 导入 JSON 的载体：草稿 + 责任 Profile，便于跨环境搬运。 */
+/** 导出 / 导入 JSON 的载体：草稿 + 责任边界，便于跨环境搬运。 */
 interface ConfigTransfer {
 	description?: string;
 	responsibility?: AgentConfig["responsibility"] | null;
@@ -113,7 +113,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 
 	const handleBack = useCallback(() => {
 		if (dirty) setLeaveConfirm(true);
-		else router.push("/");
+		else router.push("/?view=agents");
 	}, [dirty, router]);
 
 	const handleSave = useCallback(async () => {
@@ -182,7 +182,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 					loadWorkspaceContext: sourceResources.loadWorkspaceContext !== false,
 				};
 			});
-			toast.success(`已把「${sourceName}」的配置灌入草稿（不含名称/头像/责任 Profile），保存后生效`);
+			toast.success(`已把「${sourceName}」的配置灌入草稿（不含名称/头像/责任边界），保存后生效`);
 		},
 		[agents],
 	);
@@ -291,7 +291,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 		return (
 			<div className="flex h-dvh flex-col items-center justify-center gap-3">
 				<p className="text-sm text-destructive">无法加载智能体列表：{loadError}</p>
-				<Button size="sm" variant="outline" onClick={() => router.push("/")}>
+				<Button size="sm" variant="outline" onClick={() => router.push("/?view=agents")}>
 					返回
 				</Button>
 			</div>
@@ -309,7 +309,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 		return (
 			<div className="flex h-dvh flex-col items-center justify-center gap-3">
 				<p className="text-sm text-muted-foreground">智能体「{name}」不存在（404）。</p>
-				<Button size="sm" variant="outline" onClick={() => router.push("/")}>
+				<Button size="sm" variant="outline" onClick={() => router.push("/?view=agents")}>
 					返回智能体列表
 				</Button>
 			</div>
@@ -322,7 +322,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 					「{agent.name}」不是 pi Agent（connector: {agent.connector?.connectorId ?? "命令接入"}），此配置页只承载
 					pinned manager 与 pi Connector worker。
 				</p>
-				<Button size="sm" variant="outline" onClick={() => router.push("/")}>
+				<Button size="sm" variant="outline" onClick={() => router.push("/?view=agents")}>
 					返回智能体列表
 				</Button>
 			</div>
@@ -466,7 +466,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 						<Button type="button" variant="ghost" onClick={() => setLeaveConfirm(false)}>
 							继续编辑
 						</Button>
-						<Button type="button" variant="destructive" onClick={() => router.push("/")}>
+						<Button type="button" variant="destructive" onClick={() => router.push("/?view=agents")}>
 							放弃并返回
 						</Button>
 					</DialogFooter>

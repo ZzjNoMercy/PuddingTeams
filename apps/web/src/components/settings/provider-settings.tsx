@@ -124,6 +124,15 @@ function ProviderRow({
 								type="button"
 								size="sm"
 								variant="ghost"
+								className="text-muted-foreground"
+								onClick={() => setExpanded((v) => !v)}
+							>
+								{expanded ? "收起" : "替换 key"}
+							</Button>
+							<Button
+								type="button"
+								size="sm"
+								variant="ghost"
 								className="text-muted-foreground hover:text-destructive"
 								onClick={() => setConfirmingDelete(true)}
 							>
@@ -142,7 +151,7 @@ function ProviderRow({
 					</Button>
 				)}
 			</div>
-			{expanded && !provider.configured && (
+			{expanded && (
 				<form
 					className="mt-2 flex items-center gap-2 pl-4"
 					onSubmit={(e) => {

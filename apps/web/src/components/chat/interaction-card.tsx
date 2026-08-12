@@ -60,11 +60,15 @@ export function InteractionCard({
 		statusHint === "conflict" || (statusHint && !["needs_input"].includes(statusHint)) ? (statusHint as CardStatus) : "pending",
 	);
 	const [busy, setBusy] = useState(false);
+	// 多轮审批（needs_input 后同 id、revision+1）：以服务端对账的 revision 为准，
+	// props 里的 revision 只是首渲染快照。
+	const [liveRevision, setLiveRevision] = useState<number | undefined>(revision);
 	const reqs = requests ?? [];
 	const firstReq = reqs[0];
 	// M4：授权范围从服务端 options 派生，去掉 "reject"（那是动作不是范围），
 	// 默认取第一个合法范围，避免 options 不含 "once" 时 409。
-	const allowedScopes = (firstReq?.options?.length ? firstReq.options : ["once", "run", "session"]).filter(
+	// 兜底选项对齐 puddingclaw deploy-cli 的 respond 校验（仅 once|session）。
+	const allowedScopes = (firstReq?.options?.length ? firstReq.options : ["once", "session"]).filter(
 		(s) => s !== "reject",
 	);
 	const [scope, setScope] = useState<string>(allowedScopes[0] ?? "once");
@@ -76,6 +80,7 @@ export function InteractionCard({
 		getInteraction(interactionId)
 			.then(({ interaction }) => {
 				if (cancelled) return;
+				setLiveRevision(interaction.revision);
 				const s = interaction.status as CardStatus;
 				if (s === "approved" || s === "rejected" || s === "expired" || s === "failed") {
 					setStatus(s);
@@ -101,7 +106,7 @@ export function InteractionCard({
 			try {
 				const outcome = (await submitInteractionResponse(interactionId, {
 					requestId: crypto.randomUUID(),
-					revision: revision ?? 0,
+					revision: liveRevision ?? revision ?? 0,
 					...(windowId ? { windowId } : {}),
 					responses: (requests ?? []).map((r) => ({
 						requestId: r.requestId,
@@ -113,11 +118,24 @@ export function InteractionCard({
 				if (status === "failed" || status === "rejected") {
 					// M1：失败/被拒不能显示成功。
 					toast.error(outcome.outcome!.result?.error ?? "审批处理失败");
-					if (interactionId) {
-						getInteraction(interactionId)
-							.then(({ interaction }) => setStatus(interaction.status as CardStatus))
-							.catch(() => undefined);
-					}
+					getInteraction(interactionId)
+						.then(({ interaction }) => {
+							setLiveRevision(interaction.revision);
+							setStatus(interaction.status as CardStatus);
+						})
+						.catch(() => undefined);
+					return;
+				}
+				if (status === "needs_input") {
+					// 多轮审批：worker 又提了新问题（同 id、revision+1），
+					// 不能显示"已批准"，重新对账回到 pending 等用户再操作。
+					toast("已提交，worker 需要进一步审批");
+					getInteraction(interactionId)
+						.then(({ interaction }) => {
+							setLiveRevision(interaction.revision);
+							setStatus(interaction.status === "pending" ? "pending" : (interaction.status as CardStatus));
+						})
+						.catch(() => undefined);
 					return;
 				}
 				setStatus(action === "reject" ? "rejected" : "approved");
@@ -125,16 +143,17 @@ export function InteractionCard({
 			} catch (err) {
 				toast.error(err instanceof Error ? err.message : String(err));
 				// 409 等错误后重新对账，避免状态卡死。
-				if (interactionId) {
-					getInteraction(interactionId)
-						.then(({ interaction }) => setStatus(interaction.status as CardStatus))
-						.catch(() => undefined);
-				}
+				getInteraction(interactionId)
+					.then(({ interaction }) => {
+						setLiveRevision(interaction.revision);
+						setStatus(interaction.status as CardStatus);
+					})
+					.catch(() => undefined);
 			} finally {
 				setBusy(false);
 			}
 		},
-		[interactionId, revision, requests, scope, windowId],
+		[interactionId, liveRevision, revision, requests, scope, windowId],
 	);
 
 	const cancel = useCallback(async () => {

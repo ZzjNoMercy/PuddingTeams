@@ -35,7 +35,7 @@ const PI_FALLBACK_SCHEMA: Record<string, unknown> = {
 			enum: ["off", "minimal", "low", "medium", "high", "xhigh"],
 			description: "thinking 级别（留空用 pi 默认）",
 		},
-		sessionDir: { type: "string", description: "会话存储目录（可选，默认派生到 pi 配置目录下）" },
+		sessionDir: { type: "string", description: "会话存储目录（可选，默认 ~/.puddingteams/sessions/workers）" },
 	},
 };
 

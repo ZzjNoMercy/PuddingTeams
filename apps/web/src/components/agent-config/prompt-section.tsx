@@ -11,6 +11,20 @@ import type { AgentConfig, PiPreviewResource, PiResourcePreview, WorkspaceRecord
 import type { ConfigDraft } from "@/components/agent-config/draft";
 import { WorkspaceTrustBadge, workspaceTrustSuffix } from "@/components/chat/workspace-trust-badge";
 
+/** 有效提示词分段 source → 中文标签（含接收者标注，提示词管理方案 §9.9）。 */
+const SEGMENT_SOURCE_LABELS: Record<string, string> = {
+	"pi-base": "pi 基础提示词 · 内置",
+	"pi-native-append": "pi 原生追加（APPEND_SYSTEM.md） · 用户文件",
+	"agent-instructions": "Agent 运行指令 · 仅当前 Agent",
+	"window-collaboration": "群聊协作提示词 · 仅 Manager",
+	"global-context": "pi global 上下文（~/.pi/agent）",
+	"workspace-context": "项目上下文（Workspace）",
+};
+
+function segmentSourceLabel(source: string): string {
+	return SEGMENT_SOURCE_LABELS[source] ?? source;
+}
+
 function ResourceLine({ item }: { item: PiPreviewResource }) {
 	return (
 		<div className="flex items-center gap-1.5 text-xs">
@@ -72,14 +86,20 @@ export function PromptSection({
 				<strong>已保存配置</strong>的有效结果，草稿改动需保存后再预览。
 			</p>
 			<label className="flex flex-col gap-1 text-sm">
-				<span className="text-muted-foreground">系统提示词（Agent Profile，留空不追加）</span>
+				<span className="text-muted-foreground">
+					{agent.pinned ? "Manager 运行指令" : "Worker 运行指令"}（留空不追加）
+				</span>
 				<Textarea
 					value={draft.systemPrompt}
 					onChange={(e) => onChange({ systemPrompt: e.target.value })}
 					rows={8}
-					placeholder="长期人格、职责与行为规则"
+					placeholder="执行流程、输出格式、验证要求、交付约定"
 					className="font-mono text-xs"
 				/>
+				<span className="text-xs text-muted-foreground/70">
+					追加到当前 Agent 自己的 system prompt；pi 内嵌默认提示词保留。Manager 不会把某个 Worker
+					的运行指令当作路由描述读取。
+				</span>
 			</label>
 			<label className="flex items-start gap-2 text-sm">
 				<input
@@ -90,8 +110,10 @@ export function PromptSection({
 					className="mt-0.5 size-4 accent-foreground"
 				/>
 				<span className="flex flex-col">
-					<span>加载 Workspace context（AGENTS.md / CLAUDE.md）</span>
-					<span className="text-xs text-muted-foreground/70">{workspaceSwitchNote}</span>
+					<span>加载项目上下文（AGENTS.md / CLAUDE.md）</span>
+					<span className="text-xs text-muted-foreground/70">
+						只控制显式 Workspace；pi global ~/.pi/agent/AGENTS.md 不受此开关影响。{workspaceSwitchNote}
+					</span>
 				</span>
 			</label>
 
@@ -128,7 +150,7 @@ export function PromptSection({
 					{preview.segments.map((segment, index) => (
 						<details key={`${segment.source}-${segment.path ?? index}`} open={!segment.collapsed}>
 							<summary className="cursor-pointer font-medium">
-								{segment.source}
+								{segmentSourceLabel(segment.source)}
 								{segment.path ? ` · ${segment.path}` : ""}
 							</summary>
 							<pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap text-muted-foreground">{segment.content}</pre>

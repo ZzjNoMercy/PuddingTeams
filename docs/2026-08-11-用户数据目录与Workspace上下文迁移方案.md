@@ -151,7 +151,8 @@ PUDDINGTEAMS_HOME/
 │   ├── credentials.json           # 密文
 │   ├── credentials.key            # 0600
 │   ├── interaction-secrets.json   # 密文
-│   └── interactions.key           # 0600
+│   ├── interactions.key           # 0600
+│   └── auth.json                  # 平台 provider key（与 pi CLI ~/.pi/agent/auth.json 解耦）
 ├── runtime/
 │   ├── backend.lease              # 单写者 Lease
 │   ├── locks/
@@ -432,6 +433,8 @@ CLI 增加：
 puddingteams doctor paths
 puddingteams data import-legacy --from <repo>/apps/server [--dry-run]
 ```
+
+> 后续状态（2026-08-12）：迁移完成后 `data import-legacy` 与仓库内旧 `.teams`/`.sessions` 目录已一并删除；`doctor paths` 尚未实现，将随 `puddingteams doctor` 统一交付。
 
 `doctor paths` 只显示路径、来源和可写性，不显示 Secret；同时检查 package root 是否意外产生 `.teams/.sessions`。
 

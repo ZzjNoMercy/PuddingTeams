@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ChevronDownIcon, ChevronRightIcon, ExternalLinkIcon } from "lucide-react";
+import { ChevronDownIcon, ChevronRightIcon, ExternalLinkIcon, UsersIcon } from "lucide-react";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
 	Message as AiMessage,
@@ -234,10 +234,16 @@ function DelegateCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow
 		);
 	}
 
-	// HITL：等待审批 → 渲染审批卡。
+	// HITL：等待审批 → 渲染审批卡（任务文本在先，审批卡是其后续动作）。
 	if (details?.interactionId) {
 		return (
 			<div className="flex w-full flex-col gap-2">
+				{args?.task ? (
+					<p className="px-1 text-xs text-muted-foreground">
+						<span className="mr-1.5 text-muted-foreground/60">任务：</span>
+						<span className="whitespace-pre-wrap">{args.task}</span>
+					</p>
+				) : null}
 				<InteractionCard
 					interactionId={details.interactionId}
 					worker={worker ?? "worker"}
@@ -246,12 +252,6 @@ function DelegateCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow
 					windowId={details.windowId}
 					onOpenWindow={onOpenWindow}
 				/>
-				{args?.task ? (
-					<p className="px-1 text-xs text-muted-foreground">
-						<span className="mr-1.5 text-muted-foreground/60">任务：</span>
-						<span className="whitespace-pre-wrap">{args.task}</span>
-					</p>
-				) : null}
 			</div>
 		);
 	}
@@ -403,6 +403,36 @@ function ToolCallItem({
 		}
 		return <DelegateCard call={call} onOpenWindow={onOpenWindow} />;
 	}
+	// manager 建房卡：create_group_window 成功后给「打开群聊」跳转。
+	if (call.name === "create_group_window") {
+		const details = call.details as { windowId?: string; members?: string[]; name?: string } | undefined;
+		if (details?.windowId) {
+			return (
+				<div className="w-full overflow-hidden rounded-lg bg-muted">
+					<div className="flex items-center justify-between gap-2 px-3 py-2">
+						<div className="flex min-w-0 items-center gap-2 text-sm">
+							<UsersIcon className="size-4 shrink-0 text-muted-foreground" />
+							<span className="truncate">
+								已创建群聊{details.name ? `「${details.name}」` : ""}
+								{details.members?.length ? `（${details.members.join("、")}）` : ""}，任务已下达
+							</span>
+						</div>
+						<div className="flex shrink-0 items-center gap-2">
+							<button
+								type="button"
+								onClick={() => onOpenWindow?.(details.windowId!)}
+								className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+							>
+								打开群聊
+								<ExternalLinkIcon className="size-3" />
+							</button>
+							{statusBadge(call)}
+						</div>
+					</div>
+				</div>
+			);
+		}
+	}
 	return (
 		<Task defaultOpen={call.status === "running" || call.status === "error"}>
 			<TaskTrigger title={`${TOOL_STATUS_LABEL[call.status]} · ${call.name}`} />
@@ -481,11 +511,15 @@ function CustomMessageEntry({ message }: { message: ChatMessage }) {
 
 	// 状态变化追加一条 resolved 事件；前端按 interactionId 折叠到原卡片。
 	if (message.customType === "pudding:interaction_resolved") {
-		return (
-			<p className="text-xs text-muted-foreground">
-				审批已{details?.status === "approved" ? "批准" : details?.status === "rejected" ? "拒绝" : "处理"}，任务继续执行中。
-			</p>
-		);
+		const text =
+			details?.status === "approved"
+				? "审批已批准，任务继续执行中。"
+				: details?.status === "rejected"
+					? "审批已拒绝，任务已取消。"
+					: details?.status === "failed"
+						? "审批已批准，但任务执行失败。"
+						: "审批已处理。";
+		return <p className="text-xs text-muted-foreground">{text}</p>;
 	}
 
 	// Unknown custom types stay visible but unobtrusive.

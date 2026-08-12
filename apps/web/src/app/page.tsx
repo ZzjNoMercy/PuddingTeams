@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import { AgentsPane } from "@/components/agents/agents-pane";
 import { ChatPane } from "@/components/chat/chat-pane";
@@ -10,10 +11,12 @@ import { NavRail, type AppView } from "@/components/chat/nav-rail";
 import { deleteRoom, listRooms } from "@/lib/api";
 import type { RoomSummary } from "@/lib/types";
 
-export default function Home() {
+function HomeInner() {
+	const searchParams = useSearchParams();
 	const [rooms, setRooms] = useState<RoomSummary[]>([]);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
-	const [view, setView] = useState<AppView>("chat");
+	// 初始视图可由 ?view=agents 指定（如 Agent 配置页「返回」回到智能体列表）。
+	const [view, setView] = useState<AppView>(() => (searchParams.get("view") === "agents" ? "agents" : "chat"));
 	const [createOpen, setCreateOpen] = useState(false);
 	const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -131,5 +134,14 @@ export default function Home() {
 				</main>
 			)}
 		</div>
+	);
+}
+
+export default function Home() {
+	// useSearchParams 需要 Suspense 边界（Next 静态预渲染约束）。
+	return (
+		<Suspense fallback={null}>
+			<HomeInner />
+		</Suspense>
 	);
 }

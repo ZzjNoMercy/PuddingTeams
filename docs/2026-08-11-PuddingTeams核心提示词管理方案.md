@@ -1,7 +1,7 @@
 # PuddingTeams 核心提示词管理方案
 
 > 日期：2026-08-11  
-> 状态：**PuddingTeams 提示词管理核心事实源**；目标方案尚未全部落地，差距见 §8。  
+> 状态：**PuddingTeams 提示词管理核心事实源**；目标方案已落地（2026-08-11，见 §8）。  
 > 适用范围：基于 Pi 的 Manager 提示词装配、Pi Worker 运行指令、Window 协作、Global/Workspace context，以及非 Pi Worker 向 Pi manager 暴露的路由信息。  
 > 关联总设计：`2026-08-06-通用-agent-接入-底层与扩展方案.md`、`2026-08-05-房间即群聊-产品模型方案.md`。
 
@@ -258,13 +258,13 @@ Group  显示“群聊协作提示词”
 
 ## 8. 当前实现差距
 
-截至本文写入时，至少存在以下偏差，后续实现必须配套测试后才能把本节标记为已落地：
+> 实现状态（2026-08-11）：以下 5 项已全部落地并通过测试（server 222/222）。
 
-1. `piResources.systemPrompt` 和 Window guidance 通过 `systemPromptOverride` 注入，非空时会形成 `customPrompt`，可能跳过 pi 内嵌默认提示词；目标是 append-only。
-2. `loadWorkspaceContext=false` 当前映射为 `noContextFiles=true`，会把 pi global 与 Workspace context 一起关闭；目标是只过滤显式 Workspace 来源。
-3. Direct 当前数据模型/API 仍允许 `window.prompt`；目标是不展示并拒绝 Direct 用户自定义协作提示词，只保留平台固定 relay。
-4. 前端“系统提示词（Agent Profile）”与“责任 Profile”命名相撞；目标是改成“Agent/Worker 运行指令”，并标明接收者。
-5. 有效提示词预览必须按最终真实顺序区分 pi base、pi native append、Agent 运行指令、Window collaboration、global context 与 Workspace context，不能把占位文案当作实际装配结果。
+1. ~~`piResources.systemPrompt` 和 Window guidance 通过 `systemPromptOverride` 注入~~ **已落地**：改经 `appendSystemPromptOverride` 追加（`pi-resources.ts appendPiPrompts`，manager 与 pi worker 三个装配点统一），pi 内嵌默认提示词与用户 `APPEND_SYSTEM.md` 均保留在前。
+2. ~~`loadWorkspaceContext=false` 映射为 `noContextFiles=true`~~ **已落地**：改用 `agentsFilesOverride` 只剔除显式 Workspace 及目录层级文件，`~/.pi/agent/AGENTS.md` 始终保留（`piResourceLoaderOptions`）。
+3. ~~Direct 数据模型/API 允许 `window.prompt`~~ **已落地**：`TeamsStore.createWindow`/`updateWindow` 对 Direct 非空 prompt 直接抛错（`""` 允许用于清除历史值）；`resolveGuidance` 对 Direct 恒定返回固定 relay；前端仅 Group 显示协作提示词入口。
+4. ~~前端“系统提示词（Agent Profile）”命名相撞~~ **已落地**：统一改称「Manager/Worker 运行指令」与「责任边界」，并标注接收者（配置页 `prompt-section.tsx`/`overview-section.tsx`/`agent-manage-dialog.tsx`）。
+5. ~~有效提示词预览为占位文案~~ **已落地**：preview 按最终真实顺序分段——pi-base、pi-native-append（APPEND_SYSTEM.md）、agent-instructions、window-collaboration、global-context、workspace-context（`previewPiResources`）。
 
 ## 9. 验收标准
 

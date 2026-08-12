@@ -205,7 +205,7 @@ export function ChatInfoDialog({
 								value={room.name}
 								onSelect={() => runAction(onRename)}
 							/>
-							{room.type !== "solo" ? (
+							{room.type === "group" ? (
 								<InfoRow
 									label="协作提示词"
 									value={room.prompt || "使用默认协作规则"}

@@ -319,7 +319,19 @@ export interface PiResourcePreview {
 	cwd: string;
 	/** 显式 workspace 标识（含信任状态）；无 workspaceId 的窗口为 null（§6.3）。 */
 	workspace: { id: string; trust: WorkspaceTrust } | null;
-	segments: Array<{ source: string; path?: string; content: string; collapsed: boolean }>;
+	/** 有效提示词分段，按最终真实装配顺序（提示词管理方案 §8.5）。 */
+	segments: Array<{
+		source:
+			| "pi-base"
+			| "pi-native-append"
+			| "agent-instructions"
+			| "window-collaboration"
+			| "global-context"
+			| "workspace-context";
+		path?: string;
+		content: string;
+		collapsed: boolean;
+	}>;
 	effectivePrompt: string;
 	estimatedCharacters: number;
 	skills: PiPreviewResource[];
