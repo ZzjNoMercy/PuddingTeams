@@ -27,7 +27,7 @@ export interface RoomSummary {
 	pinned: boolean;
 	/** Per-worker last session handle (multi-turn continuity). */
 	workerBindings: Record<string, WorkerBinding>;
-	/** User-edited window system prompt ('' = default relay guidance). */
+	/** 群聊协作提示词（仅 Group 可编辑；Direct 固定 relay，写入会被拒绝）。 */
 	prompt: string;
 	/** Window 创建时冻结的实际运行目录；无项目模式也有。 */
 	cwdSnapshot: string;

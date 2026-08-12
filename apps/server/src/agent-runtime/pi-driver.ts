@@ -24,7 +24,7 @@ import type {
 import { sharedModelRuntime } from "../pi-bridge/model-runtime.js";
 import type { PiResourceConfig } from "../store/teams.js";
 import type { WorkspaceResourceAccess } from "../store/workspaces.js";
-import { combinePiPrompt, piResourceLoaderOptions } from "../pi-bridge/pi-resources.js";
+import { appendPiPrompts, piResourceLoaderOptions } from "../pi-bridge/pi-resources.js";
 
 export interface LocalPiDriverOptions {
 	/** 模型引用：`${provider}/${modelId}` 或裸 modelId；留空用 pi 默认模型。 */
@@ -141,7 +141,8 @@ function errMessage(err: unknown): string {
 
 /**
  * 本地 pi Connector Driver（§9.1 Pi 调 Pi）：child pi 以全新 AgentSession
- * 运行在 PuddingTeams 进程内，复用 pi 全局 agentDir 的模型与凭证。
+ * 运行在 PuddingTeams 进程内，模型目录复用 pi 全局 agentDir，provider 凭证
+ * 走平台共享 ModelRuntime（<home>/secrets/auth.json，与 pi CLI 解耦 §10.6）。
  *
  * - run      → SessionManager.create + createAgentSession + prompt
  * - continue → 内存命中复用；否则 SessionManager.open 从 JSONL 恢复后 prompt
@@ -191,7 +192,8 @@ export class LocalPiDriver implements AgentDriver {
 			settingsManager: SettingsManager.create(cwd, agentDir),
 			...piResourceLoaderOptions(this.opts.piResources, cwd, agentDir, workspaceAccess),
 			// 无 extensionFactories：child pi 不挂载团队委托工具（§9.1 默认不递归）。
-			systemPromptOverride: (base) => combinePiPrompt(base, this.opts.piResources),
+			// append-only（§3）：worker 运行指令只追加，不覆盖 pi 内嵌默认提示词。
+			appendSystemPromptOverride: (base) => appendPiPrompts(base, this.opts.piResources),
 		});
 		await loader.reload();
 		const model = await this.resolveModel();
@@ -199,6 +201,7 @@ export class LocalPiDriver implements AgentDriver {
 			cwd,
 			sessionManager,
 			...(model ? { model } : {}),
+			modelRuntime: await modelRuntime(),
 			...(this.opts.thinkingLevel
 				? { thinkingLevel: this.opts.thinkingLevel as PiThinkingLevel }
 				: {}),

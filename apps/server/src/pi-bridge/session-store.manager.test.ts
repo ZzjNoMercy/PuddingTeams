@@ -14,9 +14,9 @@ import { PiSessionStore } from "./session-store.js";
 import type { AgentDriver, AgentEvent, InvocationContext } from "../agent-runtime/types.js";
 
 /**
- * Phase 5（§10.5）：pinned manager 配置驱动会话装配——guidance 优先级
- * （window.prompt > manager 全局 prompt > 内置 relay guidance；solo 也有
- * prompt 入口）、thinking level 新建即生效且运行中即改、受影响会话统计。
+ * Phase 5（§10.5）：pinned manager 配置驱动会话装配——Window collaboration
+ * 分层（solo 无协作段；direct 固定 relay 不可编辑；group 可自定义协作提示词）、
+ * thinking level 新建即生效且运行中即改、受影响会话统计。
  */
 
 function freshDir(prefix: string): string {
@@ -41,15 +41,17 @@ async function makeStack() {
 	return { teams, sessions, invoker, drivers, dir };
 }
 
-test("P3-R: Agent Profile 与 Window collaboration prompt 分层，不再复用 manager.prompt", async () => {
-	// solo 不注入 collaboration guidance；Agent Profile 由 ResourceLoader 独立追加。
+test("P3-R: Agent 运行指令与 Window collaboration 分层；Direct 固定 relay 不可覆盖", async () => {
+	// solo 不注入 collaboration guidance；Agent 运行指令由 ResourceLoader 独立追加。
 	assert.equal(PiSessionStore.resolveGuidance(undefined, undefined), undefined);
-	// direct：window.prompt 替换内置 collaboration guidance。
+	// direct（§5.2）：平台固定 relay，ctx.prompt 一律不生效（防御历史数据）。
 	const ctx = { type: "direct" as const, members: ["alpha"], prompt: "窗口规则" };
-	assert.equal(PiSessionStore.resolveGuidance(ctx), "窗口规则");
-	// direct/group：没有窗口覆盖时用内置 relay guidance。
-	const builtin = PiSessionStore.resolveGuidance({ type: "direct", members: ["alpha"] }, undefined);
-	assert.ok(builtin!.includes("单聊窗口"));
+	const direct = PiSessionStore.resolveGuidance(ctx);
+	assert.ok(direct!.includes("单聊窗口"), "direct 必须用内置固定 relay");
+	assert.ok(!direct!.includes("窗口规则"), "direct 不接受自定义协作提示词");
+	// group（§5.3）：window.prompt 覆盖内置 collaboration guidance。
+	const groupCustom = PiSessionStore.resolveGuidance({ type: "group", members: ["a", "b"], prompt: "群规" }, undefined);
+	assert.equal(groupCustom, "群规");
 	const group = PiSessionStore.resolveGuidance({ type: "group", members: ["a", "b"] }, undefined);
 	assert.ok(group!.includes("群聊窗口"));
 });

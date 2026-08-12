@@ -139,3 +139,22 @@ test("direct identity 在 PATCH 与原地切换 commit 中都保持 (worker, wor
 	assert.equal((await store.getWindow(alphaA.id))?.workspaceId, a.id);
 	assert.equal((await store.getWindow(alphaB.id))?.workspaceId, b.id);
 });
+
+
+test("Direct 窗口拒绝自定义协作提示词（§5.2 固定 relay）；Group 不受影响", async () => {
+	const { store } = await makeStore();
+	await assert.rejects(
+		() => store.createWindow({ type: "direct", members: ["alpha"], prompt: "规则", sessionId: "s-1" }),
+		/单聊窗口不支持自定义协作提示词/,
+	);
+	const direct = await store.createWindow({ type: "direct", members: ["alpha"], sessionId: "s-2" });
+	await assert.rejects(() => store.updateWindow(direct.id, { prompt: "规则" }), /单聊窗口不支持自定义协作提示词/);
+	// 传 "" 允许：用于清掉历史遗留值。
+	const cleared = await store.updateWindow(direct.id, { prompt: "" });
+	assert.equal(cleared.prompt, undefined);
+
+	const group = await store.createWindow({ type: "group", members: ["alpha", "beta"], prompt: "群规", sessionId: "s-3" });
+	assert.equal(group.prompt, "群规");
+	const updated = await store.updateWindow(group.id, { prompt: "新群规" });
+	assert.equal(updated.prompt, "新群规");
+});

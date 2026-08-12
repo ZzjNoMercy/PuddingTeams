@@ -26,7 +26,7 @@ import {
 	type ManagerWindowContext,
 } from "./agent-extensions.js";
 import { sharedModelRuntime } from "./model-runtime.js";
-import { combinePiPrompt, piResourceLoaderOptions } from "./pi-resources.js";
+import { appendPiPrompts, piResourceLoaderOptions } from "./pi-resources.js";
 import {
 	buildCompletionReviewPrompt,
 	COMPLETION_REVIEWER_SYSTEM_PROMPT,
@@ -106,19 +106,17 @@ export class PiSessionStore {
 	}
 
 	/**
-	 * System-prompt shaping for a window's manager sessions（§10.5 优先级：
-	 * window.prompt > manager 全局 prompt > 内置 relay guidance；solo 从此
-	 * 也有 prompt 入口——manager settings 的 prompt）。direct/group → the
-	 * manager is a relay: it must hand every user message to a worker via the
-	 * per-agent delegate tool and never do the work itself. A user-edited
-	 * window prompt (`WindowConfig.prompt`) replaces the built-in relay
-	 * guidance entirely.
+	 * System-prompt shaping for a window's manager sessions（提示词管理方案 §5）：
+	 * solo 无协作段；direct 只有平台固定、不可编辑的 relay 协议（§5.2，忽略
+	 * ctx.prompt，防御历史数据）；group 才允许用户编辑的协作提示词覆盖内置
+	 * guidance（§5.3）。所有输出经 appendSystemPromptOverride 追加，不覆盖
+	 * pi 内嵌默认提示词。
 	 */
 	static resolveGuidance(ctx: ManagerWindowContext | undefined, _legacySettings?: PiManagerSettings): string | undefined {
 		if (!ctx || ctx.type === "solo") return undefined;
 		const members = ctx.members.filter(Boolean);
 		if (members.length === 0) return undefined;
-		if (ctx.prompt?.trim()) return ctx.prompt.trim();
+		if (ctx.type === "group" && ctx.prompt?.trim()) return ctx.prompt.trim();
 		if (ctx.type === "direct") {
 			const w = members[0]!;
 			const tool = delegateToolName(w);
@@ -197,7 +195,9 @@ export class PiSessionStore {
 			// noExtensions 只控制 pi-native Extension；平台 inline core/delegation
 			// factories 不受影响。Skills/templates/context 全部由 piResources 决定。
 			...(settings?.noExtensions ? { noExtensions: true } : {}),
-			systemPromptOverride: (base) => combinePiPrompt(base, resources, guidance),
+			// append-only（提示词管理方案 §3）：manager 运行指令与窗口 guidance
+			// 追加到 pi 原生 append 之后，不覆盖 pi 内嵌默认提示词。
+			appendSystemPromptOverride: (base) => appendPiPrompts(base, resources, guidance),
 		});
 		await loader.reload();
 		return { loader, plan };
@@ -233,6 +233,7 @@ export class PiSessionStore {
 			cwd: opts.cwd,
 			sessionManager: opts.sessionManager,
 			...(model ? { model } : {}),
+			modelRuntime: await this.runtime(),
 			...(settings?.thinkingLevel ? { thinkingLevel: settings.thinkingLevel } : {}),
 			resourceLoader: loader,
 			...(stripBuiltin ? { noTools: "builtin" as const } : {}),
@@ -388,8 +389,9 @@ export class PiSessionStore {
 
 	/**
 	 * Store a provider API key: in-memory runtime override (no network
-	 * validation in the SDK — the key is trusted as-is) plus durable in pi's
-	 * auth.json via the runtime's own credential store. Writing through
+	 * validation in the SDK — the key is trusted as-is) plus durable in the
+	 * platform's own auth.json（<home>/secrets/auth.json，与 pi CLI 解耦
+	 * §10.6）via the runtime's own credential store. Writing through
 	 * `credentials.modify` is required: the SDK's AuthStorage keeps an
 	 * in-memory snapshot of auth.json, so direct file writes are invisible to
 	 * availability refreshes until the process restarts.
@@ -779,6 +781,7 @@ export class PiSessionStore {
 				cwd: this.cwd,
 				sessionManager: SessionManager.inMemory(this.cwd),
 				model,
+				modelRuntime: await this.runtime(),
 				resourceLoader: loader,
 				noTools: "all",
 			});
@@ -806,6 +809,7 @@ export class PiSessionStore {
 				cwd: this.cwd,
 				sessionManager: SessionManager.inMemory(this.cwd),
 				model,
+				modelRuntime: await this.runtime(),
 				resourceLoader: loader,
 				noTools: "all",
 			});

@@ -147,9 +147,11 @@ function needsInputResult(payload: Record<string, unknown>, needs?: Record<strin
 					...(typeof needs?.command === "string" ? { command: needs.command } : {}),
 					...(typeof needs?.path === "string" ? { path: needs.path } : {}),
 					...(kind === "permission" || kind === "confirmation"
-						? { options: (["once", "run", "session", "reject"] as const).filter((s) => !options.length || options.includes(s)) }
+						// 对齐 puddingclaw deploy-cli 的 respond 校验：scope 仅 once|session
+						// （旧默认里的 "run" 会被 CLI 以 protocol_error 拒绝）。
+						? { options: (["once", "session", "reject"] as const).filter((s) => !options.length || options.includes(s)) }
 						: options.length
-							? { options: options.map((o) => o as "once") }
+							? { options }
 							: undefined),
 					reason: typeof needs?.reason === "string" ? needs.reason : undefined,
 				},

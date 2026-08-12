@@ -33,6 +33,7 @@ import { ProductSettingsStore } from "./store/product-settings.js";
 import { WorkStateStore } from "./store/work-state.js";
 import { registerWorkStateRoutes } from "./routes/work-state.js";
 import { UploadStore } from "./store/uploads.js";
+import { configureSharedModelRuntime } from "./pi-bridge/model-runtime.js";
 
 const app = Fastify({ logger: { level: "warn" } });
 
@@ -65,6 +66,9 @@ const defaultCwd = config.agentCwd ?? paths.unscopedWorkspace;
 // Worker 密钥（如 PUDDINGCLAW_TOKEN）加密存于 <home>/secrets，不进 agents.json。
 const credentials = new CredentialsStore(paths.secrets);
 await credentials.init();
+// Provider key 与 pi CLI 解耦（§10.6）：平台凭证落到 <home>/secrets/auth.json，
+// 不读写 pi 全局 agentDir 的 auth.json。必须先于任何 sharedModelRuntime 使用。
+configureSharedModelRuntime({ authPath: path.join(paths.secrets, "auth.json") });
 const teams = new TeamsStore(
 	{ state: paths.state, assets: paths.assets, managedWorkspaces: paths.managedWorkspaces },
 	defaultCwd,

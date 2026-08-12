@@ -141,6 +141,62 @@ test("Phase0 anchor: needs_input 后同一 Session 二次 delegate 返回 409 �
 	assert.equal((first.result as { runHandle?: string }).runHandle, "run-abc");
 });
 
+test("respond：delegation 无 runHandle 时不抛错卡死，交给 Driver 判断（clarify-and-retry）", async () => {
+	const { delegations, secrets } = await makeRuntime();
+	// worker 在 Run 启动前发问（分析模型澄清）：input_required 不带 runHandle/
+	// sessionHandle，旧实现在这里抛 "has no runHandle"，delegation 永卡
+	// waiting_input 且审批已被消费。
+	const responded: string[] = [];
+	const driver: AgentDriver = {
+		id: "puddingclaw",
+		async capabilities(): Promise<DriverCapabilities> {
+			return { operations: ["run", "continue", "respond", "cancel"], interactionKinds: ["question"], progress: "none", transport: "spawn" };
+		},
+		async *run(): AsyncIterable<AgentEvent> {
+			yield { type: "started" };
+			yield {
+				type: "input_required",
+				result: {
+					agentId: "puddingclaw",
+					status: "needs_input",
+					interaction: {
+						id: "",
+						kind: "question",
+						requests: [{ requestId: "req-1", prompt: "无法唯一匹配分析模型", options: ["once"] }],
+					},
+				},
+				providerState: { task: "分析一下上月的配置数据" },
+			};
+		},
+		async *continue(): AsyncIterable<AgentEvent> { throw new Error("unused"); },
+		async *respond(input: { runHandle: string; requestId: string }): AsyncIterable<AgentEvent> {
+			responded.push(input.runHandle);
+			yield { type: "started" };
+			yield { type: "completed", result: { agentId: "puddingclaw", status: "completed", content: "done" } };
+		},
+		async probe(ctx: InvocationContext) {
+			return {
+				extensionInstalled: true, detected: true, configured: true, authenticated: "unknown", enabled: true,
+				compatibility: "supported" as const, capabilities: { operations: ["run", "continue", "respond"] as const, interactionKinds: ["question"] as const, progress: "none" as const, transport: "spawn" as const }, issues: [],
+			};
+		},
+	};
+	const runtime = new AgentRuntime(delegations, secrets, () => driver, { ttlMs: 24 * 60 * 60 * 1000 });
+
+	const first = await runtime.delegate(
+		{ ...PROJECT, windowId: "win-1", managerSessionId: "sess-1", agentId: "puddingclaw", message: "x", mode: "run" },
+		{ cwd: process.cwd(), env: {} },
+	);
+	assert.equal(first.status, "needs_input");
+	const outcome = await runtime.respond(
+		first.interaction!.id,
+		{ requestId: "ui-1", revision: 0, responses: [{ requestId: "req-1", action: "approve", scope: "once" }] },
+		{ cwd: process.cwd(), env: {} },
+	);
+	assert.equal(outcome.status, "completed", "无 runHandle 不得阻断 respond（由 Driver 决定如何继续）");
+	assert.deepEqual(responded, [""], "Driver 收到空 runHandle 并自行降级（clarify-and-retry）");
+});
+
 test("Phase0 anchor: 非 pending 状态拒绝二次消费（revision 校验）", async () => {
 	const { delegations, secrets } = await makeRuntime();
 	const { driver } = makeDriver("worker-session-2", "run-def");

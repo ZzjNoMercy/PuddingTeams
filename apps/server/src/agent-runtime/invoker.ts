@@ -1,6 +1,7 @@
 import { TeamsStore, type AgentConfig, type WindowConfig } from "../store/teams.js";
 import { CredentialsStore } from "../store/credentials.js";
 import { AgentRuntime, SessionConflictError } from "./runtime.js";
+import type { DelegationRecord } from "./delegation-store.js";
 import { DriverRegistry } from "./driver-registry.js";
 import { PuddingClawDriver } from "./puddingclaw-driver.js";
 import type { AgentDriver, DriverCapabilities, InvocationContext } from "./types.js";
@@ -231,7 +232,7 @@ export class AgentInvoker {
 			if (params.parentDelegationId) {
 				const parent = await this.runtime.getDelegation(params.parentDelegationId);
 				if (!parent || parent.managerSessionId !== managerSessionId) {
-					throw new Error("parentDelegationId 必须指向当前 Session 的既有委托");
+					throw new Error("parentDelegationId 必须指向当前 Session 的既有委托（请使用上一次委托返回文本中给出的 delegationId）");
 				}
 			}
 			const managerOwner = await this.teams.windowForSession(managerSessionId);
@@ -453,6 +454,33 @@ export class AgentInvoker {
 		return prepared.responsePromise;
 	}
 
+	/**
+	 * 审批结果扇出目标（两边同步）：manager session + delegation 所属窗口的
+	 * active session（单聊镜像）。两者相同则只发 manager，窗口读取失败仅跳过镜像。
+	 */
+	private async outcomeTargets(d: DelegationRecord): Promise<{ manager?: string; direct?: string }> {
+		const manager = d.managerSessionId || undefined;
+		let direct: string | undefined;
+		try {
+			const window = await this.teams.getWindow(d.windowId);
+			const active = window?.activeSession;
+			if (active && active !== manager) direct = active;
+		} catch {
+			// 镜像目标解析失败不影响主流程。
+		}
+		return { manager, direct };
+	}
+
+	/** managerSender 的容错封装：通知失败不影响审批结果返回。 */
+	private sendOutcome(
+		sessionId: string,
+		message: { customType: string; content: string; details?: Record<string, unknown> },
+		options: { triggerTurn: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+	): void {
+		if (!this.managerSender) return;
+		void this.managerSender(sessionId, message, options).catch(() => undefined);
+	}
+
 	private async respondUnlocked(
 		interactionId: string,
 		input: { requestId: string; revision: number; responses: Array<{ requestId: string; action: string; scope?: string }> },
@@ -499,7 +527,7 @@ export class AgentInvoker {
 				responses: input.responses.map((r) => ({
 					requestId: r.requestId,
 					action: r.action as "approve" | "reject" | "answer" | "confirm",
-					scope: r.scope as "once" | "run" | "session" | undefined,
+					scope: r.scope,
 				})),
 			},
 			{ cwd, env: ctxEnv, signal },
@@ -510,36 +538,38 @@ export class AgentInvoker {
 		if (d.sessionHandle) {
 			this.rememberSession(d);
 		}
+		// 两边同步：审批结果同时扇出到 manager session 和 delegation 所属窗口的
+		// active session（单聊镜像），用户只在 solo 窗口也能看到全部结果。
+		const targets = await this.outcomeTargets(d);
 		switch (outcome.status) {
 			case "completed": {
 				// §6.2/§6.3：完成后触发 manager follow-up 汇总（triggerTurn + followUp），
 				// 并把 worker 的真实结果带给 manager，否则汇总轮无内容可转述。
 				const details = { ...(outcome.result.meta ?? {}), artifacts: outcome.result.artifacts, usage: outcome.result.usage };
-				if (this.managerSender && d.managerSessionId) {
-					void this.managerSender(
-						d.managerSessionId,
-						{
-							customType: "pudding:interaction_resolved",
-							content: `worker「${d.agentId}」的审批已通过。`,
-							details: {
-								interactionId,
-								delegationId: d.id,
-								worker: d.agentId,
-								status: "approved",
-							},
-						},
-						{ triggerTurn: false },
-					).catch(() => undefined);
-					void this.managerSender(
-						d.managerSessionId,
-						{
-							customType: "pudding:task_result",
-							content: outcome.result.content ?? "",
-							details: { interactionId, delegationId: d.id, worker: d.agentId, status: "completed", ...details },
-						},
-						// M5：manager 若在流式中，用 followUp 排队而不是 steer 打断。
-						{ triggerTurn: true, deliverAs: "followUp" },
-					).catch(() => undefined);
+				const resolved = {
+					customType: "pudding:interaction_resolved",
+					content: `worker「${d.agentId}」的审批已通过。`,
+					details: {
+						interactionId,
+						delegationId: d.id,
+						worker: d.agentId,
+						status: "approved",
+					},
+				};
+				const taskResult = {
+					customType: "pudding:task_result",
+					content: outcome.result.content ?? "",
+					details: { interactionId, delegationId: d.id, worker: d.agentId, status: "completed", ...details },
+				};
+				if (targets.manager) {
+					this.sendOutcome(targets.manager, resolved, { triggerTurn: false });
+					// M5：manager 若在流式中，用 followUp 排队而不是 steer 打断。
+					this.sendOutcome(targets.manager, taskResult, { triggerTurn: true, deliverAs: "followUp" });
+				}
+				if (targets.direct) {
+					// 单聊窗口仅展示，不唤醒 turn。
+					this.sendOutcome(targets.direct, resolved, { triggerTurn: false });
+					this.sendOutcome(targets.direct, taskResult, { triggerTurn: false });
 				}
 				return {
 					status: "completed",
@@ -551,17 +581,24 @@ export class AgentInvoker {
 					waitingInput: false,
 				};
 			}
-			case "rejected":
-				if (this.managerSender && d.managerSessionId) {
-					void this.managerSender(
-						d.managerSessionId,
-						{
-							customType: "pudding:interaction_resolved",
-							content: `worker「${d.agentId}」的审批被拒绝，任务已取消。`,
-							details: { interactionId, delegationId: d.id, worker: d.agentId, status: "rejected" },
-						},
-						{ triggerTurn: true },
-					).catch(() => undefined);
+			case "rejected": {
+				const resolved = {
+					customType: "pudding:interaction_resolved",
+					content: `worker「${d.agentId}」的审批被拒绝，任务已取消。`,
+					details: { interactionId, delegationId: d.id, worker: d.agentId, status: "rejected" },
+				};
+				const taskResult = {
+					customType: "pudding:task_result",
+					content: "审批被拒绝，任务已取消。",
+					details: { interactionId, delegationId: d.id, worker: d.agentId, status: "cancelled" },
+				};
+				if (targets.manager) {
+					this.sendOutcome(targets.manager, resolved, { triggerTurn: false });
+					this.sendOutcome(targets.manager, taskResult, { triggerTurn: true, deliverAs: "followUp" });
+				}
+				if (targets.direct) {
+					this.sendOutcome(targets.direct, resolved, { triggerTurn: false });
+					this.sendOutcome(targets.direct, taskResult, { triggerTurn: false });
 				}
 				return {
 					status: "cancelled",
@@ -571,16 +608,63 @@ export class AgentInvoker {
 					runHandle: d.runHandle,
 					waitingInput: false,
 				};
-			case "failed":
+			}
+			case "failed": {
+				const errorText = outcome.result.status === "failed" ? outcome.result.error : "任务执行失败";
+				const details = { ...(outcome.result.meta ?? {}), errorCode: "errorCode" in outcome.result ? outcome.result.errorCode : undefined };
+				const resolved = {
+					customType: "pudding:interaction_resolved",
+					content: `worker「${d.agentId}」的审批已通过，但任务执行失败。`,
+					details: { interactionId, delegationId: d.id, worker: d.agentId, status: "failed" },
+				};
+				const taskResult = {
+					customType: "pudding:task_result",
+					content: errorText,
+					details: { interactionId, delegationId: d.id, worker: d.agentId, status: "failed", ...details },
+				};
+				if (targets.manager) {
+					this.sendOutcome(targets.manager, resolved, { triggerTurn: false });
+					this.sendOutcome(targets.manager, taskResult, { triggerTurn: true, deliverAs: "followUp" });
+				}
+				if (targets.direct) {
+					this.sendOutcome(targets.direct, resolved, { triggerTurn: false });
+					this.sendOutcome(targets.direct, taskResult, { triggerTurn: false });
+				}
 				return {
 					status: "failed",
-					content: outcome.result.status === "failed" ? outcome.result.error : "任务执行失败",
-					details: { ...(outcome.result.meta ?? {}), errorCode: "errorCode" in outcome.result ? outcome.result.errorCode : undefined },
+					content: errorText,
+					details,
 					delegationId: d.id,
 					runHandle: d.runHandle,
 					waitingInput: false,
 				};
-			case "needs_input":
+			}
+			case "needs_input": {
+				// 又一轮审批：把新的 interaction（同 id、revision+1）投影到两边窗口，
+				// 均不唤醒 turn，等用户再次操作。
+				if (outcome.interaction) {
+					const required = {
+						customType: "pudding:interaction_required",
+						content: `worker「${d.agentId}」需要更多审批才能继续。`,
+						details: {
+							interactionId: outcome.interaction.id,
+							delegationId: d.id,
+							worker: d.agentId,
+							status: "pending",
+							revision: outcome.interaction.revision,
+							requests: outcome.interaction.requests.map((r) => ({
+								requestId: r.requestId,
+								prompt: r.prompt,
+								...(r.command ? { command: r.command } : {}),
+								...(r.path ? { path: r.path } : {}),
+								risk: r.risk,
+								options: r.options,
+							})),
+						},
+					};
+					if (targets.manager) this.sendOutcome(targets.manager, required, { triggerTurn: false });
+					if (targets.direct) this.sendOutcome(targets.direct, required, { triggerTurn: false });
+				}
 				return {
 					status: "needs_input",
 					content: `worker「${d.agentId}」需要更多审批。`,
@@ -595,6 +679,7 @@ export class AgentInvoker {
 					runHandle: d.runHandle,
 					waitingInput: true,
 				};
+			}
 		}
 	}
 

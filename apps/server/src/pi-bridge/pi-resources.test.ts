@@ -212,3 +212,92 @@ test("pi-resources: preview 按信任门过滤 workspace 来源并回显 workspa
 	assert.ok(open.skills.some((s) => s.source === "workspace"));
 	assert.equal(open.workspace, null, "未传 workspace 标识时 preview.workspace = null（§6.3）");
 });
+
+
+/**
+ * append-only 注入（提示词管理方案 §3/§8.1）：运行指令与 collaboration 经
+ * appendSystemPromptOverride 追加——pi 内嵌默认提示词不被顶掉，用户已有的
+ * APPEND_SYSTEM.md 保持在前、不被覆盖。
+ */
+test("pi-resources: 运行指令/collaboration append-only，不覆盖 pi base 与 APPEND_SYSTEM.md", async () => {
+	const fixture = makeFixture();
+	writeFileSync(path.join(fixture.agentDir, "APPEND_SYSTEM.md"), "用户原生追加");
+	const loader = await loadPiResources({
+		cwd: fixture.cwd,
+		agentDir: fixture.agentDir,
+		resources: { systemPrompt: "  Agent 运行指令  " },
+		collaboration: "群聊协作提示词",
+	});
+	// 无 SYSTEM.md：base 保持 undefined，由 pi 在请求装配时生成内嵌默认文本（验收 1）。
+	assert.equal(loader.getSystemPrompt(), undefined);
+	// append 顺序（验收 2）：pi 原生 APPEND_SYSTEM.md 在前，运行指令与 collaboration 只追加。
+	assert.deepEqual(loader.getAppendSystemPrompt(), ["用户原生追加", "Agent 运行指令", "群聊协作提示词"]);
+
+	// 空配置时不产生任何追加段。
+	const empty = await loadPiResources({ cwd: fixture.cwd, agentDir: freshDir("pt-wl-empty-") });
+	assert.deepEqual(empty.getAppendSystemPrompt(), []);
+});
+
+/**
+ * context 开关（§4/§8.2）：关闭 loadWorkspaceContext 或信任门 denied 时只剔除
+ * 显式 Workspace 及目录层级文件，pi global agentDir/AGENTS.md 必须保留（验收 7）。
+ */
+test("pi-resources: 关闭 workspace context 保留 pi global AGENTS.md", async () => {
+	const fixture = makeContextFixture();
+	writeFileSync(path.join(fixture.agentDir, "AGENTS.md"), "pi global 上下文");
+
+	const off = await loadPiResources({
+		cwd: fixture.cwd,
+		agentDir: fixture.agentDir,
+		resources: { loadWorkspaceContext: false },
+	});
+	const offPaths = off.getAgentsFiles().agentsFiles.map((f) => f.path);
+	assert.ok(offPaths.some((p) => isUnder(p, fixture.agentDir)), "pi global AGENTS.md 必须保留");
+	assert.ok(!offPaths.some((p) => isUnder(p, fixture.cwd)), "workspace AGENTS.md 必须剔除");
+
+	const denied = await loadPiResources({ cwd: fixture.cwd, agentDir: fixture.agentDir, workspaceAccess: ALL_DENIED });
+	const deniedPaths = denied.getAgentsFiles().agentsFiles.map((f) => f.path);
+	assert.ok(deniedPaths.some((p) => isUnder(p, fixture.agentDir)), "信任门 denied 时 pi global 仍保留");
+	assert.ok(!deniedPaths.some((p) => isUnder(p, fixture.cwd)));
+});
+
+function isUnder(filePath: string, dir: string): boolean {
+	const prefix = dir.endsWith(path.sep) ? dir : dir + path.sep;
+	return filePath === dir || filePath.startsWith(prefix);
+}
+
+test("pi-resources: preview 按真实装配顺序分段（pi base → 原生 append → 运行指令 → collaboration → global/workspace context）", async () => {
+	const fixture = makeContextFixture();
+	writeFileSync(path.join(fixture.agentDir, "AGENTS.md"), "pi global 上下文");
+	writeFileSync(path.join(fixture.agentDir, "APPEND_SYSTEM.md"), "用户原生追加");
+	const preview = await previewPiResources({
+		cwd: fixture.cwd,
+		agentDir: fixture.agentDir,
+		resources: { systemPrompt: "Agent 运行指令" },
+		collaboration: "群聊协作提示词",
+		workspaceAccess: ALL_ALLOWED,
+	});
+	const sources = preview.segments.map((s) => s.source);
+	assert.deepEqual(sources, [
+		"pi-base",
+		"pi-native-append",
+		"agent-instructions",
+		"window-collaboration",
+		"global-context",
+		"workspace-context",
+	]);
+	const append = preview.segments.find((s) => s.source === "pi-native-append")!;
+	assert.equal(append.content, "用户原生追加");
+	assert.ok(append.path?.endsWith(path.join("APPEND_SYSTEM.md")));
+	// effectivePrompt 按真实顺序拼接，不含占位文案。
+	assert.equal(
+		preview.effectivePrompt,
+		["用户原生追加", "Agent 运行指令", "群聊协作提示词"].join("\n\n"),
+	);
+
+	// 无 SYSTEM.md 时 pi-base 为占位说明（collapsed），不构成 customPrompt。
+	const bare = await previewPiResources({ cwd: fixture.cwd, agentDir: fixture.agentDir, workspaceAccess: ALL_ALLOWED });
+	const base = bare.segments.find((s) => s.source === "pi-base")!;
+	assert.ok(base.content.includes("pi 内嵌默认提示词"));
+	assert.equal(bare.segments.some((s) => s.source === "agent-instructions"), false);
+});

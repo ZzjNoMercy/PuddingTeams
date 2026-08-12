@@ -21,7 +21,9 @@ import type { ArtifactStore } from "../agent-runtime/artifact-store.js";
  *
  * - core Extension：`search_agent_tools` 工具 + roster 注入（成员名单是窗口
  *   绑定的静态事实，不做成工具，由 before_agent_start 每轮重读并写进 system
- *   prompt，成员/启用变化下一轮即生效）；
+ *   prompt，成员/启用变化下一轮即生效）；另含窗口专属 core 工具——solo 的
+ *   `create_group_window`（manager 自建群聊并下达首条任务）与 group 的
+ *   `invite_to_group`（拉已启用 worker 进组）；
  * - 每个 roster Agent 一个平台生成的 agent-delegation Extension（基础委托工具
  *   `agent_<agentId>__delegate`，内部走 ScopedAgentInvoker → AgentInvoker）；
  * - 专属 Capability Extension 按 enabled binding 装配在基础 Extension 之后；
@@ -42,6 +44,10 @@ const SYNC_IDLE_TIMEOUT_MS = 15_000;
 export const CORE_TOOL_SEARCH = "search_agent_tools";
 export const CORE_TOOL_UPDATE_WORK_STATE = "update_session_work_state";
 export const CORE_TOOL_REQUEST_DECISION = "request_human_decision";
+/** solo：manager 自建群聊并下达首条任务（房间即群聊 §manager 建房）。 */
+export const CORE_TOOL_CREATE_GROUP = "create_group_window";
+/** group：拉其他已启用 worker 进本群（成员变化走既有撤权/重建链）。 */
+export const CORE_TOOL_INVITE = "invite_to_group";
 
 /** manager Session 的窗口上下文（装配时解析，工具执行期按需重读）。 */
 export interface ManagerWindowContext {
@@ -90,8 +96,13 @@ export async function planManagerTools(
 		CORE_TOOL_SEARCH,
 		CORE_TOOL_UPDATE_WORK_STATE,
 		CORE_TOOL_REQUEST_DECISION,
+		CORE_TOOL_CREATE_GROUP,
+		CORE_TOOL_INVITE,
 	]);
-	const active = new Set<string>(managed);
+	const active = new Set<string>([CORE_TOOL_SEARCH, CORE_TOOL_UPDATE_WORK_STATE, CORE_TOOL_REQUEST_DECISION]);
+	// 窗口专属 core 工具：建房仅 solo，拉人仅 group（execute 内还有第二道门禁）。
+	if (solo) active.add(CORE_TOOL_CREATE_GROUP);
+	if (ctx?.type === "group") active.add(CORE_TOOL_INVITE);
 	for (const agent of agents) {
 		const delegate = delegateToolName(agent.name);
 		managed.add(delegate);
@@ -214,6 +225,17 @@ const RequestDecisionParams = Type.Object({
 	authorizationScope: Type.Optional(Type.String({ description: "若决定同时授予权限，精确定义其范围。" })),
 });
 
+const CreateGroupParams = Type.Object({
+	members: Type.Array(Type.String(), { description: "群聊成员：≥2 个已启用 worker 名。" }),
+	task: Type.String({ description: "下达给房间 manager 的首条整体任务（它会再拆分给成员）。" }),
+	name: Type.Optional(Type.String({ description: "群聊名称（可选，留空由首条任务自动生成）。" })),
+	prompt: Type.Optional(Type.String({ description: "群聊协作提示词：只给该房间 manager 的分工/交接/汇总规则（可选）。" })),
+});
+
+const InviteToGroupParams = Type.Object({
+	members: Type.Array(Type.String(), { description: "要拉入本群的已启用 worker 名（≥1）。" }),
+});
+
 /**
  * roster 的 system prompt 段落（每轮由 before_agent_start 重算）。成员名单是
  * 窗口绑定的静态事实，不做成工具让模型多调一轮；执行期重读保证成员/启用
@@ -241,10 +263,19 @@ export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowCon
 		const toolList = tools.map((n) => (plan.active.has(n) ? `${n}（已激活）` : n)).join("、");
 		return `- ${a.name}：${a.description || "（无描述）"}${caps}${responsibility}\n  工具：${toolList}`;
 	});
+	const soloCtx = !ctx || ctx.type === "solo";
 	return [
 		"当前可委托的 worker（按窗口成员与启用状态每轮刷新）：",
 		lines.join("\n"),
 		`标注「已激活」的工具可直接调用，不要再搜索；未激活的先用 ${CORE_TOOL_SEARCH} 按名称激活后再调用；若调用被拒绝，说明该 worker 已不可用，不要重试。`,
+		...(soloCtx
+			? [
+					`需要多个 worker 协作（拆分、并行、交接、裁决）时，用 ${CORE_TOOL_CREATE_GROUP} 建群聊并把整体任务下达给房间 manager，不要把多 worker 任务塞进单个 worker 的单聊委托。`,
+				]
+			: []),
+		...(ctx?.type === "group"
+			? [`当前协作人手不够时，用 ${CORE_TOOL_INVITE} 把其他已启用 worker 拉进本群（新成员下一轮进入 worker 清单）。`]
+			: []),
 	].join("\n");
 }
 
@@ -464,6 +495,113 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 				};
 			},
 		});
+
+		pi.registerTool({
+			name: CORE_TOOL_CREATE_GROUP,
+			label: "Create Group Window",
+			description:
+				"创建多 worker 群聊房间，并把任务作为首条消息直接下达给房间 manager 开跑。需要拆分、并行、交接、裁决的多 worker 协作时使用；单 worker 任务请直接用该 worker 的 delegate 工具。仅 solo 对话可用。",
+			parameters: CreateGroupParams,
+			async execute(_toolCallId, params: Static<typeof CreateGroupParams>) {
+				// 门禁双保险（激活策略已限定 solo；无窗口的 Session 不能建房）。
+				const ctx = await deps.resolveContext();
+				if (!ctx) throw new Error("当前 manager Session 不属于任何窗口，不能建群聊");
+				if (ctx.type !== "solo") throw new Error(`${CORE_TOOL_CREATE_GROUP} 仅 solo 对话可用`);
+				const members = [...new Set(params.members.map((m) => m.trim()).filter(Boolean))];
+				if (members.length < 2) throw new Error("群聊至少需要 2 个 worker");
+				for (const name of members) {
+					const agent = await deps.store.getAgent(name);
+					if (!agent || agent.pinned || agent.enabled === false) {
+						throw new Error(`worker「${name}」不存在、是内置 manager 或已被禁用，不能入群`);
+					}
+				}
+				// 与 rooms.ts 建房链路一致：先建 manager Session，再落窗口记录。
+				const owner = await deps.store.windowForSession(deps.getSessionId());
+				const cwd = ctx.cwd ?? (owner ? await deps.store.workspaceFor(owner.id) : undefined);
+				if (!cwd) throw new Error("无法解析当前窗口的运行目录，不能建群聊");
+				const created = await deps.sessions.create(undefined, {
+					type: "group",
+					members,
+					prompt: params.prompt,
+					workspaceId: ctx.workspaceId,
+					cwd,
+				});
+				const window = await deps.store.createWindow({
+					type: "group",
+					members,
+					workspaceId: ctx.workspaceId,
+					cwdSnapshot: cwd,
+					name: params.name,
+					prompt: params.prompt,
+					sessionId: created.id,
+				});
+				// fire-and-forget 开跑（chat.ts 首发消息同款）：房间 manager 在自己
+				// 窗口里干活，本工具不等执行结果；标题异步生成。
+				void deps.sessions
+					.open(created.id)
+					.then((session) => session.prompt(params.task))
+					.catch((err: unknown) =>
+						deps.log?.(`create_group_window 首发任务失败: ${err instanceof Error ? err.message : String(err)}`),
+					);
+				void deps.sessions.generateSessionTitle(created.id, params.task).catch(() => undefined);
+				const displayName = window.name ?? members.join("、");
+				return {
+					content: [
+						{
+							type: "text",
+							text: `已创建群聊「${displayName}」（成员：${members.join("、")}），任务已下达，房间 manager 开始执行。用户可在左侧群聊区查看进度；如需追加指令，让用户直接在群聊窗口里发言。`,
+						},
+					],
+					details: { windowId: window.id, members, ...(window.name ? { name: window.name } : {}), roomJump: true },
+				};
+			},
+		});
+
+		pi.registerTool({
+			name: CORE_TOOL_INVITE,
+			label: "Invite To Group",
+			description:
+				"把其他已启用 worker 拉进当前群聊。成员变化下一轮进入 worker 清单，其委托工具在会话装配刷新后可用。仅群聊窗口可用。",
+			parameters: InviteToGroupParams,
+			async execute(_toolCallId, params: Static<typeof InviteToGroupParams>) {
+				const ctx = await deps.resolveContext();
+				if (ctx?.type !== "group") throw new Error(`${CORE_TOOL_INVITE} 仅在群聊窗口可用`);
+				const window = await deps.store.windowForSession(deps.getSessionId());
+				if (!window || window.type !== "group") throw new Error("当前 Session 不属于群聊窗口");
+				const requested = [...new Set(params.members.map((m) => m.trim()).filter(Boolean))];
+				if (requested.length === 0) throw new Error("至少填写 1 个要拉入的 worker");
+				const added: string[] = [];
+				const skipped: string[] = [];
+				for (const name of requested) {
+					if (window.members.includes(name)) {
+						skipped.push(name);
+						continue;
+					}
+					const agent = await deps.store.getAgent(name);
+					if (!agent || agent.pinned || agent.enabled === false) {
+						throw new Error(`worker「${name}」不存在、是内置 manager 或已被禁用，不能入群`);
+					}
+					added.push(name);
+				}
+				if (added.length === 0) {
+					return {
+						content: [{ type: "text", text: `${skipped.join("、")} 已在本群，无需重复拉人。` }],
+						details: { windowId: window.id, members: window.members, added, skipped },
+					};
+				}
+				// updateWindow 触发 emitChange → 撤权/空闲重建链（与 UI 改成员一致）。
+				const updated = await deps.store.updateWindow(window.id, { members: [...window.members, ...added] });
+				return {
+					content: [
+						{
+							type: "text",
+							text: `已把 ${added.join("、")} 拉进群聊${skipped.length ? `（${skipped.join("、")} 已在群内，跳过）` : ""}。新成员将进入 worker 清单，其委托工具在会话装配刷新后可用。`,
+						},
+					],
+					details: { windowId: window.id, members: updated.members, added, skipped },
+				};
+			},
+		});
 	};
 }
 
@@ -472,7 +610,9 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 const DelegateParams = Type.Object(
 	{
 		task: Type.String({ description: "委托给该 worker 的任务。" }),
-		parentDelegationId: Type.Optional(Type.String({ description: "若这是接力/追问，填写直接前序 delegationId。" })),
+		parentDelegationId: Type.Optional(
+			Type.String({ description: "若这是接力/追问，填写上一次委托返回文本中给出的 delegationId。" }),
+		),
 		handoffKind: Type.Optional(
 			Type.Union([Type.Literal("request"), Type.Literal("followup")], {
 				description: "request=新的有返回义务的子任务；followup=沿 parentDelegationId 继续。",
@@ -693,9 +833,14 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 				const artifactNote = artifacts?.length
 					? `\n\n交付物（可在接力任务中按路径引用）：\n${artifacts.map((a) => `- ${a.name}：${a.path}`).join("\n")}`
 					: "";
+				// delegationId 必须进正文：details 只给 UI，模型看不到，没有它
+				// followup 只能瞎填（实测填过工具名）。
+				const delegationNote = result.delegationId
+					? `\n\n（delegationId：${result.delegationId}——需要该 worker 接力/追问时，用 handoffKind="followup" 并把它填进 parentDelegationId）`
+					: "";
 				const extra = await soloMeta(result.status, result.content);
 				return {
-					content: [{ type: "text", text: `${text}${artifactNote}${syncNote(extra.synced as boolean | undefined)}` }],
+					content: [{ type: "text", text: `${text}${artifactNote}${delegationNote}${syncNote(extra.synced as boolean | undefined)}` }],
 					details: { ...meta, ...picked, ...extra },
 				};
 			},

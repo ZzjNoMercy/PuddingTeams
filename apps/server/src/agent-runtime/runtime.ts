@@ -518,10 +518,10 @@ export class AgentRuntime {
 
 		// approved：调用 driver.respond 恢复原 Run。
 		const providerState = await this.providerStateOf(interactionId);
+		// runHandle 可能为空：worker 在 Run 启动前发问（如分析模型澄清）时无
+		// 运行句柄可恢复，能否继续由 Driver 判断（PuddingClaw 走 clarify-and-
+		// retry 重跑）。这里抛错会把 delegation 永远卡在 waiting_input。
 		const runHandle = delegation.runHandle ?? "";
-		if (!runHandle) {
-			throw new InteractionError("not_found", `delegation ${delegation.id} has no runHandle`);
-		}
 
 		const controller = new AbortController();
 		this.runControllers.set(delegation.id, controller);

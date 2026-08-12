@@ -17,7 +17,7 @@ import path from "node:path";
  * <home>/uploads/
  * <home>/artifacts/blobs/
  * <home>/workspaces/{managed/,unscoped/}   # unscoped = 无项目中立 cwd
- * <home>/secrets/{credentials.json,credentials.key,interaction-secrets.json,interactions.key}
+ * <home>/secrets/{credentials.json,credentials.key,interaction-secrets.json,interactions.key,auth.json}
  * <home>/runtime/{backend.lease,tmp/}
  * <home>/logs/  <home>/migrations/
  * ```

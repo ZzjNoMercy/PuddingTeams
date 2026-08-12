@@ -6,7 +6,8 @@ import path from "node:path";
  * 自定义 Provider 控制面（借鉴 PuddingClaw 的 ProviderRegistry 模式，映射到
  * pi 原生分层）：自定义 OpenAI-compatible provider/模型持久化在 pi 的
  * `models.json`（`<agentDir>/models.json`，顶层 `{ providers: { id: … } }`），
- * 凭证不进 models.json——走 pi auth.json（ModelRuntime 凭证存储）。
+ * 凭证不进 models.json——走平台自有 auth.json（共享 ModelRuntime 的凭证
+ * 存储，<home>/secrets/auth.json，与 pi CLI 解耦 §10.6）。
  *
  * 借鉴点：原子写 + 0600 + 数据落在仓库外；模型手填与 API 发现并存。
  * 避坑点：不做明文 credentials.json（复用 pi 凭证体系）；不背遗留迁移包袱。

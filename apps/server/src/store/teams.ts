@@ -124,9 +124,9 @@ export interface WindowConfig {
 	/** Currently active pi session. */
 	activeSession: string;
 	/**
-	 * User-editable system prompt for this window's manager sessions
-	 * (e.g. per-worker rules like "派活前先列模型"). Replaces the built-in
-	 * relay guidance when set; empty = default relay guidance.
+	 * 群聊协作提示词（提示词管理方案 §5.3）：仅 Group 可编辑，只注入该群聊
+	 * manager，不传给 Worker。Direct 使用平台固定 relay（§5.2），服务端拒绝
+	 * 写入；Solo 无协作段。
 	 */
 	prompt?: string;
 	/** Per-worker last session handle, for multi-turn continuity (§7.1). */
@@ -921,7 +921,8 @@ export class TeamsStore {
 				type: "direct",
 				members: [member],
 				name: opts.name?.trim() || undefined,
-				prompt: opts.prompt?.trim() || undefined,
+				// Direct 不接受自定义协作提示词（§5.2 固定 relay）；opts.prompt 仅
+				// 由旧调用方传入，这里不再写入。
 				workspaceId,
 				cwdSnapshot: context.cwdSnapshot,
 				sessions: [created.id],
@@ -985,6 +986,8 @@ export class TeamsStore {
 	}): Promise<WindowConfig> {
 		const { type, members, workspaceId, cwdSnapshot, name, prompt, sessionId } = opts;
 		if (type === "solo") throw new Error("solo 窗口由系统创建，不能手动发起");
+		// §5.2：Direct 只有平台固定 relay，拒绝自定义协作提示词。
+		if (type === "direct" && prompt?.trim()) throw new Error("单聊窗口不支持自定义协作提示词（固定 relay）");
 		const context = await this.contextForWorkspace(workspaceId);
 		if (cwdSnapshot !== undefined && cwdSnapshot !== context.cwdSnapshot) {
 			throw new Error("Window cwdSnapshot does not match its context");
@@ -1018,7 +1021,14 @@ export class TeamsStore {
 			const w = data.windows[id];
 			if (!w) throw new Error(`window not found: ${id}`);
 			if (patch.name !== undefined) w.name = patch.name?.trim() || undefined;
-			if (patch.prompt !== undefined) w.prompt = patch.prompt?.trim() || undefined;
+			if (patch.prompt !== undefined) {
+				// §5.2：Direct 固定 relay，拒绝写入自定义协作提示词；传 "" 允许，
+				// 用于清掉历史遗留值。
+				if (w.type === "direct" && patch.prompt?.trim()) {
+					throw new Error("单聊窗口不支持自定义协作提示词（固定 relay）");
+				}
+				w.prompt = patch.prompt?.trim() || undefined;
+			}
 			if (patch.members !== undefined) {
 				const members = [...new Set(patch.members)];
 				if (w.type === "solo") {

@@ -32,7 +32,7 @@ export const puddingClawConnectorManifest: ConnectorExtensionManifest = {
 			},
 		},
 		secretSchema: [{ key: "PUDDINGCLAW_TOKEN", label: "PuddingClaw Backend Token", required: true }],
-		supportedUpstreamVersions: ">=0.9",
+		supportedUpstreamVersions: ">=0.1.2",
 	},
 };
 

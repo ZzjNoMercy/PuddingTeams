@@ -38,7 +38,9 @@ export interface RespondInput {
 export interface InteractionResponse {
 	requestId: string;
 	action: "approve" | "reject" | "answer" | "confirm";
-	scope?: "once" | "run" | "session";
+	/** permission 类是授权范围（once/run/session）；question 类是用户所选
+	 * 选项的原文（如分析模型名）——question options 复用此字段回传。 */
+	scope?: string;
 	value?: unknown;
 	message?: string;
 }
@@ -53,7 +55,9 @@ export interface InteractionRequest {
 	paths?: string[];
 	risk?: string;
 	reason?: string;
-	options?: Array<"once" | "run" | "session" | "reject">;
+	/** permission 类是授权范围选项（once/run/session/reject）；question 类是
+	 * 答案选项原文清单（如可选分析模型），用户选择经 InteractionResponse.scope 回传。 */
+	options?: string[];
 }
 
 export interface ArtifactRef {

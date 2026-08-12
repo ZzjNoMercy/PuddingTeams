@@ -40,12 +40,11 @@ function stderrSummary(stderr: string): string {
 /**
  * First-party PuddingClaw Driver (§5).
  *
- * - run         → puddingclaw run --input-json - --json [--export <handoffDir>]
+ * - run         → puddingclaw agent run --input-json - --json [--export <handoffDir>]
  * - continue    → same, plus {session_id}
- * - respond     → puddingclaw respond <run_id> --input-json - --json [--export …]
+ * - respond     → puddingclaw agent respond <run_id> --input-json - --json [--export …]
  *                  {continuation_token, request_id, decisions}
- * - cancel      → puddingclaw cancel <run_id> (best-effort; the CLI may not
- *                  have a public cancel yet, so absence degrades to SIGTERM)
+ * - cancel      → puddingclaw agent cancel <run_id>（best-effort：失败降级为 SIGTERM）
  *
  * --export 目录按 §15.3 约定生成为 <cwd>/.pudding/handoff/<delegationId>/
  * （delegationId 由 Runtime 经 InvocationContext 注入）。
@@ -94,6 +93,16 @@ export class PuddingClawDriver implements AgentDriver {
 				artifacts: event.result.artifacts.map((a) => ({ ...a, path: handoffRelativePath(delegationId, a.path) })),
 			},
 		};
+	}
+
+	/**
+	 * input_required 时把原任务文本塞进 providerState（加密私有通道）：
+	 * worker 在 Run 启动前发问（分析模型澄清）时没有 continuation token /
+	 * runHandle 可恢复，respond 只能 clarify-and-retry 带原任务重跑（§8.2）。
+	 */
+	private withResumeState(event: AgentEvent, message: string): AgentEvent {
+		if (event.type !== "input_required") return event;
+		return { ...event, providerState: { ...(event.providerState ?? {}), task: message } };
 	}
 
 	private async runCli(
@@ -191,20 +200,26 @@ export class PuddingClawDriver implements AgentDriver {
 		yield {
 			type: "started",
 		};
-		yield await this.runCli(
-			["run", "--input-json", "-", "--json", ...this.exportArgs(ctx)],
-			{ message: input.message, request_id: input.requestId, ...(input.options ?? {}) },
-			ctx,
+		yield this.withResumeState(
+			await this.runCli(
+				["agent", "run", "--input-json", "-", "--json", ...this.exportArgs(ctx)],
+				{ message: input.message, request_id: input.requestId, ...(input.options ?? {}) },
+				ctx,
+			),
+			input.message,
 		);
 	}
 
 	async *continue(input: ContinueInput, ctx: InvocationContext): AsyncIterable<AgentEvent> {
 		ctx.onUpdate?.("worker 正在续接会话…", { running: true });
 		yield { type: "started", sessionHandle: input.sessionHandle };
-		yield await this.runCli(
-			["run", "--input-json", "-", "--json", ...this.exportArgs(ctx)],
-			{ message: input.message, session_id: input.sessionHandle, request_id: input.requestId, ...(input.options ?? {}) },
-			ctx,
+		yield this.withResumeState(
+			await this.runCli(
+				["agent", "run", "--input-json", "-", "--json", ...this.exportArgs(ctx)],
+				{ message: input.message, session_id: input.sessionHandle, request_id: input.requestId, ...(input.options ?? {}) },
+				ctx,
+			),
+			input.message,
 		);
 	}
 
@@ -216,22 +231,44 @@ export class PuddingClawDriver implements AgentDriver {
 			? state.continuation_token
 			: this.opts.continuationToken;
 		if (!token) {
-			yield {
-				type: "failed",
-				result: {
-					agentId: this.id,
-					status: "failed",
-					errorCode: "interaction_unsupported",
-					error: "PuddingClaw respond 需要 continuation token；当前未提供",
-					recoverable: false,
+			// clarify-and-retry（§8.2）：worker 在 Run 启动前的发问（如分析模型
+			// 澄清）没有 continuation token/runHandle 可恢复。契约是把用户的
+			// 选择并入原任务重跑一次，让模型路由这次能唯一匹配。原任务文本
+			// 由 run/continue 经 providerState.task 私有通道带来。
+			const task = typeof state.task === "string" ? state.task : "";
+			const answer = input.responses.find(
+				(r) => r.action !== "reject" && ((typeof r.scope === "string" && r.scope) || (typeof r.value === "string" && r.value)),
+			);
+			const chosen = typeof answer?.scope === "string" && answer.scope ? answer.scope : (answer?.value as string | undefined);
+			if (!task || !chosen) {
+				yield {
+					type: "failed",
+					result: {
+						agentId: this.id,
+						status: "failed",
+						errorCode: "interaction_unsupported",
+						error: "该审批对应的 worker 运行不支持恢复（无 continuation token），且缺少重跑所需的原任务或用户选择，请重新委托并在任务中说明选择",
+						recoverable: false,
+					},
+				};
+				return;
+			}
+			ctx.onUpdate?.("正在按你的选择重跑…", { running: true });
+			yield { type: "started", runHandle: input.runHandle };
+			yield await this.runCli(
+				["agent", "run", "--input-json", "-", "--json", ...this.exportArgs(ctx)],
+				{
+					message: `${task}\n\n（用户已明确：使用「${chosen}」执行本任务。）`,
+					request_id: input.requestId,
 				},
-			};
+				ctx,
+			);
 			return;
 		}
 		ctx.onUpdate?.("正在提交审批…", { running: true });
 		yield { type: "started", runHandle: input.runHandle };
 		yield await this.runCli(
-			["respond", input.runHandle, "--input-json", "-", "--json", ...this.exportArgs(ctx)],
+			["agent", "respond", input.runHandle, "--input-json", "-", "--json", ...this.exportArgs(ctx)],
 			{
 				continuation_token: token,
 				request_id: input.requestId,
@@ -250,7 +287,7 @@ export class PuddingClawDriver implements AgentDriver {
 		try {
 			await spawnWorker({
 				command: this.cmd(),
-				args: ["cancel", input.runHandle, "--json"],
+				args: ["agent", "cancel", input.runHandle, "--json"],
 				env: ctx.env,
 				cwd: this.ctxCwd(ctx),
 				signal: ctx.signal,
