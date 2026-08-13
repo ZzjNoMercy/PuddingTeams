@@ -114,6 +114,11 @@ export function WorkerAvatar({
 
 /** Avatar for the pi manager, always present in every room. */
 export function ManagerAvatar({ size = 24, className }: { size?: number; className?: string }) {
+	// pinned manager（agent 名 "manager"）走同一头像注册表：pi Connector 声明了
+	// 包内默认头像（lobehub Pi 图标），注册表装饰 hasDefaultAvatar 后即得 URL。
+	const url = useAgentAvatar("manager");
+	const [failedUrl, setFailedUrl] = useState<string | null>(null);
+	const failed = url !== null && failedUrl === url;
 	return (
 		<span
 			className={cn(
@@ -123,7 +128,17 @@ export function ManagerAvatar({ size = 24, className }: { size?: number; classNa
 			style={{ width: size, height: size }}
 			title="pi manager"
 		>
-			<BrainIcon style={{ width: size * 0.55, height: size * 0.55 }} />
+			{url && !failed ? (
+				// eslint-disable-next-line @next/next/no-img-element -- connector 包内默认头像，动态 URL
+				<img
+					src={url}
+					alt="pi manager"
+					onError={() => setFailedUrl(url)}
+					className="h-full w-full rounded-full object-cover"
+				/>
+			) : (
+				<BrainIcon style={{ width: size * 0.55, height: size * 0.55 }} />
+			)}
 		</span>
 	);
 }

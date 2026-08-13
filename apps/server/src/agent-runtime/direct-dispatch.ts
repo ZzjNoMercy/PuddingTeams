@@ -57,19 +57,23 @@ function resultCard(
 /**
  * direct 窗口消息入口：命中 direct 窗口时消费这条消息（返回 true），调用方
  * 不再走 session.prompt。worker 委托在后台执行，结果以卡片写回同一 session。
+ * `content` 是完整委托文本（含附件冻结路径块）；`display` 是气泡展示文本
+ * （用户正文 + 附件名），缺省与 content 相同。
  */
 export async function dispatchDirectMessage(
 	deps: DirectDispatchDeps,
 	sessionId: string,
 	content: string,
+	display?: string,
 ): Promise<boolean> {
 	const target = await directWorkerFor(deps.teams, sessionId);
 	if (!target) return false;
 	const { window, workerName } = target;
+	const displayText = display ?? content;
 
 	await deps.sessions.sendCustomMessage(
 		sessionId,
-		{ customType: "pudding:user_message", content, details: { windowId: window.id } },
+		{ customType: "pudding:user_message", content: displayText, details: { windowId: window.id } },
 		{ triggerTurn: false },
 	);
 	// 全新 direct 窗口的 session 文件可能还没落盘（SDK 首条 assistant 消息前
@@ -80,7 +84,7 @@ export async function dispatchDirectMessage(
 		sessionId,
 		{
 			customType: "pudding:task_assign",
-			content,
+			content: displayText,
 			details: { taskId, worker: workerName, windowId: window.id, from: "direct", status: "running" },
 		},
 		{ triggerTurn: false },

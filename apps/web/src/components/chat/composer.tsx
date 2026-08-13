@@ -102,9 +102,9 @@ function ModelPicker({ sessionId }: { sessionId: string }) {
 			<PromptInputSelectContent>
 				{[...byProvider.entries()].map(([provider, providerModels]) => (
 					<SelectGroup key={provider}>
-						<SelectLabel>{provider}</SelectLabel>
+						<SelectLabel className="text-sm font-medium text-foreground">{provider}</SelectLabel>
 						{providerModels.map((m) => (
-							<PromptInputSelectItem key={m.id} value={m.id}>
+							<PromptInputSelectItem key={m.id} value={m.id} className="text-xs text-muted-foreground">
 								{m.name}
 							</PromptInputSelectItem>
 						))}

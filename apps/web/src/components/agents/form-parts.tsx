@@ -15,7 +15,7 @@ import {
 	setAgentSecrets,
 	uploadAgentAvatar,
 } from "@/lib/api";
-import { agentAvatarChanged, useAgentAvatar } from "@/lib/avatars";
+import { agentAvatarChanged } from "@/lib/avatars";
 import { WorkerAvatar } from "@/components/chat/worker-avatar";
 import type { AgentConfig, AffectedSessions, ModelSummary, SecretSchemaItem } from "@/lib/types";
 
@@ -359,7 +359,6 @@ export function AvatarEditor({
 }) {
 	const inputRef = useRef<HTMLInputElement>(null);
 	const [busy, setBusy] = useState(false);
-	const avatarUrl = useAgentAvatar(agent.name);
 
 	const handleFile = async (file: File) => {
 		setBusy(true);
@@ -410,14 +409,16 @@ export function AvatarEditor({
 						{busy ? <LoaderIcon className="size-3.5 animate-spin" /> : <ImagePlusIcon className="size-3.5" />}
 						上传头像
 					</Button>
-					{avatarUrl ? (
+					{agent.avatar ? (
 						<Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => void handleRemove()}>
 							<XIcon className="size-3.5" />
 							删除
 						</Button>
 					) : null}
 				</div>
-				<p className="text-xs text-muted-foreground">png / jpg / webp / gif，最大 2MB；未上传时使用程序化默认头像。</p>
+				<p className="text-xs text-muted-foreground">
+					png / jpg / webp / gif，最大 2MB；未上传时使用{agent.hasDefaultAvatar ? " Connector 默认头像" : "程序化默认头像"}。
+				</p>
 			</div>
 		</div>
 	);

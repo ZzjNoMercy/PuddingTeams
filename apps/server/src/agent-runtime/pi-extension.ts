@@ -27,6 +27,8 @@ export const piConnectorManifest: ConnectorExtensionManifest = {
 		apiVersion: "1",
 		defaultTransport: "sdk",
 		supportedTransports: ["sdk"],
+		// lobehub Pi 图标（pi-mono 官方 logo），builtin assetsDir 见 index.ts 装配。
+		avatar: "pi.svg",
 		configSchema: {
 			type: "object",
 			properties: {

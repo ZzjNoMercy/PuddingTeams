@@ -1070,7 +1070,7 @@ export function AgentManageDialog({
 						{agent.connector ? <Badge variant="outline">Connector 接入</Badge> : null}
 						{legacy ? <Badge variant="outline">命令接入</Badge> : null}
 					</DialogTitle>
-					<DialogDescription>基础接入、Capability Extensions 与运行状态（§10.1）。</DialogDescription>
+					<DialogDescription>基础接入、Capability Extensions 与运行状态。</DialogDescription>
 				</DialogHeader>
 
 				{/* 通用信息：头像 + 描述 + 责任边界（全量 upsert，保留现有绑定） */}
@@ -1120,7 +1120,7 @@ export function AgentManageDialog({
 				{agent.connector?.connectorId === "pi" ? (
 					<div className="rounded-md bg-muted/60 p-3 text-xs text-muted-foreground">
 						提示词与资源（systemPrompt / 技能 / 模板）已移至独立配置页：
-						<Link href={`/agents/${encodeURIComponent(agent.name)}`} className="ml-1 underline hover:text-foreground">
+						<Link href={`/agents/config?name=${encodeURIComponent(agent.name)}`} className="ml-1 underline hover:text-foreground">
 							打开「{agent.name}」配置页
 						</Link>
 					</div>

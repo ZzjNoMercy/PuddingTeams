@@ -147,3 +147,14 @@ test("directWorkerFor：内置 manager 成员不作为可直派 worker", async (
 	);
 	assert.equal(target, undefined);
 });
+
+test("附件场景：气泡用展示文本（正文+附件名），委托消息保留完整冻结路径块", async () => {
+	const { deps, sent, delegateCalls, settle } = makeDeps({});
+	const promptText = "这个pdf讲了什么\n\n用户附件（平台冻结路径，可按需读取并在委托任务中原样传递）：\n- PRD.pdf (application/pdf, 100 bytes): /home/uploads/x/PRD.pdf";
+	const displayText = "这个pdf讲了什么\n\n附件：PRD.pdf";
+	await dispatchDirectMessage(deps, "s-direct", promptText, displayText);
+	await settle();
+	assert.equal(sent[0]!.content, displayText, "用户气泡不含路径块");
+	assert.equal(sent[1]!.content, displayText, "running 卡同样用展示文本");
+	assert.equal(delegateCalls[0]!.message, promptText, "worker 委托保留完整路径块");
+});

@@ -446,7 +446,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 							<h1 className="text-sm font-semibold">{SECTIONS.find((item) => item.key === section)?.label}</h1>
 							{dirty ? <span className="text-xs text-muted-foreground">草稿已修改，保存后生效</span> : null}
 						</div>
-						{section === "overview" ? <OverviewSection draft={draft} onChange={patchDraft} /> : null}
+						{section === "overview" ? <OverviewSection agent={agent} draft={draft} onChange={patchDraft} onAgentUpdated={setAgent} /> : null}
 						{section === "model" ? <ModelSection agent={agent} draft={draft} onChange={patchDraft} /> : null}
 						{section === "prompt" ? <PromptSection agent={agent} draft={draft} onChange={patchDraft} /> : null}
 						{section === "skills" ? <ResourceLibrarySection kind="skills" agent={agent} draft={draft} onChange={patchDraft} /> : null}

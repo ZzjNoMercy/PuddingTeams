@@ -13,6 +13,12 @@ import type { PiSessionStore } from "../pi-bridge/session-store.js";
 import type { AgentCapabilityBinding } from "../agent-runtime/extensions.js";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { previewPiResources } from "../pi-bridge/pi-resources.js";
+import { PI_CONNECTOR_ID } from "../agent-runtime/pi-extension.js";
+
+/** 头像回退用的 connector id：有绑定用绑定；pinned manager / pi worker 归 pi。 */
+function avatarConnectorId(agent: AgentConfig): string | undefined {
+	return agent.connector?.connectorId ?? (agent.invoke?.type === "pi" ? PI_CONNECTOR_ID : undefined);
+}
 
 export interface AgentsRouteDeps {
 	credentials?: CredentialsStore;
@@ -103,11 +109,12 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		// 前端据此走 avatar URL（GET avatar 路由会回退到包内资源）。
 		if (!extensions) return { agents };
 		return {
-			agents: agents.map((a) =>
-				!a.avatar && a.connector && extensions.hasConnectorAvatar(a.connector.connectorId)
+			agents: agents.map((a) => {
+				const connectorId = avatarConnectorId(a);
+				return !a.avatar && connectorId && extensions.hasConnectorAvatar(connectorId)
 					? { ...a, hasDefaultAvatar: true }
-					: a,
-			),
+					: a;
+			}),
 		};
 	});
 
@@ -661,7 +668,8 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		if (!avatar) {
 			if (extensions) {
 				const agent = (await teams.listAgents()).find((a) => a.name === req.params.name);
-				const fallback = agent?.connector ? await extensions.readConnectorAvatar(agent.connector.connectorId) : null;
+				const connectorId = agent ? avatarConnectorId(agent) : undefined;
+				const fallback = connectorId ? await extensions.readConnectorAvatar(connectorId) : null;
 				if (fallback) {
 					return reply
 						.header("content-type", fallback.mime)

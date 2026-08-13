@@ -177,6 +177,9 @@ export async function registerChatRoutes(
 			// Direct 窗口（§5.2）：绕过 manager relay，直派窗口成员 worker；
 			// 窗口 pi session 只作消息流容器，不触发 manager 回合。
 			if (teams && invoker) {
+				// 气泡只展示用户正文 + 附件名；完整冻结路径块只进 worker 委托消息。
+				const attachLine = stored.length ? `附件：${stored.map((item) => item.name).join("、")}` : "";
+				const displayText = [content, attachLine].filter(Boolean).join("\n\n");
 				const handled = await dispatchDirectMessage(
 					{
 						teams,
@@ -187,6 +190,7 @@ export async function registerChatRoutes(
 					},
 					req.params.id,
 					promptText,
+					displayText,
 				);
 				if (handled) {
 					if (isFirstMessage) generateTitle();
@@ -228,8 +232,18 @@ export async function registerChatRoutes(
 			const sessionId = req.params.id;
 			// Browsers always send Origin on cross-origin upgrades; native
 			// clients (curl/node) may omit it — allow those, block foreign pages.
+			// 发行态同源托管：server 可能绑 0.0.0.0 从局域网 IP/主机名访问，
+			// Origin 与请求 Host 一致即同源，无需进白名单。
 			const origin = req.headers.origin;
-			if (origin && !config.allowedOrigins.includes(origin)) {
+			let sameOrigin = false;
+			if (origin) {
+				try {
+					sameOrigin = new URL(origin).host === req.headers.host;
+				} catch {
+					sameOrigin = false;
+				}
+			}
+			if (origin && !sameOrigin && !config.allowedOrigins.includes(origin)) {
 				socket.close(1008, "origin not allowed");
 				return;
 			}

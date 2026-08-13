@@ -9,6 +9,7 @@ import { CredentialsStore } from "../store/credentials.js";
 import { ExtensionCatalog } from "../agent-runtime/extensions.js";
 import { DriverRegistry } from "../agent-runtime/driver-registry.js";
 import { ExtensionRegistry } from "../agent-runtime/extension-registry.js";
+import { piConnectorManifest } from "../agent-runtime/pi-extension.js";
 import { registerAgentsRoutes } from "./agents.js";
 import type { ConnectorExtensionManifest } from "../agent-runtime/extensions.js";
 
@@ -129,4 +130,34 @@ test("§11: 无 connector 默认头像的 agent 仍是 404（前端展示程序�
 		(a) => a.name === "plain-worker",
 	);
 	assert.equal(plain!.hasDefaultAvatar, undefined);
+});
+
+test("§11: pinned manager（无 connector 绑定）回退到 pi Connector 的默认头像", async () => {
+	const dir = freshDir("pt-avatar-pi-");
+	const assetsDir = path.join(dir, "pi-assets");
+	mkdirSync(assetsDir, { recursive: true });
+	writeFileSync(path.join(assetsDir, "pi.svg"), SVG_ASSET);
+
+	const teams = new TeamsStore(
+		{ state: path.join(dir, "teams"), assets: path.join(dir, "teams"), managedWorkspaces: path.join(dir, "managed") },
+		dir,
+	);
+	await teams.init();
+	const registry = new ExtensionRegistry(path.join(dir, "teams"), new ExtensionCatalog(), new DriverRegistry());
+	registry.registerBuiltin(piConnectorManifest, {}, { assetsDir });
+	await registry.init();
+	const app = Fastify();
+	registerAgentsRoutes(app, teams, { extensions: registry });
+
+	// pinned manager 没有 connector 绑定，按 invoke.type === "pi" 归 pi Connector。
+	const list = await app.inject({ method: "GET", url: "/api/agents" });
+	const manager = (list.json() as { agents: Array<{ name: string; hasDefaultAvatar?: boolean }> }).agents.find(
+		(a) => a.name === "manager",
+	);
+	assert.equal(manager!.hasDefaultAvatar, true);
+
+	const res = await app.inject({ method: "GET", url: "/api/agents/manager/avatar" });
+	assert.equal(res.statusCode, 200);
+	assert.equal(res.headers["content-type"], "image/svg+xml");
+	assert.equal(res.body, SVG_ASSET);
 });

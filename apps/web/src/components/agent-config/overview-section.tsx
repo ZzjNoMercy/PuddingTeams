@@ -2,18 +2,25 @@
 
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import type { AgentConfig } from "@/lib/types";
 import type { ConfigDraft } from "@/components/agent-config/draft";
+import { AvatarEditor } from "@/components/agents/form-parts";
 
-/** 概览分区：描述 + 责任边界（随页面级统一保存提交）。 */
+/** 概览分区：头像 + 描述 + 责任边界（头像即传即生效，其余随页面级统一保存提交）。 */
 export function OverviewSection({
+	agent,
 	draft,
 	onChange,
+	onAgentUpdated,
 }: {
+	agent: AgentConfig;
 	draft: ConfigDraft;
 	onChange: (patch: Partial<ConfigDraft>) => void;
+	onAgentUpdated: (agent: AgentConfig) => void;
 }) {
 	return (
 		<div className="flex flex-col gap-3">
+			<AvatarEditor agent={agent} onUpdated={onAgentUpdated} />
 			<label className="flex flex-col gap-1 text-sm">
 				<span className="text-muted-foreground">描述</span>
 				<Textarea value={draft.description} onChange={(e) => onChange({ description: e.target.value })} rows={3} />
