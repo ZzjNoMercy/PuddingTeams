@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { BugIcon, BotIcon, InfoIcon, MessageSquareIcon, SettingsIcon, SlidersHorizontalIcon } from "lucide-react";
 import { GithubIcon } from "@/components/github-icon";
 import { SettingsDialog } from "@/components/settings/settings-dialog";
@@ -19,36 +20,37 @@ const ISSUE_URL = "https://github.com/ZzjNoMercy/PuddingTeams/issues/new";
 
 export type AppView = "chat" | "agents";
 
-export function NavRail({ view, onView }: { view: AppView; onView: (v: AppView) => void }) {
+/** 主导航：chat（/）与智能体（/agents）是独立路由，切换即跳转。 */
+export function NavRail({ view }: { view: AppView }) {
 	const [settingsOpen, setSettingsOpen] = useState(false);
 	const [aboutOpen, setAboutOpen] = useState(false);
 
 	return (
 		<div className="flex w-14 shrink-0 flex-col items-center border-r bg-muted/50 py-2">
-			<button
-				type="button"
-				onClick={() => onView("chat")}
+			<Link
+				href="/"
 				title="对话"
 				aria-label="对话"
+				aria-current={view === "chat" ? "page" : undefined}
 				className={cn(
 					"flex size-9 items-center justify-center rounded-md text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground",
 					view === "chat" && "bg-accent text-accent-foreground",
 				)}
 			>
 				<MessageSquareIcon className="size-4" />
-			</button>
-			<button
-				type="button"
-				onClick={() => onView("agents")}
+			</Link>
+			<Link
+				href="/agents"
 				title="智能体"
 				aria-label="智能体"
+				aria-current={view === "agents" ? "page" : undefined}
 				className={cn(
 					"mt-1 flex size-9 items-center justify-center rounded-md text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground",
 					view === "agents" && "bg-accent text-accent-foreground",
 				)}
 			>
 				<BotIcon className="size-4" />
-			</button>
+			</Link>
 
 			<div className="flex-1" />
 

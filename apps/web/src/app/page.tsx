@@ -1,22 +1,17 @@
 "use client";
 
-import { Suspense, useCallback, useEffect, useState } from "react";
-import { useSearchParams } from "next/navigation";
+import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
-import { AgentsPane } from "@/components/agents/agents-pane";
 import { ChatPane } from "@/components/chat/chat-pane";
 import { CreateWindowDialog } from "@/components/chat/create-window-dialog";
 import { SessionList } from "@/components/chat/session-list";
-import { NavRail, type AppView } from "@/components/chat/nav-rail";
+import { NavRail } from "@/components/chat/nav-rail";
 import { deleteRoom, listRooms } from "@/lib/api";
 import type { RoomSummary } from "@/lib/types";
 
-function HomeInner() {
-	const searchParams = useSearchParams();
+export default function Home() {
 	const [rooms, setRooms] = useState<RoomSummary[]>([]);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
-	// 初始视图可由 ?view=agents 指定（如 Agent 配置页「返回」回到智能体列表）。
-	const [view, setView] = useState<AppView>(() => (searchParams.get("view") === "agents" ? "agents" : "chat"));
 	const [createOpen, setCreateOpen] = useState(false);
 	const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -61,7 +56,6 @@ function HomeInner() {
 	// link). The window may be brand-new (auto-created by solo routing), so the
 	// sidebar list is refetched to pick it up.
 	const openWindow = useCallback((id: string) => {
-		setView("chat");
 		setSelectedId(id);
 		listRooms()
 			.then((rooms) => setRooms(rooms))
@@ -93,55 +87,38 @@ function HomeInner() {
 
 	return (
 		<div className="flex h-dvh">
-			<NavRail view={view} onView={setView} />
-			{view === "chat" ? (
-				<>
-					<SessionList
-						rooms={rooms}
-						selectedId={selectedId}
-						onSelect={setSelectedId}
-						onNew={handleNew}
-						onDelete={handleDelete}
+			<NavRail view="chat" />
+			<SessionList
+				rooms={rooms}
+				selectedId={selectedId}
+				onSelect={setSelectedId}
+				onNew={handleNew}
+				onDelete={handleDelete}
+			/>
+			<main className="flex min-w-0 flex-1 flex-col bg-background">
+				{selectedId ? (
+					<ChatPane
+						key={selectedId}
+						roomId={selectedId}
+						onOpenWindow={openWindow}
+						onRoomUpdated={handleRoomUpdated}
 					/>
-					<main className="flex min-w-0 flex-1 flex-col bg-background">
-						{selectedId ? (
-							<ChatPane
-								key={selectedId}
-								roomId={selectedId}
-								onOpenWindow={openWindow}
-								onRoomUpdated={handleRoomUpdated}
-							/>
-						) : (
-							<div className="flex flex-1 flex-col items-center justify-center gap-4 bg-muted/30">
-								<p className="text-sm text-muted-foreground">选择左侧窗口，或发起一个新对话</p>
-								{loadError ? (
-									<p className="text-xs text-destructive">
-										无法连接 backend（{loadError}）。请确认 server 已启动。
-									</p>
-								) : null}
-							</div>
-						)}
-					</main>
-					<CreateWindowDialog
-						open={createOpen}
-						onOpenChange={setCreateOpen}
-						onCreated={upsertRoom}
-					/>
-				</>
-			) : (
-				<main className="flex min-w-0 flex-1 flex-col bg-background">
-					<AgentsPane />
-				</main>
-			)}
+				) : (
+					<div className="flex flex-1 flex-col items-center justify-center gap-4 bg-muted/30">
+						<p className="text-sm text-muted-foreground">选择左侧窗口，或发起一个新对话</p>
+						{loadError ? (
+							<p className="text-xs text-destructive">
+								无法连接 backend（{loadError}）。请确认 server 已启动。
+							</p>
+						) : null}
+					</div>
+				)}
+			</main>
+			<CreateWindowDialog
+				open={createOpen}
+				onOpenChange={setCreateOpen}
+				onCreated={upsertRoom}
+			/>
 		</div>
-	);
-}
-
-export default function Home() {
-	// useSearchParams 需要 Suspense 边界（Next 静态预渲染约束）。
-	return (
-		<Suspense fallback={null}>
-			<HomeInner />
-		</Suspense>
 	);
 }

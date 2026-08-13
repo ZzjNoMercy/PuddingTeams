@@ -113,7 +113,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 
 	const handleBack = useCallback(() => {
 		if (dirty) setLeaveConfirm(true);
-		else router.push("/?view=agents");
+		else router.push("/agents");
 	}, [dirty, router]);
 
 	const handleSave = useCallback(async () => {
@@ -291,7 +291,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 		return (
 			<div className="flex h-dvh flex-col items-center justify-center gap-3">
 				<p className="text-sm text-destructive">无法加载智能体列表：{loadError}</p>
-				<Button size="sm" variant="outline" onClick={() => router.push("/?view=agents")}>
+				<Button size="sm" variant="outline" onClick={() => router.push("/agents")}>
 					返回
 				</Button>
 			</div>
@@ -309,7 +309,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 		return (
 			<div className="flex h-dvh flex-col items-center justify-center gap-3">
 				<p className="text-sm text-muted-foreground">智能体「{name}」不存在（404）。</p>
-				<Button size="sm" variant="outline" onClick={() => router.push("/?view=agents")}>
+				<Button size="sm" variant="outline" onClick={() => router.push("/agents")}>
 					返回智能体列表
 				</Button>
 			</div>
@@ -322,7 +322,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 					「{agent.name}」不是 pi Agent（connector: {agent.connector?.connectorId ?? "命令接入"}），此配置页只承载
 					pinned manager 与 pi Connector worker。
 				</p>
-				<Button size="sm" variant="outline" onClick={() => router.push("/?view=agents")}>
+				<Button size="sm" variant="outline" onClick={() => router.push("/agents")}>
 					返回智能体列表
 				</Button>
 			</div>
@@ -466,7 +466,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 						<Button type="button" variant="ghost" onClick={() => setLeaveConfirm(false)}>
 							继续编辑
 						</Button>
-						<Button type="button" variant="destructive" onClick={() => router.push("/?view=agents")}>
+						<Button type="button" variant="destructive" onClick={() => router.push("/agents")}>
 							放弃并返回
 						</Button>
 					</DialogFooter>
