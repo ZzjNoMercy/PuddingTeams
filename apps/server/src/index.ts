@@ -34,6 +34,7 @@ import { WorkStateStore } from "./store/work-state.js";
 import { registerWorkStateRoutes } from "./routes/work-state.js";
 import { UploadStore } from "./store/uploads.js";
 import { configureSharedModelRuntime } from "./pi-bridge/model-runtime.js";
+import { registerWebStatic } from "./web-static.js";
 
 const app = Fastify({ logger: { level: "warn" } });
 
@@ -96,7 +97,10 @@ const catalog = new ExtensionCatalog();
 const productSettings = new ProductSettingsStore(paths.config);
 const extensionRegistry = new ExtensionRegistry(paths.extensions, catalog, drivers);
 extensionRegistry.registerBuiltin(puddingClawConnectorManifest, puddingClawExtensionHooks());
-extensionRegistry.registerBuiltin(piConnectorManifest, piExtensionHooks({ sessionDir: paths.workerSessions }));
+extensionRegistry.registerBuiltin(piConnectorManifest, piExtensionHooks({ sessionDir: paths.workerSessions }), {
+	// pi Connector 的默认头像（lobehub Pi 图标）随 server 包发布。
+	assetsDir: fileURLToPath(new URL("../assets", import.meta.url)),
+});
 await extensionRegistry.init({ developerMode: (await productSettings.get()).developerMode });
 // P2（§9.5 双宿主包）：codex / claude-code Connector 本体在 extensions/connectors/*，
 // 第一方预置 = 启动时按仓库内路径安装/更新，不再代码内嵌 builtin。
@@ -193,6 +197,10 @@ process.on("SIGINT", () => void shutdown().then(() => process.exit(0)));
 process.on("SIGTERM", () => void shutdown().then(() => process.exit(0)));
 
 try {
+	// 发行态：web 静态产物存在时同源托管（dev 下 out/ 不存在则跳过）。
+	if (registerWebStatic(app)) {
+		app.log.info("serving web static bundle (apps/web/out)");
+	}
 	await app.listen({ host: config.host, port: config.port });
 } catch (err) {
 	app.log.error(err, "failed to start server");

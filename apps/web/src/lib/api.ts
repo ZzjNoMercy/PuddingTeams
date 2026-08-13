@@ -34,7 +34,14 @@ import type {
 	WorkspaceTrustState,
 } from "./types";
 
-const SERVER_URL = process.env.NEXT_PUBLIC_SERVER_URL ?? "http://127.0.0.1:8933";
+// 发行态 web 静态产物由 server 同源托管，生产构建直接走 location.origin（端口由
+// 安装时的 server 决定，构建期不可知）；dev（next dev :8934 跨端口）回退到 8933。
+// NEXT_PUBLIC_SERVER_URL 可显式覆盖两者。
+const SERVER_URL =
+	process.env.NEXT_PUBLIC_SERVER_URL ??
+	(process.env.NODE_ENV === "production" && typeof window !== "undefined"
+		? window.location.origin
+		: "http://127.0.0.1:8933");
 
 export interface HealthInfo {
 	ok: boolean;

@@ -230,7 +230,7 @@ export function ManagerDialog({
 
 				<div className="rounded-md bg-muted/60 p-3 text-xs text-muted-foreground">
 					提示词与资源（systemPrompt / 技能 / 模板）已移至独立配置页：
-					<Link href={`/agents/${encodeURIComponent(agent.name)}`} className="ml-1 underline hover:text-foreground">
+					<Link href={`/agents/config?name=${encodeURIComponent(agent.name)}`} className="ml-1 underline hover:text-foreground">
 						打开「{agent.name}」配置页
 					</Link>
 				</div>

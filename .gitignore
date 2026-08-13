@@ -7,3 +7,7 @@ dist/
 .DS_Store
 apps/server/.sessions/
 apps/server/.teams/
+
+# 发行构建产物
+packages/puddingteams-cli/runtime/
+packages/puddingteams-cli/*.tgz

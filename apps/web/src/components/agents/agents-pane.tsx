@@ -414,7 +414,7 @@ export function AgentsPane() {
 	/** pinned manager 与 pi worker 进独立配置页；其余 worker 仍开三分区管理抽屉。 */
 	const openManage = (agent: AgentConfig) => {
 		if (agent.pinned || agent.connector?.connectorId === "pi") {
-			router.push(`/agents/${encodeURIComponent(agent.name)}`);
+			router.push(`/agents/config?name=${encodeURIComponent(agent.name)}`);
 			return;
 		}
 		setManageAgent(agent);

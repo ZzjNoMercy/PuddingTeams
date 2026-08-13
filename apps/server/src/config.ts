@@ -17,3 +17,10 @@ export const config = {
 		.map((s) => s.trim())
 		.filter(Boolean),
 };
+
+// 发行态 web 静态产物由本 server 同源托管，浏览器会在写请求/WS 上带自身源的
+// Origin 头，必须放行，否则同源 POST/WS 反被 CORS 拦下。
+config.allowedOrigins.push(
+	`http://127.0.0.1:${config.port}`,
+	`http://localhost:${config.port}`,
+);
