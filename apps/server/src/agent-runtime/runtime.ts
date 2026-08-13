@@ -67,6 +67,13 @@ export class SessionConflictError extends Error {
 	}
 }
 
+/** 失效会话失败的特征：worker 报 session 不存在（后端删 session/换实例/CLI 世代
+ * 替换都会触发，平台无需区分原因）。只匹配明确措辞，不误吞普通执行失败。 */
+const STALE_SESSION_PATTERN = /session[^\n]*not found/i;
+function isStaleSessionFailure(event: AgentEvent): boolean {
+	return event.type === "failed" && typeof event.result.error === "string" && STALE_SESSION_PATTERN.test(event.result.error);
+}
+
 /**
  * AgentRuntime：生命周期、并发锁、超时、取消、持久化与事件归一化（方案 §3/§8）。
  *
@@ -185,26 +192,45 @@ export class AgentRuntime {
 		};
 		const requestId = input.requestId ?? randomUUID();
 		let sessionHandle = knownSession;
+		// 失效会话恢复：continue 撞上 session-not-found（后端删 session/换实例/
+		// 升级换代都会让旧 handle 失效，平台无法也无需区分原因）时，丢弃失效
+		// handle 以新会话透明重跑一次，而不是把失败抛给上层让 manager 连环试错。
+		let staleRetried = false;
+		const startRun = (fresh: boolean): AsyncIterable<AgentEvent> =>
+			fresh || input.mode === "run" || !sessionHandle
+				? driver.run({ message: input.message, requestId, options: input.options }, runCtx)
+				: driver.continue(
+						{ message: input.message, requestId, sessionHandle: sessionHandle!, options: input.options },
+						runCtx,
+					);
 		try {
-			const events =
-				input.mode === "run" || !knownSession
-					? driver.run({ message: input.message, requestId, options: input.options }, runCtx)
-					: driver.continue(
-							{ message: input.message, requestId, sessionHandle: knownSession, options: input.options },
-							runCtx,
-						);
-
-			for await (const event of events) {
-				const handled = await this.handleEvent(event, delegation, sessionHandle, runCtx);
-				if (handled.terminal) {
-					this.runControllers.delete(delegation.id);
-					settleRun();
-					return handled.outcome;
+			let events = startRun(false);
+			for (;;) {
+				let restart = false;
+				for await (const event of events) {
+					if (!staleRetried && knownSession && input.mode !== "run" && isStaleSessionFailure(event)) {
+						staleRetried = true;
+						restart = true;
+						this.releaseSession(sessionHandle ?? knownSession, delegation.id);
+						this.activeRuns.delete(knownSession);
+						sessionHandle = undefined;
+						await this.delegations.updateDelegation(delegation.id, { sessionHandle: undefined });
+						runCtx.onUpdate?.("worker 旧会话已失效，正在以新会话重试…", { running: true });
+						events = startRun(true);
+						break;
+					}
+					const handled = await this.handleEvent(event, delegation, sessionHandle, runCtx);
+					if (handled.terminal) {
+						this.runControllers.delete(delegation.id);
+						settleRun();
+						return handled.outcome;
+					}
+					if (event.type === "started" && event.sessionHandle) {
+						sessionHandle = event.sessionHandle;
+						await this.delegations.updateDelegation(delegation.id, { sessionHandle });
+					}
 				}
-				if (event.type === "started" && event.sessionHandle) {
-					sessionHandle = event.sessionHandle;
-					await this.delegations.updateDelegation(delegation.id, { sessionHandle });
-				}
+				if (!restart) break;
 			}
 		} catch (err) {
 			if (sessionHandle) this.releaseSession(sessionHandle, delegation.id);

@@ -613,3 +613,130 @@ test("P3-1: Driver throw 与无边界流都落持久化 failed，不留下 runni
 		assert.equal((await runtime.listDelegations(`window-${behavior}`))[0]?.status, "failed");
 	}
 });
+
+
+test("失效会话自动恢复：continue 撞 session-not-found → 丢弃旧 handle 以新会话透明重跑", async () => {
+	const { delegations, secrets } = await makeRuntime();
+	const calls: string[] = [];
+	const updates: string[] = [];
+	const driver: AgentDriver = {
+		id: "puddingclaw",
+		async capabilities(): Promise<DriverCapabilities> {
+			return { operations: ["run", "continue", "respond", "cancel"], interactionKinds: [], progress: "none", transport: "spawn" };
+		},
+		async *run(): AsyncIterable<AgentEvent> {
+			calls.push("run");
+			yield { type: "started", sessionHandle: "worker-session-fresh", runHandle: "run-new" };
+			yield {
+				type: "completed",
+				result: { agentId: "puddingclaw", status: "completed", sessionHandle: "worker-session-fresh", runHandle: "run-new", content: "完成" },
+			};
+		},
+		async *continue(): AsyncIterable<AgentEvent> {
+			calls.push("continue");
+			yield { type: "started", sessionHandle: "worker-session-stale" };
+			yield {
+				type: "failed",
+				result: { agentId: "puddingclaw", status: "failed", errorCode: "http_error", error: "Headless Session not found", recoverable: false },
+			};
+		},
+		async *respond(): AsyncIterable<AgentEvent> {},
+		async probe(ctx: InvocationContext) {
+			return {
+				extensionInstalled: true, detected: true, configured: true, authenticated: "unknown", enabled: true,
+				compatibility: "supported" as const, capabilities: { operations: ["run", "continue", "respond"], interactionKinds: [], progress: "none" as const, transport: "spawn" as const }, issues: [],
+			};
+		},
+	};
+	const runtime = new AgentRuntime(delegations, secrets, () => driver);
+
+	const outcome = await runtime.delegate(
+		{ ...PROJECT, windowId: "win-1", managerSessionId: "sess-1", agentId: "puddingclaw", message: "接着上次分析", mode: "continue", sessionHandle: "worker-session-stale" },
+		{ cwd: process.cwd(), env: {}, onUpdate: (content) => updates.push(content) },
+	);
+	assert.equal(outcome.status, "completed", "失效会话必须透明重跑而不是失败");
+	assert.deepEqual(calls, ["continue", "run"], "先 continue，失败后以新会话 run 重试一次");
+	assert.ok(updates.some((u) => u.includes("旧会话已失效")), "恢复过程应经 onUpdate 告知");
+
+	const record = (await runtime.listDelegations("win-1"))[0]!;
+	assert.equal(record.status, "completed");
+	assert.equal(record.sessionHandle, "worker-session-fresh", "delegation 必须记录新 session handle");
+});
+
+test("失效会话恢复只重试一次：新会话也失败则正常失败，不死循环", async () => {
+	const { delegations, secrets } = await makeRuntime();
+	const calls: string[] = [];
+	const fail = (error: string): AgentEvent => ({
+		type: "failed",
+		result: { agentId: "puddingclaw", status: "failed", errorCode: "http_error", error, recoverable: false },
+	});
+	const driver: AgentDriver = {
+		id: "puddingclaw",
+		async capabilities(): Promise<DriverCapabilities> {
+			return { operations: ["run", "continue"], interactionKinds: [], progress: "none", transport: "spawn" };
+		},
+		async *run(): AsyncIterable<AgentEvent> {
+			calls.push("run");
+			yield { type: "started", sessionHandle: "worker-session-fresh" };
+			yield fail("Headless Session not found");
+		},
+		async *continue(): AsyncIterable<AgentEvent> {
+			calls.push("continue");
+			yield { type: "started", sessionHandle: "worker-session-stale" };
+			yield fail("Headless Session not found");
+		},
+		async *respond(): AsyncIterable<AgentEvent> {},
+		async probe(ctx: InvocationContext) {
+			return {
+				extensionInstalled: true, detected: true, configured: true, authenticated: "unknown", enabled: true,
+				compatibility: "supported" as const, capabilities: { operations: ["run", "continue"], interactionKinds: [], progress: "none" as const, transport: "spawn" as const }, issues: [],
+			};
+		},
+	};
+	const runtime = new AgentRuntime(delegations, secrets, () => driver);
+
+	const outcome = await runtime.delegate(
+		{ ...PROJECT, windowId: "win-1", managerSessionId: "sess-1", agentId: "puddingclaw", message: "x", mode: "continue", sessionHandle: "worker-session-stale" },
+		{ cwd: process.cwd(), env: {} },
+	);
+	assert.equal(outcome.status, "failed", "重试仍失败则正常失败");
+	assert.deepEqual(calls, ["continue", "run"], "恢复重试最多一次");
+});
+
+test("失效会话恢复不误吞普通失败：非 session-not-found 错误直接失败", async () => {
+	const { delegations, secrets } = await makeRuntime();
+	const calls: string[] = [];
+	const driver: AgentDriver = {
+		id: "puddingclaw",
+		async capabilities(): Promise<DriverCapabilities> {
+			return { operations: ["run", "continue"], interactionKinds: [], progress: "none", transport: "spawn" };
+		},
+		async *run(): AsyncIterable<AgentEvent> {
+			calls.push("run");
+			yield { type: "started" };
+		},
+		async *continue(): AsyncIterable<AgentEvent> {
+			calls.push("continue");
+			yield { type: "started", sessionHandle: "worker-session-stale" };
+			yield {
+				type: "failed",
+				result: { agentId: "puddingclaw", status: "failed", errorCode: "auth_error", error: "Worker Access Key is invalid, revoked, expired, or out of scope", recoverable: false },
+			};
+		},
+		async *respond(): AsyncIterable<AgentEvent> {},
+		async probe(ctx: InvocationContext) {
+			return {
+				extensionInstalled: true, detected: true, configured: true, authenticated: "unknown", enabled: true,
+				compatibility: "supported" as const, capabilities: { operations: ["run", "continue"], interactionKinds: [], progress: "none" as const, transport: "spawn" as const }, issues: [],
+			};
+		},
+	};
+	const runtime = new AgentRuntime(delegations, secrets, () => driver);
+
+	const outcome = await runtime.delegate(
+		{ ...PROJECT, windowId: "win-1", managerSessionId: "sess-1", agentId: "puddingclaw", message: "x", mode: "continue", sessionHandle: "worker-session-stale" },
+		{ cwd: process.cwd(), env: {} },
+	);
+	assert.equal(outcome.status, "failed");
+	assert.deepEqual(calls, ["continue"], "普通失败不得触发新会话重跑");
+});
