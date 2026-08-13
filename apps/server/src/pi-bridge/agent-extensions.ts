@@ -1,4 +1,3 @@
-import { existsSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { Type, type Static } from "typebox";
 import type { ExtensionAPI, InlineExtension } from "@earendil-works/pi-coding-agent";
@@ -738,6 +737,11 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 				deps.log?.(`${delegateToolName(agent.name)}: ${sessionId} → ${agent.name} (task len ${params.task.length})`);
 
 				const taskId = toolCallId || randomUUID();
+				// §4.4 派活即镜像：delegate 阻塞期间 direct 窗口先出现 running 态
+				// 指派卡；结果/审批卡由 syncToWindow 在 outcome 后补写。
+				if (isSoloContext && targetWindow) {
+					await announceToWindow(deps, targetWindow, taskId, agent.name, params.task);
+				}
 				const scoped = new ScopedAgentInvoker(agent.name, deps.invoker);
 				const result = await scoped.delegate({
 					message: params.task,
@@ -776,7 +780,6 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 						targetWindow,
 						taskId,
 						agent.name,
-						params.task,
 						status,
 						text,
 						interaction,
@@ -848,13 +851,39 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 	};
 }
 
-/** Mirror assignment + result into the direct window's message stream (§4.4). */
-async function syncToWindow(
+/** Mirror the running-state assign card before the delegate blocks (§4.4). */
+async function announceToWindow(
 	deps: Pick<ManagerExtensionDeps, "store" | "sessions">,
 	window: WindowConfig,
 	taskId: string,
 	workerName: string,
 	task: string,
+): Promise<void> {
+	try {
+		const fresh = await deps.store.getWindow(window.id);
+		const activeSession = fresh?.activeSession ?? window.activeSession;
+		await deps.sessions.sendCustomMessage(
+			activeSession,
+			{
+				customType: "pudding:task_assign",
+				content: task,
+				details: { taskId, worker: workerName, windowId: window.id, from: "solo", status: "running" },
+			},
+			{ triggerTurn: false },
+		);
+		// 全新窗口的 session 文件可能还没落盘，先把 running 卡刷进去。
+		await deps.sessions.ensureSessionFile(activeSession);
+	} catch {
+		// best-effort：镜像失败不影响派活
+	}
+}
+
+/** Mirror the outcome (result / approval card) into the direct window's message stream (§4.4). */
+async function syncToWindow(
+	deps: Pick<ManagerExtensionDeps, "store" | "sessions">,
+	window: WindowConfig,
+	taskId: string,
+	workerName: string,
 	status: string,
 	resultText: string,
 	interaction?: { interactionId: string; revision?: number; requests?: unknown[] },
@@ -877,38 +906,9 @@ async function syncToWindow(
 		// SDK _persist writes nothing until the first assistant message
 		// exists, so on a freshly auto-created window the sync would stay
 		// memory-only (lost on restart, and the fileless session makes
-		// ensureWindowAlive mint replacements). When the session file does
-		// not exist yet, replicate the SDK's first flush — header entry
-		// plus pending entries, `wx` so we never clobber — and mark the
-		// SessionManager flushed so later entries append normally.
-		// Private-field poke, best-effort: failure just means memory-only
-		// sync, as before.
-		try {
-			const sm = target.sessionManager as unknown as {
-				flushed?: boolean;
-				sessionFile?: string;
-				fileEntries?: unknown[];
-			};
-			if (sm.sessionFile && !existsSync(sm.sessionFile) && Array.isArray(sm.fileEntries)) {
-				writeFileSync(
-					sm.sessionFile,
-					sm.fileEntries.map((e) => JSON.stringify(e)).join("\n") + "\n",
-					{ encoding: "utf-8", flag: "wx" },
-				);
-				sm.flushed = true;
-			}
-		} catch {
-			// ignore — memory-only sync is the fallback
-		}
-		await target.sendCustomMessage(
-			{
-				customType: "pudding:task_assign",
-				content: task,
-				display: true,
-				details: { taskId, worker: workerName, windowId: window.id, from: "solo" },
-			},
-			{ triggerTurn: false },
-		);
+		// ensureWindowAlive mint replacements). Flush the session file first
+		// so the cards below land on disk.
+		await deps.sessions.ensureSessionFile(activeSession);
 		if (interaction) {
 			// §6.5：等待审批时，把安全投影的审批卡镜像进对方单聊窗口，用户可在
 			// 该窗口直接允许/拒绝（H2：409「去处理」跳转过去后可操作）。

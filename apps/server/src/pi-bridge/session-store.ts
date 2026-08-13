@@ -10,7 +10,7 @@ import {
 	type InlineExtension,
 } from "@earendil-works/pi-coding-agent";
 import { unlink } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import type { PiManagerSettings, PiResourceConfig, TeamsStore } from "../store/teams.js";
 import type { WorkStateStore } from "../store/work-state.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
@@ -625,6 +625,35 @@ export class PiSessionStore {
 			);
 		} catch (err) {
 			this.debugLog?.(`sendCustomMessage failed: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+
+	/**
+	 * SDK _persist writes nothing until the first assistant message exists, so
+	 * platform-written custom messages on a fresh session would stay memory-only
+	 * (lost on restart; a fileless session also makes ensureWindowAlive mint
+	 * replacements). Replicate the SDK's first flush — header entry plus pending
+	 * entries, `wx` so we never clobber — and mark the SessionManager flushed so
+	 * later entries append normally. Best-effort: failure just means the session
+	 * stays memory-only, as before.
+	 */
+	async ensureSessionFile(id: string): Promise<void> {
+		try {
+			const session = await this.open(id);
+			const sm = session.sessionManager as unknown as {
+				flushed?: boolean;
+				sessionFile?: string;
+				fileEntries?: unknown[];
+			};
+			if (sm.sessionFile && !existsSync(sm.sessionFile) && Array.isArray(sm.fileEntries)) {
+				writeFileSync(sm.sessionFile, sm.fileEntries.map((e) => JSON.stringify(e)).join("\n") + "\n", {
+					encoding: "utf-8",
+					flag: "wx",
+				});
+				sm.flushed = true;
+			}
+		} catch {
+			// memory-only fallback
 		}
 	}
 

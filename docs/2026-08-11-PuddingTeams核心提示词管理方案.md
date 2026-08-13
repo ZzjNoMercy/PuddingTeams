@@ -74,7 +74,7 @@ description: string;
 | Window | 注入 pi manager 的 Worker 路由信息 |
 | --- | --- |
 | Solo | 全部已启用、当前可委托的 Worker 路由卡 |
-| Direct | 当前唯一成员的最小路由信息（身份、委托工具、可用状态）；无需再次比较选择 |
+| Direct | 不注入（2026-08-12 起 Direct 无 manager 回合，用户消息直派唯一 Worker，见 §5.2） |
 | Group | 当前群聊全部已启用成员的完整路由卡 |
 
 运行时投影规则：
@@ -191,20 +191,14 @@ Solo 是用户与 pi manager 的自由对话：
 
 Direct 已经绑定唯一 Worker，没有“选择谁”的问题，因此不展示、也不接受用户可编辑的 Window Prompt。
 
-manager 仍恒定在场，平台必须提供不可编辑的 relay 协议：
-
-```text
-把用户消息委托给当前唯一 Worker；
-manager 不自行执行；
-收到结果后向用户转述；
-需要追问或审批时保持原 Worker Session 连续性。
-```
+**2026-08-12 起 Direct 不再经 manager relay**：direct 窗口是纯 worker 通道，用户消息由服务端直派窗口唯一 Worker（`agent-runtime/direct-dispatch.ts`），窗口的 pi session 只作消息流容器（用户消息与 worker 卡片都是 custom message），不存在 manager 回合，因此也不再注入 roster 路由段与固定 relay 协议。委托以该窗口自己的 active session 作为 `managerSessionId`：HITL 审批卡与结果对账直接落回本窗口，worker session 连续性由窗口 binding 维持（stale handle 由 Runtime 透明回退新会话）。
 
 Direct 中：
 
 - Worker 行为由 Worker 运行指令决定；
-- manager 不应把 Worker 运行指令再读一遍；
-- manager roster 可只保留目标 Worker 身份、委托工具和必要状态，不必重复注入完整多 Agent 路由材料。
+- 智能编排（多 Worker 路由、追问、接力）只发生在 solo 窗口的 pi manager；direct 窗口就是与该 Worker 的直接持续对话。
+
+~~manager 仍恒定在场，平台必须提供不可编辑的 relay 协议~~（2026-08-12 废弃，见上）。
 
 ### 5.3 Group 群聊
 
@@ -220,11 +214,11 @@ Group manager 同时读取成员的完整路由卡，在窗口成员集合内选
 | Manager 运行指令 | 是 | 是 | 是 | 否 |
 | Worker `description` / `responsibility` | 全部启用 Worker | 当前唯一 Worker（可精简） | 当前群聊成员 | 否 |
 | Worker 运行指令 | 否 | 否 | 否 | 仅当前 Worker |
-| Direct 固定 relay | 否 | 是 | 否 | 否 |
+| Direct 固定 relay | 否 | 已废弃（2026-08-12 起 Direct 无 manager 回合） | 否 | 否 |
 | Group collaboration | 否 | 否 | 是 | 否 |
 | pi global `AGENTS.md` | 是 | 是 | 是 | 是 |
 | 当前 Workspace context | 按开关 | 按开关 | 按开关 | 按同一 Delegation cwd 与开关 |
-| Manager 委托的具体任务 | 不适用 | manager 生成 | manager 生成 | 是 |
+| Manager 委托的具体任务 | 不适用 | 用户消息直派（不经 manager） | manager 生成 | 是 |
 
 ## 7. 前端信息架构
 
@@ -250,7 +244,7 @@ Window 配置：
 
 ```text
 Solo   不显示协作提示词
-Direct 不显示协作提示词；平台使用固定 relay
+Direct 不显示协作提示词（2026-08-12 起无 manager 回合，固定 relay 已废弃）
 Group  显示“群聊协作提示词”
 ```
 

@@ -460,11 +460,19 @@ function ToolCallItem({
 }
 
 /** role:"custom" entries written by the platform (solo task sync, §4.4). */
-function CustomMessageEntry({ message }: { message: ChatMessage }) {
+function CustomMessageEntry({
+	message,
+	resolvedTaskIds,
+}: {
+	message: ChatMessage;
+	resolvedTaskIds?: Set<string>;
+}) {
 	const details = message.details as
 		| {
 				worker?: string;
 				status?: string;
+				taskId?: string;
+				from?: string;
 				windowId?: string;
 				interactionId?: string;
 				delegationId?: string;
@@ -473,12 +481,32 @@ function CustomMessageEntry({ message }: { message: ChatMessage }) {
 		  }
 		| undefined;
 
+	// direct 直派（§5.2）：用户发言以普通用户气泡呈现。
+	if (message.customType === "pudding:user_message") {
+		return (
+			<AiMessage from="user">
+				<MessageContent>
+					<p className="text-sm whitespace-pre-wrap">{message.content}</p>
+				</MessageContent>
+			</AiMessage>
+		);
+	}
+
 	if (message.customType === "pudding:task_assign") {
+		// 结果/审批卡到达后（同 taskId），running 态落定，不再显示「执行中」。
+		const running = details?.status === "running" && !resolvedTaskIds?.has(details?.taskId ?? "");
+		if (details?.from === "direct") {
+			// direct 窗口：用户消息就在上方，指派卡只作 worker 侧运行指示，
+			// 落定后整张收起（结果卡已说明一切）。
+			if (!running) return null;
+			return <WorkerTaskEntry worker={details?.worker ?? "worker"} badge={<Badge variant="secondary">执行中</Badge>} running />;
+		}
 		return (
 			<AiMessage from="user">
 				<MessageContent>
 					<p className="text-xs text-muted-foreground">派给 {details?.worker ?? "worker"}</p>
 					<p className="text-sm whitespace-pre-wrap">{message.content}</p>
+					{running ? <p className="text-xs text-muted-foreground">执行中…</p> : null}
 				</MessageContent>
 			</AiMessage>
 		);
@@ -534,10 +562,12 @@ export function Message({
 	message,
 	windowType,
 	onOpenWindow,
+	resolvedTaskIds,
 }: {
 	message: ChatMessage;
 	windowType?: WindowType;
 	onOpenWindow?: (windowId: string) => void;
+	resolvedTaskIds?: Set<string>;
 }) {
 	if (message.role === "user") {
 		return (
@@ -550,7 +580,7 @@ export function Message({
 	}
 
 	if (message.role === "custom") {
-		return <CustomMessageEntry message={message} />;
+		return <CustomMessageEntry message={message} resolvedTaskIds={resolvedTaskIds} />;
 	}
 
 	if (message.role === "toolResult") {

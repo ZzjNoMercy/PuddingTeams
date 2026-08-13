@@ -125,8 +125,8 @@ export interface WindowConfig {
 	activeSession: string;
 	/**
 	 * 群聊协作提示词（提示词管理方案 §5.3）：仅 Group 可编辑，只注入该群聊
-	 * manager，不传给 Worker。Direct 使用平台固定 relay（§5.2），服务端拒绝
-	 * 写入；Solo 无协作段。
+	 * manager，不传给 Worker。Direct 无 manager 回合、无协作段（§5.2，纯
+	 * worker 通道），服务端拒绝写入；Solo 无协作段。
 	 */
 	prompt?: string;
 	/** Per-worker last session handle, for multi-turn continuity (§7.1). */

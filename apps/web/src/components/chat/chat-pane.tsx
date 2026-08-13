@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { FolderGit2Icon, FolderOpenIcon, InfoIcon, LayersIcon } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -95,6 +95,18 @@ function SessionChat({
 		setGoalCreateOpen(true);
 	}, []);
 	const layoutReady = !historyLoading && workStateReady;
+	// running 态指派卡（pudding:task_assign）在同 taskId 的结果/审批卡到达后
+	// 落定折叠。
+	const resolvedTaskIds = useMemo(() => {
+		const ids = new Set<string>();
+		for (const m of messages) {
+			if (m.role === "custom" && (m.customType === "pudding:task_result" || m.customType === "pudding:interaction_required")) {
+				const taskId = (m.details as { taskId?: string } | undefined)?.taskId;
+				if (taskId) ids.add(taskId);
+			}
+		}
+		return ids;
+	}, [messages]);
 
 	return (
 		<div className="relative flex min-h-0 flex-1 flex-col" aria-busy={!layoutReady}>
@@ -115,7 +127,7 @@ function SessionChat({
 							</div>
 						) : (
 							messages.map((m) => (
-								<Message key={m.id} message={m} windowType={windowType} onOpenWindow={onOpenWindow} />
+								<Message key={m.id} message={m} windowType={windowType} onOpenWindow={onOpenWindow} resolvedTaskIds={resolvedTaskIds} />
 							))
 						)}
 					</ConversationContent>

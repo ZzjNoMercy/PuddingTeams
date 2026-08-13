@@ -224,4 +224,8 @@ test("两边同步: manager session 与单聊 active session 相同则只发一�
 	assert.equal(outcome.status, "completed");
 	assert.equal(sent.length, 2, "同一 session 不得重复扇出");
 	assert.ok(sent.every((s) => s.sessionId === "direct-sess-1"));
+	assert.ok(
+		sent.every((s) => s.options.triggerTurn === false),
+		"direct 直派（§5.2）：manager session 属 direct 窗口时无 manager 回合，结果只展示不唤醒",
+	);
 });

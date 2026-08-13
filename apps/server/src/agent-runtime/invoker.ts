@@ -541,10 +541,18 @@ export class AgentInvoker {
 		// 两边同步：审批结果同时扇出到 manager session 和 delegation 所属窗口的
 		// active session（单聊镜像），用户只在 solo 窗口也能看到全部结果。
 		const targets = await this.outcomeTargets(d);
+		// direct 直派（§5.2）：manager session 就是 direct 窗口自己的 session，
+		// 窗口无 manager 回合，结果卡只展示、不唤醒 manager 汇总。
+		const managerWindow = d.managerSessionId ? await this.teams.windowForSession(d.managerSessionId) : undefined;
+		const taskResultOptions =
+			managerWindow?.type === "direct"
+				? ({ triggerTurn: false } as const)
+				: ({ triggerTurn: true, deliverAs: "followUp" } as const);
 		switch (outcome.status) {
 			case "completed": {
-				// §6.2/§6.3：完成后触发 manager follow-up 汇总（triggerTurn + followUp），
-				// 并把 worker 的真实结果带给 manager，否则汇总轮无内容可转述。
+				// §6.2/§6.3：完成后触发 manager follow-up 汇总（triggerTurn + followUp；
+				// direct 窗口无 manager 回合，taskResultOptions 降级为仅展示），并把
+				// worker 的真实结果带给 manager，否则汇总轮无内容可转述。
 				const details = { ...(outcome.result.meta ?? {}), artifacts: outcome.result.artifacts, usage: outcome.result.usage };
 				const resolved = {
 					customType: "pudding:interaction_resolved",
@@ -564,7 +572,7 @@ export class AgentInvoker {
 				if (targets.manager) {
 					this.sendOutcome(targets.manager, resolved, { triggerTurn: false });
 					// M5：manager 若在流式中，用 followUp 排队而不是 steer 打断。
-					this.sendOutcome(targets.manager, taskResult, { triggerTurn: true, deliverAs: "followUp" });
+					this.sendOutcome(targets.manager, taskResult, taskResultOptions);
 				}
 				if (targets.direct) {
 					// 单聊窗口仅展示，不唤醒 turn。
@@ -594,7 +602,7 @@ export class AgentInvoker {
 				};
 				if (targets.manager) {
 					this.sendOutcome(targets.manager, resolved, { triggerTurn: false });
-					this.sendOutcome(targets.manager, taskResult, { triggerTurn: true, deliverAs: "followUp" });
+					this.sendOutcome(targets.manager, taskResult, taskResultOptions);
 				}
 				if (targets.direct) {
 					this.sendOutcome(targets.direct, resolved, { triggerTurn: false });
@@ -624,7 +632,7 @@ export class AgentInvoker {
 				};
 				if (targets.manager) {
 					this.sendOutcome(targets.manager, resolved, { triggerTurn: false });
-					this.sendOutcome(targets.manager, taskResult, { triggerTurn: true, deliverAs: "followUp" });
+					this.sendOutcome(targets.manager, taskResult, taskResultOptions);
 				}
 				if (targets.direct) {
 					this.sendOutcome(targets.direct, resolved, { triggerTurn: false });

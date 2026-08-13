@@ -130,7 +130,7 @@ await teams.ensureSoloWindow(
 	},
 	async (id) => store.isOpen(id) || (await store.list()).some((s) => s.id === id),
 );
-await registerChatRoutes(app, store, teams, workStates, uploads);
+await registerChatRoutes(app, store, teams, workStates, uploads, invoker);
 await registerSettingsRoutes(app, defaultCwd);
 await registerProvidersRoutes(app, store);
 await registerAgentsRoutes(app, teams, {

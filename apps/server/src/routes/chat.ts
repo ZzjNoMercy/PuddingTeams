@@ -6,6 +6,8 @@ import path from "node:path";
 import { serializePiEvent } from "../pi-bridge/bridge.js";
 import { PiSessionStore } from "../pi-bridge/session-store.js";
 import type { TeamsStore } from "../store/teams.js";
+import { dispatchDirectMessage } from "../agent-runtime/direct-dispatch.js";
+import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import { config } from "../config.js";
 import type { WorkStateStore } from "../store/work-state.js";
 import type { UploadInput, UploadStore } from "../store/uploads.js";
@@ -69,6 +71,7 @@ export async function registerChatRoutes(
 	teams?: TeamsStore,
 	workStates?: WorkStateStore,
 	uploads?: UploadStore,
+	invoker?: AgentInvoker,
 ): Promise<void> {
 	app.get("/api/health", async () => ({ ok: true, service: "puddingteams-server", piVersion }));
 
@@ -166,14 +169,36 @@ export async function registerChatRoutes(
 			// 第一条消息到达时，异步调 LLM 生成会话标题（session_info），
 			// 不阻塞消息发送本身。
 			const isFirstMessage = session.messages.length === 0;
+			const generateTitle = () => {
+				void store.generateSessionTitle(req.params.id, content || stored.map((item) => item.name).join("、")).catch((err: unknown) => {
+					app.log.warn({ err, sessionId: req.params.id }, "title generation failed");
+				});
+			};
+			// Direct 窗口（§5.2）：绕过 manager relay，直派窗口成员 worker；
+			// 窗口 pi session 只作消息流容器，不触发 manager 回合。
+			if (teams && invoker) {
+				const handled = await dispatchDirectMessage(
+					{
+						teams,
+						sessions: store,
+						invoker,
+						onError: forwardError,
+						log: (message) => app.log.info(message),
+					},
+					req.params.id,
+					promptText,
+				);
+				if (handled) {
+					if (isFirstMessage) generateTitle();
+					return { accepted: true, attachments: stored.map(({ base64: _base64, ...item }) => item) };
+				}
+			}
 			void session.prompt(promptText, images.length ? ({ images } as PromptOptions) : undefined).catch((err: unknown) => {
 				app.log.error({ err, sessionId: req.params.id }, "prompt failed");
 				forwardError(req.params.id, err instanceof Error ? err.message : String(err));
 			});
 			if (isFirstMessage) {
-				void store.generateSessionTitle(req.params.id, content || stored.map((item) => item.name).join("、")).catch((err: unknown) => {
-					app.log.warn({ err, sessionId: req.params.id }, "title generation failed");
-				});
+				generateTitle();
 			}
 			return { accepted: true, attachments: stored.map(({ base64: _base64, ...item }) => item) };
 		},
