@@ -30,39 +30,36 @@ const COLLAPSED_KEY = "puddingteams:nav-collapsed";
 
 export type AppView = "chat" | "agents";
 
-/** 主导航：chat（/）与智能体（/agents）是独立路由，切换即跳转。可展开显示文字标签。 */
+/**
+ * 展开/收起不走 React state：渲染输出与状态无关（SSR/客户端恒一致），布局与
+ * 文字显隐由 globals.css 的 html[data-nav] 规则驱动；boot-init.js 在首帧绘制
+ * 前按 localStorage 设置该属性，因此展开态刷新无"先收后展"闪动。
+ * 这里只负责切换属性 + 持久化。
+ */
+function toggleNav(): void {
+	const el = document.documentElement;
+	const expanded = el.dataset.nav === "expanded";
+	if (expanded) delete el.dataset.nav;
+	else el.dataset.nav = "expanded";
+	localStorage.setItem(COLLAPSED_KEY, expanded ? "1" : "0");
+}
+
+/** 主导航：chat（/）与智能体（/agents）是独立路由，切换即跳转。 */
 export function NavRail({ view }: { view: AppView }) {
 	const [settingsOpen, setSettingsOpen] = useState(false);
 	const [aboutOpen, setAboutOpen] = useState(false);
-	// 默认收起（纯图标）；持久化到 localStorage，initializer 守卫 SSR。
-	const [collapsed, setCollapsed] = useState(() => {
-		if (typeof window === "undefined") return true;
-		return localStorage.getItem(COLLAPSED_KEY) !== "0";
-	});
-	const toggleCollapsed = () => {
-		setCollapsed((prev) => {
-			localStorage.setItem(COLLAPSED_KEY, prev ? "0" : "1");
-			return !prev;
-		});
-	};
 
 	const itemClass = (active: boolean) =>
 		cn(
-			"flex items-center rounded-md text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground",
-			collapsed ? "size-9 justify-center" : "h-9 w-full gap-2.5 px-2.5 text-sm",
+			"nav-item flex items-center rounded-md text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground",
 			active && "bg-accent text-accent-foreground",
 		);
 
 	return (
-		<div
-			className={cn(
-				"flex shrink-0 flex-col border-r bg-muted/50 py-2 transition-[width] duration-150",
-				collapsed ? "w-14 items-center" : "w-36 items-stretch px-2",
-			)}
-		>
+		<div className="nav-rail flex shrink-0 flex-col border-r bg-muted/50 py-2 transition-[width] duration-150">
 			<Link href="/" title="对话" aria-label="对话" aria-current={view === "chat" ? "page" : undefined} className={itemClass(view === "chat")}>
 				<MessageSquareIcon className="size-4 shrink-0" />
-				{collapsed ? null : "对话"}
+				<span className="nav-label">对话</span>
 			</Link>
 			<Link
 				href="/agents"
@@ -72,21 +69,21 @@ export function NavRail({ view }: { view: AppView }) {
 				className={cn("mt-1", itemClass(view === "agents"))}
 			>
 				<BotIcon className="size-4 shrink-0" />
-				{collapsed ? null : "智能体"}
+				<span className="nav-label">智能体</span>
 			</Link>
 
 			<div className="flex-1" />
 
 			<button
 				type="button"
-				title={collapsed ? "展开导航" : "收起导航"}
-				aria-label={collapsed ? "展开导航" : "收起导航"}
-				aria-expanded={!collapsed}
-				onClick={toggleCollapsed}
+				title="展开/收起导航"
+				aria-label="展开/收起导航"
+				onClick={toggleNav}
 				className={cn("mb-1", itemClass(false))}
 			>
-				{collapsed ? <PanelLeftOpenIcon className="size-4 shrink-0" /> : <PanelLeftCloseIcon className="size-4 shrink-0" />}
-				{collapsed ? null : "收起"}
+				<PanelLeftOpenIcon className="nav-collapsed-only size-4 shrink-0" />
+				<PanelLeftCloseIcon className="nav-expanded-only size-4 shrink-0" />
+				<span className="nav-label">收起</span>
 			</button>
 
 			<DropdownMenu>
@@ -98,7 +95,7 @@ export function NavRail({ view }: { view: AppView }) {
 						className={cn(itemClass(false), "data-[state=open]:bg-muted data-[state=open]:text-foreground")}
 					>
 						<SettingsIcon className="size-4 shrink-0" />
-						{collapsed ? null : "设置"}
+						<span className="nav-label">设置</span>
 					</button>
 				</DropdownMenuTrigger>
 				<DropdownMenuContent side="top" align="start" className="w-52">

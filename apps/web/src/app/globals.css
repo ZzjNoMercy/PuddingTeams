@@ -124,3 +124,52 @@ body {
 [data-streamdown="code-block-body"] {
 	border: none;
 }
+
+/* ---- 主导航展开/收起 ----
+   由 html[data-nav="expanded"] 驱动（boot-init.js 在首帧绘制前按 localStorage
+   设置，缺省收起）。布局与文字显隐全走 CSS，NavRail 的 React 渲染与状态无关，
+   SSR/客户端 HTML 恒一致：无 hydration mismatch，也无"先收后展"的闪动。 */
+.nav-rail {
+	width: 3.5rem;
+	align-items: center;
+	overflow: hidden;
+}
+
+.nav-item {
+	width: 2.25rem;
+	height: 2.25rem;
+	justify-content: center;
+}
+
+.nav-label {
+	flex-shrink: 0;
+	white-space: nowrap;
+}
+
+.nav-label,
+.nav-expanded-only {
+	display: none;
+}
+
+html[data-nav="expanded"] .nav-rail {
+	width: 9rem;
+	align-items: stretch;
+	padding-inline: 0.5rem;
+}
+
+html[data-nav="expanded"] .nav-item {
+	width: 100%;
+	justify-content: flex-start;
+	gap: 0.625rem;
+	padding-inline: 0.625rem;
+	font-size: 0.875rem;
+}
+
+html[data-nav="expanded"] .nav-label,
+html[data-nav="expanded"] .nav-expanded-only {
+	display: inline;
+}
+
+html[data-nav="expanded"] .nav-collapsed-only {
+	display: none;
+}
