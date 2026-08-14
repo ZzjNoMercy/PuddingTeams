@@ -403,7 +403,43 @@ export class PiSessionStore {
 			type: "api_key",
 			key: apiKey,
 		}));
-		return { availableCount: (await rt.getAvailable(providerId)).length };
+		const availableCount = (await rt.getAvailable(providerId)).length;
+		// 自愈不阻断写 key 的主流程。
+		await this.healPlaceholderModelSessions(providerId).catch((err: unknown) => {
+			this.debugLog?.(`占位模型会话自愈失败：${err instanceof Error ? err.message : String(err)}`);
+		});
+		return { availableCount };
+	}
+
+	/**
+	 * 全新部署未 init/未配 key 时建起的会话（首屏 solo 必然如此）会被 SDK
+	 * 装配 provider="unknown" 的占位模型；之后配好 key 它也不会自愈，prompt
+	 * 永远报 "No API key found for the selected model."。key 写入后把这类
+	 * 存活会话重新装配：manager 默认模型可用则用，否则用刚配置的 provider
+	 * 的首个可用模型（作用域内查询，避免全目录 getAvailable 的网络探测）。
+	 */
+	private async healPlaceholderModelSessions(providerId: string): Promise<void> {
+		const targets = [...this.active.values()].filter((s) => {
+			const m = s.model as PiModel | undefined;
+			return !m || m.provider === "unknown";
+		});
+		if (targets.length === 0) return;
+		const rt = await this.runtime();
+		let model: PiModel | undefined;
+		const preferredRef = (await this.managerSettings())?.model;
+		if (preferredRef) {
+			const resolved = await this.resolveModel(preferredRef).catch(() => undefined);
+			if (resolved && rt.hasConfiguredAuth(resolved.provider)) model = resolved;
+		}
+		model ??= (await rt.getAvailable(providerId))[0] as PiModel | undefined;
+		if (!model) return;
+		await Promise.all(
+			targets.map((s) =>
+				s.setModel(model as PiModel).catch((err: unknown) => {
+					this.debugLog?.(`会话 ${s.sessionId} 模型自愈失败：${err instanceof Error ? err.message : String(err)}`);
+				}),
+			),
+		);
 	}
 
 	/**
