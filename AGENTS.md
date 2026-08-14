@@ -8,6 +8,7 @@ Connector/Capability Extension 的本质是**给 pi 扩充连接其他 Agent 的
 
 - 通用 Agent 接入方案（Runtime/Driver/Extension/PWCP）：`docs/2026-08-06-通用-agent-接入-底层与扩展方案.md`——改了行为必须同步对应章节。
 - 房间即群聊产品模型：`docs/2026-08-05-房间即群聊-产品模型方案.md`。
+- 会话记录格式与 harness 消费：`docs/2026-08-14-会话记录格式与Harness消费.md`——session JSONL 条目全集、`pudding:*` 自定义卡清单；新增 customType 或改落盘结构必须同步。
 
 ## 目录
 
