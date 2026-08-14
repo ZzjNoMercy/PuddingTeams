@@ -7,6 +7,7 @@ import type {
 	PiTextBlock,
 	PiToolCallBlock,
 	PiToolResultMessage,
+	PiUsage,
 	ToolCallView,
 } from "./types";
 
@@ -29,6 +30,7 @@ export function renderPiMessage(m: PiAssistantMessage): {
 	content: string;
 	thinking?: string;
 	toolCalls: ToolCallView[];
+	usage?: PiUsage;
 } {
 	const blocks = Array.isArray(m.content) ? m.content : [];
 	const content = textOf(blocks);
@@ -43,6 +45,7 @@ export function renderPiMessage(m: PiAssistantMessage): {
 		content,
 		thinking: thinking.length ? thinking : undefined,
 		toolCalls,
+		usage: m.usage,
 	};
 }
 

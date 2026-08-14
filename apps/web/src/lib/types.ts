@@ -77,9 +77,24 @@ export interface PiUserMessage {
 	timestamp?: number;
 }
 
+/** pi assistant 消息上的逐轮用量（provider 返回、pi-ai 归一化）；cost 由 pi 按模型价目表换算。 */
+export interface PiUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	reasoning?: number;
+	totalTokens: number;
+	cost?: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+}
+
 export interface PiAssistantMessage {
 	role: "assistant";
 	content: PiContentBlock[];
+	provider?: string;
+	model?: string;
+	stopReason?: string;
+	usage?: PiUsage;
 	timestamp?: number;
 }
 
@@ -160,6 +175,8 @@ export interface ChatMessage {
 	error?: boolean;
 	name?: string;
 	isError?: boolean;
+	/** role === "assistant"：该轮 usage（provider 计数 + pi 换算的 cost）。 */
+	usage?: PiUsage;
 	/** role === "custom": pi customType (e.g. pudding:task_assign) + details. */
 	customType?: string;
 	details?: unknown;

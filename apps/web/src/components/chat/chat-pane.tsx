@@ -34,6 +34,8 @@ import {
 } from "@/lib/api";
 import type { ChatStatus, RoomSession, RoomSummary, WorkspaceRecord } from "@/lib/types";
 import { Composer } from "./composer";
+import { ChatStatsBar } from "./chat-stats-bar";
+import { computeSessionStats } from "@/lib/session-stats";
 import { Message } from "./message";
 import { ManagerAvatar, MemberStack, WorkerAvatar } from "./worker-avatar";
 import { DirectoryPickerDialog } from "./directory-picker-dialog";
@@ -95,6 +97,7 @@ function SessionChat({
 		setGoalCreateOpen(true);
 	}, []);
 	const layoutReady = !historyLoading && workStateReady;
+	const sessionStats = useMemo(() => computeSessionStats(messages), [messages]);
 	// running 态指派卡（pudding:task_assign）在同 taskId 的结果/审批卡到达后
 	// 落定折叠。
 	const resolvedTaskIds = useMemo(() => {
@@ -138,6 +141,7 @@ function SessionChat({
 						项目路径已失效，重新绑定或切换项目后才能继续对话与派活。
 					</div>
 				) : null}
+				<ChatStatsBar stats={sessionStats} />
 				<Composer
 					sessionId={sessionId}
 					disabled={running || Boolean(blocked)}
