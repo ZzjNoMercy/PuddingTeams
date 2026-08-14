@@ -32,8 +32,8 @@ export type AppView = "chat" | "agents";
 
 /**
  * 展开/收起不走 React state：渲染输出与状态无关（SSR/客户端恒一致），布局与
- * 文字显隐由 globals.css 的 html[data-nav] 规则驱动；boot-init.js 在首帧绘制
- * 前按 localStorage 设置该属性，因此展开态刷新无"先收后展"闪动。
+ * 文字显隐由 globals.css 的 html[data-nav] 规则驱动；layout 内联脚本在首帧
+ * 绘制前按 localStorage 设置该属性，因此展开态刷新无"先收后展"闪动。
  * 这里只负责切换属性 + 持久化。
  */
 function toggleNav(): void {

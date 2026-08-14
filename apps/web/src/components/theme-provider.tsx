@@ -1,10 +1,28 @@
 "use client";
 
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
+import {
+	createContext,
+	useContext,
+	useEffect,
+	useLayoutEffect,
+	useState,
+	type ReactNode,
+} from "react";
 
 export type Theme = "light" | "dark" | "system";
 
 const STORAGE_KEY = "puddingteams-theme";
+
+// useEffect 在绘制后才执行：若 hydration 失败触发客户端重建（或 dev 下 CSS
+// 经 JS 异步注入尚未就绪），html 上的 dark 类/内联背景被剥掉后会先画一帧亮色。
+// layout effect 在绘制前同步纠正，保证任何路径下都不闪白。
+const useIsomorphicLayoutEffect = typeof window !== "undefined" ? useLayoutEffect : useEffect;
+
+// 与 layout.tsx 内联脚本、globals.css :root/.dark 的 --background 保持一致。
+const CANVAS_COLOR: Record<"light" | "dark", string> = {
+	light: "oklch(0.9855 0.0098 87.47)",
+	dark: "oklch(0.24 0.0036 106.64)",
+};
 
 const ThemeContext = createContext<{ theme: Theme; setTheme: (t: Theme) => void } | null>(null);
 
@@ -25,10 +43,15 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 		return stored === "light" || stored === "dark" ? stored : "system";
 	});
 
-	useEffect(() => {
+	useIsomorphicLayoutEffect(() => {
 		const root = document.documentElement;
 		const apply = () => {
-			root.classList.toggle("dark", resolveTheme(theme) === "dark");
+			const resolved = resolveTheme(theme);
+			root.classList.toggle("dark", resolved === "dark");
+			// 首帧由 head 内联脚本上色；这里不移除而是持续同步内联值——
+			// dev 下 globals.css 经 JS 异步注入，贸然移除内联背景会闪白。
+			root.style.colorScheme = resolved;
+			root.style.backgroundColor = CANVAS_COLOR[resolved];
 		};
 		apply();
 		if (theme === "system") {
