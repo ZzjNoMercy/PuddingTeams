@@ -33,6 +33,7 @@ import type {
 	WorkspaceResourceKind,
 	WorkspaceTrustState,
 } from "./types";
+import { getDesktopBridge } from "./desktop";
 
 // 发行态 web 静态产物由 server 同源托管，生产构建直接走 location.origin（端口由
 // 安装时的 server 决定，构建期不可知）；dev（next dev :8934 跨端口）回退到 8933。
@@ -724,6 +725,13 @@ export async function browseWorkspaceDirectories(path: string): Promise<Workspac
 }
 
 export async function pickWorkspaceDirectory(initialPath: string): Promise<string | undefined> {
+	// 桌面宿主：优先用主进程原生目录选择器（Finder/Explorer），比 server 端
+	// AppleScript/对话框更自然；浏览器里回退到 server 路由。
+	const bridge = getDesktopBridge();
+	if (bridge?.pickDirectory) {
+		const picked = await bridge.pickDirectory(initialPath);
+		return picked ?? undefined;
+	}
 	const res = await fetch(`${SERVER_URL}/api/workspaces/pick-directory`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },

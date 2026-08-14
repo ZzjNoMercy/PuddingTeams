@@ -1,0 +1,40 @@
+# PuddingTeams 桌面打包配置（mac 先行，P3-4 §9）
+#
+# 发行物布局（复刻仓库相对路径，server bundle 内 import.meta.url 相对引用
+# assets/extensions/apps/web/out 在 runtime/ 内原样成立）：
+#
+#   <app>.app/Contents/Resources/runtime/apps/server/src/server.bundle.mjs
+#   <app>.app/Contents/Resources/runtime/apps/web/out/                 (Next 静态导出)
+#   <app>.app/Contents/Resources/runtime/extensions/connectors/{codex,claude-code}/
+#   <app>.app/Contents/Resources/runtime/apps/server/assets/          (pi 头像等)
+#
+# extraResources 从 packages/puddingteams-cli/runtime/ 整树拷贝（该目录由
+# `pnpm build:runtime` 组装），mac 目标打包后由 ELECTRON_RUN_AS_NODE 运行。
+
+appId: com.puddingteams.app
+productName: PuddingTeams
+directories:
+  output: release
+  buildResources: build
+files:
+  - dist/**/*
+  - package.json
+extraResources:
+  - from: ../packages/puddingteams-cli/runtime
+    to: runtime
+mac:
+  category: public.app-category.productivity
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+  identity: null
+dmg:
+  title: ${productName}
+  contents:
+    - x: 130
+      y: 220
+    - x: 410
+      y: 220
+      type: link
+      path: /Applications
+npmRebuild: false

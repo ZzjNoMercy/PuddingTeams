@@ -1,7 +1,7 @@
 "use client";
 
 import { forwardRef, type ButtonHTMLAttributes } from "react";
-import { ChevronRightIcon } from "lucide-react";
+import { ChevronRightIcon, FolderOpenIcon } from "lucide-react";
 import {
 	Dialog,
 	DialogContent,
@@ -9,6 +9,7 @@ import {
 	DialogTitle,
 } from "@/components/ui/dialog";
 import type { RoomSession, RoomSummary } from "@/lib/types";
+import { getDesktopBridge } from "@/lib/desktop";
 import { SessionMenu } from "./session-menu";
 import { ManagerAvatar, WorkerAvatar } from "./worker-avatar";
 
@@ -224,6 +225,21 @@ export function ChatInfoDialog({
 								detail={workspacePath}
 								onSelect={() => runAction(onSwitchWorkspace)}
 							/>
+							{getDesktopBridge() ? (
+								<button
+									type="button"
+									onClick={() => void getDesktopBridge()?.revealInFinder(workspacePath)}
+									className="flex min-h-14 w-full items-center gap-4 px-4 py-3 text-left transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 [&+&]:border-t"
+								>
+									<span className="shrink-0 text-sm font-medium">项目文件夹</span>
+									<span className="ml-auto flex min-w-0 max-w-[68%] items-center justify-end gap-2">
+										<span className="min-w-0 truncate text-right text-xs text-muted-foreground/70" title={workspacePath}>
+											{workspacePath}
+										</span>
+										<FolderOpenIcon className="size-4 shrink-0 text-muted-foreground/60" />
+									</span>
+								</button>
+							) : null}
 							<SessionMenu
 								sessions={room.sessions}
 								trigger={<SessionInfoRow value={activeSessionName} />}

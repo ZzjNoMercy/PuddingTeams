@@ -11,3 +11,7 @@ apps/server/.teams/
 # 发行构建产物
 packages/puddingteams-cli/runtime/
 packages/puddingteams-cli/*.tgz
+
+# Electron 构建产物
+electron/dist/
+electron/release/
