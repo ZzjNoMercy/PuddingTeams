@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { LoaderIcon, PlusIcon, RefreshCwIcon, TrashIcon, UserCheckIcon } from "lucide-react";
+import { LoaderIcon, MoreHorizontalIcon, PlusIcon, RefreshCwIcon, Settings2Icon, TrashIcon, UserCheckIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -25,17 +25,22 @@ import type { AgentConfig, AgentProbeResult, CatalogEntry, ConflictRun } from "@
 import { isConnectorProbe } from "@/lib/types";
 import { WorkerAvatar } from "@/components/chat/worker-avatar";
 import { ConfigSchemaForm, SecretSchemaFields } from "@/components/agents/form-parts";
-import { AgentManageDialog } from "@/components/agents/agent-manage-dialog";
-import { ExtensionsPane } from "@/components/agents/extensions-pane";
+import {
+	DropdownMenu,
+	DropdownMenuContent,
+	DropdownMenuItem,
+	DropdownMenuSeparator,
+	DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 
 /**
  * 智能体管理页（Phase 5）：
  * - 列表含 pinned 内置 Pi manager（pinned 标识，无删除/禁用/探测按钮）；
- * - pinned manager 与 pi worker 卡片跳转独立配置页（/agents/<name>，§10.5），
- *   其余 worker 进入三分区管理抽屉（§10.1）；
+ * - 所有 Agent 卡片统一跳转独立配置页（/agents/config?name=，§10.5）：
+ *   pi Agent 用四分区草稿表单，其余 worker 用概览 + 基础接入/Extensions/运行状态；
  * - 启用/禁用走 PUT /enabled：禁用有进行中 Run 时 409，弹窗选择保留（keep）或
  *   取消（cancel），绝不静默杀死；
- * - 「扩展目录」页签管理 Connector/Capability Extension 的安装/更新/卸载。
+ * - 扩展统一从 /extensions 管理 Connector/Capability Extension 的安装/更新/卸载。
  */
 
 function parseArgs(text: string): string[] {
@@ -65,7 +70,7 @@ function StatusLights({ agent, probe }: { agent: AgentConfig; probe?: AgentProbe
 	return (
 		<span className="flex items-center gap-1.5">
 			<span
-				className={`size-2 rounded-full ${agent.enabled !== false ? "bg-foreground" : "bg-muted-foreground/40"}`}
+				className={`size-2 rounded-full ${agent.enabled !== false ? "bg-primary" : "bg-muted-foreground/40"}`}
 				title={agent.enabled !== false ? "已启用" : "已停用"}
 			/>
 			{probe ? (
@@ -205,7 +210,7 @@ function CreateAgentDialog({
 				<DialogHeader>
 					<DialogTitle>添加 Worker</DialogTitle>
 					<DialogDescription>
-						Worker 按 Connector 标签归入内置或第三方；没有内置标签的接入默认归入第三方。创建后到管理抽屉完成配置、探测与启用。
+						Worker 按 Connector 标签归入内置或第三方；没有内置标签的接入默认归入第三方。创建后到配置页完成配置、探测与启用。
 					</DialogDescription>
 				</DialogHeader>
 				<div className="flex flex-col gap-3">
@@ -262,7 +267,7 @@ function CreateAgentDialog({
 								</Select>
 								{installed.length === 0 ? (
 									<span className="text-xs text-muted-foreground/70">
-										没有已安装的 Connector，请先到「扩展目录」安装。
+										没有已安装的 Connector，请先到「扩展」安装。
 									</span>
 								) : null}
 							</label>
@@ -323,12 +328,9 @@ function CreateAgentDialog({
 
 export function AgentsPane() {
 	const router = useRouter();
-	const [tab, setTab] = useState<"agents" | "extensions">("agents");
 	const [agents, setAgents] = useState<AgentConfig[]>([]);
 	const [connectorCatalog, setConnectorCatalog] = useState<CatalogEntry[]>([]);
 	const [loading, setLoading] = useState(true);
-	const [manageAgent, setManageAgent] = useState<AgentConfig | null>(null);
-	const [manageOpen, setManageOpen] = useState(false);
 	const [createOpen, setCreateOpen] = useState(false);
 	const [pendingDelete, setPendingDelete] = useState<AgentConfig | null>(null);
 	const [probing, setProbing] = useState<string | null>(null);
@@ -406,19 +408,9 @@ export function AgentsPane() {
 		setPendingDelete(null);
 	}, [pendingDelete, refresh]);
 
-	const handleAgentChanged = useCallback((updated: AgentConfig) => {
-		setAgents((prev) => prev.map((a) => (a.name === updated.name ? updated : a)));
-		setManageAgent((prev) => (prev && prev.name === updated.name ? updated : prev));
-	}, []);
-
-	/** pinned manager 与 pi worker 进独立配置页；其余 worker 仍开三分区管理抽屉。 */
+	/** 所有 Agent 统一进独立配置页（§10.5）。 */
 	const openManage = (agent: AgentConfig) => {
-		if (agent.pinned || agent.connector?.connectorId === "pi") {
-			router.push(`/agents/config?name=${encodeURIComponent(agent.name)}`);
-			return;
-		}
-		setManageAgent(agent);
-		setManageOpen(true);
+		router.push(`/agents/config?name=${encodeURIComponent(agent.name)}`);
 	};
 
 	const managers = agents.filter((agent) => agent.pinned);
@@ -427,135 +419,106 @@ export function AgentsPane() {
 	const thirdPartyWorkers = workers.filter((agent) => !isBuiltinWorker(agent, connectorCatalog));
 
 	const renderAgentCard = (agent: AgentConfig) => {
-		const description = agent.pinned
-			? agent.description.replace(/^内置\s+Pi\s+manager[：:]?\s*/i, "")
-			: agent.description;
+		const description = agent.description;
 		return (
 			<div
 				key={agent.name}
-				role="button"
-				tabIndex={0}
-				onClick={() => openManage(agent)}
-				onKeyDown={(e) => {
-					if (e.key === "Enter") openManage(agent);
-				}}
-				className="flex cursor-pointer flex-col gap-2.5 rounded-lg bg-muted p-4 transition-colors hover:bg-accent"
+				className="ops-agent-card group relative flex min-h-40 flex-col rounded-2xl p-4 transition-all"
 			>
-				<div className="flex items-start justify-between gap-2">
-					<WorkerAvatar name={agent.name} size={56} />
-					<StatusLights agent={agent} probe={probes[agent.name]} />
-				</div>
-				<div className="min-w-0">
-					<div className="flex items-center gap-1.5">
-						<span className="truncate font-mono text-sm font-medium">{agent.name}</span>
-						{agent.connector ? (
-							<Badge variant="outline" className="shrink-0">
-								{agent.connector.connectorId}
-							</Badge>
-						) : null}
+				<button type="button" className="flex flex-1 flex-col text-left" onClick={() => openManage(agent)}>
+					<div className="flex items-start justify-between gap-2">
+						<span className="ops-agent-avatar"><WorkerAvatar name={agent.name} size={42} /></span>
+						<StatusLights agent={agent} probe={probes[agent.name]} />
 					</div>
-					<p className="mt-0.5 truncate text-xs text-muted-foreground" title={description}>
-						{description || "（无描述）"}
-					</p>
-				</div>
-				{/* pinned manager：无删除/禁用/探测入口（§10.5） */}
-				{agent.pinned ? null : (
-					<div
-						className="mt-auto flex items-center gap-1 pt-1"
-						onClick={(e) => e.stopPropagation()}
-						onKeyDown={(e) => e.stopPropagation()}
-					>
-						<Button
-							type="button"
-							size="sm"
-							variant="outline"
-							onClick={() => handleProbe(agent.name)}
-							disabled={probing === agent.name}
-						>
-							{probing === agent.name ? (
-								<LoaderIcon className="size-3.5 animate-spin" />
-							) : (
-								<RefreshCwIcon className="size-3.5" />
-							)}
-							探测
-						</Button>
-						<Button
-							type="button"
-							size="sm"
-							variant="outline"
-							disabled={resolving}
-							onClick={() => void applyEnabled(agent, !(agent.enabled !== false))}
-						>
-							<UserCheckIcon className="size-3.5" />
-							{agent.enabled !== false ? "停用" : "启用"}
-						</Button>
-						<Button
-							type="button"
-							size="sm"
-							variant="ghost"
-							className="ml-auto"
-							onClick={() => setPendingDelete(agent)}
-						>
-							<TrashIcon className="size-3.5" />
-						</Button>
+					<div className="mt-3 min-w-0">
+						<div className="flex items-baseline gap-2">
+							<span className="truncate text-sm font-semibold tracking-tight">{agent.name}</span>
+							<span className="truncate font-mono text-[11px] text-muted-foreground">{agent.connector?.connectorId ?? "command"}</span>
+						</div>
+						<p className="mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground" title={description}>
+							{description || "尚未填写角色描述"}
+						</p>
 					</div>
-				)}
+					<div className="mt-auto flex items-center gap-2 pt-4 text-[11px] text-muted-foreground">
+						<span className="rounded-full bg-foreground/[0.035] px-2 py-0.5">{agent.enabled !== false ? "已启用" : "已停用"}</span>
+						{probes[agent.name] ? <span>{probeSummary(probes[agent.name])}</span> : <span>点击查看配置</span>}
+					</div>
+				</button>
+				<DropdownMenu>
+					<DropdownMenuTrigger asChild>
+						<Button type="button" size="icon" variant="ghost" aria-label={`管理 ${agent.name}`} className="absolute right-3 top-11 size-8 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100">
+							<MoreHorizontalIcon className="size-4" />
+						</Button>
+					</DropdownMenuTrigger>
+					<DropdownMenuContent align="end" className="w-40">
+						<DropdownMenuItem onSelect={() => openManage(agent)}><Settings2Icon />配置</DropdownMenuItem>
+						<DropdownMenuItem disabled={probing === agent.name} onSelect={() => void handleProbe(agent.name)}><RefreshCwIcon />{probing === agent.name ? "探测中…" : "运行探测"}</DropdownMenuItem>
+						<DropdownMenuItem disabled={resolving} onSelect={() => void applyEnabled(agent, !(agent.enabled !== false))}><UserCheckIcon />{agent.enabled !== false ? "停用" : "启用"}</DropdownMenuItem>
+						<DropdownMenuSeparator />
+						<DropdownMenuItem variant="destructive" onSelect={() => setPendingDelete(agent)}><TrashIcon />删除</DropdownMenuItem>
+					</DropdownMenuContent>
+				</DropdownMenu>
 			</div>
 		);
 	};
 
-	if (tab === "extensions") {
-		return (
-			<div className="flex h-full flex-col">
-				<PaneTabs tab={tab} onTab={setTab} />
-				<ExtensionsPane />
+	const renderManagerStrip = (agent: AgentConfig) => {
+		const description = agent.description.replace(/^内置\s+Pi\s+manager[：:]?\s*/i, "");
+		return <button key={agent.name} type="button" className="ops-manager-strip" onClick={() => openManage(agent)}>
+			<span className="ops-manager-avatar">M</span>
+			<div className="min-w-0 text-left">
+				<div className="flex items-center gap-2"><span className="text-sm font-semibold">Manager</span><span className="ops-origin-pill">内置</span></div>
+				<p className="mt-1 text-xs leading-5 text-muted-foreground">{description || "理解目标、组织协作并汇总结果"}</p>
+				<div className="mt-2 flex gap-2 text-[11px] text-muted-foreground"><span className="rounded-full bg-foreground/[0.035] px-2 py-0.5">固定角色</span><span className="rounded-full bg-foreground/[0.035] px-2 py-0.5">Pi Runtime</span></div>
 			</div>
-		);
-	}
+			<div className="ops-manager-meta"><span className="size-2 rounded-full bg-primary" /><span>可用</span><span className="text-muted-foreground">点击配置</span></div>
+		</button>;
+	};
 
 	return (
-		<div className="flex h-full flex-col">
-			<div className="flex items-center justify-between pr-4">
-				<PaneTabs tab={tab} onTab={setTab} />
+		<div className="ops-page flex h-full flex-col">
+			<header className="ops-page-header">
+				<div>
+					<h1 className="ops-page-title">智能体</h1>
+					<p className="ops-page-subtitle">管理协作角色、连接方式与运行状态</p>
+				</div>
 				<Button type="button" size="sm" onClick={() => setCreateOpen(true)}>
 					<PlusIcon className="size-4" />
 					添加 Worker
 				</Button>
-			</div>
-			<div className="mx-auto w-full max-w-5xl flex-1 overflow-y-auto px-4 pb-4">
+			</header>
+			<div className="ops-page-scroll flex-1 overflow-y-auto">
+				<div className="mx-auto w-full max-w-[1180px] px-7 pb-10">
 				{loading ? (
 					<div className="flex items-center justify-center gap-2 pt-20 text-sm text-muted-foreground">
 						<LoaderIcon className="size-4 animate-spin" />
 						加载中…
 					</div>
 				) : (
-					<div className="flex flex-col gap-8 py-2">
+					<div className="flex flex-col gap-10 py-8">
 						<section className="flex flex-col gap-3">
 							<div className="flex items-baseline gap-2">
 								<h2 className="text-sm font-semibold">Manager</h2>
-								<span className="text-xs text-muted-foreground">负责理解消息、调度 Worker</span>
+								<span className="text-xs text-muted-foreground">理解消息、组织协作并汇总结果</span>
 							</div>
 							{managers.length > 0 ? (
-								<div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
-									{managers.map(renderAgentCard)}
+								<div className="grid grid-cols-1 gap-3">
+									{managers.map(renderManagerStrip)}
 								</div>
 							) : (
 								<p className="text-sm text-muted-foreground">未找到 Manager 配置。</p>
 							)}
 						</section>
 
-						<section className="flex flex-col gap-5">
-							<div className="flex items-baseline gap-2">
-								<h2 className="text-sm font-semibold">Worker</h2>
-								<span className="text-xs text-muted-foreground">接受 Manager 委派，执行具体任务并返回结果</span>
-							</div>
+						<section className="flex flex-col gap-9">
 							<div className="flex flex-col gap-3">
-								<div className="flex items-center gap-2">
-									<h3 className="text-xs font-medium text-muted-foreground">内置</h3>
+								<div className="flex items-center justify-between gap-4">
+									<div className="flex items-center gap-2"><h3 className="text-sm font-semibold">内置</h3>
 									<Badge variant="secondary">{builtinWorkers.length}</Badge>
+									</div><span className="text-xs text-muted-foreground">随平台提供或由 Pi 衍生</span>
 								</div>
 								{builtinWorkers.length > 0 ? (
-									<div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
+									<div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
 										{builtinWorkers.map(renderAgentCard)}
 									</div>
 								) : (
@@ -563,12 +526,13 @@ export function AgentsPane() {
 								)}
 							</div>
 							<div className="flex flex-col gap-3">
-								<div className="flex items-center gap-2">
-									<h3 className="text-xs font-medium text-muted-foreground">第三方</h3>
+								<div className="flex items-center justify-between gap-4">
+									<div className="flex items-center gap-2"><h3 className="text-sm font-semibold">第三方</h3>
 									<Badge variant="secondary">{thirdPartyWorkers.length}</Badge>
+									</div><span className="text-xs text-muted-foreground">通过 Connector 添加，默认归入此处</span>
 								</div>
 								{thirdPartyWorkers.length > 0 ? (
-									<div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
+									<div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
 										{thirdPartyWorkers.map(renderAgentCard)}
 									</div>
 								) : (
@@ -578,17 +542,8 @@ export function AgentsPane() {
 						</section>
 					</div>
 				)}
+				</div>
 			</div>
-
-			{/* 非 pi worker 的三分区管理抽屉；pi Agent 已跳独立配置页（manager-dialog.tsx 留档备用） */}
-			{manageAgent && !manageAgent.pinned ? (
-				<AgentManageDialog
-					agent={manageAgent}
-					open={manageOpen}
-					onOpenChange={setManageOpen}
-					onAgentChanged={handleAgentChanged}
-				/>
-			) : null}
 
 			<CreateAgentDialog open={createOpen} onOpenChange={setCreateOpen} onCreated={refresh} />
 
@@ -652,26 +607,6 @@ export function AgentsPane() {
 					</DialogFooter>
 				</DialogContent>
 			</Dialog>
-		</div>
-	);
-}
-
-/** 页签：智能体 / 扩展目录。 */
-function PaneTabs({ tab, onTab }: { tab: "agents" | "extensions"; onTab: (tab: "agents" | "extensions") => void }) {
-	return (
-		<div className="flex items-center gap-1 px-4 py-2">
-			{(["agents", "extensions"] as const).map((key) => (
-				<button
-					key={key}
-					type="button"
-					onClick={() => onTab(key)}
-					className={`rounded-md px-3 py-1 text-sm transition-colors ${
-						tab === key ? "bg-accent font-medium" : "text-muted-foreground hover:text-foreground"
-					}`}
-				>
-					{key === "agents" ? "智能体" : "扩展目录"}
-				</button>
-			))}
 		</div>
 	);
 }

@@ -74,7 +74,7 @@ function Section({
 	children: React.ReactNode;
 }) {
 	return (
-		<section className="rounded-2xl border bg-card p-4 shadow-sm">
+		<section className="runtime-section">
 			<div className="mb-3 flex items-center gap-2">
 				<span className="text-muted-foreground">{icon}</span>
 				<h3 className="text-sm font-semibold">{title}</h3>
@@ -160,8 +160,8 @@ export function SessionRuntimeDrawer({
 					{pending.length > 0 ? <span className="flex size-4 items-center justify-center rounded-full bg-amber-500 text-[9px] text-white">{pending.length}</span> : null}
 				</Button>
 			</DialogTrigger>
-			<DialogContent className="inset-y-0 right-0 left-auto top-0 grid h-dvh w-[min(94vw,540px)] max-w-none translate-x-0 translate-y-0 grid-rows-[auto_minmax(0,1fr)] gap-0 rounded-none border-y-0 border-r-0 p-0 data-[state=closed]:slide-out-to-right data-[state=open]:slide-in-from-right sm:max-w-none">
-				<DialogHeader className="border-b px-5 py-4 pr-12">
+			<DialogContent positionMode="drawer" className="context-drawer runtime-drawer grid grid-rows-[auto_minmax(0,1fr)] gap-0 p-0">
+				<DialogHeader className="runtime-drawer-head px-5 py-4 pr-12">
 					<div className="flex items-center gap-2 text-primary"><PanelRightOpenIcon className="size-4" /><span className="text-xs font-medium">Goal Runtime</span></div>
 					<DialogTitle className="line-clamp-2 text-base leading-6">{workState.goal}</DialogTitle>
 					<DialogDescription className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
@@ -171,7 +171,7 @@ export function SessionRuntimeDrawer({
 					</DialogDescription>
 				</DialogHeader>
 
-				<div className="min-h-0 flex-1 space-y-3 overflow-y-auto bg-muted/20 p-4">
+				<div className="min-h-0 flex-1 overflow-y-auto px-5 pb-5">
 					<Section icon={<TargetIcon className="size-4" />} title="当前进度" metric={formatTime(workState.updatedAt)}>
 						<div className="space-y-2 text-xs leading-5">
 							<div><span className="text-muted-foreground">摘要</span><p className="mt-0.5 whitespace-pre-wrap text-foreground">{workState.currentBrief || "尚未记录"}</p></div>
@@ -201,7 +201,7 @@ export function SessionRuntimeDrawer({
 						{reviews.length === 0 ? <p className="text-xs text-muted-foreground">尚未提交完成复核。每次提交都会保留独立记录，不覆盖历史。</p> : (
 							<div className="space-y-2">
 								{reviews.map((review, index) => (
-									<details key={review.id} open={index === 0} className="group rounded-xl border bg-muted/20 px-3 py-2.5">
+									<details key={review.id} open={index === 0} className="group runtime-review-item px-1 py-2.5">
 										<summary className="cursor-pointer list-none select-none">
 											<div className="flex items-center gap-2 text-xs">
 												<CriterionIcon status={review.verdict === "satisfied" ? "satisfied" : review.verdict === "needs_human" ? "uncertain" : "unsatisfied"} />

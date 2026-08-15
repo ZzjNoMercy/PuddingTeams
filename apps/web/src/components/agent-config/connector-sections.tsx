@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import Link from "next/link";
 import { LoaderIcon, RefreshCwIcon, TrashIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -34,29 +33,17 @@ import type {
 	WorkerProbeResult,
 } from "@/lib/types";
 import { isConnectorProbe } from "@/lib/types";
-import { AffectedNote, AvatarEditor, ConfigSchemaForm, SecretSchemaFields, SecretsEditor } from "@/components/agents/form-parts";
+import { AffectedNote, ConfigSchemaForm, SecretSchemaFields, SecretsEditor } from "@/components/agents/form-parts";
 
 /**
- * Agent 管理抽屉（§10.1），固定三分区：
+ * Connector / legacy worker 的配置分区（§10.1），嵌在独立配置页
+ * （/agents/config?name=）里按分区导航渲染：
  * 1. 基础接入：Connector 选择/更换、config schema 表单、secret 单独输入、
  *    probe 状态与四操作能力；legacy command invoke 的 Agent 在这里编辑命令；
  * 2. Extensions：Capability 绑定列表（版本/来源/工具/激活方式/配置/启停/删除）
  *    + “添加 Extension”（只列 kind=capability 且与当前 connectorId 兼容的项）；
  * 3. 运行状态：总开关、extensionRevision、最近写操作的 activeNow/reloadPending。
- * pinned manager 不走这里（见 manager-dialog.tsx）。
  */
-
-type ManageTab = "connector" | "extensions" | "status";
-
-const splitProfileList = (value: string): string[] =>
-	[...new Set(value.split(/[\n,，]/).map((item) => item.trim()).filter(Boolean))];
-
-const TAB_LABELS: Record<ManageTab, string> = {
-	connector: "基础接入",
-	extensions: "Extensions",
-	status: "运行状态",
-};
-
 /** 安装来源三态（文档 §8）。 */
 const ORIGIN_LABELS: Record<CatalogEntry["origin"], string> = {
 	builtin: "平台内置",
@@ -102,7 +89,7 @@ const COMPATIBILITY_LABELS: Record<ConnectorProbeResult["compatibility"], string
 function ConnectorProbeView({ probe }: { probe: ConnectorProbeResult }) {
 	const status = connectorStatus(probe);
 	return (
-		<div className="flex flex-col gap-2 rounded-md bg-muted/60 p-3">
+		<div className="agent-config-inset flex flex-col gap-2">
 			<div className="flex flex-wrap items-center gap-1.5">
 				<Badge variant={statusVariant(status)}>{status}</Badge>
 				<Badge variant="outline">兼容性：{COMPATIBILITY_LABELS[probe.compatibility]}</Badge>
@@ -147,7 +134,7 @@ function ConnectorProbeView({ probe }: { probe: ConnectorProbeResult }) {
 function LegacyProbeView({ probe }: { probe: WorkerProbeResult }) {
 	const [open, setOpen] = useState(false);
 	return (
-		<div className="flex flex-col gap-1 rounded-md bg-muted/60 p-3">
+		<div className="agent-config-inset flex flex-col gap-1">
 			<div className="flex items-center gap-2">
 				<Badge variant={probe.ok ? "secondary" : "destructive"}>{probe.ok ? "健康" : "异常"}</Badge>
 				<span className="text-xs text-muted-foreground">exit {probe.exitCode}</span>
@@ -165,7 +152,7 @@ function LegacyProbeView({ probe }: { probe: WorkerProbeResult }) {
 
 function BindingProbeView({ probe }: { probe: BindingProbeResult }) {
 	return (
-		<div className="flex flex-col gap-1.5 rounded-md bg-muted/60 p-2.5">
+		<div className="agent-config-inset flex flex-col gap-1.5">
 			<div className="flex flex-wrap items-center gap-1.5">
 				<Badge variant={probe.extensionInstalled ? "secondary" : "destructive"}>
 					{probe.extensionInstalled ? "扩展已安装" : "扩展未安装"}
@@ -201,7 +188,7 @@ function BindingProbeView({ probe }: { probe: BindingProbeResult }) {
 
 // ---- 分区 1：基础接入（Connector） ----
 
-function ConnectorSection({
+export function ConnectorSection({
 	agent,
 	onMutation,
 }: {
@@ -316,6 +303,8 @@ function ConnectorSection({
 
 	return (
 		<div className="flex flex-col gap-3">
+			<section className="agent-config-card flex flex-col gap-3">
+				<div className="agent-config-card-head"><h2>Connector</h2><p>选择已安装的 Connector Extension；安装与更新在「扩展」页完成。</p></div>
 			{/* 当前绑定 */}
 			{agent.connector ? (
 				<div className="flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
@@ -346,7 +335,7 @@ function ConnectorSection({
 					</SelectContent>
 				</Select>
 				{installed.length === 0 ? (
-					<span className="text-xs text-muted-foreground/70">没有已安装的 Connector，请先到「扩展目录」安装。</span>
+					<span className="text-xs text-muted-foreground/70">没有已安装的 Connector，请先到「扩展」安装。</span>
 				) : null}
 			</label>
 			{selected && !selected.loaded ? (
@@ -355,7 +344,7 @@ function ConnectorSection({
 
 			{/* 安装前/保存前展示：来源、权限、版本范围、将注册的能力（§10.1） */}
 			{selected ? (
-				<div className="flex flex-col gap-1.5 rounded-md bg-muted/60 p-2.5 text-xs text-muted-foreground">
+				<div className="agent-config-inset flex flex-col gap-1.5 text-xs text-muted-foreground">
 					<div className="flex flex-wrap items-center gap-1.5">
 						<Badge variant="outline">来源：{selected.manifest.source}</Badge>
 						<Badge variant="outline">{ORIGIN_LABELS[selected.origin]}</Badge>
@@ -381,13 +370,12 @@ function ConnectorSection({
 				</div>
 			) : null}
 
-			{/* config schema 表单 */}
+			{/* config schema 表单 + secret + 固定版本 */}
+			</section>
 			{contribution ? (
-				<div className="flex flex-col gap-1">
-					<span className="text-sm text-muted-foreground">接入配置</span>
+				<section className="agent-config-card flex flex-col gap-3">
+					<div className="agent-config-card-head"><h2>接入配置</h2><p>按 Connector 声明的 schema 填写；密钥加密存储，只存引用。</p></div>
 					<ConfigSchemaForm schema={contribution.configSchema} value={config} onChange={setConfig} />
-				</div>
-			) : null}
 			{securityWarnings.map((warning) => (
 				<div key={warning} role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 p-2.5 text-xs text-destructive">
 					{warning}
@@ -404,10 +392,12 @@ function ConnectorSection({
 				/>
 			) : null}
 
-			<label className="flex flex-col gap-1 text-sm">
-				<span className="text-muted-foreground">固定版本（可选）</span>
-				<Input value={versionPin} onChange={(e) => setVersionPin(e.target.value)} placeholder="如 0.9.1" className="font-mono text-xs" />
-			</label>
+				<label className="flex flex-col gap-1 text-sm">
+					<span className="text-muted-foreground">固定版本（可选）</span>
+					<Input value={versionPin} onChange={(e) => setVersionPin(e.target.value)} placeholder="如 0.9.1" className="font-mono text-xs" />
+				</label>
+				</section>
+			) : null}
 
 			<div className="flex items-center gap-2">
 				<Button type="button" size="sm" disabled={!selected || !selected.loaded || saving} onClick={() => void handleSave()}>
@@ -431,7 +421,7 @@ function ConnectorSection({
 
 // ---- 分区 1（legacy）：command invoke 编辑 ----
 
-function LegacyInvokeSection({ agent, onSaved }: { agent: AgentConfig; onSaved: (agent: AgentConfig) => void }) {
+export function LegacyInvokeSection({ agent, onSaved }: { agent: AgentConfig; onSaved: (agent: AgentConfig) => void }) {
 	const invoke = agent.invoke?.type === "command" ? agent.invoke : undefined;
 	const [command, setCommand] = useState(invoke?.command ?? "");
 	const [runArgs, setRunArgs] = useState((invoke?.runArgs ?? []).join(", "));
@@ -507,9 +497,8 @@ function LegacyInvokeSection({ agent, onSaved }: { agent: AgentConfig; onSaved: 
 
 	return (
 		<div className="flex flex-col gap-3">
-			<p className="text-xs text-muted-foreground">
-				该 Agent 使用 legacy 命令接入。推荐改用 Connector Extension（先创建新 Agent 或在「扩展目录」安装 Connector）。
-			</p>
+			<section className="agent-config-card flex flex-col gap-3">
+				<div className="agent-config-card-head"><h2>接入命令</h2><p>该 Agent 使用 legacy 命令接入。推荐改用 Connector Extension（先创建新 Agent 或在「扩展」安装 Connector）。</p></div>
 			<label className="flex flex-col gap-1 text-sm">
 				<span className="text-muted-foreground">命令（可执行文件或绝对路径）</span>
 				<Input value={command} onChange={(e) => setCommand(e.target.value)} placeholder="puddingclaw" />
@@ -533,6 +522,7 @@ function LegacyInvokeSection({ agent, onSaved }: { agent: AgentConfig; onSaved: 
 				/>
 			</label>
 			<SecretsEditor agent={agent} />
+			</section>
 			<div className="flex items-center gap-2">
 				<Button type="button" size="sm" disabled={saving || !command.trim()} onClick={() => void handleSave()}>
 					{saving ? <LoaderIcon className="size-3.5 animate-spin" /> : null}
@@ -605,7 +595,7 @@ function BindingCard({
 	};
 
 	return (
-		<div className="flex flex-col gap-2 rounded-md bg-muted/60 p-3">
+		<div className="agent-config-card flex flex-col gap-2">
 			<div className="flex flex-wrap items-center gap-1.5">
 				<span className="text-sm font-medium">{manifest?.displayName ?? binding.extensionId}</span>
 				{entry ? <Badge variant="outline">v{entry.version}{entry.versionPin ? `（固定 ${entry.versionPin}）` : ""}</Badge> : null}
@@ -738,7 +728,7 @@ function BindingCard({
 	);
 }
 
-function BindingsSection({
+export function BindingsSection({
 	agent,
 	onMutation,
 }: {
@@ -837,12 +827,12 @@ function BindingsSection({
 			)}
 
 			{addOpen ? (
-				<div className="flex flex-col gap-2 rounded-md border p-3">
-					<span className="text-sm font-medium">添加 Extension</span>
+				<div className="agent-config-card flex flex-col gap-2">
+					<div className="agent-config-card-head"><h2>添加 Extension</h2></div>
 					{addable.length === 0 ? (
 						<p className="text-xs text-muted-foreground">
 							没有可添加的 Capability Extension{agent.connector ? `（需与 connector「${agent.connector.connectorId}」兼容）` : ""}
-							。可先到「扩展目录」安装。
+							。可先到「扩展」安装。
 						</p>
 					) : (
 						<Select
@@ -870,7 +860,7 @@ function BindingsSection({
 					{/* 保存前展示来源、权限、版本范围和将注册的工具（§10.1） */}
 					{addEntry && addManifest ? (
 						<>
-							<div className="flex flex-col gap-1.5 rounded-md bg-muted/60 p-2.5 text-xs text-muted-foreground">
+							<div className="agent-config-inset flex flex-col gap-1.5 text-xs text-muted-foreground">
 								<div className="flex flex-wrap items-center gap-1.5">
 									<Badge variant="outline">来源：{addManifest.source}</Badge>
 									<Badge variant="outline">{ORIGIN_LABELS[addEntry.origin]}</Badge>
@@ -943,217 +933,82 @@ function BindingsSection({
 	);
 }
 
-// ---- 分区 3：运行状态（后端有多少展示多少） ----
+// ---- 分区 3：运行状态（启用开关 + 接入探测 + 写操作影响） ----
 
-function StatusSection({ agent, lastMutation }: { agent: AgentConfig; lastMutation: MutationResponse | null }) {
+export function StatusSection({
+	agent,
+	lastMutation,
+	onToggleEnabled,
+	toggling,
+}: {
+	agent: AgentConfig;
+	lastMutation: MutationResponse | null;
+	onToggleEnabled: (enabled: boolean) => Promise<void> | void;
+	toggling: boolean;
+}) {
+	const [probe, setProbe] = useState<AgentProbeResult | null>(null);
+	const [probing, setProbing] = useState(false);
+
+	// Agent 切换时清空上次探测结果（渲染期间重置）。
+	const [prevAgent, setPrevAgent] = useState(agent);
+	if (prevAgent !== agent) {
+		setPrevAgent(agent);
+		setProbe(null);
+	}
+
+	const handleProbe = async () => {
+		setProbing(true);
+		try {
+			const result = await probeAgent(agent.name);
+			setProbe(result);
+			probeToast(result);
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		} finally {
+			setProbing(false);
+		}
+	};
+
 	return (
 		<div className="flex flex-col gap-3">
-			<div className="flex flex-col gap-1.5 rounded-md bg-muted/60 p-3 text-sm">
-				<div className="flex items-center justify-between">
-					<span className="text-muted-foreground">总开关</span>
-					<Badge variant={agent.enabled !== false ? "secondary" : "outline"}>
-						{agent.enabled !== false ? "已启用" : "已停用"}
-					</Badge>
+			<section className="agent-config-card">
+				<div className="agent-config-card-head"><h2>启用状态</h2><p>停用后 Manager 不再派活给它，已绑定的 Capability 工具也一并不可用；配置与绑定保留，再启用时恢复。</p></div>
+				<label className="flex items-start gap-2 text-sm">
+					<input
+						type="checkbox"
+						checked={agent.enabled !== false}
+						disabled={toggling}
+						onChange={(e) => void onToggleEnabled(e.target.checked)}
+						className="mt-0.5 size-4 accent-foreground"
+					/>
+					<span>
+						启用当前 Agent
+						<small className="mt-0.5 block text-xs text-muted-foreground">有进行中的 Run 时会先弹出确认，不会静默中断。</small>
+					</span>
+				</label>
+			</section>
+			<section className="agent-config-card">
+				<div className="agent-config-card-head"><h2>接入探测</h2><p>检查本机 CLI 是否安装、登录态与版本兼容性。</p></div>
+				<div>
+					<Button type="button" size="sm" variant="outline" disabled={probing} onClick={() => void handleProbe()}>
+						{probing ? <LoaderIcon className="size-3.5 animate-spin" /> : <RefreshCwIcon className="size-3.5" />}
+						探测
+					</Button>
 				</div>
-				<p className="text-xs text-muted-foreground/70">
-					总开关优先级高于所有 Capability 开关：停用后全部不可调用但保留配置，再启用时恢复之前的选择。
-				</p>
-				<div className="flex items-center justify-between">
-					<span className="text-muted-foreground">配置版本（extensionRevision）</span>
-					<code className="font-mono text-xs">{agent.extensionRevision ?? 0}</code>
-				</div>
-				<div className="flex items-center justify-between">
-					<span className="text-muted-foreground">Capability 绑定数</span>
-					<code className="font-mono text-xs">{agent.capabilityExtensions?.length ?? 0}</code>
-				</div>
-			</div>
-			<div className="flex flex-col gap-1">
-				<span className="text-sm text-muted-foreground">最近写操作影响</span>
+				{probe ? (
+					isConnectorProbe(probe) ? <ConnectorProbeView probe={probe} /> : <LegacyProbeView probe={probe} />
+				) : (
+					<p className="text-xs text-muted-foreground/70">尚未探测。列表页的状态灯来自最近一次探测。</p>
+				)}
+			</section>
+			<section className="agent-config-card">
+				<div className="agent-config-card-head"><h2>最近写操作影响</h2><p>在本页保存配置、绑定或启停后，这里列出有多少会话受影响。</p></div>
 				{lastMutation ? (
 					<AffectedNote affected={lastMutation.affectedSessions} />
 				) : (
 					<p className="text-xs text-muted-foreground/70">本次打开尚无写操作。</p>
 				)}
-			</div>
-			<p className="text-xs text-muted-foreground/70">
-				进行中的 Session/Run 明细后端暂未提供按 Agent 的列表接口；停用 Agent 或卸载 Extension 时如有冲突会如实列出。
-			</p>
+			</section>
 		</div>
-	);
-}
-
-// ---- 抽屉本体 ----
-
-export function AgentManageDialog({
-	agent,
-	open,
-	onOpenChange,
-	onAgentChanged,
-}: {
-	agent: AgentConfig;
-	open: boolean;
-	onOpenChange: (open: boolean) => void;
-	onAgentChanged: (agent: AgentConfig) => void;
-}) {
-	const [tab, setTab] = useState<ManageTab>("connector");
-	const [description, setDescription] = useState(agent.description ?? "");
-	const [identity, setIdentity] = useState(agent.responsibility?.identity ?? "");
-	const [domain, setDomain] = useState(agent.responsibility?.domain ?? "");
-	const [owns, setOwns] = useState((agent.responsibility?.owns ?? []).join("\n"));
-	const [excludes, setExcludes] = useState((agent.responsibility?.excludes ?? []).join("\n"));
-	const [escalateWhen, setEscalateWhen] = useState((agent.responsibility?.escalateWhen ?? []).join("\n"));
-	const [savingDesc, setSavingDesc] = useState(false);
-	const [lastMutation, setLastMutation] = useState<MutationResponse | null>(null);
-
-	// 渲染期间随 prop 变化重置：Agent 更新同步描述；打开/切换 Agent 时回到第一页签。
-	const [prevAgent, setPrevAgent] = useState(agent);
-	if (prevAgent !== agent) {
-		setPrevAgent(agent);
-		setDescription(agent.description ?? "");
-		setIdentity(agent.responsibility?.identity ?? "");
-		setDomain(agent.responsibility?.domain ?? "");
-		setOwns((agent.responsibility?.owns ?? []).join("\n"));
-		setExcludes((agent.responsibility?.excludes ?? []).join("\n"));
-		setEscalateWhen((agent.responsibility?.escalateWhen ?? []).join("\n"));
-	}
-	const openSignature = `${agent.name}|${String(open)}`;
-	const [prevSignature, setPrevSignature] = useState(openSignature);
-	if (openSignature !== prevSignature) {
-		setPrevSignature(openSignature);
-		if (open) {
-			setTab("connector");
-			setLastMutation(null);
-		}
-	}
-
-	const handleMutation = useCallback(
-		(res: MutationResponse) => {
-			setLastMutation(res);
-			onAgentChanged(res.agent);
-		},
-		[onAgentChanged],
-	);
-
-	const handleSaveDescription = async () => {
-		setSavingDesc(true);
-		try {
-			// 全量 upsert：带上现有 connector/绑定，避免覆盖（§10 upsert 语义）。
-			const hasResponsibility = Boolean(identity.trim() || domain.trim() || owns.trim() || excludes.trim() || escalateWhen.trim());
-			if (hasResponsibility && !domain.trim()) throw new Error("填写责任边界时，责任领域不能为空");
-			const responsibility = hasResponsibility
-				? {
-						...(identity.trim() ? { identity: identity.trim() } : {}),
-						domain: domain.trim(),
-						owns: splitProfileList(owns),
-						excludes: splitProfileList(excludes),
-						...(escalateWhen.trim() ? { escalateWhen: splitProfileList(escalateWhen) } : {}),
-					}
-				: undefined;
-			const updated = await updateAgent(agent.name, { ...agent, description: description.trim(), responsibility });
-			onAgentChanged(updated);
-			toast.success("说明与责任边界已保存");
-		} catch (err) {
-			toast.error(err instanceof Error ? err.message : String(err));
-		} finally {
-			setSavingDesc(false);
-		}
-	};
-
-	const legacy = !agent.connector && agent.invoke?.type === "command";
-
-	return (
-		<Dialog open={open} onOpenChange={onOpenChange}>
-			<DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
-				<DialogHeader>
-					<DialogTitle className="flex items-center gap-2">
-						管理「{agent.name}」
-						{agent.connector ? <Badge variant="outline">Connector 接入</Badge> : null}
-						{legacy ? <Badge variant="outline">命令接入</Badge> : null}
-					</DialogTitle>
-					<DialogDescription>基础接入、Capability Extensions 与运行状态。</DialogDescription>
-				</DialogHeader>
-
-				{/* 通用信息：头像 + 描述 + 责任边界（全量 upsert，保留现有绑定） */}
-				<div className="flex flex-col gap-2">
-					<AvatarEditor agent={agent} onUpdated={onAgentChanged} />
-					<label className="flex flex-col gap-1 text-sm">
-						<span className="text-muted-foreground">描述（展示说明，不等于责任或授权）</span>
-						<Textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={2} />
-					</label>
-					<div className="grid gap-2 rounded-md bg-muted/60 p-3 sm:grid-cols-2">
-						<label className="flex flex-col gap-1 text-sm">
-							<span className="text-muted-foreground">身份定位（可选）</span>
-							<Input value={identity} onChange={(e) => setIdentity(e.target.value)} placeholder="如：前端实现负责人" />
-						</label>
-						<label className="flex flex-col gap-1 text-sm">
-							<span className="text-muted-foreground">责任领域</span>
-							<Input value={domain} onChange={(e) => setDomain(e.target.value)} placeholder="如：Web 前端" />
-						</label>
-						<label className="flex flex-col gap-1 text-sm">
-							<span className="text-muted-foreground">负责范围（每行一项）</span>
-							<Textarea value={owns} onChange={(e) => setOwns(e.target.value)} rows={3} />
-						</label>
-						<label className="flex flex-col gap-1 text-sm">
-							<span className="text-muted-foreground">明确不负责（每行一项）</span>
-							<Textarea value={excludes} onChange={(e) => setExcludes(e.target.value)} rows={3} />
-						</label>
-						<label className="flex flex-col gap-1 text-sm sm:col-span-2">
-							<span className="text-muted-foreground">升级给 Human/manager 的条件（每行一项）</span>
-							<Textarea value={escalateWhen} onChange={(e) => setEscalateWhen(e.target.value)} rows={2} />
-						</label>
-						<p className="text-xs text-muted-foreground sm:col-span-2">责任边界只提供给 Manager 做路由、停止与升级判断；不授予权限，也不会发给 Worker。</p>
-					</div>
-					<div>
-						<Button
-							type="button"
-							size="sm"
-							variant="outline"
-							disabled={savingDesc}
-							onClick={() => void handleSaveDescription()}
-						>
-							{savingDesc ? <LoaderIcon className="size-3.5 animate-spin" /> : null}
-							保存说明与责任
-						</Button>
-					</div>
-				</div>
-
-				{agent.connector?.connectorId === "pi" ? (
-					<div className="rounded-md bg-muted/60 p-3 text-xs text-muted-foreground">
-						提示词与资源（systemPrompt / 技能 / 模板）已移至独立配置页：
-						<Link href={`/agents/config?name=${encodeURIComponent(agent.name)}`} className="ml-1 underline hover:text-foreground">
-							打开「{agent.name}」配置页
-						</Link>
-					</div>
-				) : null}
-
-				{/* 三分区页签 */}
-				<div className="flex items-center gap-1 border-b">
-					{(Object.keys(TAB_LABELS) as ManageTab[]).map((key) => (
-						<button
-							key={key}
-							type="button"
-							onClick={() => setTab(key)}
-							className={`px-3 py-1.5 text-sm transition-colors ${
-								tab === key
-									? "border-b-2 border-foreground font-medium"
-									: "text-muted-foreground hover:text-foreground"
-							}`}
-						>
-							{TAB_LABELS[key]}
-						</button>
-					))}
-				</div>
-
-				{tab === "connector" ? (
-					legacy ? (
-						<LegacyInvokeSection agent={agent} onSaved={onAgentChanged} />
-					) : (
-						<ConnectorSection agent={agent} onMutation={handleMutation} />
-					)
-				) : null}
-				{tab === "extensions" ? <BindingsSection agent={agent} onMutation={handleMutation} /> : null}
-				{tab === "status" ? <StatusSection agent={agent} lastMutation={lastMutation} /> : null}
-			</DialogContent>
-		</Dialog>
 	);
 }

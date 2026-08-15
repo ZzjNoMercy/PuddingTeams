@@ -229,9 +229,12 @@ export function ManagerDialog({
 				</div>
 
 				<div className="rounded-md bg-muted/60 p-3 text-xs text-muted-foreground">
-					提示词与资源（systemPrompt / 技能 / 模板）已移至独立配置页：
+					运行指令与模板已移至独立配置页；Skills 统一从扩展入口管理：
 					<Link href={`/agents/config?name=${encodeURIComponent(agent.name)}`} className="ml-1 underline hover:text-foreground">
 						打开「{agent.name}」配置页
+					</Link>
+					<Link href="/extensions" className="ml-2 underline hover:text-foreground">
+						打开扩展
 					</Link>
 				</div>
 

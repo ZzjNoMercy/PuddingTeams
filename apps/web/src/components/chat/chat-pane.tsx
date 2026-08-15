@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { FolderGit2Icon, FolderOpenIcon, InfoIcon, LayersIcon } from "lucide-react";
+import { ChevronDownIcon, EllipsisIcon, FolderGit2Icon, FolderOpenIcon, LayersIcon, PanelLeftOpenIcon } from "lucide-react";
 import { toast } from "sonner";
 import {
 	Conversation,
@@ -21,6 +21,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { useChat } from "@/hooks/useChat";
+import { compactDay } from "@/lib/time";
 import {
 	createRoomSession,
 	createWorkspace,
@@ -63,7 +64,10 @@ function statusLabelOf(status: ChatStatus): string {
 /** The live chat area for one pi session. Keyed by sessionId so switching
  * sessions remounts it (fresh history + WS). */
 function SessionChat({
+	roomId,
 	sessionId,
+	sessionLabel,
+	sessionModifiedAt,
 	emptyHint,
 	windowType,
 	onStatus,
@@ -74,7 +78,11 @@ function SessionChat({
 	onOpenWorkspace,
 	blocked,
 }: {
+	roomId: string;
 	sessionId: string;
+	sessionLabel: string;
+	/** 会话最后活动时间，用于分隔条的 今天/昨天/周X 展示（与列表同源）。 */
+	sessionModifiedAt?: string;
 	emptyHint?: string;
 	windowType: RoomSummary["type"];
 	onStatus: (s: ChatStatus) => void;
@@ -90,6 +98,7 @@ function SessionChat({
 	const [goalDraft, setGoalDraft] = useState("");
 	const [hasGoal, setHasGoal] = useState(false);
 	const [workStateReady, setWorkStateReady] = useState(false);
+	const [scrollButtonHost, setScrollButtonHost] = useState<HTMLDivElement | null>(null);
 	useEffect(() => onStatus(status), [status, onStatus]);
 	const markWorkStateReady = useCallback(() => setWorkStateReady(true), []);
 	const openGoalCommand = useCallback((initialGoal: string) => {
@@ -112,7 +121,7 @@ function SessionChat({
 	}, [messages]);
 
 	return (
-		<div className="relative flex min-h-0 flex-1 flex-col" aria-busy={!layoutReady}>
+		<div className="home-session-chat relative flex min-h-0 flex-1 flex-col" aria-busy={!layoutReady}>
 			<div className={`flex min-h-0 flex-1 flex-col ${layoutReady ? "visible" : "invisible"}`}>
 				<SessionWorkCard
 					sessionId={sessionId}
@@ -123,18 +132,24 @@ function SessionChat({
 					onReady={markWorkStateReady}
 				/>
 				<Conversation initial="instant" resize={layoutReady ? "smooth" : "instant"}>
-					<ConversationContent className="mx-auto w-full max-w-3xl gap-6">
+					<ConversationContent className="home-message-column">
+						<div className="home-session-marker"><span />{sessionLabel}{sessionModifiedAt ? ` · ${compactDay(sessionModifiedAt)}` : ""}<span /></div>
 						{messages.length === 0 ? (
 							<div className="flex flex-1 items-center justify-center pt-20 text-sm text-muted-foreground">
 								{emptyHint ?? "开始和 pi manager 对话"}
 							</div>
 						) : (
 							messages.map((m) => (
-								<Message key={m.id} message={m} windowType={windowType} onOpenWindow={onOpenWindow} resolvedTaskIds={resolvedTaskIds} />
+								<Message key={m.id} roomId={roomId} message={m} windowType={windowType} onOpenWindow={onOpenWindow} resolvedTaskIds={resolvedTaskIds} />
 							))
 						)}
 					</ConversationContent>
-					<ConversationScrollButton className="z-10" />
+					<ConversationScrollButton
+						portalTarget={scrollButtonHost}
+						className="home-scroll-to-bottom"
+						aria-label="回到底部"
+						title="回到底部"
+					/>
 				</Conversation>
 				{blocked ? (
 					<div className="border-t border-destructive/20 bg-destructive/5 px-4 py-2 text-center text-xs text-destructive">
@@ -153,6 +168,7 @@ function SessionChat({
 					onStop={stop}
 					onGoalCommand={openGoalCommand}
 					onOpenWorkspace={onOpenWorkspace}
+					scrollButtonHostRef={setScrollButtonHost}
 				/>
 			</div>
 			{!layoutReady ? (
@@ -168,10 +184,12 @@ export function ChatPane({
 	roomId,
 	onOpenWindow,
 	onRoomUpdated,
+	onOpenRoomList,
 }: {
 	roomId: string;
 	onOpenWindow?: (windowId: string) => void;
 	onRoomUpdated?: (room: RoomSummary) => void;
+	onOpenRoomList?: () => void;
 }) {
 	const [room, setRoom] = useState<RoomSummary | null>(null);
 	const [activeId, setActiveId] = useState<string>("");
@@ -411,18 +429,15 @@ export function ChatPane({
 	const isSingle = type === "direct";
 	const isGroup = type === "group";
 	const headerTitle = room?.name ?? "与 pi manager 对话";
-	// 副标题：active session 的标题（会话上下文）优先，否则退回类型描述；
-	// 与窗口名相同时不重复显示。
 	const activeSession = room?.sessions.find((s) => s.active);
 	const sessionTitle =
 		activeSession?.name || (activeSession?.firstMessage !== "新对话" ? activeSession?.firstMessage : "") || "";
-	const typeText =
+	const subtitle =
 		type === "group"
-			? `${members.length} 个成员 · ${members.map((m) => m.name).join("、")}`
+			? `${members.length} 位 Worker · Manager 在场`
 			: type === "direct"
-				? `与 ${members[0]?.name} 单聊`
-				: "与 pi manager 对话";
-	const subtitle = sessionTitle || (typeText !== headerTitle ? typeText : "");
+				? members[0]?.description || `与 ${members[0]?.name} 单聊`
+				: "理解消息、组织协作并汇总结果";
 	const workspaceTargetReady = switchToDefault || Boolean(targetWorkspaceId || workspacePath.trim());
 	const currentContextLabel = room?.workspace ? `${room.workspace.name} · ${room.workspace.rootPath}` : `默认目录 · ${room?.cwdSnapshot ?? ""}`;
 	const workspaceLabel = room?.workspace ? `项目 · ${room.workspace.name}` : "默认目录";
@@ -437,54 +452,35 @@ export function ChatPane({
 			: "开始和 pi manager 对话";
 
 	return (
-		<div className="relative flex h-full flex-col">
-			<header className="flex items-center justify-between gap-2 px-4 py-2">
-				<div className="flex min-w-0 items-center gap-2.5">
+		<div className="home-chat-pane relative flex h-full min-w-0">
+			<div className="home-chat-primary flex min-w-0 flex-1 flex-col">
+			<header className="home-chat-header">
+				<div className="home-chat-identity">
+					{onOpenRoomList ? <Button type="button" size="icon" variant="ghost" className="md:hidden" aria-label="打开对话列表" onClick={onOpenRoomList}><PanelLeftOpenIcon className="size-4" /></Button> : null}
 					{isGroup ? (
-						<MemberStack members={members} size={28} />
+						<MemberStack members={members} size={34} />
 					) : isSingle ? (
-						<WorkerAvatar name={members[0]!.name} size={28} />
+						<WorkerAvatar name={members[0]!.name} size={34} />
 					) : (
-						<ManagerAvatar size={28} />
+						<ManagerAvatar size={34} />
 					)}
 					<div className="min-w-0">
-						<div className="flex items-center gap-1.5">
-							<div className="truncate text-sm font-medium">{headerTitle}</div>
-							{type === "solo" ? (
-								<span className="shrink-0 text-xs text-muted-foreground">solo</span>
-							) : null}
-							{room?.workspace ? (
-								room.workspace.trust.state === "trusted" ? (
-									<WorkspaceTrustBadge trust={room.workspace.trust} />
-								) : (
-									<button
-										type="button"
-										title="项目资源尚未放行，点击处理信任"
-										onClick={() => {
-											const id = room.workspace!.id;
-											void listWorkspaces()
-												.then((list) => setTrustReview(list.find((item) => item.id === id) ?? null))
-												.catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)));
-										}}
-										className="outline-none"
-									>
-										<WorkspaceTrustBadge trust={room.workspace.trust} />
-									</button>
-								)
-							) : null}
+						<div className="home-chat-title-row">
+							<div className="home-chat-title">{headerTitle}</div>
 						</div>
 						{subtitle ? (
-							<div className="truncate text-xs text-muted-foreground">{subtitle}</div>
+							<div className="home-chat-subtitle">{subtitle}</div>
 						) : null}
 					</div>
 				</div>
-				<div className="relative flex shrink-0 items-center gap-2">
+				<div className="home-chat-actions">
 					<SessionMenu
 						sessions={room?.sessions ?? []}
 						trigger={(
-							<Button type="button" size="sm" variant="outline">
+							<Button type="button" size="sm" variant="outline" className="home-context-pill">
 								<LayersIcon className="size-3.5" />
-								会话
+								<span>{sessionTitle || "会话"}</span>
+								<ChevronDownIcon className="size-3" />
 							</Button>
 						)}
 						onSwitch={switchSession}
@@ -492,9 +488,8 @@ export function ChatPane({
 						onRename={openSessionRename}
 						onDelete={setPendingDeleteSession}
 					/>
-					<Button type="button" size="sm" variant="outline" onClick={() => setChatInfoOpen(true)}>
-						<InfoIcon className="size-3.5" />
-						聊天信息
+					<Button type="button" size="icon" variant="ghost" className="home-chat-more" aria-label="聊天设置" title="聊天设置" onClick={() => setChatInfoOpen(true)}>
+						<EllipsisIcon className="size-4" />
 					</Button>
 					{(status === "error" || status === "gone" || delayedConnectionStatus === status) && status !== "connected" ? (
 						<span
@@ -513,7 +508,10 @@ export function ChatPane({
 			{activeId && room ? (
 				<SessionChat
 					key={activeId}
+					roomId={roomId}
 					sessionId={activeId}
+					sessionLabel={sessionTitle || "新会话"}
+					sessionModifiedAt={room.sessions.find((s) => s.id === activeId)?.modifiedAt}
 					emptyHint={emptyHint}
 					windowType={type}
 					onStatus={setStatus}
@@ -525,6 +523,7 @@ export function ChatPane({
 					blocked={!room.contextAvailable || status === "gone"}
 				/>
 			) : null}
+			</div>
 
 			{room ? (
 				<ChatInfoDialog

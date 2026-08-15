@@ -29,6 +29,21 @@ export interface ProviderSummary {
 	baseUrl?: string;
 }
 
+/** Current viewer boundary. Local mode maps the OS account into the same
+ * user/tenant shape that a future authenticated multi-tenant provider uses. */
+export interface ViewerIdentity {
+	mode: "local" | "authenticated";
+	user: {
+		id: string;
+		username: string;
+		displayName: string;
+	};
+	tenant: {
+		id: string;
+		name: string;
+	};
+}
+
 // ---- 自定义 Provider（models.json 控制面） ----
 
 export interface CustomModelInput {
@@ -149,7 +164,7 @@ export type PiEvent =
 
 // ---- chat model ----
 
-export type ToolCallStatus = "pending" | "running" | "done" | "error";
+export type ToolCallStatus = "pending" | "running" | "done" | "error" | "interrupted";
 
 export interface ToolCallView {
 	id: string;

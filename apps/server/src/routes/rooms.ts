@@ -5,6 +5,10 @@ import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import { isWorkspaceDirectoryAvailable, type WorkspaceSummary } from "../store/workspaces.js";
 import type { WorkerBinding } from "../store/teams.js";
 import type { WorkStateStore } from "../store/work-state.js";
+import { realpath, stat } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { openNativeFile } from "../platform/native-file-opener.js";
 
 export interface RoomSessionSummary {
 	id: string;
@@ -96,7 +100,13 @@ export function registerRoomsRoutes(
 	teams: TeamsStore,
 	invoker?: AgentInvoker,
 	workStates?: WorkStateStore,
+	localFiles?: {
+		open?: (targetPath: string) => Promise<void>;
+		additionalRoots?: readonly string[];
+	},
 ): void {
+	const openLocalFile = localFiles?.open ?? openNativeFile;
+	const additionalFileRoots = localFiles?.additionalRoots ?? [];
 	const contextFor = async (w: WindowConfig) => ({
 		type: w.type,
 		members: w.members,
@@ -166,6 +176,45 @@ export function registerRoomsRoutes(
 		await ensureWindowAlive(w);
 		return { room: await buildWindowSummary(sessions, teams, w) };
 	});
+
+	/** Open a file referenced by chat markdown. Relative paths resolve from the
+	 * room's frozen cwd; absolute paths must still stay inside that cwd or a
+	 * platform-owned attachment root. realpath containment also blocks symlink
+	 * escapes. */
+	app.post<{ Params: { id: string }; Body: { path?: string } }>(
+		"/api/rooms/:id/open-file",
+		async (req, reply) => {
+			const window = await teams.getWindow(req.params.id);
+			if (!window) return reply.code(404).send({ error: "window not found" });
+			const requested = req.body?.path?.trim();
+			if (!requested || requested.includes("\0")) {
+				return reply.code(400).send({ error: "path must be a non-empty local file path" });
+			}
+			try {
+				const rawPath = requested.startsWith("file:")
+					? fileURLToPath(requested)
+					: requested;
+				const workspaceRoot = await realpath(await teams.workspaceFor(window.id));
+				const target = await realpath(
+					path.isAbsolute(rawPath) ? rawPath : path.resolve(workspaceRoot, rawPath),
+				);
+				const extraRoots = await Promise.all(
+					additionalFileRoots.map((root) => realpath(root).catch(() => undefined)),
+				);
+				const allowedRoots = [workspaceRoot, ...extraRoots.filter((root): root is string => Boolean(root))];
+				const allowed = allowedRoots.some((root) => {
+					const relative = path.relative(root, target);
+					return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+				});
+				if (!allowed) throw new Error("文件不在当前项目或平台附件目录中");
+				if (!(await stat(target)).isFile()) throw new Error("目标不是文件");
+				await openLocalFile(target);
+				return { path: target };
+			} catch (err) {
+				return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+			}
+		},
+	);
 
 	/** 发起对话：direct（单聊）或 group（群聊）。solo 是置顶单例，不在此创建；
 	 * 单聊按 worker 去重——已存在则直接返回既有窗口。 */

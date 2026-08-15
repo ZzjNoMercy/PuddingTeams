@@ -1,55 +1,64 @@
 "use client";
 
-import { useTheme, type Theme } from "@/components/theme-provider";
-import { cn } from "@/lib/utils";
+import { useSyncExternalStore } from "react";
+import { useTheme } from "@/components/theme-provider";
 
-const OPTIONS: { value: Theme; label: string; hint: string }[] = [
-	{ value: "system", label: "系统", hint: "跟随系统外观" },
-	{ value: "light", label: "浅色", hint: "始终浅色" },
-	{ value: "dark", label: "深色", hint: "始终深色" },
-];
+const MOTION_STORAGE_KEY = "puddingteams:reduce-motion";
+const MOTION_EVENT = "puddingteams:motion-change";
 
-function ThemePreview({ theme }: { theme: Theme }) {
-	const dark = theme === "dark";
-	const system = theme === "system";
+function subscribeMotion(listener: () => void) {
+	window.addEventListener(MOTION_EVENT, listener);
+	return () => window.removeEventListener(MOTION_EVENT, listener);
+}
+
+function getMotionSnapshot() {
+	return document.documentElement.dataset.reduceMotion === "true";
+}
+
+function PreferenceSwitch({ checked, label, onToggle }: { checked: boolean; label: string; onToggle: () => void }) {
 	return (
-		<div
-			className={cn(
-				"flex h-16 w-full items-end gap-1 rounded-sm p-1.5",
-				dark ? "bg-zinc-900" : "bg-zinc-100",
-				system && "bg-gradient-to-r from-zinc-100 from-50% to-zinc-900 to-50%",
-			)}
+		<button
+			type="button"
+			role="switch"
+			aria-checked={checked}
+			aria-label={label}
+			className="preference-switch"
+			data-checked={checked ? "true" : "false"}
+			onClick={onToggle}
 		>
-			<div className={cn("h-3 w-1/2 rounded-xs", dark ? "bg-zinc-700" : "bg-zinc-300", system && "bg-zinc-500")} />
-			<div className={cn("h-3 w-1/4 rounded-xs", dark ? "bg-zinc-600" : "bg-zinc-400")} />
-		</div>
+			<span />
+		</button>
 	);
 }
 
 export function AppearanceSettings() {
 	const { theme, setTheme } = useTheme();
+	const reduceMotion = useSyncExternalStore(subscribeMotion, getMotionSnapshot, () => false);
+	const dark = theme === "dark" || (theme === "system" && typeof window !== "undefined" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+
+	const toggleMotion = () => {
+		const next = !reduceMotion;
+		document.documentElement.dataset.reduceMotion = next ? "true" : "false";
+		localStorage.setItem(MOTION_STORAGE_KEY, next ? "1" : "0");
+		window.dispatchEvent(new Event(MOTION_EVENT));
+	};
 
 	return (
-		<div className="flex gap-3">
-			{OPTIONS.map((opt) => (
-				<button
-					type="button"
-					key={opt.value}
-					onClick={() => setTheme(opt.value)}
-					className={cn(
-						"flex w-36 flex-col gap-2 rounded-md border p-2 text-left transition-colors",
-						theme === opt.value
-							? "border-foreground/60 bg-accent"
-							: "border-transparent hover:bg-muted/60",
-					)}
-				>
-					<ThemePreview theme={opt.value} />
-					<div>
-						<div className="text-sm font-medium">{opt.label}</div>
-						<div className="text-xs text-muted-foreground">{opt.hint}</div>
-					</div>
-				</button>
-			))}
+		<div className="appearance-settings">
+			<div className="preference-row">
+				<div>
+					<strong>深色模式</strong>
+					<span>在浅色与深色界面之间切换</span>
+				</div>
+				<PreferenceSwitch checked={dark} label="深色模式" onToggle={() => setTheme(dark ? "light" : "dark")} />
+			</div>
+			<div className="preference-row">
+				<div>
+					<strong>减少动态效果</strong>
+					<span>关闭非必要过渡动画</span>
+				</div>
+				<PreferenceSwitch checked={reduceMotion} label="减少动态效果" onToggle={toggleMotion} />
+			</div>
 		</div>
 	);
 }

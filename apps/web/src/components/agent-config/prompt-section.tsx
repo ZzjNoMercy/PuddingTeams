@@ -80,7 +80,8 @@ export function PromptSection({
 			: "关闭后不注入项目目录里的上下文文件";
 
 	return (
-		<div className="flex flex-col gap-3">
+		<section className="agent-config-card flex flex-col gap-3">
+			<div className="agent-config-card-head"><h2>系统提示词</h2><p>对所有新建或重开的 Session 生效。</p></div>
 			<p className="text-xs text-muted-foreground">
 				只属于该 Agent 的提示词与资源开关；不修改 Window 协作提示词或 Workspace 文件。预览展示的是
 				<strong>已保存配置</strong>的有效结果，草稿改动需保存后再预览。
@@ -137,14 +138,13 @@ export function PromptSection({
 			</div>
 
 			{preview ? (
-				<div className="space-y-2 rounded-md border bg-background/70 p-2.5 text-xs">
+				<div className="agent-config-preview space-y-2 p-3 text-xs">
 					<div className="flex items-center gap-2">
 						运行目录：<code>{preview.cwd}</code>
 						{preview.workspace ? <WorkspaceTrustBadge trust={preview.workspace.trust} /> : null}
 					</div>
 					<div>
-						Skills {preview.skills.filter((s) => s.enabled).length}/{preview.skills.length} 启用 · Templates{" "}
-						{preview.prompts.filter((p) => p.enabled).length}/{preview.prompts.length} 启用 · Context{" "}
+						Templates {preview.prompts.filter((p) => p.enabled).length}/{preview.prompts.length} 启用 · Context{" "}
 						{preview.contextFiles.length} · 估算 {preview.estimatedCharacters} 字符
 					</div>
 					{preview.segments.map((segment, index) => (
@@ -156,14 +156,6 @@ export function PromptSection({
 							<pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap text-muted-foreground">{segment.content}</pre>
 						</details>
 					))}
-					{preview.skills.length > 0 ? (
-						<div className="flex flex-col gap-1">
-							<span className="font-medium">Skills</span>
-							{preview.skills.map((item) => (
-								<ResourceLine key={`${item.source}-${item.name}`} item={item} />
-							))}
-						</div>
-					) : null}
 					{preview.prompts.length > 0 ? (
 						<div className="flex flex-col gap-1">
 							<span className="font-medium">Prompt templates</span>
@@ -180,6 +172,6 @@ export function PromptSection({
 					))}
 				</div>
 			) : null}
-		</div>
+		</section>
 	);
 }

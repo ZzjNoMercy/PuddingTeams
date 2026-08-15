@@ -81,7 +81,7 @@ function ManagerFields({
 	}, []);
 	const thinkingLevel = draft.manager.thinkingLevel ?? "default";
 	return (
-		<div className="flex flex-col gap-3 rounded-md bg-muted/60 p-3">
+		<div className="agent-config-subsection flex flex-col gap-3">
 			<label className="flex flex-col gap-1 text-sm">
 				<span className="text-muted-foreground">默认模型（provider/modelId）</span>
 				<Input
@@ -170,8 +170,9 @@ export function ModelSection({
 	}, [agent.pinned, agent.connector?.connectorId]);
 
 	return (
-		<div className="flex flex-col gap-3">
-			<p className="text-xs text-muted-foreground">
+		<section className="agent-config-card flex flex-col gap-3">
+			<div className="agent-config-card-head"><h2>运行配置</h2><p>参数对新建或重开的 Session 生效；进行中的 Session 保持旧配置。</p></div>
+			<p className="sr-only">
 				模型与运行参数对新建或重开的 Session 生效；进行中的 Session 保持旧配置。
 			</p>
 			{agent.pinned ? (
@@ -179,7 +180,7 @@ export function ModelSection({
 			) : schema === null ? (
 				<p className="text-xs text-muted-foreground">加载配置 schema…</p>
 			) : (
-				<div className="rounded-md bg-muted/60 p-3">
+				<div className="agent-config-subsection">
 					<ConfigSchemaForm
 						schema={schema}
 						value={draft.connectorConfig}
@@ -187,6 +188,6 @@ export function ModelSection({
 					/>
 				</div>
 			)}
-		</div>
+		</section>
 	);
 }

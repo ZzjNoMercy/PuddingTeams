@@ -3,25 +3,43 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
+	ActivityIcon,
 	ArrowLeftIcon,
+	BoxIcon,
+	BoxesIcon,
 	CopyIcon,
 	DownloadIcon,
+	InfoIcon,
 	LoaderIcon,
+	MessageSquareTextIcon,
+	MoreHorizontalIcon,
+	PlugIcon,
 	RefreshCwIcon,
 	SaveIcon,
+	SlidersHorizontalIcon,
 	UploadIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { ApiConflictError, listAgents, probeAgent, putAgentConfig, setAgentEnabled } from "@/lib/api";
-import type { AgentConfig, AgentProbeResult, PiManagerSettings } from "@/lib/types";
+import {
+	DropdownMenu,
+	DropdownMenuContent,
+	DropdownMenuItem,
+	DropdownMenuSeparator,
+	DropdownMenuSub,
+	DropdownMenuSubContent,
+	DropdownMenuSubTrigger,
+	DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { ApiConflictError, listAgents, probeAgent, putAgentConfig, setAgentEnabled, updateAgent } from "@/lib/api";
+import type { AgentConfig, AgentProbeResult, MutationResponse, PiManagerSettings } from "@/lib/types";
 import { isConnectorProbe } from "@/lib/types";
 import { WorkerAvatar } from "@/components/chat/worker-avatar";
 import {
 	buildConfigBody,
+	buildResponsibility,
 	draftFromAgent,
 	isPiAgent,
 	serializeDraft,
@@ -31,22 +49,45 @@ import { OverviewSection } from "@/components/agent-config/overview-section";
 import { ModelSection } from "@/components/agent-config/model-section";
 import { PromptSection } from "@/components/agent-config/prompt-section";
 import { ResourceLibrarySection } from "@/components/agent-config/resource-library-section";
+import {
+	BindingsSection,
+	ConnectorSection,
+	LegacyInvokeSection,
+	StatusSection,
+} from "@/components/agent-config/connector-sections";
 
 /**
- * Pi Agent 独立配置页（§10.5）：概览 / 模型与运行 / 提示词 / 技能 / 模板
- * 五个分区编辑同一份页面级草稿，一个「保存」调 PUT /api/agents/:name/config
- * 一次提交；pinned manager 与 pi worker 同表单同接口（模型与运行分区按
- * pinned 渲染 PiManagerSettings 或 connector config）。
+ * Agent 独立配置页（§10.5）：所有角色统一入口。
+ * - pinned manager 与 pi worker：概览 / 模型与运行 / 提示词 / 模板四个分区编辑
+ *   同一份页面级草稿，一个「保存」调 PUT /api/agents/:name/config 一次提交；
+ * - 其余 connector / legacy worker：概览（描述 + 责任边界，随页面「保存」走
+ *   全量 upsert）+ 基础接入 / Extensions / 运行状态三个分区（各自独立保存，
+ *   见 connector-sections.tsx）。
  */
 
-type SectionKey = "overview" | "model" | "prompt" | "skills" | "templates";
+type SectionKey = "overview" | "model" | "prompt" | "templates" | "connector" | "extensions" | "status";
 
-const SECTIONS: Array<{ key: SectionKey; label: string }> = [
-	{ key: "overview", label: "概览" },
-	{ key: "model", label: "模型与运行" },
-	{ key: "prompt", label: "提示词" },
-	{ key: "skills", label: "技能" },
-	{ key: "templates", label: "模板" },
+type SectionDef = { key: SectionKey; label: string; description: string; icon: typeof InfoIcon };
+
+const OVERVIEW_SECTION: SectionDef = {
+	key: "overview",
+	label: "概览",
+	description: "定义用户看见的角色信息，以及 Manager 在协作中使用的责任边界。",
+	icon: InfoIcon,
+};
+
+const PI_SECTIONS: SectionDef[] = [
+	OVERVIEW_SECTION,
+	{ key: "model", label: "模型与运行", description: "选择模型、思考强度与上下文加载方式。", icon: SlidersHorizontalIcon },
+	{ key: "prompt", label: "提示词", description: "运行指令只属于 Agent；群聊协作规则仍在聊天信息中管理。", icon: MessageSquareTextIcon },
+	{ key: "templates", label: "模板", description: "管理可复用提示模板，让常用协作方式保持一致。", icon: BoxIcon },
+];
+
+const CONNECTOR_SECTIONS: SectionDef[] = [
+	OVERVIEW_SECTION,
+	{ key: "connector", label: "基础接入", description: "选择 Connector Extension、填写接入配置与密钥。", icon: PlugIcon },
+	{ key: "extensions", label: "Extensions", description: "绑定 Capability Extension，为 Worker 注册额外工具。", icon: BoxesIcon },
+	{ key: "status", label: "运行状态", description: "启停 Agent、探测本机接入、查看写操作对会话的影响。", icon: ActivityIcon },
 ];
 
 function probeSummary(probe: AgentProbeResult): string {
@@ -59,7 +100,7 @@ function probeSummary(probe: AgentProbeResult): string {
 	return probe.ok ? "探测健康" : `探测异常：${probe.error ?? `exit ${probe.exitCode}`}`;
 }
 
-/** 导出 / 导入 JSON 的载体：草稿 + 责任边界，便于跨环境搬运。 */
+/** 导出 / 导入 JSON 的载体：草稿 + 责任边界，便于跨环境搬运（仅 pi Agent）。 */
 interface ConfigTransfer {
 	description?: string;
 	responsibility?: AgentConfig["responsibility"] | null;
@@ -81,6 +122,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 	const [probing, setProbing] = useState(false);
 	const [toggling, setToggling] = useState(false);
 	const [leaveConfirm, setLeaveConfirm] = useState(false);
+	const [lastMutation, setLastMutation] = useState<MutationResponse | null>(null);
 	const importInputRef = useRef<HTMLInputElement>(null);
 
 	useEffect(() => {
@@ -91,7 +133,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 				setAgents(list);
 				const found = list.find((item) => item.name === name) ?? null;
 				setAgent(found);
-				if (found && isPiAgent(found)) {
+				if (found) {
 					const initial = draftFromAgent(found);
 					setDraft(initial);
 					setBaseline(serializeDraft(initial));
@@ -111,6 +153,19 @@ export function AgentConfigPage({ name }: { name: string }) {
 		setDraft((prev) => (prev ? { ...prev, ...patch } : prev));
 	}, []);
 
+	/** 分区写操作（Connector 绑定 / Capability 绑定）回写 agent 并记录影响。 */
+	const handleMutation = useCallback((res: MutationResponse) => {
+		setLastMutation(res);
+		setAgent(res.agent);
+		setAgents((prev) => prev?.map((item) => (item.name === res.agent.name ? res.agent : item)) ?? prev);
+	}, []);
+
+	/** legacy 命令接入保存后直接回写 agent。 */
+	const handleAgentSaved = useCallback((updated: AgentConfig) => {
+		setAgent(updated);
+		setAgents((prev) => prev?.map((item) => (item.name === updated.name ? updated : item)) ?? prev);
+	}, []);
+
 	const handleBack = useCallback(() => {
 		if (dirty) setLeaveConfirm(true);
 		else router.push("/agents");
@@ -120,25 +175,41 @@ export function AgentConfigPage({ name }: { name: string }) {
 		if (!agent || !draft) return;
 		setSaving(true);
 		try {
-			const mutation = await putAgentConfig(agent.name, buildConfigBody(agent, draft));
-			setAgent(mutation.agent);
-			setAgents((prev) => prev?.map((item) => (item.name === mutation.agent.name ? mutation.agent : item)) ?? prev);
-			const next = draftFromAgent(mutation.agent);
-			setDraft(next);
-			setBaseline(serializeDraft(next));
-			const { affectedSessions, activeNow, reloadPending } = mutation.affectedSessions;
-			toast.success(
-				affectedSessions > 0
-					? `「${agent.name}」配置已保存；${affectedSessions} 个会话受影响（${activeNow} 个立即生效，${reloadPending} 个回合结束后刷新）`
-					: `「${agent.name}」配置已保存；新建或重开的 Session 生效`,
-			);
-			for (const warning of mutation.securityWarnings ?? []) toast.warning(warning);
+			if (isPiAgent(agent)) {
+				const mutation = await putAgentConfig(agent.name, buildConfigBody(agent, draft));
+				setAgent(mutation.agent);
+				setAgents((prev) => prev?.map((item) => (item.name === mutation.agent.name ? mutation.agent : item)) ?? prev);
+				const next = draftFromAgent(mutation.agent);
+				setDraft(next);
+				setBaseline(serializeDraft(next));
+				const { affectedSessions, activeNow, reloadPending } = mutation.affectedSessions;
+				toast.success(
+					affectedSessions > 0
+						? `「${agent.name}」配置已保存；${affectedSessions} 个会话受影响（${activeNow} 个立即生效，${reloadPending} 个回合结束后刷新）`
+						: `「${agent.name}」配置已保存；新建或重开的 Session 生效`,
+				);
+				for (const warning of mutation.securityWarnings ?? []) toast.warning(warning);
+			} else {
+				// connector / legacy worker 只保存概览字段（描述 + 责任边界），全量 upsert
+				// 语义与原管理抽屉一致：责任边界全空 = 不提交该键（保留现状）。
+				const responsibility = buildResponsibility(draft) ?? undefined;
+				const updated = await updateAgent(agent.name, {
+					...agent,
+					description: draft.description.trim(),
+					responsibility,
+				});
+				handleAgentSaved(updated);
+				const next = draftFromAgent(updated);
+				setDraft(next);
+				setBaseline(serializeDraft(next));
+				toast.success(`「${agent.name}」配置已保存；新建或重开的 Session 生效`);
+			}
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
 			setSaving(false);
 		}
-	}, [agent, draft]);
+	}, [agent, draft, handleAgentSaved]);
 
 	/** 从其他 pi Agent 复制：model/thinkingLevel/systemPrompt/资源开关/enabled 名单灌入草稿。 */
 	const handleCopyFrom = useCallback(
@@ -285,7 +356,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 		[agent],
 	);
 
-	// ---- 加载 / 404 / 非 pi 三态 ----
+	// ---- 加载 / 404 两态 ----
 
 	if (loadError) {
 		return (
@@ -305,7 +376,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 			</div>
 		);
 	}
-	if (!agent) {
+	if (!agent || !draft) {
 		return (
 			<div className="flex h-dvh flex-col items-center justify-center gap-3">
 				<p className="text-sm text-muted-foreground">智能体「{name}」不存在（404）。</p>
@@ -315,43 +386,32 @@ export function AgentConfigPage({ name }: { name: string }) {
 			</div>
 		);
 	}
-	if (!isPiAgent(agent) || !draft) {
-		return (
-			<div className="flex h-dvh flex-col items-center justify-center gap-3">
-				<p className="text-sm text-muted-foreground">
-					「{agent.name}」不是 pi Agent（connector: {agent.connector?.connectorId ?? "命令接入"}），此配置页只承载
-					pinned manager 与 pi Connector worker。
-				</p>
-				<Button size="sm" variant="outline" onClick={() => router.push("/agents")}>
-					返回智能体列表
-				</Button>
-			</div>
-		);
-	}
 
+	const piMode = isPiAgent(agent);
+	const legacy = !agent.connector && agent.invoke?.type === "command";
+	const sections = piMode ? PI_SECTIONS : CONNECTOR_SECTIONS;
 	const copySources = agents.filter((item) => item.name !== agent.name && isPiAgent(item));
 
 	return (
-		<div className="flex h-dvh flex-col bg-background">
+		<div className="agent-config-shell flex h-full min-w-0 flex-1 flex-col bg-background">
 			{/* header */}
-			<div className="flex flex-wrap items-center gap-3 border-b px-4 py-3">
-				<Button size="sm" variant="ghost" onClick={handleBack}>
+			<header className="agent-config-head">
+				<Button size="icon" variant="ghost" onClick={handleBack} aria-label="返回智能体列表" title="返回智能体列表">
 					<ArrowLeftIcon className="size-4" />
-					返回
 				</Button>
 				<WorkerAvatar name={agent.name} size={40} />
-				<div className="min-w-0">
+				<div className="min-w-0 flex-1">
 					<div className="flex items-center gap-1.5">
-						<span className="truncate font-mono text-sm font-medium">{agent.name}</span>
-						<Badge variant="outline">{agent.pinned ? "Manager" : (agent.connector?.connectorId ?? "worker")}</Badge>
+						<span className="truncate text-sm font-semibold">{agent.name}</span>
+						<Badge variant="secondary">{agent.pinned ? "Manager" : (agent.connector?.connectorId ?? "worker")}</Badge>
 					</div>
 					<p className="truncate text-xs text-muted-foreground">{agent.description || "（无描述）"}</p>
 				</div>
 
 				{agent.pinned ? (
-					<Badge variant="secondary">已启用（不可禁用）</Badge>
+					<span className="agent-config-status">已启用</span>
 				) : (
-					<label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+					<label className="agent-config-status flex items-center gap-1.5">
 						<input
 							type="checkbox"
 							checked={agent.enabled !== false}
@@ -363,49 +423,31 @@ export function AgentConfigPage({ name }: { name: string }) {
 					</label>
 				)}
 
-				{agent.pinned ? null : (
-					<div className="flex items-center gap-1.5">
+				<div className="agent-config-actions">
+					{agent.pinned ? null : (
 						<Button size="sm" variant="outline" disabled={probing} onClick={() => void handleProbe()}>
 							{probing ? <LoaderIcon className="size-3.5 animate-spin" /> : <RefreshCwIcon className="size-3.5" />}
 							探测
 						</Button>
-						{probe ? (
-							<span className={`text-xs ${isConnectorProbe(probe) ? (probe.detected && probe.compatibility !== "incompatible" ? "text-muted-foreground" : "text-destructive") : probe.ok ? "text-muted-foreground" : "text-destructive"}`}>
-								{probeSummary(probe)}
-							</span>
-						) : null}
-					</div>
-				)}
-
-				<div className="ml-auto flex flex-wrap items-center gap-2">
-					<Select onValueChange={handleCopyFrom}>
-						<SelectTrigger size="sm" className="w-44">
-							<CopyIcon className="size-3.5" />
-							<SelectValue placeholder="从其他 Agent 复制配置" />
-						</SelectTrigger>
-						<SelectContent>
-							{copySources.length === 0 ? (
-								<SelectItem value="__none__" disabled>
-									没有其他 pi Agent
-								</SelectItem>
-							) : (
-								copySources.map((item) => (
-									<SelectItem key={item.name} value={item.name}>
-										{item.name}
-										{item.pinned ? "（Manager）" : ""}
-									</SelectItem>
-								))
-							)}
-						</SelectContent>
-					</Select>
-					<Button size="sm" variant="outline" onClick={handleExport}>
-						<DownloadIcon className="size-3.5" />
-						导出 JSON
-					</Button>
-					<Button size="sm" variant="outline" onClick={() => importInputRef.current?.click()}>
-						<UploadIcon className="size-3.5" />
-						导入 JSON
-					</Button>
+					)}
+					{piMode ? (
+						<DropdownMenu>
+							<DropdownMenuTrigger asChild>
+								<Button size="icon" variant="ghost" aria-label="更多配置操作" title="更多配置操作"><MoreHorizontalIcon className="size-4" /></Button>
+							</DropdownMenuTrigger>
+							<DropdownMenuContent align="end" className="w-52">
+								<DropdownMenuSub>
+									<DropdownMenuSubTrigger disabled={copySources.length === 0}><CopyIcon />从其他 Agent 复制</DropdownMenuSubTrigger>
+									<DropdownMenuSubContent>
+										{copySources.map((item) => <DropdownMenuItem key={item.name} onSelect={() => handleCopyFrom(item.name)}>{item.name}{item.pinned ? "（Manager）" : ""}</DropdownMenuItem>)}
+									</DropdownMenuSubContent>
+								</DropdownMenuSub>
+								<DropdownMenuSeparator />
+								<DropdownMenuItem onSelect={handleExport}><DownloadIcon />导出 JSON</DropdownMenuItem>
+								<DropdownMenuItem onSelect={() => importInputRef.current?.click()}><UploadIcon />导入 JSON</DropdownMenuItem>
+							</DropdownMenuContent>
+						</DropdownMenu>
+					) : null}
 					<input
 						ref={importInputRef}
 						type="file"
@@ -419,38 +461,47 @@ export function AgentConfigPage({ name }: { name: string }) {
 					/>
 					<Button size="sm" disabled={saving || !dirty} onClick={() => void handleSave()}>
 						{saving ? <LoaderIcon className="size-3.5 animate-spin" /> : <SaveIcon className="size-3.5" />}
-						保存{dirty ? "（有未保存更改）" : ""}
+						保存{dirty ? " · 有更改" : ""}
 					</Button>
 				</div>
-			</div>
+				{probe ? <span className={`agent-config-probe ${isConnectorProbe(probe) ? (probe.detected && probe.compatibility !== "incompatible" ? "" : "text-destructive") : probe.ok ? "" : "text-destructive"}`}>{probeSummary(probe)}</span> : null}
+			</header>
 
 			{/* 分区导航 + 内容 */}
-			<div className="flex min-h-0 flex-1">
-				<nav className="flex w-36 shrink-0 flex-col gap-1 border-r px-2 py-3">
-					{SECTIONS.map((item) => (
+			<div className="agent-config-body">
+				<nav className="agent-config-nav" aria-label="Agent 配置分区">
+					{sections.map((item) => (
 						<button
 							key={item.key}
 							type="button"
 							onClick={() => setSection(item.key)}
-							className={`rounded-md px-3 py-1.5 text-left text-sm transition-colors ${
-								section === item.key ? "bg-accent font-medium" : "text-muted-foreground hover:text-foreground"
-							}`}
+							aria-current={section === item.key ? "page" : undefined}
+							className={`agent-config-nav-button ${section === item.key ? "active" : ""}`}
 						>
+							<item.icon className="size-4" />
 							{item.label}
 						</button>
 					))}
 				</nav>
-				<main className="min-w-0 flex-1 overflow-y-auto">
-					<div className="mx-auto flex max-w-3xl flex-col gap-3 px-4 py-4">
-						<div className="flex items-baseline gap-2">
-							<h1 className="text-sm font-semibold">{SECTIONS.find((item) => item.key === section)?.label}</h1>
-							{dirty ? <span className="text-xs text-muted-foreground">草稿已修改，保存后生效</span> : null}
+				<main className="agent-config-content">
+					<div className="agent-config-column">
+						<div className="agent-config-title-row">
+							<div><h1>{sections.find((item) => item.key === section)?.label}</h1><p>{sections.find((item) => item.key === section)?.description}</p></div>
+							{dirty ? <span>草稿已修改</span> : null}
 						</div>
-						{section === "overview" ? <OverviewSection agent={agent} draft={draft} onChange={patchDraft} onAgentUpdated={setAgent} /> : null}
-						{section === "model" ? <ModelSection agent={agent} draft={draft} onChange={patchDraft} /> : null}
-						{section === "prompt" ? <PromptSection agent={agent} draft={draft} onChange={patchDraft} /> : null}
-						{section === "skills" ? <ResourceLibrarySection kind="skills" agent={agent} draft={draft} onChange={patchDraft} /> : null}
-						{section === "templates" ? <ResourceLibrarySection kind="templates" agent={agent} draft={draft} onChange={patchDraft} /> : null}
+						{section === "overview" ? <OverviewSection agent={agent} draft={draft} onChange={patchDraft} onAgentUpdated={handleAgentSaved} /> : null}
+						{piMode && section === "model" ? <ModelSection agent={agent} draft={draft} onChange={patchDraft} /> : null}
+						{piMode && section === "prompt" ? <PromptSection agent={agent} draft={draft} onChange={patchDraft} /> : null}
+						{piMode && section === "templates" ? <ResourceLibrarySection kind="templates" agent={agent} draft={draft} onChange={patchDraft} /> : null}
+						{!piMode && section === "connector" ? (
+							legacy ? (
+								<LegacyInvokeSection agent={agent} onSaved={handleAgentSaved} />
+							) : (
+								<ConnectorSection agent={agent} onMutation={handleMutation} />
+							)
+						) : null}
+						{!piMode && section === "extensions" ? <BindingsSection agent={agent} onMutation={handleMutation} /> : null}
+						{!piMode && section === "status" ? <StatusSection agent={agent} lastMutation={lastMutation} onToggleEnabled={handleToggleEnabled} toggling={toggling} /> : null}
 					</div>
 				</main>
 			</div>

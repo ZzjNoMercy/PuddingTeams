@@ -14,6 +14,7 @@ export default function Home() {
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const [createOpen, setCreateOpen] = useState(false);
 	const [loadError, setLoadError] = useState<string | null>(null);
+	const [roomsOpen, setRoomsOpen] = useState(true);
 
 	useEffect(() => {
 		let cancelled = false;
@@ -86,22 +87,26 @@ export default function Home() {
 	);
 
 	return (
-		<div className="flex h-dvh">
+		<div className="home-shell flex h-dvh">
 			<NavRail view="chat" />
+			{roomsOpen ? <button type="button" className="fixed inset-0 z-30 bg-black/30 md:hidden" aria-label="关闭对话列表" onClick={() => setRoomsOpen(false)} /> : null}
 			<SessionList
 				rooms={rooms}
 				selectedId={selectedId}
 				onSelect={setSelectedId}
 				onNew={handleNew}
 				onDelete={handleDelete}
+				open={roomsOpen}
+				onClose={() => setRoomsOpen(false)}
 			/>
-			<main className="flex min-w-0 flex-1 flex-col bg-background">
+			<main className="home-main-stage flex min-w-0 flex-1 flex-col">
 				{selectedId ? (
 					<ChatPane
 						key={selectedId}
 						roomId={selectedId}
 						onOpenWindow={openWindow}
 						onRoomUpdated={handleRoomUpdated}
+						onOpenRoomList={() => setRoomsOpen(true)}
 					/>
 				) : (
 					<div className="flex flex-1 flex-col items-center justify-center gap-4 bg-muted/30">

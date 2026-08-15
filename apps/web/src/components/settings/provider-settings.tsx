@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
-import { PencilIcon, PlusIcon, Trash2Icon } from "lucide-react";
+import { ChevronDownIcon, PencilIcon, PlusIcon, Trash2Icon } from "lucide-react";
 import {
 	deleteCustomProvider,
 	deleteProviderKey,
@@ -94,86 +94,47 @@ function ProviderRow({
 	};
 
 	return (
-		<div className="rounded-md px-3 py-2 hover:bg-muted/60">
-			<div className="flex items-center gap-3">
-				<span
-					className={`size-1.5 shrink-0 rounded-full ${provider.configured ? "bg-foreground" : "bg-muted-foreground/30"}`}
-				/>
-				<button
-					type="button"
-					className="min-w-0 flex-1 truncate text-left text-sm hover:underline"
-					onClick={() => void toggleModels()}
-				>
-					{provider.name}
-				</button>
-				<span className="text-xs text-muted-foreground">{provider.modelCount} 模型</span>
-				{provider.configured ? (
-					confirmingDelete ? (
-						<span className="flex items-center gap-1">
-							<Button type="button" size="sm" variant="destructive" disabled={busy} onClick={remove}>
-								确认删除
-							</Button>
-							<Button type="button" size="sm" variant="ghost" onClick={() => setConfirmingDelete(false)}>
-								取消
-							</Button>
-						</span>
-					) : (
-						<span className="flex items-center gap-2">
-							<span className="text-xs text-muted-foreground">已配置</span>
-							<Button
-								type="button"
-								size="sm"
-								variant="ghost"
-								className="text-muted-foreground"
-								onClick={() => setExpanded((v) => !v)}
-							>
-								{expanded ? "收起" : "替换 key"}
-							</Button>
-							<Button
-								type="button"
-								size="sm"
-								variant="ghost"
-								className="text-muted-foreground hover:text-destructive"
-								onClick={() => setConfirmingDelete(true)}
-							>
-								删除 key
-							</Button>
-						</span>
-					)
-				) : (
-					<Button
-						type="button"
-						size="sm"
-						variant="ghost"
-						onClick={() => setExpanded((v) => !v)}
-					>
-						{expanded ? "收起" : "配置 key"}
-					</Button>
-				)}
-			</div>
-			{expanded && (
-				<form
-					className="mt-2 flex items-center gap-2 pl-4"
-					onSubmit={(e) => {
-						e.preventDefault();
-						void save();
-					}}
-				>
-					<Input
-						type="password"
-						placeholder={`${provider.name} API key`}
-						value={apiKey}
-						onChange={(e) => setApiKey(e.target.value)}
-						autoComplete="off"
-						className="h-8 flex-1 text-xs"
-					/>
-					<Button type="submit" size="sm" disabled={busy || !apiKey.trim()}>
-						保存
-					</Button>
-				</form>
-			)}
+		<div className={cn("provider-row", showModels && "is-open")}>
+			<button type="button" className="provider-row-summary" onClick={() => void toggleModels()}>
+				<span className="provider-row-name">{provider.name}</span>
+				<span className="provider-row-status">
+					{provider.configured ? `已配置 · ${provider.modelCount} 模型` : "未配置"}
+				</span>
+				<ChevronDownIcon className="provider-row-chevron" aria-hidden="true" />
+			</button>
 			{showModels && (
-				<div className="mt-2 space-y-1 border-l border-border pl-4">
+				<div className="provider-row-detail">
+					<div className="provider-row-actions">
+						{confirmingDelete ? (
+							<>
+								<Button type="button" size="sm" variant="destructive" disabled={busy} onClick={remove}>确认删除</Button>
+								<Button type="button" size="sm" variant="ghost" onClick={() => setConfirmingDelete(false)}>取消</Button>
+							</>
+						) : (
+							<>
+								<Button type="button" size="sm" variant="ghost" onClick={() => setExpanded((v) => !v)}>
+									{expanded ? "收起" : provider.configured ? "替换 key" : "配置 key"}
+								</Button>
+								{provider.configured ? (
+									<Button type="button" size="sm" variant="ghost" className="text-muted-foreground hover:text-destructive" onClick={() => setConfirmingDelete(true)}>
+										删除 key
+									</Button>
+								) : null}
+							</>
+						)}
+					</div>
+					{expanded && (
+						<form
+							className="provider-key-form"
+							onSubmit={(e) => {
+								e.preventDefault();
+								void save();
+							}}
+						>
+							<Input type="password" placeholder={`${provider.name} API key`} value={apiKey} onChange={(e) => setApiKey(e.target.value)} autoComplete="off" className="h-8 flex-1 text-xs" />
+							<Button type="submit" size="sm" disabled={busy || !apiKey.trim()}>保存</Button>
+						</form>
+					)}
 					<div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
 						{provider.baseUrl ? (
 							<span title="API endpoint">
@@ -275,14 +236,14 @@ export function ProviderSettings() {
 		.sort((a, b) => Number(b.configured) - Number(a.configured));
 
 	return (
-		<div className={cn("flex min-h-0 flex-1 flex-col gap-3")}>
+		<div className={cn("provider-settings flex min-h-0 flex-1 flex-col gap-3")}>
 			<Input
 				placeholder="过滤 provider…"
 				value={filter}
 				onChange={(e) => setFilter(e.target.value)}
-				className="h-8 text-xs"
+				className="provider-filter h-9 text-xs"
 			/>
-			<div className="rounded-md border border-border px-3 py-2">
+			<div className="custom-provider-card rounded-md border border-border px-3 py-2">
 				<div className="flex items-center gap-2">
 					<span className="flex-1 text-sm text-muted-foreground">
 						自定义 Provider（OpenAI-compatible 端点，{customProviders.length}）
@@ -356,7 +317,7 @@ export function ProviderSettings() {
 					</div>
 				) : null}
 			</div>
-			<div className="min-h-0 flex-1 overflow-y-auto">
+			<div className="provider-list min-h-0 flex-1 overflow-y-auto">
 				{visible.length === 0 ? (
 					<p className="py-8 text-center text-xs text-muted-foreground">
 						{providers === null ? "加载中…" : "没有匹配的 provider"}

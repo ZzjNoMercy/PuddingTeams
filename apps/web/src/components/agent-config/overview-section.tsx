@@ -20,16 +20,17 @@ export function OverviewSection({
 }) {
 	return (
 		<div className="flex flex-col gap-3">
-			<AvatarEditor agent={agent} onUpdated={onAgentUpdated} />
-			<label className="flex flex-col gap-1 text-sm">
-				<span className="text-muted-foreground">描述</span>
-				<Textarea value={draft.description} onChange={(e) => onChange({ description: e.target.value })} rows={3} />
-				<span className="text-xs text-muted-foreground/70">
-					提供给 Manager 做识别、搜索和选择；同时用于通用 UI 展示。不是该 Worker 的运行提示词。
-				</span>
-			</label>
-			<div className="grid gap-2 rounded-md bg-muted/60 p-3 sm:grid-cols-2">
-				<span className="text-sm font-medium sm:col-span-2">责任边界</span>
+			<section className="agent-config-card">
+				<div className="agent-config-card-head"><h2>基本信息</h2><p>描述用于聊天、成员信息以及 Manager 的角色识别。</p></div>
+				<AvatarEditor agent={agent} onUpdated={onAgentUpdated} />
+				<label className="agent-config-field mt-4">
+					<span>描述</span>
+					<Textarea value={draft.description} onChange={(e) => onChange({ description: e.target.value })} rows={3} />
+					<small>用于通用 UI 展示和 Manager 路由，不是该 Worker 的运行提示词。</small>
+				</label>
+			</section>
+			<section className="agent-config-card grid gap-3 sm:grid-cols-2">
+				<div className="agent-config-card-head sm:col-span-2"><h2>责任边界</h2><p>帮助 Manager 判断何时自己处理、委派 Worker 或升级给用户。</p></div>
 				<label className="flex flex-col gap-1 text-sm">
 					<span className="text-muted-foreground">身份定位（可选）</span>
 					<Input value={draft.identity} onChange={(e) => onChange({ identity: e.target.value })} placeholder="如：前端实现负责人" />
@@ -53,7 +54,7 @@ export function OverviewSection({
 				<p className="text-xs text-muted-foreground sm:col-span-2">
 					责任边界只提供给 Manager 做路由、停止与升级判断；不授予权限，也不会发给 Worker。
 				</p>
-			</div>
+			</section>
 		</div>
 	);
 }

@@ -166,6 +166,7 @@ function ComposerInner({
 				</div>
 			) : null}
 			<PromptInput
+			className="home-composer"
 			multiple
 			maxFiles={5}
 			maxFileSize={8 * 1024 * 1024}
@@ -190,7 +191,8 @@ function ComposerInner({
 				{(attachment) => <PromptInputAttachment data={attachment} />}
 			</PromptInputAttachments>
 			<PromptInputTextarea
-				placeholder={disabled ? "agent 正在处理…" : "发消息（Enter 发送，Shift+Enter 换行）"}
+				placeholder={disabled ? "agent 正在处理…" : "发消息，或输入 / 调用命令"}
+				className="home-composer-textarea"
 			/>
 			<PromptInputFooter>
 				<PromptInputTools>
@@ -240,6 +242,7 @@ export function Composer({
 	onStop,
 	onGoalCommand,
 	onOpenWorkspace,
+	scrollButtonHostRef,
 }: {
 	sessionId: string;
 	disabled: boolean;
@@ -251,10 +254,12 @@ export function Composer({
 	onStop: () => void;
 	onGoalCommand: (initialGoal: string) => void;
 	onOpenWorkspace: () => void;
+	scrollButtonHostRef?: (node: HTMLDivElement | null) => void;
 }) {
 	return (
-		<div className="relative bg-background p-3">
-			<div className="mx-auto max-w-3xl">
+		<div className="home-composer-wrap">
+			<div className="home-composer-inner">
+				<div ref={scrollButtonHostRef} className="home-scroll-to-bottom-host" />
 				<PromptInputProvider>
 					<ComposerInner
 						sessionId={sessionId}

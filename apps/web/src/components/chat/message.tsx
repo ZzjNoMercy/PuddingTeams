@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { ChevronDownIcon, ChevronRightIcon, ExternalLinkIcon, UsersIcon } from "lucide-react";
+import { createContext, type ComponentProps, useContext, useEffect, useState } from "react";
+import { CheckIcon, ChevronDownIcon, ChevronRightIcon, ExternalLinkIcon, UsersIcon } from "lucide-react";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
 	Message as AiMessage,
@@ -18,7 +18,9 @@ import { Badge } from "@/components/ui/badge";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { streamdownPlugins } from "@/core/streamdown/plugins";
 import { delegateWorker, isDelegateCall } from "@/lib/events";
+import { openRoomFile } from "@/lib/api";
 import type { ChatMessage, ToolCallView, WindowType } from "@/lib/types";
+import { toast } from "sonner";
 import { WorkerAvatar } from "./worker-avatar";
 import { InteractionCard } from "./interaction-card";
 
@@ -27,6 +29,62 @@ const TOOL_STATUS_LABEL: Record<ToolCallView["status"], string> = {
 	running: "运行中",
 	done: "完成",
 	error: "失败",
+	interrupted: "已中断",
+};
+
+const RoomFileContext = createContext<string | undefined>(undefined);
+
+function localPathFromHref(href: string): string | undefined {
+	const value = href.trim();
+	if (!value || value.startsWith("#") || value.startsWith("?") || value.startsWith("//")) return undefined;
+	if (/^(?:https?|mailto|tel|data|blob):/i.test(value) || value.startsWith("/api/")) return undefined;
+	if (/^file:/i.test(value)) return value;
+	if (/^(?:sandbox|attachment):/i.test(value)) {
+		const localValue = value.replace(/^(?:sandbox|attachment):(?:\/\/)?/i, "");
+		try {
+			return decodeURIComponent(localValue);
+		} catch {
+			return localValue;
+		}
+	}
+	// Other URI schemes are browser links. Drive-letter paths are local files.
+	if (/^[a-z][a-z\d+.-]*:/i.test(value) && !/^[a-z]:[\\/]/i.test(value)) return undefined;
+	const pathOnly = value.split(/[?#]/, 1)[0] ?? value;
+	try {
+		return decodeURIComponent(pathOnly);
+	} catch {
+		return pathOnly;
+	}
+}
+
+function ChatMarkdownLink({ href = "", children, node, ...props }: ComponentProps<"a"> & { node?: unknown }) {
+	void node;
+	const roomId = useContext(RoomFileContext);
+	const localPath = localPathFromHref(href);
+	if (localPath && roomId) {
+		return (
+			<button
+				type="button"
+				className="home-local-file-link"
+				title={`打开本地文件：${localPath}`}
+				onClick={async () => {
+					try {
+						await openRoomFile(roomId, localPath);
+					} catch (error) {
+						toast.error(error instanceof Error ? error.message : "无法打开本地文件");
+					}
+				}}
+			>
+				{children}
+			</button>
+		);
+	}
+	return <a href={href} target={href.startsWith("#") ? undefined : "_blank"} rel="noreferrer" {...props}>{children}</a>;
+}
+
+const chatStreamdownProps = {
+	...streamdownPlugins,
+	components: { a: ChatMarkdownLink },
 };
 
 function Elapsed({ active }: { active: boolean }) {
@@ -52,6 +110,7 @@ function statusBadge(call: ToolCallView) {
 			</Badge>
 		);
 	if (call.status === "error") return <Badge variant="destructive">失败</Badge>;
+	if (call.status === "interrupted") return <Badge variant="outline">已中断</Badge>;
 	const details = call.details as { status?: string } | undefined;
 	if (details?.status === "needs_input") return <Badge variant="secondary">等待输入</Badge>;
 	return <Badge variant="secondary">完成</Badge>;
@@ -91,6 +150,7 @@ function WorkerTaskEntry({
 	running,
 	isError,
 	meta,
+	timestamp,
 	children,
 }: {
 	worker: string;
@@ -100,6 +160,7 @@ function WorkerTaskEntry({
 	running?: boolean;
 	isError?: boolean;
 	meta?: string;
+	timestamp?: number;
 	children?: React.ReactNode;
 }) {
 	// worker 工作过程：运行中/无结果时展开，拿到结果后自动折叠（可手动再展开）。
@@ -112,9 +173,49 @@ function WorkerTaskEntry({
 		if (finished) setOpen(false);
 	}
 	const escapeBottomLock = useEscapeBottomLock();
+	const time = timestamp
+		? new Date(timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })
+		: "";
+	const expandableResult = Boolean(result && (result.length > 360 || result.split("\n").length > 8));
+
+	if (finished) {
+		return (
+			<div className="home-worker-entry is-finished">
+				<WorkerAvatar name={worker} size={34} className="shrink-0" />
+				<div className="home-worker-finished-body">
+					<div className="home-worker-message-meta">
+						<strong>{worker}</strong>
+						{isError ? (
+							<span className="home-worker-status is-error">失败</span>
+						) : (
+							<span className="home-worker-status is-complete"><CheckIcon />已完成</span>
+						)}
+						{time ? <time>{time}</time> : null}
+					</div>
+					<div className={`home-worker-result ${!open && expandableResult ? "is-clamped" : ""} ${isError ? "text-destructive" : ""}`}>
+						<MessageResponse {...chatStreamdownProps}>{result}</MessageResponse>
+					</div>
+					{expandableResult ? (
+						<button
+							type="button"
+							className="home-worker-result-toggle"
+							onClick={() => {
+								escapeBottomLock();
+								setOpen((value) => !value);
+							}}
+						>
+							{open ? "收起结果" : "展开结果"}
+							<ChevronDownIcon className={open ? "rotate-180" : ""} />
+						</button>
+					) : null}
+				</div>
+			</div>
+		);
+	}
+
 	return (
-		<div className="flex w-full items-start gap-2.5">
-			<WorkerAvatar name={worker} size={28} className="mt-0.5 shrink-0" />
+		<div className="home-worker-entry flex w-full items-start gap-2.5">
+			<WorkerAvatar name={worker} size={34} className="shrink-0" />
 			<div className="min-w-0 flex-1">
 				<button
 					type="button"
@@ -144,7 +245,7 @@ function WorkerTaskEntry({
 						{children}
 						{result !== undefined && result !== "" && (
 							<div className={`mt-1 text-sm ${isError ? "text-destructive" : ""}`}>
-								<MessageResponse {...streamdownPlugins}>{result}</MessageResponse>
+								<MessageResponse {...chatStreamdownProps}>{result}</MessageResponse>
 							</div>
 						)}
 						{meta ? <p className="mt-1 text-xs text-muted-foreground/70 tabular-nums">{meta}</p> : null}
@@ -195,7 +296,7 @@ function DelegateCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow
 		| undefined;
 	const [open, setOpen] = useState(false);
 	// 任务/结果主体：运行中展开看进度，完成后自动折叠（可手动再展开）。
-	const finished = call.status === "done" || call.status === "error";
+	const finished = call.status === "done" || call.status === "error" || call.status === "interrupted";
 	const [bodyOpen, setBodyOpen] = useState(!finished);
 	const [wasFinished, setWasFinished] = useState(finished);
 	if (finished !== wasFinished) {
@@ -314,7 +415,7 @@ function DelegateCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow
 					) : null}
 					{call.result !== undefined && (
 						<div className={`text-sm ${call.isError ? "text-destructive" : ""}`}>
-							<MessageResponse {...streamdownPlugins}>{call.result}</MessageResponse>
+							<MessageResponse {...chatStreamdownProps}>{call.result}</MessageResponse>
 						</div>
 					)}
 					{meta ? <p className="text-xs text-muted-foreground/70 tabular-nums">{meta}</p> : null}
@@ -356,10 +457,12 @@ function ToolCallItem({
 	call,
 	windowType,
 	onOpenWindow,
+	timestamp,
 }: {
 	call: ToolCallView;
 	windowType?: WindowType;
 	onOpenWindow?: (windowId: string) => void;
+	timestamp?: number;
 }) {
 	if (isDelegateCall(call)) {
 		// §7 成员消息流：direct/group 下脱离 manager 气泡，渲染为 worker 独立条目。
@@ -374,6 +477,7 @@ function ToolCallItem({
 						worker={delegateWorker(call) ?? "worker"}
 						task={(call.args as { task?: string } | undefined)?.task}
 						badge={statusBadge(call)}
+						timestamp={timestamp}
 					>
 						<div className="mt-1">
 							<InteractionCard
@@ -398,6 +502,7 @@ function ToolCallItem({
 					running={call.status === "running"}
 					isError={call.isError}
 					meta={toolCallMeta(call)}
+					timestamp={timestamp}
 				/>
 			);
 		}
@@ -484,7 +589,7 @@ function CustomMessageEntry({
 	// direct 直派（§5.2）：用户发言以普通用户气泡呈现。
 	if (message.customType === "pudding:user_message") {
 		return (
-			<AiMessage from="user">
+			<AiMessage from="user" className="home-user-message">
 				<MessageContent>
 					<p className="text-sm whitespace-pre-wrap">{message.content}</p>
 				</MessageContent>
@@ -499,10 +604,10 @@ function CustomMessageEntry({
 			// direct 窗口：用户消息就在上方，指派卡只作 worker 侧运行指示，
 			// 落定后整张收起（结果卡已说明一切）。
 			if (!running) return null;
-			return <WorkerTaskEntry worker={details?.worker ?? "worker"} badge={<Badge variant="secondary">执行中</Badge>} running />;
+			return <WorkerTaskEntry worker={details?.worker ?? "worker"} badge={<Badge variant="secondary">执行中</Badge>} running timestamp={message.timestamp} />;
 		}
 		return (
-			<AiMessage from="user">
+			<AiMessage from="user" className="home-user-message">
 				<MessageContent>
 					<p className="text-xs text-muted-foreground">派给 {details?.worker ?? "worker"}</p>
 					<p className="text-sm whitespace-pre-wrap">{message.content}</p>
@@ -519,6 +624,7 @@ function CustomMessageEntry({
 				result={message.content}
 				badge={workerStatusBadge(details?.status)}
 				isError={Boolean(details?.status && details.status !== "completed")}
+				timestamp={message.timestamp}
 			/>
 		);
 	}
@@ -558,7 +664,7 @@ function CustomMessageEntry({
 	);
 }
 
-export function Message({
+function MessageBody({
 	message,
 	windowType,
 	onOpenWindow,
@@ -571,9 +677,9 @@ export function Message({
 }) {
 	if (message.role === "user") {
 		return (
-			<AiMessage from="user">
+			<AiMessage from="user" className="home-user-message">
 				<MessageContent>
-					<p className="text-sm whitespace-pre-wrap">{message.content}</p>
+					<p className="whitespace-pre-wrap">{message.content}</p>
 				</MessageContent>
 			</AiMessage>
 		);
@@ -605,36 +711,58 @@ export function Message({
 	const workerCalls = memberFlow ? message.toolCalls.filter((c) => isDelegateCall(c)) : [];
 	const showBubble = showThinking || showContent || bubbleCalls.length > 0;
 
+	const time = new Date(message.timestamp).toLocaleTimeString("zh-CN", {
+		hour: "2-digit",
+		minute: "2-digit",
+		hour12: false,
+	});
+
 	return (
 		<>
 			{showBubble && (
-				<AiMessage from="assistant">
-					<MessageContent>
+				<div className="home-assistant-message">
+					<div className="home-manager-avatar">M</div>
+					<div className="home-assistant-body">
+						<div className="home-message-meta"><strong>Manager</strong><span>{time}</span></div>
 						{showThinking && (
 							<AssistantReasoning streaming={message.streaming} thinking={message.thinking} />
 						)}
 						{bubbleCalls.length > 0 && (
 							<div className="flex w-full flex-col gap-2">
 								{bubbleCalls.map((call) => (
-									<ToolCallItem key={call.id} call={call} windowType={windowType} onOpenWindow={onOpenWindow} />
+									<ToolCallItem key={call.id} call={call} windowType={windowType} onOpenWindow={onOpenWindow} timestamp={message.timestamp} />
 								))}
 							</div>
 						)}
 						{showContent && (
 							<MessageResponse
-								className={message.error ? "text-destructive" : undefined}
-								{...streamdownPlugins}
+								className={`home-message-response ${message.error ? "text-destructive" : ""}`}
+								{...chatStreamdownProps}
 							>
 								{message.content}
 							</MessageResponse>
 						)}
-					</MessageContent>
-				</AiMessage>
+					</div>
+				</div>
 			)}
 			{workerCalls.map((call) => (
-				<ToolCallItem key={call.id} call={call} windowType={windowType} onOpenWindow={onOpenWindow} />
+				<ToolCallItem key={call.id} call={call} windowType={windowType} onOpenWindow={onOpenWindow} timestamp={message.timestamp} />
 			))}
 		</>
+	);
+}
+
+export function Message({ roomId, ...props }: {
+	roomId: string;
+	message: ChatMessage;
+	windowType?: WindowType;
+	onOpenWindow?: (windowId: string) => void;
+	resolvedTaskIds?: Set<string>;
+}) {
+	return (
+		<RoomFileContext.Provider value={roomId}>
+			<MessageBody {...props} />
+		</RoomFileContext.Provider>
 	);
 }
 

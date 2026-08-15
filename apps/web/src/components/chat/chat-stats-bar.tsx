@@ -19,7 +19,7 @@ export function ChatStatsBar({ stats }: { stats: SessionStats | null }) {
 	parts.push(`输入 ${formatTokens(stats.inputTokens)} · 输出 ${formatTokens(stats.outputTokens)}`);
 	if (stats.totalCost !== undefined) parts.push(`$${stats.totalCost < 0.01 ? stats.totalCost.toFixed(4) : stats.totalCost.toFixed(2)}`);
 	return (
-		<div className="mx-auto w-full max-w-3xl px-4 pb-1 text-right text-[11px] tabular-nums text-muted-foreground/80">
+		<div className="home-chat-stats">
 			{parts.join(" ｜ ")}
 		</div>
 	);

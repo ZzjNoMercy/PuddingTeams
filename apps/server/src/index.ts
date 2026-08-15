@@ -11,6 +11,7 @@ import { CredentialsStore } from "./store/credentials.js";
 import { TeamsStore } from "./store/teams.js";
 import { registerChatRoutes } from "./routes/chat.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
+import { registerIdentityRoutes } from "./routes/identity.js";
 import { registerProvidersRoutes } from "./routes/providers.js";
 import { registerAgentsRoutes } from "./routes/agents.js";
 import { registerResourcesRoutes } from "./routes/resources.js";
@@ -135,6 +136,7 @@ await teams.ensureSoloWindow(
 	async (id) => store.isOpen(id) || (await store.list()).some((s) => s.id === id),
 );
 await registerChatRoutes(app, store, teams, workStates, uploads, invoker);
+registerIdentityRoutes(app);
 await registerSettingsRoutes(app, defaultCwd);
 await registerProvidersRoutes(app, store);
 await registerAgentsRoutes(app, teams, {
@@ -147,7 +149,9 @@ await registerAgentsRoutes(app, teams, {
 await registerExtensionsRoutes(app, { registry: extensionRegistry, teams, runtime, sessions: store, settings: productSettings });
 registerResourcesRoutes(app);
 registerWorkspacesRoutes(app, teams.workspaces, undefined, store);
-await registerRoomsRoutes(app, store, teams, invoker, workStates);
+await registerRoomsRoutes(app, store, teams, invoker, workStates, {
+	additionalRoots: [paths.uploads],
+});
 await registerInteractionsRoutes(app, runtime, invoker, teams);
 registerArtifactsRoutes(app, artifacts);
 registerWorkStateRoutes(app, workStates, teams, store, runtime);

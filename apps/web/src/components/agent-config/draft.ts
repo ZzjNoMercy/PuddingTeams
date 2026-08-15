@@ -1,7 +1,8 @@
 import type { AgentConfig, AgentResponsibilityProfile, PiManagerSettings, PiResourceConfig } from "@/lib/types";
 
 /**
- * 独立配置页的页面级草稿：概览 / 模型与运行 / 提示词 / 技能 / 模板五个分区
+ * 独立配置页的页面级草稿：概览 / 模型与运行 / 提示词 / 模板四个分区；
+ * Skills 的资源库与作用域由扩展页管理，草稿仍保留资源字段以便保存时不丢失既有配置。
  * 编辑同一份草稿，页面级一个「保存」调 PUT /api/agents/:name/config 一次提交。
  * 文本类字段保持字符串（owns 等每行一项、skillPaths 每行一个路径），保存时才解析。
  */

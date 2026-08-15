@@ -14,7 +14,11 @@ import { PiSessionStore } from "../pi-bridge/session-store.js";
 import { registerRoomsRoutes } from "./rooms.js";
 import { registerWorkspacesRoutes } from "./workspaces.js";
 
-async function makeStack(nativePicker?: (initialPath: string) => Promise<string | undefined>) {
+async function makeStack(
+	nativePicker?: (initialPath: string) => Promise<string | undefined>,
+	fileOpener?: (targetPath: string) => Promise<void>,
+	additionalFileRoots: readonly string[] = [],
+) {
 	const dir = mkdtempSync(path.join(tmpdir(), "pt-workspace-routes-"));
 	process.env.PI_CODING_AGENT_DIR = path.join(dir, "agent-dir");
 	const teams = new TeamsStore({ state: path.join(dir, "teams"), assets: path.join(dir, "teams"), managedWorkspaces: path.join(dir, "managed") }, dir);
@@ -30,9 +34,63 @@ async function makeStack(nativePicker?: (initialPath: string) => Promise<string 
 	const sessions = new PiSessionStore(dir, path.join(dir, "sessions"), teams, invoker);
 	const app = Fastify({ logger: false });
 	registerWorkspacesRoutes(app, teams.workspaces, nativePicker);
-	registerRoomsRoutes(app, sessions, teams, invoker);
+	registerRoomsRoutes(app, sessions, teams, invoker, undefined, {
+		open: fileOpener,
+		additionalRoots: additionalFileRoots,
+	});
 	return { app, teams, sessions, delegations, dir };
 }
+
+test("消息附件从房间 cwd 解析并仅打开允许目录内的文件", async () => {
+	const opened: string[] = [];
+	const attachmentRoot = mkdtempSync(path.join(tmpdir(), "pt-upload-file-"));
+	const { app, sessions, dir } = await makeStack(
+		undefined,
+		async (targetPath) => {
+			opened.push(targetPath);
+		},
+		[attachmentRoot],
+	);
+	const created = await app.inject({
+		method: "POST",
+		url: "/api/rooms",
+		payload: { type: "direct", members: ["alpha"] },
+	});
+	const roomId = created.json().room.id as string;
+	const localFile = path.join(dir, "add.py");
+	writeFileSync(localFile, "print('ok')\n");
+
+	const openedResponse = await app.inject({
+		method: "POST",
+		url: `/api/rooms/${roomId}/open-file`,
+		payload: { path: "add.py" },
+	});
+	assert.equal(openedResponse.statusCode, 200, openedResponse.body);
+	assert.deepEqual(opened, [realpathSync(localFile)]);
+	const uploadedFile = path.join(attachmentRoot, "frozen.pdf");
+	writeFileSync(uploadedFile, "pdf\n");
+	const uploadedResponse = await app.inject({
+		method: "POST",
+		url: `/api/rooms/${roomId}/open-file`,
+		payload: { path: uploadedFile },
+	});
+	assert.equal(uploadedResponse.statusCode, 200, uploadedResponse.body);
+	assert.deepEqual(opened, [realpathSync(localFile), realpathSync(uploadedFile)]);
+
+	const outsideDir = mkdtempSync(path.join(tmpdir(), "pt-outside-file-"));
+	const outsideFile = path.join(outsideDir, "secret.txt");
+	writeFileSync(outsideFile, "secret\n");
+	const rejected = await app.inject({
+		method: "POST",
+		url: `/api/rooms/${roomId}/open-file`,
+		payload: { path: outsideFile },
+	});
+	assert.equal(rejected.statusCode, 400, rejected.body);
+	assert.deepEqual(opened, [realpathSync(localFile), realpathSync(uploadedFile)]);
+
+	await sessions.disposeAll();
+	await app.close();
+});
 
 test("未选择 Workspace 时保持默认 cwd，且与显式项目的 direct Session 隔离", async () => {
 	const { app, teams, sessions, dir } = await makeStack();

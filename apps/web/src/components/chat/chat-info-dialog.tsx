@@ -1,36 +1,24 @@
 "use client";
 
 import { forwardRef, type ButtonHTMLAttributes } from "react";
-import { ChevronRightIcon, FolderOpenIcon } from "lucide-react";
-import {
-	Dialog,
-	DialogContent,
-	DialogHeader,
-	DialogTitle,
-} from "@/components/ui/dialog";
+import { ChevronDownIcon, XIcon } from "lucide-react";
 import type { RoomSession, RoomSummary } from "@/lib/types";
-import { getDesktopBridge } from "@/lib/desktop";
 import { SessionMenu } from "./session-menu";
-import { ManagerAvatar, WorkerAvatar } from "./worker-avatar";
+import { WorkerAvatar } from "./worker-avatar";
 
 function GroupAvatar({ room }: { room: RoomSummary }) {
-	const shownMembers = room.members.slice(0, 4);
-	const positions =
-		shownMembers.length === 2
-			? ["left-1 top-5", "right-1 top-5"]
-			: shownMembers.length === 3
-				? ["left-5 top-1", "left-1 bottom-1", "right-1 bottom-1"]
-				: ["left-1 top-1", "right-1 top-1", "left-1 bottom-1", "right-1 bottom-1"];
+	const shownMembers = room.members.slice(0, 2);
 	return (
-		<div className="relative size-16 shrink-0 rounded-2xl border bg-muted/40">
+		<div className="flex shrink-0 -space-x-2 pl-0.5">
 			{shownMembers.map((member, index) => (
 				<WorkerAvatar
 					key={member.name}
 					name={member.name}
-					size={24}
-					className={`absolute ring-2 ring-background ${positions[index]}`}
+					size={36}
+					className={`ring-2 ring-background ${index === 0 ? "relative z-10" : ""}`}
 				/>
 			))}
+			{shownMembers.length === 0 ? <span className="chat-manager-avatar">M</span> : null}
 		</div>
 	);
 }
@@ -48,15 +36,15 @@ function InfoRow({
 }) {
 	const content = (
 		<>
-			<span className="shrink-0 text-sm font-medium">{label}</span>
+			<span className="chat-info-label shrink-0">{label}</span>
 			<span className="ml-auto flex min-w-0 max-w-[68%] items-center gap-2">
 				<span className="min-w-0 flex-1 text-right">
-					<span className="block truncate text-sm text-muted-foreground" title={value}>{value}</span>
+					<span className="chat-info-value block truncate" title={value}>{value}</span>
 					{detail ? (
-						<span className="mt-0.5 block truncate text-xs text-muted-foreground/70" title={detail}>{detail}</span>
+						<span className="chat-info-detail mt-0.5 block truncate" title={detail}>{detail}</span>
 					) : null}
 				</span>
-				{onSelect ? <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/60" /> : null}
+				{onSelect ? <ChevronDownIcon className="size-3 shrink-0 text-foreground/70" /> : null}
 			</span>
 		</>
 	);
@@ -65,12 +53,12 @@ function InfoRow({
 		<button
 			type="button"
 			onClick={onSelect}
-			className="flex min-h-14 w-full items-center gap-4 px-4 py-3 text-left transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 [&+&]:border-t"
+			className="chat-info-row"
 		>
 			{content}
 		</button>
 	) : (
-		<div className="flex min-h-14 w-full items-center gap-4 px-4 py-3 [&+&]:border-t">
+		<div className="chat-info-row cursor-default">
 			{content}
 		</div>
 	);
@@ -85,14 +73,14 @@ const SessionInfoRow = forwardRef<
 			ref={ref}
 			type="button"
 			{...props}
-			className="flex min-h-14 w-full items-center gap-4 px-4 py-3 text-left transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 [&+&]:border-t"
+			className="chat-info-row"
 		>
-			<span className="shrink-0 text-sm font-medium">当前会话</span>
+			<span className="chat-info-label shrink-0">当前会话</span>
 			<span className="ml-auto flex min-w-0 max-w-[68%] items-center gap-2">
-				<span className="block min-w-0 flex-1 truncate text-right text-sm text-muted-foreground" title={value}>
+				<span className="chat-info-value block min-w-0 flex-1 truncate text-right" title={value}>
 					{value}
 				</span>
-				<ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/60" />
+				<ChevronDownIcon className="size-3 shrink-0 text-foreground/70" />
 			</span>
 		</button>
 	);
@@ -127,80 +115,60 @@ export function ChatInfoDialog({
 	const activeSession = room.sessions.find((session) => session.active);
 	const activeSessionName = activeSession?.name || activeSession?.firstMessage || "新会话";
 	const workspaceName = room.workspace?.name ?? "默认目录";
-	const workspacePath = room.workspace?.rootPath ?? room.cwdSnapshot;
 	const profileDescription = isGroup
-		? `${room.members.length} 位成员共同协作，Manager 负责分工与汇总。`
+		? `${room.members.length} 位 Worker 共同协作，Manager 负责分工与汇总。`
 		: isDirect
 			? directMember?.description || "执行具体任务并返回结果。"
 			: "负责理解消息、安排任务并汇总结果。";
-	const typeLabel = isGroup ? "群聊" : isDirect ? `单聊 · ${directMember?.name ?? ""}` : "Manager";
-
 	const runAction = (action: () => void) => {
 		onOpenChange(false);
 		setTimeout(action, 0);
 	};
 
 	return (
-		<Dialog open={open} onOpenChange={onOpenChange}>
-			<DialogContent className="max-h-[85vh] gap-0 overflow-y-auto p-0 sm:max-w-xl">
-				<DialogHeader className="border-b px-5 py-4 text-left">
-					<DialogTitle>聊天信息</DialogTitle>
-				</DialogHeader>
+		<aside className={`chat-info-inspector ${open ? "open" : ""}`} aria-hidden={!open} inert={!open}>
+			<div className="chat-info-panel flex h-full flex-col gap-0 overflow-hidden">
+				<header className="chat-info-head flex items-center justify-between text-left">
+					<h2 className="chat-info-title leading-none">聊天信息</h2>
+					<p className="sr-only">查看并管理当前聊天的成员、规则、项目和会话。</p>
+					<button type="button" aria-label="关闭聊天信息" onClick={() => onOpenChange(false)} className="chat-info-close"><XIcon className="size-4" /></button>
+				</header>
 
-				<div className="space-y-5 p-5">
-					<div className="flex items-center gap-4 rounded-xl bg-muted/40 p-4">
+				<div className="chat-info-scroll">
+					<div className="chat-info-profile">
 						{isGroup ? (
 							<GroupAvatar room={room} />
 						) : isDirect && directMember ? (
-							<WorkerAvatar name={directMember.name} size={64} />
+							<WorkerAvatar name={directMember.name} size={40} />
 						) : (
-							<ManagerAvatar size={64} />
+							<span className="chat-manager-avatar">M</span>
 						)}
 						<div className="min-w-0 flex-1">
-							<div className="flex items-center gap-2">
-								<h2 className="truncate text-base font-semibold">{room.name}</h2>
-								<span className="shrink-0 rounded-full bg-background px-2 py-0.5 text-xs text-muted-foreground">
-									{typeLabel}
-								</span>
-							</div>
-							<p className="mt-1 line-clamp-2 text-sm leading-6 text-muted-foreground">
+							<h2 className="chat-info-profile-title truncate">{room.name}</h2>
+							<p className="chat-info-profile-description mt-1 line-clamp-2">
 								{profileDescription}
 							</p>
-							{directMember ? (
-								<div className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground">
-									<span className={`size-1.5 rounded-full ${directMember.enabled === false ? "bg-muted-foreground/40" : "bg-foreground"}`} />
-									{directMember.enabled === false ? "已停用" : "可用"}
-								</div>
-							) : null}
 						</div>
 					</div>
 
 					{isGroup ? (
-						<section>
-							<div className="mb-2 flex items-center justify-between px-1">
-								<h3 className="text-sm font-medium">群成员</h3>
-								<span className="text-xs tabular-nums text-muted-foreground">{room.members.length} 位</span>
-							</div>
-							<div className="grid grid-cols-4 gap-2 rounded-xl border bg-muted/20 p-3 sm:grid-cols-5">
+						<section className="chat-info-section">
+							<div className="chat-info-section-label">成员 · {room.members.length + 1}</div>
+							<div className="chat-member-grid">
+								<div className="chat-member-item"><span className="chat-manager-avatar small">M</span><span>Manager</span></div>
 								{room.members.map((member) => (
-									<div key={member.name} className="flex min-w-0 flex-col items-center gap-1.5 py-1" title={member.description}>
-										<div className="relative">
-											<WorkerAvatar name={member.name} size={42} />
-											<span
-												className={`absolute right-0 bottom-0 size-2.5 rounded-full border-2 border-background ${member.enabled === false ? "bg-muted-foreground/40" : "bg-foreground"}`}
-												title={member.enabled === false ? "已停用" : "可用"}
-											/>
-										</div>
-										<span className="w-full truncate text-center text-xs">{member.name}</span>
+									<div key={member.name} className="chat-member-item" title={member.description}>
+										<WorkerAvatar name={member.name} size={34} />
+										<span>{member.name}</span>
 									</div>
 								))}
 							</div>
 						</section>
 					) : null}
 
-					<section>
-						<h3 className="mb-2 px-1 text-sm font-medium">聊天设置</h3>
-						<div className="overflow-hidden rounded-xl border bg-background">
+					<section className="chat-info-section">
+						<h3 className="chat-info-section-label">聊天</h3>
+						<div className="chat-info-list">
 							<InfoRow
 								label={isGroup ? "群聊名称" : "对话名称"}
 								value={room.name}
@@ -208,7 +176,7 @@ export function ChatInfoDialog({
 							/>
 							{room.type === "group" ? (
 								<InfoRow
-									label="协作提示词"
+									label="协作规则"
 									value={room.prompt || "使用默认协作规则"}
 									onSelect={() => runAction(onEditPrompt)}
 								/>
@@ -216,30 +184,14 @@ export function ChatInfoDialog({
 						</div>
 					</section>
 
-					<section>
-						<h3 className="mb-2 px-1 text-sm font-medium">聊天上下文</h3>
-						<div className="overflow-hidden rounded-xl border bg-background">
+					<section className="chat-info-section">
+						<h3 className="chat-info-section-label">上下文</h3>
+						<div className="chat-info-list">
 							<InfoRow
 								label="运行项目"
 								value={workspaceName}
-								detail={workspacePath}
 								onSelect={() => runAction(onSwitchWorkspace)}
 							/>
-							{getDesktopBridge() ? (
-								<button
-									type="button"
-									onClick={() => void getDesktopBridge()?.revealInFinder(workspacePath)}
-									className="flex min-h-14 w-full items-center gap-4 px-4 py-3 text-left transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 [&+&]:border-t"
-								>
-									<span className="shrink-0 text-sm font-medium">项目文件夹</span>
-									<span className="ml-auto flex min-w-0 max-w-[68%] items-center justify-end gap-2">
-										<span className="min-w-0 truncate text-right text-xs text-muted-foreground/70" title={workspacePath}>
-											{workspacePath}
-										</span>
-										<FolderOpenIcon className="size-4 shrink-0 text-muted-foreground/60" />
-									</span>
-								</button>
-							) : null}
 							<SessionMenu
 								sessions={room.sessions}
 								trigger={<SessionInfoRow value={activeSessionName} />}
@@ -252,7 +204,7 @@ export function ChatInfoDialog({
 						</div>
 					</section>
 				</div>
-			</DialogContent>
-		</Dialog>
+			</div>
+		</aside>
 	);
 }

@@ -71,7 +71,7 @@ function DefaultAvatar({ name, size }: { name: string; size: number }) {
 					<circle cx="50" cy="50" r="44" fill="none" stroke="currentColor" strokeWidth="11" opacity="0.25" />
 				)}
 			</svg>
-			<span className="relative">{name.slice(0, 2).toUpperCase()}</span>
+			<span className="relative">{name.slice(0, size < 20 ? 1 : 2).toUpperCase()}</span>
 		</span>
 	);
 }
@@ -143,32 +143,51 @@ export function ManagerAvatar({ size = 24, className }: { size?: number; classNa
 	);
 }
 
-/** Overlapping avatar stack for a group chat (up to 3 shown, +N overflow). */
+/**
+ * 微信群式九宫格合成头像：圆角方块容器内按 1 / 2×2 / 3×3 网格排布成员
+ * 头像（成员多/头像杂时叠放会糊成一团，见列表行）。超过 9 人末格 +N。
+ * size 为容器边长，与列表/标题栏其他头像对齐。
+ */
 export function MemberStack({
 	members,
-	size = 20,
+	size = 36,
 	className,
 }: {
 	members: { name: string }[];
 	size?: number;
 	className?: string;
 }) {
-	const shown = members.slice(0, 3);
+	const MAX_CELLS = 9;
+	const overflow = members.length > MAX_CELLS ? members.length - MAX_CELLS + 1 : 0;
+	const shown = overflow ? members.slice(0, MAX_CELLS - 1) : members;
+	const cells = shown.length + (overflow ? 1 : 0);
+	const cols = cells <= 1 ? 1 : cells <= 4 ? 2 : 3;
+	const pad = Math.round(size * 0.09);
+	const gap = Math.max(1, Math.round(size * 0.06));
+	const cell = cells <= 1 ? Math.round(size * 0.62) : Math.floor((size - pad * 2 - gap * (cols - 1)) / cols);
 	return (
-		<div className={cn("flex shrink-0 items-center", className)}>
-			<div className="flex -space-x-1.5">
-				{shown.map((m) => (
-					<WorkerAvatar key={m.name} name={m.name} size={size} className="ring-2 ring-background" />
-				))}
-			</div>
-			{members.length > 3 ? (
+		<span
+			className={cn("flex shrink-0 flex-wrap content-center items-center justify-center bg-muted", className)}
+			style={{
+				width: size,
+				height: size,
+				padding: cells <= 1 ? 0 : pad,
+				gap,
+				borderRadius: Math.max(6, Math.round(size * 0.22)),
+			}}
+			title={members.map((m) => m.name).join("、")}
+		>
+			{shown.map((m) => (
+				<WorkerAvatar key={m.name} name={m.name} size={cell} />
+			))}
+			{overflow ? (
 				<span
-					className="ml-1 flex items-center justify-center rounded-full bg-muted text-xs font-medium text-muted-foreground"
-					style={{ width: size, height: size }}
+					className="flex items-center justify-center rounded-full bg-secondary font-medium text-secondary-foreground"
+					style={{ width: cell, height: cell, fontSize: Math.max(8, Math.round(cell * 0.34)) }}
 				>
-					+{members.length - 3}
+					+{overflow}
 				</span>
 			) : null}
-		</div>
+		</span>
 	);
 }

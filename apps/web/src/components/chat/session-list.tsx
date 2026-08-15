@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { XIcon } from "lucide-react";
+import { useMemo, useState } from "react";
+import { PlusIcon, SearchIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -12,6 +12,7 @@ import {
 	DialogTitle,
 } from "@/components/ui/dialog";
 import type { RoomSummary } from "@/lib/types";
+import { compactTime } from "@/lib/time";
 import { ManagerAvatar, MemberStack, WorkerAvatar } from "./worker-avatar";
 
 function WindowRow({
@@ -26,53 +27,36 @@ function WindowRow({
 	onDelete: (room: RoomSummary) => void;
 }) {
 	const members = room.members ?? [];
-	const membersText =
-		room.type === "group"
-			? `${members.length} 个成员 · ${members.map((m) => m.name).join("、")}`
-			: room.type === "direct"
-				? `与 ${members[0]?.name} 单聊`
-				: "与 pi manager 对话";
-	// 第二行：active session 的标题/首条消息（会话上下文）；没有会话标题时退回
-	// 成员摘要（群聊）或与窗口名去重后的类型描述。
-	const active = room.sessions.find((s) => s.active);
-	const sessionTitle = active?.name || (active?.firstMessage !== "新对话" ? active?.firstMessage : "") || "";
-	const subtitle = sessionTitle || (room.type === "group" ? membersText : room.name !== membersText ? membersText : "");
+	const active = room.sessions.find((session) => session.active);
+	const fallback = room.type === "group"
+		? `${members.length} 位 Worker 共同协作`
+		: room.type === "direct"
+			? members[0]?.description || `与 ${members[0]?.name ?? "Worker"} 单聊`
+			: "理解消息、组织协作并汇总结果";
+	const subtitle = active?.name || (active?.firstMessage !== "新对话" ? active?.firstMessage : "") || fallback;
+	const displayName = room.type === "direct" ? room.name.replace(/^与\s+(.+)\s+单聊$/, "$1") : room.name;
+
 	return (
-		<div
-			className={`group relative mb-0.5 rounded-md ${
-				selected ? "bg-accent text-accent-foreground" : "hover:bg-muted"
-			}`}
-		>
-			<button
-				type="button"
-				onClick={() => onSelect(room.id)}
-				className="flex w-full items-start gap-2 px-2 py-2 pr-7 text-left"
-			>
-				{room.type === "group" ? (
-					<MemberStack members={members} size={22} className="mt-0.5" />
-				) : room.type === "direct" ? (
-					<WorkerAvatar name={members[0]!.name} size={26} className="mt-0.5" />
-				) : (
-					<ManagerAvatar size={26} className="mt-0.5" />
-				)}
-				<div className="min-w-0 flex-1">
-					<div className="truncate text-sm font-medium">{room.name}</div>
-					{subtitle ? (
-						<div className="mt-0.5 truncate text-xs text-muted-foreground">{subtitle}</div>
-					) : null}
-					<div className="text-xs text-muted-foreground/60 tabular-nums">
-						{room.modifiedAt ? new Date(room.modifiedAt).toLocaleString() : "刚刚"}
-					</div>
-				</div>
+		<div className={`home-room-row group ${selected ? "is-selected" : ""}`}>
+			<button type="button" onClick={() => onSelect(room.id)} className="home-room-select">
+				<span className="home-room-avatar">
+					{room.type === "group" ? (
+						<MemberStack members={members} size={36} />
+					) : room.type === "direct" ? (
+						<WorkerAvatar name={members[0]!.name} size={36} />
+					) : (
+						<ManagerAvatar size={36} />
+					)}
+				</span>
+				<span className="home-room-copy">
+					<span className="home-room-title">{displayName}</span>
+					<span className="home-room-preview">{subtitle}</span>
+				</span>
+				<span className="home-room-time">{compactTime(room.modifiedAt)}</span>
 			</button>
 			{!room.pinned ? (
-				<button
-					type="button"
-					aria-label="删除对话"
-					onClick={() => onDelete(room)}
-					className="absolute top-2 right-1.5 rounded p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-destructive focus-visible:opacity-100 group-hover:opacity-100"
-				>
-					<XIcon className="size-3.5" />
+				<button type="button" aria-label="删除对话" onClick={() => onDelete(room)} className="home-room-delete">
+					<XIcon />
 				</button>
 			) : null}
 		</div>
@@ -85,93 +69,84 @@ export function SessionList({
 	onSelect,
 	onNew,
 	onDelete,
+	open = true,
+	onClose,
 }: {
 	rooms: RoomSummary[];
 	selectedId: string | null;
 	onSelect: (id: string) => void;
 	onNew: () => void;
 	onDelete: (id: string) => void;
+	open?: boolean;
+	onClose?: () => void;
 }) {
 	const [pendingDelete, setPendingDelete] = useState<RoomSummary | null>(null);
-	const solo = rooms.filter((r) => r.type === "solo");
-	const directs = rooms.filter((r) => r.type === "direct");
-	const groups = rooms.filter((r) => r.type === "group");
+	const [query, setQuery] = useState("");
+	const visibleRooms = useMemo(() => {
+		const normalized = query.trim().toLocaleLowerCase();
+		if (!normalized) return rooms;
+		return rooms.filter((room) => {
+			const haystack = [room.name, ...room.members.map((member) => member.name), ...room.sessions.map((session) => session.name || session.firstMessage)].join(" ");
+			return haystack.toLocaleLowerCase().includes(normalized);
+		});
+	}, [query, rooms]);
+	const solo = visibleRooms.filter((room) => room.type === "solo");
+	const directs = visibleRooms.filter((room) => room.type === "direct");
+	const groups = visibleRooms.filter((room) => room.type === "group");
+
+	const renderRoom = (room: RoomSummary) => (
+		<WindowRow
+			key={room.id}
+			room={room}
+			selected={room.id === selectedId}
+			onSelect={(id) => { onSelect(id); onClose?.(); }}
+			onDelete={setPendingDelete}
+		/>
+	);
 
 	return (
-		<div className="flex h-full w-64 shrink-0 flex-col bg-muted/50">
-			<div className="p-3">
-				<Button type="button" onClick={onNew} className="w-full">
-					+ 发起对话
-				</Button>
+		<aside className={`home-rooms-panel ${open ? "max-md:flex" : "max-md:hidden"}`}>
+			<div className="home-workspace-head">
+				<h1>PuddingTeams</h1>
+				<button type="button" onClick={onNew} aria-label="发起对话" title="发起对话" className="home-new-room"><PlusIcon /></button>
+				<button type="button" onClick={onClose} aria-label="关闭对话列表" className="home-close-rooms md:hidden"><XIcon /></button>
 			</div>
-			<div className="flex-1 overflow-y-auto px-2 pb-2">
-				{solo.map((room) => (
-					<WindowRow
-						key={room.id}
-						room={room}
-						selected={room.id === selectedId}
-						onSelect={onSelect}
-						onDelete={setPendingDelete}
-					/>
-				))}
+			<label className="home-room-search">
+				<SearchIcon />
+				<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索聊天" />
+			</label>
+			<div className="home-room-scroll">
+				{solo.map(renderRoom)}
 				{directs.length > 0 ? (
-					<div className="mt-3">
-						<p className="px-2 pb-1 text-xs font-medium text-muted-foreground">单聊</p>
-						{directs.map((room) => (
-							<WindowRow
-								key={room.id}
-								room={room}
-								selected={room.id === selectedId}
-								onSelect={onSelect}
-								onDelete={setPendingDelete}
-							/>
-						))}
-					</div>
+					<section className="home-room-section">
+						<div className="home-room-section-title"><span>单聊</span><span>{directs.length}</span></div>
+						{directs.map(renderRoom)}
+					</section>
 				) : null}
 				{groups.length > 0 ? (
-					<div className="mt-3">
-						<p className="px-2 pb-1 text-xs font-medium text-muted-foreground">群聊</p>
-						{groups.map((room) => (
-							<WindowRow
-								key={room.id}
-								room={room}
-								selected={room.id === selectedId}
-								onSelect={onSelect}
-								onDelete={setPendingDelete}
-							/>
-						))}
-					</div>
+					<section className="home-room-section">
+						<div className="home-room-section-title"><span>群聊</span><span>{groups.length}</span></div>
+						{groups.map(renderRoom)}
+					</section>
 				) : null}
-				{rooms.length === 0 ? (
-					<p className="px-2 py-6 text-center text-xs text-muted-foreground">还没有对话</p>
-				) : null}
+				{visibleRooms.length === 0 ? <p className="home-room-empty">没有匹配的聊天</p> : null}
 			</div>
 
-			<Dialog open={pendingDelete !== null} onOpenChange={(open) => !open && setPendingDelete(null)}>
+			<Dialog open={pendingDelete !== null} onOpenChange={(next) => !next && setPendingDelete(null)}>
 				<DialogContent>
 					<DialogHeader>
 						<DialogTitle>删除对话</DialogTitle>
-						<DialogDescription>
-							确定删除「{pendingDelete?.name || "新对话"}」吗？窗口内的全部会话将一并删除，无法恢复。
-						</DialogDescription>
+						<DialogDescription>确定删除「{pendingDelete?.name || "新对话"}」吗？窗口内的全部会话将一并删除，无法恢复。</DialogDescription>
 					</DialogHeader>
 					<DialogFooter>
-						<Button type="button" variant="ghost" onClick={() => setPendingDelete(null)}>
-							取消
-						</Button>
-						<Button
-							type="button"
-							variant="destructive"
-							onClick={() => {
-								if (pendingDelete) onDelete(pendingDelete.id);
-								setPendingDelete(null);
-							}}
-						>
-							删除
-						</Button>
+						<Button type="button" variant="ghost" onClick={() => setPendingDelete(null)}>取消</Button>
+						<Button type="button" variant="destructive" onClick={() => {
+							if (pendingDelete) onDelete(pendingDelete.id);
+							setPendingDelete(null);
+						}}>删除</Button>
 					</DialogFooter>
 				</DialogContent>
 			</Dialog>
-		</div>
+		</aside>
 	);
 }

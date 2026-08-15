@@ -1,10 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import {
 	BugIcon,
 	BotIcon,
+	BoxesIcon,
 	InfoIcon,
 	MessageSquareIcon,
 	PanelLeftCloseIcon,
@@ -23,31 +24,44 @@ import {
 	DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
+import { homePortalContainer } from "@/lib/home-portal";
+import { getViewerIdentity } from "@/lib/api";
+import type { ViewerIdentity } from "@/lib/types";
 
 const GITHUB_URL = "https://github.com/ZzjNoMercy/PuddingTeams";
 const ISSUE_URL = "https://github.com/ZzjNoMercy/PuddingTeams/issues/new";
-const COLLAPSED_KEY = "puddingteams:nav-collapsed";
+export type AppView = "chat" | "agents" | "extensions";
 
-export type AppView = "chat" | "agents";
-
-/**
- * 展开/收起不走 React state：渲染输出与状态无关（SSR/客户端恒一致），布局与
- * 文字显隐由 globals.css 的 html[data-nav] 规则驱动；layout 内联脚本在首帧
- * 绘制前按 localStorage 设置该属性，因此展开态刷新无"先收后展"闪动。
- * 这里只负责切换属性 + 持久化。
- */
-function toggleNav(): void {
-	const el = document.documentElement;
-	const expanded = el.dataset.nav === "expanded";
-	if (expanded) delete el.dataset.nav;
-	else el.dataset.nav = "expanded";
-	localStorage.setItem(COLLAPSED_KEY, expanded ? "1" : "0");
+function initialsOf(name: string): string {
+	const parts = name.trim().split(/\s+/).filter(Boolean);
+	if (parts.length > 1) return `${parts[0]![0] ?? ""}${parts.at(-1)![0] ?? ""}`.toUpperCase();
+	return Array.from(parts[0] ?? "用户").slice(0, 2).join("").toUpperCase();
 }
 
-/** 主导航：chat（/）与智能体（/agents）是独立路由，切换即跳转。 */
+/** 主导航：对话、智能体与扩展是独立路由，切换即跳转。 */
 export function NavRail({ view }: { view: AppView }) {
 	const [settingsOpen, setSettingsOpen] = useState(false);
 	const [aboutOpen, setAboutOpen] = useState(false);
+	const [identity, setIdentity] = useState<ViewerIdentity | null>(null);
+	useEffect(() => {
+		let active = true;
+		void getViewerIdentity()
+			.then((next) => {
+				if (active) setIdentity(next);
+			})
+			.catch(() => undefined);
+		return () => {
+			active = false;
+		};
+	}, []);
+	const username = identity?.user.displayName || identity?.user.username || "本地用户";
+
+	const toggleExpanded = () => {
+		const next = document.documentElement.dataset.nav !== "expanded";
+		if (next) document.documentElement.dataset.nav = "expanded";
+		else delete document.documentElement.dataset.nav;
+		localStorage.setItem("puddingteams:nav-collapsed", next ? "0" : "1");
+	};
 
 	const itemClass = (active: boolean) =>
 		cn(
@@ -56,7 +70,12 @@ export function NavRail({ view }: { view: AppView }) {
 		);
 
 	return (
-		<div className="nav-rail flex shrink-0 flex-col border-r bg-muted/50 py-2 transition-[width] duration-150">
+		<div className="nav-rail flex shrink-0 flex-col">
+			<Link href="/" className="nav-brand" title="PuddingTeams" aria-label="PuddingTeams 首页">
+				<span className="nav-brand-mark">PT</span>
+				<span className="nav-brand-name nav-label">PuddingTeams</span>
+			</Link>
+			<div className="nav-primary">
 			<Link href="/" title="对话" aria-label="对话" aria-current={view === "chat" ? "page" : undefined} className={itemClass(view === "chat")}>
 				<MessageSquareIcon className="size-4 shrink-0" />
 				<span className="nav-label">对话</span>
@@ -71,15 +90,25 @@ export function NavRail({ view }: { view: AppView }) {
 				<BotIcon className="size-4 shrink-0" />
 				<span className="nav-label">智能体</span>
 			</Link>
+			<Link
+				href="/extensions"
+				title="扩展"
+				aria-label="扩展"
+				aria-current={view === "extensions" ? "page" : undefined}
+				className={cn("mt-1", itemClass(view === "extensions"))}
+			>
+				<BoxesIcon className="size-4 shrink-0" />
+				<span className="nav-label">扩展</span>
+			</Link>
+			</div>
 
 			<div className="flex-1" />
-
 			<button
 				type="button"
-				title="展开/收起导航"
-				aria-label="展开/收起导航"
-				onClick={toggleNav}
-				className={cn("mb-1", itemClass(false))}
+				title="展开或收起侧边栏"
+				aria-label="展开或收起侧边栏"
+				onClick={toggleExpanded}
+				className={itemClass(false)}
 			>
 				<PanelLeftOpenIcon className="nav-collapsed-only size-4 shrink-0" />
 				<PanelLeftCloseIcon className="nav-expanded-only size-4 shrink-0" />
@@ -98,7 +127,7 @@ export function NavRail({ view }: { view: AppView }) {
 						<span className="nav-label">设置</span>
 					</button>
 				</DropdownMenuTrigger>
-				<DropdownMenuContent side="top" align="start" className="w-52">
+				<DropdownMenuContent side="top" align="start" className="home-menu w-52" container={homePortalContainer()}>
 					<DropdownMenuItem onSelect={() => setSettingsOpen(true)}>
 						<SlidersHorizontalIcon />
 						设置
@@ -118,6 +147,17 @@ export function NavRail({ view }: { view: AppView }) {
 					</DropdownMenuItem>
 				</DropdownMenuContent>
 			</DropdownMenu>
+			<div
+				className="nav-user"
+				title={`当前用户：${username}`}
+				aria-label={`当前用户 ${username}`}
+				data-track="nav.current-user"
+				data-user-id={identity?.user.id}
+				data-tenant-id={identity?.tenant.id}
+			>
+				<span className="nav-user-avatar" aria-hidden="true">{initialsOf(username)}</span>
+				<span className="nav-user-name">{username}</span>
+			</div>
 
 			<SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
 			<AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />

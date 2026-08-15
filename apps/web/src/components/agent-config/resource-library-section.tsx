@@ -317,7 +317,7 @@ export function ResourceLibrarySection({
 	const EmptyIcon = kind === "skills" ? SparklesIcon : FileTextIcon;
 
 	return (
-		<div className="flex flex-col gap-3">
+		<section className="agent-config-card flex flex-col gap-3">
 			{/* 分区头：标题 + 一句说明，右侧操作 */}
 			<div className="flex items-start justify-between gap-3">
 				<div className="flex flex-col gap-0.5">
@@ -358,7 +358,7 @@ export function ResourceLibrarySection({
 					加载库资源…
 				</div>
 			) : rows.length === 0 ? (
-				<div className="flex flex-col items-center gap-2 rounded-lg border border-dashed px-4 py-8 text-center">
+				<div className="agent-config-empty flex flex-col items-center gap-2 px-4 py-8 text-center">
 					<EmptyIcon className="size-8 text-muted-foreground/60" />
 					<p className="text-sm font-medium">库中还没有{text.label}</p>
 					<p className="text-xs text-muted-foreground">{text.emptyHint}</p>
@@ -375,7 +375,7 @@ export function ResourceLibrarySection({
 				</div>
 			) : (
 				<>
-					<div className="flex flex-col divide-y rounded-lg border">
+					<div className="agent-config-list flex flex-col gap-1">
 						{rows.map((row) => (
 							<div key={row.name} className="flex items-center gap-2.5 px-3 py-2 hover:bg-muted/50">
 								<input
@@ -633,6 +633,6 @@ export function ResourceLibrarySection({
 					</DialogFooter>
 				</DialogContent>
 			</Dialog>
-		</div>
+		</section>
 	);
 }

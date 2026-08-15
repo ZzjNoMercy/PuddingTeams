@@ -113,6 +113,16 @@ export function renderHistory(msgs: PiMessage[]): ChatMessage[] {
 			streaming: false,
 		});
 	}
+	// 完整历史里不可能存在合法的 pending：toolCall 落盘为 pending 后必有
+	// 对应 toolResult 折叠回来（done/error）。走完全部记录仍是 pending 的
+	// 调用只会来自中断——abort（stopReason "aborted"/"error"）或进程被杀
+	// （消息体都没写全）。统一降级为"已中断"展示；若会话其实还在跑，随后
+	// 的 WS 事件会按 toolCallId 把它修正为 done/error。
+	for (const msg of out) {
+		for (const call of msg.toolCalls) {
+			if (call.status === "pending") call.status = "interrupted";
+		}
+	}
 	return out;
 }
 

@@ -20,8 +20,8 @@ const useIsomorphicLayoutEffect = typeof window !== "undefined" ? useLayoutEffec
 
 // 与 layout.tsx 内联脚本、globals.css :root/.dark 的 --background 保持一致。
 const CANVAS_COLOR: Record<"light" | "dark", string> = {
-	light: "oklch(0.9855 0.0098 87.47)",
-	dark: "oklch(0.24 0.0036 106.64)",
+	light: "#f4f6f7",
+	dark: "oklch(0.12 0.012 240)",
 };
 
 const ThemeContext = createContext<{ theme: Theme; setTheme: (t: Theme) => void } | null>(null);
@@ -38,9 +38,11 @@ function resolveTheme(theme: Theme): "light" | "dark" {
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
 	const [theme, setThemeState] = useState<Theme>(() => {
-		if (typeof window === "undefined") return "system";
+		if (typeof window === "undefined") return "dark";
 		const stored = localStorage.getItem(STORAGE_KEY);
-		return stored === "light" || stored === "dark" ? stored : "system";
+		// Calm Ops is intentionally dark by default; an explicit light/system choice
+		// remains available from Settings.
+		return stored === "light" || stored === "dark" || stored === "system" ? stored : "dark";
 	});
 
 	useIsomorphicLayoutEffect(() => {

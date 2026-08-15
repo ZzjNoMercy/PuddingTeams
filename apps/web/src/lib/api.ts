@@ -32,6 +32,7 @@ import type {
 	WorkspaceDirectoryListing,
 	WorkspaceResourceKind,
 	WorkspaceTrustState,
+	ViewerIdentity,
 } from "./types";
 import { getDesktopBridge } from "./desktop";
 
@@ -55,6 +56,12 @@ export async function getHealth(): Promise<HealthInfo> {
 	const res = await fetch(`${SERVER_URL}/api/health`);
 	if (!res.ok) throw new Error(`health check failed: ${res.status}`);
 	return (await res.json()) as HealthInfo;
+}
+
+export async function getViewerIdentity(): Promise<ViewerIdentity> {
+	const res = await fetch(`${SERVER_URL}/api/identity`);
+	if (!res.ok) throw new Error(`get identity failed: ${res.status}`);
+	return (await res.json()) as ViewerIdentity;
 }
 
 export async function listSessions(): Promise<SessionSummary[]> {
@@ -677,6 +684,20 @@ export async function getRoom(id: string): Promise<RoomSummary> {
 	const res = await fetch(`${SERVER_URL}/api/rooms/${id}`);
 	if (!res.ok) throw new Error(`get room failed: ${res.status}`);
 	return ((await res.json()) as { room: RoomSummary }).room;
+}
+
+/** Resolve a chat attachment against its room workspace and open it with the
+ * operating system's default application. */
+export async function openRoomFile(roomId: string, targetPath: string): Promise<string> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/open-file`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ path: targetPath }),
+	});
+	const body = (await res.json().catch(() => null)) as { path?: string; error?: string } | null;
+	if (!res.ok) throw new Error(body?.error ?? `open file failed: ${res.status}`);
+	if (!body?.path) throw new Error("server did not return the opened file path");
+	return body.path;
 }
 
 /** 发起对话：direct（单聊）/ group（群聊）。单聊按 worker 去重，命中返回 existed。 */

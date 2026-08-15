@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 import { ArrowDownIcon } from "lucide-react";
 import type { ComponentProps } from "react";
 import { useCallback } from "react";
+import { createPortal } from "react-dom";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 
 export type ConversationProps = ComponentProps<typeof StickToBottom>;
@@ -68,10 +69,13 @@ export const ConversationEmptyState = ({
   </div>
 );
 
-export type ConversationScrollButtonProps = ComponentProps<typeof Button>;
+export type ConversationScrollButtonProps = ComponentProps<typeof Button> & {
+  portalTarget?: Element | null;
+};
 
 export const ConversationScrollButton = ({
   className,
+  portalTarget,
   ...props
 }: ConversationScrollButtonProps) => {
   const { isAtBottom, scrollToBottom } = useStickToBottomContext();
@@ -80,21 +84,21 @@ export const ConversationScrollButton = ({
     scrollToBottom();
   }, [scrollToBottom]);
 
-  return (
-    !isAtBottom && (
-      <Button
-        className={cn(
-          "absolute bottom-4 left-[50%] translate-x-[-50%] rounded-full",
-          className,
-        )}
-        onClick={handleScrollToBottom}
-        size="icon"
-        type="button"
-        variant="outline"
-        {...props}
-      >
-        <ArrowDownIcon className="size-4" />
-      </Button>
-    )
+  if (isAtBottom || portalTarget === null) return null;
+  const button = (
+    <Button
+      className={cn(
+        "absolute bottom-4 left-[50%] translate-x-[-50%] rounded-full",
+        className,
+      )}
+      onClick={handleScrollToBottom}
+      size="icon"
+      type="button"
+      variant="outline"
+      {...props}
+    >
+      <ArrowDownIcon className="size-4" />
+    </Button>
   );
+  return portalTarget ? createPortal(button, portalTarget) : button;
 };
