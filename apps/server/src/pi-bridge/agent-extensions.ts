@@ -266,7 +266,7 @@ export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowCon
 	return [
 		"当前可委托的 worker（按窗口成员与启用状态每轮刷新）：",
 		lines.join("\n"),
-		`标注「已激活」的工具可直接调用，不要再搜索；未激活的先用 ${CORE_TOOL_SEARCH} 按名称激活后再调用；若调用被拒绝，说明该 worker 已不可用，不要重试。`,
+		`标注「已激活」的工具可直接调用，不要再搜索；未激活的先用 ${CORE_TOOL_SEARCH} 按名称激活后再调用。若调用返回工具不存在（Tool ... not found），说明它当前未激活（服务重启后会话重建会重置激活态）：用 ${CORE_TOOL_SEARCH} 激活后重试一次即可，不要当作 worker 不可用。只有搜索不到该 worker 的工具、或激活后调用仍被明确拒绝时，才说明该 worker 已不可用，不要继续重试。`,
 		...(soloCtx
 			? [
 					`需要多个 worker 协作（拆分、并行、交接、裁决）时，用 ${CORE_TOOL_CREATE_GROUP} 建群聊并把整体任务下达给房间 manager，不要把多 worker 任务塞进单个 worker 的单聊委托。`,

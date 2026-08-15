@@ -319,3 +319,47 @@ test("P3-1: 无项目 Window 的 cwdSnapshot 变化后拒绝恢复旧 Interactio
 		/窗口项目已变化/,
 	);
 });
+
+test("§3.3.7: 重启/重建从 JSONL 历史回放已激活的受管工具", async () => {
+	const { teams, sessions } = await makeStack();
+	const summary = await sessions.create();
+	await teams.ensureSoloWindow(async () => ({ id: summary.id }), async () => true);
+	const name = delegateToolName("puddingclaw");
+
+	const session = await sessions.open(summary.id);
+	assert.ok(!session.getActiveToolNames().includes(name), "solo 默认只激活 core search，委托工具保持 inactive");
+
+	// SDK 落盘门槛：文件要出现过 assistant 消息才开始持久化，先补一条。
+	session.sessionManager.appendMessage({
+		role: "assistant",
+		content: [{ type: "text", text: "好的" }],
+		api: "openai",
+		provider: "openai",
+		model: "fake",
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: "stop",
+		timestamp: Date.now(),
+	} as never);
+	// 模拟上一轮 search_agent_tools 激活：SDK 会给"激活了新工具"的
+	// toolResult 标注 addedToolNames 并落盘（SDK 只写不读，回放由平台负责）。
+	session.sessionManager.appendMessage({
+		role: "toolResult",
+		toolCallId: "call_replay",
+		toolName: "search_agent_tools",
+		content: [{ type: "text", text: "已激活" }],
+		details: { matches: [name, "agent_ghost__delegate"], added: [name, "agent_ghost__delegate"] },
+		addedToolNames: [name, "agent_ghost__delegate"],
+		isError: false,
+		timestamp: Date.now(),
+	} as never);
+
+	// 模拟重启：释放内存会话，从 JSONL 重新物化。
+	await sessions.disposeAll();
+	const rebuilt = await sessions.open(summary.id);
+	assert.ok(rebuilt.getActiveToolNames().includes(name), "重建后必须恢复历史里已激活的委托工具");
+	assert.ok(
+		!rebuilt.getActiveToolNames().includes("agent_ghost__delegate"),
+		"不在当前装配计划（plan.managed）里的工具不得被回放激活",
+	);
+	await sessions.disposeAll();
+});

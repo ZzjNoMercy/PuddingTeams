@@ -241,8 +241,25 @@ export class PiSessionStore {
 		// 激活策略（§3.3）：direct 默认激活该 Agent 的基础委托工具 + always
 		// 工具；solo/group 默认只激活 core search 工具，其余预注册但
 		// inactive，由 search_agent_tools 按需纯加法激活。
+		// 激活态回放（§3.3.7）：active tools 只在内存，重启/空闲重建会清零，
+		// 但 JSONL 历史里留着直接调用成功的记录，模型会模仿历史跳过 search
+		// 导致 "Tool not found"。SDK 会把"激活了新工具"的 toolResult 标注
+		// addedToolNames（只写不读），这里从当前分支历史回放，恢复重建前的
+		// 激活集合；回放仍受 plan 约束——已禁用/移出窗口的 worker 不进
+		// plan.managed，其工具自然被过滤，撤权语义不变。
+		const replayed = new Set<string>();
+		for (const entry of opts.sessionManager.getBranch()) {
+			if (entry.type !== "message") continue;
+			const message = entry.message as { role?: string; addedToolNames?: unknown };
+			if (message.role !== "toolResult" || !Array.isArray(message.addedToolNames)) continue;
+			for (const name of message.addedToolNames) {
+				if (typeof name === "string") replayed.add(name);
+			}
+		}
 		const current = session.getActiveToolNames();
-		session.setActiveToolsByName(current.filter((n) => !plan.managed.has(n) || plan.active.has(n)));
+		session.setActiveToolsByName(
+			current.filter((n) => !plan.managed.has(n) || plan.active.has(n) || replayed.has(n)),
+		);
 		this.assembledManaged.set(session.sessionId, plan.managed);
 		return session;
 	}
