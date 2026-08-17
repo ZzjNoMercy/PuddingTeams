@@ -948,17 +948,12 @@ body {
 }
 
 .nav-brand-mark {
-	display: grid;
 	width: 2.5rem;
 	height: 2.5rem;
-	place-items: center;
 	border: 2px solid color-mix(in oklab, white 82%, transparent);
 	border-radius: 0.9rem;
-	background: var(--primary);
+	background: transparent;
 	box-shadow: 0 8px 24px color-mix(in oklab, var(--primary) 18%, transparent);
-	font-size: 0.875rem;
-	font-weight: 800;
-	letter-spacing: -0.04em;
 }
 
 .nav-brand-name {
@@ -1125,10 +1120,8 @@ html[data-nav="expanded"] .nav-primary {
 	height: 38px;
 	border-width: 2px;
 	border-radius: 13px;
-	font-size: 14px;
 	box-shadow: 0 8px 24px rgba(102, 227, 244, 0.14);
-	background: var(--home-accent, var(--primary));
-	color: var(--home-brand-ink, var(--primary-foreground));
+	background: transparent;
 }
 
 .nav-primary {

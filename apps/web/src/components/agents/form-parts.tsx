@@ -16,7 +16,7 @@ import {
 	uploadAgentAvatar,
 } from "@/lib/api";
 import { agentAvatarChanged } from "@/lib/avatars";
-import { WorkerAvatar } from "@/components/chat/worker-avatar";
+import { ManagerAvatar, WorkerAvatar } from "@/components/chat/worker-avatar";
 import type { AgentConfig, AffectedSessions, ModelSummary, SecretSchemaItem } from "@/lib/types";
 
 /**
@@ -379,8 +379,8 @@ export function AvatarEditor({
 		setBusy(true);
 		try {
 			await deleteAgentAvatar(agent.name);
-			// 删除上传后回退到 connector 包内默认头像（有则仍走 avatar URL）。
-			agentAvatarChanged(agent.name, Boolean(agent.hasDefaultAvatar));
+			// 删除上传后由展示组件决定使用 Connector 或产品默认头像。
+			agentAvatarChanged(agent.name, false);
 			onUpdated({ ...agent, avatar: undefined });
 			toast.success(`「${agent.name}」头像已删除，回落默认头像`);
 		} catch (err) {
@@ -392,7 +392,7 @@ export function AvatarEditor({
 
 	return (
 		<div className="flex items-center gap-3">
-			<WorkerAvatar name={agent.name} size={56} />
+			{agent.pinned ? <ManagerAvatar size={56} /> : <WorkerAvatar name={agent.name} size={56} />}
 			<div className="flex flex-col gap-1.5">
 				<div className="flex items-center gap-2">
 					<input
@@ -417,7 +417,7 @@ export function AvatarEditor({
 					) : null}
 				</div>
 				<p className="text-xs text-muted-foreground">
-					png / jpg / webp / gif，最大 2MB；未上传时使用{agent.hasDefaultAvatar ? " Connector 默认头像" : "程序化默认头像"}。
+					png / jpg / webp / gif，最大 2MB；未上传时使用{agent.pinned ? " PuddingTeams 默认头像" : agent.hasDefaultAvatar ? " Connector 默认头像" : "程序化默认头像"}。
 				</p>
 			</div>
 		</div>

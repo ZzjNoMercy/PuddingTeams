@@ -1,8 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import { BrainIcon } from "lucide-react";
-import { useAgentAvatar } from "@/lib/avatars";
+import { ProductAvatar } from "@/components/product-avatar";
+import { useAgentAvatar, useUploadedAgentAvatar } from "@/lib/avatars";
 import { cn } from "@/lib/utils";
 
 function hashName(name: string): number {
@@ -112,32 +112,27 @@ export function WorkerAvatar({
 	);
 }
 
-/** Avatar for the pi manager, always present in every room. */
+/** 固定 Manager：保留用户上传头像，否则使用 PuddingTeams 品牌头像。 */
 export function ManagerAvatar({ size = 24, className }: { size?: number; className?: string }) {
-	// pinned manager（agent 名 "manager"）走同一头像注册表：pi Connector 声明了
-	// 包内默认头像（lobehub Pi 图标），注册表装饰 hasDefaultAvatar 后即得 URL。
-	const url = useAgentAvatar("manager");
+	const url = useUploadedAgentAvatar("manager");
 	const [failedUrl, setFailedUrl] = useState<string | null>(null);
 	const failed = url !== null && failedUrl === url;
 	return (
 		<span
-			className={cn(
-				"flex shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground",
-				className,
-			)}
+			className={cn("flex shrink-0 items-center justify-center rounded-full", className)}
 			style={{ width: size, height: size }}
-			title="pi manager"
+			title="Manager"
 		>
 			{url && !failed ? (
 				// eslint-disable-next-line @next/next/no-img-element -- connector 包内默认头像，动态 URL
 				<img
 					src={url}
-					alt="pi manager"
+					alt="Manager"
 					onError={() => setFailedUrl(url)}
 					className="h-full w-full rounded-full object-cover"
 				/>
 			) : (
-				<BrainIcon style={{ width: size * 0.55, height: size * 0.55 }} />
+				<ProductAvatar size={size} label="Manager" />
 			)}
 		</span>
 	);

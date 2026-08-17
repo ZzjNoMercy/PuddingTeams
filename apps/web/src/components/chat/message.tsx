@@ -21,7 +21,7 @@ import { delegateWorker, isDelegateCall } from "@/lib/events";
 import { openRoomFile } from "@/lib/api";
 import type { ChatMessage, ToolCallView, WindowType } from "@/lib/types";
 import { toast } from "sonner";
-import { WorkerAvatar } from "./worker-avatar";
+import { ManagerAvatar, WorkerAvatar } from "./worker-avatar";
 import { InteractionCard } from "./interaction-card";
 
 const TOOL_STATUS_LABEL: Record<ToolCallView["status"], string> = {
@@ -721,7 +721,7 @@ function MessageBody({
 		<>
 			{showBubble && (
 				<div className="home-assistant-message">
-					<div className="home-manager-avatar">M</div>
+					<ManagerAvatar size={34} className="home-manager-avatar" />
 					<div className="home-assistant-body">
 						<div className="home-message-meta"><strong>Manager</strong><span>{time}</span></div>
 						{showThinking && (

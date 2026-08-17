@@ -14,6 +14,7 @@ import {
 	SlidersHorizontalIcon,
 } from "lucide-react";
 import { GithubIcon } from "@/components/github-icon";
+import { ProductAvatar } from "@/components/product-avatar";
 import { SettingsDialog } from "@/components/settings/settings-dialog";
 import { AboutDialog } from "@/components/settings/about-dialog";
 import {
@@ -72,7 +73,7 @@ export function NavRail({ view }: { view: AppView }) {
 	return (
 		<div className="nav-rail flex shrink-0 flex-col">
 			<Link href="/" className="nav-brand" title="PuddingTeams" aria-label="PuddingTeams 首页">
-				<span className="nav-brand-mark">PT</span>
+				<ProductAvatar size={38} shape="square" className="nav-brand-mark" />
 				<span className="nav-brand-name nav-label">PuddingTeams</span>
 			</Link>
 			<div className="nav-primary">

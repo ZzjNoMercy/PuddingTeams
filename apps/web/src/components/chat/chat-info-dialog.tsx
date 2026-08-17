@@ -4,7 +4,7 @@ import { forwardRef, type ButtonHTMLAttributes } from "react";
 import { ChevronDownIcon, XIcon } from "lucide-react";
 import type { RoomSession, RoomSummary } from "@/lib/types";
 import { SessionMenu } from "./session-menu";
-import { WorkerAvatar } from "./worker-avatar";
+import { ManagerAvatar, WorkerAvatar } from "./worker-avatar";
 
 function GroupAvatar({ room }: { room: RoomSummary }) {
 	const shownMembers = room.members.slice(0, 2);
@@ -18,7 +18,7 @@ function GroupAvatar({ room }: { room: RoomSummary }) {
 					className={`ring-2 ring-background ${index === 0 ? "relative z-10" : ""}`}
 				/>
 			))}
-			{shownMembers.length === 0 ? <span className="chat-manager-avatar">M</span> : null}
+			{shownMembers.length === 0 ? <ManagerAvatar size={40} className="chat-manager-avatar" /> : null}
 		</div>
 	);
 }
@@ -141,7 +141,7 @@ export function ChatInfoDialog({
 						) : isDirect && directMember ? (
 							<WorkerAvatar name={directMember.name} size={40} />
 						) : (
-							<span className="chat-manager-avatar">M</span>
+							<ManagerAvatar size={40} className="chat-manager-avatar" />
 						)}
 						<div className="min-w-0 flex-1">
 							<h2 className="chat-info-profile-title truncate">{room.name}</h2>
@@ -155,7 +155,7 @@ export function ChatInfoDialog({
 						<section className="chat-info-section">
 							<div className="chat-info-section-label">成员 · {room.members.length + 1}</div>
 							<div className="chat-member-grid">
-								<div className="chat-member-item"><span className="chat-manager-avatar small">M</span><span>Manager</span></div>
+								<div className="chat-member-item"><ManagerAvatar size={34} className="chat-manager-avatar small" /><span>Manager</span></div>
 								{room.members.map((member) => (
 									<div key={member.name} className="chat-member-item" title={member.description}>
 										<WorkerAvatar name={member.name} size={34} />

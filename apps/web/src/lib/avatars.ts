@@ -13,8 +13,8 @@ import { agentAvatarUrl, listAgents } from "./api";
 
 /** name -> per-agent cache-busting version (bumped on upload/delete). */
 const versions = new Map<string, number>();
-/** name -> has an uploaded avatar (null = unknown yet). */
-const hasAvatar = new Map<string, boolean>();
+/** name -> uploaded avatar / connector-bundled avatar availability. */
+const avatarKinds = new Map<string, { uploaded: boolean; bundled: boolean }>();
 const listeners = new Set<() => void>();
 let loading: Promise<void> | null = null;
 
@@ -26,9 +26,12 @@ function ensureLoaded(): void {
 	loading ??= listAgents()
 		.then((agents) => {
 			for (const a of agents) {
-				// 上传头像或 connector 包内默认头像（hasDefaultAvatar）都走 avatar URL；
-				// GET avatar 路由会上传优先、回退包内资源。
-				hasAvatar.set(a.name, Boolean(a.avatar || a.hasDefaultAvatar));
+				// GET avatar 路由会上传优先、回退包内资源；这里分别记录两种来源，
+				// 让 Manager 能保留用户上传，同时使用产品头像覆盖 Pi 品牌回退。
+				avatarKinds.set(a.name, {
+					uploaded: Boolean(a.avatar),
+					bundled: Boolean(a.hasDefaultAvatar),
+				});
 				if (!versions.has(a.name)) versions.set(a.name, 0);
 			}
 			emit();
@@ -41,20 +44,22 @@ function ensureLoaded(): void {
 
 /** Record an avatar change (upload/delete) so every WorkerAvatar refreshes. */
 export function agentAvatarChanged(name: string, uploaded: boolean): void {
-	hasAvatar.set(name, uploaded);
+	const current = avatarKinds.get(name);
+	avatarKinds.set(name, { uploaded, bundled: current?.bundled ?? false });
 	versions.set(name, (versions.get(name) ?? 0) + 1);
 	emit();
 }
 
 /** Drop a removed agent from the registry. */
 export function agentRemoved(name: string): void {
-	hasAvatar.delete(name);
+	avatarKinds.delete(name);
 	versions.delete(name);
 	emit();
 }
 
-function currentUrl(name: string): string | null {
-	if (!hasAvatar.get(name)) return null;
+function currentUrl(name: string, uploadedOnly = false): string | null {
+	const kind = avatarKinds.get(name);
+	if (!kind || (uploadedOnly ? !kind.uploaded : !kind.uploaded && !kind.bundled)) return null;
 	return agentAvatarUrl(name, versions.get(name) ?? 0);
 }
 
@@ -64,6 +69,21 @@ export function useAgentAvatar(name: string): string | null {
 	useEffect(() => {
 		ensureLoaded();
 		const update = () => setUrl(currentUrl(name));
+		listeners.add(update);
+		update();
+		return () => {
+			listeners.delete(update);
+		};
+	}, [name]);
+	return url;
+}
+
+/** 只返回用户上传头像；用于具有产品级默认头像的固定角色。 */
+export function useUploadedAgentAvatar(name: string): string | null {
+	const [url, setUrl] = useState<string | null>(() => currentUrl(name, true));
+	useEffect(() => {
+		ensureLoaded();
+		const update = () => setUrl(currentUrl(name, true));
 		listeners.add(update);
 		update();
 		return () => {

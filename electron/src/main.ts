@@ -129,6 +129,7 @@ function createWindow(appUrl: string): BrowserWindow {
 		minHeight: 600,
 		title: APP_NAME,
 		backgroundColor: "#09090b",
+		...(!app.isPackaged ? { icon: path.join(REPO_ROOT, "electron", "build", "icon.png") } : {}),
 		webPreferences: {
 			preload: path.join(__dirname, "preload.cjs"),
 			contextIsolation: true,

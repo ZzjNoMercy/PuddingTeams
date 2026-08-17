@@ -23,7 +23,7 @@ import {
 import { agentRemoved } from "@/lib/avatars";
 import type { AgentConfig, AgentProbeResult, CatalogEntry, ConflictRun } from "@/lib/types";
 import { isConnectorProbe } from "@/lib/types";
-import { WorkerAvatar } from "@/components/chat/worker-avatar";
+import { ManagerAvatar, WorkerAvatar } from "@/components/chat/worker-avatar";
 import { ConfigSchemaForm, SecretSchemaFields } from "@/components/agents/form-parts";
 import {
 	DropdownMenu,
@@ -465,7 +465,7 @@ export function AgentsPane() {
 	const renderManagerStrip = (agent: AgentConfig) => {
 		const description = agent.description.replace(/^内置\s+Pi\s+manager[：:]?\s*/i, "");
 		return <button key={agent.name} type="button" className="ops-manager-strip" onClick={() => openManage(agent)}>
-			<span className="ops-manager-avatar">M</span>
+			<ManagerAvatar size={48} className="ops-manager-avatar" />
 			<div className="min-w-0 text-left">
 				<div className="flex items-center gap-2"><span className="text-sm font-semibold">Manager</span><span className="ops-origin-pill">内置</span></div>
 				<p className="mt-1 text-xs leading-5 text-muted-foreground">{description || "理解目标、组织协作并汇总结果"}</p>

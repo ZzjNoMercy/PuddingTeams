@@ -23,6 +23,7 @@ extraResources:
   - from: ../packages/puddingteams-cli/runtime
     to: runtime
 mac:
+  icon: build/icon.png
   category: public.app-category.productivity
   target:
     - target: dmg
