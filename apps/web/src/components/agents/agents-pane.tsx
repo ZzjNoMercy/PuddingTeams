@@ -513,7 +513,7 @@ export function AgentsPane() {
 						<section className="flex flex-col gap-9">
 							<div className="flex flex-col gap-3">
 								<div className="flex items-center justify-between gap-4">
-									<div className="flex items-center gap-2"><h3 className="text-sm font-semibold">内置</h3>
+									<div className="flex items-center gap-2"><h3 className="text-sm font-semibold">Worker（内置）</h3>
 									<Badge variant="secondary">{builtinWorkers.length}</Badge>
 									</div><span className="text-xs text-muted-foreground">随平台提供或由 Pi 衍生</span>
 								</div>
@@ -527,7 +527,7 @@ export function AgentsPane() {
 							</div>
 							<div className="flex flex-col gap-3">
 								<div className="flex items-center justify-between gap-4">
-									<div className="flex items-center gap-2"><h3 className="text-sm font-semibold">第三方</h3>
+									<div className="flex items-center gap-2"><h3 className="text-sm font-semibold">Worker（第三方）</h3>
 									<Badge variant="secondary">{thirdPartyWorkers.length}</Badge>
 									</div><span className="text-xs text-muted-foreground">通过 Connector 添加，默认归入此处</span>
 								</div>

@@ -96,7 +96,10 @@ function ProviderRow({
 	return (
 		<div className={cn("provider-row", showModels && "is-open")}>
 			<button type="button" className="provider-row-summary" onClick={() => void toggleModels()}>
-				<span className="provider-row-name">{provider.name}</span>
+				<span className="provider-row-identity">
+					<span className="provider-row-indicator" data-configured={provider.configured ? "true" : "false"} />
+					<span className="provider-row-name">{provider.name}</span>
+				</span>
 				<span className="provider-row-status">
 					{provider.configured ? `已配置 · ${provider.modelCount} 模型` : "未配置"}
 				</span>
@@ -104,7 +107,19 @@ function ProviderRow({
 			</button>
 			{showModels && (
 				<div className="provider-row-detail">
-					<div className="provider-row-actions">
+					<div className="provider-connection">
+						{provider.baseUrl ? (
+							<div className="provider-connection-item">
+								<span>服务端点</span>
+								<code title={provider.baseUrl}>{provider.baseUrl}</code>
+							</div>
+						) : null}
+						<div className="provider-connection-item">
+							<span>认证方式</span>
+							<strong>{provider.oauth ? "OAuth" : provider.configured ? "API Key · 已配置" : "API Key · 未配置"}</strong>
+						</div>
+					</div>
+					<div className="provider-row-actions" aria-label="凭证操作">
 						{confirmingDelete ? (
 							<>
 								<Button type="button" size="sm" variant="destructive" disabled={busy} onClick={remove}>确认删除</Button>
@@ -135,43 +150,32 @@ function ProviderRow({
 							<Button type="submit" size="sm" disabled={busy || !apiKey.trim()}>保存</Button>
 						</form>
 					)}
-					<div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-						{provider.baseUrl ? (
-							<span title="API endpoint">
-								端点：<span className="font-mono">{provider.baseUrl}</span>
-							</span>
-						) : null}
-						<span>认证：{provider.oauth ? "OAuth" : provider.configured ? "API Key" : "未配置"}</span>
-					</div>
 					{loadingModels ? (
 						<p className="py-1 text-xs text-muted-foreground">加载中…</p>
 					) : models === null ? null : models.length === 0 ? (
 						<p className="py-1 text-xs text-muted-foreground">无模型</p>
 					) : (
-						models.map((m) => {
-							const isDefault = m.id === defaultModelRef;
-							return (
-								<div key={m.id} className="flex items-center gap-2 py-0.5">
-									<span className="min-w-0 flex-1 truncate text-xs">
-										<span className="font-medium">{m.name}</span>
-										<span className="text-muted-foreground">
-											{" · "}
-											{m.id}
-											{m.reasoning ? " · 思考" : ""}
+						<div className="provider-models">
+							<div className="provider-models-label">可用模型</div>
+							{models.map((m) => {
+								const isDefault = m.id === defaultModelRef;
+								return (
+									<div key={m.id} className="provider-model-row">
+										<span className="provider-model-copy">
+											<strong>{m.name}</strong>
+											<small>{m.id}{m.reasoning ? " · 支持思考" : ""}</small>
 										</span>
-									</span>
-									<Button
-										type="button"
-										size="sm"
-										variant="ghost"
-										disabled={isDefault}
-										onClick={() => void onSetDefault(provider.id, m.id.split("/").slice(1).join("/"))}
-									>
-										{isDefault ? "默认" : "设为默认"}
-									</Button>
-								</div>
-							);
-						})
+										{isDefault ? (
+											<span className="provider-default-badge">默认</span>
+										) : (
+											<Button type="button" size="sm" variant="ghost" onClick={() => void onSetDefault(provider.id, m.id.split("/").slice(1).join("/"))}>
+												设为默认
+											</Button>
+										)}
+									</div>
+								);
+							})}
+						</div>
 					)}
 				</div>
 			)}
@@ -188,6 +192,7 @@ export function ProviderSettings() {
 	const [editingCustom, setEditingCustom] = useState<CustomProviderRecord | undefined>();
 	const [deletingCustom, setDeletingCustom] = useState<string | null>(null);
 	const [busyDelete, setBusyDelete] = useState(false);
+	const [showMore, setShowMore] = useState(false);
 
 	const refresh = () => {
 		listProviders()
@@ -231,102 +236,24 @@ export function ProviderSettings() {
 	};
 
 	const keyword = filter.trim().toLowerCase();
-	const visible = (providers ?? [])
-		.filter((p) => !keyword || p.id.toLowerCase().includes(keyword) || p.name.toLowerCase().includes(keyword))
-		.sort((a, b) => Number(b.configured) - Number(a.configured));
+	const configured = (providers ?? []).filter((provider) => provider.configured);
+	const unconfigured = (providers ?? []).filter((provider) => !provider.configured);
+	const available = unconfigured
+		.filter((provider) => !keyword || provider.id.toLowerCase().includes(keyword) || provider.name.toLowerCase().includes(keyword));
 
 	return (
 		<div className={cn("provider-settings flex min-h-0 flex-1 flex-col gap-3")}>
-			<Input
-				placeholder="过滤 provider…"
-				value={filter}
-				onChange={(e) => setFilter(e.target.value)}
-				className="provider-filter h-9 text-xs"
-			/>
-			<div className="custom-provider-card rounded-md border border-border px-3 py-2">
-				<div className="flex items-center gap-2">
-					<span className="flex-1 text-sm text-muted-foreground">
-						自定义 Provider（OpenAI-compatible 端点，{customProviders.length}）
-					</span>
-					<Button
-						type="button"
-						size="sm"
-						variant="outline"
-						onClick={() => {
-							setEditingCustom(undefined);
-							setDialogOpen(true);
-						}}
-					>
-						<PlusIcon className="size-3.5" />
-						添加
-					</Button>
-				</div>
-				{customProviders.length > 0 ? (
-					<div className="mt-1 flex flex-col">
-						{customProviders.map((p) => (
-							<div key={p.id} className="flex items-center gap-2 py-1">
-								<span className="min-w-0 flex-1 truncate text-xs">
-									<span className="font-medium">{p.name}</span>
-									<span className="text-muted-foreground">
-										{" · "}
-										{p.id} · {p.models.length} 模型
-									</span>
-								</span>
-								{deletingCustom === p.id ? (
-									<span className="flex items-center gap-1">
-										<Button
-											type="button"
-											size="sm"
-											variant="destructive"
-											disabled={busyDelete}
-											onClick={() => void removeCustom(p.id)}
-										>
-											确认删除
-										</Button>
-										<Button type="button" size="sm" variant="ghost" onClick={() => setDeletingCustom(null)}>
-											取消
-										</Button>
-									</span>
-								) : (
-									<span className="flex items-center gap-1">
-										<Button
-											type="button"
-											size="sm"
-											variant="ghost"
-											onClick={() => {
-												setEditingCustom(p);
-												setDialogOpen(true);
-											}}
-										>
-											<PencilIcon className="size-3.5" />
-											编辑
-										</Button>
-										<Button
-											type="button"
-											size="sm"
-											variant="ghost"
-											className="text-muted-foreground hover:text-destructive"
-											onClick={() => setDeletingCustom(p.id)}
-										>
-											<Trash2Icon className="size-3.5" />
-										</Button>
-									</span>
-								)}
-							</div>
-						))}
-					</div>
-				) : null}
-			</div>
-			<div className="provider-list min-h-0 flex-1 overflow-y-auto">
-				{visible.length === 0 ? (
-					<p className="py-8 text-center text-xs text-muted-foreground">
-						{providers === null ? "加载中…" : "没有匹配的 provider"}
-					</p>
+			<div className="provider-group">
+				<div className="provider-group-label">已配置</div>
+				{providers === null ? (
+					<p className="provider-empty">加载中…</p>
+				) : configured.length === 0 ? (
+					<p className="provider-empty">尚未配置 Provider，可从下方添加。</p>
 				) : (
-					visible.map((p) => (
+					configured.map((provider) => (
 						<ProviderRow
-							key={p.id}
-							provider={p}
+							key={provider.id}
+							provider={provider}
 							defaultModelRef={defaultModelRef}
 							onSetDefault={setDefault}
 							onChanged={refresh}
@@ -334,6 +261,111 @@ export function ProviderSettings() {
 					))
 				)}
 			</div>
+			<button
+				type="button"
+				className="provider-more-toggle"
+				aria-expanded={showMore}
+				onClick={() => setShowMore((value) => !value)}
+			>
+				<span>更多 Provider</span>
+				<span className="provider-more-meta">{unconfigured.length} 个可配置</span>
+				<ChevronDownIcon aria-hidden="true" />
+			</button>
+			{showMore ? (
+				<div className="provider-more-panel">
+					<Input
+						placeholder="搜索 Provider…"
+						value={filter}
+						onChange={(e) => setFilter(e.target.value)}
+						className="provider-filter h-9 text-xs"
+					/>
+					<div className="custom-provider-card rounded-md px-3 py-2">
+						<div className="flex items-center gap-2">
+							<span className="flex-1 text-sm text-muted-foreground">
+								自定义 Provider（OpenAI-compatible 端点，{customProviders.length}）
+							</span>
+							<Button
+								type="button"
+								size="sm"
+								variant="outline"
+								onClick={() => {
+									setEditingCustom(undefined);
+									setDialogOpen(true);
+								}}
+							>
+								<PlusIcon className="size-3.5" />
+								添加
+							</Button>
+						</div>
+						{customProviders.length > 0 ? (
+							<div className="mt-1 flex flex-col">
+								{customProviders.map((p) => (
+									<div key={p.id} className="flex items-center gap-2 py-1">
+										<span className="min-w-0 flex-1 truncate text-xs">
+											<span className="font-medium">{p.name}</span>
+											<span className="text-muted-foreground">
+												{" · "}
+												{p.id} · {p.models.length} 模型
+											</span>
+										</span>
+										{deletingCustom === p.id ? (
+											<span className="flex items-center gap-1">
+												<Button type="button" size="sm" variant="destructive" disabled={busyDelete} onClick={() => void removeCustom(p.id)}>
+													确认删除
+												</Button>
+												<Button type="button" size="sm" variant="ghost" onClick={() => setDeletingCustom(null)}>
+													取消
+												</Button>
+											</span>
+										) : (
+											<span className="flex items-center gap-1">
+												<Button
+													type="button"
+													size="sm"
+													variant="ghost"
+													onClick={() => {
+														setEditingCustom(p);
+														setDialogOpen(true);
+													}}
+												>
+													<PencilIcon className="size-3.5" />
+													编辑
+												</Button>
+												<Button
+													type="button"
+													size="sm"
+													variant="ghost"
+													className="text-muted-foreground hover:text-destructive"
+													onClick={() => setDeletingCustom(p.id)}
+												>
+													<Trash2Icon className="size-3.5" />
+												</Button>
+											</span>
+										)}
+									</div>
+								))}
+							</div>
+						) : null}
+					</div>
+					<div className="provider-list min-h-0 flex-1">
+						{available.length === 0 ? (
+							<p className="py-8 text-center text-xs text-muted-foreground">
+								{providers === null ? "加载中…" : keyword ? "没有匹配的 Provider" : "没有更多 Provider"}
+							</p>
+						) : (
+							available.map((p) => (
+								<ProviderRow
+									key={p.id}
+									provider={p}
+									defaultModelRef={defaultModelRef}
+									onSetDefault={setDefault}
+									onChanged={refresh}
+								/>
+							))
+						)}
+					</div>
+				</div>
+			) : null}
 			<CustomProviderDialog
 				open={dialogOpen}
 				onOpenChange={setDialogOpen}
