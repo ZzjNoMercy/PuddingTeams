@@ -166,10 +166,12 @@ const defaultGetThinkingMessage = (
   if (isStreaming && startTime != null && startTime !== undefined) {
     return <LiveTimer startTime={startTime} />;
   }
-  if (isStreaming || duration === 0) {
+  if (isStreaming) {
     return <Shimmer duration={1}>Thinking...</Shimmer>;
   }
-  if (duration === undefined) {
+  // duration 0 = sub-second turn (floor of ms/1000); without this branch
+  // merging 0 into "a few seconds", the trigger shimmers forever post-stream.
+  if (duration === undefined || duration === 0) {
     return <span>Thought for a few seconds</span>;
   }
   return <span>Thought for {duration} seconds</span>;

@@ -95,6 +95,7 @@ function probeSummary(probe: AgentProbeResult): string {
 		if (!probe.extensionInstalled) return "扩展未安装";
 		if (!probe.detected) return "CLI 未检测";
 		if (probe.compatibility === "incompatible") return "不兼容";
+		if (probe.authenticated === false) return "凭证无效";
 		return "探测正常";
 	}
 	return probe.ok ? "探测健康" : `探测异常：${probe.error ?? `exit ${probe.exitCode}`}`;

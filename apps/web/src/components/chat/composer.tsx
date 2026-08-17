@@ -118,6 +118,7 @@ function ModelPicker({ sessionId }: { sessionId: string }) {
 function ComposerInner({
 	sessionId,
 	disabled,
+	busyHint,
 	hasGoal,
 	workspaceLabel,
 	workspacePath,
@@ -129,6 +130,8 @@ function ComposerInner({
 }: {
 	sessionId: string;
 	disabled: boolean;
+	/** run 活跃但 manager 在等 worker（delegate 阻塞中）时的等待文案。 */
+	busyHint?: string;
 	hasGoal: boolean;
 	workspaceLabel: string;
 	workspacePath: string;
@@ -191,7 +194,7 @@ function ComposerInner({
 				{(attachment) => <PromptInputAttachment data={attachment} />}
 			</PromptInputAttachments>
 			<PromptInputTextarea
-				placeholder={disabled ? "agent 正在处理…" : "发消息，或输入 / 调用命令"}
+				placeholder={disabled ? (busyHint ?? "agent 正在处理…") : "发消息，或输入 / 调用命令"}
 				className="home-composer-textarea"
 			/>
 			<PromptInputFooter>
@@ -212,7 +215,7 @@ function ComposerInner({
 						<FolderGit2Icon className="size-3.5" />
 						<span className="truncate">{workspaceLabel}</span>
 					</Button>
-					<span className="text-muted-foreground px-1 text-xs">{disabled ? "处理中…" : ""}</span>
+					<span className="text-muted-foreground px-1 text-xs">{disabled ? (busyHint ?? "处理中…") : ""}</span>
 				</PromptInputTools>
 				<PromptInputSubmit
 					status={status}
@@ -234,6 +237,7 @@ function ComposerInner({
 export function Composer({
 	sessionId,
 	disabled,
+	busyHint,
 	hasGoal,
 	workspaceLabel,
 	workspacePath,
@@ -246,6 +250,7 @@ export function Composer({
 }: {
 	sessionId: string;
 	disabled: boolean;
+	busyHint?: string;
 	hasGoal: boolean;
 	workspaceLabel: string;
 	workspacePath: string;
@@ -264,6 +269,7 @@ export function Composer({
 					<ComposerInner
 						sessionId={sessionId}
 						disabled={disabled}
+						busyHint={busyHint}
 						hasGoal={hasGoal}
 						workspaceLabel={workspaceLabel}
 						workspacePath={workspacePath}

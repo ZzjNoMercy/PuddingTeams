@@ -310,6 +310,8 @@ export class PuddingClawDriver implements AgentDriver {
 		let configured = res.exitCode === 0;
 		let authenticated: boolean | "unknown" = "unknown";
 		let upstreamVersion: string | undefined;
+		let authErrorCode: string | undefined;
+		let authErrorDetail: string | undefined;
 		if (res.stdout.trim()) {
 			try {
 				const raw = JSON.parse(res.stdout.trim()) as Record<string, unknown>;
@@ -317,6 +319,8 @@ export class PuddingClawDriver implements AgentDriver {
 				authenticated = raw.authenticated === true ? true : raw.authenticated === false ? false : "unknown";
 				detected = detected || raw.cli_version !== undefined;
 				upstreamVersion = typeof raw.server_version === "string" ? raw.server_version : undefined;
+				authErrorCode = typeof raw.error_code === "string" ? raw.error_code : undefined;
+				authErrorDetail = typeof raw.error === "string" ? raw.error : undefined;
 			} catch {
 				// ignore
 			}
@@ -333,9 +337,22 @@ export class PuddingClawDriver implements AgentDriver {
 			version: undefined,
 			transport: "spawn",
 			capabilities: PUDDINGCLAW_CAPABILITIES,
-			issues: configured
-				? []
-				: [{ code: "not_configured", message: "PuddingClaw CLI 未检测到或未配置", fixAction: "运行 puddingclaw doctor --json" }],
+			issues: [
+				...(configured
+					? []
+					: [{ code: "not_configured", message: "PuddingClaw CLI 未检测到或未配置", fixAction: "运行 puddingclaw doctor --json" }]),
+				// CLI 已安装/已配置但凭证无效（吊销/过期/超范围）也要显性报出，
+				// 不能只看 configured 就判"探测正常"。
+				...(authenticated === false
+					? [
+							{
+								code: authErrorCode ?? "auth_error",
+								message: `Worker Access Key 无效${authErrorDetail ? `：${authErrorDetail}` : ""}`,
+								fixAction: "重新配置 Worker Access Key 后再次探测",
+							},
+						]
+					: []),
+			],
 		};
 	}
 }

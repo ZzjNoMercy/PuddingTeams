@@ -108,3 +108,24 @@ test("PuddingClawDriver：respond 无 token 且缺原任务/选择时明确失�
 	assert.ok(failed && failed.type === "failed");
 	assert.equal(failed.result.errorCode, "interaction_unsupported");
 });
+
+test("PuddingClawDriver：probe 在 configured 但 authenticated=false 时显性报凭证无效", async () => {
+	const dir = freshDir();
+	const cli = path.join(dir, "fake-doctor.sh");
+	writeFileSync(
+		cli,
+		[
+			"#!/bin/sh",
+			'printf "%s\\n" \'{"configured":true,"authenticated":false,"error_code":"auth_error","error":"Worker Access Key is invalid, revoked, expired, or out of scope","cli_version":"0.1.17"}\'',
+			"",
+		].join("\n"),
+	);
+	chmodSync(cli, 0o755);
+	const driver = new PuddingClawDriver({ command: cli });
+	const probe = await driver.probe({ cwd: dir, env: { ...process.env } });
+	assert.equal(probe.configured, true);
+	assert.equal(probe.authenticated, false);
+	const authIssue = probe.issues.find((i) => i.code === "auth_error");
+	assert.ok(authIssue, `凭证无效应进 issues：${JSON.stringify(probe.issues)}`);
+	assert.ok(authIssue.message.includes("Worker Access Key 无效"), "issue 文案必须直指凭证无效");
+});

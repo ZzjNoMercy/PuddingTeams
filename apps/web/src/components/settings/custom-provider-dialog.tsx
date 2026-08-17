@@ -147,45 +147,48 @@ export function CustomProviderDialog({
 
 	return (
 		<Dialog open={open} onOpenChange={onOpenChange}>
-			<DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
-				<DialogHeader>
+			<DialogContent overlayClassName="custom-provider-dialog-overlay" className="custom-provider-dialog max-h-[min(78vh,700px)] gap-0 overflow-hidden p-0 sm:max-w-[640px]">
+				<DialogHeader className="custom-provider-dialog-header">
 					<DialogTitle>{editing ? `编辑自定义 Provider「${editing.id}」` : "添加自定义 Provider"}</DialogTitle>
 					<DialogDescription>
 						接入任意 OpenAI-compatible 端点（如 vLLM / Ollama / 网关）。保存后该 provider
 						及其模型进入全局模型目录，manager 与 worker 都可选。
 					</DialogDescription>
 				</DialogHeader>
-				<div className="flex flex-col gap-3">
-					<div className="grid grid-cols-2 gap-2">
-						<label className="flex flex-col gap-1 text-sm">
+				<div className="custom-provider-dialog-body">
+					<section className="custom-provider-section">
+						<div className="custom-provider-section-heading">
+							<strong>连接信息</strong>
+							<span>用于定位端点并写入凭证。</span>
+						</div>
+						<div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+						<label className="custom-provider-field">
 							<span className="text-muted-foreground">ID（小写字母/数字/连字符）</span>
 							<Input
 								value={id}
 								disabled={Boolean(editing)}
 								placeholder="如 my-vllm"
-								className="h-8 font-mono text-xs"
+								className="h-9 font-mono text-xs"
 								onChange={(e) => setId(e.target.value)}
 							/>
 						</label>
-						<label className="flex flex-col gap-1 text-sm">
+						<label className="custom-provider-field">
 							<span className="text-muted-foreground">显示名</span>
-							<Input value={name} placeholder="如 公司内网 vLLM" className="h-8 text-xs" onChange={(e) => setName(e.target.value)} />
+							<Input value={name} placeholder="如 公司内网 vLLM" className="h-9 text-xs" onChange={(e) => setName(e.target.value)} />
 						</label>
-					</div>
-					<label className="flex flex-col gap-1 text-sm">
-						<span className="text-muted-foreground">Base URL</span>
-						<Input
-							value={baseUrl}
-							placeholder="https://host/v1"
-							className="h-8 font-mono text-xs"
-							onChange={(e) => setBaseUrl(e.target.value)}
-						/>
-					</label>
-					<div className="grid grid-cols-2 gap-2">
-						<label className="flex flex-col gap-1 text-sm">
-							<span className="text-muted-foreground">调用协议（api）</span>
+						<label className="custom-provider-field sm:col-span-2">
+							<span className="text-muted-foreground">Base URL</span>
+							<Input
+								value={baseUrl}
+								placeholder="https://host/v1"
+								className="h-9 font-mono text-xs"
+								onChange={(e) => setBaseUrl(e.target.value)}
+							/>
+						</label>
+						<label className="custom-provider-field">
+							<span className="text-muted-foreground">调用协议</span>
 							<Select value={api} onValueChange={setApi}>
-								<SelectTrigger className="h-8 w-full text-xs">
+								<SelectTrigger className="h-9 w-full text-xs">
 									<SelectValue />
 								</SelectTrigger>
 								<SelectContent>
@@ -197,58 +200,60 @@ export function CustomProviderDialog({
 								</SelectContent>
 							</Select>
 						</label>
-						<label className="flex flex-col gap-1 text-sm">
-							<span className="text-muted-foreground">API Key（可选，保存时写入凭证）</span>
+						<label className="custom-provider-field">
+							<span className="text-muted-foreground">API Key（可选）</span>
 							<Input
 								type="password"
 								value={apiKey}
 								placeholder={editing ? "留空则不改动已存 key" : "sk-..."}
 								autoComplete="off"
-								className="h-8 font-mono text-xs"
+								className="h-9 font-mono text-xs"
 								onChange={(e) => setApiKey(e.target.value)}
 							/>
 						</label>
-					</div>
+						</div>
+					</section>
 
-					<div className="flex items-center gap-2">
-						<span className="flex-1 text-sm text-muted-foreground">模型清单（{models.length}）</span>
-						<Button type="button" size="sm" variant="outline" disabled={!canTest} onClick={() => void test()}>
-							{busy === "test" ? <LoaderIcon className="size-3.5 animate-spin" /> : <ZapIcon className="size-3.5" />}
-							测试连接
-						</Button>
-						<Button type="button" size="sm" variant="outline" disabled={!canTest} onClick={() => void discover()}>
-							{busy === "discover" ? <LoaderIcon className="size-3.5 animate-spin" /> : <RefreshCwIcon className="size-3.5" />}
-							发现模型
-						</Button>
-						<Button
-							type="button"
-							size="sm"
-							variant="outline"
-							onClick={() => setModels([...models, { id: "", _key: ++rowKey }])}
-						>
-							<PlusIcon className="size-3.5" />
-							手填模型
-						</Button>
-					</div>
+					<section className="custom-provider-section">
+						<div className="custom-provider-model-head">
+							<div className="custom-provider-section-heading">
+								<strong>模型清单 <span>· {models.length}</span></strong>
+								<span>自动发现，或直接登记模型 ID。</span>
+							</div>
+							<div className="custom-provider-actions">
+								<Button type="button" size="sm" variant="ghost" disabled={!canTest} onClick={() => void test()}>
+									{busy === "test" ? <LoaderIcon className="size-3.5 animate-spin" /> : <ZapIcon className="size-3.5" />}
+									测试连接
+								</Button>
+								<Button type="button" size="sm" variant="ghost" disabled={!canTest} onClick={() => void discover()}>
+									{busy === "discover" ? <LoaderIcon className="size-3.5 animate-spin" /> : <RefreshCwIcon className="size-3.5" />}
+									发现模型
+								</Button>
+								<Button type="button" size="sm" variant="secondary" onClick={() => setModels([...models, { id: "", _key: ++rowKey }])}>
+									<PlusIcon className="size-3.5" />
+									手填模型
+								</Button>
+							</div>
+						</div>
 
 					{models.length === 0 ? (
-						<p className="rounded-md border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground">
-							还没有模型。点「发现模型」从接口拉取，或「手填模型」直接登记模型 ID。
+						<p className="custom-provider-empty">
+							尚未添加模型。连接端点后可自动发现，也可以直接手填模型 ID。
 						</p>
 					) : (
-						<div className="flex flex-col gap-1.5">
+						<div className="custom-provider-model-list">
 							{models.map((m) => (
-								<div key={m._key} className="flex items-center gap-1.5">
+								<div key={m._key} className="custom-provider-model-row">
 									<Input
 										value={m.id}
 										placeholder="模型 ID *"
-										className="h-8 flex-1 font-mono text-xs"
+										className="h-9 min-w-[140px] flex-1 font-mono text-xs"
 										onChange={(e) => updateRow(m._key, { id: e.target.value })}
 									/>
 									<Input
 										value={m.name ?? ""}
 										placeholder="显示名"
-										className="h-8 w-28 text-xs"
+										className="h-9 w-28 text-xs"
 										onChange={(e) => updateRow(m._key, { name: e.target.value })}
 									/>
 									<Input
@@ -256,7 +261,7 @@ export function CustomProviderDialog({
 										value={m.contextWindow ?? ""}
 										placeholder="上下文"
 										title="上下文窗口（tokens）"
-										className="h-8 w-24 text-xs"
+										className="h-9 w-24 text-xs"
 										onChange={(e) => updateRow(m._key, { contextWindow: e.target.value ? Number(e.target.value) : undefined })}
 									/>
 									<label className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground" title="推理（thinking）模型">
@@ -280,8 +285,9 @@ export function CustomProviderDialog({
 							))}
 						</div>
 					)}
+					</section>
 				</div>
-				<DialogFooter>
+				<DialogFooter className="custom-provider-dialog-footer">
 					<Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
 						取消
 					</Button>

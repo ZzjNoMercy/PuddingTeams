@@ -37,6 +37,7 @@ import type { ChatStatus, RoomSession, RoomSummary, WorkspaceRecord } from "@/li
 import { Composer } from "./composer";
 import { ChatStatsBar } from "./chat-stats-bar";
 import { computeSessionStats } from "@/lib/session-stats";
+import { delegateWorker, isDelegateCall } from "@/lib/events";
 import { Message } from "./message";
 import { ManagerAvatar, MemberStack, WorkerAvatar } from "./worker-avatar";
 import { DirectoryPickerDialog } from "./directory-picker-dialog";
@@ -119,6 +120,21 @@ function SessionChat({
 		}
 		return ids;
 	}, [messages]);
+	// 拆分「等 worker」与「manager 思考」：delegate 工具阻塞在 manager 的 run 里，
+	// run 活跃不等于 manager 在生成。有 running 态委托调用时，composer 提示
+	// 等待哪个 worker，而不是笼统的「处理中」。
+	const waitingWorkers = useMemo(() => {
+		const names: string[] = [];
+		for (const m of messages) {
+			for (const call of m.toolCalls) {
+				if (call.status !== "running" || !isDelegateCall(call)) continue;
+				const worker = delegateWorker(call);
+				if (worker && !names.includes(worker)) names.push(worker);
+			}
+		}
+		return names;
+	}, [messages]);
+	const busyHint = running && waitingWorkers.length > 0 ? `等待 ${waitingWorkers.join("、")} 返回…` : undefined;
 
 	return (
 		<div className="home-session-chat relative flex min-h-0 flex-1 flex-col" aria-busy={!layoutReady}>
@@ -160,6 +176,7 @@ function SessionChat({
 				<Composer
 					sessionId={sessionId}
 					disabled={running || Boolean(blocked)}
+					busyHint={busyHint}
 					hasGoal={hasGoal}
 					workspaceLabel={workspaceLabel}
 					workspacePath={workspacePath}

@@ -8,6 +8,7 @@ import { ProviderSettings } from "./provider-settings";
 
 export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
 	const [section, setSection] = useState<"appearance" | "providers">("appearance");
+	const sectionKicker = section === "appearance" ? "APPEARANCE" : "PROVIDERS";
 
 	return (
 		<Dialog open={open} onOpenChange={onOpenChange}>
@@ -18,7 +19,7 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
 			>
 				<header className="settings-header">
 					<div>
-						<p className="settings-kicker">PREFERENCES</p>
+						<p className="settings-kicker" aria-live="polite">{sectionKicker}</p>
 						<DialogTitle className="settings-title">设置</DialogTitle>
 						<DialogDescription className="sr-only">调整界面外观和模型 Provider。</DialogDescription>
 					</div>

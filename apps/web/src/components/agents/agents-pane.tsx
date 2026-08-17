@@ -50,9 +50,11 @@ function parseArgs(text: string): string[] {
 		.filter(Boolean);
 }
 
-/** 探测健康判断：Connector probe 看 detected + 兼容性，legacy 看 ok。 */
+/** 探测健康判断：Connector probe 看 detected + 兼容性 + 认证，legacy 看 ok。 */
 function probeHealthy(probe: AgentProbeResult): boolean {
-	return isConnectorProbe(probe) ? probe.detected && probe.compatibility !== "incompatible" : probe.ok;
+	return isConnectorProbe(probe)
+		? probe.detected && probe.compatibility !== "incompatible" && probe.authenticated !== false
+		: probe.ok;
 }
 
 function probeSummary(probe: AgentProbeResult): string {
@@ -60,6 +62,7 @@ function probeSummary(probe: AgentProbeResult): string {
 		if (!probe.extensionInstalled) return "扩展未安装";
 		if (!probe.detected) return "CLI 未检测";
 		if (probe.compatibility === "incompatible") return "不兼容";
+		if (probe.authenticated === false) return "凭证无效";
 		return "探测正常";
 	}
 	return probe.ok ? "探测健康" : `探测异常：${probe.error ?? `exit ${probe.exitCode}`}`;
