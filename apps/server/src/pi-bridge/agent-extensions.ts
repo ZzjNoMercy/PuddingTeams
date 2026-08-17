@@ -250,6 +250,7 @@ export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowCon
 	}
 	const lines = plan.agents.map((a) => {
 		const tools = [...plan.managed].filter((n) => n.startsWith(`agent_${toolSafeId(a.name)}__`));
+		const identity = a.responsibility?.identity ? `（${a.responsibility.identity}）` : "";
 		const caps = a.capabilities?.length ? `｜能力：${a.capabilities.join("、")}` : "";
 		const responsibility = a.responsibility
 			? [
@@ -260,7 +261,7 @@ export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowCon
 				].join("")
 			: "";
 		const toolList = tools.map((n) => (plan.active.has(n) ? `${n}（已激活）` : n)).join("、");
-		return `- ${a.name}：${a.description || "（无描述）"}${caps}${responsibility}\n  工具：${toolList}`;
+		return `- ${a.name}${identity}：${a.description || "（无描述）"}${caps}${responsibility}\n  工具：${toolList}`;
 	});
 	const soloCtx = !ctx || ctx.type === "solo";
 	return [
@@ -671,7 +672,7 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 	void refreshSoloSummary();
 
 	const baseDescription = [
-		`把任务委托给 worker「${agent.name}」（${agent.description || "无描述"}）并返回最终结果。`,
+		`把任务委托给 worker「${agent.name}」（${agent.responsibility?.identity ? `${agent.responsibility.identity}；` : ""}${agent.description || "无描述"}）并返回最终结果。`,
 		agent.responsibility
 			? `责任领域：${agent.responsibility.domain}；负责：${agent.responsibility.owns.join("、") || "未细分"}；不负责：${agent.responsibility.excludes.join("、") || "未声明"}。`
 			: "",
