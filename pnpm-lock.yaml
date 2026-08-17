@@ -15,7 +15,7 @@ importers:
   apps/server:
     dependencies:
       '@earendil-works/pi-coding-agent':
-        specifier: ^0.83.0
+        specifier: 0.83.0
         version: 0.83.0(ws@8.21.2)(zod@4.4.3)
       '@fastify/cors':
         specifier: ^11.3.0
@@ -181,7 +181,7 @@ importers:
   extensions/connectors/claude-code:
     dependencies:
       '@earendil-works/pi-coding-agent':
-        specifier: '*'
+        specifier: '>=0.83.0 <0.84.0'
         version: 0.83.0(ws@8.21.2)(zod@4.4.3)
       '@puddingteams/pwcp':
         specifier: workspace:*
@@ -200,7 +200,7 @@ importers:
   extensions/connectors/codex:
     dependencies:
       '@earendil-works/pi-coding-agent':
-        specifier: '*'
+        specifier: '>=0.83.0 <0.84.0'
         version: 0.83.0(ws@8.21.2)(zod@4.4.3)
       '@puddingteams/pwcp':
         specifier: workspace:*
