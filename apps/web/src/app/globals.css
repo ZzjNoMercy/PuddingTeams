@@ -727,6 +727,10 @@ html[data-reduce-motion="true"] *::after {
 .agent-config-field > span,
 .agent-config-card label > span:first-child { color: color-mix(in oklab, var(--foreground) 78%, transparent); font-size: 11px; }
 .agent-config-field small { color: var(--muted-foreground); font-size: 10px; line-height: 1.55; }
+
+/* 卡片内的分条目排布（同设置页的区隔语言）：各行之间细分隔线，标签更醒目。 */
+.agent-config-rows > * + * { margin-top: 13px; border-top: 1px solid var(--config-line); padding-top: 13px; }
+.agent-config-rows .agent-config-field > span { color: var(--foreground); font-size: 12px; font-weight: 600; }
 .agent-config-shell [data-slot="input"],
 .agent-config-shell [data-slot="textarea"],
 .agent-config-shell [data-slot="select-trigger"],
@@ -1893,3 +1897,82 @@ html[data-nav="expanded"] .nav-expanded-only {
 html[data-nav="expanded"] .nav-collapsed-only {
 	display: none;
 }
+
+/* ---- Add Worker modal：分段控件 + 明确的字段标签/辅助说明 ---- */
+.worker-create-segment {
+	display: flex;
+	gap: 2px;
+	padding: 3px;
+	border-radius: 10px;
+	background: var(--home-surface-2, var(--muted));
+}
+.dark .worker-create-segment { background: rgba(255,255,255,.06); }
+.worker-create-segment button {
+	flex: 1;
+	border-radius: 8px;
+	padding: 6px 12px;
+	font-size: 13px;
+	color: var(--home-text-3, var(--muted-foreground));
+	transition: background 140ms ease, color 140ms ease, box-shadow 140ms ease;
+}
+.worker-create-segment button.is-active {
+	background: var(--home-menu, var(--background));
+	color: var(--home-text, var(--foreground));
+	font-weight: 600;
+	box-shadow: 0 1px 3px var(--home-shadow, rgba(0,0,0,.12));
+}
+
+.worker-create-field { display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
+.worker-create-label { font-size: 13px; font-weight: 600; color: var(--home-text, var(--foreground)); }
+.worker-create-required { margin-left: 2px; color: #d45555; }
+.worker-create-hint { font-size: 11px; line-height: 1.5; color: var(--home-text-3, var(--muted-foreground)); }
+.worker-create-section {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	padding: 12px;
+	border-radius: 10px;
+	background: var(--home-soft, var(--muted));
+}
+
+/* Add Worker 弹窗套用 home 皮肤（与发起对话同一视觉语言） */
+.worker-create {
+	border: 0;
+	border-radius: 20px;
+	background: var(--home-menu, var(--popover));
+	box-shadow: 0 28px 80px var(--home-shadow, rgba(0,0,0,.24)), 0 0 0 1px var(--home-line, var(--border));
+	padding: 24px;
+	gap: 0;
+}
+.worker-create [data-slot="dialog-header"] { margin-bottom: 18px; padding-right: 40px; text-align: left; }
+.worker-create [data-slot="dialog-title"] { color: var(--home-text, var(--foreground)); font-size: 16px; font-weight: 720; }
+.worker-create [data-slot="dialog-description"] { margin-top: 5px; color: var(--home-text-3, var(--muted-foreground)); font-size: 11px; line-height: 1.6; }
+.worker-create [data-slot="dialog-close"] {
+	top: 18px;
+	right: 18px;
+	display: grid;
+	width: 32px;
+	height: 32px;
+	place-items: center;
+	border-radius: 10px;
+	color: var(--home-text-3, var(--muted-foreground));
+	opacity: 1;
+}
+.worker-create [data-slot="dialog-close"]:hover { background: var(--home-soft-hover, var(--muted)); color: var(--home-text, var(--foreground)); }
+.worker-create [data-slot="input"],
+.worker-create [data-slot="textarea"],
+.worker-create [data-slot="select-trigger"] {
+	border-width: 0;
+	border-radius: 10px;
+	background: var(--home-surface-1, var(--muted));
+	box-shadow: none;
+}
+.dark .worker-create [data-slot="input"],
+.dark .worker-create [data-slot="textarea"],
+.dark .worker-create [data-slot="select-trigger"] { background: var(--home-surface-2); }
+.worker-create [data-slot="dialog-footer"] { margin-top: 20px; gap: 8px; }
+.worker-create [data-slot="dialog-footer"] button { height: 36px; border-radius: 10px; padding: 0 14px; font-size: 12px; font-weight: 650; }
+.worker-create [data-slot="dialog-footer"] button:first-child { background: var(--home-soft-hover, var(--muted)); color: var(--home-text-2, var(--foreground)); }
+.worker-create [data-slot="dialog-footer"] button:first-child:hover { background: var(--home-hover, var(--accent)); }
+.worker-create [data-slot="dialog-footer"] button:last-child { min-width: 74px; background: var(--home-accent, var(--primary)); color: var(--home-brand-ink, var(--primary-foreground)); }
+.worker-create [data-slot="dialog-footer"] button:last-child:disabled { background: var(--home-surface-3, var(--muted)); color: var(--home-text-3, var(--muted-foreground)); opacity: 1; }

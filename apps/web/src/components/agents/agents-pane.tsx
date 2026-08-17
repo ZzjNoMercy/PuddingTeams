@@ -206,46 +206,49 @@ function CreateAgentDialog({
 
 	return (
 		<Dialog open={open} onOpenChange={onOpenChange}>
-			<DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
+			<DialogContent className="worker-create max-h-[85vh] overflow-y-auto sm:max-w-xl">
 				<DialogHeader>
 					<DialogTitle>添加 Worker</DialogTitle>
 					<DialogDescription>
-						Worker 按 Connector 标签归入内置或第三方；没有内置标签的接入默认归入第三方。创建后到配置页完成配置、探测与启用。
+						选接入方式、填名称和描述即可创建；Connector 的细项配置与探测、启用都在创建后的配置页完成。
 					</DialogDescription>
 				</DialogHeader>
-				<div className="flex flex-col gap-3">
-					<div className="flex items-center gap-1">
+				<div className="flex flex-col gap-5">
+					<div className="worker-create-segment" role="tablist" aria-label="接入方式">
 						{(["connector", "command"] as const).map((m) => (
 							<button
 								key={m}
 								type="button"
+								role="tab"
+								aria-selected={mode === m}
 								onClick={() => setMode(m)}
-								className={`rounded-md px-3 py-1 text-sm transition-colors ${
-									mode === m ? "bg-accent font-medium" : "text-muted-foreground hover:text-foreground"
-								}`}
+								className={mode === m ? "is-active" : ""}
 							>
 								{m === "connector" ? "Connector 接入" : "命令接入（legacy）"}
 							</button>
 						))}
 					</div>
-					<label className="flex flex-col gap-1 text-sm">
-						<span className="text-muted-foreground">名称（唯一标识，用于委托工具 agent_&lt;名称&gt;__delegate）</span>
+
+					<label className="worker-create-field">
+						<span className="worker-create-label">名称<span className="worker-create-required">*</span></span>
 						<Input value={name} onChange={(e) => setName(e.target.value)} placeholder="如 puddingclaw" />
+						<span className="worker-create-hint">唯一标识，创建后不可改；委托工具名为 agent_&lt;名称&gt;__delegate。</span>
 					</label>
-					<label className="flex flex-col gap-1 text-sm">
-						<span className="text-muted-foreground">描述</span>
+					<label className="worker-create-field">
+						<span className="worker-create-label">描述</span>
 						<Textarea
 							value={description}
 							onChange={(e) => setDescription(e.target.value)}
-							placeholder="给 manager 看的 worker 能力描述"
+							placeholder="给 manager 看的 worker 能力描述，如「代码实现、调试与工程协作」"
 							rows={2}
 						/>
+						<span className="worker-create-hint">manager 按描述和责任边界决定把活派给谁，写清擅长的事。</span>
 					</label>
 
 					{mode === "connector" ? (
 						<>
-							<label className="flex flex-col gap-1 text-sm">
-								<span className="text-muted-foreground">Connector Extension</span>
+							<label className="worker-create-field">
+								<span className="worker-create-label">Connector Extension<span className="worker-create-required">*</span></span>
 								<Select
 									value={extensionId}
 									onValueChange={(v) => {
@@ -265,14 +268,15 @@ function CreateAgentDialog({
 										))}
 									</SelectContent>
 								</Select>
-								{installed.length === 0 ? (
-									<span className="text-xs text-muted-foreground/70">
-										没有已安装的 Connector，请先到「扩展」安装。
-									</span>
-								) : null}
+								<span className="worker-create-hint">
+									{installed.length === 0
+										? "没有已安装的 Connector，请先到「扩展」页安装。"
+										: "决定 worker 的运行方式；选中后下方出现该 Connector 的配置项。"}
+								</span>
 							</label>
 							{contribution ? (
-								<>
+								<section className="worker-create-section">
+									<span className="worker-create-label">接入配置</span>
 									<ConfigSchemaForm schema={contribution.configSchema} value={config} onChange={setConfig} />
 									<SecretSchemaFields
 										schema={contribution.secretSchema}
@@ -280,22 +284,25 @@ function CreateAgentDialog({
 										values={secrets}
 										onChange={setSecrets}
 									/>
-								</>
+								</section>
 							) : null}
 						</>
 					) : (
 						<>
-							<label className="flex flex-col gap-1 text-sm">
-								<span className="text-muted-foreground">命令（可执行文件或绝对路径）</span>
+							<label className="worker-create-field">
+								<span className="worker-create-label">命令<span className="worker-create-required">*</span></span>
 								<Input value={command} onChange={(e) => setCommand(e.target.value)} placeholder="puddingclaw" />
+								<span className="worker-create-hint">可执行文件名或绝对路径。</span>
 							</label>
-							<label className="flex flex-col gap-1 text-sm">
-								<span className="text-muted-foreground">run 参数（逗号或换行分隔）</span>
+							<label className="worker-create-field">
+								<span className="worker-create-label">run 参数</span>
 								<Input value={runArgs} onChange={(e) => setRunArgs(e.target.value)} placeholder="run, --input-json, -, --json" />
+								<span className="worker-create-hint">逗号或换行分隔。</span>
 							</label>
-							<label className="flex flex-col gap-1 text-sm">
-								<span className="text-muted-foreground">健康探测参数（可选，默认 doctor --json）</span>
+							<label className="worker-create-field">
+								<span className="worker-create-label">健康探测参数</span>
 								<Input value={probeArgs} onChange={(e) => setProbeArgs(e.target.value)} placeholder="doctor, --json" />
+								<span className="worker-create-hint">可选，默认 doctor --json。</span>
 							</label>
 						</>
 					)}
@@ -307,7 +314,8 @@ function CreateAgentDialog({
 							onChange={(e) => setEnabled(e.target.checked)}
 							className="size-4 accent-foreground"
 						/>
-						启用（勾选后 manager 才可派活给它）
+						创建后立即启用
+						<span className="worker-create-hint">（勾选后 manager 才可派活给它）</span>
 					</label>
 					{error ? <p className="text-xs text-destructive">{error}</p> : null}
 					<DialogFooter>

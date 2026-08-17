@@ -113,8 +113,21 @@ export function useChat(sessionId: string) {
 			disposed = true;
 			if (retryTimer) clearTimeout(retryTimer);
 			if (historyReadyFrame !== null) cancelAnimationFrame(historyReadyFrame);
-			wsRef.current?.close();
+			const ws = wsRef.current;
 			wsRef.current = null;
+			if (!ws) return;
+			// CONNECTING 时直接 close 会让浏览器打 "closed before the connection
+			// is established"（StrictMode 双调用、快速切换会话都会踩到）；摘掉
+			// handlers 并等 open 后再关，静默释放。
+			if (ws.readyState === WebSocket.CONNECTING) {
+				ws.onopen = null;
+				ws.onmessage = null;
+				ws.onclose = null;
+				ws.onerror = null;
+				ws.addEventListener("open", () => ws.close(), { once: true });
+			} else {
+				ws.close();
+			}
 		};
 	}, [sessionId]);
 
