@@ -6,11 +6,10 @@ import {
 	BugIcon,
 	BotIcon,
 	BoxesIcon,
+	ChevronLeftIcon,
+	ChevronRightIcon,
 	InfoIcon,
 	MessageSquareIcon,
-	PanelLeftCloseIcon,
-	PanelLeftOpenIcon,
-	SettingsIcon,
 	SlidersHorizontalIcon,
 } from "lucide-react";
 import { GithubIcon } from "@/components/github-icon";
@@ -104,28 +103,20 @@ export function NavRail({ view }: { view: AppView }) {
 			</div>
 
 			<div className="flex-1" />
-			<button
-				type="button"
-				title="展开或收起侧边栏"
-				aria-label="展开或收起侧边栏"
-				onClick={toggleExpanded}
-				className={itemClass(false)}
-			>
-				<PanelLeftOpenIcon className="nav-collapsed-only size-4 shrink-0" />
-				<PanelLeftCloseIcon className="nav-expanded-only size-4 shrink-0" />
-				<span className="nav-label">收起</span>
-			</button>
 
 			<DropdownMenu>
 				<DropdownMenuTrigger asChild>
 					<button
 						type="button"
-						title="设置和更多"
-						aria-label="设置和更多"
-						className={cn(itemClass(false), "data-[state=open]:bg-muted data-[state=open]:text-foreground")}
+						title={`${username}：设置和更多`}
+						aria-label={`${username}：设置和更多`}
+						className="nav-user"
+						data-track="nav.current-user"
+						data-user-id={identity?.user.id}
+						data-tenant-id={identity?.tenant.id}
 					>
-						<SettingsIcon className="size-4 shrink-0" />
-						<span className="nav-label">设置</span>
+						<span className="nav-user-avatar" aria-hidden="true">{initialsOf(username)}</span>
+						<span className="nav-user-name">{username}</span>
 					</button>
 				</DropdownMenuTrigger>
 				<DropdownMenuContent side="top" align="start" className="home-menu w-52" container={homePortalContainer()}>
@@ -148,20 +139,20 @@ export function NavRail({ view }: { view: AppView }) {
 					</DropdownMenuItem>
 				</DropdownMenuContent>
 			</DropdownMenu>
-			<div
-				className="nav-user"
-				title={`当前用户：${username}`}
-				aria-label={`当前用户 ${username}`}
-				data-track="nav.current-user"
-				data-user-id={identity?.user.id}
-				data-tenant-id={identity?.tenant.id}
-			>
-				<span className="nav-user-avatar" aria-hidden="true">{initialsOf(username)}</span>
-				<span className="nav-user-name">{username}</span>
-			</div>
 
 			<SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
 			<AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />
+
+			<button
+				type="button"
+				title="展开或收起侧边栏"
+				aria-label="展开或收起侧边栏"
+				onClick={toggleExpanded}
+				className="nav-edge-toggle"
+			>
+				<ChevronRightIcon className="nav-collapsed-only size-3.5" aria-hidden="true" />
+				<ChevronLeftIcon className="nav-expanded-only size-3.5" aria-hidden="true" />
+			</button>
 		</div>
 	);
 }

@@ -12,11 +12,12 @@ import {
 	InfoIcon,
 	LoaderIcon,
 	MessageSquareTextIcon,
-	MoreHorizontalIcon,
+	ChevronDownIcon,
 	PlugIcon,
 	RefreshCwIcon,
 	SaveIcon,
 	SlidersHorizontalIcon,
+	SparklesIcon,
 	UploadIcon,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -65,7 +66,7 @@ import {
  *   见 connector-sections.tsx）。
  */
 
-type SectionKey = "overview" | "model" | "prompt" | "templates" | "connector" | "extensions" | "status";
+type SectionKey = "overview" | "model" | "prompt" | "skills" | "templates" | "connector" | "extensions" | "status";
 
 type SectionDef = { key: SectionKey; label: string; description: string; icon: typeof InfoIcon };
 
@@ -80,6 +81,7 @@ const PI_SECTIONS: SectionDef[] = [
 	OVERVIEW_SECTION,
 	{ key: "model", label: "模型与运行", description: "选择模型、思考强度与上下文加载方式。", icon: SlidersHorizontalIcon },
 	{ key: "prompt", label: "提示词", description: "运行指令、项目上下文与提示词预览。", icon: MessageSquareTextIcon },
+	{ key: "skills", label: "技能", description: "管理技能库，勾选本 Agent 的选用范围。", icon: SparklesIcon },
 	{ key: "templates", label: "模板", description: "管理可复用提示模板，让常用协作方式保持一致。", icon: BoxIcon },
 ];
 
@@ -119,7 +121,6 @@ export function AgentConfigPage({ name }: { name: string }) {
 	const [baseline, setBaseline] = useState("");
 	const [section, setSection] = useState<SectionKey>("overview");
 	const [saving, setSaving] = useState(false);
-	const [probe, setProbe] = useState<AgentProbeResult | null>(null);
 	const [probing, setProbing] = useState(false);
 	const [toggling, setToggling] = useState(false);
 	const [leaveConfirm, setLeaveConfirm] = useState(false);
@@ -327,7 +328,13 @@ export function AgentConfigPage({ name }: { name: string }) {
 		if (!agent) return;
 		setProbing(true);
 		try {
-			setProbe(await probeAgent(agent.name));
+			const result = await probeAgent(agent.name);
+			const healthy = isConnectorProbe(result)
+				? result.detected && result.compatibility !== "incompatible" && result.authenticated !== false
+				: result.ok;
+			const summary = `「${agent.name}」${probeSummary(result)}`;
+			if (healthy) toast.success(summary);
+			else toast.error(summary);
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
@@ -425,7 +432,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 				)}
 
 				<div className="agent-config-actions">
-					{agent.pinned ? null : (
+					{piMode ? null : (
 						<Button size="sm" variant="outline" disabled={probing} onClick={() => void handleProbe()}>
 							{probing ? <LoaderIcon className="size-3.5 animate-spin" /> : <RefreshCwIcon className="size-3.5" />}
 							探测
@@ -434,7 +441,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 					{piMode ? (
 						<DropdownMenu>
 							<DropdownMenuTrigger asChild>
-								<Button size="icon" variant="ghost" aria-label="更多配置操作" title="更多配置操作"><MoreHorizontalIcon className="size-4" /></Button>
+								<Button size="sm" variant="outline" aria-label="复制、导入与导出配置" title="复制、导入与导出配置">导入 / 导出<ChevronDownIcon className="size-3.5" /></Button>
 							</DropdownMenuTrigger>
 							<DropdownMenuContent align="end" className="w-52">
 								<DropdownMenuSub>
@@ -465,7 +472,6 @@ export function AgentConfigPage({ name }: { name: string }) {
 						保存{dirty ? " · 有更改" : ""}
 					</Button>
 				</div>
-				{probe ? <span className={`agent-config-probe ${isConnectorProbe(probe) ? (probe.detected && probe.compatibility !== "incompatible" ? "" : "text-destructive") : probe.ok ? "" : "text-destructive"}`}>{probeSummary(probe)}</span> : null}
 			</header>
 
 			{/* 分区导航 + 内容 */}
@@ -500,6 +506,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 						{section === "overview" ? <OverviewSection agent={agent} draft={draft} onChange={patchDraft} onAgentUpdated={handleAgentSaved} /> : null}
 						{piMode && section === "model" ? <ModelSection agent={agent} draft={draft} onChange={patchDraft} /> : null}
 						{piMode && section === "prompt" ? <PromptSection agent={agent} draft={draft} onChange={patchDraft} /> : null}
+						{piMode && section === "skills" ? <ResourceLibrarySection kind="skills" agent={agent} draft={draft} onChange={patchDraft} /> : null}
 						{piMode && section === "templates" ? <ResourceLibrarySection kind="templates" agent={agent} draft={draft} onChange={patchDraft} /> : null}
 						{!piMode && section === "connector" ? (
 							legacy ? (

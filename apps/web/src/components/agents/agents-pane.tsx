@@ -68,24 +68,6 @@ function probeSummary(probe: AgentProbeResult): string {
 	return probe.ok ? "探测健康" : `探测异常：${probe.error ?? `exit ${probe.exitCode}`}`;
 }
 
-/** Enabled / health status lights: green = on, grey = off, red = probe failed. */
-function StatusLights({ agent, probe }: { agent: AgentConfig; probe?: AgentProbeResult }) {
-	return (
-		<span className="flex items-center gap-1.5">
-			<span
-				className={`size-2 rounded-full ${agent.enabled !== false ? "bg-primary" : "bg-muted-foreground/40"}`}
-				title={agent.enabled !== false ? "已启用" : "已停用"}
-			/>
-			{probe ? (
-				<span
-					className={`size-2 rounded-full ${probeHealthy(probe) ? "bg-foreground" : "bg-destructive"}`}
-					title={probeSummary(probe)}
-				/>
-			) : null}
-		</span>
-	);
-}
-
 /** Worker 分组跟随 Connector 目录来源标签；legacy / 未知 Connector 默认第三方。 */
 function isBuiltinWorker(agent: AgentConfig, connectorCatalog: CatalogEntry[]): boolean {
 	if (agent.pinned || !agent.connector) return false;
@@ -437,10 +419,7 @@ export function AgentsPane() {
 				className="ops-agent-card group relative flex min-h-40 flex-col rounded-2xl p-4 transition-all"
 			>
 				<button type="button" className="flex flex-1 flex-col text-left" onClick={() => openManage(agent)}>
-					<div className="flex items-start justify-between gap-2">
-						<span className="ops-agent-avatar"><WorkerAvatar name={agent.name} size={42} /></span>
-						<StatusLights agent={agent} probe={probes[agent.name]} />
-					</div>
+					<span className="ops-agent-avatar"><WorkerAvatar name={agent.name} size={42} /></span>
 					<div className="mt-3 min-w-0">
 						<div className="flex items-baseline gap-2">
 							<span className="truncate text-sm font-semibold tracking-tight">{agent.name}</span>
@@ -452,12 +431,12 @@ export function AgentsPane() {
 					</div>
 					<div className="mt-auto flex items-center gap-2 pt-4 text-[11px] text-muted-foreground">
 						<span className="rounded-full bg-foreground/[0.035] px-2 py-0.5">{agent.enabled !== false ? "已启用" : "已停用"}</span>
-						{probes[agent.name] ? <span>{probeSummary(probes[agent.name])}</span> : <span>点击查看配置</span>}
+						{probes[agent.name] ? <span>{probeSummary(probes[agent.name])}</span> : null}
 					</div>
 				</button>
 				<DropdownMenu>
 					<DropdownMenuTrigger asChild>
-						<Button type="button" size="icon" variant="ghost" aria-label={`管理 ${agent.name}`} className="absolute right-3 top-11 size-8 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100">
+						<Button type="button" size="icon" variant="ghost" aria-label={`管理 ${agent.name}`} className="absolute right-3 top-3 size-8 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100">
 							<MoreHorizontalIcon className="size-4" />
 						</Button>
 					</DropdownMenuTrigger>
@@ -482,7 +461,7 @@ export function AgentsPane() {
 				<p className="mt-1 text-xs leading-5 text-muted-foreground">{description || "理解目标、组织协作并汇总结果"}</p>
 				<div className="mt-2 flex gap-2 text-[11px] text-muted-foreground"><span className="rounded-full bg-foreground/[0.035] px-2 py-0.5">固定角色</span><span className="rounded-full bg-foreground/[0.035] px-2 py-0.5">Pi Runtime</span></div>
 			</div>
-			<div className="ops-manager-meta"><span className="size-2 rounded-full bg-primary" /><span>可用</span><span className="text-muted-foreground">点击配置</span></div>
+			<div className="ops-manager-meta"><span className="size-2 rounded-full bg-primary" /><span>可用</span></div>
 		</button>;
 	};
 

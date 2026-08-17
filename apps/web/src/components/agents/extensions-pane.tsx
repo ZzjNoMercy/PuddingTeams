@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { CableIcon, FileArchiveIcon, LoaderIcon, PackageIcon, RefreshCwIcon, SearchIcon, ShieldAlertIcon, SparklesIcon, TrashIcon, UploadIcon, WrenchIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -13,15 +14,13 @@ import {
 	installExtension,
 	importSkillResource,
 	importSkillsZip,
-	listAgents,
 	listExtensionCatalog,
 	listSkillLibrary,
-	putAgentPiResources,
 	setDeveloperMode,
 	uninstallExtension,
 	updateExtension,
 } from "@/lib/api";
-import type { AgentConfig, CatalogEntry, ConflictRun, SkillEntry } from "@/lib/types";
+import type { CatalogEntry, ConflictRun, SkillEntry } from "@/lib/types";
 
 /**
  * Extension 接入目录（§10.1）：kind=connector 与 kind=capability 分开的目录
@@ -241,18 +240,15 @@ function EntryCard({ entry, onChanged }: { entry: CatalogEntry; onChanged: () =>
 
 function SkillsLibraryView() {
 	const [skills, setSkills] = useState<SkillEntry[] | null>(null);
-	const [agents, setAgents] = useState<AgentConfig[]>([]);
 	const [importPath, setImportPath] = useState("");
 	const [importOpen, setImportOpen] = useState(false);
 	const [importing, setImporting] = useState(false);
-	const [busyScope, setBusyScope] = useState<string | null>(null);
 	const [zipInput, setZipInput] = useState<HTMLInputElement | null>(null);
 
 	const refresh = useCallback(async () => {
 		try {
-			const [{ skills: nextSkills }, nextAgents] = await Promise.all([listSkillLibrary(), listAgents()]);
+			const { skills: nextSkills } = await listSkillLibrary();
 			setSkills(nextSkills);
-			setAgents(nextAgents);
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		}
@@ -262,33 +258,6 @@ function SkillsLibraryView() {
 		const timer = window.setTimeout(() => void refresh(), 0);
 		return () => window.clearTimeout(timer);
 	}, [refresh]);
-
-	const scopes = useMemo(() => {
-		const result = new Map<string, string[]>();
-		for (const agent of agents.filter((item) => item.pinned || item.connector?.connectorId === "pi")) {
-			for (const name of agent.piResources?.enabledSkills ?? []) {
-				const current = result.get(name) ?? [];
-				result.set(name, [...current, agent.name]);
-			}
-		}
-		return result;
-	}, [agents]);
-	const piAgents = agents.filter((agent) => agent.pinned || agent.connector?.connectorId === "pi");
-
-	const toggleSkill = async (skill: SkillEntry, agent: AgentConfig) => {
-		const current = agent.piResources?.enabledSkills ?? [];
-		const enabled = current.includes(skill.name);
-		const enabledSkills = enabled ? current.filter((name) => name !== skill.name) : [...current, skill.name];
-		setBusyScope(`${skill.name}:${agent.name}`);
-		try {
-			await putAgentPiResources(agent.name, { ...(agent.piResources ?? {}), enabledSkills });
-			await refresh();
-		} catch (err) {
-			toast.error(err instanceof Error ? err.message : String(err));
-		} finally {
-			setBusyScope(null);
-		}
-	};
 
 	const importSkill = async () => {
 		if (!importPath.trim()) return;
@@ -325,7 +294,7 @@ function SkillsLibraryView() {
 			<div className="flex flex-wrap items-end justify-between gap-3">
 				<div>
 					<div className="flex items-center gap-2 text-sm font-medium"><SparklesIcon className="size-4 text-primary" />Skills 资源库</div>
-					<p className="mt-1 text-xs text-muted-foreground">与 pi CLI 共享；这里管理资源本体，Agent 的启用范围按作用域展示。</p>
+					<p className="mt-1 text-xs text-muted-foreground">与 pi CLI 共享；这里只管理资源本体，启用范围在各 Agent 配置页「技能」分区。</p>
 				</div>
 				<Button type="button" size="sm" onClick={() => setImportOpen(true)}><UploadIcon className="size-3.5" />导入 Skill</Button>
 			</div>
@@ -336,17 +305,9 @@ function SkillsLibraryView() {
 			) : (
 				<div className="skills-library-list">
 					{skills.map((skill) => {
-						const scope = scopes.get(skill.name) ?? [];
 						return <div key={skill.name} className="skills-library-row flex flex-wrap items-center gap-3 px-4 py-3">
 							<div className="grid size-8 shrink-0 place-items-center rounded-md bg-primary/10 text-primary"><SparklesIcon className="size-4" /></div>
 							<div className="min-w-0 flex-1"><div className="truncate font-mono text-sm">{skill.name}</div><div className="truncate text-xs text-muted-foreground">{skill.description || "无描述"}</div></div>
-							<div className="flex flex-wrap justify-end gap-1.5">
-								{piAgents.map((agent) => {
-									const active = scope.includes(agent.name);
-									const busy = busyScope === `${skill.name}:${agent.name}`;
-									return <button key={agent.name} type="button" disabled={busy} aria-pressed={active} onClick={() => void toggleSkill(skill, agent)} className={`skill-scope-chip rounded-full px-2 py-1 text-[11px] transition-colors ${active ? "active" : ""}`}>{busy ? "…" : agent.name}</button>;
-								})}
-							</div>
 						</div>;
 					})}
 				</div>
@@ -366,7 +327,15 @@ function SkillsLibraryView() {
 }
 
 export function ExtensionsPane() {
-	const [view, setView] = useState<ExtensionView>("plugins");
+	// tab 由 URL 查询参数驱动（/extensions?tab=skills|mcp|plugins）：刷新、
+	// 浏览器前进/后退都保持当前分类；静态导出不能用动态段，与
+	// /agents/config?name= 同一约定。
+	const searchParams = useSearchParams();
+	const router = useRouter();
+	const pathname = usePathname();
+	const rawTab = searchParams.get("tab");
+	const view: ExtensionView = rawTab === "skills" || rawTab === "mcp" || rawTab === "plugins" ? rawTab : "plugins";
+	const setView = (key: ExtensionView) => router.replace(`${pathname}?tab=${key}`, { scroll: false });
 	const [entries, setEntries] = useState<CatalogEntry[] | null>(null);
 	const [query, setQuery] = useState("");
 	const [installPath, setInstallPath] = useState("");
@@ -377,6 +346,9 @@ export function ExtensionsPane() {
 	const [developerMode, setDeveloperModeState] = useState(false);
 	const [developerModeLoaded, setDeveloperModeLoaded] = useState(false);
 	const [developerWarningOpen, setDeveloperWarningOpen] = useState(false);
+	// Skills tab 计数：进 skills 视图时随子视图一起刷新（子视图内部增删后
+	// 回到其他 tab 再回来即同步，与插件计数的 refresh 语义一致）。
+	const [skillCount, setSkillCount] = useState<number | null>(null);
 	const filteredEntries = useMemo(() => {
 		if (!entries) return null;
 		const needle = query.trim().toLowerCase();
@@ -397,16 +369,20 @@ export function ExtensionsPane() {
 			.catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)));
 	}, [view]);
 
-	// 分类切换时清空旧列表（渲染期间重置），effect 只负责拉取插件目录。
-	const [prevView, setPrevView] = useState(view);
-	if (view !== prevView) {
-		setPrevView(view);
-		setEntries(null);
-	}
+	// tab 计数徽标需要跨视图保留 entries/skillCount：切换分类不再清空，
+	// 回到对应视图时由 effect 重新拉取对齐。
 
 	useEffect(() => {
 		if (view === "plugins") void refresh();
 	}, [view, refresh]);
+
+	// 挂载即拉一次（tab 徽标要在进入 skills 视图前就有数），此后每次
+	// 切到 skills 视图重新对齐。
+	useEffect(() => {
+		listSkillLibrary()
+			.then(({ skills }) => setSkillCount(skills.length))
+			.catch(() => undefined);
+	}, [view]);
 
 	useEffect(() => {
 		getDeveloperMode()
@@ -498,6 +474,9 @@ export function ExtensionsPane() {
 					>
 						<span>{label}</span>
 						{key === "plugins" && entries ? <span className="tab-count">{entries.length}</span> : null}
+						{key === "skills" && skillCount !== null ? <span className="tab-count">{skillCount}</span> : null}
+						{/* MCP 尚未接入可执行 server（规划中），计数恒 0。 */}
+						{key === "mcp" ? <span className="tab-count">0</span> : null}
 						<span className="sr-only">{description}</span>
 					</button>
 				))}
