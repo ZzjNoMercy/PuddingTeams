@@ -33,6 +33,8 @@ export const puddingClawConnectorManifest: ConnectorExtensionManifest = {
 		},
 		secretSchema: [{ key: "PUDDINGCLAW_TOKEN", label: "PuddingClaw Backend Token", required: true }],
 		supportedUpstreamVersions: ">=0.1.2",
+		// 内置默认头像（布丁狗），builtin assetsDir 见 index.ts 装配。
+		avatar: "puddingclaw.png",
 	},
 };
 

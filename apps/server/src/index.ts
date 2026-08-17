@@ -97,7 +97,10 @@ const drivers = new DriverRegistry();
 const catalog = new ExtensionCatalog();
 const productSettings = new ProductSettingsStore(paths.config);
 const extensionRegistry = new ExtensionRegistry(paths.extensions, catalog, drivers);
-extensionRegistry.registerBuiltin(puddingClawConnectorManifest, puddingClawExtensionHooks());
+extensionRegistry.registerBuiltin(puddingClawConnectorManifest, puddingClawExtensionHooks(), {
+	// PuddingClaw 默认头像（布丁狗）随 server 包发布。
+	assetsDir: fileURLToPath(new URL("../assets", import.meta.url)),
+});
 extensionRegistry.registerBuiltin(piConnectorManifest, piExtensionHooks({ sessionDir: paths.workerSessions }), {
 	// pi Connector 的默认头像（lobehub Pi 图标）随 server 包发布。
 	assetsDir: fileURLToPath(new URL("../assets", import.meta.url)),

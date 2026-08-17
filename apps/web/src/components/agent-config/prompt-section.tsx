@@ -74,18 +74,14 @@ export function PromptSection({
 	// §6.3：无显式 Workspace 时开关禁用；§7.2：未受信任的项目开关不生效。
 	const workspaceSwitchDisabled = !selectedWorkspace;
 	const workspaceSwitchNote = !selectedWorkspace
-		? "无显式 Workspace，开关不生效（不会加载任何目录的上下文文件）"
+		? "无显式 Workspace，不生效"
 		: selectedWorkspace.trust.state !== "trusted"
-			? `该项目${selectedWorkspace.trust.state === "denied" ? "已被拒绝" : "尚未信任"}，信任前开关不生效`
-			: "关闭后不注入项目目录里的上下文文件";
+			? `项目${selectedWorkspace.trust.state === "denied" ? "已被拒绝" : "尚未信任"}，不生效`
+			: "";
 
 	return (
 		<section className="agent-config-card flex flex-col gap-3">
 			<div className="agent-config-card-head"><h2>系统提示词</h2><p>对所有新建或重开的 Session 生效。</p></div>
-			<p className="text-xs text-muted-foreground">
-				只属于该 Agent 的提示词与资源开关；不修改 Window 协作提示词或 Workspace 文件。预览展示的是
-				<strong>已保存配置</strong>的有效结果，草稿改动需保存后再预览。
-			</p>
 			<label className="flex flex-col gap-1 text-sm">
 				<span className="text-muted-foreground">
 					{agent.pinned ? "Manager 运行指令" : "Worker 运行指令"}（留空不追加）
@@ -98,8 +94,7 @@ export function PromptSection({
 					className="font-mono text-xs"
 				/>
 				<span className="text-xs text-muted-foreground/70">
-					追加到当前 Agent 自己的 system prompt；pi 内嵌默认提示词保留。Manager 不会把某个 Worker
-					的运行指令当作路由描述读取。
+					追加到该 Agent 自己的 system prompt。
 				</span>
 			</label>
 			<label className="flex items-start gap-2 text-sm">
@@ -112,9 +107,9 @@ export function PromptSection({
 				/>
 				<span className="flex flex-col">
 					<span>加载项目上下文（AGENTS.md / CLAUDE.md）</span>
-					<span className="text-xs text-muted-foreground/70">
-						只控制显式 Workspace；pi global ~/.pi/agent/AGENTS.md 不受此开关影响。{workspaceSwitchNote}
-					</span>
+					{workspaceSwitchNote ? (
+						<span className="text-xs text-muted-foreground/70">{workspaceSwitchNote}</span>
+					) : null}
 				</span>
 			</label>
 

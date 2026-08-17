@@ -173,10 +173,10 @@ export const DEFAULT_TEAMS: AgentConfig[] = [
 	},
 	{
 		// 决策 20：旧结构直接替换——PuddingClaw 以第一方 Connector binding 接入。
+		// 2026-08-17：种子不再预置描述与 capabilities——那是给 manager 的路由
+		// 材料，必须由用户在前台按需填写，源码/connector 包不替用户做决定。
 		name: "puddingclaw",
-		description:
-			"企业数据分析 Worker（NL2SQL、数据查询、指标归因、知识查询）。执行前需要用户指定分析模型（analytics model），未指定时会返回可选模型列表。",
-		capabilities: ["data.query", "data.analysis", "data.nl2sql", "knowledge.query"],
+		description: "",
 		connector: {
 			extensionId: "puddingclaw",
 			connectorId: "puddingclaw",

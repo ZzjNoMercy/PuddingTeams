@@ -36,7 +36,7 @@ import {
 import { ApiConflictError, listAgents, probeAgent, putAgentConfig, setAgentEnabled, updateAgent } from "@/lib/api";
 import type { AgentConfig, AgentProbeResult, MutationResponse, PiManagerSettings } from "@/lib/types";
 import { isConnectorProbe } from "@/lib/types";
-import { WorkerAvatar } from "@/components/chat/worker-avatar";
+import { ManagerAvatar, WorkerAvatar } from "@/components/chat/worker-avatar";
 import {
 	buildConfigBody,
 	buildResponsibility,
@@ -79,7 +79,7 @@ const OVERVIEW_SECTION: SectionDef = {
 const PI_SECTIONS: SectionDef[] = [
 	OVERVIEW_SECTION,
 	{ key: "model", label: "模型与运行", description: "选择模型、思考强度与上下文加载方式。", icon: SlidersHorizontalIcon },
-	{ key: "prompt", label: "提示词", description: "运行指令只属于 Agent；群聊协作规则仍在聊天信息中管理。", icon: MessageSquareTextIcon },
+	{ key: "prompt", label: "提示词", description: "运行指令、项目上下文与提示词预览。", icon: MessageSquareTextIcon },
 	{ key: "templates", label: "模板", description: "管理可复用提示模板，让常用协作方式保持一致。", icon: BoxIcon },
 ];
 
@@ -400,7 +400,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 				<Button size="icon" variant="ghost" onClick={handleBack} aria-label="返回智能体列表" title="返回智能体列表">
 					<ArrowLeftIcon className="size-4" />
 				</Button>
-				<WorkerAvatar name={agent.name} size={40} />
+				{agent.pinned ? <ManagerAvatar size={40} /> : <WorkerAvatar name={agent.name} size={40} />}
 				<div className="min-w-0 flex-1">
 					<div className="flex items-center gap-1.5">
 						<span className="truncate text-sm font-semibold">{agent.name}</span>
@@ -487,7 +487,14 @@ export function AgentConfigPage({ name }: { name: string }) {
 				<main className="agent-config-content">
 					<div className="agent-config-column">
 						<div className="agent-config-title-row">
-							<div><h1>{sections.find((item) => item.key === section)?.label}</h1><p>{sections.find((item) => item.key === section)?.description}</p></div>
+							{(() => {
+								const active = sections.find((item) => item.key === section);
+								// Manager 没有责任边界，概览描述不提它。
+								const description = active?.key === "overview" && agent.pinned
+									? "定义用户看见的角色信息。"
+									: active?.description;
+								return <div><h1>{active?.label}</h1><p>{description}</p></div>;
+							})()}
 							{dirty ? <span>草稿已修改</span> : null}
 						</div>
 						{section === "overview" ? <OverviewSection agent={agent} draft={draft} onChange={patchDraft} onAgentUpdated={handleAgentSaved} /> : null}
