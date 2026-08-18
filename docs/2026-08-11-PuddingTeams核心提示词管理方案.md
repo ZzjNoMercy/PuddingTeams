@@ -83,7 +83,8 @@ description: string;
 - 成员、启用状态、description、responsibility 或能力变化后，下一个 manager 回合必须读取最新值；
 - 非当前 Window 成员、已禁用或已撤权的 Worker 不得出现在该 Window 的 roster；
 - 路由卡只进入 pi manager，不进入任何 Worker Session；
-- delegate tool description 可以镜像必要摘要以支持工具搜索，但不得形成第二份可独立编辑的路由事实源。
+- delegate tool description 可以镜像必要摘要以支持工具搜索，但不得形成第二份可独立编辑的路由事实源；
+- 路由卡行首与 delegate 工具 label/description 渲染 Worker 的 `displayName`（name/id 解耦，见接入方案 §3.3），工具名仍含不可变内部 id；显示名与 id 不同时路由卡行首额外标注 `（id：xxx）`，`create_group_window` / `invite_to_group` 的 `members` 参数接受显示名或 id（服务端先按 id 精确命中、再按显示名唯一匹配，统一以 id 落库）。
 
 ### 2.3 Agent Profile 改称“Agent 运行指令”
 

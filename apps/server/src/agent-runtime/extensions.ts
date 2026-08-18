@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import semver from "semver";
-import type { AgentConfig } from "../store/teams.js";
+import { agentDisplayName, type AgentConfig } from "../store/teams.js";
 import type { AgentInvoker, AgentInvokeResult } from "./invoker.js";
 import type { DriverCapabilities } from "./types.js";
 
@@ -165,12 +165,13 @@ export const AGENT_DELEGATION_EXTENSION_ID = "agent-delegation";
 
 /** 每个启用 Agent 自动生成的基础 Extension manifest（运行时投影，非安装包）。 */
 export function delegationManifest(agent: AgentConfig): ExtensionManifest {
+	const display = agentDisplayName(agent);
 	return {
 		id: AGENT_DELEGATION_EXTENSION_ID,
 		kind: "capability",
-		name: `${agent.name} · 基础委托`,
+		name: `${display} · 基础委托`,
 		version: "1",
-		description: `平台生成的基础委托能力：把任务委托给 worker「${agent.name}」并返回结果。`,
+		description: `平台生成的基础委托能力：把任务委托给 worker「${display}」（id: ${agent.name}）并返回结果。`,
 		tools: [{ name: "delegate", activation: "always", description: agent.description }],
 	};
 }

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, realpath, writeFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -52,6 +52,40 @@ export interface PiResourceConfig {
 /** pinned 内置 Pi manager 的保留名（§10.5）。 */
 export const MANAGER_AGENT_NAME = "manager";
 
+/**
+ * 显示名归一化：trim；null/空串 = 清除（展示回退 name）；任意 unicode，≤40 字符。
+ * undefined 表示"未提供"（调用方据此区分不更新与清除）。
+ */
+export function normalizeDisplayName(input: string | null | undefined, agentName: string): string | undefined {
+	if (input === undefined) return undefined;
+	if (input === null) return undefined;
+	if (typeof input !== "string") throw new Error(`agent "${agentName}": displayName 必须是字符串`);
+	const display = input.trim();
+	if (!display) return undefined;
+	if ([...display].length > 40) throw new Error(`agent "${agentName}": displayName 不能超过 40 个字符`);
+	return display;
+}
+
+/** Agent 的显示名：displayName 缺省时回退不可变内部 id（name）。 */
+export function agentDisplayName(agent: Pick<AgentConfig, "name" | "displayName">): string {
+	return agent.displayName?.trim() || agent.name;
+}
+
+/**
+ * 从显示名派生内部 id：提取 ASCII slug（小写、连字符，≤32 字符）；
+ * 显示名无 ASCII 字母数字时回退 worker-<6 位随机 hex>。撞名由调用方追加后缀。
+ */
+export function agentIdFromDisplayName(displayName: string): string {
+	const slug = displayName
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 32)
+		.replace(/-+$/g, "");
+	if (slug && /^[a-z0-9]/.test(slug)) return slug;
+	return `worker-${randomBytes(3).toString("hex")}`;
+}
+
 export interface AgentResponsibilityProfile {
 	identity?: string;
 	domain: string;
@@ -61,8 +95,14 @@ export interface AgentResponsibilityProfile {
 }
 
 export interface AgentConfig {
-	/** Agent 的唯一 id（工具命名空间 agent_<agentId>__* 用）。 */
+	/**
+	 * Agent 的不可变内部 id（工具命名空间 agent_<agentId>__*、windows/credentials/
+	 * delegations 的存储键、REST 路径参数）。创建后不可改；创建时可由 displayName
+	 * 自动生成。用户可见的显示名是 displayName，不要用 name 做展示。
+	 */
 	name: string;
+	/** 用户可见显示名，可随时改；任意 unicode，允许重复。缺省回退 name。 */
+	displayName?: string;
 	description: string;
 	/** worker 的 legacy command invoke；manager 为 { type: "pi" }。 */
 	invoke?: AgentInvoke;
@@ -446,6 +486,9 @@ export class TeamsStore {
 			name: input.name.trim(),
 		};
 		if (!agent.name) throw new Error("agent name is required");
+		const displayName = normalizeDisplayName(agent.displayName, agent.name);
+		if (displayName) agent.displayName = displayName;
+		else delete agent.displayName;
 		agent.responsibility = this.normalizeResponsibility(agent.responsibility);
 		if (!agent.responsibility) delete agent.responsibility;
 		agent.piResources = this.normalizePiResources(agent.piResources);
@@ -694,7 +737,7 @@ export class TeamsStore {
 	 * 更新 pinned manager 的可编辑配置（§10.5）：描述 + manager settings 合并
 	 * （patch 中未出现的 settings 键保持不变；prompt 传空串清除）。
 	 */
-	async updateManager(patch: { description?: string; manager?: Record<string, unknown>; responsibility?: AgentResponsibilityProfile | null; piResources?: PiResourceConfig | null }): Promise<AgentConfig> {
+	async updateManager(patch: { description?: string; displayName?: string | null; manager?: Record<string, unknown>; responsibility?: AgentResponsibilityProfile | null; piResources?: PiResourceConfig | null }): Promise<AgentConfig> {
 		const agent = await this.getManager();
 		if (!agent) throw new Error(`pinned manager 不存在：${MANAGER_AGENT_NAME}`);
 		const settings = patch.manager !== undefined ? this.validateManagerSettings(patch.manager) : undefined;
@@ -702,6 +745,11 @@ export class TeamsStore {
 		const piResources = patch.piResources ? this.normalizePiResources(patch.piResources) : undefined;
 		return this.mutateAgent(MANAGER_AGENT_NAME, (a) => {
 			if (patch.description !== undefined) a.description = patch.description.trim();
+			if (patch.displayName !== undefined) {
+				const displayName = normalizeDisplayName(patch.displayName, MANAGER_AGENT_NAME);
+				if (displayName) a.displayName = displayName;
+				else delete a.displayName;
+			}
 			if (patch.responsibility !== undefined) {
 				if (responsibility) a.responsibility = responsibility;
 				else delete a.responsibility;

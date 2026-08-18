@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { ProductAvatar } from "@/components/product-avatar";
 import { useAgentAvatar, useUploadedAgentAvatar } from "@/lib/avatars";
+import { agentDisplayName } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 function hashName(name: string): number {
@@ -170,7 +171,7 @@ export function MemberStack({
 				gap,
 				borderRadius: Math.max(6, Math.round(size * 0.22)),
 			}}
-			title={members.map((m) => m.name).join("、")}
+			title={members.map((m) => agentDisplayName(m)).join("、")}
 		>
 			{shown.map((m) => (
 				<WorkerAvatar key={m.name} name={m.name} size={cell} />

@@ -20,9 +20,9 @@ import {
 	putAgentConnector,
 	setAgentEnabled,
 } from "@/lib/api";
-import { agentRemoved } from "@/lib/avatars";
+import { agentRemoved, agentRenamed } from "@/lib/avatars";
 import type { AgentConfig, AgentProbeResult, CatalogEntry, ConflictRun } from "@/lib/types";
-import { isConnectorProbe } from "@/lib/types";
+import { agentDisplayName, isConnectorProbe } from "@/lib/types";
 import { ManagerAvatar, WorkerAvatar } from "@/components/chat/worker-avatar";
 import { ConfigSchemaForm, SecretSchemaFields } from "@/components/agents/form-parts";
 import {
@@ -90,6 +90,7 @@ function CreateAgentDialog({
 }) {
 	const [mode, setMode] = useState<"connector" | "command">("connector");
 	const [name, setName] = useState("");
+	const [identifier, setIdentifier] = useState("");
 	const [description, setDescription] = useState("");
 	const [catalog, setCatalog] = useState<CatalogEntry[] | null>(null);
 	const [extensionId, setExtensionId] = useState("");
@@ -127,6 +128,7 @@ function CreateAgentDialog({
 
 	const reset = () => {
 		setName("");
+		setIdentifier("");
 		setDescription("");
 		setExtensionId("");
 		setConfig({});
@@ -141,6 +143,9 @@ function CreateAgentDialog({
 	const handleSubmit = async () => {
 		setError(null);
 		if (!name.trim()) return setError("名称必填");
+		if (identifier.trim() && !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(identifier.trim())) {
+			return setError("标识只能包含字母、数字、连字符或下划线，且以字母或数字开头");
+		}
 		if (mode === "connector" && !contribution) return setError("请选择 Connector");
 		if (mode === "command" && !command.trim()) return setError("命令必填");
 		setSaving(true);
@@ -148,7 +153,9 @@ function CreateAgentDialog({
 			const agent: AgentConfig =
 				mode === "connector"
 					? {
-							name: name.trim(),
+							// name 空串 = server 从显示名自动派生内部 id（唯一性由服务端保证）。
+							name: identifier.trim(),
+							displayName: name.trim(),
 							description: description.trim(),
 							connector: {
 								extensionId,
@@ -158,7 +165,8 @@ function CreateAgentDialog({
 							enabled,
 						}
 					: {
-							name: name.trim(),
+							name: identifier.trim(),
+							displayName: name.trim(),
 							description: description.trim(),
 							invoke: {
 								type: "command",
@@ -168,10 +176,11 @@ function CreateAgentDialog({
 							},
 							enabled,
 						};
-			await createAgent(agent);
+			const created = await createAgent(agent);
+			agentRenamed(created.name, created.displayName);
 			// 创建时填写的 secret：再走一次 PUT connector（明文提交，服务端只存 refs）。
 			if (mode === "connector" && Object.keys(secrets).length > 0) {
-				await putAgentConnector(name.trim(), {
+				await putAgentConnector(created.name, {
 					extensionId,
 					connectorId: contribution!.id,
 					config,
@@ -216,8 +225,13 @@ function CreateAgentDialog({
 
 					<label className="worker-create-field">
 						<span className="worker-create-label">名称<span className="worker-create-required">*</span></span>
-						<Input value={name} onChange={(e) => setName(e.target.value)} placeholder="如 puddingclaw" />
-						<span className="worker-create-hint">唯一标识，创建后不可改；委托工具名为 agent_&lt;名称&gt;__delegate。</span>
+						<Input value={name} onChange={(e) => setName(e.target.value)} placeholder="如 数据分析员" maxLength={40} />
+						<span className="worker-create-hint">显示名，聊天与成员列表里看到的就是它；创建后随时可改。</span>
+					</label>
+					<label className="worker-create-field">
+						<span className="worker-create-label">标识（可选）</span>
+						<Input value={identifier} onChange={(e) => setIdentifier(e.target.value)} placeholder="留空按名称自动生成" className="font-mono" />
+						<span className="worker-create-hint">内部 id（字母/数字/连字符），创建后不可改；委托工具名为 agent_&lt;标识&gt;__delegate。</span>
 					</label>
 					<label className="worker-create-field">
 						<span className="worker-create-label">描述</span>
@@ -372,8 +386,8 @@ export function AgentsPane() {
 			const { affectedSessions, reloadPending } = res.affectedSessions;
 			toast.success(
 				enabled
-					? `「${agent.name}」已启用`
-					: `「${agent.name}」已停用${
+					? `「${agentDisplayName(agent)}」已启用`
+					: `「${agentDisplayName(agent)}」已停用${
 							affectedSessions > 0 ? `；已撤权 ${affectedSessions} 个会话，${reloadPending} 个将在当前回合结束后刷新` : ""
 						}`,
 			);
@@ -393,7 +407,7 @@ export function AgentsPane() {
 		try {
 			await deleteAgent(pendingDelete.name);
 			agentRemoved(pendingDelete.name);
-			toast.success(`「${pendingDelete.name}」已删除`);
+			toast.success(`「${agentDisplayName(pendingDelete)}」已删除`);
 			refresh();
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
@@ -422,7 +436,7 @@ export function AgentsPane() {
 					<span className="ops-agent-avatar"><WorkerAvatar name={agent.name} size={42} /></span>
 					<div className="mt-3 min-w-0">
 						<div className="flex items-baseline gap-2">
-							<span className="truncate text-sm font-semibold tracking-tight">{agent.name}</span>
+							<span className="truncate text-sm font-semibold tracking-tight">{agentDisplayName(agent)}</span>
 							<span className="truncate font-mono text-[11px] text-muted-foreground">{agent.connector?.connectorId ?? "command"}</span>
 						</div>
 						<p className="mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground" title={description}>
@@ -436,7 +450,7 @@ export function AgentsPane() {
 				</button>
 				<DropdownMenu>
 					<DropdownMenuTrigger asChild>
-						<Button type="button" size="icon" variant="ghost" aria-label={`管理 ${agent.name}`} className="absolute right-3 top-3 size-8 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100">
+						<Button type="button" size="icon" variant="ghost" aria-label={`管理 ${agentDisplayName(agent)}`} className="absolute right-3 top-3 size-8 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100">
 							<MoreHorizontalIcon className="size-4" />
 						</Button>
 					</DropdownMenuTrigger>
@@ -457,7 +471,7 @@ export function AgentsPane() {
 		return <button key={agent.name} type="button" className="ops-manager-strip" onClick={() => openManage(agent)}>
 			<ManagerAvatar size={48} className="ops-manager-avatar" />
 			<div className="min-w-0 text-left">
-				<div className="flex items-center gap-2"><span className="text-sm font-semibold">Manager</span><span className="ops-origin-pill">内置</span></div>
+				<div className="flex items-center gap-2"><span className="text-sm font-semibold">{agent.displayName?.trim() || "Manager"}</span><span className="ops-origin-pill">内置</span></div>
 				<p className="mt-1 text-xs leading-5 text-muted-foreground">{description || "理解目标、组织协作并汇总结果"}</p>
 				<div className="mt-2 flex gap-2 text-[11px] text-muted-foreground"><span className="rounded-full bg-foreground/[0.035] px-2 py-0.5">固定角色</span><span className="rounded-full bg-foreground/[0.035] px-2 py-0.5">Pi Runtime</span></div>
 			</div>

@@ -11,7 +11,7 @@ import {
 	DialogHeader,
 	DialogTitle,
 } from "@/components/ui/dialog";
-import type { RoomSummary } from "@/lib/types";
+import { agentDisplayName, type RoomSummary } from "@/lib/types";
 import { compactTime } from "@/lib/time";
 import { ManagerAvatar, MemberStack, WorkerAvatar } from "./worker-avatar";
 
@@ -31,9 +31,10 @@ function WindowRow({
 	const fallback = room.type === "group"
 		? `${members.length} 位 Worker 共同协作`
 		: room.type === "direct"
-			? members[0]?.description || `与 ${members[0]?.name ?? "Worker"} 单聊`
+			? members[0]?.description || `与 ${members[0] ? agentDisplayName(members[0]) : "Worker"} 单聊`
 			: "理解消息、组织协作并汇总结果";
-	const subtitle = active?.name || (active?.firstMessage !== "新对话" ? active?.firstMessage : "") || fallback;
+	const meaningfulFirstMessage = active?.firstMessage && active.firstMessage !== "新对话" && active.firstMessage !== "(no messages)" ? active.firstMessage : "";
+	const subtitle = active?.name || meaningfulFirstMessage || fallback;
 	const displayName = room.type === "direct" ? room.name.replace(/^与\s+(.+)\s+单聊$/, "$1") : room.name;
 
 	return (
@@ -86,7 +87,7 @@ export function SessionList({
 		const normalized = query.trim().toLocaleLowerCase();
 		if (!normalized) return rooms;
 		return rooms.filter((room) => {
-			const haystack = [room.name, ...room.members.map((member) => member.name), ...room.sessions.map((session) => session.name || session.firstMessage)].join(" ");
+			const haystack = [room.name, ...room.members.map((member) => agentDisplayName(member)), ...room.sessions.map((session) => session.name || session.firstMessage)].join(" ");
 			return haystack.toLocaleLowerCase().includes(normalized);
 		});
 	}, [query, rooms]);

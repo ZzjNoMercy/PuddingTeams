@@ -10,7 +10,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { listModels, updateManager } from "@/lib/api";
-import type { AgentConfig, MutationResponse, PiManagerSettings } from "@/lib/types";
+import { agentDisplayName, type AgentConfig, type MutationResponse, type PiManagerSettings } from "@/lib/types";
 import { AffectedNote, AvatarEditor } from "@/components/agents/form-parts";
 
 /**
@@ -148,7 +148,7 @@ export function ManagerDialog({
 		<Dialog open={open} onOpenChange={onOpenChange}>
 			<DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
 				<DialogHeader>
-					<DialogTitle>管理「{agent.name}」</DialogTitle>
+					<DialogTitle>管理「{agentDisplayName(agent)}」</DialogTitle>
 					<DialogDescription>
 						Manager 负责理解用户消息、调度 Worker。不可删除、不可禁用；配置改动对新建或重开的会话生效。
 					</DialogDescription>
@@ -231,7 +231,7 @@ export function ManagerDialog({
 				<div className="rounded-md bg-muted/60 p-3 text-xs text-muted-foreground">
 					运行指令与模板已移至独立配置页；Skills 统一从扩展入口管理：
 					<Link href={`/agents/config?name=${encodeURIComponent(agent.name)}`} className="ml-1 underline hover:text-foreground">
-						打开「{agent.name}」配置页
+						打开「{agentDisplayName(agent)}」配置页
 					</Link>
 					<Link href="/extensions" className="ml-2 underline hover:text-foreground">
 						打开扩展

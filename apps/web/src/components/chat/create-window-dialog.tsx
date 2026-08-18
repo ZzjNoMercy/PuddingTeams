@@ -6,7 +6,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { createRoom, listAgents } from "@/lib/api";
-import type { AgentConfig, RoomSummary } from "@/lib/types";
+import { agentDisplayName, type AgentConfig, type RoomSummary } from "@/lib/types";
 import { WorkerAvatar } from "./worker-avatar";
 
 const DESIGN_ORDER = ["pi-a", "pi-b", "puddingclaw", "claude-code", "codex"];
@@ -138,7 +138,7 @@ export function CreateWindowDialog({
 								>
 									<WorkerAvatar name={agent.name} size={32} />
 									<span className="home-worker-choice-copy">
-										<strong>{agent.name}</strong>
+										<strong>{agentDisplayName(agent)}</strong>
 										<span>{DESIGN_DESCRIPTIONS[agent.name] ?? agent.description}</span>
 									</span>
 								</button>

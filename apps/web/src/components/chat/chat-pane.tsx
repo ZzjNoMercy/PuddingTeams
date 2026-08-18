@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDownIcon, EllipsisIcon, FolderGit2Icon, FolderOpenIcon, LayersIcon, PanelLeftOpenIcon } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -33,11 +33,12 @@ import {
 	switchRoomWorkspace,
 	updateRoom,
 } from "@/lib/api";
-import type { ChatStatus, RoomSession, RoomSummary, WorkspaceRecord } from "@/lib/types";
+import { agentDisplayName, type ChatStatus, type RoomSession, type RoomSummary, type WorkspaceRecord } from "@/lib/types";
 import { Composer } from "./composer";
 import { ChatStatsBar } from "./chat-stats-bar";
 import { computeSessionStats } from "@/lib/session-stats";
 import { delegateWorker, isDelegateCall } from "@/lib/events";
+import { useAgentLabels } from "@/lib/avatars";
 import { Message } from "./message";
 import { ManagerAvatar, MemberStack, WorkerAvatar } from "./worker-avatar";
 import { DirectoryPickerDialog } from "./directory-picker-dialog";
@@ -73,11 +74,14 @@ function SessionChat({
 	windowType,
 	onStatus,
 	onOpenWindow,
+	onRoomsMayHaveChanged,
 	workspaceLabel,
 	workspacePath,
 	workspaceAvailable,
 	onOpenWorkspace,
 	blocked,
+	sessionModel,
+	onSessionModelChange,
 }: {
 	roomId: string;
 	sessionId: string;
@@ -88,11 +92,16 @@ function SessionChat({
 	windowType: RoomSummary["type"];
 	onStatus: (s: ChatStatus) => void;
 	onOpenWindow?: (windowId: string) => void;
+	/** manager 建房工具落定后回调：侧栏房间列表立即刷新，不等轮询。 */
+	onRoomsMayHaveChanged?: () => void;
 	workspaceLabel: string;
 	workspacePath: string;
 	workspaceAvailable: boolean;
 	onOpenWorkspace: () => void;
 	blocked?: boolean;
+	/** 会话真实模型 ref（rooms 数据），composer 选择器以此为准。 */
+	sessionModel?: string;
+	onSessionModelChange?: (model: string) => void;
 }) {
 	const { messages, historyLoading, status, running, send, stop } = useChat(sessionId);
 	const [goalCreateOpen, setGoalCreateOpen] = useState(false);
@@ -134,7 +143,24 @@ function SessionChat({
 		}
 		return names;
 	}, [messages]);
-	const busyHint = running && waitingWorkers.length > 0 ? `等待 ${waitingWorkers.join("、")} 返回…` : undefined;
+	// manager 建房（create_group_window）落定后立即刷新侧栏房间列表——
+	// 8s 轮询太慢，用户会以为群聊没建上。每个 toolCallId 只触发一次。
+	const seenGroupCreations = useRef<Set<string>>(new Set());
+	useEffect(() => {
+		if (!onRoomsMayHaveChanged) return;
+		for (const m of messages) {
+			for (const call of m.toolCalls) {
+				if (call.name !== "create_group_window") continue;
+				if (call.status !== "done" && call.status !== "error") continue;
+				if (seenGroupCreations.current.has(call.id)) continue;
+				seenGroupCreations.current.add(call.id);
+				if (call.status === "done") onRoomsMayHaveChanged();
+			}
+		}
+	}, [messages, onRoomsMayHaveChanged]);
+	// delegateWorker 反解出的是内部 id；等待提示渲染显示名。
+	const agentLabels = useAgentLabels();
+	const busyHint = running && waitingWorkers.length > 0 ? `等待 ${waitingWorkers.map((id) => agentLabels[id] ?? id).join("、")} 返回…` : undefined;
 
 	return (
 		<div className="home-session-chat relative flex min-h-0 flex-1 flex-col" aria-busy={!layoutReady}>
@@ -181,6 +207,8 @@ function SessionChat({
 					workspaceLabel={workspaceLabel}
 					workspacePath={workspacePath}
 					workspaceAvailable={workspaceAvailable}
+					sessionModel={sessionModel}
+					onModelChanged={onSessionModelChange}
 					onSend={send}
 					onStop={stop}
 					onGoalCommand={openGoalCommand}
@@ -202,11 +230,13 @@ export function ChatPane({
 	onOpenWindow,
 	onRoomUpdated,
 	onOpenRoomList,
+	onRoomsMayHaveChanged,
 }: {
 	roomId: string;
 	onOpenWindow?: (windowId: string) => void;
 	onRoomUpdated?: (room: RoomSummary) => void;
 	onOpenRoomList?: () => void;
+	onRoomsMayHaveChanged?: () => void;
 }) {
 	const [room, setRoom] = useState<RoomSummary | null>(null);
 	const [activeId, setActiveId] = useState<string>("");
@@ -271,6 +301,15 @@ export function ChatPane({
 	const patchSessions = useCallback((sessions: RoomSession[], active: string) => {
 		setRoom((prev) => (prev ? { ...prev, sessions, activeSession: active } : prev));
 		setActiveId(active);
+	}, []);
+
+	/** composer 改模型后本地同步 rooms 数据，避免切换会话后回读旧值。 */
+	const handleSessionModelChange = useCallback((model: string) => {
+		setRoom((prev) =>
+			prev
+				? { ...prev, sessions: prev.sessions.map((s) => (s.id === prev.activeSession ? { ...s, model } : s)) }
+				: prev,
+		);
 	}, []);
 
 	const switchSession = useCallback(
@@ -448,12 +487,14 @@ export function ChatPane({
 	const headerTitle = room?.name ?? "与 pi manager 对话";
 	const activeSession = room?.sessions.find((s) => s.active);
 	const sessionTitle =
-		activeSession?.name || (activeSession?.firstMessage !== "新对话" ? activeSession?.firstMessage : "") || "";
+		activeSession?.name ||
+		(activeSession?.firstMessage && activeSession.firstMessage !== "新对话" && activeSession.firstMessage !== "(no messages)" ? activeSession.firstMessage : "") ||
+		"";
 	const subtitle =
 		type === "group"
 			? `${members.length} 位 Worker · Manager 在场`
 			: type === "direct"
-				? members[0]?.description || `与 ${members[0]?.name} 单聊`
+				? members[0]?.description || `与 ${members[0] ? agentDisplayName(members[0]) : ""} 单聊`
 				: "理解消息、组织协作并汇总结果";
 	const workspaceTargetReady = switchToDefault || Boolean(targetWorkspaceId || workspacePath.trim());
 	const currentContextLabel = room?.workspace ? `${room.workspace.name} · ${room.workspace.rootPath}` : `默认目录 · ${room?.cwdSnapshot ?? ""}`;
@@ -463,9 +504,9 @@ export function ChatPane({
 	const directoryPickerInitialPath =
 		workspacePath || workspaceOptions.find((item) => item.id === targetWorkspaceId)?.rootPath || room?.cwdSnapshot || "";
 	const emptyHint = isGroup
-		? `群聊：${members.map((m) => m.name).join("、")} 在窗口里，pi manager 负责调度。试试对 manager 说：让 ${members[0]?.name} 分析一个任务…`
+		? `群聊：${members.map((m) => agentDisplayName(m)).join("、")} 在窗口里，pi manager 负责调度。试试对 manager 说：让 ${members[0] ? agentDisplayName(members[0]) : "worker"} 分析一个任务…`
 		: isSingle
-			? `和 ${members[0]?.name} 单聊（经 pi manager 中转）。派一个任务，manager 会交给 ${members[0]?.name} 执行`
+			? `和 ${members[0] ? agentDisplayName(members[0]) : "worker"} 单聊（经 pi manager 中转）。派一个任务，manager 会交给 ${members[0] ? agentDisplayName(members[0]) : "它"} 执行`
 			: "开始和 pi manager 对话";
 
 	return (
@@ -533,11 +574,14 @@ export function ChatPane({
 					windowType={type}
 					onStatus={setStatus}
 					onOpenWindow={onOpenWindow}
+					onRoomsMayHaveChanged={onRoomsMayHaveChanged}
 					workspaceLabel={workspaceLabel}
 					workspacePath={currentWorkspacePath}
 					workspaceAvailable={room.contextAvailable}
 					onOpenWorkspace={openWorkspaceSwitch}
 					blocked={!room.contextAvailable || status === "gone"}
+					sessionModel={activeSession?.model}
+					onSessionModelChange={handleSessionModelChange}
 				/>
 			) : null}
 			</div>

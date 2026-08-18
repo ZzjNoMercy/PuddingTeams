@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { CableIcon, FileArchiveIcon, LoaderIcon, PackageIcon, RefreshCwIcon, SearchIcon, ShieldAlertIcon, SparklesIcon, TrashIcon, UploadIcon, WrenchIcon } from "lucide-react";
+import { CableIcon, FileArchiveIcon, FolderOpenIcon, LoaderIcon, PackageIcon, RefreshCwIcon, SearchIcon, ShieldAlertIcon, SparklesIcon, TrashIcon, UploadIcon, WrenchIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -16,6 +16,7 @@ import {
 	importSkillsZip,
 	listExtensionCatalog,
 	listSkillLibrary,
+	pickWorkspaceDirectory,
 	setDeveloperMode,
 	uninstallExtension,
 	updateExtension,
@@ -289,6 +290,15 @@ function SkillsLibraryView() {
 		}
 	};
 
+	const pickSkillDirectory = async () => {
+		try {
+			const picked = await pickWorkspaceDirectory(importPath.trim() || "/");
+			if (picked) setImportPath(picked);
+		} catch {
+			// 用户取消或目录选择不可用，保持当前输入
+		}
+	};
+
 	return (
 		<div className="flex flex-col gap-4 py-6">
 			<div className="flex flex-wrap items-end justify-between gap-3">
@@ -316,7 +326,7 @@ function SkillsLibraryView() {
 				<DialogContent>
 					<DialogHeader><DialogTitle>导入 Skill</DialogTitle><DialogDescription>导入后写入 pi 全局 Skills 目录，与 pi CLI 共享。启用范围仍按 Agent 配置的作用域决定。</DialogDescription></DialogHeader>
 					<div className="flex flex-col gap-3">
-						<div className="flex gap-2"><Input value={importPath} onChange={(e) => setImportPath(e.target.value)} placeholder="/path/to/skill-dir 或 skills.zip" className="font-mono text-xs" /><Button type="button" variant="outline" onClick={() => zipInput?.click()}><FileArchiveIcon className="size-3.5" />选择 zip</Button></div>
+						<div className="flex gap-2"><Input value={importPath} onChange={(e) => setImportPath(e.target.value)} placeholder="/path/to/skill-dir 或 skills.zip" className="font-mono text-xs" /><Button type="button" variant="outline" onClick={() => void pickSkillDirectory()}><FolderOpenIcon className="size-3.5" />选择目录</Button><Button type="button" variant="outline" onClick={() => zipInput?.click()}><FileArchiveIcon className="size-3.5" />选择 zip</Button></div>
 						<input ref={setZipInput} type="file" accept=".zip,application/zip" className="hidden" onChange={(e) => { const file = e.target.files?.[0]; e.target.value = ""; if (file) void importZip(file); }} />
 					</div>
 					<DialogFooter><Button type="button" variant="ghost" onClick={() => setImportOpen(false)}>取消</Button><Button type="button" disabled={importing || !importPath.trim()} onClick={() => void importSkill()}>{importing ? <LoaderIcon className="size-3.5 animate-spin" /> : null}导入</Button></DialogFooter>

@@ -2,7 +2,7 @@
 
 import { forwardRef, type ButtonHTMLAttributes } from "react";
 import { ChevronDownIcon, XIcon } from "lucide-react";
-import type { RoomSession, RoomSummary } from "@/lib/types";
+import { agentDisplayName, type RoomSession, type RoomSummary } from "@/lib/types";
 import { SessionMenu } from "./session-menu";
 import { ManagerAvatar, WorkerAvatar } from "./worker-avatar";
 
@@ -159,7 +159,7 @@ export function ChatInfoDialog({
 								{room.members.map((member) => (
 									<div key={member.name} className="chat-member-item" title={member.description}>
 										<WorkerAvatar name={member.name} size={34} />
-										<span>{member.name}</span>
+										<span>{agentDisplayName(member)}</span>
 									</div>
 								))}
 							</div>

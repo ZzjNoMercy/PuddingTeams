@@ -153,6 +153,92 @@ test("config: 非 pi worker 传 manager 或 connector 字段 400", async () => {
 	assert.equal(ok.json().agent.description, "合法更新");
 });
 
+test("config: worker displayName 更新与清除（name/id 解耦）", async () => {
+	const { app, teams } = await makeStack();
+	// 设置显示名：内部 id 不变。
+	const set = await app.inject({
+		method: "PUT",
+		url: "/api/agents/piworker/config",
+		payload: { displayName: "数据分析员" },
+	});
+	assert.equal(set.statusCode, 200);
+	assert.equal(set.json().agent.name, "piworker");
+	assert.equal(set.json().agent.displayName, "数据分析员");
+	// 清除（null 与空串等价）：displayName 删除，展示回退 id。
+	for (const payload of [{ displayName: null }, { displayName: "  " }]) {
+		const cleared = await app.inject({ method: "PUT", url: "/api/agents/piworker/config", payload });
+		assert.equal(cleared.statusCode, 200);
+		assert.equal(cleared.json().agent.displayName, undefined);
+	}
+	// 非法类型 400；超长 400。
+	assert.equal(
+		(await app.inject({ method: "PUT", url: "/api/agents/piworker/config", payload: { displayName: 42 } })).statusCode,
+		400,
+	);
+	assert.equal(
+		(await app.inject({ method: "PUT", url: "/api/agents/piworker/config", payload: { displayName: "超".repeat(41) } })).statusCode,
+		400,
+	);
+	assert.equal((await teams.getAgent("piworker"))?.displayName, undefined);
+});
+
+test("config: pinned manager displayName 更新", async () => {
+	const { app } = await makeStack();
+	const res = await app.inject({
+		method: "PUT",
+		url: "/api/agents/manager/config",
+		payload: { displayName: "大管家" },
+	});
+	assert.equal(res.statusCode, 200);
+	assert.equal(res.json().agent.name, "manager");
+	assert.equal(res.json().agent.displayName, "大管家");
+});
+
+test("create: 无 name 时从 displayName 派生内部 id", async () => {
+	const { app } = await makeStack();
+	// 纯中文显示名 → worker-<随机> 回退。
+	const zh = await app.inject({
+		method: "POST",
+		url: "/api/agents",
+		payload: { displayName: "数据分析员", invoke: { type: "command", command: "echo", runArgs: [] } },
+	});
+	assert.equal(zh.statusCode, 200);
+	assert.match(zh.json().agent.name, /^worker-[0-9a-f]{6}$/);
+	assert.equal(zh.json().agent.displayName, "数据分析员");
+	// ASCII 显示名 → slug；撞名追加 -2。
+	const first = await app.inject({
+		method: "POST",
+		url: "/api/agents",
+		payload: { displayName: "Data Analyst", invoke: { type: "command", command: "echo", runArgs: [] } },
+	});
+	assert.equal(first.statusCode, 200);
+	assert.equal(first.json().agent.name, "data-analyst");
+	const second = await app.inject({
+		method: "POST",
+		url: "/api/agents",
+		payload: { displayName: "data analyst", invoke: { type: "command", command: "echo", runArgs: [] } },
+	});
+	assert.equal(second.json().agent.name, "data-analyst-2");
+	// 无 name 且无 displayName → 400；显式 name 非法字符 → 400。
+	assert.equal(
+		(await app.inject({ method: "POST", url: "/api/agents", payload: { invoke: { type: "command", command: "echo", runArgs: [] } } })).statusCode,
+		400,
+	);
+	assert.equal(
+		(await app.inject({ method: "POST", url: "/api/agents", payload: { name: "坏 名字", invoke: { type: "command", command: "echo", runArgs: [] } } })).statusCode,
+		400,
+	);
+	// 显式合法 name + displayName 共存：id 用显式值。
+	const explicit = await app.inject({
+		method: "POST",
+		url: "/api/agents",
+		payload: { name: "pi-c", displayName: "本地 pi worker C", invoke: { type: "command", command: "echo", runArgs: [] } },
+	});
+	assert.equal(explicit.statusCode, 200);
+	assert.equal(explicit.json().agent.name, "pi-c");
+	assert.equal(explicit.json().agent.displayName, "本地 pi worker C");
+});
+
 test("config: pi worker 传 manager 字段 400；未知 agent 404", async () => {
 	const { app } = await makeStack();
 	assert.equal(

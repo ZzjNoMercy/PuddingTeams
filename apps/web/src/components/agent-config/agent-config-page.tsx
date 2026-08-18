@@ -36,7 +36,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { ApiConflictError, listAgents, probeAgent, putAgentConfig, setAgentEnabled, updateAgent } from "@/lib/api";
 import type { AgentConfig, AgentProbeResult, MutationResponse, PiManagerSettings } from "@/lib/types";
-import { isConnectorProbe } from "@/lib/types";
+import { agentDisplayName, isConnectorProbe } from "@/lib/types";
+import { agentRenamed } from "@/lib/avatars";
 import { ManagerAvatar, WorkerAvatar } from "@/components/chat/worker-avatar";
 import {
 	buildConfigBody,
@@ -181,30 +182,33 @@ export function AgentConfigPage({ name }: { name: string }) {
 				const mutation = await putAgentConfig(agent.name, buildConfigBody(agent, draft));
 				setAgent(mutation.agent);
 				setAgents((prev) => prev?.map((item) => (item.name === mutation.agent.name ? mutation.agent : item)) ?? prev);
+				agentRenamed(mutation.agent.name, mutation.agent.displayName);
 				const next = draftFromAgent(mutation.agent);
 				setDraft(next);
 				setBaseline(serializeDraft(next));
 				const { affectedSessions, activeNow, reloadPending } = mutation.affectedSessions;
 				toast.success(
 					affectedSessions > 0
-						? `「${agent.name}」配置已保存；${affectedSessions} 个会话受影响（${activeNow} 个立即生效，${reloadPending} 个回合结束后刷新）`
-						: `「${agent.name}」配置已保存；新建或重开的 Session 生效`,
+						? `「${agentDisplayName(mutation.agent)}」配置已保存；${affectedSessions} 个会话受影响（${activeNow} 个立即生效，${reloadPending} 个回合结束后刷新）`
+						: `「${agentDisplayName(mutation.agent)}」配置已保存；新建或重开的 Session 生效`,
 				);
 				for (const warning of mutation.securityWarnings ?? []) toast.warning(warning);
 			} else {
-				// connector / legacy worker 只保存概览字段（描述 + 责任边界），全量 upsert
-				// 语义与原管理抽屉一致：责任边界全空 = 不提交该键（保留现状）。
+				// connector / legacy worker 只保存概览字段（显示名 + 描述 + 责任边界），
+				// 全量 upsert 语义与原管理抽屉一致：责任边界全空 = 不提交该键（保留现状）。
 				const responsibility = buildResponsibility(draft) ?? undefined;
 				const updated = await updateAgent(agent.name, {
 					...agent,
+					displayName: draft.displayName.trim(),
 					description: draft.description.trim(),
 					responsibility,
 				});
 				handleAgentSaved(updated);
+				agentRenamed(updated.name, updated.displayName);
 				const next = draftFromAgent(updated);
 				setDraft(next);
 				setBaseline(serializeDraft(next));
-				toast.success(`「${agent.name}」配置已保存；新建或重开的 Session 生效`);
+				toast.success(`「${agentDisplayName(updated)}」配置已保存；新建或重开的 Session 生效`);
 			}
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
@@ -332,7 +336,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 			const healthy = isConnectorProbe(result)
 				? result.detected && result.compatibility !== "incompatible" && result.authenticated !== false
 				: result.ok;
-			const summary = `「${agent.name}」${probeSummary(result)}`;
+			const summary = `「${agentDisplayName(agent)}」${probeSummary(result)}`;
 			if (healthy) toast.success(summary);
 			else toast.error(summary);
 		} catch (err) {
@@ -350,7 +354,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 				const mutation = await setAgentEnabled(agent.name, enabled);
 				setAgent(mutation.agent);
 				setAgents((prev) => prev?.map((item) => (item.name === mutation.agent.name ? mutation.agent : item)) ?? prev);
-				toast.success(enabled ? `「${agent.name}」已启用` : `「${agent.name}」已停用`);
+				toast.success(enabled ? `「${agentDisplayName(agent)}」已启用` : `「${agentDisplayName(agent)}」已停用`);
 			} catch (err) {
 				if (err instanceof ApiConflictError) {
 					toast.error(`${err.message}（请先在智能体列表处理进行中的 Run）`);
@@ -410,7 +414,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 				{agent.pinned ? <ManagerAvatar size={40} /> : <WorkerAvatar name={agent.name} size={40} />}
 				<div className="min-w-0 flex-1">
 					<div className="flex items-center gap-1.5">
-						<span className="truncate text-sm font-semibold">{agent.name}</span>
+						<span className="truncate text-sm font-semibold">{agentDisplayName(agent)}</span>
 						<Badge variant="secondary">{agent.pinned ? "Manager" : (agent.connector?.connectorId ?? "worker")}</Badge>
 					</div>
 					<p className="truncate text-xs text-muted-foreground">{agent.description || "（无描述）"}</p>

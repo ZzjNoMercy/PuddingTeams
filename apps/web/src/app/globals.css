@@ -1659,6 +1659,8 @@ html[data-nav="expanded"] .home-workspace-head h1 {
 .home-room-preview { overflow: hidden; color: var(--home-text-3); font-size: 11px; line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; }
 .home-room-time { align-self: start; margin-top: 2px; color: var(--home-text-3); font-size: 9px; font-variant-numeric: tabular-nums; }
 .home-room-delete { position: absolute; right: 6px; bottom: 6px; display: grid; width: 20px; height: 20px; place-items: center; border-radius: 6px; color: var(--home-text-3); opacity: 0; }
+.home-room-row:hover .home-room-delete,
+.home-room-row:focus-within .home-room-delete { opacity: 1; }
 .home-room-delete:hover { background: var(--home-soft-hover); color: #db5454; opacity: 1; }
 .home-room-delete:focus-visible { opacity: 1; }
 .home-room-delete svg { width: 12px; height: 12px; }
@@ -1740,7 +1742,7 @@ html[data-nav="expanded"] .home-workspace-head h1 {
 .home-session-menu-item {
 	display: grid;
 	min-height: 46px;
-	grid-template-columns: 17px minmax(0,1fr) 24px;
+	grid-template-columns: 17px minmax(0,1fr) 24px 24px;
 	align-items: center;
 	gap: 7px;
 	padding: 8px 9px;
@@ -1750,9 +1752,8 @@ html[data-nav="expanded"] .home-workspace-head h1 {
 }
 .home-session-menu-item:focus,
 .home-session-menu-item:hover { background: var(--home-soft-hover); color: var(--home-text); }
-.home-session-menu-item.is-active,
-.home-session-menu-item.is-active:focus,
-.home-session-menu-item.is-active:hover { background: var(--home-menu-active); }
+/* 选中态按设计稿（.session-option.active）：✓ + 文字变色，不铺底色块 */
+.home-session-menu-item.is-active { color: var(--home-text); }
 .home-session-menu-check {
 	display: grid;
 	width: 17px;
@@ -1792,12 +1793,26 @@ html[data-nav="expanded"] .home-workspace-head h1 {
 	opacity: 0;
 	transition: color 120ms ease, background 120ms ease, opacity 120ms ease;
 }
-.home-session-menu-item.is-active .home-session-menu-edit,
 .home-session-menu-item:hover .home-session-menu-edit,
 .home-session-menu-item:focus-within .home-session-menu-edit { opacity: 1; }
 .home-session-menu-edit:hover { background: var(--home-soft-hover); color: var(--home-text); }
 .home-session-menu-edit:focus-visible { outline: 2px solid rgba(102,227,244,.7); outline-offset: 1px; opacity: 1; }
 .home-session-menu-edit svg { width: 12px; height: 12px; }
+.home-session-menu-delete {
+	display: grid;
+	width: 24px;
+	height: 24px;
+	place-items: center;
+	border-radius: 7px;
+	color: var(--home-text-3);
+	opacity: 0;
+	transition: color 120ms ease, background 120ms ease, opacity 120ms ease;
+}
+.home-session-menu-item:hover .home-session-menu-delete,
+.home-session-menu-item:focus-within .home-session-menu-delete { opacity: 1; }
+.home-session-menu-delete:hover { background: var(--home-soft-hover); color: #db5454; }
+.home-session-menu-delete:focus-visible { outline: 2px solid rgba(102,227,244,.7); outline-offset: 1px; opacity: 1; }
+.home-session-menu-delete svg { width: 12px; height: 12px; }
 .home-session-menu-new {
 	display: grid;
 	min-height: 46px;

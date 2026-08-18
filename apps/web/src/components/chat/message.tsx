@@ -1,7 +1,7 @@
 "use client";
 
 import { createContext, type ComponentProps, useContext, useEffect, useState } from "react";
-import { CheckIcon, ChevronDownIcon, ChevronRightIcon, ExternalLinkIcon, UsersIcon } from "lucide-react";
+import { ChevronDownIcon, ChevronRightIcon, ExternalLinkIcon, SquareTerminalIcon, UserPlusIcon, UsersIcon, WrenchIcon } from "lucide-react";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
 	Message as AiMessage,
@@ -18,6 +18,7 @@ import { Badge } from "@/components/ui/badge";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { streamdownPlugins } from "@/core/streamdown/plugins";
 import { delegateWorker, isDelegateCall } from "@/lib/events";
+import { useAgentLabel } from "@/lib/avatars";
 import { openRoomFile } from "@/lib/api";
 import type { ChatMessage, ToolCallView, WindowType } from "@/lib/types";
 import { toast } from "sonner";
@@ -31,6 +32,15 @@ const TOOL_STATUS_LABEL: Record<ToolCallView["status"], string> = {
 	error: "失败",
 	interrupted: "已中断",
 };
+
+/** 通用工具调用行的行首图标（按工具名区分；缺省由 TaskTrigger 给放大镜）。 */
+function toolCallIcon(name: string) {
+	if (name === "bash") return <SquareTerminalIcon className="size-4" />;
+	if (name === "search_agent_tools") return <WrenchIcon className="size-4" />;
+	if (name === "create_group_window") return <UsersIcon className="size-4" />;
+	if (name === "invite_to_group") return <UserPlusIcon className="size-4" />;
+	return undefined;
+}
 
 const RoomFileContext = createContext<string | undefined>(undefined);
 
@@ -101,6 +111,16 @@ function Elapsed({ active }: { active: boolean }) {
 	return <span className="tabular-nums text-muted-foreground">{active ? `${mm}:${ss}` : ""}</span>;
 }
 
+/** worker 回报的委托状态 → 中文徽标文案（未识别的兜底原始值）。 */
+const WORKER_STATUS_LABEL: Record<string, string> = {
+	completed: "完成",
+	needs_input: "等待审批",
+	cancelled: "已取消",
+	failed: "失败",
+	conflict: "会话占用",
+	timeout: "超时",
+};
+
 function statusBadge(call: ToolCallView) {
 	if (call.status === "running")
 		return (
@@ -112,14 +132,19 @@ function statusBadge(call: ToolCallView) {
 	if (call.status === "error") return <Badge variant="destructive">失败</Badge>;
 	if (call.status === "interrupted") return <Badge variant="outline">已中断</Badge>;
 	const details = call.details as { status?: string } | undefined;
-	if (details?.status === "needs_input") return <Badge variant="secondary">等待输入</Badge>;
+	if (details?.status === "needs_input") return <Badge variant="secondary">等待审批</Badge>;
+	if (details?.status && details.status !== "completed") {
+		return <Badge variant="destructive">{WORKER_STATUS_LABEL[details.status] ?? details.status}</Badge>;
+	}
 	return <Badge variant="secondary">完成</Badge>;
 }
 
 /** Badge for a worker-reported status string (custom_message details). */
 function workerStatusBadge(status?: string) {
-	if (status === "needs_input") return <Badge variant="secondary">等待输入</Badge>;
-	if (status && status !== "completed") return <Badge variant="destructive">{status}</Badge>;
+	if (status === "needs_input") return <Badge variant="secondary">等待审批</Badge>;
+	if (status && status !== "completed") {
+		return <Badge variant="destructive">{WORKER_STATUS_LABEL[status] ?? status}</Badge>;
+	}
 	return <Badge variant="secondary">完成</Badge>;
 }
 
@@ -151,6 +176,7 @@ function WorkerTaskEntry({
 	isError,
 	meta,
 	timestamp,
+	progress,
 	children,
 }: {
 	worker: string;
@@ -161,22 +187,20 @@ function WorkerTaskEntry({
 	isError?: boolean;
 	meta?: string;
 	timestamp?: number;
+	progress?: string;
 	children?: React.ReactNode;
 }) {
-	// worker 工作过程：运行中/无结果时展开，拿到结果后自动折叠（可手动再展开）。
+	// worker 工作过程：运行中/无结果时展开，完成后默认也展开；只有很长的
+	// 结果才 clamp，并保留手动展开/收起。
+	// worker prop 是内部 id（头像/详情用），展示渲染显示名。
+	const workerLabel = useAgentLabel(worker);
 	const finished = !running && result !== undefined && result !== "";
-	const [open, setOpen] = useState(!finished);
-	const [wasFinished, setWasFinished] = useState(finished);
-	if (finished !== wasFinished) {
-		// render 期间按 props 变化调整 state：running→done 折叠一次。
-		setWasFinished(finished);
-		if (finished) setOpen(false);
-	}
+	const [open, setOpen] = useState(true);
 	const escapeBottomLock = useEscapeBottomLock();
 	const time = timestamp
 		? new Date(timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })
 		: "";
-	const expandableResult = Boolean(result && (result.length > 360 || result.split("\n").length > 8));
+	const expandableResult = Boolean(result && (result.length > 1200 || result.split("\n").length > 24));
 
 	if (finished) {
 		return (
@@ -184,12 +208,10 @@ function WorkerTaskEntry({
 				<WorkerAvatar name={worker} size={34} className="shrink-0" />
 				<div className="home-worker-finished-body">
 					<div className="home-worker-message-meta">
-						<strong>{worker}</strong>
-						{isError ? (
-							<span className="home-worker-status is-error">失败</span>
-						) : (
-							<span className="home-worker-status is-complete"><CheckIcon />已完成</span>
-						)}
+						<strong>{workerLabel}</strong>
+						{/* 状态徽标由调用方按 details/status 推导（含 needs_input 等待审批），
+						    不能在这里按完成/失败二分写死。 */}
+						{badge}
 						{time ? <time>{time}</time> : null}
 					</div>
 					<div className={`home-worker-result ${!open && expandableResult ? "is-clamped" : ""} ${isError ? "text-destructive" : ""}`}>
@@ -230,7 +252,7 @@ function WorkerTaskEntry({
 					) : (
 						<ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground" />
 					)}
-					<span className="truncate font-mono text-sm font-medium">{worker}</span>
+					<span className="truncate font-mono text-sm font-medium">{workerLabel}</span>
 					{badge}
 				</button>
 				{open ? (
@@ -241,7 +263,7 @@ function WorkerTaskEntry({
 								<span className="whitespace-pre-wrap">{task}</span>
 							</p>
 						) : null}
-						{running ? <p className="mt-1 text-xs text-muted-foreground">等待 worker 完成…</p> : null}
+						{running ? <p className="mt-1 text-xs text-muted-foreground">{progress ?? "等待 worker 完成…"}</p> : null}
 						{children}
 						{result !== undefined && result !== "" && (
 							<div className={`mt-1 text-sm ${isError ? "text-destructive" : ""}`}>
@@ -267,7 +289,7 @@ function toolCallMeta(call: ToolCallView): string | undefined {
 		| undefined;
 	if (!details || (!details.status && details.outcome === undefined)) return undefined;
 	return [
-		details.status,
+		details.status ? (WORKER_STATUS_LABEL[details.status] ?? details.status) : undefined,
 		details.outcome,
 		details.elapsedMs !== undefined ? `${(details.elapsedMs / 1000).toFixed(0)}s` : undefined,
 		details.exitCode !== undefined ? `exit ${details.exitCode}` : undefined,
@@ -282,6 +304,8 @@ function toolCallMeta(call: ToolCallView): string | undefined {
 function DelegateCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow?: (windowId: string) => void }) {
 	const args = call.args as { task?: string } | undefined;
 	const worker = delegateWorker(call);
+	// worker 是内部 id（头像/工具详情用），卡面展示显示名。
+	const workerLabel = useAgentLabel(worker ?? "worker");
 	const details = call.details as
 		| {
 				status?: string;
@@ -335,27 +359,9 @@ function DelegateCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow
 		);
 	}
 
-	// HITL：等待审批 → 渲染审批卡（任务文本在先，审批卡是其后续动作）。
-	if (details?.interactionId) {
-		return (
-			<div className="flex w-full flex-col gap-2">
-				{args?.task ? (
-					<p className="px-1 text-xs text-muted-foreground">
-						<span className="mr-1.5 text-muted-foreground/60">任务：</span>
-						<span className="whitespace-pre-wrap">{args.task}</span>
-					</p>
-				) : null}
-				<InteractionCard
-					interactionId={details.interactionId}
-					worker={worker ?? "worker"}
-					requests={details.requests}
-					revision={details.revision}
-					windowId={details.windowId}
-					onOpenWindow={onOpenWindow}
-				/>
-			</div>
-		);
-	}
+	// HITL：等待审批的审批卡由 invoker 写入会话的 pudding:interaction_required
+	// custom message 承载（唯一事实源，可折叠/对账）；这里不再内联渲染，
+	// 否则同一窗口会出现两张相同的审批卡。
 
 	// 409 冲突（无 interactionId）：渲染带「去处理」跳转的占用卡。
 	if (conflict) {
@@ -386,7 +392,7 @@ function DelegateCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow
 						<ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground" />
 					)}
 					<WorkerAvatar name={worker ?? "worker"} size={20} />
-					<span className="truncate font-mono text-sm font-medium">{worker ?? "worker"}</span>
+					<span className="truncate font-mono text-sm font-medium">{workerLabel}</span>
 				</button>
 				<div className="flex shrink-0 items-center gap-2">
 					{details?.synced && details.windowId ? (
@@ -411,7 +417,7 @@ function DelegateCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow
 						</p>
 					) : null}
 					{call.status === "running" ? (
-						<p className="text-xs text-muted-foreground">等待 worker 完成…</p>
+						<p className="text-xs text-muted-foreground">{call.progress ?? "等待 worker 完成…"}</p>
 					) : null}
 					{call.result !== undefined && (
 						<div className={`text-sm ${call.isError ? "text-destructive" : ""}`}>
@@ -466,32 +472,9 @@ function ToolCallItem({
 }) {
 	if (isDelegateCall(call)) {
 		// §7 成员消息流：direct/group 下脱离 manager 气泡，渲染为 worker 独立条目。
+		// 等待审批的交互卡由 pudding:interaction_required custom message 承载，
+		// 这里一律按普通 worker 条目渲染（结果文本会说明在等待审批）。
 		if (windowType && windowType !== "solo") {
-			const details = call.details as
-				| { interactionId?: string; revision?: number; windowId?: string; requests?: Array<{ requestId: string; prompt: string; command?: string; path?: string; risk?: string; options?: string[] }> }
-				| undefined;
-			// HITL：审批卡优先（等待审批），不做成普通 worker 结果条目。
-			if (details?.interactionId) {
-				return (
-					<WorkerTaskEntry
-						worker={delegateWorker(call) ?? "worker"}
-						task={(call.args as { task?: string } | undefined)?.task}
-						badge={statusBadge(call)}
-						timestamp={timestamp}
-					>
-						<div className="mt-1">
-							<InteractionCard
-								interactionId={details.interactionId}
-								worker={delegateWorker(call) ?? "worker"}
-								requests={details.requests}
-								revision={details.revision}
-								windowId={details.windowId}
-								onOpenWindow={onOpenWindow}
-							/>
-						</div>
-					</WorkerTaskEntry>
-				);
-			}
 			const args = call.args as { task?: string } | undefined;
 			return (
 				<WorkerTaskEntry
@@ -503,6 +486,7 @@ function ToolCallItem({
 					isError={call.isError}
 					meta={toolCallMeta(call)}
 					timestamp={timestamp}
+					progress={call.progress}
 				/>
 			);
 		}
@@ -540,7 +524,7 @@ function ToolCallItem({
 	}
 	return (
 		<Task defaultOpen={call.status === "running" || call.status === "error"}>
-			<TaskTrigger title={`${TOOL_STATUS_LABEL[call.status]} · ${call.name}`} />
+			<TaskTrigger title={`${TOOL_STATUS_LABEL[call.status]} · ${call.name}`} icon={toolCallIcon(call.name)} />
 			<TaskContent>
 				{call.args !== undefined && (
 					<pre className="overflow-x-auto rounded-md bg-muted/60 p-2 text-xs">
@@ -623,7 +607,7 @@ function CustomMessageEntry({
 				worker={details?.worker ?? "worker"}
 				result={message.content}
 				badge={workerStatusBadge(details?.status)}
-				isError={Boolean(details?.status && details.status !== "completed")}
+				isError={Boolean(details?.status && details.status !== "completed" && details.status !== "needs_input")}
 				timestamp={message.timestamp}
 			/>
 		);

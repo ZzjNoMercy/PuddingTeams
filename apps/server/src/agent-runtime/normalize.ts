@@ -127,12 +127,16 @@ function needsInputResult(payload: Record<string, unknown>, needs?: Record<strin
 				.map((o) => (typeof o.id === "string" ? o.id : typeof o.name === "string" ? o.name : ""))
 				.filter(Boolean)
 		: [];
-	const kind: NeedsInputResult["interaction"]["kind"] =
-		needs && needs.type === "permission"
-			? "permission"
-			: needs && (needs.type === "confirmation" || needs.type === "skill_plan_confirmation_request")
-				? "confirmation"
-				: "question";
+	const needsType = typeof needs?.type === "string" ? needs.type : "";
+	const isPermission = needsType === "permission" || needsType === "permission_request";
+	const isConfirmation = needsType === "confirmation"
+		|| needsType === "skill_plan_confirmation"
+		|| needsType === "skill_plan_confirmation_request";
+	const kind: NeedsInputResult["interaction"]["kind"] = isPermission
+		? "permission"
+		: isConfirmation
+			? "confirmation"
+			: "question";
 
 	return {
 		...resultBase(payload),
@@ -147,9 +151,12 @@ function needsInputResult(payload: Record<string, unknown>, needs?: Record<strin
 					...(typeof needs?.command === "string" ? { command: needs.command } : {}),
 					...(typeof needs?.path === "string" ? { path: needs.path } : {}),
 					...(kind === "permission" || kind === "confirmation"
-						// 对齐 puddingclaw deploy-cli 的 respond 校验：scope 仅 once|session
-						// （旧默认里的 "run" 会被 CLI 以 protocol_error 拒绝）。
-						? { options: (["once", "session", "reject"] as const).filter((s) => !options.length || options.includes(s)) }
+						// PuddingClaw 的权限层会把精确授权目标编码进 option，例如
+						// exact_directory_run / exact_directory_session。它们是授权
+						// 目标，不是 Platform 对外协议的 scope；必须归一化为 CLI
+						// 能接受的 once/session。不能在丢失映射后回退成 session，
+						// 否则前端会展示一个服务端并未提供的长期授权按钮。
+						? { options: normalizeApprovalScopes(options) }
 						: options.length
 							? { options }
 							: undefined),
@@ -158,6 +165,30 @@ function needsInputResult(payload: Record<string, unknown>, needs?: Record<strin
 			],
 		},
 	};
+}
+
+/**
+ * Convert worker-specific permission options into the PWCP scope contract.
+ *
+ * PuddingClaw deliberately exposes target-qualified values (for example
+ * `exact_directory_session`) so the backend can enforce the exact grant. The
+ * Platform only needs to present the portable approval scope and the driver
+ * can then send `once`/`session` back to the worker. Unknown values are not
+ * promoted into a reusable scope; this is fail-closed.
+ */
+function normalizeApprovalScopes(options: string[]): string[] {
+	const scopes = new Set<string>();
+	for (const option of options) {
+		if (option === "once" || option === "run" || option.endsWith("_run")) {
+			scopes.add("once");
+		} else if (option === "session" || option.endsWith("_session")) {
+			scopes.add("session");
+		}
+	}
+	// An empty/unknown permission option set must not manufacture a reusable
+	// grant. A one-time approval is the safe compatibility default.
+	if (scopes.size === 0) scopes.add("once");
+	return [...scopes, "reject"];
 }
 
 function failedEvent(errorCode: string, error: string): AgentEvent {

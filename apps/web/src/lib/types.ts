@@ -175,6 +175,8 @@ export interface ToolCallView {
 	isError?: boolean;
 	/** Structured metadata folded from the tool result (delegate tool details). */
 	details?: unknown;
+	/** 运行中进度文本（tool_execution_update 的 partialResult，如 worker 委派进度）。 */
+	progress?: string;
 }
 
 export type ChatMessageRole = "user" | "assistant" | "toolResult" | "custom";
@@ -419,8 +421,10 @@ export interface AgentResponsibilityProfile {
 }
 
 export interface AgentConfig {
-	/** Unique agent id (used in the delegate tool name agent_<id>__delegate). */
+	/** 不可变内部 id（委托工具名 agent_<id>__delegate、URL 参数、存储键）。创建后不可改。 */
 	name: string;
+	/** 用户可见显示名，可随时改；缺省时展示回退 name。 */
+	displayName?: string;
 	description: string;
 	/** worker 的 legacy command invoke；manager 为 { type: "pi" }；可缺省（Connector 接入）。 */
 	invoke?: AgentInvoke;
@@ -443,6 +447,11 @@ export interface AgentConfig {
 	piResources?: PiResourceConfig;
 	/** Extension 配置版本（§3.3.5）。 */
 	extensionRevision?: number;
+}
+
+/** Agent 的显示名：displayName 缺省时回退内部 id（name）。所有展示位统一走这里。 */
+export function agentDisplayName(agent: Pick<AgentConfig, "name" | "displayName">): string {
+	return agent.displayName?.trim() || agent.name;
 }
 
 export interface WorkerProbeResult {
@@ -527,6 +536,8 @@ export interface RoomSession {
 	firstMessage: string;
 	modifiedAt: string;
 	active: boolean;
+	/** 会话当前模型 ref（`${provider}/${modelId}`）；composer 选择器以此为准。 */
+	model?: string;
 }
 
 export type SessionWorkStatus = "active" | "waiting_human" | "resolved" | "cancelled";

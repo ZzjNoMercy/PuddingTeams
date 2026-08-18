@@ -7,6 +7,8 @@ import type { AgentConfig, AgentResponsibilityProfile, PiManagerSettings, PiReso
  * 文本类字段保持字符串（owns 等每行一项、skillPaths 每行一个路径），保存时才解析。
  */
 export interface ConfigDraft {
+	/** 显示名（可改）；空串 = 清除，展示回退内部 id（agent.name）。 */
+	displayName: string;
 	description: string;
 	identity: string;
 	domain: string;
@@ -39,6 +41,7 @@ function splitPaths(value: string): string[] {
 export function draftFromAgent(agent: AgentConfig): ConfigDraft {
 	const resources = agent.piResources ?? {};
 	return {
+		displayName: agent.displayName ?? "",
 		description: agent.description ?? "",
 		identity: agent.responsibility?.identity ?? "",
 		domain: agent.responsibility?.domain ?? "",
@@ -104,6 +107,7 @@ export function buildConfigBody(
 	agent: AgentConfig,
 	draft: ConfigDraft,
 ): {
+	displayName: string | null;
 	description: string;
 	responsibility: AgentResponsibilityProfile | null;
 	manager?: Partial<PiManagerSettings>;
@@ -111,6 +115,8 @@ export function buildConfigBody(
 	piResources: PiResourceConfig;
 } {
 	const base = {
+		// 空串 → null：服务端清除显示名，展示回退内部 id。
+		displayName: draft.displayName.trim() || null,
 		description: draft.description.trim(),
 		responsibility: buildResponsibility(draft),
 		piResources: buildPiResources(draft),

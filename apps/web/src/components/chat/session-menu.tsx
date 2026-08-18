@@ -1,7 +1,7 @@
 "use client";
 
 import type { ReactElement } from "react";
-import { CheckIcon, PencilIcon, PlusIcon } from "lucide-react";
+import { CheckIcon, PencilIcon, PlusIcon, Trash2Icon } from "lucide-react";
 import {
 	DropdownMenu,
 	DropdownMenuContent,
@@ -13,7 +13,7 @@ import { homePortalContainer } from "@/lib/home-portal";
 
 function updateLabel(session: RoomSession): string {
 	const modifiedAt = new Date(session.modifiedAt);
-	if (Number.isNaN(modifiedAt.getTime())) return session.active ? "当前会话" : "";
+	if (Number.isNaN(modifiedAt.getTime())) return "";
 
 	const now = new Date();
 	const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -21,14 +21,11 @@ function updateLabel(session: RoomSession): string {
 	const dayDelta = Math.round((startOfToday.getTime() - startOfModified.getTime()) / 86_400_000);
 	const elapsed = Math.max(0, now.getTime() - modifiedAt.getTime());
 
-	let update: string;
-	if (elapsed < 60_000) update = "刚刚更新";
-	else if (elapsed < 3_600_000) update = `${Math.floor(elapsed / 60_000)} 分钟前更新`;
-	else if (dayDelta === 0) update = "今天更新";
-	else if (dayDelta === 1) update = "昨天更新";
-	else update = `${modifiedAt.getMonth() + 1}月${modifiedAt.getDate()}日更新`;
-
-	return session.active ? `当前会话 · ${update}` : update;
+	if (elapsed < 60_000) return "刚刚";
+	if (elapsed < 3_600_000) return `${Math.floor(elapsed / 60_000)} 分钟前`;
+	if (dayDelta === 0) return "今天";
+	if (dayDelta === 1) return "昨天";
+	return `${modifiedAt.getMonth() + 1}月${modifiedAt.getDate()}日`;
 }
 
 export function SessionMenu({
@@ -37,6 +34,7 @@ export function SessionMenu({
 	onSwitch,
 	onNew,
 	onRename,
+	onDelete,
 	align = "end",
 }: {
 	sessions: RoomSession[];
@@ -75,6 +73,17 @@ export function SessionMenu({
 							className="home-session-menu-edit"
 						>
 							<PencilIcon />
+						</button>
+						<button
+							type="button"
+							aria-label={`删除会话「${session.name || session.firstMessage || "新对话"}」`}
+							onClick={(event) => {
+								event.stopPropagation();
+								onDelete(session);
+							}}
+							className="home-session-menu-delete"
+						>
+							<Trash2Icon />
 						</button>
 					</DropdownMenuItem>
 				))}

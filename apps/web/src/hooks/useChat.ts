@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { abortSession, fetchMessages, sendMessage, sessionWsUrl, type MessageAttachmentInput } from "@/lib/api";
-import { reducePiEvent, renderHistory } from "@/lib/events";
+import { markRunningToolCalls, reducePiEvent, renderHistory } from "@/lib/events";
 import type { ChatMessage, ChatStatus, PiMessage } from "@/lib/types";
 
 export function useChat(sessionId: string) {
@@ -35,8 +35,8 @@ export function useChat(sessionId: string) {
 
 		const loadHistory = (initial = false) =>
 			fetchMessages(sessionId)
-				.then((msgs) => {
-					if (!disposed) setMessages(renderHistory(msgs as PiMessage[]));
+				.then(({ messages: msgs, runningToolCallIds }) => {
+					if (!disposed) setMessages(markRunningToolCalls(renderHistory(msgs as PiMessage[]), runningToolCallIds));
 					if (initial) markHistoryReady();
 				})
 				.catch((err: unknown) => {

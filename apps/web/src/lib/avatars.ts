@@ -9,12 +9,17 @@ import { agentAvatarUrl, listAgents } from "./api";
  * member popover, member message flow) and most call sites only know the
  * worker *name* — so instead of threading the avatar field through every
  * prop chain, this cache resolves name → avatar URL in one place.
+ *
+ * name/id 解耦后，同一注册表也缓存 name → displayName，供只有内部 id 的
+ * 展示位（委托卡、审批卡、等待提示）渲染显示名。
  */
 
 /** name -> per-agent cache-busting version (bumped on upload/delete). */
 const versions = new Map<string, number>();
 /** name -> uploaded avatar / connector-bundled avatar availability. */
 const avatarKinds = new Map<string, { uploaded: boolean; bundled: boolean }>();
+/** 内部 id（name）-> 显示名（displayName 缺省回退 name）。 */
+const displayNames = new Map<string, string>();
 const listeners = new Set<() => void>();
 let loading: Promise<void> | null = null;
 
@@ -32,6 +37,7 @@ function ensureLoaded(): void {
 					uploaded: Boolean(a.avatar),
 					bundled: Boolean(a.hasDefaultAvatar),
 				});
+				displayNames.set(a.name, a.displayName?.trim() || a.name);
 				if (!versions.has(a.name)) versions.set(a.name, 0);
 			}
 			emit();
@@ -54,7 +60,49 @@ export function agentAvatarChanged(name: string, uploaded: boolean): void {
 export function agentRemoved(name: string): void {
 	avatarKinds.delete(name);
 	versions.delete(name);
+	displayNames.delete(name);
 	emit();
+}
+
+/** Record a display-name change so every id-only 展示位即时刷新。 */
+export function agentRenamed(name: string, displayName?: string): void {
+	displayNames.set(name, displayName?.trim() || name);
+	emit();
+}
+
+/** 显示名快照（同步读取；首次渲染可能回退 id，ensureLoaded 完成后经 hook 刷新）。 */
+export function agentLabel(name: string): string {
+	return displayNames.get(name) ?? name;
+}
+
+/** 内部 id → 显示名的响应式 hook（委托卡/审批卡等只有 id 的展示位用）。 */
+export function useAgentLabel(name: string): string {
+	const [label, setLabel] = useState<string>(() => agentLabel(name));
+	useEffect(() => {
+		ensureLoaded();
+		const update = () => setLabel(agentLabel(name));
+		listeners.add(update);
+		update();
+		return () => {
+			listeners.delete(update);
+		};
+	}, [name]);
+	return label;
+}
+
+/** 全量 id → 显示名映射（列表类场景一次取用，避免变长 hook）。 */
+export function useAgentLabels(): Record<string, string> {
+	const [labels, setLabels] = useState<Record<string, string>>(() => Object.fromEntries(displayNames));
+	useEffect(() => {
+		ensureLoaded();
+		const update = () => setLabels(Object.fromEntries(displayNames));
+		listeners.add(update);
+		update();
+		return () => {
+			listeners.delete(update);
+		};
+	}, []);
+	return labels;
 }
 
 function currentUrl(name: string, uploadedOnly = false): string | null {

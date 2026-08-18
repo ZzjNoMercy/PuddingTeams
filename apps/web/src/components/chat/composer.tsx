@@ -46,9 +46,25 @@ async function encodeAttachment(item: PromptInputFilePart): Promise<MessageAttac
 	};
 }
 
-function ModelPicker({ sessionId }: { sessionId: string }) {
+function ModelPicker({
+	sessionId,
+	sessionModel,
+	onChanged,
+}: {
+	sessionId: string;
+	/** 会话真实模型 ref（服务端为准）；空表示尚未知晓，用本地偏好兜底。 */
+	sessionModel?: string;
+	onChanged?: (model: string) => void;
+}) {
 	const [models, setModels] = useState<ModelSummary[]>([]);
-	const [value, setValue] = useState<string>(() => getPreferredModel() ?? "");
+	const [value, setValue] = useState<string>(() => sessionModel ?? getPreferredModel() ?? "");
+	// 服务端模型后到达或切换会话（SessionChat 按 sessionId remount 后 rooms
+	// 数据刷新）时跟随真值；本地偏好只决定首次渲染。
+	const [prevSessionModel, setPrevSessionModel] = useState(sessionModel);
+	if (sessionModel !== prevSessionModel) {
+		setPrevSessionModel(sessionModel);
+		if (sessionModel) setValue(sessionModel);
+	}
 
 	useEffect(() => {
 		let cancelled = false;
@@ -57,10 +73,10 @@ function ModelPicker({ sessionId }: { sessionId: string }) {
 				.then((models) => {
 					if (cancelled) return;
 					setModels(models);
-					// Adopt the first model when nothing was picked yet (or the stored
-					// pick no longer exists), so the select never shows a dead value.
+					// 没有任何已知的模型时才收养目录第一个；已有值（会话真值或
+					// 本地偏好）即使已不在目录里也不覆盖——显示失效的真值好过错指。
 					setValue((prev) => {
-						if (prev && models.some((m) => m.id === prev)) return prev;
+						if (prev) return prev;
 						const next = models[0]?.id ?? "";
 						if (next) setPreferredModel(next);
 						return next;
@@ -80,9 +96,11 @@ function ModelPicker({ sessionId }: { sessionId: string }) {
 	const handleChange = (ref: string) => {
 		setValue(ref);
 		setPreferredModel(ref);
-		setSessionModel(sessionId, ref).catch((err: unknown) => {
-			toast.error(err instanceof Error ? err.message : String(err));
-		});
+		setSessionModel(sessionId, ref)
+			.then(() => onChanged?.(ref))
+			.catch((err: unknown) => {
+				toast.error(err instanceof Error ? err.message : String(err));
+			});
 	};
 
 	if (models.length === 0) return null;
@@ -123,6 +141,8 @@ function ComposerInner({
 	workspaceLabel,
 	workspacePath,
 	workspaceAvailable,
+	sessionModel,
+	onModelChanged,
 	onSend,
 	onStop,
 	onGoalCommand,
@@ -136,6 +156,9 @@ function ComposerInner({
 	workspaceLabel: string;
 	workspacePath: string;
 	workspaceAvailable: boolean;
+	/** 会话真实模型 ref（服务端 rooms 数据）。 */
+	sessionModel?: string;
+	onModelChanged?: (model: string) => void;
 	onSend: (text: string, attachments?: MessageAttachmentInput[]) => void | Promise<void>;
 	onStop: () => void;
 	onGoalCommand: (initialGoal: string) => void;
@@ -202,7 +225,7 @@ function ComposerInner({
 					<Button type="button" size="icon" variant="ghost" className="size-8" onClick={() => attachments.openFileDialog()} aria-label="添加附件" title="添加附件（最多 5 个，每个 8MB）">
 						<PaperclipIcon className="size-4" />
 					</Button>
-					<ModelPicker sessionId={sessionId} />
+					<ModelPicker sessionId={sessionId} sessionModel={sessionModel} onChanged={onModelChanged} />
 					<Button
 						type="button"
 						size="sm"
@@ -242,6 +265,8 @@ export function Composer({
 	workspaceLabel,
 	workspacePath,
 	workspaceAvailable,
+	sessionModel,
+	onModelChanged,
 	onSend,
 	onStop,
 	onGoalCommand,
@@ -255,6 +280,8 @@ export function Composer({
 	workspaceLabel: string;
 	workspacePath: string;
 	workspaceAvailable: boolean;
+	sessionModel?: string;
+	onModelChanged?: (model: string) => void;
 	onSend: (text: string, attachments?: MessageAttachmentInput[]) => void | Promise<void>;
 	onStop: () => void;
 	onGoalCommand: (initialGoal: string) => void;
@@ -274,6 +301,8 @@ export function Composer({
 						workspaceLabel={workspaceLabel}
 						workspacePath={workspacePath}
 						workspaceAvailable={workspaceAvailable}
+						sessionModel={sessionModel}
+						onModelChanged={onModelChanged}
 						onSend={onSend}
 						onStop={onStop}
 						onGoalCommand={onGoalCommand}

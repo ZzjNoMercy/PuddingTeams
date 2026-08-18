@@ -814,6 +814,18 @@ export class AgentRuntime {
 		return this.delegations.listDelegations(windowId, managerSessionId);
 	}
 
+	/**
+	 * 该 delegation 的 Run 是否在本进程内存中活着（activeRuns 只登记活 Run）。
+	 * 持久化状态 running/waiting_input 跨重启后可能没有活 Run（进程重启即死），
+	 * 历史重放的"仍在执行"标注必须以此为准，不能把陈旧记录标成运行中。
+	 */
+	isDelegationActive(delegationId: string): boolean {
+		for (const id of this.activeRuns.values()) {
+			if (id === delegationId) return true;
+		}
+		return false;
+	}
+
 	/** 列出窗口下的 interactions（审批卡列表对账，H3）。 */
 	async listInteractions(windowId?: string): Promise<InteractionRecord[]> {
 		return this.delegations.listInteractions(windowId);

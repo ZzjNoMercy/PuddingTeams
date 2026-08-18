@@ -216,7 +216,10 @@ export async function registerChatRoutes(
 	app.get<{ Params: { id: string } }>("/api/sessions/:id/messages", async (req, reply) => {
 		try {
 			const session = await store.open(req.params.id);
-			return { messages: session.messages };
+			// 仍在执行的委托（delegate 工具调用阻塞中）：前端历史重放会把无
+			// toolResult 的调用一律降级"已中断"，需要这个清单把它们标回 running。
+			const runningToolCallIds = invoker ? await invoker.runningDelegateToolCallIds(req.params.id) : [];
+			return { messages: session.messages, runningToolCallIds };
 		} catch (err) {
 			if (err instanceof Error && err.message.startsWith("Session not found")) {
 				return reply.code(404).send({ error: "session not found" });

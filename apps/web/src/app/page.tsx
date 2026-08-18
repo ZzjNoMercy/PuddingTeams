@@ -69,6 +69,13 @@ export default function Home() {
 		setRooms((prev) => prev.map((r) => (r.id === room.id ? room : r)));
 	}, []);
 
+	// manager 建房落定后立刻重拉房间列表，让新群聊马上出现在侧栏。
+	const handleRoomsMayHaveChanged = useCallback(() => {
+		listRooms()
+			.then((rooms) => setRooms(rooms))
+			.catch(() => undefined);
+	}, []);
+
 	const handleDelete = useCallback(
 		async (id: string) => {
 			try {
@@ -107,6 +114,7 @@ export default function Home() {
 						onOpenWindow={openWindow}
 						onRoomUpdated={handleRoomUpdated}
 						onOpenRoomList={() => setRoomsOpen(true)}
+						onRoomsMayHaveChanged={handleRoomsMayHaveChanged}
 					/>
 				) : (
 					<div className="flex flex-1 flex-col items-center justify-center gap-4 bg-muted/30">

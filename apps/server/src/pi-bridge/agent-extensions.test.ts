@@ -7,7 +7,7 @@ import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { TeamsStore, type AgentConfig } from "../store/teams.js";
 import { WorkStateStore } from "../store/work-state.js";
-import type { PiSessionStore } from "./session-store.js";
+import { PiSessionStore } from "./session-store.js";
 import { AgentRuntime } from "../agent-runtime/runtime.js";
 import { DelegationStore } from "../agent-runtime/delegation-store.js";
 import { InteractionSecretStore } from "../agent-runtime/interaction-secret-store.js";
@@ -423,6 +423,20 @@ test("Phase4: 搜索已激活的工具返回可直接调用，而不是没有匹
 	assert.ok(prompt.includes(`${delegateToolName("alpha")}（已激活）`), "roster 必须标注已激活工具");
 });
 
+test("Phase4: roster 渲染显示名（displayName），工具名仍用内部 id", async () => {
+	const teams = await makeTeams([{ ...agentConfig("alpha"), displayName: "阿尔法" }]);
+	const catalog = new ExtensionCatalog();
+	const ctx: ManagerWindowContext = { type: "direct", members: ["alpha"], displayNames: { alpha: "阿尔法" } };
+	const plan = await planManagerTools(teams, catalog, ctx);
+	const prompt = rosterPromptSection(plan, ctx);
+	assert.ok(prompt.includes("- 阿尔法"), "roster 行首必须是显示名");
+	assert.ok(prompt.includes(delegateToolName("alpha")), "工具名仍用内部 id");
+	// 单聊 guidance 同样渲染显示名。
+	const guidance = PiSessionStore.resolveGuidance(ctx);
+	assert.ok(guidance?.includes("worker「阿尔法」"), `guidance 必须渲染显示名，实际：${guidance}`);
+	assert.ok(guidance?.includes(delegateToolName("alpha")), "guidance 工具名仍用内部 id");
+});
+
 test("Phase4: roster 由 before_agent_start 注入 system prompt 且每轮刷新", async () => {
 	const teams = await makeTeams([agentConfig("alpha"), agentConfig("beta")]);
 	const catalog = new ExtensionCatalog();
@@ -630,6 +644,38 @@ test("manager 建房: solo create_group_window 建成群聊并 fire-and-forget �
 	);
 });
 
+test("manager 建房: members 接受显示名并解析为内部 id（name/id 解耦）", async () => {
+	const { store, cwd } = await makeTeamsWithCwd([
+		agentConfig("alpha", { displayName: "阿尔法" }),
+		agentConfig("pi-b", { displayName: "Designer" }),
+	]);
+	const mockSessions = {
+		create: async () => ({ id: "group-session-1" }),
+		open: async () => ({ prompt: async () => {} }),
+		generateSessionTitle: async () => undefined,
+	};
+	const ctx: ManagerWindowContext = { type: "solo", members: [], cwd };
+	const tools = await registerCoreTools(makeRoomDeps(store, ctx, mockSessions));
+	const create = tools.get(CORE_TOOL_CREATE_GROUP)!;
+
+	const result = await create.execute(
+		"call-1",
+		{ members: ["阿尔法", "Designer"], task: "做一份报告" },
+		undefined,
+		undefined,
+		{} as ExtensionContext,
+	);
+	const details = result.details as { windowId: string; members: string[] };
+	assert.deepEqual(details.members, ["alpha", "pi-b"], "显示名必须解析为内部 id 落库");
+	assert.deepEqual((await store.getWindow(details.windowId))!.members, ["alpha", "pi-b"]);
+
+	// roster 里显示名与 id 不同时必须标注 id，manager 才能完成映射。
+	const plan = await planManagerTools(store, new ExtensionCatalog(), ctx);
+	const roster = rosterPromptSection(plan, ctx);
+	assert.ok(roster.includes("阿尔法（id：alpha）"), "roster 行必须标注内部 id");
+	assert.ok(roster.includes("Designer（id：pi-b）"), "roster 行必须标注内部 id");
+});
+
 test("manager 建房: create_group_window 在 direct/group 被拒绝；invite_to_group 在 solo 被拒绝", async () => {
 	const { store, cwd } = await makeTeamsWithCwd([agentConfig("alpha"), agentConfig("beta")]);
 	const directTools = await registerCoreTools(
@@ -695,4 +741,62 @@ test("manager 拉人: group invite_to_group 加入新成员，roster 重算后�
 	const again = await invite.execute("call-2", { members: ["gamma"] }, undefined, undefined, {} as ExtensionContext);
 	assert.ok((again.content[0] as { text: string }).text.includes("无需重复拉人"));
 	assert.deepEqual((await store.getWindow(window.id))!.members, ["alpha", "beta", "gamma"], "重复拉人不改动成员");
+});
+
+test("solo 派活: worker 单聊绑在其他项目时复用并原地切换到 solo 当前项目", async () => {
+	const { store, cwd } = await makeTeamsWithCwd([agentConfig("alpha")]);
+	const invoker = await makeInvoker(store, "alpha");
+	// solo 单例（无项目，默认 cwd）；alpha 的单聊绑在项目 A。
+	await store.ensureSoloWindow(async () => ({ id: "sess-solo" }), async () => true);
+	const wsA = await store.workspaces.createManaged("proj-a");
+	const direct = await store.createWindow({ type: "direct", members: ["alpha"], workspaceId: wsA.id, sessionId: "sess-alpha" });
+
+	const createdIds: string[] = [];
+	const removedIds: string[] = [];
+	const sessions = {
+		create: async () => {
+			const id = `sess-new-${createdIds.length + 1}`;
+			createdIds.push(id);
+			return { id };
+		},
+		remove: async (id: string) => {
+			removedIds.push(id);
+			return true;
+		},
+		list: async () => [],
+		sendCustomMessage: async () => undefined,
+		ensureSessionFile: async () => undefined,
+		open: async () => ({ isIdle: true, waitForIdle: async () => {}, sendCustomMessage: async () => ({}) }),
+	};
+	const ctx: ManagerWindowContext = { type: "solo", members: [], cwd };
+	const deps: ManagerExtensionDeps = {
+		store,
+		sessions: sessions as never,
+		invoker,
+		catalog: new ExtensionCatalog(),
+		getSessionId: () => "sess-solo",
+		ctx,
+		resolveContext: async () => ctx,
+	};
+	const plan = await planManagerTools(store, deps.catalog, ctx);
+	const { pi, tools } = mockPi();
+	for (const ext of buildManagerExtensionFactories(plan, deps)) {
+		const factory = typeof ext === "function" ? ext : ext.factory;
+		await factory(pi);
+	}
+
+	const result = await tools.get(delegateToolName("alpha"))!.execute(
+		"call-1",
+		{ task: "做个报告" },
+		undefined,
+		undefined,
+		{} as ExtensionContext,
+	);
+	const details = result.details as { windowId?: string };
+	assert.equal(details.windowId, direct.id, "必须复用既有单聊，不得按项目另开窗口");
+	const after = (await store.getWindow(direct.id))!;
+	assert.equal(after.workspaceId, undefined, "复用后窗口必须已原地切到 solo 当前上下文（无项目）");
+	assert.deepEqual(createdIds, ["sess-new-1"], "只发生原地切换的一次会话重建，不得走 ensureDirectWindow 新建窗口");
+	assert.deepEqual(removedIds, ["sess-alpha"], "原地切换后旧会话被清理，新会话成为窗口活跃会话");
+	assert.equal((await store.listWindows()).filter((w) => w.type === "direct" && w.members[0] === "alpha").length, 1, "同一 worker 仍然只有一个单聊");
 });

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Type, type Static } from "typebox";
 import type { ExtensionAPI, InlineExtension } from "@earendil-works/pi-coding-agent";
-import type { TeamsStore, AgentConfig, WindowConfig, WindowType } from "../store/teams.js";
+import { agentDisplayName, type TeamsStore, type AgentConfig, type WindowConfig, type WindowType } from "../store/teams.js";
 import { WorkStateConflictError, type WorkStateStore } from "../store/work-state.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import {
@@ -51,7 +51,10 @@ export const CORE_TOOL_INVITE = "invite_to_group";
 /** manager Session 的窗口上下文（装配时解析，工具执行期按需重读）。 */
 export interface ManagerWindowContext {
 	type: WindowType;
+	/** 成员的内部 id（AgentConfig.name）；提示词渲染用 displayNames 映射成显示名。 */
 	members: string[];
+	/** 成员 id → 显示名（装配时快照）；缺省时回退 id 本身。 */
+	displayNames?: Record<string, string>;
 	prompt?: string;
 	workspaceId?: string;
 	/** manager 与 worker 必须共享的项目 cwd。 */
@@ -225,15 +228,28 @@ const RequestDecisionParams = Type.Object({
 });
 
 const CreateGroupParams = Type.Object({
-	members: Type.Array(Type.String(), { description: "群聊成员：≥2 个已启用 worker 名。" }),
+	members: Type.Array(Type.String(), { description: "群聊成员：≥2 个已启用 worker，填内部 id 或显示名（roster 中括号标注的 id 为准）。" }),
 	task: Type.String({ description: "下达给房间 manager 的首条整体任务（它会再拆分给成员）。" }),
 	name: Type.Optional(Type.String({ description: "群聊名称（可选，留空由首条任务自动生成）。" })),
 	prompt: Type.Optional(Type.String({ description: "群聊协作提示词：只给该房间 manager 的分工/交接/汇总规则（可选）。" })),
 });
 
 const InviteToGroupParams = Type.Object({
-	members: Type.Array(Type.String(), { description: "要拉入本群的已启用 worker 名（≥1）。" }),
+	members: Type.Array(Type.String(), { description: "要拉入本群的已启用 worker（≥1），填内部 id 或显示名。" }),
 });
+
+/**
+ * 成员引用解析：manager 在 roster 里看到的是显示名，存储与窗口成员用内部
+ * id。先按 id 精确命中，再按显示名唯一匹配（大小写不敏感）；多义或未命中
+ * 返回 undefined，由调用方报错提示改用 id。
+ */
+async function resolveWorkerRef(store: TeamsStore, ref: string): Promise<AgentConfig | undefined> {
+	const byId = await store.getAgent(ref);
+	if (byId) return byId;
+	const lower = ref.toLowerCase();
+	const matches = (await store.listAgents()).filter((a) => agentDisplayName(a).toLowerCase() === lower);
+	return matches.length === 1 ? matches[0] : undefined;
+}
 
 /**
  * roster 的 system prompt 段落（每轮由 before_agent_start 重算）。成员名单是
@@ -261,7 +277,11 @@ export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowCon
 				].join("")
 			: "";
 		const toolList = tools.map((n) => (plan.active.has(n) ? `${n}（已激活）` : n)).join("、");
-		return `- ${a.name}${identity}：${a.description || "（无描述）"}${caps}${responsibility}\n  工具：${toolList}`;
+		const label = agentDisplayName(a);
+		// 显示名与内部 id 不同则标注 id：create_group_window / invite_to_group
+		// 的 members 以 id 为准，manager 必须能自己完成映射。
+		const idNote = label !== a.name ? `（id：${a.name}）` : "";
+		return `- ${label}${idNote}${identity}：${a.description || "（无描述）"}${caps}${responsibility}\n  工具：${toolList}`;
 	});
 	const soloCtx = !ctx || ctx.type === "solo";
 	return [
@@ -270,7 +290,7 @@ export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowCon
 		`标注「已激活」的工具可直接调用，不要再搜索；未激活的先用 ${CORE_TOOL_SEARCH} 按名称激活后再调用。若调用返回工具不存在（Tool ... not found），说明它当前未激活（服务重启后会话重建会重置激活态）：用 ${CORE_TOOL_SEARCH} 激活后重试一次即可，不要当作 worker 不可用。只有搜索不到该 worker 的工具、或激活后调用仍被明确拒绝时，才说明该 worker 已不可用，不要继续重试。`,
 		...(soloCtx
 			? [
-					`需要多个 worker 协作（拆分、并行、交接、裁决）时，用 ${CORE_TOOL_CREATE_GROUP} 建群聊并把整体任务下达给房间 manager，不要把多 worker 任务塞进单个 worker 的单聊委托。`,
+					`只要任务需要两个及以上 worker——包括串行交接（一个 worker 的产出是另一个的输入，如"先查数据再做 PPT"）——就用 ${CORE_TOOL_CREATE_GROUP} 建群聊并把整体任务下达给房间 manager，让 worker 在群里直接交接、用户全程旁观。不要在 solo 里逐个单聊派活、自己搬运中间结果。只有纯单 worker 任务才直接委托该 worker。`,
 				]
 			: []),
 		...(ctx?.type === "group"
@@ -507,14 +527,21 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 				const ctx = await deps.resolveContext();
 				if (!ctx) throw new Error("当前 manager Session 不属于任何窗口，不能建群聊");
 				if (ctx.type !== "solo") throw new Error(`${CORE_TOOL_CREATE_GROUP} 仅 solo 对话可用`);
-				const members = [...new Set(params.members.map((m) => m.trim()).filter(Boolean))];
-				if (members.length < 2) throw new Error("群聊至少需要 2 个 worker");
-				for (const name of members) {
-					const agent = await deps.store.getAgent(name);
+				const refs = [...new Set(params.members.map((m) => m.trim()).filter(Boolean))];
+				if (refs.length < 2) throw new Error("群聊至少需要 2 个 worker");
+				const memberAgents: AgentConfig[] = [];
+				for (const ref of refs) {
+					const agent = await resolveWorkerRef(deps.store, ref);
 					if (!agent || agent.pinned || agent.enabled === false) {
-						throw new Error(`worker「${name}」不存在、是内置 manager 或已被禁用，不能入群`);
+						throw new Error(`worker「${ref}」不存在、是内置 manager 或已被禁用，不能入群（members 请使用 roster 中括号标注的内部 id）`);
 					}
+					if (memberAgents.some((a) => a.name === agent.name)) {
+						throw new Error(`worker「${ref}」与其他成员重复，不能入群`);
+					}
+					memberAgents.push(agent);
 				}
+				const members = memberAgents.map((a) => a.name);
+				const memberLabels = memberAgents.map((a) => agentDisplayName(a));
 				// 与 rooms.ts 建房链路一致：先建 manager Session，再落窗口记录。
 				const owner = await deps.store.windowForSession(deps.getSessionId());
 				const cwd = ctx.cwd ?? (owner ? await deps.store.workspaceFor(owner.id) : undefined);
@@ -544,12 +571,12 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 						deps.log?.(`create_group_window 首发任务失败: ${err instanceof Error ? err.message : String(err)}`),
 					);
 				void deps.sessions.generateSessionTitle(created.id, params.task).catch(() => undefined);
-				const displayName = window.name ?? members.join("、");
+				const displayName = window.name ?? memberLabels.join("、");
 				return {
 					content: [
 						{
 							type: "text",
-							text: `已创建群聊「${displayName}」（成员：${members.join("、")}），任务已下达，房间 manager 开始执行。用户可在左侧群聊区查看进度；如需追加指令，让用户直接在群聊窗口里发言。`,
+							text: `已创建群聊「${displayName}」（成员：${memberLabels.join("、")}），任务已下达，房间 manager 开始执行。用户可在左侧群聊区查看进度；如需追加指令，让用户直接在群聊窗口里发言。`,
 						},
 					],
 					details: { windowId: window.id, members, ...(window.name ? { name: window.name } : {}), roomJump: true },
@@ -571,17 +598,19 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 				const requested = [...new Set(params.members.map((m) => m.trim()).filter(Boolean))];
 				if (requested.length === 0) throw new Error("至少填写 1 个要拉入的 worker");
 				const added: string[] = [];
+				const addedLabels: string[] = [];
 				const skipped: string[] = [];
-				for (const name of requested) {
-					if (window.members.includes(name)) {
-						skipped.push(name);
+				for (const ref of requested) {
+					const agent = await resolveWorkerRef(deps.store, ref);
+					if (!agent || agent.pinned || agent.enabled === false) {
+						throw new Error(`worker「${ref}」不存在、是内置 manager 或已被禁用，不能入群（members 请使用 roster 中括号标注的内部 id）`);
+					}
+					if (window.members.includes(agent.name) || added.includes(agent.name)) {
+						skipped.push(agentDisplayName(agent));
 						continue;
 					}
-					const agent = await deps.store.getAgent(name);
-					if (!agent || agent.pinned || agent.enabled === false) {
-						throw new Error(`worker「${name}」不存在、是内置 manager 或已被禁用，不能入群`);
-					}
-					added.push(name);
+					added.push(agent.name);
+					addedLabels.push(agentDisplayName(agent));
 				}
 				if (added.length === 0) {
 					return {
@@ -595,7 +624,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 					content: [
 						{
 							type: "text",
-							text: `已把 ${added.join("、")} 拉进群聊${skipped.length ? `（${skipped.join("、")} 已在群内，跳过）` : ""}。新成员将进入 worker 清单，其委托工具在会话装配刷新后可用。`,
+							text: `已把 ${addedLabels.join("、")} 拉进群聊${skipped.length ? `（${skipped.join("、")} 已在群内，跳过）` : ""}。新成员将进入 worker 清单，其委托工具在会话装配刷新后可用。`,
 						},
 					],
 					details: { windowId: window.id, members: updated.members, added, skipped },
@@ -635,6 +664,49 @@ const DelegateParams = Type.Object(
 type DelegateInput = Static<typeof DelegateParams>;
 
 /**
+ * solo 派活的单聊解析（用户拍板「复用并原地切项目」）：同一 worker 优先
+ * 只有一个单聊。当前项目有 exact 窗口直接用；否则找该 worker 的任一单聊，
+ * 无进行中任务时原地切换到 solo 当前项目（switchWorkspaceInPlace 会取消
+ * 窗口内活 Run，所以忙时绝不切换）；忙或切换失败则按项目新建兜底。
+ */
+async function resolveDirectWindowForDelegation(
+	deps: ManagerExtensionDeps,
+	agentName: string,
+	workspaceId: string | undefined,
+	cwd: string,
+): Promise<WindowConfig> {
+	const exact = await deps.store.findDirectWindow(agentName, workspaceId, cwd);
+	if (exact) return exact;
+	const candidate = (await deps.store.listWindows()).find((w) => w.type === "direct" && w.members[0] === agentName);
+	if (candidate && (await deps.invoker.activeDelegations(candidate.id)).length === 0) {
+		try {
+			const switched = await deps.invoker.switchWorkspaceInPlace(
+				candidate.id,
+				workspaceId,
+				(fresh, nextCwd) =>
+					deps.sessions.create(undefined, {
+						type: fresh.type,
+						members: fresh.members,
+						prompt: fresh.prompt,
+						workspaceId,
+						cwd: nextCwd,
+					}),
+				(id) => deps.sessions.remove(id),
+			);
+			return switched.window;
+		} catch {
+			// 切换失败（目录失效等）走新建兜底，不阻断派活。
+		}
+	}
+	return deps.store.ensureDirectWindow(
+		agentName,
+		workspaceId,
+		() => deps.sessions.create(undefined, { type: "direct", members: [agentName], workspaceId, cwd }),
+		{ cwdSnapshot: cwd },
+	);
+}
+
+/**
  * 平台生成的基础 agent-delegation Extension（§10.2）：每个 roster Agent 一个，
  * 只注册稳定的委托工具 `agent_<agentId>__delegate`。工具绑定 agentId，参数里
  * 没有 agent 字段，无法改投其他 Agent；启用状态与成员关系由 AgentInvoker
@@ -649,20 +721,27 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 		if (!solo) return;
 		try {
 			const workspaceId = deps.ctx?.workspaceId;
-			const direct = await deps.store.findDirectWindow(agent.name, workspaceId, deps.ctx?.cwd);
+			// 与 resolveDirectWindowForDelegation 的复用策略一致：先看当前项目
+			// exact 窗口，否则该 worker 的任一单聊（派活时会原地切到当前项目）。
+			const exact = await deps.store.findDirectWindow(agent.name, workspaceId, deps.ctx?.cwd);
+			const reused = exact
+				? undefined
+				: (await deps.store.listWindows()).find((w) => w.type === "direct" && w.members[0] === agent.name);
+			const direct = exact ?? reused;
 			let windowInfo = "单聊：无（首次派活时自动创建）";
 			if (direct) {
 				const byId = new Map((await deps.sessions.list()).map((s) => [s.id, s]));
 				const infos = direct.sessions.map((id) => byId.get(id)).filter((s): s is NonNullable<typeof s> => Boolean(s));
+				const suffix = reused ? "（绑定了其他项目，派活时自动切换到当前项目）" : "";
 				windowInfo = infos.length
-					? `单聊现有会话：${infos
+					? `单聊现有会话${suffix}：${infos
 							.slice(0, 3)
 							.map(
 								(s) =>
 									`「${s.firstMessage || "新对话"}」（最近活跃 ${s.modifiedAt.slice(0, 16).replace("T", " ")}）`,
 							)
 							.join("；")}`
-					: "单聊：已有窗口，暂无历史会话";
+					: `单聊：已有窗口${suffix}，暂无历史会话`;
 			}
 			soloSummary = windowInfo;
 		} catch {
@@ -672,7 +751,7 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 	void refreshSoloSummary();
 
 	const baseDescription = [
-		`把任务委托给 worker「${agent.name}」（${agent.responsibility?.identity ? `${agent.responsibility.identity}；` : ""}${agent.description || "无描述"}）并返回最终结果。`,
+		`把任务委托给 worker「${agentDisplayName(agent)}」（${agent.responsibility?.identity ? `${agent.responsibility.identity}；` : ""}${agent.description || "无描述"}）并返回最终结果。`,
 		agent.responsibility
 			? `责任领域：${agent.responsibility.domain}；负责：${agent.responsibility.owns.join("、") || "未细分"}；不负责：${agent.responsibility.excludes.join("、") || "未声明"}。`
 			: "",
@@ -683,7 +762,7 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 	return (pi) => {
 		pi.registerTool({
 			name: delegateToolName(agent.name),
-			label: `${agent.name} · 委托`,
+			label: `${agentDisplayName(agent)} · 委托`,
 			get description() {
 				if (!solo) return baseDescription;
 				return [
@@ -724,15 +803,7 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 					if (!window) throw new Error("当前 manager Session 不属于任何窗口，不能派活");
 					const workspaceId = window.workspaceId;
 					const cwd = await deps.store.workspaceFor(window.id);
-					targetWindow = await deps.store.ensureDirectWindow(agent.name, workspaceId, () =>
-						deps.sessions.create(undefined, {
-							type: "direct",
-							members: [agent.name],
-							workspaceId,
-							cwd,
-						}),
-						{ cwdSnapshot: cwd },
-					);
+					targetWindow = await resolveDirectWindowForDelegation(deps, agent.name, workspaceId, cwd);
 				}
 
 				deps.log?.(`${delegateToolName(agent.name)}: ${sessionId} → ${agent.name} (task len ${params.task.length})`);

@@ -126,6 +126,28 @@ export function renderHistory(msgs: PiMessage[]): ChatMessage[] {
 	return out;
 }
 
+/**
+ * 回放降级兜底：renderHistory 会把没有 toolResult 的调用一律标成"已中断"，
+ * 但 delegate 这类长阻塞调用在委派期间本来就没有 toolResult。服务端在
+ * /messages 响应里给出仍在运行的 toolCallId 清单，这里把它们标回 running。
+ */
+export function markRunningToolCalls(messages: ChatMessage[], runningIds: string[]): ChatMessage[] {
+	if (runningIds.length === 0) return messages;
+	const running = new Set(runningIds);
+	let changed = false;
+	const next = messages.map((msg) => {
+		if (!msg.toolCalls.some((t) => t.status === "interrupted" && running.has(t.id))) return msg;
+		changed = true;
+		return {
+			...msg,
+			toolCalls: msg.toolCalls.map((t) =>
+				t.status === "interrupted" && running.has(t.id) ? { ...t, status: "running" as const } : t,
+			),
+		};
+	});
+	return changed ? next : messages;
+}
+
 function findLastAssistant(messages: ChatMessage[]): number {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		if (messages[i]!.role === "assistant") return i;
@@ -158,6 +180,7 @@ function upsertToolCall(messages: ChatMessage[], patch: Partial<ToolCallView> & 
 					result: patch.result,
 					details: patch.details,
 					isError: patch.isError,
+					progress: patch.progress,
 				},
 			];
 	return messages.map((m, i) => (i === idx ? { ...m, toolCalls } : m));
@@ -304,12 +327,15 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 			});
 		}
 		case "tool_execution_update": {
-			// Live progress from tools (delegate tool onUpdate). The tool call is
-			// already running; keep it visible in case a start was missed.
+			// Live progress from tools (delegate tool onUpdate → partialResult).
+			// The tool call is already running; keep it visible in case a start
+			// was missed, and surface the progress text on the card.
+			const { text } = extractToolResult(event.partialResult);
 			return upsertToolCall(messages, {
 				id: event.toolCallId as string,
 				name: event.toolName as string,
 				status: "running",
+				progress: text || undefined,
 			});
 		}
 		case "tool_execution_end": {

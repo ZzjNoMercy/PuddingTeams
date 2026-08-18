@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { TeamsStore, type AgentConfig, type WindowConfig, type WindowType } from "../store/teams.js";
+import { TeamsStore, agentDisplayName, type AgentConfig, type WindowConfig, type WindowType } from "../store/teams.js";
 import { PiSessionStore } from "../pi-bridge/session-store.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import { isWorkspaceDirectoryAvailable, type WorkspaceSummary } from "../store/workspaces.js";
@@ -17,6 +17,8 @@ export interface RoomSessionSummary {
 	firstMessage: string;
 	modifiedAt: string;
 	active: boolean;
+	/** 会话当前模型 ref（`${provider}/${modelId}`），composer 选择器的真值来源。 */
+	model?: string;
 }
 
 export interface RoomSummary {
@@ -44,8 +46,9 @@ const TYPE_ORDER: Record<WindowType, number> = { solo: 0, direct: 1, group: 2 };
 
 function autoTitle(w: WindowConfig, members: AgentConfig[]): string {
 	if (w.type === "solo") return "与 pi manager 对话";
-	if (w.type === "direct") return `与 ${w.members[0] ?? members[0]?.name ?? ""} 单聊`;
-	return `群聊：${(members.length ? members : []).map((m) => m.name).join("、") || w.members.join("、")}`;
+	// 标题渲染显示名（缺省回退 id）；w.members 里是内部 id。
+	if (w.type === "direct") return `与 ${members[0] ? agentDisplayName(members[0]) : (w.members[0] ?? "")} 单聊`;
+	return `群聊：${(members.length ? members : []).map((m) => agentDisplayName(m)).join("、") || w.members.join("、")}`;
 }
 
 async function buildWindowSummary(
@@ -82,6 +85,7 @@ async function buildWindowSummary(
 				firstMessage: info?.firstMessage ?? "新对话",
 				modifiedAt: info?.modifiedAt ?? "",
 				active: id === active,
+				model: info?.model,
 			};
 		}),
 		activeSession: active,

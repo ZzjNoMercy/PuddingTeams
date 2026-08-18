@@ -403,6 +403,40 @@ test("Phase1 回归: needs_input 归一化只产生一个 request，选项不破
 	assert.equal(ps.continuation_token, undefined, "无 continuation_token 时 providerState 不含 token");
 });
 
+test("PuddingClaw 权限目标 scope 归一化为 CLI 可接受的 once/session", async () => {
+	const { normalizePuddingClawJson } = await import("../agent-runtime/normalize.js");
+	const event = normalizePuddingClawJson({
+		status: "needs_input",
+		request_id: "perm-req-shell-test",
+		needs_input: {
+			type: "permission_request",
+			prompt: "允许终端访问目录？",
+			options: [
+				{ id: "exact_directory_run" },
+				{ id: "exact_directory_session" },
+			],
+		},
+	});
+	assert.equal(event.type, "input_required");
+	if (event.type !== "input_required") return;
+	assert.deepEqual(event.result.interaction.requests[0]?.options, ["once", "session", "reject"]);
+});
+
+test("未知或仅一次性权限 option 不制造 session 授权", async () => {
+	const { normalizePuddingClawJson } = await import("../agent-runtime/normalize.js");
+	const event = normalizePuddingClawJson({
+		status: "needs_input",
+		needs_input: {
+			type: "permission",
+			prompt: "允许一次执行？",
+			options: [{ id: "exact_shell_run" }],
+		},
+	});
+	assert.equal(event.type, "input_required");
+	if (event.type !== "input_required") return;
+	assert.deepEqual(event.result.interaction.requests[0]?.options, ["once", "reject"]);
+});
+
 
 /**
  * Phase6 回归：run 模式 completed outcome 必须携带更新后的 delegation

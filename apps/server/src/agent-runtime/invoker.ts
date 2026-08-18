@@ -1,4 +1,4 @@
-import { TeamsStore, type AgentConfig, type WindowConfig } from "../store/teams.js";
+import { TeamsStore, agentDisplayName, type AgentConfig, type WindowConfig } from "../store/teams.js";
 import { CredentialsStore } from "../store/credentials.js";
 import { AgentRuntime, SessionConflictError } from "./runtime.js";
 import type { DelegationRecord } from "./delegation-store.js";
@@ -83,6 +83,19 @@ export class AgentInvoker {
 		sender: AgentInvoker["managerSender"],
 	): void {
 		this.managerSender = sender;
+	}
+
+	/**
+	 * 该 manager Session 里仍在执行的委托的工具调用 id 列表（历史重放修正
+	 * "已中断"误标用）：以内存中的活 Run 为准（isDelegationActive），持久化
+	 * 的 running/waiting_input 跨重启后不算数。
+	 */
+	async runningDelegateToolCallIds(managerSessionId: string): Promise<string[]> {
+		const list = await this.runtime.listDelegations(undefined, managerSessionId);
+		return list
+			.filter((d) => (d.status === "running" || d.status === "waiting_input") && this.runtime.isDelegationActive(d.id))
+			.map((d) => d.managerToolCallId)
+			.filter((id): id is string => Boolean(id));
 	}
 
 	/** Serialize the short transition boundary for one window. */
@@ -306,11 +319,11 @@ export class AgentInvoker {
 			if (err instanceof SessionConflictError) {
 				// M5：冲突时把该 session 已有的 pending interaction 一起带出，
 				// 前端才能折叠/跳转到真正的审批卡（solo 派活时卡片在对方的单聊窗口）。
-				const agentName = agent?.name ?? params.agent.name;
-				const pending = await this.pendingInteractionFor(agentName, windowId);
+				const conflictAgent = agent ?? params.agent;
+				const pending = await this.pendingInteractionFor(conflictAgent.name, windowId);
 				return {
 					status: "conflict",
-					content: `worker「${agentName}」的会话仍在等待上一个任务的审批，不能发起新任务（409）。请先在上一个审批卡上操作。`,
+					content: `worker「${agentDisplayName(conflictAgent)}」的会话仍在等待上一个任务的审批，不能发起新任务（409）。请先在上一个审批卡上操作。`,
 					details: {
 						conflict: true,
 						sessionHandle,
@@ -348,7 +361,7 @@ export class AgentInvoker {
 						managerSessionId,
 						{
 							customType: "pudding:interaction_required",
-							content: `worker「${agent.name}」需要人工审批才能继续。`,
+							content: `worker「${agentDisplayName(agent)}」需要人工审批才能继续。`,
 							details: {
 								interactionId: interaction.id,
 								delegationId: d.id,
@@ -371,7 +384,7 @@ export class AgentInvoker {
 				return {
 					...base,
 					status: "needs_input",
-					content: `worker「${agent.name}」需要人工审批才能继续（已保存待处理请求，不会重跑任务）。`,
+					content: `worker「${agentDisplayName(agent)}」需要人工审批才能继续（已保存待处理请求，不会重跑任务）。`,
 					details: {
 						interactionId: interaction.id,
 						delegationId: d.id,
@@ -402,7 +415,7 @@ export class AgentInvoker {
 				return {
 					...base,
 					status: "failed",
-					content: `worker「${agent.name}」执行出错：${err}`,
+					content: `worker「${agentDisplayName(agent)}」执行出错：${err}`,
 					details: {
 						...(result?.meta ?? {}),
 						errorCode: result && "errorCode" in result ? result.errorCode : undefined,
@@ -544,6 +557,8 @@ export class AgentInvoker {
 		// direct 直派（§5.2）：manager session 就是 direct 窗口自己的 session，
 		// 窗口无 manager 回合，结果卡只展示、不唤醒 manager 汇总。
 		const managerWindow = d.managerSessionId ? await this.teams.windowForSession(d.managerSessionId) : undefined;
+		// 卡面文案渲染显示名；details.worker 保留内部 id（机器消费，前端映射）。
+		const workerLabel = agentDisplayName((await this.teams.getAgent(d.agentId)) ?? { name: d.agentId });
 		const taskResultOptions =
 			managerWindow?.type === "direct"
 				? ({ triggerTurn: false } as const)
@@ -556,7 +571,7 @@ export class AgentInvoker {
 				const details = { ...(outcome.result.meta ?? {}), artifacts: outcome.result.artifacts, usage: outcome.result.usage };
 				const resolved = {
 					customType: "pudding:interaction_resolved",
-					content: `worker「${d.agentId}」的审批已通过。`,
+					content: `worker「${workerLabel}」的审批已通过。`,
 					details: {
 						interactionId,
 						delegationId: d.id,
@@ -592,7 +607,7 @@ export class AgentInvoker {
 			case "rejected": {
 				const resolved = {
 					customType: "pudding:interaction_resolved",
-					content: `worker「${d.agentId}」的审批被拒绝，任务已取消。`,
+					content: `worker「${workerLabel}」的审批被拒绝，任务已取消。`,
 					details: { interactionId, delegationId: d.id, worker: d.agentId, status: "rejected" },
 				};
 				const taskResult = {
@@ -622,7 +637,7 @@ export class AgentInvoker {
 				const details = { ...(outcome.result.meta ?? {}), errorCode: "errorCode" in outcome.result ? outcome.result.errorCode : undefined };
 				const resolved = {
 					customType: "pudding:interaction_resolved",
-					content: `worker「${d.agentId}」的审批已通过，但任务执行失败。`,
+					content: `worker「${workerLabel}」的审批已通过，但任务执行失败。`,
 					details: { interactionId, delegationId: d.id, worker: d.agentId, status: "failed" },
 				};
 				const taskResult = {
@@ -653,7 +668,7 @@ export class AgentInvoker {
 				if (outcome.interaction) {
 					const required = {
 						customType: "pudding:interaction_required",
-						content: `worker「${d.agentId}」需要更多审批才能继续。`,
+						content: `worker「${workerLabel}」需要更多审批才能继续。`,
 						details: {
 							interactionId: outcome.interaction.id,
 							delegationId: d.id,
@@ -675,7 +690,7 @@ export class AgentInvoker {
 				}
 				return {
 					status: "needs_input",
-					content: `worker「${d.agentId}」需要更多审批。`,
+					content: `worker「${workerLabel}」需要更多审批。`,
 					details: {
 						interactionId: outcome.interaction?.id,
 						delegationId: d.id,

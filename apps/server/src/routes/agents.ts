@@ -3,6 +3,7 @@ import {
 	AVATAR_MAX_BYTES,
 	MANAGER_AGENT_NAME,
 	TeamsStore,
+	agentIdFromDisplayName,
 	type AgentConfig,
 } from "../store/teams.js";
 import { CredentialsStore } from "../store/credentials.js";
@@ -120,7 +121,21 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 
 	app.post<{ Body: Partial<Record<string, unknown>> }>("/api/agents", async (req, reply) => {
 		try {
-			const agent = await teams.upsertAgent(req.body as unknown as AgentConfig);
+			const body = { ...(req.body ?? {}) } as Record<string, unknown>;
+			// name/id 解耦：未显式给内部 id（name）时，从显示名派生并保证唯一。
+			if (typeof body.name !== "string" || !body.name.trim()) {
+				const displayName = typeof body.displayName === "string" ? body.displayName.trim() : "";
+				if (!displayName) return reply.code(400).send({ error: "displayName 必填（name 缺省时据此生成内部 id）" });
+				const taken = new Set((await teams.listAgents()).map((a) => a.name));
+				const base = agentIdFromDisplayName(displayName);
+				let generated = base;
+				for (let i = 2; taken.has(generated); i += 1) generated = `${base}-${i}`;
+				body.name = generated;
+			} else if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(body.name.trim())) {
+				// 显式 id 必须是文件名/工具名安全字符（生成路径已保证）。
+				return reply.code(400).send({ error: "name（内部 id）只能包含字母、数字、连字符或下划线，且以字母或数字开头" });
+			}
+			const agent = await teams.upsertAgent(body as unknown as AgentConfig);
 			return { agent };
 		} catch (err) {
 			return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
@@ -135,6 +150,9 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 				if (req.params.name === MANAGER_AGENT_NAME) {
 					const agent = await teams.updateManager({
 						...(typeof req.body?.description === "string" ? { description: req.body.description } : {}),
+						...(typeof req.body?.displayName === "string" || req.body?.displayName === null
+							? { displayName: req.body.displayName }
+							: {}),
 						...(req.body?.responsibility === null || (req.body?.responsibility && typeof req.body.responsibility === "object")
 							? { responsibility: req.body.responsibility as AgentConfig["responsibility"] | null }
 							: {}),
@@ -159,7 +177,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 	);
 
 	/** pinned manager 可编辑配置（§10.5）：描述 + manager settings 合并更新。 */
-	app.patch<{ Params: { name: string }; Body: { description?: string; manager?: Record<string, unknown>; responsibility?: AgentConfig["responsibility"] | null; piResources?: AgentConfig["piResources"] | null } }>(
+	app.patch<{ Params: { name: string }; Body: { description?: string; displayName?: string | null; manager?: Record<string, unknown>; responsibility?: AgentConfig["responsibility"] | null; piResources?: AgentConfig["piResources"] | null } }>(
 		"/api/agents/:name/manager",
 		async (req, reply) => {
 			if (req.params.name !== MANAGER_AGENT_NAME) {
@@ -168,6 +186,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 			try {
 				const agent = await teams.updateManager({
 					...(req.body?.description !== undefined ? { description: req.body.description } : {}),
+					...(req.body?.displayName !== undefined ? { displayName: req.body.displayName } : {}),
 					...(req.body?.responsibility !== undefined ? { responsibility: req.body.responsibility } : {}),
 					...(req.body?.manager !== undefined ? { manager: req.body.manager } : {}),
 					...(req.body?.piResources !== undefined ? { piResources: req.body.piResources } : {}),
@@ -244,6 +263,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		Params: { name: string };
 		Body: {
 			description?: string;
+			displayName?: string | null;
 			responsibility?: AgentConfig["responsibility"] | null;
 			manager?: Record<string, unknown>;
 			connector?: { config?: Record<string, unknown> } | null;
@@ -260,6 +280,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 			try {
 				const updated = await teams.updateManager({
 					...(body.description !== undefined ? { description: body.description } : {}),
+					...(body.displayName !== undefined ? { displayName: body.displayName } : {}),
 					...(body.responsibility !== undefined ? { responsibility: body.responsibility } : {}),
 					...(body.manager !== undefined ? { manager: body.manager } : {}),
 					...(body.piResources !== undefined ? { piResources: body.piResources } : {}),
@@ -275,6 +296,9 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		if (body.description !== undefined && typeof body.description !== "string") {
 			return reply.code(400).send({ error: "description 必须是字符串" });
 		}
+		if (body.displayName !== undefined && body.displayName !== null && typeof body.displayName !== "string") {
+			return reply.code(400).send({ error: "displayName 必须是字符串" });
+		}
 		if (body.connector !== undefined && agent.connector?.connectorId !== "pi") {
 			return reply.code(400).send({ error: "connector 配置区仅适用于 pi Connector 绑定的 Agent" });
 		}
@@ -285,6 +309,10 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		try {
 			const next: AgentConfig = { ...agent };
 			if (body.description !== undefined) next.description = body.description;
+			if (body.displayName !== undefined) {
+				// null/空串 = 清除显示名（展示回退内部 id）；归一化在 upsertAgent。
+				next.displayName = body.displayName ?? "";
+			}
 			if (body.responsibility !== undefined) {
 				if (body.responsibility === null) delete next.responsibility;
 				else next.responsibility = body.responsibility;

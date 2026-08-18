@@ -22,9 +22,14 @@ export function OverviewSection({
 	return (
 		<div className="flex flex-col gap-3">
 			<section className="agent-config-card">
-				<div className="agent-config-card-head"><h2>基本信息</h2><p>描述用于聊天、成员信息以及 Manager 的角色识别。</p></div>
+				<div className="agent-config-card-head"><h2>基本信息</h2><p>名称用于聊天与成员列表展示；描述用于 Manager 的角色识别。</p></div>
 				<div className="agent-config-rows">
 					<AvatarEditor agent={agent} onUpdated={onAgentUpdated} />
+					<label className="agent-config-field">
+						<span>名称</span>
+						<Input value={draft.displayName} onChange={(e) => onChange({ displayName: e.target.value })} placeholder={agent.name} maxLength={40} />
+						<small>显示名可随时改，最长 40 字符；内部标识「{agent.name}」创建后不可改（委托工具与存储键使用）。</small>
+					</label>
 					<label className="agent-config-field">
 						<span>描述</span>
 						<Textarea value={draft.description} onChange={(e) => onChange({ description: e.target.value })} rows={3} />

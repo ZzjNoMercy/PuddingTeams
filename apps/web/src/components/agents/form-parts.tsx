@@ -17,7 +17,7 @@ import {
 } from "@/lib/api";
 import { agentAvatarChanged } from "@/lib/avatars";
 import { ManagerAvatar, WorkerAvatar } from "@/components/chat/worker-avatar";
-import type { AgentConfig, AffectedSessions, ModelSummary, SecretSchemaItem } from "@/lib/types";
+import { agentDisplayName, type AgentConfig, type AffectedSessions, type ModelSummary, type SecretSchemaItem } from "@/lib/types";
 
 /**
  * 共享表单件（§10.1）：
@@ -366,7 +366,7 @@ export function AvatarEditor({
 			const updated = await uploadAgentAvatar(agent.name, file);
 			agentAvatarChanged(agent.name, true);
 			onUpdated(updated);
-			toast.success(`「${agent.name}」头像已更新`);
+			toast.success(`「${agentDisplayName(agent)}」头像已更新`);
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
@@ -382,7 +382,7 @@ export function AvatarEditor({
 			// 删除上传后由展示组件决定使用 Connector 或产品默认头像。
 			agentAvatarChanged(agent.name, false);
 			onUpdated({ ...agent, avatar: undefined });
-			toast.success(`「${agent.name}」头像已删除，回落默认头像`);
+			toast.success(`「${agentDisplayName(agent)}」头像已删除，回落默认头像`);
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {

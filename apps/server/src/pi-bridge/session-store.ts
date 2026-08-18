@@ -9,8 +9,9 @@ import {
 	type CreateAgentSessionOptions,
 	type InlineExtension,
 } from "@earendil-works/pi-coding-agent";
-import { unlink } from "node:fs/promises";
+import { readFile, unlink } from "node:fs/promises";
 import { existsSync, writeFileSync } from "node:fs";
+import { agentDisplayName } from "../store/teams.js";
 import type { PiManagerSettings, PiResourceConfig, TeamsStore } from "../store/teams.js";
 import type { WorkStateStore } from "../store/work-state.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
@@ -43,6 +44,8 @@ export interface SessionSummary {
 	name?: string;
 	modifiedAt: string;
 	active: boolean;
+	/** 会话当前模型的 opaque ref（`${provider}/${modelId}`），取自最后一条 model_change。 */
+	model?: string;
 }
 
 export interface ModelSummary {
@@ -66,6 +69,9 @@ export interface ProviderSummary {
 }
 
 type PiModel = NonNullable<CreateAgentSessionOptions["model"]>;
+
+/** 纯展示 custom message 等待 run 落定的上限（超时降级 nextTurn）。 */
+const CUSTOM_MESSAGE_IDLE_WAIT_MS = 15_000;
 
 /**
  * Owns the pi AgentSession lifecycle for a single backend process.
@@ -117,19 +123,22 @@ export class PiSessionStore {
 		const members = ctx.members.filter(Boolean);
 		if (members.length === 0) return undefined;
 		if (ctx.type === "group" && ctx.prompt?.trim()) return ctx.prompt.trim();
+		// 成员在提示词里渲染显示名（id → displayName 快照，缺省回退 id）；
+		// 工具名仍含 id，与 roster 段的工具清单一一对应。
+		const label = (id: string) => ctx.displayNames?.[id] ?? id;
 		if (ctx.type === "direct") {
 			const w = members[0]!;
 			const tool = delegateToolName(w);
 			return [
-				`当前是单聊窗口，用户的消息是发给 worker「${w}」的。`,
+				`当前是单聊窗口，用户的消息是发给 worker「${label(w)}」的。`,
 				"规则：",
-				`1. 用户的每一条请求都用 ${tool} 工具委托给 worker「${w}」，不要自己动手执行，也不要直接作答。`,
+				`1. 用户的每一条请求都用 ${tool} 工具委托给 worker「${label(w)}」，不要自己动手执行，也不要直接作答。`,
 				"2. 拿到 worker 结果后把结果转述给用户（可简要概括），不要额外发挥。",
 				`3. 若 worker 需要更多输入（如选择分析模型），把可选内容转述给用户，等用户回复后再用 ${tool} 续接。`,
 			].join("\n");
 		}
 		return [
-			`当前是群聊窗口，pi manager 是调度者，成员：${members.join("、")}。多个 worker 需要配合完成用户的整体目标。`,
+			`当前是群聊窗口，pi manager 是调度者，成员：${members.map(label).join("、")}。多个 worker 需要配合完成用户的整体目标。`,
 			"规则：",
 			`1. 把用户的整体目标拆解成可执行的子任务；成员的委托工具默认未激活，先用 ${CORE_TOOL_SEARCH} 按 worker 名激活对应的 agent_<id>__delegate 工具，再逐个委托给最合适的 worker（可调用多个 worker、可分多步执行）。`,
 			"2. 用户指名 worker 时，优先把相关子任务委托给它。",
@@ -210,6 +219,9 @@ export class PiSessionStore {
 		ctx?: ManagerWindowContext;
 		cwd: string;
 		getSessionId: () => string;
+		/** open() 重开已有会话：模型以 JSONL 最后一条 model_change 为准，
+		 *  不用 manager 默认模型覆盖用户的选择（SDK 只在未传 model 时才恢复记录）。 */
+		preferRecordedModel?: boolean;
 	}): Promise<AgentSession> {
 		const settings = await this.managerSettings();
 		const resources = await this.managerResources();
@@ -221,9 +233,10 @@ export class PiSessionStore {
 		const isRelay = opts.ctx !== undefined && opts.ctx.type !== "solo";
 		const stripBuiltin = (isRelay && guidance !== undefined) || settings?.builtinTools === false;
 		// §10.5 默认模型：显式选择的模型优先，否则用 manager 配置的默认模型
-		// （解析失败不阻断建会话，回退 SDK 默认）。
+		// （解析失败不阻断建会话，回退 SDK 默认）。重开会话（preferRecordedModel）
+		// 不解析默认值，让 SDK 从 JSONL 的 model_change 恢复用户选过的模型。
 		let model = opts.model;
-		if (!model && settings?.model) {
+		if (!model && !opts.preferRecordedModel && settings?.model) {
 			model = await this.resolveModel(settings.model).catch((err: unknown) => {
 				this.debugLog?.(`manager 默认模型解析失败：${err instanceof Error ? err.message : String(err)}`);
 				return undefined;
@@ -345,7 +358,10 @@ export class PiSessionStore {
 		const w = await this.teamsStore.windowForSession(sessionId);
 		if (!w) return undefined;
 		const cwd = await this.teamsStore.workspaceFor(w.id);
-		return { type: w.type, members: w.members, prompt: w.prompt, workspaceId: w.workspaceId, cwd };
+		// 显示名快照：提示词（guidance/roster）渲染显示名，members 仍是内部 id。
+		const displayNames: Record<string, string> = {};
+		for (const a of await this.teamsStore.listAgents()) displayNames[a.name] = agentDisplayName(a);
+		return { type: w.type, members: w.members, displayNames, prompt: w.prompt, workspaceId: w.workspaceId, cwd };
 	}
 
 	/** Shared model runtime (auth + model catalog)：进程级单例（model-runtime.ts），
@@ -529,14 +545,19 @@ export class PiSessionStore {
 		// /private/tmp canonical-path aliases). Discover by the owned directory;
 		// Window ownership remains the authority when a session is opened.
 		const sessions = await SessionManager.listAll(this.sessionDir);
-		const summaries = sessions.map((info) => ({
-			id: info.id,
-			sessionFile: info.path,
-			firstMessage: info.firstMessage,
-			name: info.name,
-			modifiedAt: info.modified.toISOString(),
-			active: this.active.has(info.id),
-		}));
+		const summaries = await Promise.all(
+			sessions.map(async (info) => ({
+				id: info.id,
+				sessionFile: info.path,
+				firstMessage: info.firstMessage,
+				name: info.name,
+				modifiedAt: info.modified.toISOString(),
+				active: this.active.has(info.id),
+				model: this.active.has(info.id)
+					? PiSessionStore.modelRefOf(this.active.get(info.id)!)
+					: await PiSessionStore.modelRefOfFile(info.path),
+			})),
+		);
 		const byId = new Map(summaries.map((summary) => [summary.id, summary]));
 		for (const session of this.active.values()) {
 			const existing = byId.get(session.sessionId);
@@ -553,9 +574,35 @@ export class PiSessionStore {
 				name: session.sessionName,
 				modifiedAt: new Date().toISOString(),
 				active: true,
+				model: PiSessionStore.modelRefOf(session),
 			});
 		}
 		return summaries;
+	}
+
+	/** 存活会话的当前模型 ref。 */
+	private static modelRefOf(session: AgentSession): string | undefined {
+		const model = session.model as PiModel | undefined;
+		return model ? `${model.provider}/${model.id}` : undefined;
+	}
+
+	/** 磁盘会话的当前模型 ref：JSONL 最后一条 model_change（best-effort）。 */
+	private static async modelRefOfFile(sessionFile: string): Promise<string | undefined> {
+		try {
+			const content = await readFile(sessionFile, "utf8");
+			const lines = content.split("\n");
+			for (let i = lines.length - 1; i >= 0; i--) {
+				const line = lines[i]!;
+				if (!line.includes('"model_change"')) continue;
+				const parsed = JSON.parse(line) as { type?: string; provider?: string; modelId?: string };
+				if (parsed.type === "model_change" && parsed.provider && parsed.modelId) {
+					return `${parsed.provider}/${parsed.modelId}`;
+				}
+			}
+		} catch {
+			// 读取失败不影响列表主流程。
+		}
+		return undefined;
 	}
 
 	/** Return the live AgentSession for a session id, opening it from file if needed. */
@@ -592,6 +639,7 @@ export class PiSessionStore {
 			ctx,
 			cwd,
 			getSessionId: () => id,
+			preferRecordedModel: true,
 		});
 		this.active.set(session.sessionId, session);
 		return session;
@@ -657,8 +705,11 @@ export class PiSessionStore {
 	/**
 	 * Send a custom message into a manager session and optionally trigger a new
 	 * LLM turn (§6.3). Best-effort: the session may be busy streaming; failures
-	 * are swallowed so an approval can never block the caller. `deliverAs:
-	 * "followUp"` queues instead of steering when the session is mid-stream.
+	 * are swallowed so an approval can never block the caller.
+	 *
+	 * triggerTurn:false 是「纯展示」语义：pi SDK 在流式中会无视 triggerTurn
+	 * 直接 followUp/steer 进模型队列，所以这里先等 run 落定再追加（有界），
+	 * 仍在跑则降级 nextTurn，绝不把通知变成 manager 的复读轮。
 	 */
 	async sendCustomMessage(
 		id: string,
@@ -667,6 +718,22 @@ export class PiSessionStore {
 	): Promise<void> {
 		try {
 			const session = await this.open(id);
+			// pi SDK 在 isStreaming 时无视 triggerTurn，一律 followUp/steer 把消息排进
+			// 模型队列——纯展示通知（审批卡、结果镜像）会把 manager 唤醒，产生一轮
+			// 「收到，仍在等审批」式的自问自答。triggerTurn:false 一律先等当前 run
+			// 落定再追加；有界等待后仍在跑则降级 nextTurn（不主动起轮，随下一次
+			// 用户输入进入上下文），绝不走 followUp/steer。
+			if (!options.triggerTurn && !session.isIdle) {
+				await Promise.race([
+					session.waitForIdle(),
+					new Promise<void>((resolve) => setTimeout(resolve, CUSTOM_MESSAGE_IDLE_WAIT_MS)),
+				]).catch(() => undefined);
+			}
+			const deliverAs = options.triggerTurn
+				? (options.deliverAs ?? "followUp")
+				: session.isIdle
+					? undefined
+					: "nextTurn";
 			await session.sendCustomMessage(
 				{
 					customType: message.customType,
@@ -674,7 +741,7 @@ export class PiSessionStore {
 					display: true,
 					details: message.details,
 				},
-				{ ...options, deliverAs: options.deliverAs ?? "followUp" },
+				{ ...options, deliverAs },
 			);
 		} catch (err) {
 			this.debugLog?.(`sendCustomMessage failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -801,6 +868,7 @@ export class PiSessionStore {
 			name: session.sessionName,
 			modifiedAt: new Date().toISOString(),
 			active: true,
+			model: PiSessionStore.modelRefOf(session),
 		};
 	}
 

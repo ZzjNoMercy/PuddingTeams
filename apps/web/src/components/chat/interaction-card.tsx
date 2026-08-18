@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { cancelInteraction, getInteraction, submitInteractionResponse } from "@/lib/api";
+import { useAgentLabel } from "@/lib/avatars";
 import { WorkerAvatar } from "./worker-avatar";
 
 type CardStatus = "pending" | "busy" | "approved" | "rejected" | "expired" | "failed";
@@ -30,9 +31,11 @@ function statusLabel(status: CardStatus): string {
 }
 
 /**
- * HITL 审批卡（§6.5）。两种来源共用：
- * 1. 委托工具（agent_<id>__delegate）结果里的 waitingInput details（当前窗口内）；
- * 2. `pudding:interaction_required` custom message（solo 同步进对方单聊窗口）。
+ * HITL 审批卡（§6.5）。承载面：
+ * - `pudding:interaction_required` custom message（needs_input 时由 invoker
+ *   写入 manager 会话；solo 还会镜像进对方单聊窗口）——唯一事实源；
+ * - 委托工具结果只保留文本说明，不再内联渲染审批卡（避免同一窗口两张卡）；
+ * - 409 冲突卡（无交互正文，只有状态与「去处理」跳转）除外。
  *
  * 状态以服务端为事实源：挂载时和每次操作后通过 GET /api/interactions/:id 对账，
  * 支持页面刷新后恢复（pending/approved/rejected/expired 都可重放）。
@@ -59,6 +62,8 @@ export function InteractionCard({
 	const [status, setStatus] = useState<CardStatus>(
 		statusHint === "conflict" || (statusHint && !["needs_input"].includes(statusHint)) ? (statusHint as CardStatus) : "pending",
 	);
+	// worker prop 是内部 id（头像用），卡面展示显示名。
+	const workerLabel = useAgentLabel(worker);
 	const [busy, setBusy] = useState(false);
 	// 多轮审批（needs_input 后同 id、revision+1）：以服务端对账的 revision 为准，
 	// props 里的 revision 只是首渲染快照。
@@ -177,10 +182,7 @@ export function InteractionCard({
 			<div className="flex items-center justify-between gap-2 px-3 pt-2">
 				<div className="flex min-w-0 items-center gap-2">
 					<WorkerAvatar name={worker} size={20} />
-					<span className="truncate font-mono text-sm font-medium">{worker}</span>
-					<Badge variant="outline" className="shrink-0 text-muted-foreground">
-						实验
-					</Badge>
+					<span className="truncate font-mono text-sm font-medium">{workerLabel}</span>
 					{statusHint === "conflict" ? (
 						<Badge variant="destructive" className="gap-1">
 							<ShieldAlertIcon className="size-3" />

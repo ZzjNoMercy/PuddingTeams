@@ -187,10 +187,11 @@ export async function setSessionModel(sessionId: string, model: string): Promise
 	}
 }
 
-export async function fetchMessages(sessionId: string): Promise<unknown[]> {
+export async function fetchMessages(sessionId: string): Promise<{ messages: unknown[]; runningToolCallIds: string[] }> {
 	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/messages`);
 	if (!res.ok) throw new Error(`fetch messages failed: ${res.status}`);
-	return ((await res.json()) as { messages: unknown[] }).messages;
+	const body = (await res.json()) as { messages: unknown[]; runningToolCallIds?: string[] };
+	return { messages: body.messages, runningToolCallIds: body.runningToolCallIds ?? [] };
 }
 
 export interface MessageAttachmentInput {
