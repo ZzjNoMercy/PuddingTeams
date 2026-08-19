@@ -248,6 +248,19 @@ export class LocalPiDriver implements AgentDriver {
 		return session;
 	}
 
+	/**
+	 * 配置里的 model 与驻留/恢复会话的当前模型对齐：模型只在 createAgentSession
+	 * 时生效，改配置后继续跑的旧会话（内存驻留或 JSONL 恢复）仍用旧模型，
+	 * 需要显式 setModel 纠偏；相同则不动。未配置 model（用 pi 默认）时不干预。
+	 */
+	private async reconcileModel(session: AgentSession): Promise<void> {
+		const model = await this.resolveModel();
+		if (!model) return;
+		const current = session.model as PiModel | undefined;
+		if (current && current.provider === model.provider && current.id === model.id) return;
+		await session.setModel(model);
+	}
+
 	/** run 开新会话；continue 先查内存驻留，miss 则从 JSONL 恢复。 */
 	private async openSession(
 		ctx: InvocationContext,
@@ -259,10 +272,14 @@ export class LocalPiDriver implements AgentDriver {
 			: undefined;
 		if (sessionHandle) {
 			const live = sessionsByHandle.get(sessionHandle);
-			if (live) return { session: live, sessionHandle };
+			if (live) {
+				await this.reconcileModel(live);
+				return { session: live, sessionHandle };
+			}
 			const info = (await SessionManager.list(ctx.cwd, this.sessionDir())).find((s) => s.id === sessionHandle);
 			if (!info) throw new Error(`pi worker 会话不存在：${sessionHandle}`);
 			const session = await this.newSession(SessionManager.open(info.path, this.sessionDir()), ctx.cwd, access);
+			await this.reconcileModel(session);
 			retainSession(session);
 			return { session, sessionHandle: session.sessionId };
 		}
