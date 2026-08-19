@@ -217,6 +217,44 @@ export function sessionWsUrl(sessionId: string): string {
 	return `${SERVER_URL.replace(/^http/, "ws")}/api/sessions/${sessionId}/ws`;
 }
 
+// ---- worker 执行过程可视化（pi worker，只读） ----
+
+export interface WorkerProcessInfo {
+	delegationId: string;
+	agentId: string;
+	status: string;
+	sessionHandle?: string;
+	/** 委托创建时间（ISO）：worker 会话跨任务续接，用它切出本次委托的消息。 */
+	createdAt: string;
+	live: boolean;
+}
+
+export async function fetchDelegationProcess(delegationId: string): Promise<WorkerProcessInfo> {
+	const res = await fetch(`${SERVER_URL}/api/delegations/${delegationId}/process`);
+	if (!res.ok) throw new Error(`fetch delegation process failed: ${res.status}`);
+	return (await res.json()) as WorkerProcessInfo;
+}
+
+export async function fetchDelegationProcessMessages(
+	delegationId: string,
+): Promise<{ messages: unknown[]; live: boolean; agentId: string; status: string; createdAt: string; runningToolCallIds: string[] }> {
+	const res = await fetch(`${SERVER_URL}/api/delegations/${delegationId}/process/messages`);
+	if (!res.ok) throw new Error(`fetch worker messages failed: ${res.status}`);
+	const body = (await res.json()) as {
+		messages: unknown[];
+		live: boolean;
+		agentId: string;
+		status: string;
+		createdAt: string;
+		runningToolCallIds?: string[];
+	};
+	return { ...body, runningToolCallIds: body.runningToolCallIds ?? [] };
+}
+
+export function delegationProcessWsUrl(delegationId: string): string {
+	return `${SERVER_URL.replace(/^http/, "ws")}/api/delegations/${delegationId}/process/ws`;
+}
+
 export async function getSettings(): Promise<{
 	defaultProvider?: string;
 	defaultModel?: string;

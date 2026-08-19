@@ -774,3 +774,40 @@ test("失效会话恢复不误吞普通失败：非 session-not-found 错误直�
 	assert.equal(outcome.status, "failed");
 	assert.deepEqual(calls, ["continue"], "普通失败不得触发新会话重跑");
 });
+
+test("started 事件经 onUpdate 透出 sessionHandle/delegationId（执行过程可视化入口）", async () => {
+	const { delegations, secrets } = await makeRuntime();
+	const driver: AgentDriver = {
+		id: "puddingclaw",
+		async capabilities(): Promise<DriverCapabilities> {
+			return { operations: ["run", "continue"], interactionKinds: [], progress: "stream", transport: "spawn" };
+		},
+		async *run(): AsyncIterable<AgentEvent> {
+			yield { type: "started", sessionHandle: "worker-session-9", runHandle: "run-9" };
+			yield {
+				type: "completed",
+				result: { agentId: "puddingclaw", status: "completed", sessionHandle: "worker-session-9", runHandle: "run-9", content: "done" },
+			};
+		},
+		async *continue(): AsyncIterable<AgentEvent> {},
+		async *respond(): AsyncIterable<AgentEvent> {},
+		async probe(ctx: InvocationContext) {
+			return {
+				extensionInstalled: true, detected: true, configured: true, authenticated: "unknown", enabled: true,
+				compatibility: "supported" as const, capabilities: { operations: ["run", "continue"], interactionKinds: [], progress: "stream" as const, transport: "spawn" as const }, issues: [],
+			};
+		},
+	};
+	const runtime = new AgentRuntime(delegations, secrets, () => driver);
+
+	const updates: Array<{ content: string; details?: unknown }> = [];
+	const outcome = await runtime.delegate(
+		{ ...PROJECT, windowId: "win-1", managerSessionId: "sess-1", agentId: "puddingclaw", message: "x", mode: "run" },
+		{ cwd: process.cwd(), env: {}, onUpdate: (content, details) => updates.push({ content, details }) },
+	);
+	assert.equal(outcome.status, "completed");
+	const ready = updates.find((u) => (u.details as { sessionHandle?: string } | undefined)?.sessionHandle === "worker-session-9");
+	assert.ok(ready, "started 必须把 sessionHandle 经 onUpdate 透出给委托卡");
+	assert.equal((ready.details as { delegationId?: string }).delegationId, outcome.delegation.id);
+	assert.equal((ready.details as { running?: boolean }).running, true);
+});

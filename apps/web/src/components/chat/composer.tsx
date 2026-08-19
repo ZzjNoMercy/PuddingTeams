@@ -22,6 +22,8 @@ import {
 import { listModels, MODELS_CHANGED_EVENT, setSessionModel, type MessageAttachmentInput } from "@/lib/api";
 import { getPreferredModel, setPreferredModel } from "@/lib/model-pref";
 import type { ModelSummary } from "@/lib/types";
+import type { SessionStats } from "@/lib/session-stats";
+import { ChatStatsBar } from "./chat-stats-bar";
 import { SelectGroup, SelectLabel } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import { FolderGit2Icon, PaperclipIcon, TargetIcon } from "lucide-react";
@@ -266,6 +268,7 @@ export function Composer({
 	workspacePath,
 	workspaceAvailable,
 	sessionModel,
+	stats,
 	onModelChanged,
 	onSend,
 	onStop,
@@ -281,6 +284,8 @@ export function Composer({
 	workspacePath: string;
 	workspaceAvailable: boolean;
 	sessionModel?: string;
+	/** 会话用量统计（composer 悬浮层内、输入框上方）。 */
+	stats?: SessionStats | null;
 	onModelChanged?: (model: string) => void;
 	onSend: (text: string, attachments?: MessageAttachmentInput[]) => void | Promise<void>;
 	onStop: () => void;
@@ -290,6 +295,8 @@ export function Composer({
 }) {
 	return (
 		<div className="home-composer-wrap">
+			{/* composer 是绝对定位的悬浮层，统计条放层内才不会被它盖住。 */}
+			<ChatStatsBar stats={stats ?? null} />
 			<div className="home-composer-inner">
 				<div ref={scrollButtonHostRef} className="home-scroll-to-bottom-host" />
 				<PromptInputProvider>

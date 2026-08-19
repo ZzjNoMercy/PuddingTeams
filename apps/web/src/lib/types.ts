@@ -609,6 +609,10 @@ export interface DelegationTrace {
 	evidenceRequirements?: string[];
 	completionBoundary?: string;
 	status: string;
+	/** worker 会话句柄（pi worker 可用于执行过程可视化）。 */
+	sessionHandle?: string;
+	/** 该委托的 worker 是 pi（执行过程可视化入口开关）。 */
+	processView?: boolean;
 	createdAt: string;
 	updatedAt: string;
 }

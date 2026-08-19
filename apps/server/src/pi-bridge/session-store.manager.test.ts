@@ -363,3 +363,39 @@ test("§3.3.7: 重启/重建从 JSONL 历史回放已激活的受管工具", asy
 	);
 	await sessions.disposeAll();
 });
+
+test("store 级事件订阅跨 runtimeDirty 重建存活（WS 推送不断流）", async () => {
+	const { teams, sessions } = await makeStack();
+	const summary = await sessions.create();
+	await teams.ensureSoloWindow(async () => ({ id: summary.id }), async () => true);
+	const seen: string[] = [];
+	const unsubscribe = sessions.subscribe(summary.id, (event) => {
+		if (event.type === "message_start") {
+			const m = event.message as { customType?: string };
+			if (m.customType === "pudding:probe") seen.push(event.type);
+		}
+	});
+
+	const probe = () =>
+		sessions.sendCustomMessage(
+			summary.id,
+			{ customType: "pudding:probe", content: "ping" },
+			{ triggerTurn: false },
+		);
+	await probe();
+	assert.equal(seen.length, 1, "订阅基线：实例正常时必须收到事件");
+
+	// 触发空闲重建（§3.3.6）：配置变更标记 runtimeDirty，下次 open 换实例。
+	await sessions.ensureSessionFile(summary.id);
+	const before = await sessions.open(summary.id);
+	await teams.updateManager({ manager: { thinkingLevel: "high" } });
+	await sessions.syncAgentConfigChange();
+	const after = await sessions.open(summary.id);
+	assert.notEqual(after, before, "重建必须产生新的 AgentSession 实例");
+
+	// 重建前订阅的 listener 必须继续收到新实例的事件（不断流、不重复）。
+	await probe();
+	assert.equal(seen.length, 2, "runtimeDirty 重建后订阅必须接力到新实例");
+	unsubscribe();
+	await sessions.disposeAll();
+});

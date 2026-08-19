@@ -828,7 +828,8 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 					completionBoundary: params.completionBoundary,
 					mode: isSoloContext ? (params.session === "new" ? "run" : "continue") : "continue",
 					signal,
-					onUpdate: (content) => onUpdate?.({ content: [{ type: "text", text: content }], details: {} }),
+					onUpdate: (content, details) =>
+						onUpdate?.({ content: [{ type: "text", text: content }], details: { processView: agent.connector?.connectorId === "pi", ...(details as Record<string, unknown> | undefined) } }),
 				});
 
 				const meta: Record<string, unknown> = {
@@ -836,6 +837,9 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 					status: result.status,
 					delegationId: result.delegationId,
 					interactionId: result.interactionId,
+					// 执行过程可视化入口：pi worker 的会话可按 delegationId 只读查看。
+					sessionHandle: result.sessionHandle,
+					processView: agent.connector?.connectorId === "pi",
 				};
 				const picked = result.details;
 
@@ -845,6 +849,7 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 					status: string,
 					text: string,
 					interaction?: { interactionId: string; revision?: number; requests?: unknown[] },
+					extraDetails?: Record<string, unknown>,
 				): Promise<boolean> => {
 					if (!isSoloContext || !targetWindow) return false;
 					const ok = await syncToWindow(
@@ -855,6 +860,7 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 						status,
 						text,
 						interaction,
+						extraDetails,
 					);
 					void refreshSoloSummary();
 					return ok;
@@ -863,9 +869,10 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 					status: string,
 					text: string,
 					interaction?: { interactionId: string; revision?: number; requests?: unknown[] },
+					extraDetails?: Record<string, unknown>,
 				) => {
 					if (!isSoloContext || !targetWindow) return {};
-					const synced = await sync(status, text, interaction);
+					const synced = await sync(status, text, interaction, extraDetails);
 					return { taskId, windowId: targetWindow.id, synced };
 				};
 				const syncNote = (synced: boolean | undefined) =>
@@ -913,7 +920,7 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 				const delegationNote = result.delegationId
 					? `\n\n（delegationId：${result.delegationId}——需要该 worker 接力/追问时，用 handoffKind="followup" 并把它填进 parentDelegationId）`
 					: "";
-				const extra = await soloMeta(result.status, result.content);
+				const extra = await soloMeta(result.status, result.content, undefined, picked.usage ? { usage: picked.usage } : undefined);
 				return {
 					content: [{ type: "text", text: `${text}${artifactNote}${delegationNote}${syncNote(extra.synced as boolean | undefined)}` }],
 					details: { ...meta, ...picked, ...extra },
@@ -959,6 +966,8 @@ async function syncToWindow(
 	status: string,
 	resultText: string,
 	interaction?: { interactionId: string; revision?: number; requests?: unknown[] },
+	/** 额外 details（如本任务 token 消耗 usage），并入结果卡。 */
+	extraDetails?: Record<string, unknown>,
 ): Promise<boolean> {
 	try {
 		// Re-read the window: the active session may have moved since the
@@ -1009,7 +1018,7 @@ async function syncToWindow(
 				customType: "pudding:task_result",
 				content: resultText,
 				display: true,
-				details: { taskId, worker: workerName, status, windowId: window.id },
+				details: { taskId, worker: workerName, status, windowId: window.id, ...(extraDetails ?? {}) },
 			},
 			{ triggerTurn: false },
 		);

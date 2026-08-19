@@ -15,3 +15,6 @@ packages/puddingteams-cli/*.tgz
 # Electron 构建产物
 electron/dist/
 electron/release/
+
+# 设计稿永不入库（本地设计探索目录）
+designs/

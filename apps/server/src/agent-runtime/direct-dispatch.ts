@@ -24,14 +24,15 @@ export interface DirectDispatchDeps {
 export async function directWorkerFor(
 	teams: Pick<TeamsStore, "windowForSession" | "getAgent">,
 	sessionId: string,
-): Promise<{ window: WindowConfig; workerName: string } | undefined> {
+): Promise<{ window: WindowConfig; workerName: string; processView: boolean } | undefined> {
 	const window = await teams.windowForSession(sessionId);
 	if (!window || window.type !== "direct") return undefined;
 	const workerName = window.members[0];
 	if (!workerName) return undefined;
 	const agent = await teams.getAgent(workerName);
 	if (!agent || agent.pinned || agent.invoke?.type === "pi") return undefined;
-	return { window, workerName };
+	// pi worker（Connector 绑定 connectorId=pi）的会话支持执行过程可视化。
+	return { window, workerName, processView: agent.connector?.connectorId === "pi" };
 }
 
 function resultCard(
@@ -39,6 +40,7 @@ function resultCard(
 	taskId: string,
 	windowId: string,
 	result: AgentInvokeResult,
+	processView: boolean,
 ): { customType: string; content: string; details: Record<string, unknown> } {
 	return {
 		customType: "pudding:task_result",
@@ -50,6 +52,11 @@ function resultCard(
 			status: result.status,
 			delegationId: result.delegationId,
 			interactionId: result.interactionId,
+			// 执行过程可视化入口（仅 pi worker）。
+			sessionHandle: result.sessionHandle,
+			processView,
+			// 本任务 token 消耗（pi worker 按 Run 聚合；其他 driver 有则透传）。
+			...(result.details.usage ? { usage: result.details.usage } : {}),
 		},
 	};
 }
@@ -68,7 +75,7 @@ export async function dispatchDirectMessage(
 ): Promise<boolean> {
 	const target = await directWorkerFor(deps.teams, sessionId);
 	if (!target) return false;
-	const { window, workerName } = target;
+	const { window, workerName, processView } = target;
 	const displayText = display ?? content;
 
 	await deps.sessions.sendCustomMessage(
@@ -94,6 +101,10 @@ export async function dispatchDirectMessage(
 		deps.sessions.sendCustomMessage(sessionId, message, { triggerTurn: false });
 
 	void (async () => {
+		// 执行过程可视化：runtime 的 started 更新带回 delegationId/sessionHandle，
+		// 补写一张同 taskId 的富化指派卡（前端按 taskId 去重，只留最新），
+		// 让运行中的卡片也有「执行过程」入口。只补一次。
+		let enriched = false;
 		const agent = await deps.invoker.requireAgent(workerName);
 		const result = await deps.invoker.delegate({
 			agent,
@@ -104,12 +115,32 @@ export async function dispatchDirectMessage(
 			message: content,
 			// binding 有 handle 就 continue，没有/失效由 runtime 透明回退 run。
 			mode: "continue",
+			onUpdate: (_text, details) => {
+				if (enriched || !processView) return;
+				const d = details as { delegationId?: string; sessionHandle?: string } | undefined;
+				if (!d?.delegationId || !d.sessionHandle) return;
+				enriched = true;
+				void send({
+					customType: "pudding:task_assign",
+					content: displayText,
+					details: {
+						taskId,
+						worker: workerName,
+						windowId: window.id,
+						from: "direct",
+						status: "running",
+						delegationId: d.delegationId,
+						sessionHandle: d.sessionHandle,
+						processView: true,
+					},
+				});
+			},
 		});
 		if (result.status === "needs_input") {
 			// 审批卡已由 invoker 写进本 session（managerSessionId = 本窗口）。
 			return;
 		}
-		await send(resultCard(workerName, taskId, window.id, result));
+		await send(resultCard(workerName, taskId, window.id, result, processView));
 		deps.log?.(`direct dispatch: ${sessionId} → ${workerName} (${result.status})`);
 	})().catch((err: unknown) => {
 		const message = err instanceof Error ? err.message : String(err);

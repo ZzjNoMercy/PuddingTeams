@@ -1878,6 +1878,9 @@ html[data-nav="expanded"] .home-workspace-head h1 {
 .home-message-response :where(h1,h2,h3,h4) { color: var(--home-text); font-size: 14px; line-height: 1.5; }
 .home-message-response :where(p,ul,ol,pre,blockquote) { margin-top: .5em; margin-bottom: .5em; }
 .home-message-response code { font-size: .9em; }
+/* 合并气泡段内：正文首尾段落的 .5em 外边距会与 flex gap 叠加造成间距不均，收掉。 */
+.home-assistant-segment .home-message-response > :first-child { margin-top: 0; }
+.home-assistant-segment .home-message-response > :last-child { margin-bottom: 0; }
 .home-worker-entry { grid-template-columns: 34px minmax(0,1fr); gap: 12px; }
 .home-worker-entry button span { font-family: inherit; font-size: 12px; }
 .home-worker-entry p,

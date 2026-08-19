@@ -258,9 +258,11 @@ export async function registerChatRoutes(
 			sockets.add(socket);
 
 			try {
-				const session = await store.open(sessionId);
+				// open 只为校验存在性并确保实例已物化；订阅走 store 级通道，
+				// runtimeDirty 空闲重建换掉 AgentSession 实例后推送不断流。
+				await store.open(sessionId);
 				socket.send(JSON.stringify({ type: "session_ready", sessionId }));
-				const unsubscribe = session.subscribe((event) => {
+				const unsubscribe = store.subscribe(sessionId, (event) => {
 					const payload = serializePiEvent(event);
 					if (payload && socket.readyState === socket.OPEN) socket.send(payload);
 				});

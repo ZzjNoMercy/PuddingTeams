@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import {
 	AlertCircleIcon,
 	CheckCircle2Icon,
@@ -24,6 +25,8 @@ import {
 	DialogTrigger,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { WorkerProcessDialog } from "./worker-process-dialog";
+import { useAgentLabel } from "@/lib/avatars";
 import type {
 	CompletionReview,
 	CompletionReviewCriterion,
@@ -151,6 +154,10 @@ export function SessionRuntimeDrawer({
 	const currentCriteria = latestCurrentReview?.criteria ?? [];
 	const satisfied = currentCriteria.filter((item) => item.status === "satisfied").length;
 	const pending = decisions.filter((item) => item.status === "pending");
+	// pi worker 执行过程查看器（委托链「执行过程」入口）。
+	const [processViewId, setProcessViewId] = useState<string | null>(null);
+	const processViewDelegation = delegations.find((item) => item.id === processViewId);
+	const processViewLabel = useAgentLabel(processViewDelegation?.agentId ?? "");
 
 	return (
 		<Dialog>
@@ -257,7 +264,20 @@ export function SessionRuntimeDrawer({
 							<div className="space-y-3 border-l pl-3">
 								{delegations.map((item) => (
 									<div key={item.id} className="relative text-xs before:absolute before:-left-[17px] before:top-1 before:size-2 before:rounded-full before:border before:bg-background">
-										<div className="flex items-center gap-1.5"><span className="font-medium">{item.agentId}</span><span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">{item.status}</span></div>
+										<div className="flex items-center gap-1.5">
+											<span className="font-medium">{item.agentId}</span>
+											<span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">{item.status}</span>
+											{item.processView && item.sessionHandle ? (
+												<button
+													type="button"
+													className="flex items-center gap-0.5 text-[10px] text-muted-foreground hover:text-foreground"
+													onClick={() => setProcessViewId(item.id)}
+												>
+													执行过程
+													<ExternalLinkIcon className="size-2.5" />
+												</button>
+											) : null}
+										</div>
 										<div className="mt-0.5 text-[11px] leading-4 text-muted-foreground">{item.intent || item.expectedOutcome || "普通委托"}</div>
 										<div className="mt-0.5 truncate font-mono text-[9px] text-muted-foreground/70" title={item.id}>{item.id}</div>
 									</div>
@@ -275,6 +295,14 @@ export function SessionRuntimeDrawer({
 					<div className="flex items-center justify-center gap-1.5 py-2 text-[10px] text-muted-foreground"><Clock3Icon className="size-3" />运行事实来自当前 Session 控制面，不展示模型私有推理。</div>
 				</div>
 			</DialogContent>
+			<WorkerProcessDialog
+				delegationId={processViewId}
+				workerName={processViewLabel || undefined}
+				open={processViewId !== null}
+				onOpenChange={(open) => {
+					if (!open) setProcessViewId(null);
+				}}
+			/>
 		</Dialog>
 	);
 }

@@ -33,6 +33,8 @@ import { registerWorkspacesRoutes } from "./routes/workspaces.js";
 import { ProductSettingsStore } from "./store/product-settings.js";
 import { WorkStateStore } from "./store/work-state.js";
 import { registerWorkStateRoutes } from "./routes/work-state.js";
+import { registerWorkerProcessRoutes } from "./routes/worker-process.js";
+import { WorkerProcessService } from "./agent-runtime/worker-process.js";
 import { UploadStore } from "./store/uploads.js";
 import { configureSharedModelRuntime } from "./pi-bridge/model-runtime.js";
 import { registerWebStatic } from "./web-static.js";
@@ -126,6 +128,34 @@ const store = new PiSessionStore(defaultCwd, paths.sessions, teams, invoker, cat
 invoker.setManagerSender((managerSessionId, message, options) =>
 	store.sendCustomMessage(managerSessionId, message, options),
 );
+// 启动收割（server_restart）：上次进程退出留下的 running/waiting_input 孤儿
+// 委托统一转 failed，并补写 manager 会话——有真实工具调用的补合成 toolResult
+// （manager 下次运行能看到失败原因并重新决策）；direct 直派链路（
+// managerToolCallId 是 taskId、会话里没有 toolCall）改补一张失败结果卡。
+const reapedOrphans = await runtime.reapOrphanedRuns(async (orphan) => {
+	if (!orphan.managerToolCallId) return;
+	const text =
+		`PuddingTeams 服务重启，该任务运行中断（server_restart）。worker「${orphan.agentId}」的执行已终止；` +
+		`交接目录 ${orphan.cwdSnapshot}/.pudding/handoff/${orphan.id} 中可能保留了部分进展。如需继续，请重新委派并说明可复用的进展。`;
+	const wrote = await store.appendToolResultIfPending(orphan.managerSessionId, {
+		toolCallId: orphan.managerToolCallId,
+		toolName: `agent_${orphan.agentId}__delegate`,
+		text,
+		details: { status: "failed", errorCode: "server_restart", delegationId: orphan.id },
+	});
+	if (!wrote) {
+		await store.sendCustomMessage(
+			orphan.managerSessionId,
+			{
+				customType: "pudding:task_result",
+				content: text,
+				details: { taskId: orphan.managerToolCallId, worker: orphan.agentId, windowId: orphan.windowId, status: "failed" },
+			},
+			{ triggerTurn: false },
+		);
+	}
+});
+if (reapedOrphans > 0) app.log.info({ reaped: reapedOrphans }, "reaped orphaned delegations from previous process");
 // §1/§2 产品模型：solo 窗口是置顶单例，服务端启动即保证存在。
 await teams.ensureSoloWindow(
 	async (workspaceId, cwdSnapshot) => {
@@ -158,6 +188,7 @@ await registerRoomsRoutes(app, store, teams, invoker, workStates, {
 await registerInteractionsRoutes(app, runtime, invoker, teams);
 registerArtifactsRoutes(app, artifacts);
 registerWorkStateRoutes(app, workStates, teams, store, runtime);
+registerWorkerProcessRoutes(app, new WorkerProcessService(delegations, teams, paths.workerSessions));
 
 // §15.6 artifact.created 事件：与现有审批/任务结果同一通道——manager session
 // 的 custom message（pi JSONL → 订阅中的 websocket 下发浏览器），不触发新轮次。

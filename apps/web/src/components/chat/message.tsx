@@ -1,7 +1,7 @@
 "use client";
 
-import { createContext, type ComponentProps, useContext, useEffect, useState } from "react";
-import { ChevronDownIcon, ChevronRightIcon, ExternalLinkIcon, SquareTerminalIcon, UserPlusIcon, UsersIcon, WrenchIcon } from "lucide-react";
+import { createContext, type ComponentProps, useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { ChevronDownIcon, ChevronRightIcon, ExternalLinkIcon, FilePenIcon, FileSearchIcon, FileTextIcon, FolderIcon, SquareTerminalIcon, UserPlusIcon, UsersIcon, WrenchIcon } from "lucide-react";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
 	Message as AiMessage,
@@ -19,11 +19,13 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { streamdownPlugins } from "@/core/streamdown/plugins";
 import { delegateWorker, isDelegateCall } from "@/lib/events";
 import { useAgentLabel } from "@/lib/avatars";
+import { formatTokens } from "@/lib/session-stats";
 import { openRoomFile } from "@/lib/api";
 import type { ChatMessage, ToolCallView, WindowType } from "@/lib/types";
 import { toast } from "sonner";
 import { ManagerAvatar, WorkerAvatar } from "./worker-avatar";
 import { InteractionCard } from "./interaction-card";
+import { WorkerProcessDialog } from "./worker-process-dialog";
 
 const TOOL_STATUS_LABEL: Record<ToolCallView["status"], string> = {
 	pending: "待运行",
@@ -36,6 +38,10 @@ const TOOL_STATUS_LABEL: Record<ToolCallView["status"], string> = {
 /** 通用工具调用行的行首图标（按工具名区分；缺省由 TaskTrigger 给放大镜）。 */
 function toolCallIcon(name: string) {
 	if (name === "bash") return <SquareTerminalIcon className="size-4" />;
+	if (name === "read") return <FileTextIcon className="size-4" />;
+	if (name === "write" || name === "edit") return <FilePenIcon className="size-4" />;
+	if (name === "grep" || name === "find") return <FileSearchIcon className="size-4" />;
+	if (name === "ls") return <FolderIcon className="size-4" />;
 	if (name === "search_agent_tools") return <WrenchIcon className="size-4" />;
 	if (name === "create_group_window") return <UsersIcon className="size-4" />;
 	if (name === "invite_to_group") return <UserPlusIcon className="size-4" />;
@@ -97,15 +103,20 @@ const chatStreamdownProps = {
 	components: { a: ChatMarkdownLink },
 };
 
-function Elapsed({ active }: { active: boolean }) {
-	const [start] = useState(() => Date.now());
+/**
+ * 执行中计时器。起算点优先用消息时间戳（工具调用发起时刻）：组件随窗口
+ * 切换/重挂载会重建，用挂载时间会清零；用消息时间戳则切换后仍显示真实
+ * 已耗时。缺省（无时间戳）退回挂载时刻。
+ */
+function Elapsed({ active, since }: { active: boolean; since?: number }) {
+	const [mountedAt] = useState(() => Date.now());
 	const [now, setNow] = useState(() => Date.now());
 	useEffect(() => {
 		if (!active) return;
 		const t = setInterval(() => setNow(Date.now()), 1000);
 		return () => clearInterval(t);
 	}, [active]);
-	const s = Math.max(0, Math.round((now - start) / 1000));
+	const s = Math.max(0, Math.round((now - (since ?? mountedAt)) / 1000));
 	const mm = String(Math.floor(s / 60)).padStart(2, "0");
 	const ss = String(s % 60).padStart(2, "0");
 	return <span className="tabular-nums text-muted-foreground">{active ? `${mm}:${ss}` : ""}</span>;
@@ -121,12 +132,12 @@ const WORKER_STATUS_LABEL: Record<string, string> = {
 	timeout: "超时",
 };
 
-function statusBadge(call: ToolCallView) {
+function statusBadge(call: ToolCallView, since?: number) {
 	if (call.status === "running")
 		return (
 			<Badge variant="secondary" className="gap-1">
 				<span className="size-1.5 animate-pulse rounded-full bg-muted-foreground" />
-				执行中 <Elapsed active />
+				执行中 <Elapsed active since={since} />
 			</Badge>
 		);
 	if (call.status === "error") return <Badge variant="destructive">失败</Badge>;
@@ -149,16 +160,60 @@ function workerStatusBadge(status?: string) {
 }
 
 /**
- * 展开/折叠前解除 StickToBottom 的吸底锁定：内容变高时它的 ResizeObserver
- * 会把底部吸住（scrollTop 增大），导致被点击的卡片跳到视口顶部。官方 API
- * stopScroll() 同步置 escapedFromLock + isAtBottom=false，随后的高度变化
- * 不再触发吸底，标题保持原位、内容向下展开；用户向下滚动或折叠（负向
- * resize）时库会自动恢复吸底。isNearBottom 不受影响，「回到底部」浮钮
- * 也不会误现。
+ * 展开/折叠时把卡片钉在原地：stopScroll() 解除 StickToBottom 吸底（内容变高时
+ * 它的 ResizeObserver 会吸住底部，把被点的卡片顶到视口上方），同时记录卡片
+ * 顶部的视口位置，React 提交后按位移补偿 scrollTop。只 stopScroll 不够——
+ * 收起内容（负向 resize）时 use-stick-to-bottom 的 ResizeObserver 在
+ * isNearBottom 下会重新吸底（setEscapedFromLock(false) + setIsAtBottom(true)），
+ * 随后任何新内容都会把视口拽到底部，用户找不到刚才点的卡片。补偿滚动本身
+ * 会触发 scroll 事件，方向向上，库会保持 escaped 状态，不会误吸底；
+ * isNearBottom 不受影响，「回到底部」浮钮也不会误现。
  */
-function useEscapeBottomLock() {
-	const { stopScroll } = useStickToBottomContext();
-	return stopScroll;
+function useAnchorPreservingToggle<T extends HTMLElement>() {
+	const { stopScroll, scrollRef } = useStickToBottomContext();
+	const rootRef = useRef<T | null>(null);
+	const anchorTop = useRef<number | null>(null);
+	const toggle = (setter: React.Dispatch<React.SetStateAction<boolean>>) => {
+		anchorTop.current = rootRef.current?.getBoundingClientRect().top ?? null;
+		stopScroll();
+		setter((v) => !v);
+	};
+	useLayoutEffect(() => {
+		const before = anchorTop.current;
+		anchorTop.current = null;
+		if (before === null) return;
+		const el = rootRef.current;
+		const scroller = scrollRef.current;
+		if (!el || !scroller) return;
+		const delta = el.getBoundingClientRect().top - before;
+		if (delta !== 0) scroller.scrollTop += delta;
+	});
+	return { rootRef, toggle };
+}
+
+/**
+ * pi worker「执行过程」入口：details 带 processView + delegationId 时出现
+ * （运行中来自 delegate 的 started 更新，落定后来自工具结果 meta）。
+ * 非 pi worker 没有 pi 事件流可看，不显示。
+ */
+function ProcessViewButton({ details, worker }: { details: unknown; worker: string }) {
+	const d = details as { processView?: boolean; delegationId?: string } | undefined;
+	const workerLabel = useAgentLabel(worker);
+	const [open, setOpen] = useState(false);
+	if (!d?.processView || !d.delegationId) return null;
+	return (
+		<>
+			<button
+				type="button"
+				onClick={() => setOpen(true)}
+				className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+			>
+				执行过程
+				<ExternalLinkIcon className="size-3" />
+			</button>
+			<WorkerProcessDialog delegationId={d.delegationId} workerName={workerLabel} open={open} onOpenChange={setOpen} />
+		</>
+	);
 }
 
 /**
@@ -167,6 +222,24 @@ function useEscapeBottomLock() {
  * wrapped inside the manager bubble. Shared by direct/group delegate tool blocks
  * and solo-synced pudding:task_result custom messages.
  */
+/** 本任务 token 消耗（worker Run 聚合，经 details.usage 透传到结果卡/工具卡）。 */
+interface TaskUsage {
+	turns?: number;
+	inputTokens?: number;
+	outputTokens?: number;
+	cost?: number;
+}
+
+/** 「消耗 输入 12.3K · 输出 1.2K · $0.0034」；无数据不显示。 */
+function usageMetaText(usage: TaskUsage | undefined): string | undefined {
+	if (!usage || (usage.inputTokens === undefined && usage.outputTokens === undefined)) return undefined;
+	let text = `消耗 输入 ${formatTokens(usage.inputTokens ?? 0)} · 输出 ${formatTokens(usage.outputTokens ?? 0)}`;
+	if (typeof usage.cost === "number") {
+		text += ` · $${usage.cost < 0.01 ? usage.cost.toFixed(4) : usage.cost.toFixed(2)}`;
+	}
+	return text;
+}
+
 function WorkerTaskEntry({
 	worker,
 	task,
@@ -175,8 +248,10 @@ function WorkerTaskEntry({
 	running,
 	isError,
 	meta,
+	usage,
 	timestamp,
 	progress,
+	actions,
 	children,
 }: {
 	worker: string;
@@ -186,98 +261,143 @@ function WorkerTaskEntry({
 	running?: boolean;
 	isError?: boolean;
 	meta?: string;
+	/** 本任务 token 消耗（worker Run 聚合）。 */
+	usage?: TaskUsage;
 	timestamp?: number;
 	progress?: string;
+	/** 额外动作区（如 pi worker 的「执行过程」入口）。 */
+	actions?: React.ReactNode;
 	children?: React.ReactNode;
 }) {
-	// worker 工作过程：运行中/无结果时展开，完成后默认也展开；只有很长的
-	// 结果才 clamp，并保留手动展开/收起。
+	// worker 工作过程：运行中/完成都默认展开； chevron 折叠整卡（两种状态一致），
+	// 完成态的长结果另有 clamp，运行中的长任务默认折叠成三行可展开。
 	// worker prop 是内部 id（头像/详情用），展示渲染显示名。
 	const workerLabel = useAgentLabel(worker);
 	const finished = !running && result !== undefined && result !== "";
 	const [open, setOpen] = useState(true);
-	const escapeBottomLock = useEscapeBottomLock();
+	const [resultOpen, setResultOpen] = useState(true);
+	const [taskOpen, setTaskOpen] = useState(false);
+	const { rootRef, toggle: toggleKeepingAnchor } = useAnchorPreservingToggle<HTMLDivElement>();
 	const time = timestamp
 		? new Date(timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })
 		: "";
 	const expandableResult = Boolean(result && (result.length > 1200 || result.split("\n").length > 24));
+	const clampTask = Boolean(task && (task.length > 240 || task.split("\n").length > 5));
+	const usageText = usageMetaText(usage);
+
+	const header = (
+		<div className="flex items-center gap-2">
+			<button
+				type="button"
+				onClick={() => toggleKeepingAnchor(setOpen)}
+				className="flex items-center gap-2 text-left"
+			>
+				{open ? (
+					<ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground" />
+				) : (
+					<ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground" />
+				)}
+				<span className="truncate font-mono text-sm font-medium">{workerLabel}</span>
+				{/* 状态徽标由调用方按 details/status 推导（含 needs_input 等待审批），
+				    不能在这里按完成/失败二分写死。 */}
+				{badge}
+			</button>
+			{actions}
+			{time ? <time className="text-muted-foreground/60 text-[10px] tabular-nums">{time}</time> : null}
+		</div>
+	);
+
+	// 任务块：左侧竖线引用样式，和长结果/正文区分开；clamp 开关独占一行，
+	// 不再贴在正文尾巴上被当成普通文本。
+	const taskBlock = task ? (
+		<div className="mt-1 border-l-2 border-border/70 pl-2">
+			<p className="text-xs text-muted-foreground">
+				<span className="mr-1.5 text-muted-foreground/60">任务：</span>
+				<span className={`whitespace-pre-wrap ${clampTask && !taskOpen ? "line-clamp-3" : ""}`}>{task}</span>
+			</p>
+			{clampTask ? (
+				<button
+					type="button"
+					className="mt-0.5 flex items-center gap-0.5 text-[11px] text-muted-foreground/80 hover:text-foreground"
+					onClick={() => toggleKeepingAnchor(setTaskOpen)}
+				>
+					{taskOpen ? "收起任务详情" : "展开任务详情"}
+					<ChevronDownIcon className={`size-3 transition-transform ${taskOpen ? "rotate-180" : ""}`} />
+				</button>
+			) : null}
+		</div>
+	) : null;
+
+	const collapsedPreview = task ? (
+		<p className="mt-1 truncate text-xs text-muted-foreground">
+			<span className="mr-1.5 text-muted-foreground/60">任务：</span>
+			{task}
+		</p>
+	) : null;
 
 	if (finished) {
 		return (
-			<div className="home-worker-entry is-finished">
+			<div ref={rootRef} className="home-worker-entry is-finished">
 				<WorkerAvatar name={worker} size={34} className="shrink-0" />
 				<div className="home-worker-finished-body">
-					<div className="home-worker-message-meta">
-						<strong>{workerLabel}</strong>
-						{/* 状态徽标由调用方按 details/status 推导（含 needs_input 等待审批），
-						    不能在这里按完成/失败二分写死。 */}
-						{badge}
-						{time ? <time>{time}</time> : null}
-					</div>
-					<div className={`home-worker-result ${!open && expandableResult ? "is-clamped" : ""} ${isError ? "text-destructive" : ""}`}>
-						<MessageResponse {...chatStreamdownProps}>{result}</MessageResponse>
-					</div>
-					{expandableResult ? (
-						<button
-							type="button"
-							className="home-worker-result-toggle"
-							onClick={() => {
-								escapeBottomLock();
-								setOpen((value) => !value);
-							}}
-						>
-							{open ? "收起结果" : "展开结果"}
-							<ChevronDownIcon className={open ? "rotate-180" : ""} />
-						</button>
-					) : null}
+					{header}
+					{open ? (
+						<>
+							{taskBlock}
+							{/* 结果区与任务块用分隔线区分归属，避免长任务和长结果视觉上粘连。 */}
+							<div className="mt-2 border-t border-border/60 pt-1.5">
+								<div className={`home-worker-result ${!resultOpen && expandableResult ? "is-clamped" : ""} ${isError ? "text-destructive" : ""}`}>
+									<MessageResponse {...chatStreamdownProps}>{result}</MessageResponse>
+								</div>
+								{expandableResult ? (
+									<button
+										type="button"
+										className="home-worker-result-toggle"
+										onClick={() => toggleKeepingAnchor(setResultOpen)}
+									>
+										{resultOpen ? "收起结果" : "展开结果"}
+										<ChevronDownIcon className={resultOpen ? "rotate-180" : ""} />
+									</button>
+								) : null}
+							</div>
+							{usageText ? <p className="mt-1 text-xs text-muted-foreground/70 tabular-nums">{usageText}</p> : null}
+						</>
+					) : (
+						collapsedPreview
+					)}
 				</div>
 			</div>
 		);
 	}
 
 	return (
-		<div className="home-worker-entry flex w-full items-start gap-2.5">
+		<div ref={rootRef} className="home-worker-entry flex w-full items-start gap-2.5">
 			<WorkerAvatar name={worker} size={34} className="shrink-0" />
 			<div className="min-w-0 flex-1">
-				<button
-					type="button"
-					onClick={() => {
-						escapeBottomLock();
-						setOpen((v) => !v);
-					}}
-					className="flex items-center gap-2 text-left"
-				>
-					{open ? (
-						<ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground" />
-					) : (
-						<ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground" />
-					)}
-					<span className="truncate font-mono text-sm font-medium">{workerLabel}</span>
-					{badge}
-				</button>
+				{header}
 				{open ? (
 					<>
-						{task ? (
-							<p className="mt-1 text-xs text-muted-foreground">
-								<span className="mr-1.5 text-muted-foreground/60">任务：</span>
-								<span className="whitespace-pre-wrap">{task}</span>
+						{taskBlock}
+						{running ? (
+							<p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+								<span className="size-1.5 animate-pulse rounded-full bg-muted-foreground" />
+								{progress ?? "等待 worker 完成…"}
 							</p>
 						) : null}
-						{running ? <p className="mt-1 text-xs text-muted-foreground">{progress ?? "等待 worker 完成…"}</p> : null}
 						{children}
 						{result !== undefined && result !== "" && (
-							<div className={`mt-1 text-sm ${isError ? "text-destructive" : ""}`}>
-								<MessageResponse {...chatStreamdownProps}>{result}</MessageResponse>
+							<div className="mt-2 border-t border-border/60 pt-1.5">
+								<div className={`text-sm ${isError ? "text-destructive" : ""}`}>
+									<MessageResponse {...chatStreamdownProps}>{result}</MessageResponse>
+								</div>
 							</div>
 						)}
 						{meta ? <p className="mt-1 text-xs text-muted-foreground/70 tabular-nums">{meta}</p> : null}
+						{usageText ? <p className="mt-1 text-xs text-muted-foreground/70 tabular-nums">{usageText}</p> : null}
 					</>
-				) : task ? (
-					<p className="mt-1 truncate text-xs text-muted-foreground">
-						<span className="mr-1.5 text-muted-foreground/60">任务：</span>
-						{task}
-					</p>
-				) : null}
+				) : (
+					collapsedPreview
+				)}
 			</div>
 		</div>
 	);
@@ -301,7 +421,7 @@ function toolCallMeta(call: ToolCallView): string | undefined {
 
 /** Specialized card for a delegate tool call — rendered as a member message
  * (worker avatar + name + result), with the raw tool call kept expandable. */
-function DelegateCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow?: (windowId: string) => void }) {
+function DelegateCard({ call, onOpenWindow, timestamp }: { call: ToolCallView; onOpenWindow?: (windowId: string) => void; timestamp?: number }) {
 	const args = call.args as { task?: string } | undefined;
 	const worker = delegateWorker(call);
 	// worker 是内部 id（头像/工具详情用），卡面展示显示名。
@@ -314,6 +434,7 @@ function DelegateCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow
 				conflict?: boolean;
 				interactionId?: string;
 				delegationId?: string;
+				processView?: boolean;
 				revision?: number;
 				requests?: Array<{ requestId: string; prompt: string; command?: string; path?: string; risk?: string; options?: string[] }>;
 		  }
@@ -329,7 +450,7 @@ function DelegateCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow
 		if (finished) setBodyOpen(false);
 	}
 	const meta = toolCallMeta(call);
-	const escapeBottomLock = useEscapeBottomLock();
+	const { rootRef, toggle: toggleKeepingAnchor } = useAnchorPreservingToggle<HTMLDivElement>();
 
 	// 409 冲突 + 带 pending interactionId：冲突优先显示，并保留对账的 interactionId。
 	const conflict = details?.status === "conflict" || details?.conflict;
@@ -376,14 +497,11 @@ function DelegateCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow
 	}
 
 	return (
-		<div className="w-full overflow-hidden rounded-lg bg-muted">
+		<div ref={rootRef} className="w-full overflow-hidden rounded-lg bg-muted">
 			<div className="flex items-center justify-between gap-2 px-3 pt-2">
 				<button
 					type="button"
-					onClick={() => {
-						escapeBottomLock();
-						setBodyOpen((v) => !v);
-					}}
+					onClick={() => toggleKeepingAnchor(setBodyOpen)}
 					className="flex min-w-0 items-center gap-2 text-left"
 				>
 					{bodyOpen ? (
@@ -395,6 +513,7 @@ function DelegateCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow
 					<span className="truncate font-mono text-sm font-medium">{workerLabel}</span>
 				</button>
 				<div className="flex shrink-0 items-center gap-2">
+					<ProcessViewButton details={call.details} worker={worker ?? "worker"} />
 					{details?.synced && details.windowId ? (
 						<button
 							type="button"
@@ -405,7 +524,7 @@ function DelegateCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow
 							<ExternalLinkIcon className="size-3" />
 						</button>
 					) : null}
-					{statusBadge(call)}
+					{statusBadge(call, timestamp)}
 				</div>
 			</div>
 			{bodyOpen ? (
@@ -425,6 +544,11 @@ function DelegateCard({ call, onOpenWindow }: { call: ToolCallView; onOpenWindow
 						</div>
 					)}
 					{meta ? <p className="text-xs text-muted-foreground/70 tabular-nums">{meta}</p> : null}
+					{usageMetaText((call.details as { usage?: TaskUsage } | undefined)?.usage) ? (
+						<p className="text-xs text-muted-foreground/70 tabular-nums">
+							{usageMetaText((call.details as { usage?: TaskUsage } | undefined)?.usage)}
+						</p>
+					) : null}
 					<Collapsible open={open} onOpenChange={setOpen}>
 						<CollapsibleTrigger className="flex items-center gap-1 text-xs text-muted-foreground/70 hover:text-foreground">
 							{open ? <ChevronDownIcon className="size-3.5" /> : <ChevronRightIcon className="size-3.5" />}
@@ -481,16 +605,18 @@ function ToolCallItem({
 					worker={delegateWorker(call) ?? "worker"}
 					task={args?.task}
 					result={call.result}
-					badge={statusBadge(call)}
+					badge={statusBadge(call, timestamp)}
 					running={call.status === "running"}
 					isError={call.isError}
 					meta={toolCallMeta(call)}
+					usage={(call.details as { usage?: TaskUsage } | undefined)?.usage}
 					timestamp={timestamp}
 					progress={call.progress}
+					actions={<ProcessViewButton details={call.details} worker={delegateWorker(call) ?? "worker"} />}
 				/>
 			);
 		}
-		return <DelegateCard call={call} onOpenWindow={onOpenWindow} />;
+		return <DelegateCard call={call} onOpenWindow={onOpenWindow} timestamp={timestamp} />;
 	}
 	// manager 建房卡：create_group_window 成功后给「打开群聊」跳转。
 	if (call.name === "create_group_window") {
@@ -515,7 +641,7 @@ function ToolCallItem({
 								打开群聊
 								<ExternalLinkIcon className="size-3" />
 							</button>
-							{statusBadge(call)}
+							{statusBadge(call, timestamp)}
 						</div>
 					</div>
 				</div>
@@ -565,7 +691,10 @@ function CustomMessageEntry({
 				windowId?: string;
 				interactionId?: string;
 				delegationId?: string;
+				sessionHandle?: string;
+				processView?: boolean;
 				revision?: number;
+				usage?: TaskUsage;
 				requests?: Array<{ requestId: string; prompt: string; command?: string; path?: string; risk?: string; options?: string[] }>;
 		  }
 		| undefined;
@@ -588,7 +717,15 @@ function CustomMessageEntry({
 			// direct 窗口：用户消息就在上方，指派卡只作 worker 侧运行指示，
 			// 落定后整张收起（结果卡已说明一切）。
 			if (!running) return null;
-			return <WorkerTaskEntry worker={details?.worker ?? "worker"} badge={<Badge variant="secondary">执行中</Badge>} running timestamp={message.timestamp} />;
+			return (
+				<WorkerTaskEntry
+					worker={details?.worker ?? "worker"}
+					badge={<Badge variant="secondary">执行中</Badge>}
+					running
+					timestamp={message.timestamp}
+					actions={<ProcessViewButton details={details} worker={details?.worker ?? "worker"} />}
+				/>
+			);
 		}
 		return (
 			<AiMessage from="user" className="home-user-message">
@@ -609,6 +746,8 @@ function CustomMessageEntry({
 				badge={workerStatusBadge(details?.status)}
 				isError={Boolean(details?.status && details.status !== "completed" && details.status !== "needs_input")}
 				timestamp={message.timestamp}
+				usage={details?.usage}
+				actions={<ProcessViewButton details={details} worker={details?.worker ?? "worker"} />}
 			/>
 		);
 	}
@@ -653,12 +792,17 @@ function MessageBody({
 	windowType,
 	onOpenWindow,
 	resolvedTaskIds,
+	assistantAs,
 }: {
 	message: ChatMessage;
 	windowType?: WindowType;
 	onOpenWindow?: (windowId: string) => void;
 	resolvedTaskIds?: Set<string>;
+	/** assistant 消息的身份覆盖：worker 执行过程查看器里 assistant 是 worker
+	 *  自己（内部 id，头像/显示名按它解析），缺省为 Manager。 */
+	assistantAs?: string;
 }) {
+	const assistantLabel = useAgentLabel(assistantAs ?? "");
 	if (message.role === "user") {
 		return (
 			<AiMessage from="user" className="home-user-message">
@@ -705,9 +849,13 @@ function MessageBody({
 		<>
 			{showBubble && (
 				<div className="home-assistant-message">
-					<ManagerAvatar size={34} className="home-manager-avatar" />
+					{assistantAs ? (
+						<WorkerAvatar name={assistantAs} size={34} className="home-manager-avatar" />
+					) : (
+						<ManagerAvatar size={34} className="home-manager-avatar" />
+					)}
 					<div className="home-assistant-body">
-						<div className="home-message-meta"><strong>Manager</strong><span>{time}</span></div>
+						<div className="home-message-meta"><strong>{assistantAs ? assistantLabel : "Manager"}</strong><span>{time}</span></div>
 						{showThinking && (
 							<AssistantReasoning streaming={message.streaming} thinking={message.thinking} />
 						)}
@@ -742,6 +890,7 @@ export function Message({ roomId, ...props }: {
 	windowType?: WindowType;
 	onOpenWindow?: (windowId: string) => void;
 	resolvedTaskIds?: Set<string>;
+	assistantAs?: string;
 }) {
 	return (
 		<RoomFileContext.Provider value={roomId}>
@@ -750,7 +899,7 @@ export function Message({ roomId, ...props }: {
 	);
 }
 
-function AssistantReasoning({ streaming, thinking }: { streaming: boolean; thinking?: string }) {
+function AssistantReasoning({ streaming, thinking, className }: { streaming: boolean; thinking?: string; className?: string }) {
 	// Freeze the mount-time streaming flag: live messages mount open and auto-close
 	// when the stream ends; history messages mount already collapsed, so switching
 	// sessions never plays an open→close jump (vendored Reasoning auto-closes
@@ -758,9 +907,184 @@ function AssistantReasoning({ streaming, thinking }: { streaming: boolean; think
 	const [defaultOpen] = useState(() => streaming);
 
 	return (
-		<Reasoning isStreaming={streaming} defaultOpen={defaultOpen}>
+		<Reasoning isStreaming={streaming} defaultOpen={defaultOpen} className={className}>
 			<ReasoningTrigger hasContent={Boolean(thinking)} />
 			<ReasoningContent>{thinking ?? ""}</ReasoningContent>
 		</Reasoning>
+	);
+}
+
+/**
+ * 工具折叠摘要行：一段里连续的非 delegate 工具调用折成一行
+ * 「使用了 N 个工具，运行 M 个命令」（M=bash 数，为 0 时省略后半句），
+ * chevron 展开看每个工具细节；有工具在跑时显示「执行中 · 工具名」+ 脉冲点。
+ */
+function ToolSummaryRow({
+	calls,
+	windowType,
+	onOpenWindow,
+	timestamp,
+}: {
+	calls: ToolCallView[];
+	windowType?: WindowType;
+	onOpenWindow?: (windowId: string) => void;
+	timestamp: number;
+}) {
+	const [open, setOpen] = useState(false);
+	const { rootRef, toggle: toggleKeepingAnchor } = useAnchorPreservingToggle<HTMLDivElement>();
+	const running = calls.filter((c) => c.status === "running");
+	const failed = calls.filter((c) => c.status === "error" || c.isError).length;
+	const bashCount = calls.filter((c) => c.name === "bash").length;
+	const summary =
+		running.length > 0
+			? `执行中 · ${running[running.length - 1]!.name}`
+			: `使用了 ${calls.length} 个工具${bashCount > 0 ? `，运行 ${bashCount} 个命令` : ""}`;
+	return (
+		<Collapsible
+			ref={rootRef}
+			open={open}
+			onOpenChange={() => toggleKeepingAnchor(setOpen)}
+		>
+			<CollapsibleTrigger className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground">
+				{open ? <ChevronDownIcon className="size-3.5" /> : <ChevronRightIcon className="size-3.5" />}
+				{running.length > 0 ? <span className="size-1.5 animate-pulse rounded-full bg-muted-foreground" /> : null}
+				{summary}
+				{failed > 0 && running.length === 0 ? <Badge variant="destructive">{failed} 失败</Badge> : null}
+			</CollapsibleTrigger>
+			<CollapsibleContent className="mt-2 flex w-full flex-col gap-2">
+				{calls.map((call) => (
+					<ToolCallItem key={call.id} call={call} windowType={windowType} onOpenWindow={onOpenWindow} timestamp={timestamp} />
+				))}
+			</CollapsibleContent>
+		</Collapsible>
+	);
+}
+
+type AssistantNode = { merged: ChatMessage[] } | { single: ChatMessage };
+
+/**
+ * 合并气泡正文：连续 assistant 段（一个 run 的多个 turn，常只有 thinking+工具、
+ * 无正文）渲染为一条气泡，段内按 thinking → 正文 → 工具摘要行 顺序排布。
+ * §7 成员消息流：delegate 工具段要脱离气泡独立成 worker 条目，打断合并走旧渲染；
+ * solo 窗口 delegate 卡（DelegateCard）不入折叠，按段内顺序全卡渲染。
+ */
+function AssistantGroupBody({
+	messages,
+	windowType,
+	onOpenWindow,
+	assistantAs,
+}: {
+	messages: ChatMessage[];
+	windowType?: WindowType;
+	onOpenWindow?: (windowId: string) => void;
+	assistantAs?: string;
+}) {
+	const assistantLabel = useAgentLabel(assistantAs ?? "");
+	const memberFlow = windowType === "direct" || windowType === "group";
+	const nodes: AssistantNode[] = [];
+	for (const m of messages) {
+		if (memberFlow && m.toolCalls.some((c) => isDelegateCall(c))) {
+			nodes.push({ single: m });
+			continue;
+		}
+		const last = nodes[nodes.length - 1];
+		if (last && "merged" in last) last.merged.push(m);
+		else nodes.push({ merged: [m] });
+	}
+
+	return (
+		<>
+			{nodes.map((node) => {
+				if ("single" in node) {
+					return (
+						<MessageBody
+							key={node.single.id}
+							message={node.single}
+							windowType={windowType}
+							onOpenWindow={onOpenWindow}
+							assistantAs={assistantAs}
+						/>
+					);
+				}
+				const segments = node.merged
+					.map((m) => ({
+						m,
+						showThinking:
+							Boolean(m.thinking) || (m.streaming && !m.content && m.toolCalls.length === 0),
+						showContent: Boolean(m.content) || m.error,
+						foldCalls: m.toolCalls.filter((c) => !isDelegateCall(c)),
+						cardCalls: memberFlow ? [] : m.toolCalls.filter((c) => isDelegateCall(c)),
+					}))
+					.filter((s) => s.showThinking || s.showContent || s.foldCalls.length > 0 || s.cardCalls.length > 0);
+				if (segments.length === 0) return null;
+				const lastTime = new Date(segments[segments.length - 1]!.m.timestamp).toLocaleTimeString("zh-CN", {
+					hour: "2-digit",
+					minute: "2-digit",
+					hour12: false,
+				});
+				return (
+					<div key={node.merged[0]!.id} className="home-assistant-message">
+						{assistantAs ? (
+							<WorkerAvatar name={assistantAs} size={34} className="home-manager-avatar" />
+						) : (
+							<ManagerAvatar size={34} className="home-manager-avatar" />
+						)}
+						<div className="home-assistant-body">
+							<div className="home-message-meta">
+								<strong>{assistantAs ? assistantLabel : "Manager"}</strong>
+								<span>{lastTime}</span>
+							</div>
+							<div className="flex w-full flex-col gap-3">
+								{segments.map((s) => (
+									<div key={s.m.id} className="home-assistant-segment flex w-full flex-col gap-2">
+										{s.showThinking && <AssistantReasoning streaming={s.m.streaming} thinking={s.m.thinking} className="mb-0" />}
+										{s.showContent && (
+											<MessageResponse
+												className={`home-message-response ${s.m.error ? "text-destructive" : ""}`}
+												{...chatStreamdownProps}
+											>
+												{s.m.content}
+											</MessageResponse>
+										)}
+										{s.foldCalls.length > 0 && (
+											<ToolSummaryRow
+												calls={s.foldCalls}
+												windowType={windowType}
+												onOpenWindow={onOpenWindow}
+												timestamp={s.m.timestamp}
+											/>
+										)}
+										{s.cardCalls.map((call) => (
+											<ToolCallItem
+												key={call.id}
+												call={call}
+												windowType={windowType}
+												onOpenWindow={onOpenWindow}
+												timestamp={s.m.timestamp}
+											/>
+										))}
+									</div>
+								))}
+							</div>
+						</div>
+					</div>
+				);
+			})}
+		</>
+	);
+}
+
+/** groupForRender 分组的 assistant 段集合，渲染入口与 Message 对齐（RoomFileContext）。 */
+export function AssistantGroup({ roomId, ...props }: {
+	roomId: string;
+	messages: ChatMessage[];
+	windowType?: WindowType;
+	onOpenWindow?: (windowId: string) => void;
+	assistantAs?: string;
+}) {
+	return (
+		<RoomFileContext.Provider value={roomId}>
+			<AssistantGroupBody {...props} />
+		</RoomFileContext.Provider>
 	);
 }

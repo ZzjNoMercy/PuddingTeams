@@ -23,7 +23,15 @@ export function registerWorkStateRoutes(
 			return {
 				workState: (await workStates.get(req.params.id)) ?? null,
 				decisions: await workStates.listDecisions(req.params.id),
-				delegations: runtime ? await runtime.listDelegations(undefined, req.params.id) : [],
+				// processView：pi worker 的会话支持执行过程可视化（只读），前端据此显示入口。
+				delegations: runtime
+					? await Promise.all(
+							(await runtime.listDelegations(undefined, req.params.id)).map(async (d) => ({
+								...d,
+								processView: (await teams.getAgent(d.agentId))?.connector?.connectorId === "pi",
+							})),
+						)
+					: [],
 			};
 		} catch (err) {
 			return reply.code(404).send({ error: err instanceof Error ? err.message : String(err) });

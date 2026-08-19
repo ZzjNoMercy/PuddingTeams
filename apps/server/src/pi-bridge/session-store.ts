@@ -6,6 +6,7 @@ import {
 	SessionManager,
 	SettingsManager,
 	type AgentSession,
+	type AgentSessionEvent,
 	type CreateAgentSessionOptions,
 	type InlineExtension,
 } from "@earendil-works/pi-coding-agent";
@@ -88,6 +89,12 @@ export class PiSessionStore {
 	private assembledManaged = new Map<string, Set<string>>();
 	/** 配置变化标记（§3.3.5）：Session 空闲时重建 ResourceLoader/AgentSession。 */
 	private runtimeDirty = new Set<string>();
+	/** 长生命周期事件订阅（WS 推送）：挂在 store 上而非单个 AgentSession
+	 *  实例——runtimeDirty 空闲重建会换掉实例，实例级 subscribe 会静默断流
+	 *  （socket 还连着，事件却发到了已 dispose 的旧实例）。 */
+	private listeners = new Map<string, Set<(event: AgentSessionEvent) => void>>();
+	/** 已挂过转发器的实例，避免重复 subscribe 导致事件翻倍。 */
+	private forwarded = new WeakSet<AgentSession>();
 	private unsubscribeTeams?: () => void;
 
 	constructor(
@@ -274,7 +281,36 @@ export class PiSessionStore {
 			current.filter((n) => !plan.managed.has(n) || plan.active.has(n) || replayed.has(n)),
 		);
 		this.assembledManaged.set(session.sessionId, plan.managed);
+		this.attachForwarder(session);
 		return session;
+	}
+
+	/** 把实例事件桥接到 store 级订阅者；每个实例只挂一次。 */
+	private attachForwarder(session: AgentSession): void {
+		if (this.forwarded.has(session)) return;
+		this.forwarded.add(session);
+		session.subscribe((event) => {
+			const set = this.listeners.get(session.sessionId);
+			if (!set) return;
+			for (const listener of set) listener(event);
+		});
+	}
+
+	/**
+	 * 订阅会话事件（跨实例重建存活）：listener 挂在 sessionId 上，装配新
+	 * 实例时自动接力。返回退订函数。
+	 */
+	subscribe(id: string, listener: (event: AgentSessionEvent) => void): () => void {
+		let set = this.listeners.get(id);
+		if (!set) {
+			set = new Set();
+			this.listeners.set(id, set);
+		}
+		set.add(listener);
+		return () => {
+			set.delete(listener);
+			if (set.size === 0) this.listeners.delete(id);
+		};
 	}
 
 	/**
@@ -745,6 +781,50 @@ export class PiSessionStore {
 			);
 		} catch (err) {
 			this.debugLog?.(`sendCustomMessage failed: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+
+	/**
+	 * 启动收割器补写：为孤儿委托的 manager 工具调用追加一条合成 toolResult，
+	 * 让 manager 下次运行时能在上下文里看到失败原因并重新决策；前端历史重放
+	 * 也会把它折成「失败」而不是「已中断」。仅在启动早期调用（会话尚未加载）。
+	 * 返回 false 表示该会话里不存在匹配的 toolCall（如 direct 直派链路的
+	 * managerToolCallId 其实是 taskId，没有工具调用），调用方应改用自定义卡。
+	 */
+	async appendToolResultIfPending(
+		id: string,
+		input: { toolCallId: string; toolName: string; text: string; details?: Record<string, unknown> },
+	): Promise<boolean> {
+		try {
+			const session = await this.open(id);
+			const msgs = session.messages as unknown as Array<{
+				role?: string;
+				toolCallId?: string;
+				content?: unknown;
+			}>;
+			if (msgs.some((m) => m.role === "toolResult" && m.toolCallId === input.toolCallId)) return true;
+			const hasCall = msgs.some(
+				(m) =>
+					m.role === "assistant" &&
+					Array.isArray(m.content) &&
+					m.content.some(
+						(b) => Boolean(b) && typeof b === "object" && (b as { type?: unknown }).type === "toolCall" && (b as { id?: unknown }).id === input.toolCallId,
+					),
+			);
+			if (!hasCall) return false;
+			session.sessionManager.appendMessage({
+				role: "toolResult",
+				toolCallId: input.toolCallId,
+				toolName: input.toolName,
+				content: [{ type: "text", text: input.text }],
+				details: input.details,
+				isError: true,
+				timestamp: Date.now(),
+			});
+			return true;
+		} catch (err) {
+			this.debugLog?.(`appendToolResultIfPending failed: ${err instanceof Error ? err.message : String(err)}`);
+			return false;
 		}
 	}
 

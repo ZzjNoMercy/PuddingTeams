@@ -86,6 +86,11 @@ function isStaleSessionFailure(event: AgentEvent): boolean {
  */
 export class AgentRuntime {
 	private readonly activeRuns = new Map<string, string>();
+	/** 活 Run 的 delegationId 集合。activeRuns 以 sessionHandle 为键，无会话句柄
+	 *  的 driver（如 puddingclaw 一次性 CLI run，started 事件不带 sessionHandle）
+	 *  永远不会登记进 activeRuns；isDelegationActive 必须以本集合为准，否则
+	 *  前端历史重放会把在跑的委托误标「已中断」。 */
+	private readonly activeDelegations = new Set<string>();
 	/** Active subprocess/stream cancellation owned by the Runtime, not HTTP. */
 	private readonly runControllers = new Map<string, AbortController>();
 	private readonly runSettled = new Map<string, Promise<void>>();
@@ -176,6 +181,7 @@ export class AgentRuntime {
 			sessionHandle: knownSession,
 		});
 		if (knownSession) this.activeRuns.set(knownSession, delegation.id);
+		this.activeDelegations.add(delegation.id);
 		input.onCreated?.(delegation);
 
 		// delegationId 注入 ctx：Driver 据此生成 handoff 导出目录（§15.3）。
@@ -222,12 +228,21 @@ export class AgentRuntime {
 					const handled = await this.handleEvent(event, delegation, sessionHandle, runCtx);
 					if (handled.terminal) {
 						this.runControllers.delete(delegation.id);
+						// waiting_input（HITL 待审批）不算结束：Run 挂起待 respond，
+						// 仍算活跃，否则审批期间前端会误标「已中断」。
+						if (handled.outcome.status !== "needs_input") this.activeDelegations.delete(delegation.id);
 						settleRun();
 						return handled.outcome;
 					}
 					if (event.type === "started" && event.sessionHandle) {
 						sessionHandle = event.sessionHandle;
 						await this.delegations.updateDelegation(delegation.id, { sessionHandle });
+						// 执行过程可视化：运行中的委托卡即可拿到 sessionHandle 入口。
+						runCtx.onUpdate?.("worker 会话已就绪", {
+							running: true,
+							sessionHandle,
+							delegationId: delegation.id,
+						});
 					}
 				}
 				if (!restart) break;
@@ -246,6 +261,7 @@ export class AgentRuntime {
 				this.delegations.transitionDelegation(delegation.id, ["running"], { status: "failed", result: failed }),
 			);
 			this.runControllers.delete(delegation.id);
+			this.activeDelegations.delete(delegation.id);
 			settleRun();
 			if (!transition.applied && transition.record?.status === "cancelled") {
 				const cancelled: NormalizedResult = { agentId: input.agentId, status: "cancelled", errorCode: "cancelled", error: "任务已取消", recoverable: true };
@@ -267,6 +283,7 @@ export class AgentRuntime {
 			this.delegations.transitionDelegation(delegation.id, ["running"], { status: "failed", result: failed }),
 		);
 		this.runControllers.delete(delegation.id);
+		this.activeDelegations.delete(delegation.id);
 		settleRun();
 		if (!transition.applied && transition.record?.status === "cancelled") {
 			const cancelled: NormalizedResult = { agentId: input.agentId, status: "cancelled", errorCode: "cancelled", error: "任务已取消", recoverable: true };
@@ -516,6 +533,7 @@ export class AgentRuntime {
 				// reject 也是终态：释放 input_required 时占的 session 锁（否则该
 				// session 永久 409 直到重启），并清理加密 continuation token（M4）。
 				if (delegation.sessionHandle) this.releaseSession(delegation.sessionHandle, delegation.id);
+				this.activeDelegations.delete(delegation.id);
 				await this.secrets.removeProviderState(interaction.id).catch(() => undefined);
 				onAdmitted?.();
 				return {
@@ -610,6 +628,10 @@ export class AgentRuntime {
 		} finally {
 			this.responding.delete(interactionId);
 			this.runControllers.delete(delegation.id);
+			// respond 可能回到 waiting_input（多轮审批）：仍挂起待下次 respond，
+			// 保持活跃登记；只有真正终态才移除。
+			const rec = await this.delegations.getDelegation(delegation.id);
+			if (rec?.status !== "waiting_input") this.activeDelegations.delete(delegation.id);
 			settleRun();
 		}
 	}
@@ -799,7 +821,48 @@ export class AgentRuntime {
 			await this.secrets.removeProviderState(interaction.id).catch(() => undefined);
 		}
 		if (delegation.sessionHandle) this.releaseSession(delegation.sessionHandle, delegationId);
+		this.activeDelegations.delete(delegationId);
 		return { ...(settled ? { settled } : {}) };
+	}
+
+	/**
+	 * 启动收割（server_restart）：进程重启后内存里的 Run 全灭，但持久化的
+	 * running/waiting_input 记录还挂着；不处理的话 manager 的委托工具调用永远
+	 * pending（前端误标「已中断」）、manager 永远等不到结果、pending 审批卡
+	 * 永不过期。开机时把这些孤儿统一转 failed，清理挂起审批与加密 state，
+	 * 并经 notify 回调补写 manager 会话（下次运行时 manager 能在上下文里看到
+	 * 失败原因并重新决策）。返回收割数量。
+	 */
+	async reapOrphanedRuns(
+		notify?: (delegation: DelegationRecord, result: NormalizedResult) => Promise<void>,
+	): Promise<number> {
+		const orphans = (await this.delegations.listDelegations()).filter(
+			(d) => d.status === "running" || d.status === "waiting_input",
+		);
+		let reaped = 0;
+		for (const orphan of orphans) {
+			const result: NormalizedResult = {
+				agentId: orphan.agentId,
+				status: "failed",
+				errorCode: "server_restart",
+				error: "PuddingTeams 服务重启，任务运行中断",
+				recoverable: true,
+			};
+			const transition = await this.withDelegationTransition(orphan.id, () =>
+				this.delegations.transitionDelegation(orphan.id, ["running", "waiting_input"], { status: "failed", result }),
+			);
+			if (!transition.applied) continue;
+			for (const interaction of await this.delegations.listInteractions()) {
+				if (interaction.delegationId !== orphan.id) continue;
+				if (interaction.status === "pending" || interaction.status === "responding") {
+					await this.delegations.updateInteraction(interaction.id, { status: "expired" });
+				}
+				await this.secrets.removeProviderState(interaction.id).catch(() => undefined);
+			}
+			reaped++;
+			if (notify) await notify(transition.record ?? orphan, result).catch(() => undefined);
+		}
+		return reaped;
 	}
 
 	/** 校验当前 Session 是否可发起新 Run（锁 + 状态）。 */
@@ -815,15 +878,13 @@ export class AgentRuntime {
 	}
 
 	/**
-	 * 该 delegation 的 Run 是否在本进程内存中活着（activeRuns 只登记活 Run）。
-	 * 持久化状态 running/waiting_input 跨重启后可能没有活 Run（进程重启即死），
-	 * 历史重放的"仍在执行"标注必须以此为准，不能把陈旧记录标成运行中。
+	 * 该 delegation 的 Run 是否在本进程内存中活着（activeDelegations 登记所有
+	 * 活 Run，含无 sessionHandle 的一次性 CLI driver）。持久化状态
+	 *  running/waiting_input 跨重启后可能没有活 Run（进程重启即死），历史
+	 * 重放的"仍在执行"标注必须以此为准，不能把陈旧记录标成运行中。
 	 */
 	isDelegationActive(delegationId: string): boolean {
-		for (const id of this.activeRuns.values()) {
-			if (id === delegationId) return true;
-		}
-		return false;
+		return this.activeDelegations.has(delegationId);
 	}
 
 	/** 列出窗口下的 interactions（审批卡列表对账，H3）。 */

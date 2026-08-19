@@ -63,13 +63,66 @@ function renderCustom(m: PiCustomMessage): ChatMessage {
 	};
 }
 
+/**
+ * direct 直派的指派卡会先写一张即时卡（无 delegationId），worker 会话就绪后
+ * 再补一张同 taskId 的富化卡（带「执行过程」入口字段）。同 taskId 只留最新，
+ * 历史回放与实时事件走同一去重，避免一张变两张。
+ */
+function upsertCustomMessage(list: ChatMessage[], next: ChatMessage): ChatMessage[] {
+	if (next.customType === "pudding:task_assign") {
+		const taskId = (next.details as { taskId?: string } | undefined)?.taskId;
+		if (taskId) {
+			const idx = list.findIndex(
+				(m) =>
+					m.role === "custom" &&
+					m.customType === next.customType &&
+					(m.details as { taskId?: string } | undefined)?.taskId === taskId,
+			);
+			if (idx >= 0) {
+				const copy = [...list];
+				copy[idx] = next;
+				return copy;
+			}
+		}
+	}
+	return [...list, next];
+}
+
+/**
+ * 渲染前分组：连续的 assistant 段（一个 run 的多个 turn，常只有 thinking+工具、
+ * 无正文）合并成一条气泡，正文叙述与工具摘要按序排布（参考：叙述段落之间夹
+ * 一行「使用了 N 个工具」的折叠摘要）。reducer 仍操作扁平列表，分组只是
+ * 渲染层视图，不影响事件折叠语义。
+ */
+export type RenderItem = ChatMessage | { kind: "assistantGroup"; id: string; messages: ChatMessage[] };
+
+export function groupForRender(messages: ChatMessage[]): RenderItem[] {
+	const out: RenderItem[] = [];
+	for (const m of messages) {
+		if (m.role !== "assistant") {
+			out.push(m);
+			continue;
+		}
+		const last = out[out.length - 1];
+		if (last && "kind" in last && last.kind === "assistantGroup") {
+			last.messages.push(m);
+			continue;
+		}
+		out.push({ kind: "assistantGroup", id: m.id, messages: [m] });
+	}
+	return out;
+}
+
 /** Build the initial message list when a session is opened (history from file). */
 export function renderHistory(msgs: PiMessage[]): ChatMessage[] {
 	const out: ChatMessage[] = [];
 	for (const m of msgs) {
 		if (m.role === "custom") {
 			if (m.display === false) continue;
-			out.push(renderCustom(m));
+			const next = renderCustom(m);
+			const replaced = upsertCustomMessage(out, next);
+			out.length = 0;
+			out.push(...replaced);
 			continue;
 		}
 		if (m.role === "toolResult") {
@@ -169,7 +222,16 @@ function upsertToolCall(messages: ChatMessage[], patch: Partial<ToolCallView> & 
 	const msg = messages[idx]!;
 	const existing = msg.toolCalls.find((t) => t.id === patch.id);
 	const toolCalls = existing
-		? msg.toolCalls.map((t) => (t.id === patch.id ? { ...t, ...patch } : t))
+		? msg.toolCalls.map((t) => {
+				if (t.id !== patch.id) return t;
+				const merged = { ...t, ...patch };
+				// details 做浅合并：运行中 onUpdate（sessionHandle 等）与终态 meta
+				// 分多次到达，直接替换会把先到的字段抹掉。
+				if (t.details && patch.details && typeof t.details === "object" && typeof patch.details === "object") {
+					merged.details = { ...(t.details as Record<string, unknown>), ...(patch.details as Record<string, unknown>) };
+				}
+				return merged;
+			})
 		: [
 				...msg.toolCalls,
 				{
@@ -253,7 +315,7 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 			if (!m) return messages;
 			if (m.role === "custom") {
 				if (m.display === false) return messages;
-				return [...messages, renderCustom(m)];
+				return upsertCustomMessage(messages, renderCustom(m));
 			}
 			if (m.role === "user") {
 				return [
@@ -330,12 +392,15 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 			// Live progress from tools (delegate tool onUpdate → partialResult).
 			// The tool call is already running; keep it visible in case a start
 			// was missed, and surface the progress text on the card.
-			const { text } = extractToolResult(event.partialResult);
+			// details 也要带上：delegate 的 started 更新携带 sessionHandle/
+			// delegationId/processView，是「执行过程」入口的运行中数据来源。
+			const { text, details } = extractToolResult(event.partialResult);
 			return upsertToolCall(messages, {
 				id: event.toolCallId as string,
 				name: event.toolName as string,
 				status: "running",
 				progress: text || undefined,
+				...(details ? { details } : {}),
 			});
 		}
 		case "tool_execution_end": {

@@ -66,6 +66,11 @@ export const PI_CAPABILITIES: DriverCapabilities = {
 const sessionsByHandle = new Map<string, AgentSession>();
 const runningByRunHandle = new Map<string, AgentSession>();
 
+/** 执行过程可视化：按 sessionHandle 查驻留的 worker 会话（不在池里=未在跑/已被淘汰）。 */
+export function liveWorkerSession(handle: string): AgentSession | undefined {
+	return sessionsByHandle.get(handle);
+}
+
 function modelRuntime(): Promise<ModelRuntime> {
 	return sharedModelRuntime();
 }
@@ -90,7 +95,13 @@ interface PiAssistantProjection {
 	content?: unknown;
 	stopReason?: string;
 	errorMessage?: string;
-	usage?: { input?: number; output?: number; cost?: number | { total?: number } };
+	usage?: {
+		input?: number;
+		output?: number;
+		cacheRead?: number;
+		cacheWrite?: number;
+		cost?: number | { total?: number };
+	};
 }
 
 function lastAssistant(session: AgentSession): PiAssistantProjection | undefined {
@@ -99,6 +110,33 @@ function lastAssistant(session: AgentSession): PiAssistantProjection | undefined
 		if (messages[i]?.role === "assistant") return messages[i];
 	}
 	return undefined;
+}
+
+/**
+ * 聚合本次 Run 新增 assistant 消息的 token 用量（多轮工具循环每轮一条
+ * assistant 消息，只取末条会严重少算）。口径与 manager 统计条一致：
+ * 输入 = 净输入 + 缓存读 + 缓存写；cost 取 pi 按价目表换算的总价。
+ */
+function aggregateRunUsage(
+	messages: PiAssistantProjection[],
+): { turns: number; inputTokens: number; outputTokens: number; cost?: number } | undefined {
+	let turns = 0;
+	let input = 0;
+	let output = 0;
+	let cost = 0;
+	let hasCost = false;
+	for (const m of messages) {
+		if (m?.role !== "assistant" || !m.usage) continue;
+		turns++;
+		input += (m.usage.input ?? 0) + (m.usage.cacheRead ?? 0) + (m.usage.cacheWrite ?? 0);
+		output += m.usage.output ?? 0;
+		const c = typeof m.usage.cost === "number" ? m.usage.cost : m.usage.cost?.total;
+		if (typeof c === "number") {
+			cost += c;
+			hasCost = true;
+		}
+	}
+	return turns > 0 ? { turns, inputTokens: input, outputTokens: output, ...(hasCost ? { cost } : {}) } : undefined;
 }
 
 function assistantText(message: PiAssistantProjection | undefined): string {
@@ -313,6 +351,9 @@ export class LocalPiDriver implements AgentDriver {
 
 		let promptError: unknown;
 		let done = false;
+		// 本次 Run 的用量聚合切片：worker 会话跨任务续接，只统计 prompt 之后
+		// 新增的消息（含多轮工具循环的每一条 assistant）。
+		const messageCountBefore = session.messages.length;
 		const promptPromise = session
 			.prompt(message)
 			.catch((err: unknown) => {
@@ -339,16 +380,9 @@ export class LocalPiDriver implements AgentDriver {
 
 		const base = { agentId: this.id, sessionHandle, runHandle };
 		const last = lastAssistant(session);
-		const usage = last?.usage
-			? {
-					inputTokens: last.usage.input,
-					outputTokens: last.usage.output,
-					cost:
-						typeof last.usage.cost === "number"
-							? last.usage.cost
-							: last.usage.cost?.total,
-				}
-			: undefined;
+		const usage = aggregateRunUsage(
+			(session.messages as unknown as PiAssistantProjection[]).slice(messageCountBefore),
+		);
 		if (ctx.signal?.aborted || last?.stopReason === "aborted") {
 			yield {
 				type: "failed",

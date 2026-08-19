@@ -35,11 +35,10 @@ import {
 } from "@/lib/api";
 import { agentDisplayName, type ChatStatus, type RoomSession, type RoomSummary, type WorkspaceRecord } from "@/lib/types";
 import { Composer } from "./composer";
-import { ChatStatsBar } from "./chat-stats-bar";
 import { computeSessionStats } from "@/lib/session-stats";
-import { delegateWorker, isDelegateCall } from "@/lib/events";
+import { delegateWorker, groupForRender, isDelegateCall } from "@/lib/events";
 import { useAgentLabels } from "@/lib/avatars";
-import { Message } from "./message";
+import { AssistantGroup, Message } from "./message";
 import { ManagerAvatar, MemberStack, WorkerAvatar } from "./worker-avatar";
 import { DirectoryPickerDialog } from "./directory-picker-dialog";
 import { WorkspaceTrustDialog, needsTrustDecision } from "./workspace-trust-dialog";
@@ -181,9 +180,13 @@ function SessionChat({
 								{emptyHint ?? "开始和 pi manager 对话"}
 							</div>
 						) : (
-							messages.map((m) => (
-								<Message key={m.id} roomId={roomId} message={m} windowType={windowType} onOpenWindow={onOpenWindow} resolvedTaskIds={resolvedTaskIds} />
-							))
+							groupForRender(messages).map((item) =>
+								"kind" in item ? (
+									<AssistantGroup key={item.id} roomId={roomId} messages={item.messages} windowType={windowType} onOpenWindow={onOpenWindow} />
+								) : (
+									<Message key={item.id} roomId={roomId} message={item} windowType={windowType} onOpenWindow={onOpenWindow} resolvedTaskIds={resolvedTaskIds} />
+								),
+							)
 						)}
 					</ConversationContent>
 					<ConversationScrollButton
@@ -198,7 +201,6 @@ function SessionChat({
 						项目路径已失效，重新绑定或切换项目后才能继续对话与派活。
 					</div>
 				) : null}
-				<ChatStatsBar stats={sessionStats} />
 				<Composer
 					sessionId={sessionId}
 					disabled={running || Boolean(blocked)}
@@ -208,6 +210,7 @@ function SessionChat({
 					workspacePath={workspacePath}
 					workspaceAvailable={workspaceAvailable}
 					sessionModel={sessionModel}
+					stats={sessionStats}
 					onModelChanged={onSessionModelChange}
 					onSend={send}
 					onStop={stop}
