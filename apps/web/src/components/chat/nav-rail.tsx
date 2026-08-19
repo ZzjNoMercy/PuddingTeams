@@ -119,7 +119,9 @@ export function NavRail({ view }: { view: AppView }) {
 						<span className="nav-user-name">{username}</span>
 					</button>
 				</DropdownMenuTrigger>
-				<DropdownMenuContent side="top" align="start" className="home-menu w-52" container={homePortalContainer()}>
+				{/* 菜单关闭默认会把焦点还给触发器，浏览器启发式判定为键盘焦点，
+				    导致鼠标用完菜单后 :focus-visible 描边一直挂着；拦截焦点归还。 */}
+				<DropdownMenuContent side="top" align="start" className="home-menu w-52" container={homePortalContainer()} onCloseAutoFocus={(event) => event.preventDefault()}>
 					<DropdownMenuItem onSelect={() => setSettingsOpen(true)}>
 						<SlidersHorizontalIcon />
 						设置
