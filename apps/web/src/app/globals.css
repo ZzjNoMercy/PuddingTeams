@@ -1970,6 +1970,20 @@ html[data-nav="expanded"] .home-workspace-head h1 {
 	font-size: 10px;
 	font-variant-numeric: tabular-nums;
 }
+.home-chat-stats-pill {
+	display: inline-block;
+	padding: 2px 8px;
+	border-radius: 999px;
+	background: color-mix(in oklab, var(--home-surface-1) 92%, transparent);
+	backdrop-filter: blur(8px);
+	transition: opacity 180ms ease, transform 180ms ease;
+}
+/* 只在吸底时显示：上滑浏览历史时淡出，避免悬浮层与消息流互相干涉。 */
+.home-chat-stats.is-hidden .home-chat-stats-pill {
+	opacity: 0;
+	transform: translateY(4px);
+	pointer-events: none;
+}
 .home-composer-wrap {
 	position: absolute;
 	right: 0;

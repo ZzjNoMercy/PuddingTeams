@@ -269,6 +269,7 @@ export function Composer({
 	workspaceAvailable,
 	sessionModel,
 	stats,
+	statsVisible = true,
 	onModelChanged,
 	onSend,
 	onStop,
@@ -286,6 +287,8 @@ export function Composer({
 	sessionModel?: string;
 	/** 会话用量统计（composer 悬浮层内、输入框上方）。 */
 	stats?: SessionStats | null;
+	/** 吸底时才显示统计条，上滑浏览历史时淡出。 */
+	statsVisible?: boolean;
 	onModelChanged?: (model: string) => void;
 	onSend: (text: string, attachments?: MessageAttachmentInput[]) => void | Promise<void>;
 	onStop: () => void;
@@ -296,7 +299,7 @@ export function Composer({
 	return (
 		<div className="home-composer-wrap">
 			{/* composer 是绝对定位的悬浮层，统计条放层内才不会被它盖住。 */}
-			<ChatStatsBar stats={stats ?? null} />
+			<ChatStatsBar stats={stats ?? null} visible={statsVisible} />
 			<div className="home-composer-inner">
 				<div ref={scrollButtonHostRef} className="home-scroll-to-bottom-host" />
 				<PromptInputProvider>

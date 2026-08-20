@@ -9,6 +9,7 @@ import {
 	ConversationScrollButton,
 } from "@/components/ai-elements/conversation";
 import { Loader } from "@/components/ai-elements/loader";
+import { useStickToBottomContext } from "use-stick-to-bottom";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -46,6 +47,13 @@ import { WorkspaceTrustBadge, workspaceTrustSuffix } from "./workspace-trust-bad
 import { ChatInfoDialog } from "./chat-info-dialog";
 import { SessionMenu } from "./session-menu";
 import { SessionWorkCard } from "./session-work-card";
+
+/** StickToBottom 的 isAtBottom 桥给悬浮层外的兄弟组件（统计条淡入淡出）。 */
+function AtBottomReporter({ onChange }: { onChange: (atBottom: boolean) => void }) {
+	const { isAtBottom } = useStickToBottomContext();
+	useEffect(() => onChange(isAtBottom), [isAtBottom, onChange]);
+	return null;
+}
 
 function statusLabelOf(status: ChatStatus): string {
 	switch (status) {
@@ -108,6 +116,7 @@ function SessionChat({
 	const [hasGoal, setHasGoal] = useState(false);
 	const [workStateReady, setWorkStateReady] = useState(false);
 	const [scrollButtonHost, setScrollButtonHost] = useState<HTMLDivElement | null>(null);
+	const [atBottom, setAtBottom] = useState(true);
 	useEffect(() => onStatus(status), [status, onStatus]);
 	const markWorkStateReady = useCallback(() => setWorkStateReady(true), []);
 	const openGoalCommand = useCallback((initialGoal: string) => {
@@ -173,6 +182,7 @@ function SessionChat({
 					onReady={markWorkStateReady}
 				/>
 				<Conversation initial="instant" resize={layoutReady ? "smooth" : "instant"}>
+					<AtBottomReporter onChange={setAtBottom} />
 					<ConversationContent className="home-message-column">
 						<div className="home-session-marker"><span />{sessionLabel}{sessionModifiedAt ? ` · ${compactDay(sessionModifiedAt)}` : ""}<span /></div>
 						{messages.length === 0 ? (
@@ -211,6 +221,7 @@ function SessionChat({
 					workspaceAvailable={workspaceAvailable}
 					sessionModel={sessionModel}
 					stats={sessionStats}
+					statsVisible={atBottom}
 					onModelChanged={onSessionModelChange}
 					onSend={send}
 					onStop={stop}
