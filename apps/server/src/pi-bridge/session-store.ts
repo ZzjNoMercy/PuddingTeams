@@ -791,6 +791,34 @@ export class PiSessionStore {
 	}
 
 	/**
+	 * Append an audit-only custom entry directly to the SessionManager branch.
+	 *
+	 * This is used for a running delegate projection while the manager itself is
+	 * still inside that delegate tool call. Going through AgentSession's
+	 * sendCustomMessage would wait for idle (or enqueue a next turn), so a refresh
+	 * during a long-running worker task could not recover the delegation id. The
+	 * hidden entry is persisted immediately, does not enter the model queue, and
+	 * is consumed by the web history reducer only to enrich the original tool card.
+	 */
+	async appendCustomMessageProjection(
+		id: string,
+		message: { customType: string; content: string; details?: Record<string, unknown> },
+	): Promise<void> {
+		try {
+			const session = await this.open(id);
+			session.sessionManager.appendCustomMessageEntry(
+				message.customType,
+				message.content,
+				false,
+				message.details,
+			);
+			await this.ensureSessionFile(id);
+		} catch (err) {
+			this.debugLog?.(`appendCustomMessageProjection failed: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+
+	/**
 	 * 启动收割器补写：为孤儿委托的 manager 工具调用追加一条合成 toolResult，
 	 * 让 manager 下次运行时能在上下文里看到失败原因并重新决策；前端历史重放
 	 * 也会把它折成「失败」而不是「已中断」。仅在启动早期调用（会话尚未加载）。

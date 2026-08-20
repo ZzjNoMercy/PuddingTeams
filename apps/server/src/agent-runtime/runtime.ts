@@ -4,6 +4,7 @@ import { DelegationStore, type DelegationRecord, type InteractionRecord } from "
 import { InteractionSecretStore } from "./interaction-secret-store.js";
 import { InteractionBroker, InteractionError } from "./interaction-broker.js";
 import type { ArtifactStore } from "./artifact-store.js";
+import type { DelegationTimelineStore } from "./delegation-timeline-store.js";
 import type {
 	AgentDriver,
 	AgentEvent,
@@ -12,6 +13,7 @@ import type {
 	InteractionResponse,
 	NeedsInputResult,
 	NormalizedResult,
+	WorkerActivity,
 } from "./types.js";
 
 export interface DelegateInput {
@@ -106,8 +108,87 @@ export class AgentRuntime {
 		private readonly ttl: InteractionTTL = { ttlMs: 24 * 60 * 60 * 1000 },
 		/** §15.6 交付物登记（可选；push/observe 无差别，缺省不登记）。 */
 		private readonly artifacts?: ArtifactStore,
+		/** Append-only worker activity timeline (optional in isolated tests). */
+		private readonly timeline?: DelegationTimelineStore,
 	) {
 		this.broker = new InteractionBroker(delegations);
+	}
+
+	private activityFromUpdate(agentId: string, content: string, details: unknown): WorkerActivity {
+		const candidate = details && typeof details === "object"
+			? (details as { activity?: Partial<WorkerActivity> }).activity
+			: undefined;
+		if (candidate && typeof candidate === "object") {
+			return {
+				source: typeof candidate.source === "string" && candidate.source ? candidate.source : agentId,
+				sourceEvent: typeof candidate.sourceEvent === "string" && candidate.sourceEvent ? candidate.sourceEvent : "progress",
+				kind: candidate.kind ?? "lifecycle",
+				status: candidate.status ?? "running",
+				title: typeof candidate.title === "string" && candidate.title ? candidate.title : content,
+				...(typeof candidate.content === "string" ? { content: candidate.content } : {}),
+				...(typeof candidate.itemId === "string" ? { itemId: candidate.itemId } : {}),
+				...(typeof candidate.sourceSeq === "number" ? { sourceSeq: candidate.sourceSeq } : {}),
+				...(candidate.metadata && typeof candidate.metadata === "object" ? { metadata: candidate.metadata } : {}),
+			};
+		}
+		return {
+			source: agentId,
+			sourceEvent: "runtime.progress",
+			kind: "lifecycle",
+			status: "running",
+			title: content,
+		};
+	}
+
+	private timelineContext(ctx: InvocationContext, delegation: DelegationRecord): InvocationContext {
+		return {
+			...ctx,
+			onUpdate: (content, details) => {
+				if (this.timeline) {
+					void this.timeline
+						.append(delegation.id, this.activityFromUpdate(delegation.agentId, content, details))
+						.catch(() => undefined);
+				}
+				const publicDetails = details && typeof details === "object"
+					? { ...(details as Record<string, unknown>), delegationId: delegation.id }
+					: { delegationId: delegation.id };
+				ctx.onUpdate?.(content, publicDetails);
+			},
+		};
+	}
+
+	private async recordBoundary(delegation: DelegationRecord, event: AgentEvent): Promise<void> {
+		if (!this.timeline) return;
+		let activity: WorkerActivity | undefined;
+		if (event.type === "input_required") {
+			activity = {
+				source: delegation.agentId,
+				sourceEvent: "runtime.input_required",
+				kind: "approval",
+				status: "waiting",
+				title: "等待人工处理",
+				metadata: { interactionKind: event.result.interaction.kind },
+			};
+		} else if (event.type === "completed") {
+			activity = {
+				source: delegation.agentId,
+				sourceEvent: "runtime.completed",
+				kind: "lifecycle",
+				status: "completed",
+				title: "任务已完成",
+			};
+		} else if (event.type === "failed") {
+			activity = {
+				source: delegation.agentId,
+				sourceEvent: "runtime.failed",
+				kind: event.result.status === "cancelled" ? "lifecycle" : "error",
+				status: event.result.status === "cancelled" ? "completed" : "failed",
+				title: event.result.status === "cancelled" ? "任务已取消" : "任务执行失败",
+				content: event.result.error,
+				metadata: { errorCode: event.result.errorCode, resultStatus: event.result.status },
+			};
+		}
+		if (activity) await this.timeline.append(delegation.id, activity).catch(() => undefined);
 	}
 
 	/** In-process per-session lock: one active/waiting run per sessionHandle. */
@@ -171,6 +252,7 @@ export class AgentRuntime {
 			managerToolCallId: input.managerToolCallId,
 			parentDelegationId: input.parentDelegationId,
 			handoffKind: input.handoffKind,
+			task: input.message,
 			intent: input.intent,
 			expectedOutcome: input.expectedOutcome,
 			evidenceRequirements: input.evidenceRequirements,
@@ -189,13 +271,27 @@ export class AgentRuntime {
 		this.runControllers.set(delegation.id, controller);
 		const settleRun = this.trackRun(delegation.id);
 		const signal = ctx.signal ? AbortSignal.any([ctx.signal, controller.signal]) : controller.signal;
-		const runCtx: InvocationContext = {
+		const runCtx = this.timelineContext({
 			...ctx,
 			cwd: delegation.cwdSnapshot,
 			delegationId: delegation.id,
 			...(delegation.workspaceId ? { workspaceId: delegation.workspaceId } : {}),
 			signal,
-		};
+		}, delegation);
+		// The immutable delegation exists before the Driver starts. Surface its id
+		// immediately so every running card (including external CLI workers that do
+		// not expose a session/run handle yet) can offer precise cancellation.
+		runCtx.onUpdate?.("worker 已接收任务，正在启动…", {
+			running: true,
+			delegationId: delegation.id,
+			activity: {
+				source: delegation.agentId,
+				sourceEvent: "runtime.accepted",
+				kind: "lifecycle",
+				status: "started",
+				title: "PuddingTeams 已接收任务",
+			},
+		});
 		const requestId = input.requestId ?? randomUUID();
 		let sessionHandle = knownSession;
 		// 失效会话恢复：continue 撞上 session-not-found（后端删 session/换实例/
@@ -260,6 +356,7 @@ export class AgentRuntime {
 			const transition = await this.withDelegationTransition(delegation.id, () =>
 				this.delegations.transitionDelegation(delegation.id, ["running"], { status: "failed", result: failed }),
 			);
+			if (transition.applied) await this.recordBoundary(delegation, { type: "failed", result: failed });
 			this.runControllers.delete(delegation.id);
 			this.activeDelegations.delete(delegation.id);
 			settleRun();
@@ -282,6 +379,7 @@ export class AgentRuntime {
 		const transition = await this.withDelegationTransition(delegation.id, () =>
 			this.delegations.transitionDelegation(delegation.id, ["running"], { status: "failed", result: failed }),
 		);
+		if (transition.applied) await this.recordBoundary(delegation, { type: "failed", result: failed });
 		this.runControllers.delete(delegation.id);
 		this.activeDelegations.delete(delegation.id);
 		settleRun();
@@ -362,6 +460,7 @@ export class AgentRuntime {
 				}
 				const interaction = await this.persistInteraction(delegation, event.result, event.providerState);
 				if (effectiveSession) this.activeRuns.set(effectiveSession, delegation.id);
+				await this.recordBoundary(delegation, event);
 				return {
 					terminal: true,
 					outcome: {
@@ -392,6 +491,7 @@ export class AgentRuntime {
 				}
 				if (effectiveSession) this.releaseSession(effectiveSession, delegation.id);
 				await this.registerArtifacts(event.result, delegation, ctx);
+				await this.recordBoundary(delegation, event);
 				return { terminal: true, outcome: { status: "completed", result: event.result, delegation: transitioned.record ?? delegation } };
 			}
 			case "failed": {
@@ -410,6 +510,7 @@ export class AgentRuntime {
 					return { terminal: true, outcome: { status: "failed", result, delegation: record } };
 				}
 				if (effectiveSession) this.releaseSession(effectiveSession, delegation.id);
+				await this.recordBoundary(delegation, event);
 				return {
 					terminal: true,
 					outcome: { status: "failed", result: event.result, delegation: transitioned.record ?? delegation },
@@ -561,6 +662,31 @@ export class AgentRuntime {
 		}
 
 		// approved：调用 driver.respond 恢复原 Run。
+		// Interaction 已消费后，Delegation 必须立即从 waiting_input 回到
+		// running；否则 worker 实际续跑期间，任务卡、抽屉与持久化状态会一直
+		// 假装仍在等待审批。
+		const resumed = await this.withDelegationTransition(delegation.id, () =>
+			this.delegations.transitionDelegation(delegation.id, ["waiting_input"], {
+				status: "running",
+				revision: (delegation.revision ?? 0) + 1,
+			}),
+		);
+		if (!resumed.applied) {
+			onAdmitted?.(false);
+			const record = resumed.record ?? delegation;
+			return {
+				status: "failed",
+				result: {
+					agentId: delegation.agentId,
+					status: record.status === "cancelled" ? "cancelled" : "failed",
+					errorCode: record.status === "cancelled" ? "cancelled" : "state_conflict",
+					error: record.status === "cancelled" ? "任务已取消" : `审批恢复失败：任务已是 ${record.status}`,
+					recoverable: record.status !== "cancelled",
+				},
+				delegation: record,
+				interaction: approved,
+			};
+		}
 		const providerState = await this.providerStateOf(interactionId);
 		// runHandle 可能为空：worker 在 Run 启动前发问（如分析模型澄清）时无
 		// 运行句柄可恢复，能否继续由 Driver 判断（PuddingClaw 走 clarify-and-
@@ -571,15 +697,14 @@ export class AgentRuntime {
 		this.runControllers.set(delegation.id, controller);
 		const settleRun = this.trackRun(delegation.id);
 		const signal = ctx.signal ? AbortSignal.any([ctx.signal, controller.signal]) : controller.signal;
-		const invocationCtx: InvocationContext = {
+		const invocationCtx = this.timelineContext({
 			...ctx,
 			signal,
 			cwd: delegation.cwdSnapshot,
 			...(delegation.workspaceId ? { workspaceId: delegation.workspaceId } : {}),
-			onUpdate: ctx.onUpdate,
 			// respond 恢复的是同一条 Run，导出目录仍按原 delegation 约定（§15.3）。
 			delegationId: delegation.id,
-		};
+		}, delegation);
 		// Driver 需要 continuation token；PuddingClawDriver 在构造时持有，这里把
 		// provider state 透传为 respond 的私有字段（Runtime 不接触明文）。
 		invocationCtx.providerState = providerState;
@@ -605,22 +730,24 @@ export class AgentRuntime {
 			}
 			const result: NormalizedResult = { agentId: delegation.agentId, status: "failed", errorCode: "no_boundary_event", error: "respond 无边界事件", recoverable: false };
 			const transition = await this.withDelegationTransition(delegation.id, () =>
-				this.delegations.transitionDelegation(delegation.id, ["waiting_input"], { status: "failed", result }),
+				this.delegations.transitionDelegation(delegation.id, ["running", "waiting_input"], { status: "failed", result }),
 			);
 			if (transition.applied) {
 				await this.delegations.updateInteraction(interaction.id, { status: "failed" });
 				await this.secrets.removeProviderState(interaction.id).catch(() => undefined);
+				await this.recordBoundary(delegation, { type: "failed", result });
 			}
 			return { status: "failed", result, delegation: transition.record ?? delegation, interaction };
 		} catch (err) {
 			if (sessionHandle) this.releaseSession(sessionHandle, delegation.id);
 			const result: NormalizedResult = { agentId: delegation.agentId, status: "failed", errorCode: "driver_error", error: err instanceof Error ? err.message : String(err), recoverable: false };
 			const transition = await this.withDelegationTransition(delegation.id, () =>
-				this.delegations.transitionDelegation(delegation.id, ["waiting_input"], { status: "failed", result }),
+				this.delegations.transitionDelegation(delegation.id, ["running", "waiting_input"], { status: "failed", result }),
 			);
 			if (transition.applied) {
 				await this.delegations.updateInteraction(interaction.id, { status: "failed" });
 				await this.secrets.removeProviderState(interaction.id).catch(() => undefined);
+				await this.recordBoundary(delegation, { type: "failed", result });
 			}
 			if (!transition.applied && transition.record?.status === "cancelled") {
 				const cancelled: NormalizedResult = { agentId: delegation.agentId, status: "cancelled", errorCode: "cancelled", error: "任务已取消", recoverable: true };
@@ -674,7 +801,7 @@ export class AgentRuntime {
 				ctx.onUpdate?.(event.message, { running: true });
 				return { terminal: false, outcome: undefined as unknown as RespondOutcome };
 			case "completed": {
-				const transitioned = await this.delegations.transitionDelegation(delegation.id, ["waiting_input"], {
+				const transitioned = await this.delegations.transitionDelegation(delegation.id, ["running", "waiting_input"], {
 					status: "completed",
 					revision: (current?.revision ?? delegation.revision ?? 0) + 1,
 					sessionHandle,
@@ -689,13 +816,14 @@ export class AgentRuntime {
 				await this.delegations.updateInteraction(interaction.id, { status: "approved" });
 				if (sessionHandle) this.releaseSession(sessionHandle, delegation.id);
 				await this.registerArtifacts(event.result, delegation, ctx);
+				await this.recordBoundary(delegation, event);
 				return {
 					terminal: true,
 					outcome: { status: "completed", result: event.result, delegation: transitioned.record ?? delegation, interaction },
 				};
 			}
 			case "failed": {
-				const transitioned = await this.delegations.transitionDelegation(delegation.id, ["waiting_input"], {
+				const transitioned = await this.delegations.transitionDelegation(delegation.id, ["running", "waiting_input"], {
 					status: event.result.status === "cancelled" ? "cancelled" : "failed",
 					revision: (current?.revision ?? delegation.revision ?? 0) + 1,
 					result: event.result,
@@ -708,13 +836,14 @@ export class AgentRuntime {
 				await this.secrets.removeProviderState(interaction.id);
 				await this.delegations.updateInteraction(interaction.id, { status: "failed" });
 				if (sessionHandle) this.releaseSession(sessionHandle, delegation.id);
+				await this.recordBoundary(delegation, event);
 				return {
 					terminal: true,
 					outcome: { status: "failed", result: event.result, delegation: transitioned.record ?? delegation, interaction },
 				};
 			}
 			case "input_required": {
-				const transitioned = await this.delegations.transitionDelegation(delegation.id, ["waiting_input"], {
+				const transitioned = await this.delegations.transitionDelegation(delegation.id, ["running", "waiting_input"], {
 					status: "waiting_input",
 					revision: (current?.revision ?? delegation.revision ?? 0) + 1,
 				});
@@ -742,6 +871,7 @@ export class AgentRuntime {
 						...event.providerState,
 					});
 				}
+				await this.recordBoundary(delegation, event);
 				return {
 					terminal: true,
 					outcome: {
@@ -790,9 +920,24 @@ export class AgentRuntime {
 		const sealed = await this.delegations.transitionDelegation(
 			delegationId,
 			["running", "waiting_input"],
-			{ status: "cancelled" },
+			{
+				status: "cancelled",
+				result: {
+					agentId: delegation.agentId,
+					status: "cancelled",
+					errorCode: "cancelled",
+					error: "任务已取消",
+					recoverable: true,
+				},
+			},
 		);
 		if (!sealed.applied) return {};
+		await this.recordBoundary(delegation, {
+			type: "failed",
+			result: sealed.record?.result && sealed.record.result.status === "cancelled"
+				? sealed.record.result
+				: { agentId: delegation.agentId, status: "cancelled", errorCode: "cancelled", error: "任务已取消", recoverable: true },
+		});
 		const settled = this.runSettled.get(delegationId);
 		this.runControllers.get(delegationId)?.abort();
 		let driver: AgentDriver | undefined;
@@ -854,6 +999,7 @@ export class AgentRuntime {
 				this.delegations.transitionDelegation(orphan.id, ["running", "waiting_input"], { status: "failed", result }),
 			);
 			if (!transition.applied) continue;
+			await this.recordBoundary(orphan, { type: "failed", result });
 			for (const interaction of await this.delegations.listInteractions()) {
 				if (interaction.delegationId !== orphan.id) continue;
 				if (interaction.status === "pending" || interaction.status === "responding") {

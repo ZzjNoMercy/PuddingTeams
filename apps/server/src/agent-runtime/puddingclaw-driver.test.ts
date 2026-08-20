@@ -3,7 +3,8 @@ import assert from "node:assert";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { PuddingClawDriver } from "./puddingclaw-driver.js";
+import { createPuddingClawActivityObserver, PuddingClawDriver, projectPuddingClawActivity } from "./puddingclaw-driver.js";
+import { normalizePuddingClawJson, PUDDINGCLAW_CAPABILITIES } from "./normalize.js";
 import type { AgentEvent, InvocationContext } from "./types.js";
 
 /**
@@ -109,14 +110,14 @@ test("PuddingClawDriver：respond 无 token 且缺原任务/选择时明确失�
 	assert.equal(failed.result.errorCode, "interaction_unsupported");
 });
 
-test("PuddingClawDriver：probe 在 configured 但 authenticated=false 时显性报凭证无效", async () => {
+test("PuddingClawDriver：本机 probe 不依赖 authenticated 字段", async () => {
 	const dir = freshDir();
 	const cli = path.join(dir, "fake-doctor.sh");
 	writeFileSync(
 		cli,
 		[
 			"#!/bin/sh",
-			'printf "%s\\n" \'{"configured":true,"authenticated":false,"error_code":"auth_error","error":"Worker Access Key is invalid, revoked, expired, or out of scope","cli_version":"0.1.17"}\'',
+			'printf "%s\\n" \'{"configured":true,"reachable":true,"cli_version":"0.1.18"}\'',
 			"",
 		].join("\n"),
 	);
@@ -124,8 +125,119 @@ test("PuddingClawDriver：probe 在 configured 但 authenticated=false 时显性
 	const driver = new PuddingClawDriver({ command: cli });
 	const probe = await driver.probe({ cwd: dir, env: { ...process.env } });
 	assert.equal(probe.configured, true);
-	assert.equal(probe.authenticated, false);
-	const authIssue = probe.issues.find((i) => i.code === "auth_error");
-	assert.ok(authIssue, `凭证无效应进 issues：${JSON.stringify(probe.issues)}`);
-	assert.ok(authIssue.message.includes("Worker Access Key 无效"), "issue 文案必须直指凭证无效");
+	assert.equal(probe.authenticated, "unknown");
+	assert.equal(probe.issues.length, 0);
+});
+
+test("PuddingClawDriver：长连接丢失后用同一 request_id 恢复幂等终态", async () => {
+	const dir = freshDir();
+	const cli = path.join(dir, "fake-recover.sh");
+	const stateFile = path.join(dir, "attempt.txt");
+	writeFileSync(
+		cli,
+		[
+			"#!/bin/sh",
+			'cat > "$STDIN_CAPTURE"',
+			'count=$(cat "$STATE_FILE" 2>/dev/null || printf "0")',
+			'count=$((count + 1))',
+			'printf "%s" "$count" > "$STATE_FILE"',
+			'if [ "$count" -eq 1 ]; then',
+			'  printf "%s\\n" \'{"status":"error","error_code":"connection_error","error":"fetch failed"}\'',
+			'elif [ "$count" -eq 2 ]; then',
+			'  printf "%s\\n" \'{"status":"error","error_code":"http_error","error":"An identical Worker Run is already in progress"}\'',
+			"else",
+			'  printf "%s\\n" \'{"status":"completed","final_response":"recovered","run_id":"run-1","session_id":"session-1"}\'',
+			"fi",
+			"",
+		].join("\n"),
+	);
+	chmodSync(cli, 0o755);
+	const updates: string[] = [];
+	const driver = new PuddingClawDriver({
+		command: cli,
+		connectionRecoveryMinAgeMs: 0,
+		connectionRecoveryIntervalMs: 1,
+		connectionRecoveryMs: 1_000,
+	});
+	const events = await collect(driver.run(
+		{ message: "long task", requestId: "stable-request-id" },
+		{
+			cwd: dir,
+			env: {
+				...process.env,
+				STATE_FILE: stateFile,
+				STDIN_CAPTURE: path.join(dir, "stdin.json"),
+			},
+			onUpdate: (content) => updates.push(content),
+		},
+	));
+	const completed = events.find((event) => event.type === "completed");
+	assert.ok(completed && completed.type === "completed");
+	assert.equal(completed.result.content, "recovered");
+	assert.equal(readFileSync(stateFile, "utf-8"), "3");
+	const stdin = JSON.parse(readFileSync(path.join(dir, "stdin.json"), "utf-8")) as { request_id?: string };
+	assert.equal(stdin.request_id, "stable-request-id", "每次恢复必须重用原始幂等键");
+	assert.ok(updates.some((text) => text.includes("恢复同一任务")));
+	assert.ok(updates.some((text) => text.includes("仍在执行")));
+});
+
+test("PuddingClaw 时间线：17 类公共事件均有结构化投影，工具负载脱敏", () => {
+	const names = [
+		"run_starting", "task_preflight_started", "task_preflight_completed", "run_started",
+		"run_outcome", "goal_run_continued", "new_response", "token", "segment_break",
+		"segment_content_replaced", "tool_start", "tool_end", "permission_required",
+		"permission_resolved", "final_response", "done", "error",
+	];
+	const projected = names.map((event, index) => projectPuddingClawActivity({
+		event,
+		data: {
+			content: event === "token" ? "正文增量" : undefined,
+			tool: "database_sql_execute",
+			arguments: { query: "select 1", api_key: "must-not-leak" },
+			output: { rows: 1 },
+			run_id: "run-1",
+			seq: index + 1,
+		},
+	}));
+	assert.ok(projected.every(Boolean), "公共白名单事件不得静默丢弃");
+	assert.deepEqual(projected.map((item) => item!.activity.sourceEvent), names);
+	assert.equal(projected[7]!.activity.kind, "assistant");
+	assert.equal(projected[10]!.activity.kind, "tool");
+	assert.match(projected[10]!.activity.content ?? "", /\[redacted\]/);
+	assert.ok(!(projected[10]!.activity.content ?? "").includes("must-not-leak"));
+});
+
+test("PuddingClaw 时间线：连续 token 在落盘前合并，非 token 事件结束分组", () => {
+	const emitted: Array<ReturnType<typeof projectPuddingClawActivity> & {}> = [];
+	const observer = createPuddingClawActivityObserver((event) => emitted.push(event));
+	observer.push({ event: "token", seq: 11, data: { content: "实时", response_id: "response-1" } });
+	observer.push({ event: "token", seq: 12, data: { content: "天气", response_id: "response-1" } });
+	assert.equal(emitted.length, 0, "连续 token 未遇边界前只在 Driver 内缓冲");
+	observer.push({ event: "segment_break", seq: 13, data: {} });
+
+	assert.equal(emitted.length, 2, "落盘一条 token batch，再落盘 segment 边界");
+	assert.equal(emitted[0]?.activity.sourceEvent, "token.batch");
+	assert.equal(emitted[0]?.activity.content, "实时天气");
+	assert.deepEqual(emitted[0]?.activity.metadata, { tokenEventCount: 2, sourceSeqStart: 11, sourceSeqEnd: 12 });
+	assert.equal(emitted[1]?.activity.sourceEvent, "segment_break");
+	observer.flush();
+	assert.equal(emitted.length, 2, "重复 flush 不产生空批次");
+});
+
+test("PuddingClaw 主结果只使用 final_response，不拼接过程事件或协议负载", () => {
+	const completed = normalizePuddingClawJson({
+		status: "completed",
+		final_response: "最终答复",
+		tokens: ["过程", "增量"],
+		segments: ["中间回复"],
+	});
+	assert.equal(completed.type, "completed");
+	if (completed.type !== "completed") return;
+	assert.equal(completed.result.content, "最终答复");
+
+	const empty = normalizePuddingClawJson({ status: "completed", tokens: ["不能进入主卡"] });
+	assert.equal(empty.type, "completed");
+	if (empty.type !== "completed") return;
+	assert.equal(empty.result.content, "（puddingclaw 无最终文本输出）");
+	assert.equal(PUDDINGCLAW_CAPABILITIES.progress, "stream");
 });

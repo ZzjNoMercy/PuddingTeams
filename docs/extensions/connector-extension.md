@@ -16,7 +16,7 @@ Connector 包是**同一份代码、两个宿主入口**的 npm 包：既是 `pi
 
 边界铁律（写代码时随时对照）：
 
-- **pi 门面只用 `ExtensionAPI`**：registerTool、事件回调；没有 spawn、server 持久化、审批路由能力。
+- **pi 门面只从 pi 宿主取得 `ExtensionAPI`**：用它 registerTool、接收执行上下文与事件回调；`ExtensionAPI` 本身不提供 PuddingTeams 的 spawn broker、Delegation 持久化或审批路由。纯 pi 门面仍可按包权限调用共享核心（例如 `spawnWorker()`）执行本地 CLI，但那是包自己的轻量执行链，不会获得 PuddingTeams 的房间能力。
 - **Driver 只用 Driver SPI（`@puddingteams/pwcp`）**：不 import pi SDK，不 import PuddingTeams server 内部模块。
 - **共享核心（`core/`）不依赖任何宿主**：协议翻译、事件归一化放这里，两个入口各自薄适配。
 - pi 入口是包的**门面**，Driver SPI 才是 Connector 的**本体**；完整的房间能力（manager-worker 编排、HITL 审批闭环、workspace 交接）只有 PuddingTeams 提供。
@@ -66,7 +66,7 @@ pi resource-loader 按此字段找入口，`pi install <source>` 后加载 `pi/i
 | `entry` | Driver 入口（包内相对路径，指向 `driver/index.ts`）；与 `connector.declarative` 互斥 |
 | `connector.id` / `displayName` / `apiVersion` | Connector contribution 身份；`apiVersion` 只支持 `"1"` |
 | `connector.defaultTransport` / `supportedTransports` | `spawn` / `http` / `rpc` / `acp` / `sdk`；default 必须包含在 supported 中 |
-| `connector.configSchema` | JSON Schema 子集，前端据此渲染配置表单（`format: "model"` 渲染为模型下拉）；用户只配 executable、transport 和安全设置，不手写命令模板 |
+| `connector.configSchema` | JSON Schema 子集，前端据此渲染配置表单。`format: "model"` 使用平台模型目录；`"x-puddingteams-options": "driver"` 调用该 Connector 的动态选项发现。用户只配 executable、transport 和安全设置，不手写命令模板 |
 | `connector.secretSchema` | `[{key, label, required}]`；密钥写 CredentialsStore，只存 secretRefs |
 | `connector.avatar` | 默认头像，包内相对资源路径（如 `assets/codex.svg`） |
 
@@ -91,7 +91,7 @@ pi resource-loader 按此字段找入口，`pi install <source>` 后加载 `pi/i
 
 ## 4. Driver SPI 契约要点
 
-类型定义在 `@puddingteams/pwcp/types`（`AgentDriver` 接口）。五个操作：
+类型定义在 `@puddingteams/pwcp/types`（`AgentDriver` 接口）。五个运行操作和一个可选的控制面发现操作：
 
 | 操作 | 语义 |
 | --- | --- |
@@ -100,16 +100,21 @@ pi resource-loader 按此字段找入口，`pi install <source>` 后加载 `pi/i
 | `respond(input, ctx)` | 给仍在等待输入的同一条 Run 提交审批/回答（HITL）。不支持就在 capabilities 里不声明，实现里防御性 yield `interaction_unsupported` |
 | `cancel(input, ctx)` | 可选。取消当前 Run，不删 Session；无上游取消命令时 no-op——运行时取消经 `ctx.signal` → SIGTERM→SIGKILL（spawnWorker 保证） |
 | `probe(ctx)` | 探测 CLI 可执行性/版本/能力，不依赖用户配置；`issues` 给出可操作的修复提示 |
+| `listConfigOptions(field, ctx)` | 可选。返回某个 configSchema 字段的 provider-native 动态选项；宿主通过已有 Agent binding 注入 cwd/env/secrets，只转发结果，不维护上游模型清单 |
 
 硬约束：
 
 - **边界事件恰好一个**：每次 run/continue/respond 必须收束于 `completed` / `failed` / `input_required` 三者之一，不多不少。`failed` 要带 `errorCode`、`recoverable`（退出码 2 这类用法错误标 `false`，避免 Runtime 无谓重试）。
 - **capabilities 诚实声明**：`operations` / `interactionKinds` / `progress` / `transport` 必须与实现一致；不支持就是空数组（如 `interactionKinds: []`）。Runtime 按声明路由，虚标会在运行期变成路由错误。
-- **progress 外送规则**：流式进度经 `ctx.onUpdate?.(text, { streaming: true })` 实时外送；**终态 content 不走 progress**（避免与边界事件的 `result.content` 重复）。
+- **progress 外送规则**：流式进度经 `ctx.onUpdate?.(text, { streaming: true })` 实时外送；需要执行过程逐事件展示时，在 details 增加 Connector-neutral 的 `activity: WorkerActivity`。Runtime 会为 activity 分配本地 `seq` 并 append-only 落盘；Connector 不自行维护平台序号。**终态 content 不走普通 progress**（避免与边界事件的 `result.content` 重复），但上游 `final_response` 仍可作为 activity 保留在时间线。
 - **sessionHandle/runHandle 不透明**：Driver 生成与消费（codex 用 `thread.started` 的 thread_id，resume 以 thread 为单位，runHandle 复用 thread_id）。
 - **observe 收集**（§15.4）：任务前 `gitBaseline(cwd)` 取基线，completed 后 `observeGitArtifacts` 只收新增变更，防止脏工作区误报。
 
 `InvocationContext` 提供：`cwd`（房间 workspace 绑定，Driver 不自己猜目录）、`env`（已注入凭证）、`signal`、`timeouts`（startupMs/activeMs）、`onUpdate`。
+
+Codex 的 `model` 字段是动态发现参考实现：Driver 短暂启动 `codex app-server --stdio` 并分页调用 `model/list`，完成即退出；任务执行仍保持 `codex exec --json` 的 spawn + JSONL。前端发现失败时保留手输兜底，字段留空表示使用 Codex 默认模型。
+
+Claude Code 的 `model` 字段也走动态选项，但其 CLI 没有稳定的无头列表命令。Driver 读取 Claude 用户/项目设置中的 `availableModels`、`modelOverrides`、模型环境变量和自定义模型，未设置 allowlist 时补充官方稳定模型别名；是否真正可用仍由执行时的 Claude Code 按账号、企业策略与 provider 校验。Connector 不读取 OAuth 凭证，也不拿 Anthropic 公共 API 模型清单冒充 Claude Code picker。
 
 ## 5. pi 门面要点
 
@@ -118,6 +123,65 @@ pi resource-loader 按此字段找入口，`pi install <source>` 后加载 `pi/i
 - description 里写清「独立会话，看不到当前对话，task 要给足上下文」；
 - 参数 schema 用 typebox；`cwd` 默认取 `ctx.cwd`；
 - 工具是**单次委托入口**，不实现会话续接、审批——那些在 PuddingTeams 半边。
+
+当前 Codex 门面的等价缩略结构如下：
+
+```ts
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { spawnWorker } from "@puddingteams/pwcp/spawn";
+import { JsonlLineParser } from "@puddingteams/pwcp/jsonl-lines";
+
+const Params = Type.Object({ task: Type.String() });
+
+export default function codexConnector(pi: ExtensionAPI) {
+  pi.registerTool({
+    name: "codex_delegate",
+    parameters: Params,
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const parser = new JsonlLineParser();
+      const reducer = new CodexEventReducer();
+      const processRaw = (raw: unknown) => {
+        const progress = reducer.push(raw);
+        if (progress) {
+          onUpdate?.({ content: [{ type: "text", text: progress }], details: undefined });
+        }
+      };
+      const result = await spawnWorker({
+        command: "codex",
+        args: ["exec", "--json", "-C", ctx.cwd, params.task],
+        cwd: ctx.cwd,
+        signal,
+        onStdout: chunk => {
+          for (const raw of parser.push(chunk)) processRaw(raw);
+        }
+      });
+      for (const raw of parser.flush()) processRaw(raw);
+      const boundary = reducer.boundary("codex");
+      return {
+        content: [{ type: "text", text: projectBoundary(boundary, result) }],
+        details: { threadId: reducer.threadId, usage: reducer.usage, exitCode: result.exitCode }
+      };
+    }
+  });
+}
+```
+
+`execute()` 返回的是 pi 统一的 `AgentToolResult<TDetails>`：`content` 进入模型上下文，`details` 供日志/UI；pi 随后把它包装成带 `role/toolCallId/toolName/isError/timestamp` 的 `ToolResultMessage`。完整纯 pi 路径为：
+
+```text
+package.json: pi.extensions
+  → pi resource-loader import pi/index.ts
+  → 调用 default factory
+  → pi.registerTool(<id>_delegate)
+  → 模型 toolCall
+  → execute()
+  → 包内共享执行/归一化核心
+  → AgentToolResult
+  → pi ToolResultMessage
+```
+
+PuddingTeams 激活同一个 Connector 包时不会用这条门面链承担房间委托：ExtensionRegistry 从 `puddingteams.entry` 加载 `driver/index.ts`，平台另行生成 manager inline 委托 Extension，然后执行 `ScopedAgentInvoker → AgentInvoker → AgentRuntime → Driver`。因此纯 pi 路径没有 `state/delegations.json`、delegation timeline、Web HITL 与窗口镜像；两条路径不能混画成一条。
 
 ## 6. 开发流程
 
@@ -150,6 +214,8 @@ pi resource-loader 按此字段找入口，`pi install <source>` 后加载 `pi/i
 - `run` → `codex exec --json --skip-git-repo-check -C <cwd> -s <sandbox> [-m model] <message>`；
 - `continue` → `codex exec resume --json … <sessionHandle> <message>`；
 - `cancel` no-op、`respond` 防御性失败（codex headless 无跨进程审批），`capabilities: operations [run, continue, cancel]`、`interactionKinds: []`、`progress: "stream"`、`transport: "spawn"`；
+- `core/codex-normalize.ts` 将 `thread.started`、`turn.*`、`item.started/updated/completed`、`error` 以及 agent message、reasoning、command、file change、MCP/collab tool、web search、todo item 投影成 `WorkerActivity`；PuddingTeams 因此可逐事件回放，pi 门面仍只消费兼容的文本 progress；
+- 多条 completed `agent_message` 都保留在执行过程时间线，但终态 `result.content` 只采用最后一条，避免主聊天卡再次拼接展示过程说明；PuddingClaw 同理只采用 `final_response`（旧 CLI 的明确 `reply` 兜底），不拼接 token/segment 或整个协议负载；
 - 已真机验证：`pi -e` 无头调用 `codex_delegate` 成功；driver run/continue 会话记忆成功；server 启动时 `installOrUpdateFromDir` 按仓库路径预置（改动即时生效，不再是 builtin）。
 
 明确延后（写包时不要假设存在）：

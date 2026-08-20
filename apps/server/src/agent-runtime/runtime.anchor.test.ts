@@ -141,6 +141,41 @@ test("Phase0 anchor: needs_input 后同一 Session 二次 delegate 返回 409 �
 	assert.equal((first.result as { runHandle?: string }).runHandle, "run-abc");
 });
 
+test("批准受理后：续跑期间 delegation 立即回到 running，完成后再进入终态", async () => {
+	const { delegations, secrets } = await makeRuntime();
+	const { driver } = makeDriver("worker-session-resume", "run-resume");
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	driver.respond = async function* (): AsyncIterable<AgentEvent> {
+		yield { type: "started", sessionHandle: "worker-session-resume", runHandle: "run-resume" };
+		await gate;
+		yield {
+			type: "completed",
+			result: { agentId: "puddingclaw", status: "completed", sessionHandle: "worker-session-resume", runHandle: "run-resume", content: "完成" },
+		};
+	};
+	const runtime = new AgentRuntime(delegations, secrets, () => driver, { ttlMs: 24 * 60 * 60 * 1000 });
+	const first = await runtime.delegate(
+		{ ...PROJECT, windowId: "win-resume", managerSessionId: "sess-resume", agentId: "puddingclaw", message: "x", mode: "run" },
+		{ cwd: process.cwd(), env: {} },
+	);
+	const interactionId = first.interaction!.id;
+	let admitted!: (continuing: boolean) => void;
+	const admittedPromise = new Promise<boolean>((resolve) => { admitted = resolve; });
+	const responsePromise = runtime.respond(
+		interactionId,
+		{ requestId: "approve-resume", revision: 0, responses: [{ requestId: "perm-1", action: "approve" }] },
+		{ cwd: process.cwd(), env: {} },
+		driver,
+		admitted,
+	);
+	assert.equal(await admittedPromise, true);
+	assert.equal((await delegations.getDelegation(first.delegation.id))?.status, "running");
+	release();
+	assert.equal((await responsePromise).status, "completed");
+	assert.equal((await delegations.getDelegation(first.delegation.id))?.status, "completed");
+});
+
 test("respond：delegation 无 runHandle 时不抛错卡死，交给 Driver 判断（clarify-and-retry）", async () => {
 	const { delegations, secrets } = await makeRuntime();
 	// worker 在 Run 启动前发问（分析模型澄清）：input_required 不带 runHandle/
@@ -594,6 +629,7 @@ test("P3-1: cancel abort 真实 Run，迟到 completed 不能复活 cancelled De
 	assert.equal(observedAbort, true);
 	assert.equal(outcome.delegation.status, "cancelled");
 	assert.equal((await runtime.getDelegation(delegation.id))?.status, "cancelled");
+	assert.equal((await runtime.getDelegation(delegation.id))?.result?.status, "cancelled", "取消原因必须持久化供闭环与重放使用");
 });
 
 test("P3-1: terminal CAS 阻止 cancelled 被 completed 覆盖", async () => {

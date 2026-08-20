@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseExtensionManifest, ExtensionCatalog } from "./extensions.js";
@@ -64,9 +64,35 @@ test("P1/P2: claude-code 折叠 manifest（package.json puddingteams 字段）�
 	for (const key of ["command", "model", "permissionMode", "systemPrompt", "allowedTools"]) {
 		assert.ok(props[key], `configSchema 缺 ${key}`);
 	}
+	assert.equal((props.model as Record<string, unknown>)["x-puddingteams-options"], "driver");
 	// ANTHROPIC_API_KEY 可选（本机 claude 登录态优先）。
 	assert.equal(parsed.connector.secretSchema?.[0]?.key, "ANTHROPIC_API_KEY");
 	assert.equal(parsed.connector.secretSchema?.[0]?.required, false);
+});
+
+test("Claude Code 配置模型下拉：合并官方别名、本机 allowlist 与模型映射", async () => {
+	const home = freshDir("claude-model-home-");
+	const cwd = freshDir("claude-model-cwd-");
+	mkdirSync(path.join(home, ".claude"), { recursive: true });
+	mkdirSync(path.join(cwd, ".claude"), { recursive: true });
+	writeFileSync(path.join(home, ".claude", "settings.json"), JSON.stringify({
+		availableModels: ["sonnet", "company-opus"],
+		model: "sonnet",
+		modelOverrides: { "company-opus": "gateway/opus-prod" },
+		env: {
+			ANTHROPIC_DEFAULT_SONNET_MODEL: "gateway/sonnet-prod",
+			ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: "Company Sonnet",
+		},
+	}));
+	writeFileSync(path.join(cwd, ".claude", "settings.local.json"), JSON.stringify({
+		availableModels: ["haiku"],
+	}));
+	const options = await new ClaudeCodeDriver().listConfigOptions("model", { cwd, env: { HOME: home } });
+	assert.deepEqual(options.map((option) => option.value), ["sonnet", "company-opus", "haiku"]);
+	assert.equal(options[0]?.label, "Sonnet · Company Sonnet");
+	assert.equal(options[0]?.isDefault, true);
+	assert.equal(options[1]?.description, "company-opus 由 Claude Code 映射到 gateway/opus-prod");
+	assert.deepEqual(await new ClaudeCodeDriver().listConfigOptions("unknown", { cwd, env: { HOME: home } }), []);
 });
 
 test("P1: claude-code driverFactory 多实例——同一 Connector 按 config 构造独立 Driver", () => {

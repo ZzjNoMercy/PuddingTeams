@@ -21,6 +21,8 @@ import type {
 	SessionWorkState,
 	DecisionRequest,
 	DelegationTrace,
+	DelegationTimelineEvent,
+	DriverConfigOption,
 	SessionSummary,
 	SkillDocument,
 	SkillEntry,
@@ -213,11 +215,22 @@ export async function abortSession(sessionId: string): Promise<void> {
 	await fetch(`${SERVER_URL}/api/sessions/${sessionId}/abort`, { method: "POST" });
 }
 
+/** Cancel one delegated worker Run without aborting the manager Session. */
+export async function cancelDelegation(delegationId: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/delegations/${encodeURIComponent(delegationId)}/cancel`, {
+		method: "POST",
+	});
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `cancel delegation failed: ${res.status}`);
+	}
+}
+
 export function sessionWsUrl(sessionId: string): string {
 	return `${SERVER_URL.replace(/^http/, "ws")}/api/sessions/${sessionId}/ws`;
 }
 
-// ---- worker 执行过程可视化（pi worker，只读） ----
+// ---- worker 执行过程可视化（pi 会话 / spawn 活动时间线，只读） ----
 
 export interface WorkerProcessInfo {
 	delegationId: string;
@@ -227,6 +240,28 @@ export interface WorkerProcessInfo {
 	/** 委托创建时间（ISO）：worker 会话跨任务续接，用它切出本次委托的消息。 */
 	createdAt: string;
 	live: boolean;
+	view: "session" | "timeline";
+}
+
+export interface WorkerProcessListItem extends WorkerProcessInfo {
+	updatedAt: string;
+	managerSessionId: string;
+	task?: string;
+	intent?: string;
+	expectedOutcome?: string;
+}
+
+export async function fetchRoomDelegationProcesses(
+	roomId: string,
+	managerSessionId?: string,
+): Promise<WorkerProcessListItem[]> {
+	const params = new URLSearchParams();
+	if (managerSessionId) params.set("managerSessionId", managerSessionId);
+	const query = params.size ? `?${params.toString()}` : "";
+	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/delegation-processes${query}`);
+	if (!res.ok) throw new Error(`fetch room delegation processes failed: ${res.status}`);
+	const body = (await res.json()) as { delegations?: WorkerProcessListItem[] };
+	return body.delegations ?? [];
 }
 
 export async function fetchDelegationProcess(delegationId: string): Promise<WorkerProcessInfo> {
@@ -253,6 +288,28 @@ export async function fetchDelegationProcessMessages(
 
 export function delegationProcessWsUrl(delegationId: string): string {
 	return `${SERVER_URL.replace(/^http/, "ws")}/api/delegations/${delegationId}/process/ws`;
+}
+
+export async function fetchDelegationTimeline(delegationId: string): Promise<{
+	events: DelegationTimelineEvent[];
+	live: boolean;
+	agentId: string;
+	status: string;
+	createdAt: string;
+}> {
+	const res = await fetch(`${SERVER_URL}/api/delegations/${encodeURIComponent(delegationId)}/process/timeline`);
+	if (!res.ok) throw new Error(`fetch delegation timeline failed: ${res.status}`);
+	return (await res.json()) as {
+		events: DelegationTimelineEvent[];
+		live: boolean;
+		agentId: string;
+		status: string;
+		createdAt: string;
+	};
+}
+
+export function delegationTimelineWsUrl(delegationId: string, afterSeq = 0): string {
+	return `${SERVER_URL.replace(/^http/, "ws")}/api/delegations/${encodeURIComponent(delegationId)}/process/timeline/ws?afterSeq=${afterSeq}`;
 }
 
 export async function getSettings(): Promise<{
@@ -319,6 +376,18 @@ export async function probeAgent(name: string): Promise<AgentProbeResult> {
 		throw new Error(body?.error ?? `probe failed: ${res.status}`);
 	}
 	return ((await res.json()) as { probe: AgentProbeResult }).probe;
+}
+
+export async function listAgentConnectorConfigOptions(name: string, field: string): Promise<DriverConfigOption[]> {
+	const res = await fetch(
+		`${SERVER_URL}/api/agents/${encodeURIComponent(name)}/connector/config-options/${encodeURIComponent(field)}`,
+	);
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `load Connector options failed: ${res.status}`);
+	}
+	const body = (await res.json()) as { options?: DriverConfigOption[] };
+	return body.options ?? [];
 }
 
 // ---- Phase 5：Extension 目录与 Connector/Capability 绑定（§10.1） ----

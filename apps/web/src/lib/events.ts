@@ -64,28 +64,72 @@ function renderCustom(m: PiCustomMessage): ChatMessage {
 }
 
 /**
+ * Approval/result custom messages are the append-only status stream for an
+ * earlier delegate tool result. Reconcile that original card by delegationId
+ * (or interactionId) so an admitted approval stops rendering as waiting.
+ */
+function reconcileDelegationStatus(list: ChatMessage[], next: ChatMessage): ChatMessage[] {
+	const details = next.details as { taskId?: string; delegationId?: string; interactionId?: string; status?: string } | undefined;
+	if (!details) return list;
+	let status: string | undefined;
+	if (next.customType === "pudding:task_assign") status = details.status ?? "running";
+	else if (next.customType === "pudding:interaction_required") status = "needs_input";
+	else if (next.customType === "pudding:interaction_resolved") {
+		status = details.status === "approved" ? "running" : details.status;
+	} else if (next.customType === "pudding:task_result") status = details.status;
+	if (!status || (!details.taskId && !details.delegationId && !details.interactionId)) return list;
+
+	let changed = false;
+	const reconciled = list.map((message) => {
+		if (!message.toolCalls.length) return message;
+		const toolCalls = message.toolCalls.map((call) => {
+			if (!isDelegateCall(call)) return call;
+			const callDetails = call.details as { delegationId?: string; interactionId?: string } | undefined;
+			const matches = Boolean(
+				(details.taskId && call.id === details.taskId)
+				|| (details.delegationId && callDetails?.delegationId === details.delegationId)
+				|| (details.interactionId && callDetails?.interactionId === details.interactionId),
+			);
+			if (!matches) return call;
+			changed = true;
+			return {
+				...call,
+				details: {
+					...(callDetails ?? {}),
+					...(next.details && typeof next.details === "object" ? next.details as Record<string, unknown> : {}),
+					status,
+				},
+			};
+		});
+		return toolCalls.some((call, index) => call !== message.toolCalls[index]) ? { ...message, toolCalls } : message;
+	});
+	return changed ? reconciled : list;
+}
+
+/**
  * direct 直派的指派卡会先写一张即时卡（无 delegationId），worker 会话就绪后
  * 再补一张同 taskId 的富化卡（带「执行过程」入口字段）。同 taskId 只留最新，
  * 历史回放与实时事件走同一去重，避免一张变两张。
  */
 function upsertCustomMessage(list: ChatMessage[], next: ChatMessage): ChatMessage[] {
+	const reconciledList = reconcileDelegationStatus(list, next);
 	if (next.customType === "pudding:task_assign") {
 		const taskId = (next.details as { taskId?: string } | undefined)?.taskId;
 		if (taskId) {
-			const idx = list.findIndex(
+			const idx = reconciledList.findIndex(
 				(m) =>
 					m.role === "custom" &&
 					m.customType === next.customType &&
 					(m.details as { taskId?: string } | undefined)?.taskId === taskId,
 			);
 			if (idx >= 0) {
-				const copy = [...list];
+				const copy = [...reconciledList];
 				copy[idx] = next;
 				return copy;
 			}
 		}
 	}
-	return [...list, next];
+	return [...reconciledList, next];
 }
 
 /**
@@ -118,8 +162,17 @@ export function renderHistory(msgs: PiMessage[]): ChatMessage[] {
 	const out: ChatMessage[] = [];
 	for (const m of msgs) {
 		if (m.role === "custom") {
-			if (m.display === false) continue;
 			const next = renderCustom(m);
+			if (m.display === false) {
+				// Hidden group running projections are audit/recovery state, not a
+				// second chat card. Fold them into the original delegate tool call.
+				if (m.customType === "pudding:task_assign") {
+					const replaced = reconcileDelegationStatus(out, next);
+					out.length = 0;
+					out.push(...replaced);
+				}
+				continue;
+			}
 			const replaced = upsertCustomMessage(out, next);
 			out.length = 0;
 			out.push(...replaced);
@@ -353,10 +406,11 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 			const idx = findLastAssistant(messages);
 			if (idx < 0) return messages;
 			const prev = messages[idx]!;
-			const statusById = new Map(prev.toolCalls.map((t) => [t.id, t.status]));
+			const previousById = new Map(prev.toolCalls.map((t) => [t.id, t]));
 			const toolCalls = renderPiMessage(m).toolCalls.map((t) => ({
+				...(previousById.get(t.id) ?? {}),
 				...t,
-				status: statusById.get(t.id) ?? t.status,
+				status: previousById.get(t.id)?.status ?? t.status,
 			}));
 			return messages.map((msg, i) => (i === idx ? { ...msg, ...renderPiMessage(m), toolCalls, streaming: true } : msg));
 		}
@@ -371,10 +425,11 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 				];
 			}
 			const prev = messages[idx]!;
-			const statusById = new Map(prev.toolCalls.map((t) => [t.id, t.status]));
+			const previousById = new Map(prev.toolCalls.map((t) => [t.id, t]));
 			const toolCalls = renderPiMessage(m).toolCalls.map((t) => ({
+				...(previousById.get(t.id) ?? {}),
 				...t,
-				status: statusById.get(t.id) ?? t.status,
+				status: previousById.get(t.id)?.status ?? t.status,
 			}));
 			return messages.map((msg, i) =>
 				i === idx ? { ...msg, ...renderPiMessage(m), toolCalls, streaming: false } : msg,

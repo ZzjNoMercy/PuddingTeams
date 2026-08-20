@@ -21,8 +21,8 @@ import { TeamsStore } from "../store/teams.js";
  *           只读展示 extensions/registry.json 的 bundled 预装状态（init 无安装动作）；
  * - 阶段 2.5 上游 CLI 安装：puddingclaw 第一优先级，codex/claude 询问式安装 +
  *           登录态提示；
- * - 阶段 3  PuddingClaw 接入：Backend URL + Worker Token → agents.json env +
- *           CredentialsStore（加密）→ `puddingclaw doctor --json` 复核；
+ * - 阶段 3  PuddingClaw 接入：本机回环 Backend URL → agents.json env →
+ *           `puddingclaw doctor --json` 复核；不配置 PuddingClaw Token；
  * - 阶段 4  汇总确认后原子写入；跳过/非 TTY 不阻塞（退出码 0）。
  *
  * 原则：探测只读；写入前汇总确认；密钥不回显不进日志；失败给可操作修复指引。
@@ -373,7 +373,7 @@ interface InitDraft {
 	/** 默认模型 → pi 全局 settings.json（与 Web 设置页同一写入路径）。 */
 	defaultModel?: { provider: string; model: string };
 	/** PuddingClaw 接入：URL → agents.json env；Token → CredentialsStore（加密）。 */
-	puddingclaw?: { url?: string; token?: string };
+	puddingclaw?: { url?: string };
 }
 
 async function askYesNo(deps: ResolvedDeps, question: string, defaultYes = false): Promise<boolean> {
@@ -652,7 +652,7 @@ async function stageCliInstall(
 // ---- 阶段 3：PuddingClaw 接入配置 ----
 
 async function stagePuddingClawSetup(deps: ResolvedDeps, draft: InitDraft, log: (msg: string) => void): Promise<void> {
-	log("\n阶段 3  PuddingClaw 接入（Backend URL + Worker Token）");
+	log("\n阶段 3  PuddingClaw 本机接入（Backend URL）");
 	if (!deps.isTTY) {
 		log("  ○ 非交互模式跳过（可稍后重跑 init 或在 Web 智能体管理配置）");
 		return;
@@ -663,16 +663,14 @@ async function stagePuddingClawSetup(deps: ResolvedDeps, draft: InitDraft, log: 
 		return;
 	}
 	const url = (await deps.ask(`  Backend URL [${DEFAULT_PUDDINGCLAW_URL}]: `)).trim() || DEFAULT_PUDDINGCLAW_URL;
-	const token = (await deps.secretAsk("  Worker Token（输入不显示，留空稍后补）: ")).trim();
-	draft.puddingclaw = { url, ...(token ? { token } : {}) };
-	if (!token) log("  ○ 未输入 Token：只保存 URL，Token 稍后在 Web 智能体管理补");
+	draft.puddingclaw = { url };
 }
 
-/** 递归找 configured/authenticated/reachable 布尔字段，容忍 doctor JSON 结构变化。 */
+/** 递归找 configured/reachable 布尔字段，容忍 doctor JSON 结构变化。 */
 function summarizeDoctorFlags(value: unknown, out: string[] = []): string[] {
 	if (!value || typeof value !== "object") return out;
 	for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-		if (["configured", "authenticated", "reachable"].includes(k) && typeof v === "boolean") {
+		if (["configured", "reachable"].includes(k) && typeof v === "boolean") {
 			out.push(`${k}=${v ? "✓" : "✗"}`);
 		} else {
 			summarizeDoctorFlags(v, out);
@@ -684,7 +682,6 @@ function summarizeDoctorFlags(value: unknown, out: string[] = []): string[] {
 async function verifyPuddingClaw(deps: ResolvedDeps, draft: InitDraft, log: (msg: string) => void): Promise<void> {
 	const env: NodeJS.ProcessEnv = {};
 	if (draft.puddingclaw?.url) env.PUDDINGCLAW_URL = draft.puddingclaw.url;
-	if (draft.puddingclaw?.token) env.PUDDINGCLAW_TOKEN = draft.puddingclaw.token;
 	const res = await deps.exec("puddingclaw", ["doctor", "--json"], { timeoutMs: PROBE_TIMEOUT_MS, env });
 	if (res.code !== 0) {
 		log(`  ○ puddingclaw doctor 复核失败（退出码 ${res.code}）：${res.stderr.trim().split("\n")[0] ?? "无输出"}；启动后可用 Web 探测复核`);
@@ -707,7 +704,6 @@ function draftSummary(draft: InitDraft, home: string): string[] {
 	if (draft.customProvider) lines.push(`自定义 provider「${draft.customProvider.id}」（${draft.customProvider.input.models.length} 个模型）→ pi 全局 models.json`);
 	if (draft.defaultModel) lines.push(`默认模型 ${draft.defaultModel.provider}/${draft.defaultModel.model} → pi 全局 settings.json`);
 	if (draft.puddingclaw?.url) lines.push(`puddingclaw Backend URL ${draft.puddingclaw.url} → agents.json env（PUDDINGCLAW_URL）`);
-	if (draft.puddingclaw?.token) lines.push(`puddingclaw Worker Token → ${home}/secrets/credentials.json（AES-256-GCM 加密）`);
 	return lines;
 }
 
@@ -744,13 +740,9 @@ async function applyDraft(draft: InitDraft, deps: ResolvedDeps): Promise<string[
 		await deps.setDefaultModel(draft.defaultModel.provider, draft.defaultModel.model);
 		applied.push(`默认模型 ${draft.defaultModel.provider}/${draft.defaultModel.model}`);
 	}
-	if (draft.puddingclaw && (draft.puddingclaw.url || draft.puddingclaw.token)) {
+	if (draft.puddingclaw?.url) {
 		const credentials = new CredentialsStore(paths.secrets);
 		await credentials.init();
-		if (draft.puddingclaw.token) {
-			await credentials.setSecrets("puddingclaw", { PUDDINGCLAW_TOKEN: draft.puddingclaw.token });
-			applied.push("puddingclaw Worker Token（加密）");
-		}
 		if (draft.puddingclaw.url) {
 			await mkdir(paths.unscopedWorkspace, { recursive: true });
 			const teams = new TeamsStore(

@@ -11,13 +11,14 @@ import {
 	deleteAgentAvatar,
 	deleteAgentSecret,
 	getAgentSecrets,
+	listAgentConnectorConfigOptions,
 	listModels,
 	setAgentSecrets,
 	uploadAgentAvatar,
 } from "@/lib/api";
 import { agentAvatarChanged } from "@/lib/avatars";
 import { ManagerAvatar, WorkerAvatar } from "@/components/chat/worker-avatar";
-import { agentDisplayName, type AgentConfig, type AffectedSessions, type ModelSummary, type SecretSchemaItem } from "@/lib/types";
+import { agentDisplayName, type AgentConfig, type AffectedSessions, type DriverConfigOption, type ModelSummary, type SecretSchemaItem } from "@/lib/types";
 
 /**
  * 共享表单件（§10.1）：
@@ -34,6 +35,8 @@ interface JsonSchemaProp {
 	description?: string;
 	/** 扩展注解："model" = 渲染为可用模型下拉（数据源 /api/models）。 */
 	format?: string;
+	/** Extension annotation: options are discovered by the bound Driver. */
+	"x-puddingteams-options"?: string;
 	enum?: unknown[];
 	default?: unknown;
 }
@@ -166,15 +169,89 @@ function ModelSelectField({
 	);
 }
 
+function DriverOptionSelectField({
+	agentName,
+	field,
+	label,
+	mark,
+	current,
+	description,
+	onSelect,
+}: {
+	agentName: string;
+	field: string;
+	label: string;
+	mark: React.ReactNode;
+	current: unknown;
+	description?: string;
+	onSelect: (next: string | undefined) => void;
+}) {
+	const [options, setOptions] = useState<DriverConfigOption[] | null>(null);
+	const [error, setError] = useState<string | null>(null);
+	useEffect(() => {
+		let cancelled = false;
+		listAgentConnectorConfigOptions(agentName, field)
+			.then((list) => {
+				if (!cancelled) {
+					setOptions(list);
+					setError(null);
+				}
+			})
+			.catch((reason: unknown) => {
+				if (!cancelled) {
+					setOptions([]);
+					setError(reason instanceof Error ? reason.message : String(reason));
+				}
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [agentName, field]);
+	const value = typeof current === "string" && current ? current : UNSET;
+	const known = options?.some((option) => option.value === value) ?? false;
+	return (
+		<label className="flex flex-col gap-1 text-sm">
+			<span className="text-muted-foreground">{label}{mark}</span>
+			{error ? (
+				<Input
+					value={typeof current === "string" ? current : ""}
+					onChange={(event) => onSelect(event.target.value || undefined)}
+					placeholder="模型 ID"
+				/>
+			) : (
+				<Select value={value} onValueChange={(next) => onSelect(next === UNSET ? undefined : next)}>
+					<SelectTrigger className="w-full">
+						<SelectValue placeholder={options === null ? "正在读取模型…" : "请选择模型"} />
+					</SelectTrigger>
+					<SelectContent>
+						<SelectItem value={UNSET}>不设置（使用 worker 默认模型）</SelectItem>
+						{value !== UNSET && !known ? <SelectItem value={value}>{value}（当前值）</SelectItem> : null}
+						{(options ?? []).map((option) => (
+							<SelectItem key={option.value} value={option.value}>
+								{option.label}{option.isDefault ? " · 默认" : ""}
+							</SelectItem>
+						))}
+					</SelectContent>
+				</Select>
+			)}
+			{error ? <span className="text-xs text-amber-600">模型列表读取失败，可手动输入：{error}</span> : null}
+			{description ? <span className="text-xs text-muted-foreground/70">{description}</span> : null}
+		</label>
+	);
+}
+
 /** 根据 configSchema 渲染配置表单（受控）。 */
 export function ConfigSchemaForm({
 	schema,
 	value,
 	onChange,
+	agentName,
 }: {
 	schema: Record<string, unknown> | undefined;
 	value: Record<string, unknown>;
 	onChange: (next: Record<string, unknown>) => void;
+	/** Existing Agent binding used for Driver-owned dynamic config options. */
+	agentName?: string;
 }) {
 	const props = simpleProperties(schema);
 	if (!props) {
@@ -188,6 +265,25 @@ export function ConfigSchemaForm({
 				const label = prop.title ?? key;
 				const current = value[key];
 				const mark = required.includes(key) ? <span className="text-destructive"> *</span> : null;
+				if (prop["x-puddingteams-options"] === "driver" && agentName) {
+					return (
+						<DriverOptionSelectField
+							key={key}
+							agentName={agentName}
+							field={key}
+							label={label}
+							mark={mark}
+							current={current}
+							description={prop.description}
+							onSelect={(next) => {
+								const updated = { ...value };
+								if (next === undefined) delete updated[key];
+								else updated[key] = next;
+								onChange(updated);
+							}}
+						/>
+					);
+				}
 				if (prop.format === "model" && (prop.type === "string" || prop.type === undefined)) {
 					return (
 						<ModelSelectField
@@ -514,13 +610,13 @@ export function SecretsEditor({ agent }: { agent: AgentConfig }) {
 							))}
 						</div>
 					) : (
-						<p className="text-xs text-muted-foreground/60">尚未配置。例如 PuddingClaw 需要 PUDDINGCLAW_TOKEN。</p>
+						<p className="text-xs text-muted-foreground/60">尚未配置。仅添加当前命令明确要求的环境变量。</p>
 					)}
 					<div className="flex flex-col gap-1.5">
 						<Input
 							value={keyName}
 							onChange={(e) => setKeyName(e.target.value)}
-							placeholder="变量名，如 PUDDINGCLAW_TOKEN"
+							placeholder="变量名，如 GITHUB_TOKEN"
 							className="font-mono text-xs"
 						/>
 						<div className="flex items-center gap-1.5">

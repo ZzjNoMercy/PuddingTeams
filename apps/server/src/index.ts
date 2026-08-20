@@ -35,6 +35,7 @@ import { WorkStateStore } from "./store/work-state.js";
 import { registerWorkStateRoutes } from "./routes/work-state.js";
 import { registerWorkerProcessRoutes } from "./routes/worker-process.js";
 import { WorkerProcessService } from "./agent-runtime/worker-process.js";
+import { DelegationTimelineStore } from "./agent-runtime/delegation-timeline-store.js";
 import { UploadStore } from "./store/uploads.js";
 import { configureSharedModelRuntime } from "./pi-bridge/model-runtime.js";
 import { registerWebStatic } from "./web-static.js";
@@ -67,7 +68,7 @@ app.log.info({ home: paths.home }, "puddingteams home resolved");
 // 无 AGENTS.md）；config.agentCwd 仅作显式诊断覆盖。
 const defaultCwd = config.agentCwd ?? paths.unscopedWorkspace;
 
-// Worker 密钥（如 PUDDINGCLAW_TOKEN）加密存于 <home>/secrets，不进 agents.json。
+// Extension manifest 明确声明的密钥加密存于 <home>/secrets，不进 agents.json。
 const credentials = new CredentialsStore(paths.secrets);
 await credentials.init();
 // Provider key 与 pi CLI 解耦（§10.6）：平台凭证落到 <home>/secrets/auth.json，
@@ -84,6 +85,8 @@ await teams.init();
 // Phase 1：Runtime/Driver 抽取。委托、交互与加密 provider state 独立存储。
 const delegations = new DelegationStore(paths.state);
 await delegations.init();
+const delegationTimelines = new DelegationTimelineStore(path.join(paths.state, "delegation-timelines"));
+await delegationTimelines.init();
 const interactionSecrets = new InteractionSecretStore(paths.secrets);
 await interactionSecrets.init();
 // §15.6 交付物登记：Runtime 完成时写入，API 可查。
@@ -121,6 +124,7 @@ const runtime: AgentRuntime = new AgentRuntime(
 	(agentId) => invoker.driverFor(agentId),
 	{ ttlMs: 24 * 60 * 60 * 1000 },
 	artifacts,
+	delegationTimelines,
 );
 const invoker = new AgentInvoker(teams, runtime, drivers, credentials, defaultCwd);
 
@@ -188,7 +192,9 @@ await registerRoomsRoutes(app, store, teams, invoker, workStates, {
 await registerInteractionsRoutes(app, runtime, invoker, teams);
 registerArtifactsRoutes(app, artifacts);
 registerWorkStateRoutes(app, workStates, teams, store, runtime);
-registerWorkerProcessRoutes(app, new WorkerProcessService(delegations, teams, paths.workerSessions));
+registerWorkerProcessRoutes(app, new WorkerProcessService(delegations, teams, paths.workerSessions, delegationTimelines), {
+	cancel: (delegationId, signal) => invoker.cancel(delegationId, signal),
+});
 
 // §15.6 artifact.created 事件：与现有审批/任务结果同一通道——manager session
 // 的 custom message（pi JSONL → 订阅中的 websocket 下发浏览器），不触发新轮次。

@@ -42,7 +42,7 @@
 				"type": "object",
 				"properties": {
 					"command": { "type": "string", "description": "Claude Code 可执行文件名或路径", "default": "claude" },
-					"model": { "type": "string", "description": "worker 使用的模型（--model）；留空用 claude 默认" },
+					"model": { "type": "string", "title": "model", "x-puddingteams-options": "driver", "description": "按 Claude Code 的模型别名与本机 availableModels/自定义配置选择；留空用 Claude 默认" },
 					"permissionMode": {
 						"type": "string",
 						"enum": ["default", "acceptEdits", "plan", "bypassPermissions"],

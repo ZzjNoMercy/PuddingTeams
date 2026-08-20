@@ -31,8 +31,9 @@ export async function directWorkerFor(
 	if (!workerName) return undefined;
 	const agent = await teams.getAgent(workerName);
 	if (!agent || agent.pinned || agent.invoke?.type === "pi") return undefined;
-	// pi worker（Connector 绑定 connectorId=pi）的会话支持执行过程可视化。
-	return { window, workerName, processView: agent.connector?.connectorId === "pi" };
+	// Every delegation has an append-only activity timeline; pi additionally
+	// resolves this entry to its full AgentSession view.
+	return { window, workerName, processView: true };
 }
 
 function resultCard(
@@ -52,7 +53,7 @@ function resultCard(
 			status: result.status,
 			delegationId: result.delegationId,
 			interactionId: result.interactionId,
-			// 执行过程可视化入口（仅 pi worker）。
+			// 执行过程可视化入口（pi=完整会话，spawn worker=事件时间线）。
 			sessionHandle: result.sessionHandle,
 			processView,
 			// 本任务 token 消耗（pi worker 按 Run 聚合；其他 driver 有则透传）。
@@ -109,10 +110,11 @@ export async function dispatchDirectMessage(
 		deps.sessions.sendCustomMessage(sessionId, message, { triggerTurn: false });
 
 	void (async () => {
-		// 执行过程可视化：runtime 的 started 更新带回 delegationId/sessionHandle，
-		// 补写一张同 taskId 的富化指派卡（前端按 taskId 去重，只留最新），
-		// 让运行中的卡片也有「执行过程」入口。只补一次。
-		let enriched = false;
+		// Runtime 接单后立即带回 delegationId；补写同 taskId 的富化指派卡
+		// （前端按 taskId 去重），让所有 worker 都能精确中止。pi worker 后续若
+		// 同时带 sessionHandle，还会获得「执行过程」入口。
+		let enrichedDelegation = false;
+		let enrichedProcess = false;
 		const agent = await deps.invoker.requireAgent(workerName);
 		const result = await deps.invoker.delegate({
 			agent,
@@ -124,10 +126,12 @@ export async function dispatchDirectMessage(
 			// binding 有 handle 就 continue，没有/失效由 runtime 透明回退 run。
 			mode: "continue",
 			onUpdate: (_text, details) => {
-				if (enriched || !processView) return;
 				const d = details as { delegationId?: string; sessionHandle?: string } | undefined;
-				if (!d?.delegationId || !d.sessionHandle) return;
-				enriched = true;
+				if (!d?.delegationId) return;
+				const addsProcess = processView && Boolean(d.sessionHandle);
+				if (enrichedDelegation && (!addsProcess || enrichedProcess)) return;
+				enrichedDelegation = true;
+				if (addsProcess) enrichedProcess = true;
 				void send({
 					customType: "pudding:task_assign",
 					content: displayText,
@@ -138,8 +142,8 @@ export async function dispatchDirectMessage(
 						from: "direct",
 						status: "running",
 						delegationId: d.delegationId,
-						sessionHandle: d.sessionHandle,
-						processView: true,
+						...(d.sessionHandle ? { sessionHandle: d.sessionHandle } : {}),
+						processView,
 					},
 				});
 			},

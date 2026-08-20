@@ -184,6 +184,24 @@ test("Phase5: DEFAULT_TEAMS 新结构——pinned manager + PuddingClaw connecto
 	await app.close();
 });
 
+test("Connector 动态配置选项：宿主转发 Driver 结果，不猜 provider 模型", async () => {
+	const { app, drivers } = await makeStack();
+	const driver = makeDriver("puddingclaw");
+	driver.listConfigOptions = async (field) => field === "model"
+		? [{ value: "provider-model", label: "Provider Model", isDefault: true }]
+		: [];
+	drivers.registerFactory("puddingclaw", () => driver, "puddingclaw");
+	const response = await app.inject({
+		method: "GET",
+		url: "/api/agents/puddingclaw/connector/config-options/model",
+	});
+	assert.equal(response.statusCode, 200, response.body);
+	assert.deepEqual(response.json(), {
+		options: [{ value: "provider-model", label: "Provider Model", isDefault: true }],
+	});
+	await app.close();
+});
+
 test("Phase5: pinned manager 双层拒绝——不可删除、不可禁用、保留名与 pi 类型受保护", async () => {
 	const { app } = await makeStack();
 	// 路由层拒绝删除/禁用。
@@ -235,9 +253,9 @@ test("Phase5: manager 可编辑配置——PATCH 合并、非法值拒绝", asyn
 	await app.close();
 });
 
-test("Phase5: Connector 绑定 API——secretRefs only，revision 与 affectedSessions 响应", async () => {
+test("Phase5: PuddingClaw Connector 不接受未声明 secret，revision 与 affectedSessions 响应", async () => {
 	const { app, credentials } = await makeStack();
-	const res = await app.inject({
+	const rejected = await app.inject({
 		method: "PUT",
 		url: "/api/agents/puddingclaw/connector",
 		payload: {
@@ -247,19 +265,29 @@ test("Phase5: Connector 绑定 API——secretRefs only，revision 与 affectedS
 			secrets: { PUDDINGCLAW_TOKEN: "sk-secret-value-123" },
 		},
 	});
+	assert.equal(rejected.statusCode, 400);
+	assert.match(rejected.body, /not declared/);
+
+	const res = await app.inject({
+		method: "PUT",
+		url: "/api/agents/puddingclaw/connector",
+		payload: {
+			extensionId: "puddingclaw",
+			connectorId: "puddingclaw",
+			config: { command: "puddingclaw" },
+		},
+	});
 	assert.equal(res.statusCode, 200);
 	const body = res.json() as {
 		agent: { connector: { secretRefs?: Record<string, string> }; extensionRevision: number };
 		revision: number;
 		affectedSessions: { affectedSessions: number; activeNow: number; reloadPending: number };
 	};
-	assert.deepEqual(body.agent.connector.secretRefs, { PUDDINGCLAW_TOKEN: "PUDDINGCLAW_TOKEN" }, "只存 secretRefs");
-	assert.ok(!res.body.includes("sk-secret-value-123"), "响应不得包含 secret 明文");
+	assert.equal(body.agent.connector.secretRefs, undefined);
 	assert.ok(body.revision >= 1, "写操作必须递增 extensionRevision");
 	assert.equal(typeof body.affectedSessions.activeNow, "number");
 	assert.equal(typeof body.affectedSessions.reloadPending, "number");
-	// 明文落在加密 CredentialsStore。
-	assert.deepEqual(await credentials.listConfigured("puddingclaw"), ["PUDDINGCLAW_TOKEN"]);
+	assert.deepEqual(await credentials.listConfigured("puddingclaw"), []);
 
 	// GET 返回绑定 + contribution manifest。
 	const get = await app.inject({ method: "GET", url: "/api/agents/puddingclaw/connector" });

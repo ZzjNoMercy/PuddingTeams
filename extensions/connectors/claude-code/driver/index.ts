@@ -1,9 +1,13 @@
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import path from "node:path";
 import type {
 	AgentDriver,
 	AgentEvent,
 	ContinueInput,
 	DriverCapabilities,
+	DriverConfigOption,
 	InvocationContext,
 	ProbeResult,
 	RespondInput,
@@ -44,6 +48,41 @@ function stderrSummary(stderr: string): string {
 	return `：${s}${stderr.length > max ? "…" : ""}`;
 }
 
+type ClaudeSettings = {
+	availableModels?: unknown;
+	model?: unknown;
+	modelOverrides?: unknown;
+	env?: unknown;
+};
+
+const CLAUDE_MODEL_ALIASES: Array<{ value: string; label: string; family?: "OPUS" | "SONNET" | "HAIKU" }> = [
+	{ value: "best", label: "Best", family: "OPUS" },
+	{ value: "sonnet", label: "Sonnet", family: "SONNET" },
+	{ value: "opus", label: "Opus", family: "OPUS" },
+	{ value: "haiku", label: "Haiku", family: "HAIKU" },
+	{ value: "sonnet[1m]", label: "Sonnet · 1M", family: "SONNET" },
+	{ value: "opus[1m]", label: "Opus · 1M", family: "OPUS" },
+	{ value: "opusplan", label: "Opus Plan" },
+];
+
+function recordOf(value: unknown): Record<string, unknown> {
+	return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function stringsOf(value: unknown): string[] {
+	return Array.isArray(value)
+		? value.filter((item): item is string => typeof item === "string" && Boolean(item.trim())).map((item) => item.trim())
+		: [];
+}
+
+async function readSettings(file: string): Promise<ClaudeSettings | undefined> {
+	try {
+		return recordOf(JSON.parse(await readFile(file, "utf8"))) as ClaudeSettings;
+	} catch {
+		return undefined;
+	}
+}
+
 /**
  * Claude Code CLI Driver（§4/§8.1，spawn + stream-json 流式）。
  *
@@ -67,6 +106,57 @@ export class ClaudeCodeDriver implements AgentDriver {
 
 	private cmd(): string {
 		return this.opts.command ?? "claude";
+	}
+
+	/**
+	 * Claude Code has an interactive /model picker but no stable headless list
+	 * command. Mirror its documented aliases and local model policy/configuration;
+	 * Claude remains the authority that validates account/provider availability.
+	 */
+	async listConfigOptions(field: string, ctx: InvocationContext): Promise<DriverConfigOption[]> {
+		if (field !== "model") return [];
+		const cwd = ctx.cwd ?? process.cwd();
+		const configDir = ctx.env?.CLAUDE_CONFIG_DIR?.trim()
+			|| path.join(ctx.env?.HOME?.trim() || homedir(), ".claude");
+		const files = [...new Set([
+			path.join(configDir, "settings.json"),
+			path.join(cwd, ".claude", "settings.json"),
+			path.join(cwd, ".claude", "settings.local.json"),
+		])];
+		const settings = (await Promise.all(files.map(readSettings))).filter((item): item is ClaudeSettings => Boolean(item));
+		const hasAllowlist = settings.some((item) => Array.isArray(item.availableModels));
+		const allowed = [...new Set(settings.flatMap((item) => stringsOf(item.availableModels)))];
+		const overrides = Object.assign({}, ...settings.map((item) => recordOf(item.modelOverrides))) as Record<string, unknown>;
+		const settingsEnv = Object.assign({}, ...settings.map((item) => recordOf(item.env))) as Record<string, unknown>;
+		const env: Record<string, string | undefined> = {};
+		for (const [key, value] of Object.entries(settingsEnv)) if (typeof value === "string") env[key] = value;
+		for (const [key, value] of Object.entries(ctx.env ?? {})) if (typeof value === "string") env[key] = value;
+		const configuredDefault = [...settings].reverse().find((item) => typeof item.model === "string")?.model;
+		const initialModel = env.ANTHROPIC_MODEL?.trim() || (typeof configuredDefault === "string" ? configuredDefault.trim() : "");
+		const values = hasAllowlist ? allowed : CLAUDE_MODEL_ALIASES.map((alias) => alias.value);
+		if (!hasAllowlist) {
+			for (const value of [env.ANTHROPIC_MODEL, env.ANTHROPIC_CUSTOM_MODEL_OPTION, ...Object.keys(overrides)]) {
+				if (value?.trim() && !values.includes(value.trim())) values.push(value.trim());
+			}
+		}
+
+		return values.map((value) => {
+			const alias = CLAUDE_MODEL_ALIASES.find((item) => item.value === value);
+			const familyTarget = alias?.family ? env[`ANTHROPIC_DEFAULT_${alias.family}_MODEL`]?.trim() : undefined;
+			const familyName = alias?.family ? env[`ANTHROPIC_DEFAULT_${alias.family}_MODEL_NAME`]?.trim() : undefined;
+			const override = typeof overrides[value] === "string" ? overrides[value].trim() : undefined;
+			const isCustom = value === env.ANTHROPIC_CUSTOM_MODEL_OPTION?.trim();
+			const customName = isCustom ? env.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME?.trim() : undefined;
+			const target = override || familyTarget;
+			return {
+				value,
+				label: customName || (alias ? `${alias.label}${familyName || target ? ` · ${familyName || target}` : ""}` : value),
+				description: isCustom
+					? env.ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION?.trim() || "Claude Code 自定义模型"
+					: target ? `${value} 由 Claude Code 映射到 ${target}` : undefined,
+				isDefault: Boolean(initialModel && (initialModel === value || initialModel === target)),
+			};
+		});
 	}
 
 	private optionArgs(): string[] {

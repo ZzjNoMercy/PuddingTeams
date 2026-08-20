@@ -91,17 +91,26 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		name: string,
 		secrets: Record<string, string> | undefined,
 		existingRefs: Record<string, string> | undefined,
+		allowedKeys?: ReadonlySet<string>,
 	): Promise<Record<string, string> | undefined> {
-		if (secrets === undefined) return existingRefs;
+		const refs = { ...(existingRefs ?? {}) };
+		if (allowedKeys) {
+			for (const key of Object.keys(refs)) {
+				if (allowedKeys.has(key)) continue;
+				delete refs[key];
+				await credentials?.removeSecret(name, key);
+			}
+		}
+		if (secrets === undefined) return Object.keys(refs).length > 0 ? refs : undefined;
 		if (!credentials) throw new Error("secrets store not configured");
 		for (const [k, v] of Object.entries(secrets)) {
 			if (typeof v !== "string") throw new Error(`secret "${k}" must be a string`);
 			if (!SECRET_KEY.test(k)) throw new Error(`secret key "${k}" must be UPPER_SNAKE (env var name)`);
+			if (allowedKeys && !allowedKeys.has(k)) throw new Error(`secret "${k}" is not declared by this extension`);
 		}
 		await credentials.setSecrets(name, secrets);
-		const refs = { ...(existingRefs ?? {}) };
 		for (const k of Object.keys(secrets)) refs[k] = k;
-		return refs;
+		return Object.keys(refs).length > 0 ? refs : undefined;
 	}
 
 	app.get("/api/agents", async () => {
@@ -398,6 +407,33 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		return { connector: binding, extension: contribution, securityWarnings: connectorSecurityWarnings(agent) };
 	});
 
+	/** Connector-owned dynamic config choices (for example Codex model/list). */
+	app.get<{ Params: { name: string; field: string } }>(
+		"/api/agents/:name/connector/config-options/:field",
+		async (req, reply) => {
+			try {
+				const agent = await teams.getAgent(req.params.name);
+				if (!agent) return reply.code(404).send({ error: "agent not found" });
+				if (!agent.connector || !invoker) return reply.code(400).send({ error: "agent has no Connector" });
+				if (!/^[a-zA-Z][a-zA-Z0-9_.-]{0,63}$/.test(req.params.field)) {
+					return reply.code(400).send({ error: "invalid config field" });
+				}
+				const driver = await invoker.driverFor(agent.name);
+				if (!driver) return reply.code(404).send({ error: "Connector driver unavailable" });
+				if (!driver.listConfigOptions) return { options: [] };
+				const secrets = credentials ? await credentials.getSecrets(agent.name) : {};
+				return {
+					options: await driver.listConfigOptions(req.params.field, {
+						cwd: teams.defaultContextCwd(),
+						env: { ...process.env, ...(agent.env ?? {}), ...secrets },
+					}),
+				};
+			} catch (err) {
+				return reply.code(502).send({ error: err instanceof Error ? err.message : String(err) });
+			}
+		},
+	);
+
 	app.put<{
 		Params: { name: string };
 		Body: {
@@ -424,7 +460,8 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 			return reply.code(400).send({ error: `extension「${extensionId}」未安装或不包含 connector「${connectorId}」` });
 		}
 		try {
-			const secretRefs = await applySecrets(agent.name, req.body?.secrets, agent.connector?.secretRefs);
+			const allowedSecretKeys = new Set(manifest?.kind === "connector" ? (manifest.connector.secretSchema ?? []).map((item) => item.key) : []);
+			const secretRefs = await applySecrets(agent.name, req.body?.secrets, agent.connector?.secretRefs, allowedSecretKeys);
 			const updated = await teams.setConnectorBinding(agent.name, {
 				extensionId: extensionId.trim(),
 				connectorId: connectorId.trim(),
@@ -473,7 +510,8 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 			return reply.code(400).send({ error: `extension「${extensionId}」未安装或不包含 capability「${capabilityId}」` });
 		}
 		try {
-			const secretRefs = await applySecrets(agent.name, req.body?.secrets, undefined);
+			const allowedSecretKeys = new Set(manifest?.kind === "capability" ? (manifest.capability.secretSchema ?? []).map((item) => item.key) : []);
+			const secretRefs = await applySecrets(agent.name, req.body?.secrets, undefined, allowedSecretKeys);
 			const updated = await teams.addCapabilityBinding(agent.name, {
 				extensionId: extensionId.trim(),
 				capabilityId: capabilityId.trim(),
@@ -507,8 +545,10 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		if (activation !== undefined && activation !== "always" && activation !== "searchable") {
 			return reply.code(400).send({ error: 'activation 必须是 "always" | "searchable"' });
 		}
+		const manifest = extensions?.manifestOf(binding.extensionId);
 		try {
-			const secretRefs = await applySecrets(agent.name, req.body?.secrets, binding.secretRefs);
+			const allowedSecretKeys = new Set(manifest?.kind === "capability" ? (manifest.capability.secretSchema ?? []).map((item) => item.key) : []);
+			const secretRefs = await applySecrets(agent.name, req.body?.secrets, binding.secretRefs, allowedSecretKeys);
 			const patch: Partial<Omit<AgentCapabilityBinding, "id" | "extensionId" | "capabilityId">> = {
 				...(enabled !== undefined ? { enabled } : {}),
 				...(config !== undefined ? { config } : {}),

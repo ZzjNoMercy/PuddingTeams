@@ -10,7 +10,7 @@ export const metadata: Metadata = {
 
 // Parser-blocking inline initialization: apply persisted visual preferences
 // and an explicit canvas color before the full stylesheet can paint.
-const visualPreferenceInitScript = `(function(){try{var r=document.documentElement;var t=localStorage.getItem("puddingteams-theme");var d=t==="dark"||(!t)||(t==="system"&&window.matchMedia("(prefers-color-scheme: dark)").matches);if(d)r.classList.add("dark");r.style.colorScheme=d?"dark":"light";r.style.backgroundColor=d?"oklch(0.12 0.012 240)":"#f4f6f7";if(localStorage.getItem("puddingteams:nav-collapsed")==="0")r.dataset.nav="expanded";if(localStorage.getItem("puddingteams:reduce-motion")==="1")r.dataset.reduceMotion="true"}catch(e){}})();`;
+const visualPreferenceInitScript = `(function(){try{var r=document.documentElement;var t=localStorage.getItem("puddingteams-theme");var d=t==="dark"||(!t)||(t==="system"&&window.matchMedia("(prefers-color-scheme: dark)").matches);if(d)r.classList.add("dark");r.style.colorScheme=d?"dark":"light";r.style.backgroundColor=d?"oklch(0.12 0.012 240)":"#eef3f5";if(localStorage.getItem("puddingteams:nav-collapsed")==="0")r.dataset.nav="expanded";if(localStorage.getItem("puddingteams:reduce-motion")==="1")r.dataset.reduceMotion="true"}catch(e){}})();`;
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
 	return (

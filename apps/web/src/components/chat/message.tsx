@@ -1,7 +1,7 @@
 "use client";
 
 import { createContext, type ComponentProps, useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ChevronDownIcon, ChevronRightIcon, ExternalLinkIcon, FilePenIcon, FileSearchIcon, FileTextIcon, FolderIcon, SquareTerminalIcon, UserPlusIcon, UsersIcon, WrenchIcon } from "lucide-react";
+import { ChevronDownIcon, ChevronRightIcon, ExternalLinkIcon, FilePenIcon, FileSearchIcon, FileTextIcon, FolderIcon, ListTreeIcon, SquareIcon, SquareTerminalIcon, UserPlusIcon, UsersIcon, WrenchIcon } from "lucide-react";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
 	Message as AiMessage,
@@ -20,12 +20,12 @@ import { streamdownPlugins } from "@/core/streamdown/plugins";
 import { delegateWorker, isDelegateCall } from "@/lib/events";
 import { useAgentLabel } from "@/lib/avatars";
 import { formatTokens } from "@/lib/session-stats";
-import { openRoomFile } from "@/lib/api";
+import { cancelDelegation, openRoomFile } from "@/lib/api";
 import type { ChatMessage, ToolCallView, WindowType } from "@/lib/types";
 import { toast } from "sonner";
 import { ManagerAvatar, WorkerAvatar } from "./worker-avatar";
 import { InteractionCard } from "./interaction-card";
-import { WorkerProcessDialog } from "./worker-process-dialog";
+import { useWorkerProcessDrawer } from "./worker-process-context";
 
 const TOOL_STATUS_LABEL: Record<ToolCallView["status"], string> = {
 	pending: "待运行",
@@ -124,6 +124,7 @@ function Elapsed({ active, since }: { active: boolean; since?: number }) {
 
 /** worker 回报的委托状态 → 中文徽标文案（未识别的兜底原始值）。 */
 const WORKER_STATUS_LABEL: Record<string, string> = {
+	running: "执行中",
 	completed: "完成",
 	needs_input: "等待审批",
 	cancelled: "已取消",
@@ -136,7 +137,8 @@ const WORKER_STATUS_LABEL: Record<string, string> = {
 };
 
 function statusBadge(call: ToolCallView, since?: number) {
-	if (call.status === "running")
+	const details = call.details as { status?: string } | undefined;
+	if (call.status === "running" || details?.status === "running" || details?.status === "approved")
 		return (
 			<Badge variant="secondary" className="gap-1">
 				<span className="size-1.5 animate-pulse rounded-full bg-muted-foreground" />
@@ -145,7 +147,6 @@ function statusBadge(call: ToolCallView, since?: number) {
 		);
 	if (call.status === "error") return <Badge variant="destructive">失败</Badge>;
 	if (call.status === "interrupted") return <Badge variant="outline">已中断</Badge>;
-	const details = call.details as { status?: string } | undefined;
 	if (details?.status === "needs_input") return <Badge variant="secondary">等待审批</Badge>;
 	if (details?.status && details.status !== "completed") {
 		return <Badge variant="destructive">{WORKER_STATUS_LABEL[details.status] ?? details.status}</Badge>;
@@ -194,28 +195,48 @@ function useAnchorPreservingToggle<T extends HTMLElement>() {
 	return { rootRef, toggle };
 }
 
-/**
- * pi worker「执行过程」入口：details 带 processView + delegationId 时出现
- * （运行中来自 delegate 的 started 更新，落定后来自工具结果 meta）。
- * 非 pi worker 没有 pi 事件流可看，不显示。
- */
-function ProcessViewButton({ details, worker }: { details: unknown; worker: string }) {
-	const d = details as { processView?: boolean; delegationId?: string } | undefined;
-	const workerLabel = useAgentLabel(worker);
-	const [open, setOpen] = useState(false);
-	if (!d?.processView || !d.delegationId) return null;
+/** 委托任务的独立过程入口；任务摘要仍由相邻标题/箭头负责。 */
+function ProcessViewButton({ details }: { details: unknown }) {
+	const process = details as { processView?: boolean; delegationId?: string } | undefined;
+	const { openWorkerProcess } = useWorkerProcessDrawer();
+	if (!process?.processView || !process.delegationId) return null;
 	return (
-		<>
-			<button
-				type="button"
-				onClick={() => setOpen(true)}
-				className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-			>
-				执行过程
-				<ExternalLinkIcon className="size-3" />
-			</button>
-			<WorkerProcessDialog delegationId={d.delegationId} workerName={workerLabel} open={open} onOpenChange={setOpen} />
-		</>
+		<button
+			type="button"
+			className="home-process-link"
+			onClick={() => openWorkerProcess(process.delegationId!)}
+			title="打开执行过程"
+		>
+			<ListTreeIcon aria-hidden="true" />
+			<span>执行过程</span>
+		</button>
+	);
+}
+
+/** Cancel exactly one delegated Run; the manager Session stays alive. */
+function CancelDelegationButton({ delegationId }: { delegationId?: string }) {
+	const [cancelling, setCancelling] = useState(false);
+	if (!delegationId) return null;
+	return (
+		<button
+			type="button"
+			disabled={cancelling}
+			onClick={async () => {
+				setCancelling(true);
+				try {
+					await cancelDelegation(delegationId);
+					toast.success("已请求中止该任务");
+				} catch (error) {
+					toast.error(error instanceof Error ? error.message : "无法中止任务");
+					setCancelling(false);
+				}
+			}}
+			className="flex items-center gap-1 text-xs text-muted-foreground hover:text-destructive disabled:cursor-wait disabled:opacity-60"
+			title="仅中止这个 worker 任务"
+		>
+			<SquareIcon className="size-3 fill-current" />
+			{cancelling ? "正在中止" : "中止"}
+		</button>
 	);
 }
 
@@ -248,6 +269,7 @@ function WorkerTaskEntry({
 	task,
 	result,
 	badge,
+	processDetails,
 	running,
 	isError,
 	meta,
@@ -261,6 +283,8 @@ function WorkerTaskEntry({
 	task?: string;
 	result?: string;
 	badge: React.ReactNode;
+	/** 有 delegationId 时，点击任务标题直接打开完整任务明细。 */
+	processDetails?: unknown;
 	running?: boolean;
 	isError?: boolean;
 	meta?: string;
@@ -281,6 +305,16 @@ function WorkerTaskEntry({
 	const [resultOpen, setResultOpen] = useState(true);
 	const [taskOpen, setTaskOpen] = useState(false);
 	const { rootRef, toggle: toggleKeepingAnchor } = useAnchorPreservingToggle<HTMLDivElement>();
+	const { openWorkerProcess } = useWorkerProcessDrawer();
+	const process = processDetails as { processView?: boolean; delegationId?: string } | undefined;
+	const canOpenProcess = Boolean(process?.processView && process.delegationId);
+	const openTaskDetail = () => {
+		if (canOpenProcess) {
+			openWorkerProcess(process!.delegationId!);
+			return;
+		}
+		toggleKeepingAnchor(setOpen);
+	};
 	const time = timestamp
 		? new Date(timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })
 		: "";
@@ -293,18 +327,30 @@ function WorkerTaskEntry({
 			<button
 				type="button"
 				onClick={() => toggleKeepingAnchor(setOpen)}
-				className="flex items-center gap-2 text-left"
+				className="flex size-5 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+				aria-label={open ? "收起任务摘要" : "展开任务摘要"}
+				aria-expanded={open}
 			>
 				{open ? (
-					<ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground" />
+					<ChevronDownIcon className="size-3.5 shrink-0" />
 				) : (
-					<ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground" />
+					<ChevronRightIcon className="size-3.5 shrink-0" />
 				)}
-				<span className="truncate font-mono text-sm font-medium">{workerLabel}</span>
-				{/* 状态徽标由调用方按 details/status 推导（含 needs_input 等待审批），
-				    不能在这里按完成/失败二分写死。 */}
-				{badge}
 			</button>
+			<div className="flex min-w-0 flex-1 items-center gap-2">
+				<button
+					type="button"
+					onClick={openTaskDetail}
+					className="home-worker-task-link flex min-w-0 items-center gap-2 text-left"
+					title={canOpenProcess ? "打开任务明细" : open ? "收起任务摘要" : "展开任务摘要"}
+				>
+					<span className="truncate font-mono text-sm font-medium">{workerLabel}</span>
+					{/* 状态徽标由调用方按 details/status 推导（含 needs_input 等待审批），
+					    不能在这里按完成/失败二分写死。 */}
+					{badge}
+				</button>
+				<ProcessViewButton details={processDetails} />
+			</div>
 			{actions}
 			{time ? <time className="text-muted-foreground/60 text-[10px] tabular-nums">{time}</time> : null}
 		</div>
@@ -332,10 +378,10 @@ function WorkerTaskEntry({
 	) : null;
 
 	const collapsedPreview = task ? (
-		<p className="mt-1 truncate text-xs text-muted-foreground">
+		<button type="button" className="mt-1 block w-full truncate text-left text-xs text-muted-foreground hover:text-foreground" onClick={openTaskDetail} title={canOpenProcess ? "打开任务明细" : "展开任务摘要"}>
 			<span className="mr-1.5 text-muted-foreground/60">任务：</span>
 			{task}
-		</p>
+		</button>
 	) : null;
 
 	if (finished) {
@@ -443,8 +489,9 @@ function DelegateCard({ call, onOpenWindow, timestamp }: { call: ToolCallView; o
 		  }
 		| undefined;
 	const [open, setOpen] = useState(false);
+	const resumedRunning = details?.status === "running" || details?.status === "approved";
 	// 任务/结果主体：运行中展开看进度，完成后自动折叠（可手动再展开）。
-	const finished = call.status === "done" || call.status === "error" || call.status === "interrupted";
+	const finished = !resumedRunning && (call.status === "done" || call.status === "error" || call.status === "interrupted");
 	const [bodyOpen, setBodyOpen] = useState(!finished);
 	const [wasFinished, setWasFinished] = useState(finished);
 	if (finished !== wasFinished) {
@@ -454,6 +501,15 @@ function DelegateCard({ call, onOpenWindow, timestamp }: { call: ToolCallView; o
 	}
 	const meta = toolCallMeta(call);
 	const { rootRef, toggle: toggleKeepingAnchor } = useAnchorPreservingToggle<HTMLDivElement>();
+	const { openWorkerProcess } = useWorkerProcessDrawer();
+	const canOpenProcess = Boolean(details?.processView && details.delegationId);
+	const openTaskDetail = () => {
+		if (canOpenProcess) {
+			openWorkerProcess(details!.delegationId!);
+			return;
+		}
+		toggleKeepingAnchor(setBodyOpen);
+	};
 
 	// 409 冲突 + 带 pending interactionId：冲突优先显示，并保留对账的 interactionId。
 	const conflict = details?.status === "conflict" || details?.conflict;
@@ -500,23 +556,33 @@ function DelegateCard({ call, onOpenWindow, timestamp }: { call: ToolCallView; o
 	}
 
 	return (
-		<div ref={rootRef} className="w-full overflow-hidden rounded-lg bg-muted">
+		<div ref={rootRef} className="home-delegate-card w-full overflow-hidden rounded-lg bg-muted" data-process-link={canOpenProcess ? "true" : "false"}>
 			<div className="flex items-center justify-between gap-2 px-3 pt-2">
 				<button
 					type="button"
 					onClick={() => toggleKeepingAnchor(setBodyOpen)}
-					className="flex min-w-0 items-center gap-2 text-left"
+					className="flex size-5 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-background/60 hover:text-foreground"
+					aria-label={bodyOpen ? "收起任务摘要" : "展开任务摘要"}
+					aria-expanded={bodyOpen}
 				>
 					{bodyOpen ? (
-						<ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground" />
+						<ChevronDownIcon className="size-3.5 shrink-0" />
 					) : (
-						<ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground" />
+						<ChevronRightIcon className="size-3.5 shrink-0" />
 					)}
+				</button>
+				<button
+					type="button"
+					onClick={openTaskDetail}
+					className="home-delegate-task-link flex min-w-0 flex-1 items-center gap-2 text-left"
+					title={canOpenProcess ? "打开任务明细" : bodyOpen ? "收起任务摘要" : "展开任务摘要"}
+				>
 					<WorkerAvatar name={worker ?? "worker"} size={20} />
 					<span className="truncate font-mono text-sm font-medium">{workerLabel}</span>
 				</button>
 				<div className="flex shrink-0 items-center gap-2">
-					<ProcessViewButton details={call.details} worker={worker ?? "worker"} />
+					<ProcessViewButton details={call.details} />
+					{call.status === "running" || resumedRunning ? <CancelDelegationButton delegationId={details?.delegationId} /> : null}
 					{details?.synced && details.windowId ? (
 						<button
 							type="button"
@@ -538,10 +604,12 @@ function DelegateCard({ call, onOpenWindow, timestamp }: { call: ToolCallView; o
 							<span className="whitespace-pre-wrap">{args.task}</span>
 						</p>
 					) : null}
-					{call.status === "running" ? (
+					{call.status === "running" || resumedRunning ? (
 						<p className="text-xs text-muted-foreground">{call.progress ?? "等待 worker 完成…"}</p>
 					) : null}
-					{call.result !== undefined && (
+					{/* needs_input 的旧 toolResult 是“等待审批”快照；批准续跑后
+					    隐藏这段过期正文，以实时 running 状态为准。 */}
+					{call.result !== undefined && !resumedRunning && (
 						<div className={`text-sm ${call.isError ? "text-destructive" : ""}`}>
 							<MessageResponse {...chatStreamdownProps}>{call.result}</MessageResponse>
 						</div>
@@ -573,14 +641,14 @@ function DelegateCard({ call, onOpenWindow, timestamp }: { call: ToolCallView; o
 					</Collapsible>
 				</div>
 			) : (
-				<div className="px-3 pb-2 pt-1">
+				<button type="button" className="block w-full px-3 pb-2 pt-1 text-left" onClick={openTaskDetail} title={canOpenProcess ? "打开任务明细" : "展开任务摘要"}>
 					{args?.task ? (
-						<p className="truncate text-xs text-muted-foreground">
+						<span className="block truncate text-xs text-muted-foreground transition-colors hover:text-foreground">
 							<span className="mr-1.5 text-muted-foreground/60">任务：</span>
 							{args.task}
-						</p>
+						</span>
 					) : null}
-				</div>
+				</button>
 			)}
 		</div>
 	);
@@ -599,23 +667,27 @@ function ToolCallItem({
 }) {
 	if (isDelegateCall(call)) {
 		// §7 成员消息流：direct/group 下脱离 manager 气泡，渲染为 worker 独立条目。
-		// 等待审批的交互卡由 pudding:interaction_required custom message 承载，
-		// 这里一律按普通 worker 条目渲染（结果文本会说明在等待审批）。
+		// 等待审批的交互卡由 pudding:interaction_required custom message 承载；
+		// 批准续跑后隐藏旧 needs_input toolResult，按普通 running worker 条目渲染。
 		if (windowType && windowType !== "solo") {
 			const args = call.args as { task?: string } | undefined;
+			const details = call.details as { status?: string; delegationId?: string } | undefined;
+			const resumedRunning = details?.status === "running" || details?.status === "approved";
+			const running = call.status === "running" || resumedRunning;
 			return (
 				<WorkerTaskEntry
 					worker={delegateWorker(call) ?? "worker"}
 					task={args?.task}
-					result={call.result}
+					result={resumedRunning ? undefined : call.result}
 					badge={statusBadge(call, timestamp)}
-					running={call.status === "running"}
-					isError={call.isError}
+					processDetails={call.details}
+					running={running}
+					isError={resumedRunning ? false : call.isError}
 					meta={toolCallMeta(call)}
 					usage={(call.details as { usage?: TaskUsage } | undefined)?.usage}
 					timestamp={timestamp}
 					progress={call.progress}
-					actions={<ProcessViewButton details={call.details} worker={delegateWorker(call) ?? "worker"} />}
+					actions={running ? <CancelDelegationButton delegationId={details?.delegationId} /> : null}
 				/>
 			);
 		}
@@ -724,9 +796,10 @@ function CustomMessageEntry({
 				<WorkerTaskEntry
 					worker={details?.worker ?? "worker"}
 					badge={<Badge variant="secondary">执行中</Badge>}
+					processDetails={details}
 					running
 					timestamp={message.timestamp}
-					actions={<ProcessViewButton details={details} worker={details?.worker ?? "worker"} />}
+					actions={<CancelDelegationButton delegationId={details?.delegationId} />}
 				/>
 			);
 		}
@@ -735,7 +808,12 @@ function CustomMessageEntry({
 				<MessageContent>
 					<p className="text-xs text-muted-foreground">派给 {details?.worker ?? "worker"}</p>
 					<p className="text-sm whitespace-pre-wrap">{message.content}</p>
-					{running ? <p className="text-xs text-muted-foreground">执行中…</p> : null}
+					{running ? (
+						<div className="flex items-center gap-2 text-xs text-muted-foreground">
+							<span>执行中…</span>
+							<CancelDelegationButton delegationId={details?.delegationId} />
+						</div>
+					) : null}
 				</MessageContent>
 			</AiMessage>
 		);
@@ -747,10 +825,10 @@ function CustomMessageEntry({
 				worker={details?.worker ?? "worker"}
 				result={message.content}
 				badge={workerStatusBadge(details?.status)}
+				processDetails={details}
 				isError={Boolean(details?.status && details.status !== "completed" && details.status !== "needs_input")}
 				timestamp={message.timestamp}
 				usage={details?.usage}
-				actions={<ProcessViewButton details={details} worker={details?.worker ?? "worker"} />}
 			/>
 		);
 	}

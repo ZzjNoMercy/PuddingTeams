@@ -4,7 +4,6 @@ import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { runDoctorCli, runInitCli, type CliDeps, type ExecResult, type HttpProbeResult } from "./init-cli.js";
-import { CredentialsStore } from "../store/credentials.js";
 
 /**
  * `puddingteams doctor/init`（分阶段向导：环境检查 → Provider → Connector 状态
@@ -253,14 +252,13 @@ test("init 阶段1：选择跳过 → 无待写入项，阶段 4 不再询问", 
 
 // ---- init：阶段 3 PuddingClaw 接入 + 阶段 4 写入 ----
 
-test("init 阶段3：配置 URL + Token → agents.json env 与加密 credentials", async () => {
+test("init 阶段3：只配置本机 URL，不采集或保存 PuddingClaw Token", async () => {
 	// provider=4(跳过) → 阶段3 配置=Y → URL=回车(默认) → 确认=y
 	const fake = makeFake({
 		isTTY: true,
 		answers: ["4", "", "", "y"],
-		secretAnswers: ["pcl-token-1"],
 		commands: {
-			puddingclaw: { code: 0, stdout: '{"cli_version":"1.2.3","configured":true,"authenticated":true,"reachable":true}\n' },
+			puddingclaw: { code: 0, stdout: '{"cli_version":"1.2.3","configured":true,"reachable":true}\n' },
 			codex: { code: 0, stdout: "codex 0.40.0\n" },
 			claude: { code: 0, stdout: "2.0.0\n" },
 		},
@@ -273,14 +271,11 @@ test("init 阶段3：配置 URL + Token → agents.json env 与加密 credential
 	const pcl = agentsFile.agents.find((a) => a.name === "puddingclaw");
 	assert.equal(pcl?.env?.PUDDINGCLAW_URL, "http://127.0.0.1:8888", "默认 URL 必须写 agents.json env");
 
-	// Token 落加密 credentials（读回解密验证），不进 agents.json
-	const credentials = new CredentialsStore(path.join(fake.home, "secrets"));
-	await credentials.init();
-	assert.deepEqual(await credentials.getSecrets("puddingclaw"), { PUDDINGCLAW_TOKEN: "pcl-token-1" });
 	assert.equal(pcl?.env?.PUDDINGCLAW_TOKEN, undefined);
 
-	// 配置后必须跑 doctor 复核（env 注入 URL/Token）
+	// 配置后必须跑 doctor 复核，只注入本机 URL。
 	assert.ok(fake.calls.some((c) => c.command === "puddingclaw" && c.args[0] === "doctor"), "复核必须执行 puddingclaw doctor");
+	assert.equal(fake.secrets.length, 0, "PuddingClaw 接入不得询问 Token");
 });
 
 test("init 阶段4：用户拒绝确认 → 什么都不写", async () => {

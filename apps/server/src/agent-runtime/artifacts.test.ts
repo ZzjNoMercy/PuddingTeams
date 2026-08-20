@@ -116,6 +116,7 @@ test("PuddingClawDriver：run/continue/respond 都传 --export <handoffDir>，ar
 	);
 	const argv3 = readFileSync(capture3, "utf-8").trim().split("\n");
 	assert.deepEqual(argv3.slice(0, 2), ["agent", "respond"]);
+	assert.ok(argv3.includes("--jsonl"), "respond 也必须流式透出审批后的后续事件");
 	assert.equal(argv3[argv3.indexOf("--export") + 1], handoffDirFor(ws, "del-42"));
 });
 

@@ -15,6 +15,8 @@ export interface DelegationRecord {
 	/** Optional causal edge to an earlier delegation in the same manager Session. */
 	parentDelegationId?: string;
 	handoffKind?: "request" | "followup";
+	/** Worker-facing task text, kept so the process index can name each run. */
+	task?: string;
 	/** Why this delegation exists, separate from the worker-facing task text. */
 	intent?: string;
 	expectedOutcome?: string;

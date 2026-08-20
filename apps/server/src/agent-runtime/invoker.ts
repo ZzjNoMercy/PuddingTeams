@@ -406,6 +406,7 @@ export class AgentInvoker {
 			}
 			case "failed": {
 				const result = delegation.result;
+				const cancelled = result?.status === "cancelled";
 				const err =
 					result && result.status === "failed"
 						? result.error
@@ -414,8 +415,8 @@ export class AgentInvoker {
 							: "worker 执行失败";
 				return {
 					...base,
-					status: "failed",
-					content: `worker「${agentDisplayName(agent)}」执行出错：${err}`,
+					status: cancelled ? "cancelled" : "failed",
+					content: cancelled ? `worker「${agentDisplayName(agent)}」任务已取消。` : `worker「${agentDisplayName(agent)}」执行出错：${err}`,
 					details: {
 						...(result?.meta ?? {}),
 						errorCode: result && "errorCode" in result ? result.errorCode : undefined,
@@ -449,6 +450,8 @@ export class AgentInvoker {
 		const delegation = await this.runtime.getDelegationById(interactionId);
 		if (!delegation) throw new Error("interaction or delegation not found");
 		const managerOwner = await this.teams.windowForSession(delegation.managerSessionId);
+		const targets = await this.outcomeTargets(delegation);
+		const workerLabel = agentDisplayName((await this.teams.getAgent(delegation.agentId)) ?? { name: delegation.agentId });
 		const prepared = await this.withWindowLifecycles(
 			[delegation.windowId, ...(managerOwner ? [managerOwner.id] : [])],
 			async () => {
@@ -460,15 +463,35 @@ export class AgentInvoker {
 					admittedResolve = resolve;
 					admittedReject = reject;
 				});
-				const responsePromise = this.respondUnlocked(interactionId, input, signal, admittedResolve);
+				const responsePromise = this.respondUnlocked(interactionId, input, signal, (continuing) => {
+					if (continuing) {
+						// Approval is resolved at admission time, not when the resumed worker
+						// eventually finishes. This immediately reconciles the task card in
+						// both the manager room and the mirrored worker direct room.
+						const resumed = {
+							customType: "pudding:interaction_resolved",
+							content: `worker「${workerLabel}」的审批已通过，任务继续执行中。`,
+							details: {
+								interactionId,
+								delegationId: delegation.id,
+								worker: delegation.agentId,
+								status: "approved",
+							},
+						};
+						if (targets.manager) this.sendOutcome(targets.manager, resumed, { triggerTurn: false });
+						if (targets.direct) this.sendOutcome(targets.direct, resumed, { triggerTurn: false });
+					}
+					admittedResolve(continuing);
+				});
 				void responsePromise.catch(admittedReject);
 				await Promise.race([admitted, responsePromise.then(() => undefined)]);
 				return { admitted, responsePromise };
 			},
 		);
 		// 受理即返回：HTTP 不等 worker 续跑落定，立即给前端「已批准」反馈；
-		// 续跑的最终结果（completed/needs_input/failed）由 respondUnlocked 内部的
-		// outcome 扇出以 pudding:interaction_resolved / task_result 卡送达两边窗口。
+		// interaction_resolved(approved) 已在受理点即时扇出；续跑的后续边界
+		// （completed/needs_input/failed）再由 respondUnlocked 投影 task_result
+		// 或下一轮 interaction_required 到两边窗口。
 		return Promise.race([
 			prepared.admitted.then((continuing): Promise<AgentInvokeResult> | AgentInvokeResult =>
 				continuing
@@ -587,29 +610,17 @@ export class AgentInvoker {
 				// direct 窗口无 manager 回合，taskResultOptions 降级为仅展示），并把
 				// worker 的真实结果带给 manager，否则汇总轮无内容可转述。
 				const details = { ...(outcome.result.meta ?? {}), artifacts: outcome.result.artifacts, usage: outcome.result.usage };
-				const resolved = {
-					customType: "pudding:interaction_resolved",
-					content: `worker「${workerLabel}」的审批已通过。`,
-					details: {
-						interactionId,
-						delegationId: d.id,
-						worker: d.agentId,
-						status: "approved",
-					},
-				};
 				const taskResult = {
 					customType: "pudding:task_result",
 					content: outcome.result.content ?? "",
 					details: { interactionId, delegationId: d.id, worker: d.agentId, status: "completed", ...details },
 				};
 				if (targets.manager) {
-					this.sendOutcome(targets.manager, resolved, { triggerTurn: false });
 					// M5：manager 若在流式中，用 followUp 排队而不是 steer 打断。
 					this.sendOutcome(targets.manager, taskResult, taskResultOptions);
 				}
 				if (targets.direct) {
 					// 单聊窗口仅展示，不唤醒 turn。
-					this.sendOutcome(targets.direct, resolved, { triggerTurn: false });
 					this.sendOutcome(targets.direct, taskResult, { triggerTurn: false });
 				}
 				return {
@@ -653,22 +664,15 @@ export class AgentInvoker {
 			case "failed": {
 				const errorText = outcome.result.status === "failed" ? outcome.result.error : "任务执行失败";
 				const details = { ...(outcome.result.meta ?? {}), errorCode: "errorCode" in outcome.result ? outcome.result.errorCode : undefined };
-				const resolved = {
-					customType: "pudding:interaction_resolved",
-					content: `worker「${workerLabel}」的审批已通过，但任务执行失败。`,
-					details: { interactionId, delegationId: d.id, worker: d.agentId, status: "failed" },
-				};
 				const taskResult = {
 					customType: "pudding:task_result",
 					content: errorText,
 					details: { interactionId, delegationId: d.id, worker: d.agentId, status: "failed", ...details },
 				};
 				if (targets.manager) {
-					this.sendOutcome(targets.manager, resolved, { triggerTurn: false });
 					this.sendOutcome(targets.manager, taskResult, taskResultOptions);
 				}
 				if (targets.direct) {
-					this.sendOutcome(targets.direct, resolved, { triggerTurn: false });
 					this.sendOutcome(targets.direct, taskResult, { triggerTurn: false });
 				}
 				return {
@@ -738,12 +742,62 @@ export class AgentInvoker {
 	private async cancelUnlocked(delegationId: string, signal?: AbortSignal): Promise<void> {
 		const delegation = await this.runtime.getDelegation(delegationId);
 		if (!delegation) throw new Error("delegation not found");
+		const wasWaitingInput = delegation.status === "waiting_input";
 		const agent = await this.teams.getAgent(delegation.agentId);
 		await this.runtime.cancel(delegationId, {
 			cwd: delegation.cwdSnapshot,
 			env: agent ? await this.envFor(agent) : process.env,
 			signal,
 		});
+
+		// running 委托仍占着 manager 的 delegate tool call：abort 后 delegate()
+		// 会自然返回 cancelled toolResult，manager 随即继续生成，不另发重复卡。
+		// waiting_input 的 tool call 已经在审批边界返回；此时若只封存
+		// Delegation，manager 永远收不到新的终态。因此显式投影取消结果并唤醒
+		// manager 完成本轮闭环，同时同步到 worker 单聊窗口。
+		if (wasWaitingInput) await this.notifyWaitingCancellation(delegation);
+	}
+
+	private async notifyWaitingCancellation(delegation: DelegationRecord): Promise<void> {
+		const targets = await this.outcomeTargets(delegation);
+		const managerWindow = delegation.managerSessionId
+			? await this.teams.windowForSession(delegation.managerSessionId)
+			: undefined;
+		const workerLabel = agentDisplayName(
+			(await this.teams.getAgent(delegation.agentId)) ?? { name: delegation.agentId },
+		);
+		const interactions = await this.runtime.listInteractions(delegation.windowId);
+		const interaction = interactions.find((item) => item.delegationId === delegation.id);
+		const details = {
+			...(interaction ? { interactionId: interaction.id } : {}),
+			delegationId: delegation.id,
+			worker: delegation.agentId,
+			status: "cancelled",
+		};
+		const resolved = {
+			customType: "pudding:interaction_resolved",
+			content: `用户已中止 worker「${workerLabel}」的待审批任务。`,
+			details,
+		};
+		const taskResult = {
+			customType: "pudding:task_result",
+			content: `worker「${workerLabel}」任务已由用户取消。`,
+			details,
+		};
+		if (targets.manager) {
+			this.sendOutcome(targets.manager, resolved, { triggerTurn: false });
+			this.sendOutcome(
+				targets.manager,
+				taskResult,
+				managerWindow?.type === "direct"
+					? { triggerTurn: false }
+					: { triggerTurn: true, deliverAs: "followUp" },
+			);
+		}
+		if (targets.direct) {
+			this.sendOutcome(targets.direct, resolved, { triggerTurn: false });
+			this.sendOutcome(targets.direct, taskResult, { triggerTurn: false });
+		}
 	}
 
 	/** 查找某 worker 在该窗口下当前 pending 的 interaction（M5：409 时带出）。 */

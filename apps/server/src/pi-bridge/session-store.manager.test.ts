@@ -431,3 +431,31 @@ test("store 级事件订阅跨 runtimeDirty 重建存活（WS 推送不断流）
 	unsubscribe();
 	await sessions.disposeAll();
 });
+
+test("group running 投影直接追加为隐藏 custom entry，不进入展示消息流", async () => {
+	const { teams, sessions } = await makeStack();
+	const summary = await sessions.create();
+	await teams.createWindow({ type: "group", members: ["puddingclaw"], sessionId: summary.id });
+
+	await sessions.appendCustomMessageProjection(summary.id, {
+		customType: "pudding:task_assign",
+		content: "生成页面",
+		details: {
+			taskId: "call-1",
+			delegationId: "delegation-1",
+			worker: "puddingclaw",
+			from: "group",
+			status: "running",
+		},
+	});
+
+	const session = await sessions.open(summary.id);
+	const projection = session.sessionManager.getBranch().find((entry) =>
+		entry.type === "custom_message" && entry.customType === "pudding:task_assign",
+	);
+	assert.ok(projection && projection.type === "custom_message");
+	assert.equal(projection.display, false);
+	assert.equal((projection.details as { delegationId?: string }).delegationId, "delegation-1");
+	assert.ok(session.sessionFile, "隐藏投影也必须立即刷出 manager Session JSONL");
+	await sessions.disposeAll();
+});

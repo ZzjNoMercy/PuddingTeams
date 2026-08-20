@@ -136,7 +136,7 @@ async function makeStack(variant: "completed" | "failed" | "needs_input", manage
 		{ cwd: window.cwdSnapshot, env: {} },
 	);
 	assert.equal(delegated.status, "needs_input");
-	return { invoker, interactionId: delegated.interaction!.id, sent, window };
+	return { invoker, interactionId: delegated.interaction!.id, delegationId: delegated.delegation.id, sent, window };
 }
 
 const approve = {
@@ -200,6 +200,24 @@ test("两边同步: rejected 扇出 manager + 单聊（任务取消）", async (
 	}
 });
 
+test("两边同步: 主动取消待审批任务会通知并唤醒 manager 闭环", async () => {
+	const { invoker, delegationId, sent } = await makeStack("completed");
+	await invoker.cancel(delegationId);
+
+	await waitForSent(sent, 4);
+	const manager = sent.filter((s) => s.sessionId === "manager-sess-1");
+	assert.deepEqual(manager.map((s) => s.customType), ["pudding:interaction_resolved", "pudding:task_result"]);
+	assert.equal(manager[0]!.status, "cancelled");
+	assert.equal(manager[0]!.options.triggerTurn, false);
+	assert.equal(manager[1]!.status, "cancelled");
+	assert.equal(manager[1]!.options.triggerTurn, true, "待审批 tool call 已结束，取消后必须唤醒 manager 闭环");
+	assert.equal(manager[1]!.options.deliverAs, "followUp");
+
+	const direct = sent.filter((s) => s.sessionId === "direct-sess-1");
+	assert.deepEqual(direct.map((s) => s.customType), ["pudding:interaction_resolved", "pudding:task_result"]);
+	assert.ok(direct.every((s) => s.options.triggerTurn === false), "worker 单聊只同步展示，不启动 manager 回合");
+});
+
 test("两边同步: failed 也会通知两边（不再静默）", async () => {
 	const { invoker, interactionId, sent } = await makeStack("failed");
 	const outcome = await invoker.respond(interactionId, approve);
@@ -208,7 +226,7 @@ test("两边同步: failed 也会通知两边（不再静默）", async () => {
 	await waitForSent(sent, 4);
 	const manager = sent.filter((s) => s.sessionId === "manager-sess-1");
 	assert.deepEqual(manager.map((s) => s.customType), ["pudding:interaction_resolved", "pudding:task_result"]);
-	assert.equal(manager[0]!.status, "failed");
+	assert.equal(manager[0]!.status, "approved", "审批受理时先恢复任务卡为执行中");
 	assert.equal(manager[1]!.status, "failed");
 	assert.equal(manager[1]!.options.triggerTurn, true, "失败同样唤醒 manager 汇总");
 	const direct = sent.filter((s) => s.sessionId === "direct-sess-1");
@@ -221,12 +239,17 @@ test("两边同步: 多轮 needs_input 投影新审批卡到两边（不唤醒�
 	const outcome = await invoker.respond(interactionId, approve);
 	assert.equal(outcome.status, "approved", "受理即返回；新一轮审批卡走后台扇出");
 
-	await waitForSent(sent, 2);
+	await waitForSent(sent, 4);
 	for (const sessionId of ["manager-sess-1", "direct-sess-1"]) {
 		const messages = sent.filter((s) => s.sessionId === sessionId);
-		assert.deepEqual(messages.map((s) => s.customType), ["pudding:interaction_required"], `${sessionId} 必须收到新一轮审批卡`);
-		assert.equal(messages[0]!.status, "pending");
-		assert.equal(messages[0]!.options.triggerTurn, false, "等用户再批，不唤醒 turn");
+		assert.deepEqual(
+			messages.map((s) => s.customType),
+			["pudding:interaction_resolved", "pudding:interaction_required"],
+			`${sessionId} 必须先恢复执行，再进入新一轮审批`,
+		);
+		assert.equal(messages[0]!.status, "approved");
+		assert.equal(messages[1]!.status, "pending");
+		assert.equal(messages[1]!.options.triggerTurn, false, "等用户再批，不唤醒 turn");
 	}
 });
 

@@ -17,8 +17,9 @@ interface CredentialsFile {
 const PAYLOAD_PREFIX = "v1.";
 
 /**
- * Encrypted, per-agent secret store for worker env tokens (e.g. PuddingClaw's
- * PUDDINGCLAW_TOKEN). Lives outside agents.json — values are AES-256-GCM
+ * Encrypted, per-agent secret store for connector/capability environment
+ * credentials explicitly declared by an Extension manifest. Lives outside
+ * agents.json — values are AES-256-GCM
  * encrypted with a random 32-byte key at `<secrets>/credentials.key` and
  * written to `<secrets>/credentials.json`. The plaintext is never
  * persisted and never returned to the browser; the backend injects it into the

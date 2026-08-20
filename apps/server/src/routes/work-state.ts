@@ -23,14 +23,10 @@ export function registerWorkStateRoutes(
 			return {
 				workState: (await workStates.get(req.params.id)) ?? null,
 				decisions: await workStates.listDecisions(req.params.id),
-				// processView：pi worker 的会话支持执行过程可视化（只读），前端据此显示入口。
+				// Every delegation exposes a read-only process view. Pi resolves to its
+				// AgentSession; spawn connectors resolve to the persisted event timeline.
 				delegations: runtime
-					? await Promise.all(
-							(await runtime.listDelegations(undefined, req.params.id)).map(async (d) => ({
-								...d,
-								processView: (await teams.getAgent(d.agentId))?.connector?.connectorId === "pi",
-							})),
-						)
+					? (await runtime.listDelegations(undefined, req.params.id)).map((d) => ({ ...d, processView: true }))
 					: [],
 			};
 		} catch (err) {

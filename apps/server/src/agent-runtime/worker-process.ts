@@ -1,7 +1,9 @@
 import { SessionManager, type AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import path from "node:path";
 import type { DelegationRecord, DelegationStore } from "./delegation-store.js";
 import type { TeamsStore } from "../store/teams.js";
 import { liveWorkerSession } from "./pi-driver.js";
+import type { DelegationTimelineEvent, DelegationTimelineStore } from "./delegation-timeline-store.js";
 
 /**
  * pi worker 执行过程可视化（只读）：pi worker 的 child session 是完整 pi
@@ -9,8 +11,8 @@ import { liveWorkerSession } from "./pi-driver.js";
  * 结束后可从 JSONL 回放。本服务把这两种来源统一成「按 delegationId 查看」
  * 的读接口，供路由层给前端提供与 manager 一致的事件流/历史。
  *
- * 只支持 pi worker（Connector 绑定 connectorId === "pi"）；外部 CLI worker
- * 的执行流在对方进程里，拿不到 pi 事件流。
+ * pi worker 保留完整 AgentSession 回放；spawn CLI worker 使用平台追加式
+ * delegation timeline。两种来源共享同一个「执行过程」入口。
  */
 
 export interface WorkerProcessInfo {
@@ -22,6 +24,15 @@ export interface WorkerProcessInfo {
 	createdAt: string;
 	/** 会话当前驻留内存（正在跑或近期跑过），可订阅实时事件。 */
 	live: boolean;
+	view: "session" | "timeline";
+}
+
+export interface WorkerProcessListItem extends WorkerProcessInfo {
+	updatedAt: string;
+	managerSessionId: string;
+	task?: string;
+	intent?: string;
+	expectedOutcome?: string;
 }
 
 export class WorkerProcessService {
@@ -30,19 +41,101 @@ export class WorkerProcessService {
 		private readonly teams: TeamsStore,
 		/** 平台默认 worker 会话目录（<home>/sessions/workers）。 */
 		private readonly defaultSessionDir: string,
+		private readonly timelines?: DelegationTimelineStore,
 	) {}
 
 	async resolve(delegationId: string): Promise<WorkerProcessInfo | undefined> {
 		const d = await this.delegations.getDelegation(delegationId);
 		if (!d) return undefined;
+		const agent = await this.teams.getAgent(d.agentId);
+		const view = d.sessionHandle && (agent?.connector?.connectorId === "pi" || !agent) ? "session" : "timeline";
 		return {
 			delegationId: d.id,
 			agentId: d.agentId,
 			status: d.status,
 			sessionHandle: d.sessionHandle,
 			createdAt: d.createdAt,
-			live: d.sessionHandle ? liveWorkerSession(d.sessionHandle) !== undefined : false,
+			live: view === "session"
+				? Boolean(d.sessionHandle && liveWorkerSession(d.sessionHandle) !== undefined)
+				: d.status === "running" || d.status === "waiting_input",
+			view,
 		};
+	}
+
+	/**
+	 * Current-session process index for the shared worker drawer. A solo/group
+	 * delegation is owned by the manager session but executes in (and is mirrored
+	 * to) a worker direct window, so requiring both ids to match hides a live Run.
+	 * Show manager-owned records plus records explicitly mirrored into the
+	 * currently displayed room session.
+	 */
+	async list(windowId: string, managerSessionId?: string): Promise<WorkerProcessListItem[]> {
+		const byWindow = await this.delegations.listDelegations(windowId);
+		let records = byWindow;
+		if (managerSessionId) {
+			const byManager = await this.delegations.listDelegations(undefined, managerSessionId);
+			const mirrored = await this.mirroredTaskIndex(managerSessionId);
+			const visibleWindowRecords = byWindow.filter((record) =>
+				mirrored.has(record.id) || Boolean(record.managerToolCallId && mirrored.has(record.managerToolCallId)),
+			);
+			const union = new Map([...byManager, ...visibleWindowRecords].map((record) => [record.id, record]));
+			records = [...union.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+		}
+		const sessionIds = [...new Set(records.filter((record) => !record.task).map((record) => record.managerSessionId))];
+		const mirroredTasks = new Map<string, Map<string, string>>();
+		await Promise.all(sessionIds.map(async (sessionId) => {
+			mirroredTasks.set(sessionId, await this.mirroredTaskIndex(sessionId));
+		}));
+		return Promise.all(records.map(async (record) => {
+			const info = await this.resolve(record.id);
+			if (!info) throw new Error(`delegation disappeared while listing: ${record.id}`);
+			const taskIndex = mirroredTasks.get(record.managerSessionId);
+			return {
+				...info,
+				updatedAt: record.updatedAt,
+				managerSessionId: record.managerSessionId,
+				task: record.task
+					?? taskIndex?.get(record.id)
+					?? (record.managerToolCallId ? taskIndex?.get(record.managerToolCallId) : undefined),
+				intent: record.intent,
+				expectedOutcome: record.expectedOutcome,
+			};
+		}));
+	}
+
+	/** Recover task names for records created before DelegationRecord persisted `task`. */
+	private async mirroredTaskIndex(managerSessionId: string): Promise<Map<string, string>> {
+		const index = new Map<string, string>();
+		const managerSessionsDir = path.dirname(this.defaultSessionDir);
+		const info = (await SessionManager.listAll(managerSessionsDir)).find((item) => item.id === managerSessionId);
+		if (info) {
+			const session = SessionManager.open(info.path, managerSessionsDir);
+			for (const entry of session.getBranch()) {
+				const message = entry as {
+					type?: string;
+					customType?: string;
+					content?: unknown;
+					details?: { delegationId?: unknown; taskId?: unknown };
+				};
+				if (message.type !== "custom_message" || message.customType !== "pudding:task_assign" || typeof message.content !== "string") continue;
+				if (typeof message.details?.delegationId === "string") index.set(message.details.delegationId, message.content);
+				if (typeof message.details?.taskId === "string") index.set(message.details.taskId, message.content);
+			}
+		}
+		return index;
+	}
+
+	async timeline(delegationId: string, afterSeq = 0): Promise<DelegationTimelineEvent[]> {
+		return this.timelines?.list(delegationId, afterSeq) ?? [];
+	}
+
+	async subscribeTimeline(
+		delegationId: string,
+		afterSeq: number,
+		listener: (event: DelegationTimelineEvent) => void,
+	): Promise<{ events: DelegationTimelineEvent[]; unsubscribe: () => void }> {
+		if (!this.timelines) return { events: [], unsubscribe: () => undefined };
+		return this.timelines.subscribeFrom(delegationId, afterSeq, listener);
 	}
 
 	/** Agent 可在 Connector config 里覆盖 sessionDir（与 pi-driver 装配一致）。 */

@@ -373,6 +373,66 @@ test("委托结果正文携带 delegationId，followup 凭它接力成功", asyn
 	assert.ok(secondText.includes("done"), `followup 必须被接受并完成：${secondText}`);
 });
 
+test("群聊委托: 立即持久化 running 投影，且 session:new 真正新开 worker 会话", async () => {
+	const teams = await makeTeams([agentConfig("alpha")]);
+	const invoker = await makeInvoker(teams, "alpha");
+	const catalog = new ExtensionCatalog();
+	const ctx: ManagerWindowContext = { type: "group", members: ["alpha"] };
+	await teams.createWindow({ type: "group", members: ["alpha"], sessionId: "sess-test" });
+	const projections: Array<{
+		sessionId: string;
+		message: { customType: string; content: string; details?: Record<string, unknown> };
+	}> = [];
+	const sessions = {
+		appendCustomMessageProjection: async (
+			sessionId: string,
+			message: { customType: string; content: string; details?: Record<string, unknown> },
+		) => {
+			projections.push({ sessionId, message });
+		},
+		ensureSessionFile: async () => undefined,
+	};
+	const deps: ManagerExtensionDeps = {
+		store: teams,
+		sessions: sessions as never,
+		invoker,
+		catalog,
+		getSessionId: () => "sess-test",
+		ctx,
+		resolveContext: async () => ctx,
+	};
+	const plan = await planManagerTools(teams, catalog, ctx);
+	const { pi, tools } = mockPi();
+	for (const ext of buildManagerExtensionFactories(plan, deps)) {
+		const factory = typeof ext === "function" ? ext : ext.factory;
+		await factory(pi);
+	}
+
+	const result = await tools.get(delegateToolName("alpha"))!.execute(
+		"call-group-1",
+		{ task: "绘制完整页面", session: "new" },
+		undefined,
+		undefined,
+		{} as ExtensionContext,
+	);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+
+	assert.equal((result.details as { status?: string }).status, "completed");
+	const delegationId = (result.details as { delegationId?: string }).delegationId;
+	assert.ok(delegationId);
+	const records = await invoker.delegationsForManagerSession("sess-test");
+	assert.equal(records.at(-1)?.operation, "run", "group 的 session:new 不能再被强制改成 continue");
+	assert.ok(projections.length >= 1, "worker 接单后必须立即向 group manager Session 写 running 投影");
+	const enriched = projections.at(-1)!;
+	assert.equal(enriched.sessionId, "sess-test");
+	assert.equal(enriched.message.customType, "pudding:task_assign");
+	assert.equal(enriched.message.details?.taskId, "call-group-1");
+	assert.equal(enriched.message.details?.delegationId, delegationId);
+	assert.equal(enriched.message.details?.from, "group");
+	assert.equal(enriched.message.details?.processView, true);
+	assert.equal(enriched.message.details?.sessionHandle, "alpha-sess");
+});
+
 test("Phase4: search_agent_tools 纯加法激活，撤权工具不会被重新激活", async () => {
 	const teams = await makeTeams([agentConfig("alpha"), agentConfig("beta")]);
 	const catalog = new ExtensionCatalog();

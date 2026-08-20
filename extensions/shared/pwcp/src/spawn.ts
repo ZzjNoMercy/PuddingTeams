@@ -29,6 +29,8 @@ export interface SpawnOptions {
 	stdinJson?: unknown;
 	/** Parse stdout as newline-delimited JSON; otherwise single-JSON mode. */
 	jsonl?: boolean;
+	/** Observe parsed JSONL events while the child is still running. */
+	onJsonLine?: (event: unknown) => void;
 	/** First-event deadline: reject when no data arrives within startupMs. */
 	startupMs?: number;
 	onStdout?: (chunk: string) => void;
@@ -94,7 +96,9 @@ export async function spawnWorker(opts: SpawnOptions): Promise<SpawnResult> {
 				const trimmed = raw.trim();
 				if (!trimmed) continue;
 				try {
-					lines.push(JSON.parse(trimmed));
+					const parsed = JSON.parse(trimmed);
+					lines.push(parsed);
+					opts.onJsonLine?.(parsed);
 				} catch {
 					// 非 JSON 行是诊断输出，忽略（stderr 才是诊断通道）。
 				}

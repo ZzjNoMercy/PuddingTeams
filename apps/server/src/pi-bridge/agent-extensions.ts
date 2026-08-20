@@ -661,7 +661,7 @@ const DelegateParams = Type.Object(
 		session: Type.Optional(
 			Type.Union([Type.Literal("new"), Type.Literal("continue")], {
 				description:
-					'仅 solo 对话有效："continue"（默认）续接该 worker 单聊中正在进行的会话；任务与现有会话无关时传 "new"。',
+					'"continue"（默认）续接该窗口中该 worker 的会话；任务与现有会话无关时传 "new" 新开会话。',
 			}),
 		),
 	},
@@ -821,6 +821,8 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 				if (isSoloContext && targetWindow) {
 					await announceToWindow(deps, targetWindow, taskId, agent.name, params.task);
 				}
+				let mirroredDelegation = false;
+				let mirroredProcess = false;
 				const scoped = new ScopedAgentInvoker(agent.name, deps.invoker);
 				const result = await scoped.delegate({
 					message: params.task,
@@ -833,10 +835,23 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 					expectedOutcome: params.expectedOutcome,
 					evidenceRequirements: params.evidenceRequirements,
 					completionBoundary: params.completionBoundary,
-					mode: isSoloContext ? (params.session === "new" ? "run" : "continue") : "continue",
+					mode: params.session === "new" ? "run" : "continue",
 					signal,
-					onUpdate: (content, details) =>
-						onUpdate?.({ content: [{ type: "text", text: content }], details: { processView: agent.connector?.connectorId === "pi", ...(details as Record<string, unknown> | undefined) } }),
+					onUpdate: (content, details) => {
+						const updateDetails = details as { delegationId?: string; sessionHandle?: string } | undefined;
+						const processView = true;
+						onUpdate?.({ content: [{ type: "text", text: content }], details: { processView, ...updateDetails } });
+						if (!targetWindow || !updateDetails?.delegationId) return;
+						const addsProcess = processView && Boolean(updateDetails.sessionHandle);
+						if (mirroredDelegation && (!addsProcess || mirroredProcess)) return;
+						mirroredDelegation = true;
+						if (addsProcess) mirroredProcess = true;
+						void announceToWindow(deps, targetWindow, taskId, agent.name, params.task, {
+							delegationId: updateDetails.delegationId,
+							...(updateDetails.sessionHandle ? { sessionHandle: updateDetails.sessionHandle } : {}),
+							processView,
+						}, isSoloContext ? "solo" : "group");
+					},
 				});
 
 				const meta: Record<string, unknown> = {
@@ -844,9 +859,9 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 					status: result.status,
 					delegationId: result.delegationId,
 					interactionId: result.interactionId,
-					// 执行过程可视化入口：pi worker 的会话可按 delegationId 只读查看。
+					// 执行过程入口：pi 展示完整会话，spawn worker 展示追加式时间线。
 					sessionHandle: result.sessionHandle,
-					processView: agent.connector?.connectorId === "pi",
+					processView: true,
 				};
 				const picked = result.details;
 
@@ -867,7 +882,7 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 						status,
 						text,
 						interaction,
-						extraDetails,
+						{ delegationId: result.delegationId, ...extraDetails },
 					);
 					void refreshSoloSummary();
 					return ok;
@@ -944,19 +959,25 @@ async function announceToWindow(
 	taskId: string,
 	workerName: string,
 	task: string,
+	extraDetails?: Record<string, unknown>,
+	from: "solo" | "group" = "solo",
 ): Promise<void> {
 	try {
 		const fresh = await deps.store.getWindow(window.id);
 		const activeSession = fresh?.activeSession ?? window.activeSession;
-		await deps.sessions.sendCustomMessage(
-			activeSession,
-			{
-				customType: "pudding:task_assign",
-				content: task,
-				details: { taskId, worker: workerName, windowId: window.id, from: "solo", status: "running" },
-			},
-			{ triggerTurn: false },
-		);
+		const message = {
+			customType: "pudding:task_assign",
+			content: task,
+			details: { taskId, worker: workerName, windowId: window.id, from, status: "running", ...(extraDetails ?? {}) },
+		};
+		if (from === "group") {
+			// The group manager is currently blocked inside this delegate tool.
+			// Persist a hidden projection immediately; the web reducer folds it
+			// back into the original tool card after refresh/WS reconnect.
+			await deps.sessions.appendCustomMessageProjection(activeSession, message);
+		} else {
+			await deps.sessions.sendCustomMessage(activeSession, message, { triggerTurn: false });
+		}
 		// 全新窗口的 session 文件可能还没落盘，先把 running 卡刷进去。
 		await deps.sessions.ensureSessionFile(activeSession);
 	} catch {
@@ -1010,7 +1031,7 @@ async function syncToWindow(
 						worker: workerName,
 						windowId: window.id,
 						interactionId: interaction.interactionId,
-						delegationId: taskId,
+						delegationId: typeof extraDetails?.delegationId === "string" ? extraDetails.delegationId : taskId,
 						status: "pending",
 						revision: interaction.revision,
 						requests: interaction.requests,

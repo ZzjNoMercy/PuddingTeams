@@ -375,7 +375,7 @@ export function ConnectorSection({
 			{contribution ? (
 				<section className="agent-config-card flex flex-col gap-3">
 					<div className="agent-config-card-head"><h2>接入配置</h2><p>按 Connector 声明的 schema 填写；密钥加密存储，只存引用。</p></div>
-					<ConfigSchemaForm schema={contribution.configSchema} value={config} onChange={setConfig} />
+					<ConfigSchemaForm schema={contribution.configSchema} value={config} onChange={setConfig} agentName={agent.name} />
 			{securityWarnings.map((warning) => (
 				<div key={warning} role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 p-2.5 text-xs text-destructive">
 					{warning}

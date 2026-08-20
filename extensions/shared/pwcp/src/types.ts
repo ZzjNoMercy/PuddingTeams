@@ -126,6 +126,35 @@ export type AgentEvent =
 	| { type: "completed"; result: CompletedResult }
 	| { type: "failed"; result: FailedResult };
 
+/**
+ * Connector-neutral worker activity projected from an upstream event stream.
+ *
+ * Drivers emit these through `InvocationContext.onUpdate(..., { activity })`.
+ * PuddingTeams assigns delegation-local id/seq/timestamp and persists every
+ * activity as an append-only timeline entry. `sourceEvent` remains diagnostic;
+ * consumers render `kind`/`status` instead of depending on provider names.
+ */
+export interface WorkerActivity {
+	source: string;
+	sourceEvent: string;
+	kind: "lifecycle" | "assistant" | "reasoning" | "tool" | "file" | "search" | "plan" | "approval" | "error";
+	status: "started" | "running" | "updated" | "completed" | "failed" | "waiting" | "resolved";
+	title: string;
+	/** Visible assistant text, command/tool summary, output excerpt, or error. */
+	content?: string;
+	/** Stable upstream item/call id when the spawn protocol exposes one. */
+	itemId?: string;
+	/** Upstream sequence when exposed; PuddingTeams always adds its own seq. */
+	sourceSeq?: number;
+	/** Small, already-redacted provider-neutral facts for richer rendering. */
+	metadata?: Record<string, unknown>;
+}
+
+export interface WorkerActivityUpdateDetails {
+	activity: WorkerActivity;
+	[k: string]: unknown;
+}
+
 export interface DriverCapabilities {
 	operations: Array<"run" | "continue" | "respond" | "cancel">;
 	interactionKinds: Array<"permission" | "question" | "confirmation">;
@@ -146,7 +175,10 @@ export interface InvocationContext {
 	signal?: AbortSignal;
 	/** 启动超时 / 活跃超时等配置。 */
 	timeouts?: { startupMs?: number; activeMs?: number };
-	/** 进度回调（由 Runtime 转成 progress 事件）。 */
+	/**
+	 * 进度回调（由 Runtime 转成 progress 事件）。Driver 可在 details.activity
+	 * 携带结构化 WorkerActivity；Runtime 会追加落盘后再供执行过程时间线订阅。
+	 */
 	onUpdate?: (content: string, details?: unknown) => void;
 	/**
 	 * 仅 Runtime 在 respond 时注入的私有 provider state（continuation token）。
@@ -170,6 +202,14 @@ export interface ProbeResult {
 	issues: Array<{ code: string; message: string; fixAction?: string }>;
 }
 
+/** Driver-owned dynamic choices for one Connector config field. */
+export interface DriverConfigOption {
+	value: string;
+	label: string;
+	description?: string;
+	isDefault?: boolean;
+}
+
 /**
  * AgentDriver SPI：PuddingTeams 核心只内置 SPI 和 Registry，具体 Agent 的
  * 协议映射由 Connector Extension 注册到 Driver Registry。
@@ -182,4 +222,6 @@ export interface AgentDriver {
 	respond(input: RespondInput, ctx: InvocationContext): AsyncIterable<AgentEvent>;
 	cancel?(input: { runHandle: string }, ctx: InvocationContext): Promise<void>;
 	probe(ctx: InvocationContext): Promise<ProbeResult>;
+	/** Optional provider-native option discovery (for example Codex model/list). */
+	listConfigOptions?(field: string, ctx: InvocationContext): Promise<DriverConfigOption[]>;
 }

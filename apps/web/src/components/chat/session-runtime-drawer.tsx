@@ -10,7 +10,7 @@ import {
 	FileCheck2Icon,
 	GitBranchIcon,
 	HistoryIcon,
-	PanelRightOpenIcon,
+	ListTreeIcon,
 	ShieldCheckIcon,
 	TargetIcon,
 	XCircleIcon,
@@ -25,8 +25,7 @@ import {
 	DialogTrigger,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { WorkerProcessDialog } from "./worker-process-dialog";
-import { useAgentLabel } from "@/lib/avatars";
+import { useWorkerProcessDrawer } from "./worker-process-context";
 import type {
 	CompletionReview,
 	CompletionReviewCriterion,
@@ -154,22 +153,20 @@ export function SessionRuntimeDrawer({
 	const currentCriteria = latestCurrentReview?.criteria ?? [];
 	const satisfied = currentCriteria.filter((item) => item.status === "satisfied").length;
 	const pending = decisions.filter((item) => item.status === "pending");
-	// pi worker 执行过程查看器（委托链「执行过程」入口）。
-	const [processViewId, setProcessViewId] = useState<string | null>(null);
-	const processViewDelegation = delegations.find((item) => item.id === processViewId);
-	const processViewLabel = useAgentLabel(processViewDelegation?.agentId ?? "");
+	const [drawerOpen, setDrawerOpen] = useState(false);
+	const { openWorkerProcess } = useWorkerProcessDrawer();
 
 	return (
-		<Dialog>
+		<Dialog open={drawerOpen} onOpenChange={setDrawerOpen}>
 			<DialogTrigger asChild>
 				<Button size="sm" variant="outline" className="h-7 gap-1.5 rounded-full px-2.5 text-[11px]">
-					<PanelRightOpenIcon className="size-3.5" />运行详情
+					<ListTreeIcon className="size-3.5" />运行详情
 					{pending.length > 0 ? <span className="flex size-4 items-center justify-center rounded-full bg-amber-500 text-[9px] text-white">{pending.length}</span> : null}
 				</Button>
 			</DialogTrigger>
 			<DialogContent positionMode="drawer" className="context-drawer runtime-drawer grid grid-rows-[auto_minmax(0,1fr)] gap-0 p-0">
 				<DialogHeader className="runtime-drawer-head px-5 py-4 pr-12">
-					<div className="flex items-center gap-2 text-primary"><PanelRightOpenIcon className="size-4" /><span className="text-xs font-medium">Goal Runtime</span></div>
+					<div className="flex items-center gap-2 text-primary"><ListTreeIcon className="size-4" /><span className="text-xs font-medium">Goal Runtime</span></div>
 					<DialogTitle className="line-clamp-2 text-base leading-6">{workState.goal}</DialogTitle>
 					<DialogDescription className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
 						<span>{workState.status === "resolved" ? "已完成" : workState.status === "waiting_human" ? "等待人类" : workState.status === "cancelled" ? "已取消" : "进行中"}</span>
@@ -267,14 +264,17 @@ export function SessionRuntimeDrawer({
 										<div className="flex items-center gap-1.5">
 											<span className="font-medium">{item.agentId}</span>
 											<span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">{item.status}</span>
-											{item.processView && item.sessionHandle ? (
+											{item.processView ? (
 												<button
 													type="button"
 													className="flex items-center gap-0.5 text-[10px] text-muted-foreground hover:text-foreground"
-													onClick={() => setProcessViewId(item.id)}
+													onClick={() => {
+														setDrawerOpen(false);
+														setTimeout(() => openWorkerProcess(item.id), 0);
+													}}
 												>
 													执行过程
-													<ExternalLinkIcon className="size-2.5" />
+											<ListTreeIcon className="size-2.5" />
 												</button>
 											) : null}
 										</div>
@@ -295,14 +295,6 @@ export function SessionRuntimeDrawer({
 					<div className="flex items-center justify-center gap-1.5 py-2 text-[10px] text-muted-foreground"><Clock3Icon className="size-3" />运行事实来自当前 Session 控制面，不展示模型私有推理。</div>
 				</div>
 			</DialogContent>
-			<WorkerProcessDialog
-				delegationId={processViewId}
-				workerName={processViewLabel || undefined}
-				open={processViewId !== null}
-				onOpenChange={(open) => {
-					if (!open) setProcessViewId(null);
-				}}
-			/>
 		</Dialog>
 	);
 }

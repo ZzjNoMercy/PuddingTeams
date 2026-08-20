@@ -11,6 +11,7 @@ import path from "node:path";
  * ```
  * <home>/config/product.json
  * <home>/state/{agents,windows,workspaces,delegations,interactions,work-states,artifacts}.json
+ * <home>/state/delegation-timelines/<delegationId>.jsonl  # spawn worker append-only events
  * <home>/sessions/ + sessions/workers/      # pi manager JSONL + pi worker sessions
  * <home>/extensions/registry.json
  * <home>/assets/avatars/

@@ -229,6 +229,13 @@ export interface SecretSchemaItem {
 	required: boolean;
 }
 
+export interface DriverConfigOption {
+	value: string;
+	label: string;
+	description?: string;
+	isDefault?: boolean;
+}
+
 export interface ConnectorContribution {
 	id: string;
 	displayName: string;
@@ -609,12 +616,28 @@ export interface DelegationTrace {
 	evidenceRequirements?: string[];
 	completionBoundary?: string;
 	status: string;
-	/** worker 会话句柄（pi worker 可用于执行过程可视化）。 */
+	/** worker 会话句柄（pi 使用；spawn worker 的过程来自 delegation timeline）。 */
 	sessionHandle?: string;
-	/** 该委托的 worker 是 pi（执行过程可视化入口开关）。 */
+	/** 该委托提供只读执行过程入口。 */
 	processView?: boolean;
 	createdAt: string;
 	updatedAt: string;
+}
+
+export interface DelegationTimelineEvent {
+	id: string;
+	delegationId: string;
+	seq: number;
+	timestamp: string;
+	source: string;
+	sourceEvent: string;
+	kind: "lifecycle" | "assistant" | "reasoning" | "tool" | "file" | "search" | "plan" | "approval" | "error";
+	status: "started" | "running" | "updated" | "completed" | "failed" | "waiting" | "resolved";
+	title: string;
+	content?: string;
+	itemId?: string;
+	sourceSeq?: number;
+	metadata?: Record<string, unknown>;
 }
 
 export type WindowType = "solo" | "direct" | "group";

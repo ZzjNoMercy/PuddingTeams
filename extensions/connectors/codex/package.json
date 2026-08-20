@@ -42,7 +42,7 @@
 				"type": "object",
 				"properties": {
 					"command": { "type": "string", "description": "Codex 可执行文件名或路径", "default": "codex" },
-					"model": { "type": "string", "description": "worker 使用的模型（-m）；留空用 codex 默认" },
+					"model": { "type": "string", "title": "model", "x-puddingteams-options": "driver", "description": "从 Codex app-server model/list 读取当前账号可用模型；留空用 Codex 默认" },
 					"sandbox": {
 						"type": "string",
 						"enum": ["read-only", "workspace-write", "danger-full-access"],

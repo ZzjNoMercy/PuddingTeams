@@ -7,6 +7,7 @@ import type {
 	ProbeResult,
 	RespondInput,
 	RunInput,
+	WorkerActivity,
 } from "./types.js";
 import { normalizePuddingClawJson, PUDDINGCLAW_CAPABILITIES } from "./normalize.js";
 import { handoffDirFor, handoffRelativePath } from "./handoff.js";
@@ -24,6 +25,16 @@ export interface PuddingClawDriverOptions {
 	 * Never logged; only placed into the machine-readable stdin JSON.
 	 */
 	continuationToken?: string;
+	/**
+	 * A long synchronous Headless request can be completed by PuddingClaw after
+	 * an intermediary has already closed the HTTP connection.  Re-submit the
+	 * same request_id for this long to recover the idempotent terminal result.
+	 */
+	connectionRecoveryMs?: number;
+	/** Minimum first-attempt age before a connection_error is treated as a lost response. */
+	connectionRecoveryMinAgeMs?: number;
+	/** Poll interval while the same request_id is still running upstream. */
+	connectionRecoveryIntervalMs?: number;
 }
 
 /** 有界的 stderr 诊断摘要（§8.1）：截断 + 脱敏 token 形字符串。 */
@@ -33,24 +44,190 @@ function stderrSummary(stderr: string): string {
 	let s = stderr.trim().slice(0, max);
 	// 脱敏形如 token/sk-.../Bearer ... 的敏感片段，绝不进模型上下文。
 	s = s.replace(/\b(?:token|sk-)[a-zA-Z0-9_\-\.]{6,}\b/gi, "[redacted]");
-	s = s.replace(/\b(?:PUDDINGCLAW_TOKEN|Authorization)\s*[:=]\s*"?[^\s"\]]+/gi, "$1=[redacted]");
+	s = s.replace(/\bAuthorization\s*[:=]\s*"?[^\s"\]]+/gi, "Authorization=[redacted]");
 	return `：${s}${stderr.length > max ? "…" : ""}`;
+}
+
+export function projectPuddingClawActivity(line: unknown): { label: string; activity: WorkerActivity } | undefined {
+	if (!line || typeof line !== "object") return undefined;
+	const envelope = line as Record<string, unknown>;
+	const name = typeof envelope.event === "string" ? envelope.event : "";
+	if (!name || name === "result") return undefined;
+	const data = envelope.data && typeof envelope.data === "object" ? envelope.data as Record<string, unknown> : {};
+	const tool = firstText(data.tool, data.tool_name) || "工具";
+	const itemId = firstText(data.tool_call_id, data.call_id, data.response_id, data.run_id);
+	const sourceSeq = typeof envelope.seq === "number" ? envelope.seq : typeof data.seq === "number" ? data.seq : undefined;
+	const content = firstText(data.content, data.text, data.message, data.prompt, data.final_response);
+	const input = data.input ?? data.arguments ?? data.params;
+	const output = data.output ?? data.result;
+	const isError = data.is_error === true || data.error === true || typeof data.error === "string";
+	const common = (
+		kind: WorkerActivity["kind"],
+		status: WorkerActivity["status"],
+		title: string,
+		body?: string,
+		metadata?: Record<string, unknown>,
+	): { label: string; activity: WorkerActivity } => ({
+		label: title,
+		activity: {
+			source: "puddingclaw",
+			sourceEvent: name,
+			kind,
+			status,
+			title,
+			...(body ? { content: truncateActivity(body, 16_000) } : {}),
+			...(itemId ? { itemId } : {}),
+			...(sourceSeq !== undefined ? { sourceSeq } : {}),
+			...(metadata ? { metadata } : {}),
+		},
+	});
+
+	switch (name) {
+		case "run_starting":
+			return common("lifecycle", "started", "PuddingClaw 正在启动");
+		case "task_preflight_started":
+			return common("lifecycle", "started", "正在准备任务上下文");
+		case "task_preflight_completed":
+			return common("lifecycle", "completed", "任务上下文已准备");
+		case "run_started":
+			return common("lifecycle", "started", "PuddingClaw Run 已开始", undefined, simpleFacts(data, ["run_id", "session_id", "project_id"]));
+		case "run_outcome":
+			return common("lifecycle", isError ? "failed" : "updated", "PuddingClaw Run 结果已更新", content || safeActivityStringify(data.outcome), simpleFacts(data, ["outcome", "status"]));
+		case "goal_run_continued":
+			return common("lifecycle", "updated", "目标继续执行", content);
+		case "new_response":
+			return common("assistant", "started", "开始生成新回复");
+		case "token":
+			return common("assistant", "running", "正在生成回复", content);
+		case "segment_break":
+			return common("assistant", "updated", "回复进入下一分段");
+		case "segment_content_replaced":
+			return common("assistant", "updated", "回复分段已替换", content);
+		case "tool_start":
+			return common("tool", "started", `开始执行：${tool}`, safeActivityStringify(input), { tool });
+		case "tool_end":
+			return common("tool", isError ? "failed" : "completed", `${isError ? "执行失败" : "执行完成"}：${tool}`, safeActivityStringify(data.error ?? output), { tool, isError });
+		case "permission_required":
+			return common("approval", "waiting", "等待人工审批", content || safeActivityStringify(data.requests), simpleFacts(data, ["run_id", "request_id"]));
+		case "permission_resolved":
+			return common("approval", "resolved", "人工审批已处理", content, simpleFacts(data, ["request_id", "decision", "scope"]));
+		case "final_response":
+			return common("assistant", "completed", "PuddingClaw 最终回复", content);
+		case "done":
+			return common("lifecycle", "completed", "PuddingClaw 已完成");
+		case "error":
+			return common("error", "failed", "PuddingClaw 执行错误", content || safeActivityStringify(data.error));
+		case "stream_reset_required":
+			return common("error", "failed", "上游事件历史需要重新同步", safeActivityStringify(data));
+		default:
+			return undefined;
+	}
+}
+
+/**
+ * Collapse transport-level token deltas before they reach the platform
+ * timeline. Semantic events remain one-to-one; a consecutive token run becomes
+ * one bounded `token.batch` activity with diagnostic count/source-seq range.
+ */
+export function createPuddingClawActivityObserver(
+	emit: (projected: { label: string; activity: WorkerActivity }) => void,
+): { push: (line: unknown) => void; flush: () => void } {
+	let tokenContent = "";
+	let tokenCount = 0;
+	let tokenItemId: string | undefined;
+	let sourceSeqStart: number | undefined;
+	let sourceSeqEnd: number | undefined;
+
+	const flush = () => {
+		if (tokenCount === 0) return;
+		emit({
+			label: "回复内容已生成",
+			activity: {
+				source: "puddingclaw",
+				sourceEvent: "token.batch",
+				kind: "assistant",
+				status: "updated",
+				title: "回复内容片段",
+				...(tokenContent ? { content: tokenContent } : {}),
+				...(tokenItemId ? { itemId: tokenItemId } : {}),
+				...(sourceSeqEnd !== undefined ? { sourceSeq: sourceSeqEnd } : {}),
+				metadata: {
+					tokenEventCount: tokenCount,
+					...(sourceSeqStart !== undefined ? { sourceSeqStart } : {}),
+					...(sourceSeqEnd !== undefined ? { sourceSeqEnd } : {}),
+				},
+			},
+		});
+		tokenContent = "";
+		tokenCount = 0;
+		tokenItemId = undefined;
+		sourceSeqStart = undefined;
+		sourceSeqEnd = undefined;
+	};
+
+	return {
+		push: (line) => {
+			const projected = projectPuddingClawActivity(line);
+			if (projected?.activity.sourceEvent === "token") {
+				const nextItemId = projected.activity.itemId;
+				if (tokenCount > 0 && tokenItemId && nextItemId && tokenItemId !== nextItemId) flush();
+				tokenContent = truncateActivity(`${tokenContent}${projected.activity.content ?? ""}`, 16_000);
+				tokenCount += 1;
+				tokenItemId ??= nextItemId;
+				if (sourceSeqStart === undefined) sourceSeqStart = projected.activity.sourceSeq;
+				if (projected.activity.sourceSeq !== undefined) sourceSeqEnd = projected.activity.sourceSeq;
+				return;
+			}
+			// `result` and unknown future non-token events are still boundaries even
+			// when they have no public WorkerActivity projection.
+			flush();
+			if (projected) emit(projected);
+		},
+		flush,
+	};
+}
+
+function firstText(...values: unknown[]): string {
+	for (const value of values) if (typeof value === "string" && value) return value;
+	return "";
+}
+
+function simpleFacts(data: Record<string, unknown>, keys: string[]): Record<string, unknown> | undefined {
+	const entries = keys
+		.filter((key) => typeof data[key] === "string" || typeof data[key] === "number" || typeof data[key] === "boolean")
+		.map((key) => [key.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase()), data[key]]);
+	return entries.length ? Object.fromEntries(entries) : undefined;
+}
+
+function safeActivityStringify(value: unknown): string {
+	if (value === undefined || value === null) return "";
+	if (typeof value === "string") return truncateActivity(value, 12_000);
+	try {
+		return truncateActivity(JSON.stringify(value, (key, current) => /token|secret|password|authorization|credential|api[_-]?key/i.test(key) ? "[redacted]" : current, 2), 12_000);
+	} catch {
+		return "[unserializable payload]";
+	}
+}
+
+function truncateActivity(value: string, max: number): string {
+	return value.length > max ? `${value.slice(0, max)}…` : value;
 }
 
 /**
  * First-party PuddingClaw Driver (§5).
  *
- * - run         → puddingclaw agent run --input-json - --json [--export <handoffDir>]
- * - continue    → same, plus {session_id}
- * - respond     → puddingclaw agent respond <run_id> --input-json - --json [--export …]
+ * - run         → puddingclaw agent run --input-json - --jsonl [--export <handoffDir>]
+ * - continue    → same, plus {session_id}; JSONL progress is projected to Runtime activity
+ * - respond     → puddingclaw agent respond <run_id> --input-json - --jsonl [--export …]
  *                  {continuation_token, request_id, decisions}
  * - cancel      → puddingclaw agent cancel <run_id>（best-effort：失败降级为 SIGTERM）
  *
  * --export 目录按 §15.3 约定生成为 <cwd>/.pudding/handoff/<delegationId>/
  * （delegationId 由 Runtime 经 InvocationContext 注入）。
  *
- * The CLI's stdout carries a single JSON boundary in phase 1 (§8.2); a future
- * JSONL endpoint flows through the same normalize path per line.
+ * run/continue/respond consume the CLI JSONL stream, project every public
+ * event into the append-only delegation timeline, then normalize the final
+ * `result` boundary.
  */
 export class PuddingClawDriver implements AgentDriver {
 	readonly id = "puddingclaw";
@@ -109,17 +286,92 @@ export class PuddingClawDriver implements AgentDriver {
 		args: string[],
 		stdin: unknown,
 		ctx: InvocationContext,
+		streamProgress = false,
 	): Promise<AgentEvent> {
-		const res = await spawnWorker({
-			command: this.cmd(),
-			args,
-			env: ctx.env,
-			cwd: this.ctxCwd(ctx),
-			signal: ctx.signal,
-			timeoutMs: this.opts.timeoutMs ?? ctx.timeouts?.activeMs ?? 900_000,
-			startupMs: ctx.timeouts?.startupMs ?? 30_000,
-			stdinJson: stdin,
+		const activeMs = this.opts.timeoutMs ?? ctx.timeouts?.activeMs ?? 900_000;
+		const startedAt = Date.now();
+		const recoveryDeadline = startedAt + Math.min(
+			activeMs,
+			this.opts.connectionRecoveryMs ?? activeMs,
+		);
+		let recovering = false;
+		let recoveryAttempt = 0;
+
+		for (;;) {
+			const attemptStartedAt = Date.now();
+			const remainingMs = Math.max(1, startedAt + activeMs - attemptStartedAt);
+			const observer = streamProgress
+				? createPuddingClawActivityObserver((projected) => this.emitWorkerActivity(projected, ctx))
+				: undefined;
+			let res: Awaited<ReturnType<typeof spawnWorker>>;
+			try {
+				res = await spawnWorker({
+					command: this.cmd(),
+					args,
+					env: ctx.env,
+					cwd: this.ctxCwd(ctx),
+					signal: ctx.signal,
+					timeoutMs: remainingMs,
+					startupMs: ctx.timeouts?.startupMs ?? 30_000,
+					stdinJson: stdin,
+					jsonl: streamProgress,
+					onJsonLine: observer?.push,
+				});
+			} finally {
+				observer?.flush();
+			}
+			const event = this.eventFromSpawn(res, ctx, remainingMs);
+			const attemptAgeMs = Date.now() - attemptStartedAt;
+			const result = event.type === "failed" ? event.result : undefined;
+			const lostLongResponse =
+				result?.errorCode === "connection_error" &&
+				attemptAgeMs >= (this.opts.connectionRecoveryMinAgeMs ?? 30_000);
+			const stillRunning =
+				recovering &&
+				result?.errorCode === "http_error" &&
+				/identical Worker Run is already in progress/i.test(result.error);
+
+			if (!(lostLongResponse || stillRunning) || Date.now() >= recoveryDeadline || ctx.signal?.aborted) {
+				return event;
+			}
+
+			recovering = true;
+			recoveryAttempt += 1;
+			ctx.onUpdate?.(
+				stillRunning ? "上游任务仍在执行，正在等待结果…" : "连接已断开，但上游可能仍在执行；正在恢复同一任务的结果…",
+				{ running: true, recovering: true, recoveryAttempt },
+			);
+			await this.recoveryDelay(ctx.signal);
+		}
+	}
+
+	private emitWorkerActivity(projected: { label: string; activity: WorkerActivity }, ctx: InvocationContext): void {
+		ctx.onUpdate?.(projected.label, {
+			running: projected.activity.status !== "completed" && projected.activity.status !== "failed",
+			workerEvent: projected.activity.sourceEvent,
+			activity: projected.activity,
 		});
+	}
+
+	private async recoveryDelay(signal?: AbortSignal): Promise<void> {
+		const delayMs = this.opts.connectionRecoveryIntervalMs ?? 5_000;
+		if (signal?.aborted) return;
+		await new Promise<void>((resolve) => {
+			const timer = setTimeout(done, delayMs);
+			function done() {
+				signal?.removeEventListener("abort", done);
+				clearTimeout(timer);
+				resolve();
+			}
+			signal?.addEventListener("abort", done, { once: true });
+		});
+	}
+
+	private eventFromSpawn(
+		res: Awaited<ReturnType<typeof spawnWorker>>,
+		ctx: InvocationContext,
+		timeoutMs: number,
+	): AgentEvent {
 		if (res.timedOut) {
 			return {
 				type: "failed",
@@ -127,7 +379,7 @@ export class PuddingClawDriver implements AgentDriver {
 					agentId: this.id,
 					status: "failed",
 					errorCode: "timeout",
-					error: `worker 超时（${Math.round((this.opts.timeoutMs ?? 900_000) / 1000)}s）`,
+					error: `worker 超时（${Math.round(timeoutMs / 1000)}s）`,
 					recoverable: false,
 				},
 			};
@@ -165,7 +417,12 @@ export class PuddingClawDriver implements AgentDriver {
 			};
 		}
 
-		const lastLine = res.lines.length > 0 ? res.lines[res.lines.length - 1] : undefined;
+		const rawLastLine = res.lines.length > 0 ? res.lines[res.lines.length - 1] : undefined;
+		const lastLine = rawLastLine && typeof rawLastLine === "object"
+			&& (rawLastLine as Record<string, unknown>).event === "result"
+			&& (rawLastLine as Record<string, unknown>).data
+			? (rawLastLine as Record<string, unknown>).data
+			: rawLastLine;
 		if (lastLine !== undefined) {
 			const event = normalizePuddingClawJson(lastLine);
 			ctx.onUpdate?.("worker 执行完成", { exitCode: res.exitCode });
@@ -197,14 +454,24 @@ export class PuddingClawDriver implements AgentDriver {
 
 	async *run(input: RunInput, ctx: InvocationContext): AsyncIterable<AgentEvent> {
 		ctx.onUpdate?.("worker 正在执行…", { running: true });
+		const options = input.options ?? {};
+		const metadata = options.metadata && typeof options.metadata === "object"
+			? options.metadata as Record<string, unknown>
+			: {};
 		yield {
 			type: "started",
 		};
 		yield this.withResumeState(
 			await this.runCli(
-				["agent", "run", "--input-json", "-", "--json", ...this.exportArgs(ctx)],
-				{ message: input.message, request_id: input.requestId, ...(input.options ?? {}) },
+				["agent", "run", "--input-json", "-", "--jsonl", ...this.exportArgs(ctx)],
+					{
+						...options,
+						message: input.message,
+						request_id: input.requestId,
+						metadata: { ...metadata, caller_id: "puddingteams", caller_name: "PuddingTeams" },
+					},
 				ctx,
+				true,
 			),
 			input.message,
 		);
@@ -212,12 +479,23 @@ export class PuddingClawDriver implements AgentDriver {
 
 	async *continue(input: ContinueInput, ctx: InvocationContext): AsyncIterable<AgentEvent> {
 		ctx.onUpdate?.("worker 正在续接会话…", { running: true });
+		const options = input.options ?? {};
+		const metadata = options.metadata && typeof options.metadata === "object"
+			? options.metadata as Record<string, unknown>
+			: {};
 		yield { type: "started", sessionHandle: input.sessionHandle };
 		yield this.withResumeState(
 			await this.runCli(
-				["agent", "run", "--input-json", "-", "--json", ...this.exportArgs(ctx)],
-				{ message: input.message, session_id: input.sessionHandle, request_id: input.requestId, ...(input.options ?? {}) },
+				["agent", "run", "--input-json", "-", "--jsonl", ...this.exportArgs(ctx)],
+					{
+						...options,
+						message: input.message,
+						session_id: input.sessionHandle,
+						request_id: input.requestId,
+						metadata: { ...metadata, caller_id: "puddingteams", caller_name: "PuddingTeams" },
+					},
 				ctx,
+				true,
 			),
 			input.message,
 		);
@@ -256,19 +534,21 @@ export class PuddingClawDriver implements AgentDriver {
 			ctx.onUpdate?.("正在按你的选择重跑…", { running: true });
 			yield { type: "started", runHandle: input.runHandle };
 			yield await this.runCli(
-				["agent", "run", "--input-json", "-", "--json", ...this.exportArgs(ctx)],
-				{
-					message: `${task}\n\n（用户已明确：使用「${chosen}」执行本任务。）`,
-					request_id: input.requestId,
-				},
+				["agent", "run", "--input-json", "-", "--jsonl", ...this.exportArgs(ctx)],
+					{
+						message: `${task}\n\n（用户已明确：使用「${chosen}」执行本任务。）`,
+						request_id: input.requestId,
+						metadata: { caller_id: "puddingteams", caller_name: "PuddingTeams" },
+					},
 				ctx,
+				true,
 			);
 			return;
 		}
 		ctx.onUpdate?.("正在提交审批…", { running: true });
 		yield { type: "started", runHandle: input.runHandle };
 		yield await this.runCli(
-			["agent", "respond", input.runHandle, "--input-json", "-", "--json", ...this.exportArgs(ctx)],
+			["agent", "respond", input.runHandle, "--input-json", "-", "--jsonl", ...this.exportArgs(ctx)],
 			{
 				continuation_token: token,
 				request_id: input.requestId,
@@ -280,6 +560,7 @@ export class PuddingClawDriver implements AgentDriver {
 				})),
 			},
 			ctx,
+			true,
 		);
 	}
 
@@ -308,19 +589,14 @@ export class PuddingClawDriver implements AgentDriver {
 		});
 		let detected = res.exitCode !== -1;
 		let configured = res.exitCode === 0;
-		let authenticated: boolean | "unknown" = "unknown";
+		const authenticated: boolean | "unknown" = "unknown";
 		let upstreamVersion: string | undefined;
-		let authErrorCode: string | undefined;
-		let authErrorDetail: string | undefined;
 		if (res.stdout.trim()) {
 			try {
 				const raw = JSON.parse(res.stdout.trim()) as Record<string, unknown>;
 				configured = raw.configured === true;
-				authenticated = raw.authenticated === true ? true : raw.authenticated === false ? false : "unknown";
 				detected = detected || raw.cli_version !== undefined;
 				upstreamVersion = typeof raw.server_version === "string" ? raw.server_version : undefined;
-				authErrorCode = typeof raw.error_code === "string" ? raw.error_code : undefined;
-				authErrorDetail = typeof raw.error === "string" ? raw.error : undefined;
 			} catch {
 				// ignore
 			}
@@ -341,17 +617,6 @@ export class PuddingClawDriver implements AgentDriver {
 				...(configured
 					? []
 					: [{ code: "not_configured", message: "PuddingClaw CLI 未检测到或未配置", fixAction: "运行 puddingclaw doctor --json" }]),
-				// CLI 已安装/已配置但凭证无效（吊销/过期/超范围）也要显性报出，
-				// 不能只看 configured 就判"探测正常"。
-				...(authenticated === false
-					? [
-							{
-								code: authErrorCode ?? "auth_error",
-								message: `Worker Access Key 无效${authErrorDetail ? `：${authErrorDetail}` : ""}`,
-								fixAction: "重新配置 Worker Access Key 后再次探测",
-							},
-						]
-					: []),
 			],
 		};
 	}

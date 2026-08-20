@@ -5,6 +5,12 @@
 > 状态：已按 PuddingClaw Worker / 独立 Pi Platform / Room Pi Manager 三阶段修订
 >
 > 说明：文件名保留历史上的 `mcp` 字样；MCP 已不属于当前 v0 范围。
+>
+> 2026-08-20 覆盖决策：PuddingClaw 当前只支持本机回环 CLI/Backend，已取消
+> Worker Access Key、`PUDDINGCLAW_TOKEN` 与 `PUDDINGCLAW_HEADLESS_TOKEN`。
+> 本文件是历史快照，涉及 Token/远程 Worker 的段落不再作为实现要求；当前契约以
+> PuddingClaw 仓库的 `docs/headless-worker-cli.md` 和 PuddingTeams 的
+> `docs/2026-08-06-通用-agent-接入-底层与扩展方案.md` 为准。
 
 ## 1. 结论与当前优先级
 

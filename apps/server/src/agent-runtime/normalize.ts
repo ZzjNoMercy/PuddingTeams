@@ -43,13 +43,15 @@ export function normalizePuddingClawJson(raw: unknown): AgentEvent {
 		return { type: "failed", result: { ...resultBase(payload), status: "cancelled", errorCode: "cancelled", error: "任务已取消", recoverable: true } };
 	}
 
-	// completed（含默认兜底）
+	// completed：主聊天卡只接收上游明确声明的最终回复。token、segment、
+	// 中间 assistant 内容已经逐事件进入 delegation timeline，不能在这里
+	// 拼接或把整个协议 payload 当成正文展示。
 	const content =
 		(typeof payload.final_response === "string" && payload.final_response
 			? payload.final_response
-			: typeof payload.reply === "string"
+			: typeof payload.reply === "string" && payload.reply
 				? payload.reply
-				: JSON.stringify(payload));
+				: "（puddingclaw 无最终文本输出）");
 	const artifacts = parseExportedArtifacts(payload);
 	return {
 		type: "completed",
@@ -207,6 +209,8 @@ function failedEvent(errorCode: string, error: string): AgentEvent {
 export const PUDDINGCLAW_CAPABILITIES: DriverCapabilities = {
 	operations: ["run", "continue", "respond", "cancel"],
 	interactionKinds: ["permission", "confirmation"],
-	progress: "none",
+	// All public Headless JSONL events are projected into the Runtime timeline;
+	// terminal content remains the separately normalized final response.
+	progress: "stream",
 	transport: "spawn",
 };

@@ -20,7 +20,7 @@ const useIsomorphicLayoutEffect = typeof window !== "undefined" ? useLayoutEffec
 
 // 与 layout.tsx 内联脚本、globals.css :root/.dark 的 --background 保持一致。
 const CANVAS_COLOR: Record<"light" | "dark", string> = {
-	light: "#f4f6f7",
+	light: "#eef3f5",
 	dark: "oklch(0.12 0.012 240)",
 };
 

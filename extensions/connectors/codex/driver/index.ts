@@ -2,12 +2,15 @@ import type {
 	AgentDriver,
 	AgentEvent,
 	ContinueInput,
+	DriverConfigOption,
 	DriverCapabilities,
 	InvocationContext,
 	ProbeResult,
 	RespondInput,
 	RunInput,
 } from "@puddingteams/pwcp/types";
+import { spawn } from "node:child_process";
+import { createInterface } from "node:readline";
 import { gitBaseline, observeGitArtifacts } from "@puddingteams/pwcp/observe";
 import { spawnWorker, type SpawnResult } from "@puddingteams/pwcp/spawn";
 import { JsonlLineParser } from "@puddingteams/pwcp/jsonl-lines";
@@ -59,6 +62,93 @@ export class CodexDriver implements AgentDriver {
 		return this.opts.command ?? "codex";
 	}
 
+	/**
+	 * Read the account-aware picker catalog from Codex itself. This deliberately
+	 * starts app-server only for discovery; task execution remains spawn + JSONL.
+	 */
+	async listConfigOptions(field: string, ctx: InvocationContext): Promise<DriverConfigOption[]> {
+		if (field !== "model") return [];
+		return new Promise((resolve, reject) => {
+			const child = spawn(this.cmd(), ["app-server", "--stdio"], {
+				cwd: ctx.cwd ?? process.cwd(),
+				env: ctx.env,
+				stdio: ["pipe", "pipe", "pipe"],
+			});
+			let settled = false;
+			let stderr = "";
+			let requestId = 1;
+			const options: DriverConfigOption[] = [];
+			const timer = setTimeout(() => finish(new Error("Codex model/list 超时")), 15_000);
+			const lines = createInterface({ input: child.stdout });
+			const send = (payload: unknown) => child.stdin.write(`${JSON.stringify(payload)}\n`);
+			const finish = (error?: Error) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				lines.close();
+				child.stdin.end();
+				child.kill();
+				if (error) reject(error);
+				else resolve(options);
+			};
+			const requestPage = (cursor?: string | null) => {
+				requestId += 1;
+				send({ method: "model/list", id: requestId, params: { cursor: cursor ?? null, limit: 100, includeHidden: false } });
+			};
+
+			child.stderr.on("data", (chunk: Buffer) => {
+				if (stderr.length < 4_000) stderr += chunk.toString("utf8");
+			});
+			child.on("error", (error) => finish(error));
+			child.on("exit", (code) => {
+				if (!settled) finish(new Error(`Codex app-server 提前退出（${code ?? "unknown"}）${stderrSummary(stderr)}`));
+			});
+			lines.on("line", (line) => {
+				if (!line.trim() || settled) return;
+				let message: {
+					id?: number;
+					result?: { data?: Array<{ id?: string; model?: string; displayName?: string; description?: string; isDefault?: boolean }>; nextCursor?: string | null };
+					error?: { message?: string };
+				};
+				try {
+					message = JSON.parse(line) as typeof message;
+				} catch {
+					return;
+				}
+				if (message.error) {
+					finish(new Error(message.error.message || "Codex model/list 失败"));
+					return;
+				}
+				if (message.id === 1) {
+					send({ method: "initialized" });
+					requestPage();
+					return;
+				}
+				if (message.id !== requestId || !message.result) return;
+				for (const model of message.result.data ?? []) {
+					const value = model.model?.trim() || model.id?.trim();
+					if (!value || options.some((option) => option.value === value)) continue;
+					options.push({
+						value,
+						label: model.displayName?.trim() || value,
+						description: model.description?.trim() || undefined,
+						isDefault: model.isDefault === true,
+					});
+				}
+				if (message.result.nextCursor) requestPage(message.result.nextCursor);
+				else finish();
+			});
+			send({
+				method: "initialize",
+				id: 1,
+				params: {
+					clientInfo: { name: "puddingteams", title: "PuddingTeams", version: "0.1.0" },
+					capabilities: { experimentalApi: false, requestAttestation: false },
+				},
+			});
+		});
+	}
+
 	private runArgs(ctx: InvocationContext): string[] {
 		const args = ["--json", "--skip-git-repo-check", "-C", ctx.cwd ?? process.cwd(), "-s", this.opts.sandbox ?? "workspace-write"];
 		if (this.opts.model) args.push("-m", this.opts.model);
@@ -84,10 +174,17 @@ export class CodexDriver implements AgentDriver {
 		const baseline = await gitBaseline(cwd, ctx.env);
 		const reducer = new CodexEventReducer();
 		const parser = new JsonlLineParser();
+		const feedRaw = (raw: unknown) => {
+			const projected = reducer.pushWithActivity(raw);
+			if (projected.activity) {
+				ctx.onUpdate?.(projected.progress ?? projected.activity.title, { streaming: true, activity: projected.activity });
+			} else if (projected.progress) {
+				ctx.onUpdate?.(projected.progress, { streaming: true });
+			}
+		};
 		const feed = (chunk: string) => {
 			for (const raw of parser.push(chunk)) {
-				const progress = reducer.push(raw);
-				if (progress) ctx.onUpdate?.(progress, { streaming: true });
+				feedRaw(raw);
 			}
 		};
 		const res: SpawnResult = await spawnWorker({
@@ -100,7 +197,7 @@ export class CodexDriver implements AgentDriver {
 			startupMs: ctx.timeouts?.startupMs ?? 30_000,
 			onStdout: feed,
 		});
-		for (const raw of parser.flush()) reducer.push(raw);
+		for (const raw of parser.flush()) feedRaw(raw);
 
 		if (res.timedOut) {
 			return {

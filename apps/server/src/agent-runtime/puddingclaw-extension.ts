@@ -18,7 +18,7 @@ export const puddingClawConnectorManifest: ConnectorExtensionManifest = {
 	source: "builtin",
 	kind: "connector",
 	engines: { puddingteams: ">=0.1 <1" },
-	permissions: ["spawn", "secrets"],
+	permissions: ["spawn"],
 	connector: {
 		id: PUDDINGCLAW_CONNECTOR_ID,
 		displayName: "PuddingClaw",
@@ -31,7 +31,6 @@ export const puddingClawConnectorManifest: ConnectorExtensionManifest = {
 				command: { type: "string", description: "PuddingClaw 可执行文件名或路径", default: "puddingclaw" },
 			},
 		},
-		secretSchema: [{ key: "PUDDINGCLAW_TOKEN", label: "PuddingClaw Backend Token", required: true }],
 		supportedUpstreamVersions: ">=0.1.2",
 		// 内置默认头像（布丁狗），builtin assetsDir 见 index.ts 装配。
 		avatar: "puddingclaw.png",

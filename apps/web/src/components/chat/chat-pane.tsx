@@ -47,6 +47,8 @@ import { WorkspaceTrustBadge, workspaceTrustSuffix } from "./workspace-trust-bad
 import { ChatInfoDialog } from "./chat-info-dialog";
 import { SessionMenu } from "./session-menu";
 import { SessionWorkCard } from "./session-work-card";
+import { WorkerProcessDrawer } from "./worker-process-dialog";
+import { WorkerProcessProvider } from "./worker-process-context";
 
 /** StickToBottom 的 isAtBottom 桥给悬浮层外的兄弟组件（统计条淡入淡出）。 */
 function AtBottomReporter({ onChange }: { onChange: (atBottom: boolean) => void }) {
@@ -144,7 +146,9 @@ function SessionChat({
 		const names: string[] = [];
 		for (const m of messages) {
 			for (const call of m.toolCalls) {
-				if (call.status !== "running" || !isDelegateCall(call)) continue;
+				if (!isDelegateCall(call)) continue;
+				const resumedStatus = (call.details as { status?: string } | undefined)?.status;
+				if (call.status !== "running" && resumedStatus !== "running" && resumedStatus !== "approved") continue;
 				const worker = delegateWorker(call);
 				if (worker && !names.includes(worker)) names.push(worker);
 			}
@@ -261,6 +265,8 @@ export function ChatPane({
 	const [promptOpen, setPromptOpen] = useState(false);
 	const [promptValue, setPromptValue] = useState("");
 	const [chatInfoOpen, setChatInfoOpen] = useState(false);
+	const [workerProcessOpen, setWorkerProcessOpen] = useState(false);
+	const [requestedDelegationId, setRequestedDelegationId] = useState<string | null>(null);
 	const [pendingDeleteSession, setPendingDeleteSession] = useState<RoomSession | null>(null);
 	const [renamingSession, setRenamingSession] = useState<RoomSession | null>(null);
 	const [sessionRenameValue, setSessionRenameValue] = useState("");
@@ -274,12 +280,19 @@ export function ChatPane({
 	const [trustCandidate, setTrustCandidate] = useState<{ workspace: WorkspaceRecord; mode: "new_window" | "in_place" } | null>(null);
 	/** 头部「待信任/已拒绝」badge 点开的信任复核（与切换项目流程分开）。 */
 	const [trustReview, setTrustReview] = useState<WorkspaceRecord | null>(null);
+	const openWorkerProcess = useCallback((delegationId: string) => {
+		setChatInfoOpen(false);
+		setRequestedDelegationId(delegationId);
+		setWorkerProcessOpen(true);
+	}, []);
 
 	useEffect(() => {
 		let cancelled = false;
 		getRoom(roomId)
 			.then((r) => {
 				if (cancelled) return;
+				setWorkerProcessOpen(false);
+				setRequestedDelegationId(null);
 				setRoom(r);
 				setActiveId(r.activeSession || "");
 			})
@@ -329,6 +342,8 @@ export function ChatPane({
 	const switchSession = useCallback(
 		async (sessionId: string) => {
 			if (sessionId === activeId) return;
+			setWorkerProcessOpen(false);
+			setRequestedDelegationId(null);
 			try {
 				await setActiveRoomSession(roomId, sessionId);
 				if (room) {
@@ -345,6 +360,8 @@ export function ChatPane({
 	);
 
 	const newSession = useCallback(async () => {
+		setWorkerProcessOpen(false);
+		setRequestedDelegationId(null);
 		try {
 			const created = await createRoomSession(roomId);
 			setRoom((prev) =>
@@ -560,7 +577,7 @@ export function ChatPane({
 						onRename={openSessionRename}
 						onDelete={setPendingDeleteSession}
 					/>
-					<Button type="button" size="icon" variant="ghost" className="home-chat-more" aria-label="聊天设置" title="聊天设置" onClick={() => setChatInfoOpen(true)}>
+					<Button type="button" size="icon" variant="ghost" className="home-chat-more" aria-label="聊天设置" title="聊天设置" onClick={() => { setWorkerProcessOpen(false); setChatInfoOpen(true); }}>
 						<EllipsisIcon className="size-4" />
 					</Button>
 					{(status === "error" || status === "gone" || delayedConnectionStatus === status) && status !== "connected" ? (
@@ -578,6 +595,7 @@ export function ChatPane({
 				</div>
 			</header>
 			{activeId && room ? (
+				<WorkerProcessProvider value={{ openWorkerProcess }}>
 				<SessionChat
 					key={activeId}
 					roomId={roomId}
@@ -597,8 +615,23 @@ export function ChatPane({
 					sessionModel={activeSession?.model}
 					onSessionModelChange={handleSessionModelChange}
 				/>
+				</WorkerProcessProvider>
 			) : null}
 			</div>
+
+			{room && activeId ? (
+				<WorkerProcessProvider value={{ openWorkerProcess }}>
+				<WorkerProcessDrawer
+					key={`${activeId}:${requestedDelegationId ?? "index"}`}
+					roomId={roomId}
+					managerSessionId={activeId}
+					requestedDelegationId={requestedDelegationId}
+					showWorkerFilter={isGroup}
+					open={workerProcessOpen}
+					onOpenChange={setWorkerProcessOpen}
+				/>
+				</WorkerProcessProvider>
+			) : null}
 
 			{room ? (
 				<ChatInfoDialog
