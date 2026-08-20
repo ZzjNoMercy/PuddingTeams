@@ -34,6 +34,7 @@ function makeDeps(overrides: {
 }) {
 	const sent: SentMessage[] = [];
 	const errors: string[] = [];
+	const renames: string[] = [];
 	const delegateCalls: AgentInvokeParams[] = [];
 	const window = overrides.window ?? directWindow();
 	const agents = overrides.agents ?? new Map([[worker.name, worker]]);
@@ -47,6 +48,11 @@ function makeDeps(overrides: {
 				sent.push({ sessionId, customType: message.customType, content: message.content, details: message.details });
 			},
 			ensureSessionFile: async () => {},
+			sessionName: async () => renames[0] ?? "",
+			rename: async (_id, name) => {
+				renames.push(name);
+				return { id: _id, sessionFile: "", firstMessage: "", name, modifiedAt: "", active: true };
+			},
 		},
 		invoker: {
 			requireAgent: async (name) => {
@@ -71,7 +77,7 @@ function makeDeps(overrides: {
 	const settle = async () => {
 		for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
 	};
-	return { deps, sent, errors, delegateCalls, settle };
+	return { deps, sent, errors, renames, delegateCalls, settle };
 }
 
 test("非 direct 窗口不拦截，返回 false 交回调用方走 manager 回合", async () => {
@@ -82,9 +88,12 @@ test("非 direct 窗口不拦截，返回 false 交回调用方走 manager 回�
 });
 
 test("direct 窗口命中：先写用户消息与 running 指派卡，后台 delegate 完成后写结果卡", async () => {
-	const { deps, sent, delegateCalls, settle } = makeDeps({});
+	const { deps, sent, renames, delegateCalls, settle } = makeDeps({});
 	const handled = await dispatchDirectMessage(deps, "s-direct", "查一下千线激光雷达车型");
 	assert.equal(handled, true);
+
+	// 首条消息用任务文本自动起名（direct 窗口没有 manager 回合，走不到 LLM 标题）。
+	assert.deepEqual(renames, ["查一下千线激光雷达车型"]);
 
 	// 同步段：用户消息 + running 指派卡（都在返回前落进消息流）。
 	assert.deepEqual(sent.map((m) => m.customType), ["pudding:user_message", "pudding:task_assign"]);

@@ -145,11 +145,21 @@ const approve = {
 	responses: [{ requestId: "perm-1", action: "approve", scope: "once" }],
 };
 
-test("两边同步: completed 扇出 manager（唤醒汇总）+ 单聊（仅展示）", async () => {
+/** 受理即返回后，结果扇出在后台续跑：轮询直到消息到齐。 */
+async function waitForSent(sent: Sent[], count: number): Promise<void> {
+	for (let i = 0; i < 200 && sent.length < count; i++) {
+		await new Promise((r) => setTimeout(r, 5));
+	}
+	assert.equal(sent.length, count, "后台扇出应在期限内完成");
+}
+
+test("两边同步: 受理即返回 approved，completed 扇出 manager（唤醒汇总）+ 单聊（仅展示）", async () => {
 	const { invoker, interactionId, sent } = await makeStack("completed");
 	const outcome = await invoker.respond(interactionId, approve);
-	assert.equal(outcome.status, "completed");
+	assert.equal(outcome.status, "approved", "approve 受理后立即返回，不等 worker 续跑落定");
+	assert.equal(outcome.details.admitted, true);
 
+	await waitForSent(sent, 4);
 	const manager = sent.filter((s) => s.sessionId === "manager-sess-1");
 	const direct = sent.filter((s) => s.sessionId === "direct-sess-1");
 	assert.deepEqual(
@@ -193,8 +203,9 @@ test("两边同步: rejected 扇出 manager + 单聊（任务取消）", async (
 test("两边同步: failed 也会通知两边（不再静默）", async () => {
 	const { invoker, interactionId, sent } = await makeStack("failed");
 	const outcome = await invoker.respond(interactionId, approve);
-	assert.equal(outcome.status, "failed");
+	assert.equal(outcome.status, "approved", "受理即返回；失败结果走后台扇出");
 
+	await waitForSent(sent, 4);
 	const manager = sent.filter((s) => s.sessionId === "manager-sess-1");
 	assert.deepEqual(manager.map((s) => s.customType), ["pudding:interaction_resolved", "pudding:task_result"]);
 	assert.equal(manager[0]!.status, "failed");
@@ -208,8 +219,9 @@ test("两边同步: failed 也会通知两边（不再静默）", async () => {
 test("两边同步: 多轮 needs_input 投影新审批卡到两边（不唤醒）", async () => {
 	const { invoker, interactionId, sent } = await makeStack("needs_input");
 	const outcome = await invoker.respond(interactionId, approve);
-	assert.equal(outcome.status, "needs_input");
+	assert.equal(outcome.status, "approved", "受理即返回；新一轮审批卡走后台扇出");
 
+	await waitForSent(sent, 2);
 	for (const sessionId of ["manager-sess-1", "direct-sess-1"]) {
 		const messages = sent.filter((s) => s.sessionId === sessionId);
 		assert.deepEqual(messages.map((s) => s.customType), ["pudding:interaction_required"], `${sessionId} 必须收到新一轮审批卡`);
@@ -221,8 +233,8 @@ test("两边同步: 多轮 needs_input 投影新审批卡到两边（不唤醒�
 test("两边同步: manager session 与单聊 active session 相同则只发一次", async () => {
 	const { invoker, interactionId, sent } = await makeStack("completed", "direct-sess-1");
 	const outcome = await invoker.respond(interactionId, approve);
-	assert.equal(outcome.status, "completed");
-	assert.equal(sent.length, 2, "同一 session 不得重复扇出");
+	assert.equal(outcome.status, "approved");
+	await waitForSent(sent, 2);
 	assert.ok(sent.every((s) => s.sessionId === "direct-sess-1"));
 	assert.ok(
 		sent.every((s) => s.options.triggerTurn === false),

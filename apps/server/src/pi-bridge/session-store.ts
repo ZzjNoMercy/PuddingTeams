@@ -147,7 +147,7 @@ export class PiSessionStore {
 		return [
 			`当前是群聊窗口，pi manager 是调度者，成员：${members.map(label).join("、")}。多个 worker 需要配合完成用户的整体目标。`,
 			"规则：",
-			`1. 把用户的整体目标拆解成可执行的子任务；成员的委托工具默认未激活，先用 ${CORE_TOOL_SEARCH} 按 worker 名激活对应的 agent_<id>__delegate 工具，再逐个委托给最合适的 worker（可调用多个 worker、可分多步执行）。`,
+			`1. 把用户的整体目标拆解成可执行的子任务；成员的委托工具（agent_<id>__delegate）默认已激活，直接按 roster 里的工具名逐个委托给最合适的 worker（可调用多个 worker、可分多步执行）。`,
 			"2. 用户指名 worker 时，优先把相关子任务委托给它。",
 			"3. 结合之前 worker 返回的结果决定下一步：后续子任务可引用/续接先前结果，需要接力时安排好 worker 之间的顺序。",
 			"4. 需求或关键参数模糊时先向用户澄清，不要自行臆测。",
@@ -258,9 +258,9 @@ export class PiSessionStore {
 			resourceLoader: loader,
 			...(stripBuiltin ? { noTools: "builtin" as const } : {}),
 		});
-		// 激活策略（§3.3）：direct 默认激活该 Agent 的基础委托工具 + always
-		// 工具；solo/group 默认只激活 core search 工具，其余预注册但
-		// inactive，由 search_agent_tools 按需纯加法激活。
+		// 激活策略（§3.3）：基础委托工具全窗口默认激活（省掉 search 轮次）；
+		// capability 扩展工具按绑定策略预注册，searchable 的保持 inactive，
+		// 由 search_agent_tools 按需纯加法激活。
 		// 激活态回放（§3.3.7）：active tools 只在内存，重启/空闲重建会清零，
 		// 但 JSONL 历史里留着直接调用成功的记录，模型会模仿历史跳过 search
 		// 导致 "Tool not found"。SDK 会把"激活了新工具"的 toolResult 标注
@@ -694,6 +694,12 @@ export class PiSessionStore {
 		const model = await this.resolveModel(modelRef);
 		await session.setModel(model);
 		return PiSessionStore.summarizeModel(model);
+	}
+
+	/** 会话当前名称（未命名返回 ""）；direct 窗口首条消息自动起名前查它。 */
+	async sessionName(id: string): Promise<string> {
+		const session = await this.open(id);
+		return session.sessionName ?? "";
 	}
 
 	/** Set the user-facing session name and persist it as a session_info entry. */

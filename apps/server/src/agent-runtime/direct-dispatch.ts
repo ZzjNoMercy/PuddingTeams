@@ -14,7 +14,7 @@ import type { TeamsStore, WindowConfig } from "../store/teams.js";
 
 export interface DirectDispatchDeps {
 	teams: Pick<TeamsStore, "windowForSession" | "getAgent">;
-	sessions: Pick<PiSessionStore, "sendCustomMessage" | "ensureSessionFile">;
+	sessions: Pick<PiSessionStore, "sendCustomMessage" | "ensureSessionFile" | "rename" | "sessionName">;
 	invoker: Pick<AgentInvoker, "requireAgent" | "delegate">;
 	onError?: (sessionId: string, message: string) => void;
 	log?: (message: string) => void;
@@ -86,6 +86,14 @@ export async function dispatchDirectMessage(
 	// 全新 direct 窗口的 session 文件可能还没落盘（SDK 首条 assistant 消息前
 	// 不持久化）：先复制 SDK 的首刷，避免重启后整段对话蒸发。
 	await deps.sessions.ensureSessionFile(sessionId);
+	// direct 窗口没有 manager 回合，永远不会走 LLM 标题生成；pi 的
+	// firstMessage 元数据又只认 user 角色消息（本会话全是 custom 卡），
+	// 不起名的话会话下拉只能显示 pi 的 "(no messages)" 占位。首条消息
+	// 时用任务文本截断命名；用户改过的名字不覆盖。
+	if (!(await deps.sessions.sessionName(sessionId))) {
+		const title = displayText.replace(/\s+/g, " ").trim().slice(0, 40);
+		if (title) await deps.sessions.rename(sessionId, title).catch(() => undefined);
+	}
 	const taskId = randomUUID();
 	await deps.sessions.sendCustomMessage(
 		sessionId,

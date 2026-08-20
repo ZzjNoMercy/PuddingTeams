@@ -199,19 +199,27 @@ test("Phase4: 窗口内只有成员的工具可见（direct 非成员 Agent 不�
 	assert.deepEqual([...tools.keys()].sort(), [...plan.managed].sort());
 });
 
-test("Phase4: 激活策略——group/solo 默认只激活 core，委托工具预注册但 inactive", async () => {
+test("Phase4: 激活策略——委托工具全窗口默认激活，capability 扩展工具仍按需激活", async () => {
 	const teams = await makeTeams([agentConfig("alpha"), agentConfig("beta")]);
 	const catalog = new ExtensionCatalog();
 
 	const group = await planManagerTools(teams, catalog, { type: "group", members: ["alpha", "beta"] });
 	assert.ok(group.managed.has(delegateToolName("alpha")) && group.managed.has(delegateToolName("beta")));
 	const core = [CORE_TOOL_SEARCH, CORE_TOOL_UPDATE_WORK_STATE, CORE_TOOL_REQUEST_DECISION];
-	assert.deepEqual([...group.active], [...core, CORE_TOOL_INVITE], "group 默认激活 core + 拉人工具");
+	assert.deepEqual(
+		[...group.active],
+		[...core, CORE_TOOL_INVITE, delegateToolName("alpha"), delegateToolName("beta")],
+		"group 默认激活 core + 拉人工具 + 成员委托工具（省掉 search 轮次）",
+	);
 
-	// solo（无窗口上下文）：roster 为全部启用 Agent，激活集为 core + 建房工具。
+	// solo（无窗口上下文）：roster 为全部启用 Agent（含内置 puddingclaw），
+	// 激活集为 core + 建房工具 + 全部委托工具。
 	const solo = await planManagerTools(teams, catalog, undefined);
 	assert.ok(solo.managed.has(delegateToolName("alpha")) && solo.managed.has(delegateToolName("beta")));
-	assert.deepEqual([...solo.active], [...core, CORE_TOOL_CREATE_GROUP]);
+	assert.deepEqual(
+		[...solo.active],
+		[...core, CORE_TOOL_CREATE_GROUP, delegateToolName("alpha"), delegateToolName("beta"), delegateToolName("puddingclaw")],
+	);
 
 	// 禁用 beta 后掉出 roster（装配期即不可见）。
 	await teams.setEnabled("beta", false);
@@ -394,6 +402,43 @@ test("Phase4: search_agent_tools 纯加法激活，撤权工具不会被重新�
 	const second = await search.execute("call-2", { query: "alpha" }, undefined, undefined, {} as ExtensionContext);
 	assert.deepEqual((second.details as { matches: string[] }).matches, [], "禁用后工具不得再被搜索激活");
 	assert.ok(!getActive().includes(delegateToolName("alpha")));
+});
+
+test("Phase4: search_agent_tools 空格分词 AND，worker 名 + 职责关键词可组合命中", async () => {
+	const teams = await makeTeams([
+		agentConfig("alpha", {
+			responsibility: { identity: "检索员", domain: "联网检索", owns: ["联网检索", "资料汇总"], excludes: [] },
+		}),
+		agentConfig("beta"),
+	]);
+	const catalog = new ExtensionCatalog();
+	const invoker = await makeInvoker(teams, "alpha", "beta");
+	const ctx: ManagerWindowContext = { type: "group", members: ["alpha", "beta"] };
+	const plan = await planManagerTools(teams, catalog, ctx);
+	const { pi, tools, setActive } = mockPi();
+	for (const ext of buildManagerExtensionFactories(plan, makeDeps(teams, invoker, catalog, ctx))) {
+		const factory = typeof ext === "function" ? ext : ext.factory;
+		await factory(pi);
+	}
+	setActive([CORE_TOOL_SEARCH]);
+
+	const search = tools.get(CORE_TOOL_SEARCH)!;
+	// 回归：整串 "alpha 联网检索" 既不是工具名子串也不是描述子串，
+	// 旧实现必然落空；分词后两词分别命中工具名与责任边界描述。
+	const combo = await search.execute("call-1", { query: "alpha 联网检索" }, undefined, undefined, {} as ExtensionContext);
+	assert.deepEqual(
+		(combo.details as { matches: string[] }).matches,
+		[delegateToolName("alpha")],
+		"worker 名 + 职责关键词应组合命中其委托工具",
+	);
+
+	// 单个职责关键词也能命中（描述含责任边界）。
+	const byDuty = await search.execute("call-2", { query: "联网检索" }, undefined, undefined, {} as ExtensionContext);
+	assert.deepEqual((byDuty.details as { matches: string[] }).matches, [delegateToolName("alpha")]);
+
+	// AND 语义：任一词不命中则整体不匹配，不会误激活无关工具。
+	const miss = await search.execute("call-3", { query: "alpha 写代码" }, undefined, undefined, {} as ExtensionContext);
+	assert.deepEqual((miss.details as { matches: string[] }).matches, []);
 });
 
 test("Phase4: 搜索已激活的工具返回可直接调用，而不是没有匹配", async () => {

@@ -81,8 +81,9 @@ export interface ManagedToolPlan {
  * 计算一个窗口上下文的受管工具集（§3.3）：
  * - roster：solo 为全部启用 Agent；direct/group 仅启用的窗口成员；
  * - 命名空间：`agent_<agentId>__delegate`、`agent_<agentId>__<extId>__<tool>`；
- * - 激活：direct 默认激活该 Agent 的基础委托工具 + 绑定的 always 工具；
- *   solo/group 默认只激活 core（search），其余预注册但 inactive；
+ * - 激活：基础委托工具全窗口默认激活（省掉 search 激活轮次）；
+ *   capability 扩展工具按绑定策略，always 随 direct 默认激活，
+ *   其余预注册但 inactive，由 search_agent_tools 纯加法激活；
  * - roster 本身不进工具集，由 core Extension 的 before_agent_start 注入 prompt。
  */
 export async function planManagerTools(
@@ -108,7 +109,9 @@ export async function planManagerTools(
 	for (const agent of agents) {
 		const delegate = delegateToolName(agent.name);
 		managed.add(delegate);
-		if (ctx?.type === "direct") active.add(delegate);
+		// 委托工具全窗口默认激活：schema 常驻成本远低于「先 search 激活再调用」
+		// 的整轮上下文重发；search 只留给数量不确定的 capability 扩展工具。
+		active.add(delegate);
 		for (const binding of agent.capabilityExtensions ?? []) {
 			if (!binding.enabled) continue;
 			const module = catalog.get(binding.extensionId);
@@ -193,7 +196,7 @@ export function buildManagerExtensionFactories(
 // ---- core Extension（roster prompt 注入 + search_agent_tools） ----
 
 const SearchParams = Type.Object({
-	query: Type.String({ description: "搜索关键词（匹配工具名或描述，如 worker 名）。" }),
+	query: Type.String({ description: "搜索关键词（空格分词，逐词匹配工具名或描述，如 worker 名、职责关键词）。" }),
 });
 
 const UpdateWorkStateParams = Type.Object({
@@ -287,7 +290,7 @@ export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowCon
 	return [
 		"当前可委托的 worker（按窗口成员与启用状态每轮刷新）：",
 		lines.join("\n"),
-		`标注「已激活」的工具可直接调用，不要再搜索；未激活的先用 ${CORE_TOOL_SEARCH} 按名称激活后再调用。若调用返回工具不存在（Tool ... not found），说明它当前未激活（服务重启后会话重建会重置激活态）：用 ${CORE_TOOL_SEARCH} 激活后重试一次即可，不要当作 worker 不可用。只有搜索不到该 worker 的工具、或激活后调用仍被明确拒绝时，才说明该 worker 已不可用，不要继续重试。`,
+		`委托工具默认全部已激活，按 roster 里的工具名直接调用，不要先搜索。标注「已激活」的扩展能力工具同样直接调用；只有未激活的扩展能力工具才先用 ${CORE_TOOL_SEARCH} 按名称激活后再调用。若调用返回工具不存在（Tool ... not found），说明它当前未激活（服务重启后会话重建会重置激活态）：用 ${CORE_TOOL_SEARCH} 激活后重试一次即可，不要当作 worker 不可用。只有搜索不到该 worker 的工具、或激活后调用仍被明确拒绝时，才说明该 worker 已不可用，不要继续重试。`,
 		...(soloCtx
 			? [
 					`只要任务需要两个及以上 worker——包括串行交接（一个 worker 的产出是另一个的输入，如"先查数据再做 PPT"）——就用 ${CORE_TOOL_CREATE_GROUP} 建群聊并把整体任务下达给房间 manager，让 worker 在群里直接交接、用户全程旁观。不要在 solo 里逐个单聊派活、自己搬运中间结果。只有纯单 worker 任务才直接委托该 worker。`,
@@ -350,7 +353,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 			description:
 				"按关键词搜索当前窗口内 Agent 的工具，并纯加法激活匹配项（setActiveTools）。找到后要先用返回的工具名发起调用。",
 			promptGuidelines: [
-				`需要调用未激活的 Agent 工具时，先用 ${CORE_TOOL_SEARCH} 搜索并激活，再发起调用。`,
+				`委托工具默认已激活，直接按 roster 里的工具名调用；只有未激活的扩展能力工具才先用 ${CORE_TOOL_SEARCH} 搜索并激活，再发起调用。`,
 			],
 			parameters: SearchParams,
 			async execute(_toolCallId, params: Static<typeof SearchParams>) {
@@ -360,13 +363,17 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 				const query = params.query.toLowerCase();
 				// 匹配全量受管工具（含已激活的）：模型搜一个已激活的工具名时，
 				// 要明确告诉它"已激活可直接调用"，而不是"没有匹配"把它绕晕。
+				// 空格分词 AND：模型常搜「worker 名 + 职责关键词」（如
+				// "puddingclaw 联网检索"），整串子串匹配必然落空；逐词命中工具名
+				// 或描述（描述含责任边界/负责清单）才符合它的搜索习惯。
+				const tokens = query.split(/\s+/).filter(Boolean);
 				const matches = pi
 					.getAllTools()
-					.filter(
-						(t) =>
-							plan.managed.has(t.name) &&
-							(t.name.toLowerCase().includes(query) || t.description.toLowerCase().includes(query)),
-					)
+					.filter((t) => {
+						if (!plan.managed.has(t.name)) return false;
+						const haystack = `${t.name}\n${t.description}`.toLowerCase();
+						return tokens.every((tok) => haystack.includes(tok));
+					})
 					.map((t) => t.name);
 				if (matches.length === 0) {
 					return {
@@ -903,7 +910,7 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 
 				if (result.status === "failed") {
 					const text = result.content;
-					await soloMeta("error", text);
+					await soloMeta("failed", text);
 					throw new Error(text);
 				}
 

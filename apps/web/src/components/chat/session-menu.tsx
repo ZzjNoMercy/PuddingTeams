@@ -11,8 +11,15 @@ import {
 import type { RoomSession } from "@/lib/types";
 import { homePortalContainer } from "@/lib/home-portal";
 
-function updateLabel(session: RoomSession): string {
-	const modifiedAt = new Date(session.modifiedAt);
+/** pi 元数据的 "(no messages)" 是占位不是名字（direct 窗口全是 custom 卡，
+ *  没有 user 角色消息可摘），与「新对话」一样不参与展示。 */
+function sessionDisplayName(session: RoomSession): string {
+	const first = session.firstMessage;
+	const meaningful = first && first !== "新对话" && first !== "(no messages)" ? first : "";
+	return session.name || meaningful || "新对话";
+}
+
+function updateLabel(session: RoomSession): string {	const modifiedAt = new Date(session.modifiedAt);
 	if (Number.isNaN(modifiedAt.getTime())) return "";
 
 	const now = new Date();
@@ -60,12 +67,12 @@ export function SessionMenu({
 							{session.active ? <CheckIcon /> : null}
 						</span>
 						<span className="home-session-menu-copy">
-							<strong>{session.name || session.firstMessage || "新对话"}</strong>
+							<strong>{sessionDisplayName(session)}</strong>
 							<span>{updateLabel(session)}</span>
 						</span>
 						<button
 							type="button"
-							aria-label={`重命名会话「${session.name || session.firstMessage || "新对话"}」`}
+							aria-label={`重命名会话「${sessionDisplayName(session)}」`}
 							onClick={(event) => {
 								event.stopPropagation();
 								onRename(session);
@@ -76,7 +83,7 @@ export function SessionMenu({
 						</button>
 						<button
 							type="button"
-							aria-label={`删除会话「${session.name || session.firstMessage || "新对话"}」`}
+							aria-label={`删除会话「${sessionDisplayName(session)}」`}
 							onClick={(event) => {
 								event.stopPropagation();
 								onDelete(session);

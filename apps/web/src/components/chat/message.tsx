@@ -128,6 +128,9 @@ const WORKER_STATUS_LABEL: Record<string, string> = {
 	needs_input: "等待审批",
 	cancelled: "已取消",
 	failed: "失败",
+	// 历史卡：direct 镜像在失败时写过 vocab 外的 "error"（agent-extensions soloMeta），
+	// 新数据已统一 failed，这里仅为兼容旧会话记录。
+	error: "失败",
 	conflict: "会话占用",
 	timeout: "超时",
 };

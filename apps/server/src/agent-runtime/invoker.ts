@@ -452,19 +452,37 @@ export class AgentInvoker {
 		const prepared = await this.withWindowLifecycles(
 			[delegation.windowId, ...(managerOwner ? [managerOwner.id] : [])],
 			async () => {
-				let admittedResolve!: () => void;
+				// continuing=true 表示审批已受理、worker 即将续跑（可能跑很久）；
+				// false 表示终态/冲突路径，完整结果紧随其后。
+				let admittedResolve!: (continuing: boolean) => void;
 				let admittedReject!: (reason: unknown) => void;
-				const admitted = new Promise<void>((resolve, reject) => {
+				const admitted = new Promise<boolean>((resolve, reject) => {
 					admittedResolve = resolve;
 					admittedReject = reject;
 				});
 				const responsePromise = this.respondUnlocked(interactionId, input, signal, admittedResolve);
 				void responsePromise.catch(admittedReject);
 				await Promise.race([admitted, responsePromise.then(() => undefined)]);
-				return { responsePromise };
+				return { admitted, responsePromise };
 			},
 		);
-		return prepared.responsePromise;
+		// 受理即返回：HTTP 不等 worker 续跑落定，立即给前端「已批准」反馈；
+		// 续跑的最终结果（completed/needs_input/failed）由 respondUnlocked 内部的
+		// outcome 扇出以 pudding:interaction_resolved / task_result 卡送达两边窗口。
+		return Promise.race([
+			prepared.admitted.then((continuing): Promise<AgentInvokeResult> | AgentInvokeResult =>
+				continuing
+					? {
+							status: "approved",
+							content: "审批已受理，任务继续执行中。",
+							details: { interactionId, admitted: true },
+							delegationId: delegation.id,
+							waitingInput: false,
+						}
+					: prepared.responsePromise,
+			),
+			prepared.responsePromise,
+		]);
 	}
 
 	/**
@@ -498,7 +516,7 @@ export class AgentInvoker {
 		interactionId: string,
 		input: { requestId: string; revision: number; responses: Array<{ requestId: string; action: string; scope?: string }> },
 		signal?: AbortSignal,
-		onAdmitted?: () => void,
+		onAdmitted?: (continuing: boolean) => void,
 	): Promise<AgentInvokeResult> {
 		// H5：respond 也要用该 agent 的凭证 + workspace cwd，否则子进程裸环境
 		// 无 token、无 PATH，且跑错目录。

@@ -3,13 +3,14 @@ import assert from "node:assert";
 import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Type } from "typebox";
 import { TeamsStore } from "../store/teams.js";
 import { AgentRuntime } from "../agent-runtime/runtime.js";
 import { DelegationStore } from "../agent-runtime/delegation-store.js";
 import { InteractionSecretStore } from "../agent-runtime/interaction-secret-store.js";
 import { DriverRegistry } from "../agent-runtime/driver-registry.js";
 import { AgentInvoker } from "../agent-runtime/invoker.js";
-import { delegateToolName } from "../agent-runtime/extensions.js";
+import { ExtensionCatalog, delegateToolName, extensionToolName, type CapabilityExtensionModule } from "../agent-runtime/extensions.js";
 import { PiSessionStore } from "./session-store.js";
 import type { AgentDriver, AgentEvent, InvocationContext } from "../agent-runtime/types.js";
 
@@ -23,7 +24,7 @@ function freshDir(prefix: string): string {
 	return mkdtempSync(path.join(tmpdir(), prefix));
 }
 
-async function makeStack() {
+async function makeStack(catalog?: ExtensionCatalog) {
 	process.env.PI_CODING_AGENT_DIR = freshDir("pt-mgr-agentdir-");
 	const dir = freshDir("pt-mgr-");
 	const teams = new TeamsStore({ state: path.join(dir, "teams"), assets: path.join(dir, "teams"), managedWorkspaces: path.join(dir, "managed") }, dir);
@@ -37,7 +38,7 @@ async function makeStack() {
 		ttlMs: 24 * 60 * 60 * 1000,
 	});
 	const invoker = new AgentInvoker(teams, runtime, drivers, undefined, dir);
-	const sessions = new PiSessionStore(dir, path.join(dir, "sessions"), teams, invoker);
+	const sessions = new PiSessionStore(dir, path.join(dir, "sessions"), teams, invoker, catalog);
 	return { teams, sessions, invoker, drivers, dir };
 }
 
@@ -321,13 +322,44 @@ test("P3-1: 无项目 Window 的 cwdSnapshot 变化后拒绝恢复旧 Interactio
 });
 
 test("§3.3.7: 重启/重建从 JSONL 历史回放已激活的受管工具", async () => {
-	const { teams, sessions } = await makeStack();
+	// searchable capability 工具是唯一「受管但默认 inactive」的类别（委托工具
+	// 已全窗口默认激活），回放语义用它验证。
+	const module: CapabilityExtensionModule = {
+		manifest: {
+			id: "test-ext",
+			kind: "capability",
+			name: "测试扩展",
+			version: "1",
+			tools: [{ name: "deep_query", activation: "searchable", description: "深度查询" }],
+		},
+		register(ctx) {
+			ctx.registerTool({
+				name: "deep_query",
+				label: "Deep Query",
+				description: "深度查询",
+				parameters: Type.Object({}),
+				async execute() {
+					return { content: [{ type: "text", text: "q" }], details: {} };
+				},
+			});
+		},
+	};
+	const catalog = new ExtensionCatalog();
+	catalog.register(module);
+	const { teams, sessions } = await makeStack(catalog);
 	const summary = await sessions.create();
 	await teams.ensureSoloWindow(async () => ({ id: summary.id }), async () => true);
 	const name = delegateToolName("puddingclaw");
+	const seeded = (await teams.getAgent("puddingclaw"))!;
+	await teams.upsertAgent({
+		...seeded,
+		capabilityExtensions: [{ id: "b1", extensionId: "test-ext", capabilityId: "test-ext", enabled: true, config: {} }],
+	});
+	const extTool = extensionToolName("puddingclaw", "test-ext", "deep_query");
 
 	const session = await sessions.open(summary.id);
-	assert.ok(!session.getActiveToolNames().includes(name), "solo 默认只激活 core search，委托工具保持 inactive");
+	assert.ok(session.getActiveToolNames().includes(name), "委托工具默认激活，无需 search");
+	assert.ok(!session.getActiveToolNames().includes(extTool), "searchable 扩展工具默认保持 inactive");
 
 	// SDK 落盘门槛：文件要出现过 assistant 消息才开始持久化，先补一条。
 	session.sessionManager.appendMessage({
@@ -347,8 +379,8 @@ test("§3.3.7: 重启/重建从 JSONL 历史回放已激活的受管工具", asy
 		toolCallId: "call_replay",
 		toolName: "search_agent_tools",
 		content: [{ type: "text", text: "已激活" }],
-		details: { matches: [name, "agent_ghost__delegate"], added: [name, "agent_ghost__delegate"] },
-		addedToolNames: [name, "agent_ghost__delegate"],
+		details: { matches: [extTool, "agent_ghost__delegate"], added: [extTool, "agent_ghost__delegate"] },
+		addedToolNames: [extTool, "agent_ghost__delegate"],
 		isError: false,
 		timestamp: Date.now(),
 	} as never);
@@ -356,7 +388,7 @@ test("§3.3.7: 重启/重建从 JSONL 历史回放已激活的受管工具", asy
 	// 模拟重启：释放内存会话，从 JSONL 重新物化。
 	await sessions.disposeAll();
 	const rebuilt = await sessions.open(summary.id);
-	assert.ok(rebuilt.getActiveToolNames().includes(name), "重建后必须恢复历史里已激活的委托工具");
+	assert.ok(rebuilt.getActiveToolNames().includes(extTool), "重建后必须恢复历史里已激活的扩展工具");
 	assert.ok(
 		!rebuilt.getActiveToolNames().includes("agent_ghost__delegate"),
 		"不在当前装配计划（plan.managed）里的工具不得被回放激活",

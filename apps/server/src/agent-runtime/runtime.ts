@@ -488,7 +488,7 @@ export class AgentRuntime {
 		input: { requestId: string; revision: number; responses: InteractionResponse[] },
 		ctx: InvocationContext,
 		driverSnapshot?: AgentDriver,
-		onAdmitted?: () => void,
+		onAdmitted?: (continuing: boolean) => void,
 	): Promise<RespondOutcome> {
 		const interaction = await this.delegations.getInteraction(interactionId);
 		if (!interaction) throw new InteractionError("not_found", "interaction not found");
@@ -498,7 +498,7 @@ export class AgentRuntime {
 		// M3：同一 interaction 同时在飞（双签 / 两个标签页）时，拒绝第二次调用，
 		// 绝不并发调 driver.respond。
 		if (this.responding.has(interactionId)) {
-			onAdmitted?.();
+			onAdmitted?.(false);
 			return {
 				status: "failed",
 				result: { agentId: delegation.agentId, status: "failed", errorCode: "responding", error: "该审批正在处理中，请稍候", recoverable: true },
@@ -516,7 +516,7 @@ export class AgentRuntime {
 		// 幂等检查 + 校验。
 		const { interaction: approved, replayed } = await this.broker.submit(interactionId, input);
 		if (replayed) {
-			onAdmitted?.();
+			onAdmitted?.(false);
 			// 幂等重放：已经消费过，返回当前终态，不再次调用 driver。
 			const existing = await this.delegations.getDelegation(interaction.delegationId);
 			return {
@@ -535,7 +535,7 @@ export class AgentRuntime {
 				if (delegation.sessionHandle) this.releaseSession(delegation.sessionHandle, delegation.id);
 				this.activeDelegations.delete(delegation.id);
 				await this.secrets.removeProviderState(interaction.id).catch(() => undefined);
-				onAdmitted?.();
+				onAdmitted?.(false);
 				return {
 					status: "rejected",
 					result: {
@@ -550,7 +550,7 @@ export class AgentRuntime {
 				};
 			}
 		} else {
-			onAdmitted?.();
+			onAdmitted?.(false);
 			// 状态既不是 pending 也不是终态——异常路径。
 			return {
 				status: "failed",
@@ -586,7 +586,9 @@ export class AgentRuntime {
 
 		let sessionHandle = delegation.sessionHandle;
 		this.responding.add(interactionId);
-		onAdmitted?.();
+		// continuing=true：审批已受理，worker 即将续跑（可能很久），调用方应
+		// 立即向 HTTP 返回受理态结果，续跑结果走 outcome 扇出通知。
+		onAdmitted?.(true);
 		try {
 			for await (const event of driver.respond!(
 				{
