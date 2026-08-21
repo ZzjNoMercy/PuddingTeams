@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Type, type Static } from "typebox";
 import type { ExtensionAPI, InlineExtension } from "@earendil-works/pi-coding-agent";
 import { agentDisplayName, type TeamsStore, type AgentConfig, type WindowConfig, type WindowType } from "../store/teams.js";
-import { WorkStateConflictError, type WorkStateStore } from "../store/work-state.js";
+import { WorkStateConflictError, WorkStateOperationConflictError, goalCriterionRefs, type WorkStateStore } from "../store/work-state.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import {
 	ScopedAgentInvoker,
@@ -14,6 +14,8 @@ import {
 } from "../agent-runtime/extensions.js";
 import type { PiSessionStore } from "./session-store.js";
 import type { ArtifactStore } from "../agent-runtime/artifact-store.js";
+import type { LargeWorkerResultStore } from "../store/large-worker-result.js";
+import type { ProductSettingsStore } from "../store/product-settings.js";
 
 /**
  * Phase 4：manager Session 的 Extension 装配（方案 §3.3）。
@@ -43,10 +45,17 @@ const SYNC_IDLE_TIMEOUT_MS = 15_000;
 export const CORE_TOOL_SEARCH = "search_agent_tools";
 export const CORE_TOOL_UPDATE_WORK_STATE = "update_session_work_state";
 export const CORE_TOOL_REQUEST_DECISION = "request_human_decision";
+export const CORE_TOOL_CREATE_GOAL = "create_session_goal";
+export const CORE_TOOL_UPDATE_WORK_PLAN = "update_work_plan";
+export const CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM = "advance_manager_work_item";
+export const CORE_TOOL_REVIEW_WORK_ITEM = "review_work_item";
+export const CORE_TOOL_READ_DELEGATION_RESULT = "read_delegation_result";
 /** solo：manager 自建群聊并下达首条任务（房间即群聊 §manager 建房）。 */
 export const CORE_TOOL_CREATE_GROUP = "create_group_window";
 /** group：拉其他已启用 worker 进本群（成员变化走既有撤权/重建链）。 */
 export const CORE_TOOL_INVITE = "invite_to_group";
+const GOAL_ACTIVE_TOOLS = [CORE_TOOL_UPDATE_WORK_STATE, CORE_TOOL_REQUEST_DECISION, CORE_TOOL_UPDATE_WORK_PLAN, CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM, CORE_TOOL_REVIEW_WORK_ITEM] as const;
+const GOAL_CONTROLLED_TOOLS = [CORE_TOOL_CREATE_GOAL, ...GOAL_ACTIVE_TOOLS] as const;
 
 /** manager Session 的窗口上下文（装配时解析，工具执行期按需重读）。 */
 export interface ManagerWindowContext {
@@ -99,10 +108,19 @@ export async function planManagerTools(
 		CORE_TOOL_SEARCH,
 		CORE_TOOL_UPDATE_WORK_STATE,
 		CORE_TOOL_REQUEST_DECISION,
+		CORE_TOOL_CREATE_GOAL,
+		CORE_TOOL_UPDATE_WORK_PLAN,
+		CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM,
+		CORE_TOOL_REVIEW_WORK_ITEM,
+		CORE_TOOL_READ_DELEGATION_RESULT,
 		CORE_TOOL_CREATE_GROUP,
 		CORE_TOOL_INVITE,
 	]);
-	const active = new Set<string>([CORE_TOOL_SEARCH, CORE_TOOL_UPDATE_WORK_STATE, CORE_TOOL_REQUEST_DECISION]);
+	const active = new Set<string>([
+		CORE_TOOL_SEARCH,
+		CORE_TOOL_READ_DELEGATION_RESULT,
+	]);
+	if (!ctx || ctx.type !== "direct") active.add(CORE_TOOL_CREATE_GOAL);
 	// 窗口专属 core 工具：建房仅 solo，拉人仅 group（execute 内还有第二道门禁）。
 	if (solo) active.add(CORE_TOOL_CREATE_GROUP);
 	if (ctx?.type === "group") active.add(CORE_TOOL_INVITE);
@@ -137,6 +155,8 @@ export interface ManagerExtensionDeps {
 	catalog: ExtensionCatalog;
 	workStates?: WorkStateStore;
 	artifacts?: ArtifactStore;
+	largeResults?: LargeWorkerResultStore;
+	productSettings?: ProductSettingsStore;
 	/** 可变绑定：createAgentSession 内部生成 session id，工具执行期惰性读取。 */
 	getSessionId: () => string;
 	/** 装配时的窗口上下文（描述文案用；执行期一律经 resolveContext 重读）。 */
@@ -200,6 +220,7 @@ const SearchParams = Type.Object({
 });
 
 const UpdateWorkStateParams = Type.Object({
+	goalId: Type.String({ description: "系统提示中当前 Goal 的 goalId；用于阻止旧 Goal 的迟到调用。" }),
 	revision: Type.Integer({ minimum: 0, description: "系统提示中当前工作状态的 revision。" }),
 	currentBrief: Type.Optional(Type.String({ description: "截至目前已确认的事实、结果与进展摘要。" })),
 	waitingOn: Type.Optional(Type.String({ description: "当前具体在等待谁或什么；空字符串表示清除。" })),
@@ -207,15 +228,71 @@ const UpdateWorkStateParams = Type.Object({
 	status: Type.Optional(
 		Type.Union([
 			Type.Literal("active"),
-			Type.Literal("waiting_human"),
 			Type.Literal("resolved"),
 			Type.Literal("cancelled"),
 		]),
 	),
 	artifactIds: Type.Optional(Type.Array(Type.String(), { description: "支撑当前结论的稳定 Artifact ID。" })),
+	completionCriteria: Type.Optional(Type.Array(Type.Object({
+		criterion: Type.String({ description: "冻结 Goal 完成条件原文，必须逐条原样对应。" }),
+		status: Type.Union([Type.Literal("satisfied"), Type.Literal("unsatisfied"), Type.Literal("uncertain")]),
+		evidenceRefs: Type.Array(Type.String(), { minItems: 1, description: "至少引用一条消息、WorkItem、Delegation、Artifact 或接口证据。" }),
+		explanation: Type.String(),
+	}), { description: "manager 自审完成 Goal 时必填；逐条记录条件、证据与结论。" })),
+});
+
+const CreateGoalParams = Type.Object({
+	goal: Type.String({ description: "用户已经明确表达、需要持续追踪的目标。" }),
+	completionBoundary: Type.String({ description: "仅把用户已表达的完成语义规范化为逐行条件，不得增加新标准。" }),
+	completionReviewMode: Type.Optional(Type.Union([Type.Literal("manager"), Type.Literal("independent")])),
+	activationReason: Type.String({ description: "为何该请求需要持续执行、追踪或多 Worker 协作。" }),
+	criteriaOrigin: Type.Union([Type.Literal("user_input"), Type.Literal("manager_derived")]),
+	sourceMessageIds: Type.Array(Type.String(), { minItems: 1, description: "目标与条件所依据的用户消息 id。" }),
+});
+
+const UpdateWorkPlanParams = Type.Object({
+	goalId: Type.String({ description: "系统提示中当前 Goal 的 goalId。" }),
+	expectedRevision: Type.Integer({ minimum: 0 }),
+	title: Type.Optional(Type.String()),
+	upsertItems: Type.Array(Type.Object({
+		id: Type.Optional(Type.String()),
+		title: Type.String(),
+		description: Type.Optional(Type.String()),
+		assignedAgentId: Type.Optional(Type.String()),
+		dependsOn: Type.Optional(Type.Array(Type.String())),
+		acceptanceCriteria: Type.Array(Type.String(), { minItems: 1 }),
+		sourceGoalCriteria: Type.Optional(Type.Array(Type.String())),
+	})),
+	removeItemIds: Type.Optional(Type.Array(Type.String())),
+	cancelItemIds: Type.Optional(Type.Array(Type.String(), { description: "保留审计历史但取消的 WorkItem；活动委托必须先中断，非取消项不能继续依赖它。" })),
+	reopenItemIds: Type.Optional(Type.Array(Type.String(), { description: "阻塞原因已解除后，把 blocked WorkItem 重新置为 revision 以便新 attempt。" })),
+	reason: Type.String(),
+});
+
+const ReviewWorkItemParams = Type.Object({
+	goalId: Type.String({ description: "系统提示中当前 Goal 的 goalId。" }),
+	workItemId: Type.String(),
+	expectedRevision: Type.Integer({ minimum: 0 }),
+	verdict: Type.Union([Type.Literal("accepted"), Type.Literal("revision"), Type.Literal("blocked")]),
+	summary: Type.String(),
+	evidenceRefs: Type.Optional(Type.Array(Type.String())),
+});
+const AdvanceManagerWorkItemParams = Type.Object({
+	goalId: Type.String({ description: "系统提示中当前 Goal 的 goalId。" }),
+	workItemId: Type.String({ description: "assignedAgentId=manager 的 WorkItem id。" }),
+	expectedRevision: Type.Integer({ minimum: 0 }),
+	status: Type.Union([Type.Literal("in_progress"), Type.Literal("submitted")]),
+	summary: Type.Optional(Type.String({ description: "submitted 时必填，说明 Manager 已完成的交付。" })),
+	evidenceRefs: Type.Optional(Type.Array(Type.String(), { description: "submitted 时引用的消息、Delegation、Artifact 或接口证据。" })),
+});
+const ReadDelegationResultParams = Type.Object({
+	delegationId: Type.String(),
+	offset: Type.Optional(Type.Integer({ minimum: 0, description: "字符偏移，默认 0。" })),
+	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 160_000, description: "本次读取字符数；省略时使用 Harness 设置。" })),
 });
 
 const RequestDecisionParams = Type.Object({
+	goalId: Type.String({ description: "系统提示中当前 Goal 的 goalId。" }),
 	revision: Type.Integer({ minimum: 0, description: "系统提示中当前工作状态的 revision。" }),
 	question: Type.String({ description: "必须由人类作出的业务决定。" }),
 	context: Type.String({ description: "做决定所需的最小充分背景。" }),
@@ -304,6 +381,7 @@ export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowCon
 
 function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => void {
 	return (pi) => {
+		let latestUserSourceIds = new Set<string>();
 		// Work state is request-scoped rather than a sticky system-prompt
 		// override. pi's sendCustomMessage(triggerTurn) starts an agent turn
 		// without emitting before_agent_start; keeping Goal state only in that
@@ -312,24 +390,71 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 		// request, including custom-message turns, and its injected message is
 		// not persisted into the conversation history.
 		pi.on("context", async (event) => {
-			const workState = deps.workStates ? await deps.workStates.get(deps.getSessionId()) : undefined;
+			// display:false custom entries are UI/audit projections persisted in the
+			// Session JSONL (for example pudding:task_assign while a delegate tool is
+			// still running). pi's default convertToLlm maps every custom message to a
+			// user message, even hidden ones. Keeping such an entry between an
+			// assistant toolCall and its toolResult breaks OpenAI-compatible provider
+			// ordering (`role=tool` must immediately answer `tool_calls`). Hidden
+			// projections are not model facts; authoritative Goal state is injected
+			// below on every request, so remove them before provider conversion.
+			const modelMessages = event.messages.filter((message) =>
+				message.role !== "custom" || !("display" in message) || message.display !== false,
+			);
+			const workState = deps.workStates ? await deps.workStates.getActive(deps.getSessionId()) : undefined;
+			const latestGoal = workState ?? (deps.workStates ? await deps.workStates.get(deps.getSessionId()) : undefined);
+			const contextWindow = await deps.resolveContext();
+			const goalActivation = contextWindow && deps.productSettings
+				? (await deps.productSettings.get()).harness.goalActivation
+				: undefined;
+			const activeWithoutGoalControls = pi.getActiveTools().filter((name) => !(GOAL_CONTROLLED_TOOLS as readonly string[]).includes(name));
+			const controlled = workState
+				? GOAL_ACTIVE_TOOLS
+				: contextWindow && contextWindow.type !== "direct" && (goalActivation?.[contextWindow.type] ?? "manager_explicit") === "manager_explicit"
+					? [CORE_TOOL_CREATE_GOAL]
+					: [];
+			pi.setActiveTools([...new Set([...activeWithoutGoalControls, ...controlled])]);
+			const sourceMessageIds = modelMessages
+				.filter((message) => message.role === "user")
+				.slice(-5)
+				.map((message, index) => {
+					const timestamp = "timestamp" in message && typeof message.timestamp === "number" ? message.timestamp : index;
+					return `user:${timestamp}`;
+				});
+			latestUserSourceIds = new Set(sourceMessageIds);
+			const planLines = workState?.plan
+				? Object.values(workState.plan.items)
+					.filter((item) => item.status !== "accepted" && item.status !== "cancelled")
+					.slice(0, 24)
+					.map((item) => {
+						const submission = item.submissions.at(-1);
+						return `- ${item.id} [${item.status}] dependsOn=${item.dependsOn.join(",") || "无"} active=${item.activeDelegationId ?? "无"}${submission?.summary ? `｜最近提交：${truncate(submission.summary).slice(0, 500)}` : ""}`;
+					})
+				: [];
 			const workSection = workState
 				? [
 						"[PuddingTeams 当前工作上下文]",
 						"当前 Session 是一个需要持续负责的 Goal。manager 是唯一可更新当前工作状态的责任主体。",
+						"先判断本轮用户意图是否属于当前 Goal：相关追问、补充或约束变更才继续当前 Goal；无关的一次性问答正常回答且不得改写 Goal；若用户提出另一个需要持续执行的目标，不得静默覆盖当前 Goal，当前 Goal 未结束时先请用户选择继续、结束或另开 Session。Goal 终态后可在同一 Session 创建新的 Goal，旧 Goal 保留为历史。",
 						`目标：${workState.goal}`,
 						`完成边界：${workState.completionBoundary}`,
 						`完成复核：${workState.reviewMode === "independent" ? `独立 reviewer${workState.reviewerModel ? `（${workState.reviewerModel}）` : "（自动选择模型）"}` : "manager 自审"}`,
-						`状态：${workState.status}｜revision：${workState.revision}`,
+						`状态：${workState.status}/${workState.execution.status}｜goalId：${workState.goalId}｜revision：${workState.revision}｜epoch：${workState.execution.epoch}`,
 						`当前摘要：${workState.currentBrief || "（尚未记录）"}`,
 						`等待：${workState.waitingOn || "无"}`,
 						`下一步：${workState.nextAction || "尚未记录"}`,
-						`每次取得实质进展后调用 ${CORE_TOOL_UPDATE_WORK_STATE}；只有完成边界已满足且证据充分时才提交 status=resolved。独立复核 Goal 会在提交后启动隔离 reviewer，未通过时按 gaps 继续工作。遇到产品/业务取舍时调用 ${CORE_TOOL_REQUEST_DECISION}，不要把它伪装成 Connector 权限审批。`,
+						`冻结条件引用：${goalCriterionRefs(workState).map((item) => `${item.id}=${item.text}`).join("；")}`,
+						...(workState.plan ? [`Manager WorkPlan（覆盖 Goal r${workState.plan.coveredGoalRevision}${workState.plan.needsReconcile ? "，必须先对账当前 Goal 契约" : ""}）：\n${planLines.join("\n") || "（全部已验收）"}`] : ["Manager WorkPlan：尚未建立。多步骤、依赖或多 Worker 任务先调用 update_work_plan。"]),
+						`Goal 状态写操作必须串行：一次只调用一个 ${CORE_TOOL_UPDATE_WORK_PLAN}/${CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM}/${CORE_TOOL_REVIEW_WORK_ITEM}/${CORE_TOOL_UPDATE_WORK_STATE}，拿到新 revision 后再调用下一个，禁止在同一轮并行提交多个写操作。`,
+						`assignedAgentId=manager 的 WorkItem 开始时调用 ${CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM} 标记 in_progress，完成交付后再标记 submitted，然后调用 ${CORE_TOOL_REVIEW_WORK_ITEM} 验收；不得删除 Manager 工作项绕过提交和验收。worker 委托完成只代表 submitted，同样必须明确验收。`,
+						`只有完成边界已满足且证据充分时才提交 status=resolved。manager 自审必须在 completionCriteria 中逐条原样回填全部冻结条件、证据和 satisfied 结论；独立复核 Goal 会启动隔离 reviewer。上游限流由 Runtime 在同一 Delegation/Session 内冷却续跑，不要因 429 立即重新委托。遇到产品/业务取舍时调用 ${CORE_TOOL_REQUEST_DECISION}。`,
 					].join("\n")
-				: `[PuddingTeams 当前工作上下文]\n当前 Session 尚未设置 Goal；不要调用 ${CORE_TOOL_UPDATE_WORK_STATE} 或 ${CORE_TOOL_REQUEST_DECISION}。`;
+				: contextWindow && goalActivation?.[contextWindow.type] === "manager_explicit"
+					? `[PuddingTeams 当前工作上下文]\n当前 Session 没有正在进行的 Goal。${latestGoal ? `最近结束的 Goal（${latestGoal.status}）：${latestGoal.goal}\n最终摘要：${latestGoal.currentBrief || "（尚未记录）"}\n用户若在追问其结果，基于同一 Session 上下文正常回答；若提出新的持续工作，创建新的 Goal，不得改写历史 Goal。` : ""}仅当用户已明确给出需要持续执行的结果与可判定完成边界时调用 ${CORE_TOOL_CREATE_GOAL}；问候、闲聊、一次性解释不创建，边界含糊${goalActivation.confirmWhenAmbiguous ? "先询问" : "时保持普通会话，除非用户补充明确边界"}。创建时 sourceMessageIds 只能从这些最近用户消息引用中选择：${sourceMessageIds.join("、") || "（当前请求无可引用消息）"}。不要调用其他 Goal 工具。`
+					: `[PuddingTeams 当前工作上下文]\n当前 Session 尚未设置 Goal，且 Harness 的 ${contextWindow?.type ?? "unknown"} 策略不允许 Manager 自动创建。保持普通会话；用户可通过 /goal/UI 显式创建（disabled 时界面请求也会被服务端拒绝）。不要调用 Goal 工具。`;
 			return {
 				messages: [
-					...event.messages,
+					...modelMessages,
 					{
 						role: "custom" as const,
 						customType: "pudding:work_state_context",
@@ -401,23 +526,150 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 		});
 
 		pi.registerTool({
+			name: CORE_TOOL_READ_DELEGATION_RESULT,
+			label: "Read Delegation Result",
+			description: "分页读取当前 manager Session 所拥有 Delegation 的完整归一化结果。超长结果不会只剩预览。",
+			parameters: ReadDelegationResultParams,
+			async execute(_toolCallId, params: Static<typeof ReadDelegationResultParams>) {
+				const delegations = await deps.invoker.delegationsForManagerSession(deps.getSessionId());
+				const delegation = delegations.find((item) => item.id === params.delegationId);
+				if (!delegation) throw new Error("delegationId 不属于当前 manager Session");
+				const offset = params.offset ?? 0;
+				const configured = deps.productSettings ? (await deps.productSettings.get()).harness.workerResults.readChunkTokens * 4 : 32_000;
+				const limit = params.limit ?? configured;
+				let result: { content: string; offset: number; nextOffset?: number; totalChars: number };
+				try {
+					if (!deps.largeResults) throw new Error("large result store disabled");
+					result = await deps.largeResults.read(params.delegationId, offset, limit);
+				} catch {
+					const content = delegation.result?.status === "completed" ? delegation.result.content : "";
+					if (!content) throw new Error("该 Delegation 没有可读取的 completed 结果");
+					const chunk = content.slice(offset, offset + limit);
+					const next = offset + chunk.length;
+					result = { content: chunk, offset, ...(next < content.length ? { nextOffset: next } : {}), totalChars: content.length };
+				}
+				return {
+					content: [{ type: "text", text: result.content + (result.nextOffset === undefined ? "\n\n（已到结果末尾）" : `\n\n（nextOffset=${result.nextOffset}，totalChars=${result.totalChars}）`) }],
+					details: { delegationId: params.delegationId, ...result },
+				};
+			},
+		});
+
+		pi.registerTool({
+			name: CORE_TOOL_CREATE_GOAL,
+			label: "Create Session Goal",
+			description: "把目标明确、需要持续执行或多 Worker 协作的请求显式设为 Goal。只能规范化用户已表达的完成条件；含糊时先询问。",
+			parameters: CreateGoalParams,
+			async execute(toolCallId, params: Static<typeof CreateGoalParams>) {
+				if (!deps.workStates) throw new Error("Session Work State 未启用");
+				const sessionId = deps.getSessionId();
+				const ctx = await deps.resolveContext();
+				if (!ctx || ctx.type === "direct") throw new Error("direct Session 只能由用户通过 /goal 创建 Goal");
+				const activation = deps.productSettings ? (await deps.productSettings.get()).harness.goalActivation[ctx.type] : "manager_explicit";
+				if (activation !== "manager_explicit") throw new Error(`当前 Harness goalActivation.${ctx.type}=${activation}，Manager 无权自动创建 Goal`);
+				const invalidSources = params.sourceMessageIds.filter((id) => !latestUserSourceIds.has(id));
+				if (invalidSources.length) throw new Error(`sourceMessageIds 不是当前上下文中的真实用户消息引用：${invalidSources.join("、")}`);
+				const state = await deps.workStates.create({
+					sessionId,
+					goal: params.goal,
+					completionBoundary: params.completionBoundary,
+					reviewMode: params.completionReviewMode,
+					participantAgentIds: ctx.members,
+					contractProvenance: {
+						criteriaOrigin: params.criteriaOrigin,
+						sourceMessageIds: params.sourceMessageIds,
+						...(params.criteriaOrigin === "manager_derived" ? { authoredByAgentId: "manager" } : {}),
+					},
+					operationId: toolCallId,
+				});
+				const active = pi.getActiveTools().filter((name) => !(GOAL_CONTROLLED_TOOLS as readonly string[]).includes(name));
+				pi.setActiveTools([...new Set([...active, ...GOAL_ACTIVE_TOOLS])]);
+				return {
+					content: [{ type: "text", text: `已创建 Session Goal（goalId ${state.goalId}，revision ${state.revision}，epoch ${state.execution.epoch}）。后续多步骤工作先建立 WorkPlan。` }],
+					details: { workState: state, activationReason: params.activationReason },
+				};
+			},
+		});
+
+		pi.registerTool({
+			name: CORE_TOOL_UPDATE_WORK_PLAN,
+			label: "Update Work Plan",
+			description: "创建或更新当前 Goal 的 WorkItem DAG。验收条件只能从冻结 Goal 条件、步骤产物和下游依赖派生。",
+			parameters: UpdateWorkPlanParams,
+			async execute(toolCallId, params: Static<typeof UpdateWorkPlanParams>) {
+				if (!deps.workStates) throw new Error("Session Work State 未启用");
+				const state = await deps.workStates.updatePlan(
+					deps.getSessionId(),
+					params.expectedRevision,
+					{
+						title: params.title,
+						upsertItems: params.upsertItems.map((item) => ({ ...item, dependsOn: item.dependsOn ?? [], sourceGoalCriteria: item.sourceGoalCriteria ?? [] })),
+						removeItemIds: params.removeItemIds,
+						cancelItemIds: params.cancelItemIds,
+						reopenItemIds: params.reopenItemIds,
+						reason: params.reason,
+					},
+					toolCallId,
+					undefined,
+					params.goalId,
+				);
+				return { content: [{ type: "text", text: `WorkPlan 已更新（${Object.keys(state.plan?.items ?? {}).length} 项，revision ${state.revision}）。` }], details: { workState: state } };
+			},
+		});
+
+		pi.registerTool({
+			name: CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM,
+			label: "Advance Manager Work Item",
+			description: "推进 Manager 自己负责的 WorkItem：开始时置为 in_progress，交付完成后生成正式 Submission。不能用于 worker 工作项。",
+			parameters: AdvanceManagerWorkItemParams,
+			async execute(toolCallId, params: Static<typeof AdvanceManagerWorkItemParams>) {
+				if (!deps.workStates) throw new Error("Session Work State 未启用");
+				const state = await deps.workStates.advanceManagerWorkItem(
+					deps.getSessionId(), params.workItemId, params.expectedRevision,
+					{ status: params.status, summary: params.summary, evidenceRefs: params.evidenceRefs },
+					toolCallId, undefined, params.goalId,
+				);
+				return { content: [{ type: "text", text: params.status === "in_progress" ? `Manager 已开始 WorkItem ${params.workItemId}（revision ${state.revision}）。` : `Manager 已提交 WorkItem ${params.workItemId}，现在可以验收（revision ${state.revision}）。` }], details: { workState: state } };
+			},
+		});
+
+		pi.registerTool({
+			name: CORE_TOOL_REVIEW_WORK_ITEM,
+			label: "Review Work Item",
+			description: "验收最新 Submission。accepted 才会解锁依赖；revision/blocked 不会完成 Goal。",
+			parameters: ReviewWorkItemParams,
+			async execute(toolCallId, params: Static<typeof ReviewWorkItemParams>) {
+				if (!deps.workStates) throw new Error("Session Work State 未启用");
+				const state = await deps.workStates.reviewWorkItem(
+					deps.getSessionId(), params.workItemId, params.expectedRevision,
+					{ verdict: params.verdict, summary: params.summary, evidenceRefs: params.evidenceRefs },
+					toolCallId,
+					undefined,
+					params.goalId,
+				);
+				return { content: [{ type: "text", text: `WorkItem ${params.workItemId} 已标记为 ${params.verdict}（revision ${state.revision}）。` }], details: { workState: state } };
+			},
+		});
+
+		pi.registerTool({
 			name: CORE_TOOL_UPDATE_WORK_STATE,
 			label: "Update Session Work State",
 			description: "更新当前 Goal 的权威工作摘要、等待项、下一步和完成状态；使用 revision 做乐观并发控制。",
 			parameters: UpdateWorkStateParams,
-			async execute(_toolCallId, params: Static<typeof UpdateWorkStateParams>) {
+			async execute(toolCallId, params: Static<typeof UpdateWorkStateParams>) {
 				if (!deps.workStates) throw new Error("Session Work State 未启用");
 				try {
-					const { revision, ...patch } = params;
+					const { goalId, revision, completionCriteria, ...patch } = params;
 					if (patch.status === "resolved") {
 						const sessionId = deps.getSessionId();
-						const current = await deps.workStates.get(sessionId);
+						const current = await deps.workStates.getActive(sessionId);
 						if (!current) throw new Error("Session Goal 不存在");
+						if (current.goalId !== goalId) throw new Error("当前 Goal 已变化，请重新读取目标状态后再提交。");
 						if (current.revision !== revision) throw new WorkStateConflictError(current);
-						const delegations = await deps.invoker.delegationsForManagerSession(sessionId);
+						const delegations = (await deps.invoker.delegationsForManagerSession(sessionId)).filter((item) => item.goalId === current.goalId);
 						const active = delegations.filter((item) => item.status === "running" || item.status === "waiting_input");
 						if (active.length > 0) throw new Error(`仍有 ${active.length} 个委托正在执行或等待输入，不能完成 Goal`);
-						const pendingDecisions = (await deps.workStates.listDecisions(sessionId)).filter((item) => item.status === "pending");
+						const pendingDecisions = (await deps.workStates.listDecisions(sessionId, current.goalId)).filter((item) => item.status === "pending");
 						if (pendingDecisions.length > 0) throw new Error(`仍有 ${pendingDecisions.length} 个待回答的人类决策，不能完成 Goal`);
 
 						if (current.reviewMode === "independent") {
@@ -455,7 +707,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 										producer: item.producer,
 										delegationId: item.delegationId,
 									})),
-									humanDecisions: (await deps.workStates.listDecisions(sessionId))
+									humanDecisions: (await deps.workStates.listDecisions(sessionId, current.goalId))
 										.filter((item) => item.status === "answered")
 										.map((item) => ({ id: item.id, question: item.question, answer: item.answer, authorizationScope: item.grantedAuthorizationScope })),
 									managerEvidence: [],
@@ -466,7 +718,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 								currentBrief,
 								artifactIds: patch.artifactIds,
 								review,
-							});
+							}, `completion-review:${toolCallId}`, current.execution.epoch, goalId);
 							const text = review.verdict === "satisfied"
 								? `独立复核通过，Goal 已完成（revision ${state.revision}）。`
 								: review.verdict === "needs_human"
@@ -474,8 +726,16 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 									: `独立复核未通过，Goal 保持 active。缺口：${review.gaps.join("；") || "见逐项复核结果"}`;
 							return { content: [{ type: "text", text }], details: { workState: state, completionReview: review } as Record<string, unknown> };
 						}
+						if (!completionCriteria) throw new Error("manager 自审完成 Goal 时必须逐条填写 completionCriteria");
+						const state = await deps.workStates.applyManagerCompletion(sessionId, revision, {
+							currentBrief: patch.currentBrief?.trim() || current.currentBrief,
+							artifactIds: patch.artifactIds,
+							criteria: completionCriteria,
+						}, `manager-completion:${toolCallId}`, current.execution.epoch, goalId);
+						return { content: [{ type: "text", text: `Manager 已逐项复核全部完成条件，Goal 已完成（revision ${state.revision}）。` }], details: { workState: state, completionReview: state.completionReviews.at(-1) } as Record<string, unknown> };
 					}
-					const state = await deps.workStates.update(deps.getSessionId(), revision, patch);
+					if (completionCriteria) throw new Error("completionCriteria 仅在 status=resolved 的 manager 自审中使用");
+					const state = await deps.workStates.update(deps.getSessionId(), revision, patch, toolCallId, undefined, goalId);
 					return {
 						content: [{ type: "text", text: `当前工作已更新（${state.status}，revision ${state.revision}）。` }],
 						details: { workState: state } as Record<string, unknown>,
@@ -494,7 +754,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 			label: "Request Human Decision",
 			description: "创建业务级人类决策请求并暂停当前 Goal；它不替代 Connector 的 permission/confirmation 审批。",
 			parameters: RequestDecisionParams,
-			async execute(_toolCallId, params: Static<typeof RequestDecisionParams>) {
+			async execute(toolCallId, params: Static<typeof RequestDecisionParams>) {
 				if (!deps.workStates) throw new Error("Session Work State 未启用");
 				const sessionId = deps.getSessionId();
 				const decision = await deps.workStates.createDecision({
@@ -506,16 +766,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 					blockedAction: params.blockedAction,
 					resumeHint: params.resumeHint,
 					authorizationScope: params.authorizationScope,
-				});
-				try {
-					await deps.workStates.update(sessionId, params.revision, {
-						status: "waiting_human",
-						waitingOn: params.question,
-						nextAction: params.resumeHint,
-					});
-				} catch (err) {
-					if (!(err instanceof WorkStateConflictError)) throw err;
-				}
+				}, toolCallId, params.revision, params.goalId);
 				return {
 					content: [{ type: "text", text: `已创建人类决策请求：${decision.question}。等待回答，不要执行被阻塞动作。` }],
 					details: { decision },
@@ -646,6 +897,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 const DelegateParams = Type.Object(
 	{
 		task: Type.String({ description: "委托给该 worker 的任务。" }),
+		workItemId: Type.Optional(Type.String({ description: "当前 Goal WorkPlan 中要推进的 WorkItem id。" })),
 		parentDelegationId: Type.Optional(
 			Type.String({ description: "若这是接力/追问，填写上一次委托返回文本中给出的 delegationId。" }),
 		),
@@ -782,7 +1034,13 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 			parameters: DelegateParams,
 			async execute(toolCallId, params: DelegateInput, signal, onUpdate) {
 				const sessionId = deps.getSessionId();
-				const goal = deps.workStates ? await deps.workStates.get(sessionId) : undefined;
+				const goal = deps.workStates ? await deps.workStates.getActive(sessionId) : undefined;
+				if (params.workItemId && !goal?.plan?.items[params.workItemId]) throw new Error("workItemId 不属于当前 Goal WorkPlan");
+				if (goal?.plan && !params.workItemId) throw new Error("当前 Goal 已有 WorkPlan，委托必须绑定 workItemId");
+				const workItem = params.workItemId ? goal?.plan?.items[params.workItemId] : undefined;
+				if (workItem && !["ready", "revision", "in_progress"].includes(workItem.status)) {
+					throw new Error(`WorkItem ${workItem.id} 当前状态 ${workItem.status}，依赖尚未验收或正在等待处理`);
+				}
 				if (goal && (!params.intent?.trim() || !params.expectedOutcome?.trim() || !params.completionBoundary?.trim())) {
 					throw new Error("Goal Session 的委托必须声明 intent、expectedOutcome 与 completionBoundary，避免无因果派活。");
 				}
@@ -823,12 +1081,18 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 				}
 				let mirroredDelegation = false;
 				let mirroredProcess = false;
+				let projectedRunning = false;
 				const scoped = new ScopedAgentInvoker(agent.name, deps.invoker);
 				const result = await scoped.delegate({
 					message: params.task,
 					windowId: targetWindow?.id ?? "",
 					managerSessionId: sessionId,
 					managerToolCallId: taskId,
+					goalId: goal?.goalId,
+					workPlanId: goal?.plan?.id,
+					workItemId: params.workItemId,
+					attempt: workItem ? workItem.delegationIds.length + 1 : undefined,
+					goalEpoch: goal?.execution.epoch,
 					parentDelegationId: params.parentDelegationId,
 					handoffKind: params.handoffKind ?? (params.parentDelegationId ? "followup" : "request"),
 					intent: params.intent,
@@ -839,18 +1103,53 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 					signal,
 					onUpdate: (content, details) => {
 						const updateDetails = details as { delegationId?: string; sessionHandle?: string } | undefined;
+						if (!projectedRunning && params.workItemId && goal && updateDetails?.delegationId && deps.workStates) {
+							projectedRunning = true;
+							void deps.workStates.noteDelegation(sessionId, {
+								goalId: goal.goalId,
+								workItemId: params.workItemId,
+								delegationId: updateDetails.delegationId,
+								delegationStatus: "running",
+								goalEpoch: goal.execution.epoch,
+							}, `delegation-created:${updateDetails.delegationId}`).catch(() => undefined);
+						}
 						const processView = true;
-						onUpdate?.({ content: [{ type: "text", text: content }], details: { processView, ...updateDetails } });
+						onUpdate?.({ content: [{ type: "text", text: content }], details: { processView, ...(goal ? { goalId: goal.goalId } : {}), ...updateDetails } });
 						if (!targetWindow || !updateDetails?.delegationId) return;
 						const addsProcess = processView && Boolean(updateDetails.sessionHandle);
 						if (mirroredDelegation && (!addsProcess || mirroredProcess)) return;
 						mirroredDelegation = true;
 						if (addsProcess) mirroredProcess = true;
-						void announceToWindow(deps, targetWindow, taskId, agent.name, params.task, {
+						const runningDetails = {
 							delegationId: updateDetails.delegationId,
+							...(goal ? { goalId: goal.goalId } : {}),
+							...(params.workItemId ? { workItemId: params.workItemId } : {}),
 							...(updateDetails.sessionHandle ? { sessionHandle: updateDetails.sessionHandle } : {}),
 							processView,
-						}, isSoloContext ? "solo" : "group");
+						};
+						void announceToWindow(
+							deps,
+							targetWindow,
+							taskId,
+							agent.name,
+							params.task,
+							runningDetails,
+							isSoloContext ? "solo" : "group",
+						);
+						if (isSoloContext) {
+							// The visible mirror belongs to the worker direct window, but the
+							// originating solo manager tool card also needs durable process
+							// metadata so a session switch does not erase its drawer entry.
+							void appendManagerRunningProjection(
+								deps,
+								sessionId,
+								targetWindow.id,
+								taskId,
+								agent.name,
+								params.task,
+								runningDetails,
+							);
+						}
 					},
 				});
 
@@ -862,8 +1161,36 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 					// 执行过程入口：pi 展示完整会话，spawn worker 展示追加式时间线。
 					sessionHandle: result.sessionHandle,
 					processView: true,
+					goalId: goal?.goalId,
+					workPlanId: goal?.plan?.id,
+					workItemId: params.workItemId,
+					goalEpoch: goal?.execution.epoch,
 				};
 				const picked = result.details;
+				if (params.workItemId && goal && result.delegationId && deps.workStates) {
+					const boundaryStatus = result.status === "needs_input" || result.status === "conflict"
+						? "waiting_input"
+						: result.status === "completed"
+							? "completed"
+							: "failed";
+					try {
+						await deps.workStates.noteDelegation(sessionId, {
+							goalId: goal.goalId,
+							workItemId: params.workItemId,
+							delegationId: result.delegationId,
+							delegationStatus: boundaryStatus,
+							goalEpoch: goal.execution.epoch,
+							artifactIds: (picked as { artifacts?: Array<{ id?: string }> }).artifacts?.map((item) => item.id).filter((id): id is string => Boolean(id)) ?? [],
+							summary: result.status === "completed" ? truncate(result.content).slice(0, 2_000) : undefined,
+						}, `delegation-boundary:${result.delegationId}:${boundaryStatus}`);
+					} catch (error) {
+						// An interrupt advances the Goal epoch. A late worker callback remains in
+						// Delegation history, but must neither mutate the new epoch nor turn an
+						// otherwise valid worker result into a manager tool failure.
+						if (!(error instanceof WorkStateOperationConflictError) || error.code !== "stale_goal_state") throw error;
+						deps.log?.(`ignored stale Goal epoch callback for Delegation ${result.delegationId}`);
+					}
+				}
 
 				// §4.4: mirror into the direct window's message stream. Best-effort —
 				// a busy target session yields synced:false instead of blocking.
@@ -882,7 +1209,12 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 						status,
 						text,
 						interaction,
-						{ delegationId: result.delegationId, ...extraDetails },
+						{
+							delegationId: result.delegationId,
+							sessionHandle: result.sessionHandle,
+							processView: true,
+							...extraDetails,
+						},
 					);
 					void refreshSoloSummary();
 					return ok;
@@ -929,7 +1261,17 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 					throw new Error(text);
 				}
 
-				const text = truncate(result.content);
+				const projection = result.delegationId && deps.largeResults && deps.productSettings
+					? await deps.largeResults.project(result.delegationId, result.content, (await deps.productSettings.get()).harness.workerResults)
+					: {
+							text: truncate(result.content),
+							offloaded: result.content.length > MAX_RESULT_CHARS,
+							originalChars: result.content.length,
+							estimatedTokens: Math.ceil(result.content.length / 4),
+							delegationId: result.delegationId ?? "",
+							estimation: "ceil(chars/4)" as const,
+						};
+				const text = projection.text;
 				// §15.6 接力：交付物清单附在结果文本末尾（传路径不传内容），
 				// details 里已有结构化 artifacts（invoker 投影），供 manager 在
 				// 接力任务文本中按路径引用。
@@ -942,10 +1284,10 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 				const delegationNote = result.delegationId
 					? `\n\n（delegationId：${result.delegationId}——需要该 worker 接力/追问时，用 handoffKind="followup" 并把它填进 parentDelegationId）`
 					: "";
-				const extra = await soloMeta(result.status, result.content, undefined, picked.usage ? { usage: picked.usage } : undefined);
+				const extra = await soloMeta(result.status, projection.text, undefined, picked.usage ? { usage: picked.usage } : undefined);
 				return {
 					content: [{ type: "text", text: `${text}${artifactNote}${delegationNote}${syncNote(extra.synced as boolean | undefined)}` }],
-					details: { ...meta, ...picked, ...extra },
+					details: { ...meta, ...picked, ...extra, largeResult: projection },
 				};
 			},
 		});
@@ -982,6 +1324,34 @@ async function announceToWindow(
 		await deps.sessions.ensureSessionFile(activeSession);
 	} catch {
 		// best-effort：镜像失败不影响派活
+	}
+}
+
+/** Persist the solo manager's own running delegate projection without adding a second card. */
+async function appendManagerRunningProjection(
+	deps: Pick<ManagerExtensionDeps, "sessions">,
+	managerSessionId: string,
+	targetWindowId: string,
+	taskId: string,
+	workerName: string,
+	task: string,
+	extraDetails: Record<string, unknown>,
+): Promise<void> {
+	try {
+		await deps.sessions.appendCustomMessageProjection(managerSessionId, {
+			customType: "pudding:task_assign",
+			content: task,
+			details: {
+				taskId,
+				worker: workerName,
+				windowId: targetWindowId,
+				from: "solo",
+				status: "running",
+				...extraDetails,
+			},
+		});
+	} catch {
+		// Recovery metadata is best-effort and must never fail the worker run.
 	}
 }
 

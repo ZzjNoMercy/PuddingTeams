@@ -12,6 +12,12 @@ export interface DelegationRecord {
 	cwdSnapshot: string;
 	managerSessionId: string;
 	managerToolCallId?: string;
+	goalId?: string;
+	workPlanId?: string;
+	workItemId?: string;
+	attempt?: number;
+	/** Goal execution epoch captured when this immutable Run is created. */
+	goalEpoch?: number;
 	/** Optional causal edge to an earlier delegation in the same manager Session. */
 	parentDelegationId?: string;
 	handoffKind?: "request" | "followup";
@@ -46,6 +52,8 @@ export interface InteractionRecord {
 	providerStateRef: string;
 	/** 幂等键：已经消费的响应 request_id（重放时直接返回终态）。 */
 	consumedRequestId?: string;
+	/** Payload hash paired with consumedRequestId; same key + different answers is a conflict. */
+	consumedPayloadHash?: string;
 	expiresAt?: string;
 	createdAt: string;
 	updatedAt: string;

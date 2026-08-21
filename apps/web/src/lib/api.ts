@@ -24,6 +24,7 @@ import type {
 	DelegationTimelineEvent,
 	DriverConfigOption,
 	SessionSummary,
+	SessionGoalSummary,
 	SkillDocument,
 	SkillEntry,
 	SkillsZipImportResult,
@@ -216,9 +217,11 @@ export async function abortSession(sessionId: string): Promise<void> {
 }
 
 /** Cancel one delegated worker Run without aborting the manager Session. */
-export async function cancelDelegation(delegationId: string): Promise<void> {
+export async function cancelDelegation(delegationId: string, expectedGoalId?: string): Promise<void> {
 	const res = await fetch(`${SERVER_URL}/api/delegations/${encodeURIComponent(delegationId)}/cancel`, {
 		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ expectedGoalId }),
 	});
 	if (!res.ok) {
 		const body = (await res.json().catch(() => null)) as { error?: string } | null;
@@ -234,6 +237,8 @@ export function sessionWsUrl(sessionId: string): string {
 
 export interface WorkerProcessInfo {
 	delegationId: string;
+	managerSessionId: string;
+	goalId?: string;
 	agentId: string;
 	status: string;
 	sessionHandle?: string;
@@ -245,7 +250,6 @@ export interface WorkerProcessInfo {
 
 export interface WorkerProcessListItem extends WorkerProcessInfo {
 	updatedAt: string;
-	managerSessionId: string;
 	task?: string;
 	intent?: string;
 	expectedOutcome?: string;
@@ -328,6 +332,44 @@ export async function setDefaultModel(provider: string, model: string): Promise<
 		body: JSON.stringify({ provider, model }),
 	});
 	if (!res.ok) throw new Error(`set default model failed: ${res.status}`);
+}
+
+export interface HarnessSettings {
+	workerResults: {
+		offloadThresholdTokens: number;
+		previewHeadTokens: number;
+		previewTailTokens: number;
+		readChunkTokens: number;
+	};
+	goalActivation: {
+		solo: "manager_explicit" | "user_explicit" | "disabled";
+		group: "manager_explicit" | "user_explicit" | "disabled";
+		direct: "user_explicit" | "disabled";
+		confirmWhenAmbiguous: boolean;
+	};
+	goalRecovery: {
+		mode: "safe_auto" | "manual";
+		directMode: "manual";
+		resumeLeaseMs: number;
+		operationRetentionDays: number;
+		maxOperationsPerSession: number;
+	};
+}
+export async function getHarnessSettings(): Promise<HarnessSettings> {
+	const res = await fetch(`${SERVER_URL}/api/settings/harness`);
+	const body = (await res.json()) as { harness?: HarnessSettings; error?: string };
+	if (!res.ok || !body.harness) throw new Error(body.error ?? "get harness settings failed");
+	return body.harness;
+}
+export async function setHarnessSettings(settings: Partial<HarnessSettings>): Promise<HarnessSettings> {
+	const res = await fetch(`${SERVER_URL}/api/settings/harness`, {
+		method: "PUT",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(settings),
+	});
+	const body = (await res.json()) as { harness?: HarnessSettings; error?: string };
+	if (!res.ok || !body.harness) throw new Error(body.error ?? "update harness settings failed");
+	return body.harness;
 }
 
 // ---- agents registry (teams.json) ----
@@ -945,22 +987,25 @@ export async function createRoomSession(
 ): Promise<SessionSummary> {
 	const res = await fetch(`${SERVER_URL}/api/rooms/${roomId}/sessions`, {
 		method: "POST",
-		headers: { "content-type": "application/json" },
+		headers: { "content-type": "application/json", ...(goal ? { "Idempotency-Key": operationKey("room-goal") } : {}) },
 		body: JSON.stringify(goal ?? {}),
 	});
 	if (!res.ok) throw new Error(`create room session failed: ${res.status}`);
 	return ((await res.json()) as { session: SessionSummary }).session;
 }
 
-export async function getSessionWorkState(sessionId: string): Promise<{
+export async function getSessionWorkState(sessionId: string, goalId?: string): Promise<{
 	workState: SessionWorkState | null;
+	activeGoalId: string | null;
+	goals: SessionGoalSummary[];
 	decisions: DecisionRequest[];
 	delegations: DelegationTrace[];
 }> {
-	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/work-state`);
-	const body = (await res.json()) as { workState?: SessionWorkState | null; decisions?: DecisionRequest[]; delegations?: DelegationTrace[]; error?: string };
+	const query = goalId ? `?goalId=${encodeURIComponent(goalId)}` : "";
+	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/work-state${query}`);
+	const body = (await res.json()) as { workState?: SessionWorkState | null; activeGoalId?: string | null; goals?: SessionGoalSummary[]; decisions?: DecisionRequest[]; delegations?: DelegationTrace[]; error?: string };
 	if (!res.ok) throw new Error(body.error ?? `get work state failed: ${res.status}`);
-	return { workState: body.workState ?? null, decisions: body.decisions ?? [], delegations: body.delegations ?? [] };
+	return { workState: body.workState ?? null, activeGoalId: body.activeGoalId ?? null, goals: body.goals ?? [], decisions: body.decisions ?? [], delegations: body.delegations ?? [] };
 }
 
 export async function putSessionWorkState(
@@ -969,7 +1014,7 @@ export async function putSessionWorkState(
 ): Promise<SessionWorkState> {
 	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/work-state`, {
 		method: "PUT",
-		headers: { "content-type": "application/json" },
+		headers: { "content-type": "application/json", "Idempotency-Key": operationKey("goal") },
 		body: JSON.stringify(input),
 	});
 	const body = (await res.json()) as { workState?: SessionWorkState; current?: SessionWorkState; error?: string };
@@ -984,12 +1029,53 @@ export async function answerDecisionRequest(
 ): Promise<DecisionRequest> {
 	const res = await fetch(`${SERVER_URL}/api/decision-requests/${decisionId}/answer`, {
 		method: "POST",
-		headers: { "content-type": "application/json" },
+		headers: { "content-type": "application/json", "Idempotency-Key": operationKey("decision") },
 		body: JSON.stringify({ answer, grantedAuthorizationScope }),
 	});
 	const body = (await res.json()) as { decision?: DecisionRequest; error?: string };
 	if (!res.ok) throw new Error(body.error ?? `answer decision failed: ${res.status}`);
 	return body.decision!;
+}
+
+function operationKey(kind: string): string {
+	return `${kind}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+}
+
+export async function reviewWorkItem(
+	sessionId: string,
+	workItemId: string,
+	input: { expectedGoalId: string; expectedRevision: number; expectedEpoch: number; verdict: "accepted" | "revision" | "blocked"; summary: string; evidenceRefs?: string[] },
+): Promise<SessionWorkState> {
+	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/work-items/${encodeURIComponent(workItemId)}/review`, {
+		method: "POST",
+		headers: { "content-type": "application/json", "Idempotency-Key": operationKey("work-item-review") },
+		body: JSON.stringify(input),
+	});
+	const body = (await res.json()) as { workState?: SessionWorkState; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `review work item failed: ${res.status}`);
+	return body.workState!;
+}
+
+export async function interruptGoal(sessionId: string, expectedGoalId: string, expectedRevision: number): Promise<SessionWorkState> {
+	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/goal/interrupt`, {
+		method: "POST",
+		headers: { "content-type": "application/json", "Idempotency-Key": operationKey("goal-interrupt") },
+		body: JSON.stringify({ expectedGoalId, expectedRevision, kind: "user" }),
+	});
+	const body = (await res.json()) as { workState?: SessionWorkState; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `interrupt goal failed: ${res.status}`);
+	return body.workState!;
+}
+
+export async function resumeGoal(sessionId: string, expectedGoalId: string, expectedRevision: number): Promise<SessionWorkState> {
+	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/goal/resume`, {
+		method: "POST",
+		headers: { "content-type": "application/json", "Idempotency-Key": operationKey("goal-resume") },
+		body: JSON.stringify({ expectedGoalId, expectedRevision, ownerId: "web-user" }),
+	});
+	const body = (await res.json()) as { workState?: SessionWorkState; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `resume goal failed: ${res.status}`);
+	return body.workState!;
 }
 
 /** Switch the active pi session of a window. */
@@ -1049,6 +1135,8 @@ export interface InteractionView {
 export interface InteractionDelegationView {
 	id: string;
 	windowId: string;
+	managerSessionId: string;
+	goalId?: string;
 	agentId: string;
 	status: string;
 	createdAt: string;
@@ -1078,6 +1166,7 @@ export async function getInteraction(
 export interface InteractionResponseSubmit {
 	requestId: string;
 	revision: number;
+	expectedGoalId?: string;
 	windowId?: string;
 	responses: Array<{ requestId: string; action: string; scope?: string }>;
 }
@@ -1100,8 +1189,8 @@ export async function submitInteractionResponse(
 }
 
 /** 取消一个 pending 审批。 */
-export async function cancelInteraction(id: string): Promise<void> {
-	const res = await fetch(`${SERVER_URL}/api/interactions/${id}/cancel`, { method: "POST" });
+export async function cancelInteraction(id: string, expectedGoalId?: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/interactions/${id}/cancel`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ expectedGoalId }) });
 	if (!res.ok) {
 		const body = (await res.json().catch(() => null)) as { error?: string } | null;
 		throw new Error(body?.error ?? `cancel interaction failed: ${res.status}`);

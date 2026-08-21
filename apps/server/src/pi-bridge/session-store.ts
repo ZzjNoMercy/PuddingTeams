@@ -36,6 +36,8 @@ import {
 	type CompletionReviewInput,
 } from "./completion-review.js";
 import type { CompletionReview } from "../store/work-state.js";
+import type { LargeWorkerResultStore } from "../store/large-worker-result.js";
+import type { ProductSettingsStore } from "../store/product-settings.js";
 
 export interface SessionSummary {
 	id: string;
@@ -95,7 +97,15 @@ export class PiSessionStore {
 	private listeners = new Map<string, Set<(event: AgentSessionEvent) => void>>();
 	/** 已挂过转发器的实例，避免重复 subscribe 导致事件翻倍。 */
 	private forwarded = new WeakSet<AgentSession>();
+	/** Serializes receiver-side eventId checks with their JSONL append. */
+	private customEventQueue: Promise<unknown> = Promise.resolve();
+	private deliveredCustomEvents = new Set<string>();
 	private unsubscribeTeams?: () => void;
+	private serializeCustomEvent<T>(fn: () => Promise<T>): Promise<T> {
+		const run = this.customEventQueue.then(fn, fn);
+		this.customEventQueue = run.then(() => undefined, () => undefined);
+		return run;
+	}
 
 	constructor(
 		private readonly cwd: string,
@@ -105,6 +115,8 @@ export class PiSessionStore {
 		catalog?: ExtensionCatalog,
 		private readonly workStates?: WorkStateStore,
 		private readonly artifacts?: ArtifactStore,
+		private readonly largeResults?: LargeWorkerResultStore,
+		private readonly productSettings?: ProductSettingsStore,
 	) {
 		this.catalog = catalog ?? new ExtensionCatalog();
 		if (this.teamsStore && this.invoker) {
@@ -190,6 +202,8 @@ export class PiSessionStore {
 				catalog: this.catalog,
 				workStates: this.workStates,
 				artifacts: this.artifacts,
+				largeResults: this.largeResults,
+				productSettings: this.productSettings,
 				getSessionId,
 				ctx,
 				resolveContext: () => this.windowContextOf(getSessionId()),
@@ -289,11 +303,14 @@ export class PiSessionStore {
 	private attachForwarder(session: AgentSession): void {
 		if (this.forwarded.has(session)) return;
 		this.forwarded.add(session);
-		session.subscribe((event) => {
-			const set = this.listeners.get(session.sessionId);
-			if (!set) return;
-			for (const listener of set) listener(event);
-		});
+		session.subscribe((event) => this.forwardEvent(session.sessionId, event));
+	}
+
+	/** Forward SDK and platform-authored projection events through the same WS bus. */
+	private forwardEvent(id: string, event: AgentSessionEvent): void {
+		const set = this.listeners.get(id);
+		if (!set) return;
+		for (const listener of set) listener(event);
 	}
 
 	/**
@@ -744,6 +761,39 @@ export class PiSessionStore {
 		return this.active.has(id);
 	}
 
+	private hasCustomEvent(session: { messages: unknown }, eventId: string): boolean {
+		return this.deliveredCustomEvents.has(eventId) || (session.messages as Array<{ role?: string; details?: unknown }>).some((entry) =>
+			entry.role === "custom" &&
+			entry.details !== null &&
+			typeof entry.details === "object" &&
+			(entry.details as { eventId?: unknown }).eventId === eventId
+		);
+	}
+
+	private async deliverCustomMessage(
+		id: string,
+		message: { customType: string; content: string; details?: Record<string, unknown> },
+		options: { triggerTurn: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+	): Promise<void> {
+		const session = await this.open(id);
+		if (!options.triggerTurn && !session.isIdle) {
+			await Promise.race([
+				session.waitForIdle(),
+				new Promise<void>((resolve) => setTimeout(resolve, CUSTOM_MESSAGE_IDLE_WAIT_MS)),
+			]).catch(() => undefined);
+		}
+		const deliverAs = options.triggerTurn
+			? (options.deliverAs ?? "followUp")
+			: session.isIdle
+				? undefined
+				: "nextTurn";
+		await session.sendCustomMessage(
+			{ customType: message.customType, content: message.content, display: true, details: message.details },
+			{ ...options, deliverAs },
+		);
+		await this.ensureSessionFile(id);
+	}
+
 	/**
 	 * Send a custom message into a manager session and optionally trigger a new
 	 * LLM turn (§6.3). Best-effort: the session may be busy streaming; failures
@@ -759,32 +809,7 @@ export class PiSessionStore {
 		options: { triggerTurn: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
 		try {
-			const session = await this.open(id);
-			// pi SDK 在 isStreaming 时无视 triggerTurn，一律 followUp/steer 把消息排进
-			// 模型队列——纯展示通知（审批卡、结果镜像）会把 manager 唤醒，产生一轮
-			// 「收到，仍在等审批」式的自问自答。triggerTurn:false 一律先等当前 run
-			// 落定再追加；有界等待后仍在跑则降级 nextTurn（不主动起轮，随下一次
-			// 用户输入进入上下文），绝不走 followUp/steer。
-			if (!options.triggerTurn && !session.isIdle) {
-				await Promise.race([
-					session.waitForIdle(),
-					new Promise<void>((resolve) => setTimeout(resolve, CUSTOM_MESSAGE_IDLE_WAIT_MS)),
-				]).catch(() => undefined);
-			}
-			const deliverAs = options.triggerTurn
-				? (options.deliverAs ?? "followUp")
-				: session.isIdle
-					? undefined
-					: "nextTurn";
-			await session.sendCustomMessage(
-				{
-					customType: message.customType,
-					content: message.content,
-					display: true,
-					details: message.details,
-				},
-				{ ...options, deliverAs },
-			);
+			await this.deliverCustomMessage(id, message, options);
 		} catch (err) {
 			this.debugLog?.(`sendCustomMessage failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
@@ -813,9 +838,67 @@ export class PiSessionStore {
 				message.details,
 			);
 			await this.ensureSessionFile(id);
+			// SessionManager direct appends do not emit AgentSession events. Mirror
+			// this hidden projection onto the store subscription bus so an already
+			// open manager page can enrich its delegate card immediately, not only
+			// after a history reload.
+			this.forwardEvent(id, {
+				type: "message_start",
+				message: {
+					role: "custom",
+					customType: message.customType,
+					content: message.content,
+					display: false,
+					details: message.details,
+					timestamp: Date.now(),
+				},
+			} as AgentSessionEvent);
 		} catch (err) {
 			this.debugLog?.(`appendCustomMessageProjection failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
+	}
+
+	/**
+	 * Outbox receiver-side dedupe. The event id lives in custom-message details,
+	 * so a crash after JSONL append but before outbox acknowledgement is safe.
+	 */
+	async appendCustomMessageIfAbsent(
+		id: string,
+		eventId: string,
+		message: { customType: string; content: string; details?: Record<string, unknown> },
+		options: { triggerTurn: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+	): Promise<boolean> {
+		return this.serializeCustomEvent(async () => {
+			const session = await this.open(id);
+			if (this.hasCustomEvent(session, eventId)) return false;
+			await this.deliverCustomMessage(id, {
+				...message,
+				details: { ...(message.details ?? {}), eventId },
+			}, options);
+			this.deliveredCustomEvents.add(eventId);
+			return true;
+		});
+	}
+
+	/** Hidden outbox projection with the same receiver-side idempotency rule. */
+	async appendCustomMessageProjectionIfAbsent(
+		id: string,
+		eventId: string,
+		message: { customType: string; content: string; details?: Record<string, unknown> },
+	): Promise<boolean> {
+		return this.serializeCustomEvent(async () => {
+			const session = await this.open(id);
+			if (this.hasCustomEvent(session, eventId)) return false;
+			session.sessionManager.appendCustomMessageEntry(
+				message.customType,
+				message.content,
+				false,
+				{ ...(message.details ?? {}), eventId },
+			);
+			await this.ensureSessionFile(id);
+			this.deliveredCustomEvents.add(eventId);
+			return true;
+		});
 	}
 
 	/**

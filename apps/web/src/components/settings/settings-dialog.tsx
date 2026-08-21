@@ -1,14 +1,15 @@
 "use client";
 
 import { useState } from "react";
-import { PaletteIcon, ServerCogIcon, XIcon } from "lucide-react";
+import { BrainCircuitIcon, PaletteIcon, ServerCogIcon, XIcon } from "lucide-react";
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { AppearanceSettings } from "./appearance-settings";
 import { ProviderSettings } from "./provider-settings";
+import { HarnessSettingsPanel } from "./harness-settings";
 
 export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
-	const [section, setSection] = useState<"appearance" | "providers">("appearance");
-	const sectionKicker = section === "appearance" ? "APPEARANCE" : "PROVIDERS";
+	const [section, setSection] = useState<"appearance" | "providers" | "harness">("appearance");
+	const sectionKicker = section === "appearance" ? "APPEARANCE" : section === "providers" ? "PROVIDERS" : "HARNESS";
 
 	return (
 		<Dialog open={open} onOpenChange={onOpenChange}>
@@ -40,6 +41,10 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
 							<PaletteIcon aria-hidden="true" />
 							<span><strong>外观</strong><small>主题与动态效果</small></span>
 						</button>
+						<button type="button" className="settings-nav-item" data-active={section === "harness" ? "true" : "false"} onClick={() => setSection("harness")}>
+							<BrainCircuitIcon aria-hidden="true" />
+							<span><strong>Harness</strong><small>上下文与恢复策略</small></span>
+						</button>
 						<button
 							type="button"
 							className="settings-nav-item"
@@ -61,7 +66,7 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
 									<AppearanceSettings />
 								</section>
 							</div>
-						) : (
+						) : section === "providers" ? (
 							<div className="settings-content-column">
 								<div className="settings-section-heading">
 									<h2 id="providers-heading">模型 Provider</h2>
@@ -70,6 +75,11 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
 								<section className="settings-card settings-provider-card" aria-labelledby="providers-heading">
 									<ProviderSettings />
 								</section>
+							</div>
+						) : (
+							<div className="settings-content-column">
+								<div className="settings-section-heading"><h2 id="harness-heading">Harness</h2><p>控制 Manager 上下文预算、Goal 激活与安全恢复。</p></div>
+								<section className="settings-card" aria-labelledby="harness-heading"><HarnessSettingsPanel /></section>
 							</div>
 						)}
 					</main>

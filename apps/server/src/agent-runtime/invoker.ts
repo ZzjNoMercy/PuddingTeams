@@ -10,6 +10,11 @@ export interface AgentInvokeParams {
 	windowId: string;
 	managerSessionId: string;
 	managerToolCallId?: string;
+	goalId?: string;
+	workPlanId?: string;
+	workItemId?: string;
+	attempt?: number;
+	goalEpoch?: number;
 	parentDelegationId?: string;
 	handoffKind?: "request" | "followup";
 	intent?: string;
@@ -285,6 +290,11 @@ export class AgentInvoker {
 						cwdSnapshot: cwd,
 						managerSessionId,
 						managerToolCallId: params.managerToolCallId,
+						goalId: params.goalId,
+						workPlanId: params.workPlanId,
+						workItemId: params.workItemId,
+						attempt: params.attempt,
+						goalEpoch: params.goalEpoch,
 						parentDelegationId: params.parentDelegationId,
 						handoffKind: params.handoffKind,
 						intent: params.intent,
@@ -348,7 +358,7 @@ export class AgentInvoker {
 			delegationId: d.id,
 			runHandle: d.runHandle,
 			sessionHandle: d.sessionHandle,
-			details: {},
+			details: { ...(d.goalId ? { goalId: d.goalId } : {}) },
 		};
 
 		switch (delegation.status) {
@@ -365,6 +375,7 @@ export class AgentInvoker {
 							details: {
 								interactionId: interaction.id,
 								delegationId: d.id,
+								...(d.goalId ? { goalId: d.goalId } : {}),
 								worker: agent.name,
 								status: "pending",
 								revision: interaction.revision,
@@ -388,6 +399,7 @@ export class AgentInvoker {
 					details: {
 						interactionId: interaction.id,
 						delegationId: d.id,
+						...(d.goalId ? { goalId: d.goalId } : {}),
 						kind: interaction.kind,
 						revision: interaction.revision,
 						requests: interaction.requests.map((r) => ({
@@ -739,6 +751,14 @@ export class AgentInvoker {
 		);
 	}
 
+	/** Delete/session lifecycle boundary: seal every active Run before its owner disappears. */
+	async cancelManagerSession(managerSessionId: string, signal?: AbortSignal): Promise<number> {
+		const active = (await this.runtime.listDelegations(undefined, managerSessionId))
+			.filter((item) => item.status === "running" || item.status === "waiting_input");
+		for (const item of active) await this.cancel(item.id, signal);
+		return active.length;
+	}
+
 	private async cancelUnlocked(delegationId: string, signal?: AbortSignal): Promise<void> {
 		const delegation = await this.runtime.getDelegation(delegationId);
 		if (!delegation) throw new Error("delegation not found");
@@ -776,7 +796,7 @@ export class AgentInvoker {
 		};
 		const resolved = {
 			customType: "pudding:interaction_resolved",
-			content: `用户已中止 worker「${workerLabel}」的待审批任务。`,
+			content: `用户已终止 worker「${workerLabel}」的待审批任务。`,
 			details,
 		};
 		const taskResult = {

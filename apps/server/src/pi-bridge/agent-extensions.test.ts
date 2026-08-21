@@ -28,6 +28,10 @@ import {
 	CORE_TOOL_SEARCH,
 	CORE_TOOL_UPDATE_WORK_STATE,
 	CORE_TOOL_REQUEST_DECISION,
+	CORE_TOOL_CREATE_GOAL,
+	CORE_TOOL_UPDATE_WORK_PLAN,
+	CORE_TOOL_REVIEW_WORK_ITEM,
+	CORE_TOOL_READ_DELEGATION_RESULT,
 	CORE_TOOL_CREATE_GROUP,
 	CORE_TOOL_INVITE,
 	type ManagerExtensionDeps,
@@ -182,8 +186,8 @@ test("Phase4: 窗口内只有成员的工具可见（direct 非成员 Agent 不�
 	assert.ok(plan.active.has(delegateToolName("alpha")), "direct 默认激活该 Agent 的基础委托工具");
 	assert.deepEqual(
 		[...plan.active].filter((n) => !n.startsWith("agent_")),
-		[CORE_TOOL_SEARCH, CORE_TOOL_UPDATE_WORK_STATE, CORE_TOOL_REQUEST_DECISION],
-		"Session Goal 的三个 core 工具始终可见",
+		[CORE_TOOL_SEARCH, CORE_TOOL_READ_DELEGATION_RESULT],
+		"direct 无 Manager Goal 激活工具，Goal 专用工具仅注册不激活",
 	);
 
 	// factories 实际注册的工具名与 plan 一致。
@@ -205,7 +209,7 @@ test("Phase4: 激活策略——委托工具全窗口默认激活，capability �
 
 	const group = await planManagerTools(teams, catalog, { type: "group", members: ["alpha", "beta"] });
 	assert.ok(group.managed.has(delegateToolName("alpha")) && group.managed.has(delegateToolName("beta")));
-	const core = [CORE_TOOL_SEARCH, CORE_TOOL_UPDATE_WORK_STATE, CORE_TOOL_REQUEST_DECISION];
+	const core = [CORE_TOOL_SEARCH, CORE_TOOL_READ_DELEGATION_RESULT, CORE_TOOL_CREATE_GOAL];
 	assert.deepEqual(
 		[...group.active],
 		[...core, CORE_TOOL_INVITE, delegateToolName("alpha"), delegateToolName("beta")],
@@ -589,13 +593,15 @@ test("产品验收冻结: Goal 上下文在 custom-message turn 前按最新状�
 	const invoker = await makeInvoker(teams, "alpha");
 	const workStates = new WorkStateStore(freshDir("pt-goal-context-"));
 	await workStates.init();
-	const deps = { ...makeDeps(teams, invoker, catalog, undefined), workStates };
-	const plan = await planManagerTools(teams, catalog, undefined);
-	const { pi, handlers } = mockPi();
+	const ctx: ManagerWindowContext = { type: "solo", members: ["alpha"] };
+	const deps = { ...makeDeps(teams, invoker, catalog, ctx), workStates };
+	const plan = await planManagerTools(teams, catalog, ctx);
+	const { pi, handlers, getActive, setActive } = mockPi();
 	for (const ext of buildManagerExtensionFactories(plan, deps)) {
 		const factory = typeof ext === "function" ? ext : ext.factory;
 		await factory(pi);
 	}
+	setActive([...plan.active]);
 	const context = handlers.get("context")?.[0];
 	assert.ok(context, "core extension 必须注册逐请求 context handler");
 	const textOf = async () => {
@@ -603,6 +609,8 @@ test("产品验收冻结: Goal 上下文在 custom-message turn 前按最新状�
 		return String(result.messages.at(-1)?.content);
 	};
 	assert.match(await textOf(), /尚未设置 Goal/);
+	assert.ok(getActive().includes(CORE_TOOL_CREATE_GOAL));
+	assert.ok(!getActive().includes(CORE_TOOL_UPDATE_WORK_PLAN));
 	await workStates.create({
 		sessionId: "sess-test",
 		goal: "冻结验收",
@@ -611,6 +619,61 @@ test("产品验收冻结: Goal 上下文在 custom-message turn 前按最新状�
 	});
 	assert.match(await textOf(), /目标：冻结验收/);
 	assert.doesNotMatch(await textOf(), /尚未设置 Goal/);
+	assert.ok(!getActive().includes(CORE_TOOL_CREATE_GOAL));
+	assert.ok(getActive().includes(CORE_TOOL_UPDATE_WORK_PLAN));
+});
+
+test("模型上下文剔除 display:false 审计投影，保持 toolCall/toolResult 相邻", async () => {
+	const teams = await makeTeams([agentConfig("alpha")]);
+	const catalog = new ExtensionCatalog();
+	const invoker = await makeInvoker(teams, "alpha");
+	const ctx: ManagerWindowContext = { type: "solo", members: ["alpha"] };
+	const deps = makeDeps(teams, invoker, catalog, ctx);
+	const plan = await planManagerTools(teams, catalog, ctx);
+	const { pi, handlers } = mockPi();
+	for (const ext of buildManagerExtensionFactories(plan, deps)) {
+		const factory = typeof ext === "function" ? ext : ext.factory;
+		await factory(pi);
+	}
+	const context = handlers.get("context")?.[0];
+	assert.ok(context);
+	const assistant = {
+		role: "assistant" as const,
+		content: [{ type: "toolCall" as const, id: "call-1", name: delegateToolName("alpha"), arguments: { task: "检查" } }],
+		stopReason: "toolUse" as const,
+		timestamp: 1,
+	};
+	const hiddenProjection = {
+		role: "custom" as const,
+		customType: "pudding:task_assign",
+		content: "检查",
+		display: false,
+		timestamp: 2,
+	};
+	const toolResult = {
+		role: "toolResult" as const,
+		toolCallId: "call-1",
+		toolName: delegateToolName("alpha"),
+		content: [{ type: "text" as const, text: "完成" }],
+		isError: false,
+		timestamp: 3,
+	};
+	const visibleBusinessMessage = {
+		role: "custom" as const,
+		customType: "pudding:task_result",
+		content: "可见业务消息",
+		display: true,
+		timestamp: 4,
+	};
+	const result = await context!(
+		{ messages: [assistant, hiddenProjection, toolResult, visibleBusinessMessage] },
+		{},
+	) as { messages: Array<{ role?: string; customType?: string }> };
+	assert.deepEqual(
+		result.messages.slice(0, 3).map((message) => [message.role, message.customType]),
+		[["assistant", undefined], ["toolResult", undefined], ["custom", "pudding:task_result"]],
+	);
+	assert.equal(result.messages.at(-1)?.customType, "pudding:work_state_context");
 });
 
 test("P3-G: independent Goal 的 resolved 提交先走隔离 reviewer 再原子完成", async () => {
@@ -619,14 +682,14 @@ test("P3-G: independent Goal 的 resolved 提交先走隔离 reviewer 再原子�
 	const invoker = await makeInvoker(teams);
 	const states = new WorkStateStore(freshDir("pt-review-state-"));
 	await states.init();
-	await states.create({ sessionId: "sess-test", goal: "交付页面", completionBoundary: "页面验证通过" });
+	const goal = await states.create({ sessionId: "sess-test", goal: "交付页面", completionBoundary: "页面验证通过" });
 	let reviewCalls = 0;
 	const sessions = {
 		async reviewGoalCompletion() {
 			reviewCalls++;
 			return {
 				id: "review-1",
-				goalRevision: 0,
+				goalRevision: 1,
 				mode: "independent" as const,
 				verdict: "satisfied" as const,
 				criteria: [{ criterion: "页面验证通过", status: "satisfied" as const, evidenceRefs: ["tool-1"], explanation: "验证成功" }],
@@ -648,7 +711,7 @@ test("P3-G: independent Goal 的 resolved 提交先走隔离 reviewer 再原子�
 	const update = tools.get(CORE_TOOL_UPDATE_WORK_STATE)!;
 	const result = await update.execute(
 		"call-resolve",
-		{ revision: 0, status: "resolved", currentBrief: "页面已生成并验证" },
+		{ goalId: goal.goalId, revision: 0, status: "resolved", currentBrief: "页面已生成并验证" },
 		undefined,
 		undefined,
 		{} as ExtensionContext,
@@ -858,6 +921,18 @@ test("solo 派活: worker 单聊绑在其他项目时复用并原地切换到 so
 
 	const createdIds: string[] = [];
 	const removedIds: string[] = [];
+	const visibleMessages: Array<{
+		sessionId: string;
+		message: { customType: string; content: string; details?: Record<string, unknown> };
+	}> = [];
+	const projections: Array<{
+		sessionId: string;
+		message: { customType: string; content: string; details?: Record<string, unknown> };
+	}> = [];
+	const targetMessages: Array<{
+		sessionId: string;
+		message: { customType: string; content: string; details?: Record<string, unknown> };
+	}> = [];
 	const sessions = {
 		create: async () => {
 			const id = `sess-new-${createdIds.length + 1}`;
@@ -869,9 +944,26 @@ test("solo 派活: worker 单聊绑在其他项目时复用并原地切换到 so
 			return true;
 		},
 		list: async () => [],
-		sendCustomMessage: async () => undefined,
+		sendCustomMessage: async (
+			sessionId: string,
+			message: { customType: string; content: string; details?: Record<string, unknown> },
+		) => {
+			visibleMessages.push({ sessionId, message });
+		},
+		appendCustomMessageProjection: async (
+			sessionId: string,
+			message: { customType: string; content: string; details?: Record<string, unknown> },
+		) => {
+			projections.push({ sessionId, message });
+		},
 		ensureSessionFile: async () => undefined,
-		open: async () => ({ isIdle: true, waitForIdle: async () => {}, sendCustomMessage: async () => ({}) }),
+		open: async (sessionId: string) => ({
+			isIdle: true,
+			waitForIdle: async () => {},
+			sendCustomMessage: async (message: { customType: string; content: string; details?: Record<string, unknown> }) => {
+				targetMessages.push({ sessionId, message });
+			},
+		}),
 	};
 	const ctx: ManagerWindowContext = { type: "solo", members: [], cwd };
 	const deps: ManagerExtensionDeps = {
@@ -898,10 +990,36 @@ test("solo 派活: worker 单聊绑在其他项目时复用并原地切换到 so
 		{} as ExtensionContext,
 	);
 	const details = result.details as { windowId?: string };
+	await new Promise<void>((resolve) => setImmediate(resolve));
 	assert.equal(details.windowId, direct.id, "必须复用既有单聊，不得按项目另开窗口");
 	const after = (await store.getWindow(direct.id))!;
 	assert.equal(after.workspaceId, undefined, "复用后窗口必须已原地切到 solo 当前上下文（无项目）");
 	assert.deepEqual(createdIds, ["sess-new-1"], "只发生原地切换的一次会话重建，不得走 ensureDirectWindow 新建窗口");
 	assert.deepEqual(removedIds, ["sess-alpha"], "原地切换后旧会话被清理，新会话成为窗口活跃会话");
 	assert.equal((await store.listWindows()).filter((w) => w.type === "direct" && w.members[0] === "alpha").length, 1, "同一 worker 仍然只有一个单聊");
+
+	const visibleAssign = visibleMessages.find((item) =>
+		item.message.customType === "pudding:task_assign" && item.message.details?.taskId === "call-1"
+	);
+	assert.ok(visibleAssign, "solo 派活开始时必须立即把任务镜像到 worker 单聊");
+	assert.equal(visibleAssign.sessionId, "sess-new-1");
+	assert.equal(visibleAssign.message.details?.from, "solo");
+
+	const enriched = projections.at(-1);
+	assert.ok(enriched, "solo manager 来源 Session 必须持久化隐藏 running 投影");
+	assert.equal(enriched.sessionId, "sess-solo");
+	assert.equal(enriched.message.customType, "pudding:task_assign");
+	assert.equal(enriched.message.details?.taskId, "call-1");
+	assert.equal(enriched.message.details?.from, "solo");
+	assert.equal(enriched.message.details?.windowId, direct.id);
+	assert.equal(enriched.message.details?.delegationId, (result.details as { delegationId?: string }).delegationId);
+	assert.equal(enriched.message.details?.processView, true);
+	assert.equal(enriched.message.details?.sessionHandle, "alpha-sess");
+
+	const completed = targetMessages.find((item) => item.message.customType === "pudding:task_result");
+	assert.ok(completed, "solo worker 落定后必须向单聊写结果卡");
+	assert.equal(completed.sessionId, "sess-new-1");
+	assert.equal(completed.message.details?.delegationId, (result.details as { delegationId?: string }).delegationId);
+	assert.equal(completed.message.details?.processView, true, "完成态结果卡仍必须保留执行过程入口");
+	assert.equal(completed.message.details?.sessionHandle, "alpha-sess");
 });

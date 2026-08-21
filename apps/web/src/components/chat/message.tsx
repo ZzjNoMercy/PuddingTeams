@@ -147,11 +147,13 @@ function statusBadge(call: ToolCallView, since?: number) {
 		);
 	if (call.status === "error") return <Badge variant="destructive">失败</Badge>;
 	if (call.status === "interrupted") return <Badge variant="outline">已中断</Badge>;
+	if (call.status === "pending") return <Badge variant="secondary">准备中</Badge>;
 	if (details?.status === "needs_input") return <Badge variant="secondary">等待审批</Badge>;
 	if (details?.status && details.status !== "completed") {
 		return <Badge variant="destructive">{WORKER_STATUS_LABEL[details.status] ?? details.status}</Badge>;
 	}
-	return <Badge variant="secondary">完成</Badge>;
+	if (call.status === "done" || details?.status === "completed") return <Badge variant="secondary">完成</Badge>;
+	return <Badge variant="outline">状态未知</Badge>;
 }
 
 /** Badge for a worker-reported status string (custom_message details). */
@@ -214,7 +216,7 @@ function ProcessViewButton({ details }: { details: unknown }) {
 }
 
 /** Cancel exactly one delegated Run; the manager Session stays alive. */
-function CancelDelegationButton({ delegationId }: { delegationId?: string }) {
+function CancelDelegationButton({ delegationId, goalId }: { delegationId?: string; goalId?: string }) {
 	const [cancelling, setCancelling] = useState(false);
 	if (!delegationId) return null;
 	return (
@@ -224,18 +226,18 @@ function CancelDelegationButton({ delegationId }: { delegationId?: string }) {
 			onClick={async () => {
 				setCancelling(true);
 				try {
-					await cancelDelegation(delegationId);
-					toast.success("已请求中止该任务");
+					await cancelDelegation(delegationId, goalId);
+					toast.success("已终止该 Worker 任务");
 				} catch (error) {
-					toast.error(error instanceof Error ? error.message : "无法中止任务");
+					toast.error(error instanceof Error ? error.message : "无法终止任务");
 					setCancelling(false);
 				}
 			}}
 			className="flex items-center gap-1 text-xs text-muted-foreground hover:text-destructive disabled:cursor-wait disabled:opacity-60"
-			title="仅中止这个 worker 任务"
+			title="仅终止这个 Worker 任务，不影响 Goal 和其他任务"
 		>
 			<SquareIcon className="size-3 fill-current" />
-			{cancelling ? "正在中止" : "中止"}
+			{cancelling ? "正在终止" : "终止任务"}
 		</button>
 	);
 }
@@ -283,7 +285,7 @@ function WorkerTaskEntry({
 	task?: string;
 	result?: string;
 	badge: React.ReactNode;
-	/** 有 delegationId 时，点击任务标题直接打开完整任务明细。 */
+	/** 委托过程元数据，仅供独立的「执行过程」按钮使用。 */
 	processDetails?: unknown;
 	running?: boolean;
 	isError?: boolean;
@@ -305,16 +307,7 @@ function WorkerTaskEntry({
 	const [resultOpen, setResultOpen] = useState(true);
 	const [taskOpen, setTaskOpen] = useState(false);
 	const { rootRef, toggle: toggleKeepingAnchor } = useAnchorPreservingToggle<HTMLDivElement>();
-	const { openWorkerProcess } = useWorkerProcessDrawer();
-	const process = processDetails as { processView?: boolean; delegationId?: string } | undefined;
-	const canOpenProcess = Boolean(process?.processView && process.delegationId);
-	const openTaskDetail = () => {
-		if (canOpenProcess) {
-			openWorkerProcess(process!.delegationId!);
-			return;
-		}
-		toggleKeepingAnchor(setOpen);
-	};
+	const toggleTaskSummary = () => toggleKeepingAnchor(setOpen);
 	const time = timestamp
 		? new Date(timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })
 		: "";
@@ -340,9 +333,9 @@ function WorkerTaskEntry({
 			<div className="flex min-w-0 flex-1 items-center gap-2">
 				<button
 					type="button"
-					onClick={openTaskDetail}
+					onClick={toggleTaskSummary}
 					className="home-worker-task-link flex min-w-0 items-center gap-2 text-left"
-					title={canOpenProcess ? "打开任务明细" : open ? "收起任务摘要" : "展开任务摘要"}
+					title={open ? "收起任务摘要" : "展开任务摘要"}
 				>
 					<span className="truncate font-mono text-sm font-medium">{workerLabel}</span>
 					{/* 状态徽标由调用方按 details/status 推导（含 needs_input 等待审批），
@@ -378,7 +371,7 @@ function WorkerTaskEntry({
 	) : null;
 
 	const collapsedPreview = task ? (
-		<button type="button" className="mt-1 block w-full truncate text-left text-xs text-muted-foreground hover:text-foreground" onClick={openTaskDetail} title={canOpenProcess ? "打开任务明细" : "展开任务摘要"}>
+		<button type="button" className="mt-1 block w-full truncate text-left text-xs text-muted-foreground hover:text-foreground" onClick={toggleTaskSummary} title="展开任务摘要">
 			<span className="mr-1.5 text-muted-foreground/60">任务：</span>
 			{task}
 		</button>
@@ -483,6 +476,7 @@ function DelegateCard({ call, onOpenWindow, timestamp }: { call: ToolCallView; o
 				conflict?: boolean;
 				interactionId?: string;
 				delegationId?: string;
+				goalId?: string;
 				processView?: boolean;
 				revision?: number;
 				requests?: Array<{ requestId: string; prompt: string; command?: string; path?: string; risk?: string; options?: string[] }>;
@@ -501,15 +495,7 @@ function DelegateCard({ call, onOpenWindow, timestamp }: { call: ToolCallView; o
 	}
 	const meta = toolCallMeta(call);
 	const { rootRef, toggle: toggleKeepingAnchor } = useAnchorPreservingToggle<HTMLDivElement>();
-	const { openWorkerProcess } = useWorkerProcessDrawer();
-	const canOpenProcess = Boolean(details?.processView && details.delegationId);
-	const openTaskDetail = () => {
-		if (canOpenProcess) {
-			openWorkerProcess(details!.delegationId!);
-			return;
-		}
-		toggleKeepingAnchor(setBodyOpen);
-	};
+	const toggleTaskSummary = () => toggleKeepingAnchor(setBodyOpen);
 
 	// 409 冲突 + 带 pending interactionId：冲突优先显示，并保留对账的 interactionId。
 	const conflict = details?.status === "conflict" || details?.conflict;
@@ -530,6 +516,7 @@ function DelegateCard({ call, onOpenWindow, timestamp }: { call: ToolCallView; o
 				<InteractionCard
 					interactionId={details.interactionId}
 					worker={worker ?? "worker"}
+					goalId={details.goalId}
 					requests={details.requests}
 					revision={details.revision}
 					windowId={details.windowId}
@@ -556,7 +543,7 @@ function DelegateCard({ call, onOpenWindow, timestamp }: { call: ToolCallView; o
 	}
 
 	return (
-		<div ref={rootRef} className="home-delegate-card w-full overflow-hidden rounded-lg bg-muted" data-process-link={canOpenProcess ? "true" : "false"}>
+		<div ref={rootRef} className="home-delegate-card w-full overflow-hidden rounded-lg bg-muted">
 			<div className="flex items-center justify-between gap-2 px-3 pt-2">
 				<button
 					type="button"
@@ -573,16 +560,16 @@ function DelegateCard({ call, onOpenWindow, timestamp }: { call: ToolCallView; o
 				</button>
 				<button
 					type="button"
-					onClick={openTaskDetail}
+					onClick={toggleTaskSummary}
 					className="home-delegate-task-link flex min-w-0 flex-1 items-center gap-2 text-left"
-					title={canOpenProcess ? "打开任务明细" : bodyOpen ? "收起任务摘要" : "展开任务摘要"}
+					title={bodyOpen ? "收起任务摘要" : "展开任务摘要"}
 				>
 					<WorkerAvatar name={worker ?? "worker"} size={20} />
 					<span className="truncate font-mono text-sm font-medium">{workerLabel}</span>
 				</button>
 				<div className="flex shrink-0 items-center gap-2">
 					<ProcessViewButton details={call.details} />
-					{call.status === "running" || resumedRunning ? <CancelDelegationButton delegationId={details?.delegationId} /> : null}
+					{call.status === "running" || resumedRunning ? <CancelDelegationButton delegationId={details?.delegationId} goalId={details?.goalId} /> : null}
 					{details?.synced && details.windowId ? (
 						<button
 							type="button"
@@ -641,7 +628,7 @@ function DelegateCard({ call, onOpenWindow, timestamp }: { call: ToolCallView; o
 					</Collapsible>
 				</div>
 			) : (
-				<button type="button" className="block w-full px-3 pb-2 pt-1 text-left" onClick={openTaskDetail} title={canOpenProcess ? "打开任务明细" : "展开任务摘要"}>
+				<button type="button" className="block w-full px-3 pb-2 pt-1 text-left" onClick={toggleTaskSummary} title="展开任务摘要">
 					{args?.task ? (
 						<span className="block truncate text-xs text-muted-foreground transition-colors hover:text-foreground">
 							<span className="mr-1.5 text-muted-foreground/60">任务：</span>
@@ -671,7 +658,7 @@ function ToolCallItem({
 		// 批准续跑后隐藏旧 needs_input toolResult，按普通 running worker 条目渲染。
 		if (windowType && windowType !== "solo") {
 			const args = call.args as { task?: string } | undefined;
-			const details = call.details as { status?: string; delegationId?: string } | undefined;
+				const details = call.details as { status?: string; delegationId?: string; goalId?: string } | undefined;
 			const resumedRunning = details?.status === "running" || details?.status === "approved";
 			const running = call.status === "running" || resumedRunning;
 			return (
@@ -687,7 +674,7 @@ function ToolCallItem({
 					usage={(call.details as { usage?: TaskUsage } | undefined)?.usage}
 					timestamp={timestamp}
 					progress={call.progress}
-					actions={running ? <CancelDelegationButton delegationId={details?.delegationId} /> : null}
+					actions={running ? <CancelDelegationButton delegationId={details?.delegationId} goalId={details?.goalId} /> : null}
 				/>
 			);
 		}
@@ -766,6 +753,7 @@ function CustomMessageEntry({
 				windowId?: string;
 				interactionId?: string;
 				delegationId?: string;
+				goalId?: string;
 				sessionHandle?: string;
 				processView?: boolean;
 				revision?: number;
@@ -793,14 +781,45 @@ function CustomMessageEntry({
 			// 落定后整张收起（结果卡已说明一切）。
 			if (!running) return null;
 			return (
-				<WorkerTaskEntry
-					worker={details?.worker ?? "worker"}
+					<WorkerTaskEntry
+						worker={details?.worker ?? "worker"}
 					badge={<Badge variant="secondary">执行中</Badge>}
 					processDetails={details}
 					running
 					timestamp={message.timestamp}
-					actions={<CancelDelegationButton delegationId={details?.delegationId} />}
+					actions={<CancelDelegationButton delegationId={details?.delegationId} goalId={details?.goalId} />}
 				/>
+			);
+		}
+		if (details?.from === "solo") {
+			// A manager-routed task should still feel like a normal direct worker
+			// conversation: user-side task first, then one worker running row, then
+			// the eventual worker result. Keep process/cancel controls on the worker
+			// row instead of burying them in the task bubble.
+			return (
+				<>
+					<AiMessage from="user" className="home-user-message">
+						<MessageContent>
+							<p className="text-xs text-muted-foreground">Manager 委派</p>
+							<p className="text-sm whitespace-pre-wrap">{message.content}</p>
+						</MessageContent>
+					</AiMessage>
+					{running ? (
+						<WorkerTaskEntry
+							worker={details?.worker ?? "worker"}
+							badge={(
+								<Badge variant="secondary" className="gap-1">
+									<span className="size-1.5 animate-pulse rounded-full bg-muted-foreground" />
+									执行中 <Elapsed active since={message.timestamp} />
+								</Badge>
+							)}
+							processDetails={details}
+							running
+							timestamp={message.timestamp}
+							actions={<CancelDelegationButton delegationId={details?.delegationId} goalId={details?.goalId} />}
+						/>
+					) : null}
+				</>
 			);
 		}
 		return (
@@ -811,7 +830,7 @@ function CustomMessageEntry({
 					{running ? (
 						<div className="flex items-center gap-2 text-xs text-muted-foreground">
 							<span>执行中…</span>
-							<CancelDelegationButton delegationId={details?.delegationId} />
+							<CancelDelegationButton delegationId={details?.delegationId} goalId={details?.goalId} />
 						</div>
 					) : null}
 				</MessageContent>
@@ -837,8 +856,9 @@ function CustomMessageEntry({
 	if (message.customType === "pudding:interaction_required") {
 		return (
 			<InteractionCard
-				interactionId={details?.interactionId}
-				worker={details?.worker ?? "worker"}
+					interactionId={details?.interactionId}
+					worker={details?.worker ?? "worker"}
+					goalId={details?.goalId}
 				requests={details?.requests}
 				revision={details?.revision}
 				windowId={details?.windowId}
@@ -948,12 +968,15 @@ function MessageBody({
 							</div>
 						)}
 						{showContent && (
-							<MessageResponse
-								className={`home-message-response ${message.error ? "text-destructive" : ""}`}
-								{...chatStreamdownProps}
-							>
-								{message.content}
-							</MessageResponse>
+							<>
+								<MessageResponse
+									className={`home-message-response ${message.error ? "text-destructive" : ""}`}
+									{...chatStreamdownProps}
+								>
+									{message.content}
+								</MessageResponse>
+								<ErrorTechnicalDetails detail={message.errorDetail} />
+							</>
 						)}
 					</div>
 				</div>
@@ -992,6 +1015,21 @@ function AssistantReasoning({ streaming, thinking, className }: { streaming: boo
 			<ReasoningTrigger hasContent={Boolean(thinking)} />
 			<ReasoningContent>{thinking ?? ""}</ReasoningContent>
 		</Reasoning>
+	);
+}
+
+function ErrorTechnicalDetails({ detail }: { detail?: string }) {
+	if (!detail) return null;
+	return (
+		<Collapsible className="mt-1">
+			<CollapsibleTrigger className="group flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground">
+				<ChevronRightIcon className="size-3 transition-transform group-data-[state=open]:rotate-90" />
+				查看技术详情
+			</CollapsibleTrigger>
+			<CollapsibleContent className="mt-2 max-w-full rounded-md border bg-muted/40 p-3">
+				<pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all text-xs text-muted-foreground">{detail}</pre>
+			</CollapsibleContent>
+		</Collapsible>
 	);
 }
 
@@ -1127,6 +1165,7 @@ function AssistantGroupBody({
 												{s.m.content}
 											</MessageResponse>
 										)}
+										<ErrorTechnicalDetails detail={s.m.errorDetail} />
 										{s.foldCalls.length > 0 && (
 											<ToolSummaryRow
 												calls={s.foldCalls}

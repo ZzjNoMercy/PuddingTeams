@@ -31,6 +31,7 @@ import { registerExtensionsRoutes } from "./routes/extensions.js";
 import { registerArtifactsRoutes } from "./routes/artifacts.js";
 import { registerWorkspacesRoutes } from "./routes/workspaces.js";
 import { ProductSettingsStore } from "./store/product-settings.js";
+import { LargeWorkerResultStore } from "./store/large-worker-result.js";
 import { WorkStateStore } from "./store/work-state.js";
 import { registerWorkStateRoutes } from "./routes/work-state.js";
 import { registerWorkerProcessRoutes } from "./routes/worker-process.js";
@@ -101,6 +102,9 @@ const drivers = new DriverRegistry();
 // 上次安装的本地 Extension 在 init 时重新注册（capability→catalog，connector→drivers）。
 const catalog = new ExtensionCatalog();
 const productSettings = new ProductSettingsStore(paths.config);
+const largeWorkerResults = new LargeWorkerResultStore(paths.state);
+const initialProductSettings = await productSettings.get();
+workStates.configureOperationLedger(initialProductSettings.harness.goalRecovery);
 const extensionRegistry = new ExtensionRegistry(paths.extensions, catalog, drivers);
 extensionRegistry.registerBuiltin(puddingClawConnectorManifest, puddingClawExtensionHooks(), {
 	// PuddingClaw 默认头像（布丁狗）随 server 包发布。
@@ -110,7 +114,7 @@ extensionRegistry.registerBuiltin(piConnectorManifest, piExtensionHooks({ sessio
 	// pi Connector 的默认头像（lobehub Pi 图标）随 server 包发布。
 	assetsDir: fileURLToPath(new URL("../assets", import.meta.url)),
 });
-await extensionRegistry.init({ developerMode: (await productSettings.get()).developerMode });
+await extensionRegistry.init({ developerMode: initialProductSettings.developerMode });
 // P2（§9.5 双宿主包）：codex / claude-code Connector 本体在 extensions/connectors/*，
 // 第一方预置 = 启动时按仓库内路径安装/更新，不再代码内嵌 builtin。
 const REPO_CONNECTORS_DIR = fileURLToPath(new URL("../../../extensions/connectors", import.meta.url));
@@ -128,7 +132,7 @@ const runtime: AgentRuntime = new AgentRuntime(
 );
 const invoker = new AgentInvoker(teams, runtime, drivers, credentials, defaultCwd);
 
-const store = new PiSessionStore(defaultCwd, paths.sessions, teams, invoker, catalog, workStates, artifacts);
+const store = new PiSessionStore(defaultCwd, paths.sessions, teams, invoker, catalog, workStates, artifacts, largeWorkerResults, productSettings);
 invoker.setManagerSender((managerSessionId, message, options) =>
 	store.sendCustomMessage(managerSessionId, message, options),
 );
@@ -160,6 +164,83 @@ const reapedOrphans = await runtime.reapOrphanedRuns(async (orphan) => {
 	}
 });
 if (reapedOrphans > 0) app.log.info({ reaped: reapedOrphans }, "reaped orphaned delegations from previous process");
+// Goal v4 recovery runs after Runtime has sealed orphaned Runs and before HTTP
+// opens. Terminal Delegations are projected into WorkItem submissions exactly
+// once; restart orphans advance one Goal epoch and never resurrect the old Run.
+const reconciledGoals = await workStates.reconcileDelegations(await runtime.listDelegations());
+if (reconciledGoals.projected || reconciledGoals.interrupted) {
+	app.log.info(reconciledGoals, "reconciled Goal checkpoints");
+}
+const goalRecoverySettings = (await productSettings.get()).harness.goalRecovery;
+for (const state of await workStates.listActive()) {
+	if (state.execution.status !== "interrupted") continue;
+	const owner = await teams.windowForSession(state.sessionId);
+	if (!owner || owner.type === "direct" || goalRecoverySettings.mode !== "safe_auto") continue;
+	await workStates.resumeGoal(
+		state.sessionId,
+		state.revision,
+		{ ownerId: "startup-recovery", leaseMs: goalRecoverySettings.resumeLeaseMs },
+		`startup-resume:${state.goalId}:${state.execution.epoch}`,
+		state.goalId,
+	).catch(() => undefined);
+}
+let goalOutboxDrain: Promise<void> = Promise.resolve();
+async function drainGoalOutbox(): Promise<void> {
+	for (const event of await workStates.pendingOutbox()) {
+		try {
+			if (event.kind === "goal_changed") {
+				await store.appendCustomMessageProjectionIfAbsent(event.sessionId, event.id, {
+					customType: "pudding:work_plan_update",
+					content: "Goal 或 WorkPlan 权威状态已更新，请重新读取 work-state。",
+					details: { goalId: event.goalId, ...event.payload },
+				});
+				await workStates.markOutboxDelivered(event.id);
+				continue;
+			}
+			const owner = await teams.windowForSession(event.sessionId);
+			const current = await workStates.getActive(event.sessionId);
+			const belongsToCurrentGoal = current?.goalId === event.goalId;
+			const triggerTurn = belongsToCurrentGoal && (event.kind === "decision_answered" || (event.kind === "goal_recovery" && owner?.type !== "direct"));
+			const content = event.kind === "decision_answered"
+				? "Human 已回答业务决策，请从同一 Goal 的安全点继续。"
+				: event.kind === "goal_recovery"
+					? "PuddingTeams 已完成重启对账。请保留已验收 WorkItem，从最近安全点创建新的 Delegation attempt；不要把旧 Run 当作仍在运行。"
+					: "Goal 已暂停；历史 Delegation 保留为审计事实，等待安全恢复。";
+			await store.appendCustomMessageIfAbsent(
+				event.sessionId,
+				event.id,
+				{ customType: event.kind === "goal_recovery" ? "pudding:goal_recovery" : event.kind === "goal_interrupted" ? "pudding:goal_interrupted" : "pudding:decision_answered", content, details: { goalId: event.goalId, ...event.payload } },
+				{ triggerTurn, deliverAs: triggerTurn ? "followUp" : undefined },
+			);
+			// A delivered recovery event advances execution only after the receiver
+			// has durably accepted it. If the process dies before acknowledgement,
+			// receiver-side eventId dedupe makes the retry harmless.
+			if (event.kind === "goal_recovery" && triggerTurn) {
+				if (current?.execution.status === "recovering") {
+					await workStates.update(
+						event.sessionId,
+						current.revision,
+						{ executionStatus: "running" },
+						`recovery-delivered:${event.id}`,
+						current.execution.epoch,
+						current.goalId,
+					);
+				}
+			}
+			await workStates.markOutboxDelivered(event.id);
+		} catch (error) {
+			app.log.warn({ err: error, eventId: event.id }, "Goal outbox delivery failed; will retry");
+		}
+	}
+}
+function scheduleGoalOutboxDrain(): Promise<void> {
+	const run = goalOutboxDrain.then(drainGoalOutbox, drainGoalOutbox);
+	goalOutboxDrain = run.catch(() => undefined);
+	return run;
+}
+await scheduleGoalOutboxDrain();
+const goalOutboxTimer = setInterval(() => void scheduleGoalOutboxDrain(), 2_500);
+goalOutboxTimer.unref();
 // §1/§2 产品模型：solo 窗口是置顶单例，服务端启动即保证存在。
 await teams.ensureSoloWindow(
 	async (workspaceId, cwdSnapshot) => {
@@ -174,7 +255,7 @@ await teams.ensureSoloWindow(
 );
 await registerChatRoutes(app, store, teams, workStates, uploads, invoker);
 registerIdentityRoutes(app);
-await registerSettingsRoutes(app, defaultCwd);
+await registerSettingsRoutes(app, defaultCwd, productSettings, workStates);
 await registerProvidersRoutes(app, store);
 await registerAgentsRoutes(app, teams, {
 	credentials,
@@ -188,13 +269,14 @@ registerResourcesRoutes(app);
 registerWorkspacesRoutes(app, teams.workspaces, undefined, store);
 await registerRoomsRoutes(app, store, teams, invoker, workStates, {
 	additionalRoots: [paths.uploads],
+	productSettings,
 });
-await registerInteractionsRoutes(app, runtime, invoker, teams);
+await registerInteractionsRoutes(app, runtime, invoker, teams, workStates);
 registerArtifactsRoutes(app, artifacts);
-registerWorkStateRoutes(app, workStates, teams, store, runtime);
+registerWorkStateRoutes(app, workStates, teams, store, runtime, productSettings);
 registerWorkerProcessRoutes(app, new WorkerProcessService(delegations, teams, paths.workerSessions, delegationTimelines), {
 	cancel: (delegationId, signal) => invoker.cancel(delegationId, signal),
-});
+}, workStates);
 
 // §15.6 artifact.created 事件：与现有审批/任务结果同一通道——manager session
 // 的 custom message（pi JSONL → 订阅中的 websocket 下发浏览器），不触发新轮次。
@@ -232,6 +314,8 @@ try {
 
 async function shutdown(): Promise<void> {
 	app.log.info("shutting down");
+	clearInterval(goalOutboxTimer);
+	await goalOutboxDrain;
 	await store.disposeAll();
 	await app.close();
 	await releaseLease();

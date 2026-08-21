@@ -41,6 +41,8 @@ export interface LocalPiDriverOptions {
 	workspaceAccessFor?: (workspaceId?: string) => Promise<WorkspaceResourceAccess>;
 	/** 会话存储目录；平台注入 `PUDDINGTEAMS_HOME/sessions/workers`，缺省（独立使用）派生 `<pi agentDir>/puddingteams-worker-sessions`。 */
 	sessionDir?: string;
+	/** 仅供运行时/测试调节；429/过载保持同一 Delegation 与 Session 冷却续跑。 */
+	transientRecovery?: { maxAttempts?: number; rateLimitDelayMs?: number; overloadedDelayMs?: number };
 }
 
 type PiModel = NonNullable<CreateAgentSessionOptions["model"]>;
@@ -175,6 +177,31 @@ function toProgress(event: AgentSessionEvent): AgentEvent | undefined {
 
 function errMessage(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
+}
+
+export function transientCooldownMs(error: string, options: LocalPiDriverOptions["transientRecovery"]): number | undefined {
+	if (/\b429\b|rate.?limit|max rpm|too many requests/i.test(error)) {
+		const retryAfter = error.match(/(?:retry|try again)\s+after\s+(\d+(?:\.\d+)?)\s*(milliseconds?|ms|seconds?|secs?|s|minutes?|mins?|m)\b/i);
+		if (retryAfter) {
+			const value = Number(retryAfter[1]);
+			const unit = retryAfter[2]?.toLowerCase() ?? "s";
+			const multiplier = unit.startsWith("milli") || unit === "ms" ? 1 : unit.startsWith("m") ? 60_000 : 1_000;
+			return Math.max(1_000, Math.ceil(value * multiplier));
+		}
+		return options?.rateLimitDelayMs ?? 60_000;
+	}
+	if (/overloaded|capacity/i.test(error)) return options?.overloadedDelayMs ?? 15_000;
+	return undefined;
+}
+
+async function waitForCooldown(ms: number, signal?: AbortSignal): Promise<boolean> {
+	if (signal?.aborted) return false;
+	return new Promise<boolean>((resolve) => {
+		const timer = setTimeout(() => { cleanup(); resolve(true) }, ms);
+		const abort = () => { clearTimeout(timer); cleanup(); resolve(false) };
+		const cleanup = () => signal?.removeEventListener("abort", abort);
+		signal?.addEventListener("abort", abort, { once: true });
+	});
 }
 
 /**
@@ -349,6 +376,8 @@ export class LocalPiDriver implements AgentDriver {
 		ctx: InvocationContext,
 		sessionHandle: string,
 		runHandle: string,
+		transientAttempt = 0,
+		usageStart?: number,
 	): AsyncIterable<AgentEvent> {
 		const queue: AgentEvent[] = [];
 		let wake: (() => void) | undefined;
@@ -370,7 +399,7 @@ export class LocalPiDriver implements AgentDriver {
 		let done = false;
 		// 本次 Run 的用量聚合切片：worker 会话跨任务续接，只统计 prompt 之后
 		// 新增的消息（含多轮工具循环的每一条 assistant）。
-		const messageCountBefore = session.messages.length;
+		const messageCountBefore = usageStart ?? session.messages.length;
 		const promptPromise = session
 			.prompt(message)
 			.catch((err: unknown) => {
@@ -428,13 +457,37 @@ export class LocalPiDriver implements AgentDriver {
 			return;
 		}
 		if (last?.stopReason === "error") {
+			const error = last.errorMessage ?? "pi worker 执行失败";
+			const cooldownMs = transientCooldownMs(error, this.opts.transientRecovery);
+			const maxAttempts = this.opts.transientRecovery?.maxAttempts ?? 2;
+			if (cooldownMs !== undefined && transientAttempt < maxAttempts) {
+				yield {
+					type: "progress",
+					stage: "rate_limit_wait",
+					message: `上游限流，保留当前任务与会话，${Math.ceil(cooldownMs / 1000)} 秒后自动继续（${transientAttempt + 1}/${maxAttempts}）`,
+				};
+				if (!(await waitForCooldown(cooldownMs, ctx.signal))) {
+					yield { type: "failed", result: { ...base, status: "cancelled", errorCode: "cancelled", error: "任务已终止", recoverable: true, ...(usage ? { usage } : {}) } };
+					return;
+				}
+				yield* this.drive(
+					session,
+					"刚才因上游限流中断。请从当前会话已有进度继续完成原任务，不要重复已经完成的检查或工具调用。",
+					ctx,
+					sessionHandle,
+					runHandle,
+					transientAttempt + 1,
+					messageCountBefore,
+				);
+				return;
+			}
 			yield {
 				type: "failed",
 				result: {
 					...base,
 					status: "failed",
 					errorCode: "worker_error",
-					error: last.errorMessage ?? "pi worker 执行失败",
+					error,
 					recoverable: true,
 					...(usage ? { usage } : {}),
 				},

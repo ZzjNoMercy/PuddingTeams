@@ -11,6 +11,7 @@ import { DelegationStore } from "../agent-runtime/delegation-store.js";
 import { WorkerProcessService } from "../agent-runtime/worker-process.js";
 import { DelegationTimelineStore } from "../agent-runtime/delegation-timeline-store.js";
 import { registerWorkerProcessRoutes } from "./worker-process.js";
+import { WorkStateStore } from "../store/work-state.js";
 
 /** pi worker 执行过程可视化（只读）：按 delegationId 回放/订阅 worker 会话。 */
 
@@ -27,6 +28,8 @@ async function makeStack() {
 	const timelines = new DelegationTimelineStore(path.join(dir, "timelines"));
 	await timelines.init();
 	const service = new WorkerProcessService(delegations, teams, workerSessions, timelines);
+	const workStates = new WorkStateStore(path.join(dir, "goal-state"));
+	await workStates.init();
 	const app = Fastify({ logger: false });
 	const cancellations: string[] = [];
 	await app.register(websocket);
@@ -35,8 +38,8 @@ async function makeStack() {
 			cancellations.push(delegationId);
 			await delegations.transitionDelegation(delegationId, ["running", "waiting_input"], { status: "cancelled" });
 		},
-	});
-	return { app, delegations, timelines, workerSessions, dir, cancellations };
+	}, workStates);
+	return { app, delegations, timelines, workerSessions, workStates, dir, cancellations };
 }
 
 /** 造一个落盘的 worker 会话（user + assistant 两条消息），返回 sessionId。 */
@@ -211,6 +214,7 @@ test("已结束委托：从 JSONL 回放 worker 会话历史，live=false", asyn
 	assert.equal(info.statusCode, 200, info.body);
 	assert.deepEqual(info.json(), {
 		delegationId: d.id,
+		managerSessionId: "s1",
 		agentId: "pi-worker",
 		status: "completed",
 		sessionHandle: handle,
@@ -286,5 +290,25 @@ test("spawn worker：process 选择追加式 timeline，REST 按 seq 回放", as
 	const history = await app.inject({ method: "GET", url: `/api/delegations/${d.id}/process/timeline?afterSeq=1` });
 	assert.equal(history.statusCode, 200, history.body);
 	assert.deepEqual(history.json().events.map((event: { seq: number; title: string }) => [event.seq, event.title]), [[2, "命令完成"]]);
+	await app.close();
+});
+
+test("Goal v5：历史 Goal 的 Delegation 只能查看，不能再取消", async () => {
+	const { app, delegations, workStates, dir, cancellations } = await makeStack();
+	const goalA = await workStates.create({ sessionId: "s-goal", goal: "A", completionBoundary: "A 完成", reviewMode: "manager", operationId: "create-a" });
+	const delegation = await delegations.createDelegation({
+		cwdSnapshot: dir, windowId: "w1", managerSessionId: "s-goal", goalId: goalA.goalId,
+		agentId: "codex", agentRevision: 0, operation: "run",
+	});
+	await workStates.update("s-goal", goalA.revision, { status: "cancelled", currentBrief: "A 已结束" }, "cancel-a", goalA.execution.epoch, goalA.goalId);
+	await workStates.create({ sessionId: "s-goal", goal: "B", completionBoundary: "B 完成", operationId: "create-b" });
+	const response = await app.inject({
+		method: "POST", url: `/api/delegations/${delegation.id}/cancel`,
+		headers: { "content-type": "application/json" }, body: { expectedGoalId: goalA.goalId },
+	});
+	assert.equal(response.statusCode, 409, response.body);
+	assert.equal(response.json().code, "stale_goal_state");
+	assert.deepEqual(cancellations, []);
+	assert.equal((await delegations.getDelegation(delegation.id))?.status, "running");
 	await app.close();
 });

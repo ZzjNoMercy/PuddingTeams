@@ -1,10 +1,12 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-export type SessionWorkStatus = "active" | "waiting_human" | "resolved" | "cancelled";
+export type SessionWorkStatus = "active" | "resolved" | "cancelled";
+export type GoalExecutionStatus = "idle" | "running" | "waiting_human" | "interrupted" | "recovering" | "reviewing";
 export type CompletionReviewMode = "manager" | "independent";
 export type CompletionReviewVerdict = "satisfied" | "not_satisfied" | "needs_human";
+export type WorkItemStatus = "planned" | "ready" | "in_progress" | "waiting_input" | "submitted" | "revision" | "accepted" | "blocked" | "cancelled";
 
 export interface CompletionReviewCriterion {
 	criterion: string;
@@ -12,48 +14,108 @@ export interface CompletionReviewCriterion {
 	evidenceRefs: string[];
 	explanation: string;
 }
-
 export interface CompletionReview {
 	id: string;
 	goalRevision: number;
-	mode: "independent";
+	mode: "manager" | "independent";
 	verdict: CompletionReviewVerdict;
 	criteria: CompletionReviewCriterion[];
 	gaps: string[];
-	reviewerModel: string;
+	reviewerModel?: string;
 	reviewerSessionId: string;
 	reviewedAt: string;
 }
-
+export interface GoalContractProvenance {
+	criteriaOrigin: "user_input" | "manager_derived";
+	sourceMessageIds: string[];
+	authoredByAgentId?: "manager";
+}
+export interface GoalInterruption {
+	id: string;
+	kind: "user" | "server_restart" | "manager_interrupted" | "effect_unknown";
+	fingerprint: string;
+	delegationIds: string[];
+	interruptedAt: string;
+}
+export interface GoalExecution {
+	epoch: number;
+	status: GoalExecutionStatus;
+	interruption?: GoalInterruption;
+	resumeLease?: { ownerId: string; token: string; expiresAt: string };
+}
+export interface WorkItemSubmission {
+	id: string;
+	attempt: number;
+	source: "delegation" | "manager";
+	delegationId?: string;
+	resultRef:
+		| { kind: "delegation_result"; delegationId: string }
+		| { kind: "manager_summary"; evidenceRefs: string[] };
+	artifactIds: string[];
+	summary?: string;
+	submittedAt: string;
+	review?: {
+		verdict: "accepted" | "revision" | "blocked";
+		summary: string;
+		evidenceRefs: string[];
+		reviewedAt: string;
+	};
+}
+export interface WorkItem {
+	id: string;
+	title: string;
+	description?: string;
+	assignedAgentId?: string;
+	dependsOn: string[];
+	acceptanceCriteria: string[];
+	sourceGoalCriteria: string[];
+	status: WorkItemStatus;
+	delegationIds: string[];
+	activeDelegationId?: string;
+	submissions: WorkItemSubmission[];
+	acceptedSubmissionId?: string;
+	lastChange?: { reason: string; changedAt: string; previousRevision: number };
+	revision: number;
+	createdAt: string;
+	updatedAt: string;
+}
+export interface GoalWorkPlan {
+	id: string;
+	title?: string;
+	coveredGoalRevision: number;
+	needsReconcile: boolean;
+	revision: number;
+	items: Record<string, WorkItem>;
+	createdAt: string;
+	updatedAt: string;
+}
 export interface SessionWorkState {
+	goalId: string;
 	sessionId: string;
 	goal: string;
+	contractProvenance: GoalContractProvenance;
 	responsibleAgentId: string;
 	participantAgentIds: string[];
 	currentBrief: string;
 	waitingOn?: string;
 	nextAction?: string;
 	completionBoundary: string;
-	/** 只在 goal / completionBoundary 改变时递增；进度更新不使验收契约漂移。 */
 	goalRevision: number;
 	reviewMode: CompletionReviewMode;
 	reviewerModel?: string;
-	/** 按提交时间追加的独立复核轨迹；旧 Goal revision 的记录也保留用于审计。 */
 	completionReviews: CompletionReview[];
 	status: SessionWorkStatus;
+	execution: GoalExecution;
+	plan?: GoalWorkPlan;
 	artifactIds: string[];
 	revision: number;
 	createdAt: string;
 	updatedAt: string;
 }
-
-export interface DecisionOption {
-	id: string;
-	label: string;
-}
-
+export interface DecisionOption { id: string; label: string }
 export interface DecisionRequest {
 	id: string;
+	goalId: string;
 	sessionId: string;
 	requestedBy: string;
 	question: string;
@@ -68,280 +130,811 @@ export interface DecisionRequest {
 	createdAt: string;
 	updatedAt: string;
 }
-
+export interface GoalOperation {
+	id: string;
+	goalId?: string;
+	sessionId: string;
+	epoch: number;
+	kind: string;
+	payloadHash: string;
+	status: "committed";
+	resultRevision?: number;
+	result: unknown;
+	createdAt: string;
+	updatedAt: string;
+}
+export interface GoalOutboxEvent {
+	id: string;
+	goalId: string;
+	sessionId: string;
+	epoch: number;
+	kind: "goal_changed" | "decision_answered" | "goal_recovery" | "goal_interrupted";
+	payload: Record<string, unknown>;
+	status: "pending" | "delivered";
+	createdAt: string;
+	deliveredAt?: string;
+}
 interface WorkStateFile {
-	version: 3;
+	version: 5;
 	states: Record<string, SessionWorkState>;
 	decisions: Record<string, DecisionRequest>;
+	operations: Record<string, GoalOperation>;
+	outbox: Record<string, GoalOutboxEvent>;
 }
 
 export class WorkStateConflictError extends Error {
-	constructor(readonly current: SessionWorkState, message = "work state revision conflict") {
+	constructor(readonly current: SessionWorkState, message = `目标状态刚刚发生变化（当前 revision ${current.revision}）。请基于最新状态串行执行下一步`) {
 		super(message);
 		this.name = "WorkStateConflictError";
 	}
 }
-
-function text(value: unknown, field: string, required = false): string | undefined {
-	if (value === undefined) return undefined;
-	if (typeof value !== "string") throw new Error(`${field} 必须是字符串`);
-	const trimmed = value.trim();
-	if (required && !trimmed) throw new Error(`${field} 不能为空`);
-	if (trimmed.length > 30_000) throw new Error(`${field} 过长`);
-	return trimmed || undefined;
+export class WorkStateOperationConflictError extends Error {
+	constructor(message: string, readonly code: "idempotency_conflict" | "stale_goal_state") {
+		super(message);
+		this.name = "WorkStateOperationConflictError";
+	}
 }
 
-function stringList(value: unknown, field: string): string[] | undefined {
-	if (value === undefined) return undefined;
-	if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
-		throw new Error(`${field} 必须是字符串数组`);
-	}
+function requiredText(value: unknown, field: string): string {
+	if (typeof value !== "string" || !value.trim()) throw new Error(`${field} 不能为空`);
+	if (value.trim().length > 30_000) throw new Error(`${field} 过长`);
+	return value.trim();
+}
+function optionalText(value: unknown, field: string): string | undefined {
+	if (value === undefined || value === "") return undefined;
+	if (typeof value !== "string") throw new Error(`${field} 必须是字符串`);
+	if (value.trim().length > 30_000) throw new Error(`${field} 过长`);
+	return value.trim() || undefined;
+}
+function strings(value: unknown, field: string): string[] {
+	if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw new Error(`${field} 必须是字符串数组`);
 	return [...new Set(value.map((item) => item.trim()).filter(Boolean))];
 }
+function stable(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
+	if (value && typeof value === "object") {
+		return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${stable(item)}`).join(",")}}`;
+	}
+	return JSON.stringify(value);
+}
+function hash(value: unknown): string {
+	return `sha256:${createHash("sha256").update(stable(value)).digest("hex")}`;
+}
+function copy<T>(value: T): T { return structuredClone(value) }
+function now(): string { return new Date().toISOString() }
 
-/** Session Goal、业务决策与当前版本的单机原子存储。 */
+export function goalCriterionRefs(state: Pick<SessionWorkState, "goalRevision" | "completionBoundary">): Array<{ id: string; text: string }> {
+	return state.completionBoundary.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
+		.map((item, index) => ({ id: `goal:${state.goalRevision}:${index + 1}`, text: item }));
+}
+function assertDag(items: Record<string, WorkItem>): void {
+	for (const item of Object.values(items)) {
+		if (item.dependsOn.includes(item.id)) throw new Error(`WorkItem ${item.id} 不能依赖自身`);
+		for (const id of item.dependsOn) if (!items[id]) throw new Error(`WorkItem ${item.id} 引用了不存在或跨 Plan 的依赖 ${id}`);
+	}
+	const visiting = new Set<string>();
+	const visited = new Set<string>();
+	const visit = (id: string) => {
+		if (visiting.has(id)) throw new Error("WorkPlan dependsOn 必须是无环 DAG");
+		if (visited.has(id)) return;
+		visiting.add(id);
+		for (const parent of items[id]?.dependsOn ?? []) visit(parent);
+		visiting.delete(id);
+		visited.add(id);
+	};
+	for (const id of Object.keys(items)) visit(id);
+}
+function deriveReady(plan: GoalWorkPlan): void {
+	for (const item of Object.values(plan.items)) {
+		if (item.status === "planned" || item.status === "ready") {
+			item.status = item.dependsOn.every((id) => plan.items[id]?.status === "accepted") ? "ready" : "planned";
+		}
+	}
+}
+
 export class WorkStateStore {
 	private readonly file: string;
 	private queue: Promise<unknown> = Promise.resolve();
-
-	constructor(private readonly stateDir: string) {
-		this.file = path.join(stateDir, "work-states.json");
+	private operationRetentionDays = 30;
+	private maxOperationsPerSession = 512;
+	constructor(private readonly stateDir: string) { this.file = path.join(stateDir, "work-states.json") }
+	async init(): Promise<void> { await mkdir(this.stateDir, { recursive: true }) }
+	configureOperationLedger(input: { operationRetentionDays: number; maxOperationsPerSession: number }): void {
+		this.operationRetentionDays = Math.max(7, Math.min(input.operationRetentionDays, 365));
+		this.maxOperationsPerSession = Math.max(128, Math.min(input.maxOperationsPerSession, 4096));
 	}
-
-	async init(): Promise<void> {
-		await mkdir(this.stateDir, { recursive: true });
-	}
-
 	private serialize<T>(fn: () => Promise<T>): Promise<T> {
 		const run = this.queue.then(fn, fn);
 		this.queue = run.then(() => undefined, () => undefined);
 		return run;
 	}
-
 	private async load(): Promise<WorkStateFile> {
 		try {
-			const parsed = JSON.parse(await readFile(this.file, "utf-8")) as Partial<WorkStateFile>;
-			return { version: 3, states: parsed.states ?? {}, decisions: parsed.decisions ?? {} };
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-			return { version: 3, states: {}, decisions: {} };
+			const parsed = JSON.parse(await readFile(this.file, "utf8")) as Partial<WorkStateFile>;
+			if (parsed.version !== 5) throw new Error(`work-states.json 必须使用 v5（${this.file}）；项目未上线，不读取旧结构，请移走旧文件后重启`);
+			return { version: 5, states: parsed.states ?? {}, decisions: parsed.decisions ?? {}, operations: parsed.operations ?? {}, outbox: parsed.outbox ?? {} };
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			return { version: 5, states: {}, decisions: {}, operations: {}, outbox: {} };
 		}
 	}
-
 	private async write(data: WorkStateFile): Promise<void> {
-		const tmp = `${this.file}.${randomUUID().slice(0, 8)}.tmp`;
-		await writeFile(tmp, JSON.stringify(data, null, 2) + "\n", "utf-8");
-		await rename(tmp, this.file);
+		const temp = `${this.file}.${randomUUID().slice(0, 8)}.tmp`;
+		await writeFile(temp, JSON.stringify(data, null, 2) + "\n", "utf8");
+		await rename(temp, this.file);
 	}
-
+	private opKey(sessionId: string, operationId: string, goalId?: string): string { return `${goalId ?? sessionId}:${operationId}` }
+	private replay<T>(data: WorkStateFile, sessionId: string, operationId: string, kind: string, payload: unknown, goalId?: string): T | undefined {
+		const operation = data.operations[this.opKey(sessionId, operationId, goalId)];
+		if (!operation) return undefined;
+		if (operation.kind !== kind || operation.payloadHash !== hash(payload)) {
+			throw new WorkStateOperationConflictError("同一 Idempotency-Key 被用于不同请求", "idempotency_conflict");
+		}
+		return copy(operation.result as T);
+	}
+	private commit<T>(data: WorkStateFile, sessionId: string, operationId: string, epoch: number, kind: string, payload: unknown, result: T, revision?: number, goalId?: string, scope: "session" | "goal" = goalId ? "goal" : "session"): void {
+		const timestamp = now();
+		data.operations[this.opKey(sessionId, operationId, scope === "goal" ? goalId : undefined)] = {
+			id: operationId, sessionId, ...(goalId ? { goalId } : {}), epoch, kind, payloadHash: hash(payload), status: "committed",
+			...(revision === undefined ? {} : { resultRevision: revision }), result: copy(result), createdAt: timestamp, updatedAt: timestamp,
+		};
+		const cutoff = Date.now() - this.operationRetentionDays * 24 * 60 * 60 * 1000;
+		const operations = Object.entries(data.operations)
+			.filter(([, item]) => item.sessionId === sessionId)
+			.sort(([, a], [, b]) => b.updatedAt.localeCompare(a.updatedAt));
+		for (const [index, [key, item]] of operations.entries()) {
+			if (index < this.maxOperationsPerSession || new Date(item.updatedAt).getTime() >= cutoff) continue;
+			delete data.operations[key];
+		}
+	}
+	private event(data: WorkStateFile, event: Omit<GoalOutboxEvent, "status" | "createdAt">): void {
+		if (!data.outbox[event.id]) data.outbox[event.id] = { ...event, status: "pending", createdAt: now() };
+	}
+	private current(state: SessionWorkState, revision: number, epoch?: number, goalId?: string): void {
+		if (!Number.isInteger(revision) || revision < 0) throw new Error("revision 必须是非负整数");
+		if (goalId !== undefined && state.goalId !== goalId) throw new WorkStateOperationConflictError("当前 Goal 已变化，请重新读取目标状态", "stale_goal_state");
+		if (state.revision !== revision) throw new WorkStateConflictError(state);
+		if (epoch !== undefined && state.execution.epoch !== epoch) throw new WorkStateOperationConflictError("Goal execution epoch 已变化", "stale_goal_state");
+	}
+	private sessionGoals(data: WorkStateFile, sessionId: string): SessionWorkState[] {
+		return Object.values(data.states).filter((state) => state.sessionId === sessionId).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+	}
+	private active(data: WorkStateFile, sessionId: string): SessionWorkState | undefined {
+		const active = this.sessionGoals(data, sessionId).filter((state) => state.status === "active");
+		if (active.length > 1) throw new Error(`Session ${sessionId} 存在多个 active Goal`);
+		return active[0];
+	}
+	private byGoalId(data: WorkStateFile, sessionId: string, goalId: string): SessionWorkState | undefined {
+		const state = data.states[goalId];
+		return state?.sessionId === sessionId ? state : undefined;
+	}
+	private cancelPendingDecisions(data: WorkStateFile, goalId: string, timestamp: string): void {
+		for (const [id, decision] of Object.entries(data.decisions)) {
+			if (decision.goalId === goalId && decision.status === "pending") data.decisions[id] = { ...decision, status: "cancelled", updatedAt: timestamp };
+		}
+	}
 	async get(sessionId: string): Promise<SessionWorkState | undefined> {
-		return (await this.load()).states[sessionId];
+		const data = await this.load();
+		const state = this.active(data, sessionId) ?? this.sessionGoals(data, sessionId)[0];
+		return state ? copy(state) : undefined;
 	}
-
+	async getActive(sessionId: string): Promise<SessionWorkState | undefined> {
+		const state = this.active(await this.load(), sessionId);
+		return state ? copy(state) : undefined;
+	}
+	async getGoal(sessionId: string, goalId: string): Promise<SessionWorkState | undefined> {
+		const state = this.byGoalId(await this.load(), sessionId, goalId);
+		return state ? copy(state) : undefined;
+	}
+	async listSessionGoals(sessionId: string): Promise<SessionWorkState[]> {
+		return this.sessionGoals(await this.load(), sessionId).map(copy);
+	}
+	async listActive(): Promise<SessionWorkState[]> {
+		const data = await this.load();
+		for (const sessionId of new Set(Object.values(data.states).map((state) => state.sessionId))) this.active(data, sessionId);
+		return Object.values(data.states).filter((state) => state.status === "active").map(copy);
+	}
+	async findGoalCreationOperation(operationId: string): Promise<SessionWorkState | undefined> {
+		const operation = Object.values((await this.load()).operations).find((item) => item.id === operationId && item.kind === "create_goal");
+		return operation ? copy(operation.result as SessionWorkState) : undefined;
+	}
 	async create(input: {
-		sessionId: string;
-		goal: string;
-		completionBoundary: string;
-		reviewMode?: CompletionReviewMode;
-		reviewerModel?: string;
-		participantAgentIds?: string[];
+		sessionId: string; goal: string; completionBoundary: string; reviewMode?: CompletionReviewMode;
+		reviewerModel?: string; participantAgentIds?: string[]; contractProvenance?: GoalContractProvenance; operationId?: string;
 	}): Promise<SessionWorkState> {
-		const goal = text(input.goal, "goal", true)!;
-		const completionBoundary = text(input.completionBoundary, "completionBoundary", true)!;
-		const reviewerModel = text(input.reviewerModel, "reviewerModel");
+		const goal = requiredText(input.goal, "goal");
+		const completionBoundary = requiredText(input.completionBoundary, "completionBoundary");
+		const operationId = input.operationId ?? randomUUID();
+		const payload = { ...input, operationId: undefined, goal, completionBoundary };
 		return this.serialize(async () => {
 			const data = await this.load();
-			if (data.states[input.sessionId]) throw new Error("该 Session 已有 Goal 状态");
-			const now = new Date().toISOString();
+			const replay = this.replay<SessionWorkState>(data, input.sessionId, operationId, "create_goal", payload);
+			if (replay) return replay;
+			if (Object.values(data.operations).some((item) => item.id === operationId)) {
+				throw new WorkStateOperationConflictError("同一 Goal 创建 operationId 已属于另一 Session", "idempotency_conflict");
+			}
+			if (this.active(data, input.sessionId)) throw new Error("该 Session 已有正在进行的 Goal；请先完成或取消当前 Goal");
+			const provenance = input.contractProvenance ?? { criteriaOrigin: "user_input" as const, sourceMessageIds: [] };
+			if (provenance.criteriaOrigin === "manager_derived" && provenance.sourceMessageIds.length === 0) throw new Error("Manager 自动创建 Goal 必须引用至少一条来源消息");
+			const timestamp = now();
+			const goalId = randomUUID();
 			const state: SessionWorkState = {
-				sessionId: input.sessionId,
-				goal,
-				responsibleAgentId: "manager",
-				participantAgentIds: [...new Set(input.participantAgentIds ?? [])],
-				currentBrief: "",
-				completionBoundary,
-				goalRevision: 0,
-				reviewMode: input.reviewMode ?? "independent",
-				...(reviewerModel ? { reviewerModel } : {}),
-				completionReviews: [],
-				status: "active",
-				artifactIds: [],
-				revision: 0,
-				createdAt: now,
-				updatedAt: now,
+				goalId, sessionId: input.sessionId, goal,
+				contractProvenance: {
+					criteriaOrigin: provenance.criteriaOrigin,
+					sourceMessageIds: strings(provenance.sourceMessageIds, "sourceMessageIds"),
+					...(provenance.criteriaOrigin === "manager_derived" ? { authoredByAgentId: "manager" as const } : {}),
+				},
+				responsibleAgentId: "manager", participantAgentIds: [...new Set(input.participantAgentIds ?? [])],
+				currentBrief: "", completionBoundary, goalRevision: 1, reviewMode: input.reviewMode ?? "independent",
+				...(optionalText(input.reviewerModel, "reviewerModel") ? { reviewerModel: input.reviewerModel!.trim() } : {}),
+				completionReviews: [], status: "active", execution: { epoch: 1, status: "idle" },
+				artifactIds: [], revision: 0, createdAt: timestamp, updatedAt: timestamp,
 			};
-			data.states[input.sessionId] = state;
+			data.states[goalId] = state;
+			this.event(data, { id: `goal-created:${goalId}`, goalId, sessionId: input.sessionId, epoch: 1, kind: "goal_changed", payload: { action: "created" } });
+			this.commit(data, input.sessionId, operationId, 1, "create_goal", payload, state, 0, goalId, "session");
 			await this.write(data);
-			return state;
+			return copy(state);
 		});
 	}
-
 	async update(
-		sessionId: string,
-		expectedRevision: number,
+		sessionId: string, expectedRevision: number,
 		patch: {
-			goal?: string;
-			participantAgentIds?: string[];
-			currentBrief?: string;
-			waitingOn?: string;
-			nextAction?: string;
-			completionBoundary?: string;
-			reviewMode?: CompletionReviewMode;
-			reviewerModel?: string;
-			status?: SessionWorkStatus;
-			artifactIds?: string[];
+			goal?: string; participantAgentIds?: string[]; currentBrief?: string; waitingOn?: string; nextAction?: string;
+			completionBoundary?: string; reviewMode?: CompletionReviewMode; reviewerModel?: string; status?: SessionWorkStatus;
+			executionStatus?: GoalExecutionStatus; artifactIds?: string[];
 		},
+		operationId: string = randomUUID(), expectedEpoch?: number, expectedGoalId?: string,
 	): Promise<SessionWorkState> {
-		if (!Number.isInteger(expectedRevision) || expectedRevision < 0) throw new Error("revision 必须是非负整数");
+		const payload = { expectedGoalId, expectedRevision, expectedEpoch, patch };
 		return this.serialize(async () => {
 			const data = await this.load();
-			const current = data.states[sessionId];
-			if (!current) throw new Error("Session Goal 不存在");
-			if (current.revision !== expectedRevision) throw new WorkStateConflictError(current);
-			const status = patch.status ?? current.status;
-			const completionBoundary = text(patch.completionBoundary, "completionBoundary") ?? current.completionBoundary;
-			const currentBrief = text(patch.currentBrief, "currentBrief") ?? (patch.currentBrief === "" ? "" : current.currentBrief);
-			if (status === "resolved" && current.reviewMode === "independent" && current.status !== "resolved") {
-				throw new Error("独立复核 Goal 必须通过 reviewer 完成申请，不能直接设为 resolved");
-			}
-			if (status === "resolved" && (!completionBoundary || !currentBrief)) {
-				throw new Error("resolved 前必须填写 completionBoundary 与 currentBrief");
-			}
-			const goal = patch.goal !== undefined ? text(patch.goal, "goal", true)! : current.goal;
-			const contractChanged = goal !== current.goal || completionBoundary !== current.completionBoundary;
-			const reviewerModel = patch.reviewerModel !== undefined ? text(patch.reviewerModel, "reviewerModel") : current.reviewerModel;
+			const state = this.active(data, sessionId);
+			if (!state) throw new Error("Session Goal 不存在");
+			const goalId = expectedGoalId ?? state.goalId;
+			const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "update_goal", payload, goalId);
+			if (replay) return replay;
+			this.current(state, expectedRevision, expectedEpoch, goalId);
+			const goal = patch.goal === undefined ? state.goal : requiredText(patch.goal, "goal");
+			const boundary = patch.completionBoundary === undefined ? state.completionBoundary : requiredText(patch.completionBoundary, "completionBoundary");
+			const currentBrief = patch.currentBrief === undefined ? state.currentBrief : (patch.currentBrief.trim() ? requiredText(patch.currentBrief, "currentBrief") : "");
+			const requestedStatus = patch.status ?? state.status;
+			if (patch.status === "resolved") throw new Error("Goal 只能通过完成复核置为 resolved；Manager 使用 applyManagerCompletion，独立复核使用 applyCompletionReview");
+			const contractChanged = goal !== state.goal || boundary !== state.completionBoundary;
+			const status: SessionWorkStatus = contractChanged ? "active" : requestedStatus;
 			const next: SessionWorkState = {
-				...current,
-				goal,
-				...(patch.participantAgentIds !== undefined ? { participantAgentIds: stringList(patch.participantAgentIds, "participantAgentIds")! } : {}),
-				currentBrief,
-				...(patch.waitingOn !== undefined ? { waitingOn: text(patch.waitingOn, "waitingOn") } : {}),
-				...(patch.nextAction !== undefined ? { nextAction: text(patch.nextAction, "nextAction") } : {}),
-				completionBoundary,
-				goalRevision: contractChanged ? current.goalRevision + 1 : current.goalRevision,
-				...(patch.reviewMode !== undefined ? { reviewMode: patch.reviewMode } : {}),
-				status,
-				...(patch.artifactIds !== undefined ? { artifactIds: stringList(patch.artifactIds, "artifactIds")! } : {}),
-				revision: current.revision + 1,
-				updatedAt: new Date().toISOString(),
+				...state, goal, completionBoundary: boundary, currentBrief, status,
+				goalRevision: contractChanged ? state.goalRevision + 1 : state.goalRevision,
+				...(patch.participantAgentIds === undefined ? {} : { participantAgentIds: strings(patch.participantAgentIds, "participantAgentIds") }),
+				...(patch.reviewMode === undefined ? {} : { reviewMode: patch.reviewMode }),
+				...(patch.artifactIds === undefined ? {} : { artifactIds: strings(patch.artifactIds, "artifactIds") }),
+				execution: { ...state.execution, ...(status !== "active" ? { status: "idle" as const } : patch.executionStatus ? { status: patch.executionStatus } : {}) },
+				revision: state.revision + 1, updatedAt: now(),
 			};
-			if (reviewerModel) next.reviewerModel = reviewerModel;
-			else delete next.reviewerModel;
-			if (!next.waitingOn) delete next.waitingOn;
-			if (!next.nextAction) delete next.nextAction;
-			data.states[sessionId] = next;
+			const waitingOn = optionalText(patch.waitingOn, "waitingOn");
+			const nextAction = optionalText(patch.nextAction, "nextAction");
+			if (patch.waitingOn !== undefined) waitingOn ? next.waitingOn = waitingOn : delete next.waitingOn;
+			if (patch.nextAction !== undefined) nextAction ? next.nextAction = nextAction : delete next.nextAction;
+			if (patch.reviewerModel !== undefined) {
+				const model = optionalText(patch.reviewerModel, "reviewerModel");
+				model ? next.reviewerModel = model : delete next.reviewerModel;
+			}
+			if (contractChanged) {
+				if (next.plan) next.plan = { ...next.plan, needsReconcile: true };
+				next.nextAction = "Goal 契约已变化，重新对账 WorkPlan 与完成条件";
+			}
+			if (next.status !== "active") this.cancelPendingDecisions(data, state.goalId, next.updatedAt);
+			data.states[state.goalId] = next;
+			this.event(data, { id: `goal-change:${state.goalId}:${next.revision}`, goalId: state.goalId, sessionId, epoch: next.execution.epoch, kind: "goal_changed", payload: { action: "updated", revision: next.revision } });
+			this.commit(data, sessionId, operationId, next.execution.epoch, "update_goal", payload, next, next.revision, state.goalId);
 			await this.write(data);
-			return next;
+			return copy(next);
 		});
 	}
-
-	/**
-	 * 独立 reviewer 的唯一完成入口。复核期间若状态 revision 变化则拒绝提交，
-	 * 防止把旧证据的判定应用到更新后的当前工作。
-	 */
-	async applyCompletionReview(
-		sessionId: string,
-		expectedRevision: number,
+	async updatePlan(
+		sessionId: string, expectedRevision: number,
 		input: {
-			currentBrief: string;
-			artifactIds?: string[];
-			review: CompletionReview;
+			title?: string;
+			upsertItems: Array<{ id?: string; title: string; description?: string; assignedAgentId?: string; dependsOn?: string[]; acceptanceCriteria: string[]; sourceGoalCriteria?: string[] }>;
+			removeItemIds?: string[]; cancelItemIds?: string[]; reopenItemIds?: string[]; reason: string;
 		},
+		operationId: string, expectedEpoch?: number, expectedGoalId?: string,
 	): Promise<SessionWorkState> {
-		const currentBrief = text(input.currentBrief, "currentBrief", true)!;
+		const payload = { expectedGoalId, expectedRevision, expectedEpoch, input };
 		return this.serialize(async () => {
 			const data = await this.load();
-			const current = data.states[sessionId];
-			if (!current) throw new Error("Session Goal 不存在");
-			if (current.revision !== expectedRevision) throw new WorkStateConflictError(current);
-			if (current.reviewMode !== "independent") throw new Error("当前 Goal 未启用独立复核");
-			if (input.review.goalRevision !== current.goalRevision) throw new Error("reviewer 判定对应的 Goal 版本已失效");
-			if (Object.values(data.decisions).some((item) => item.sessionId === sessionId && item.status === "pending")) {
-				throw new Error("仍有待回答的人类决策，不能完成 Goal");
+			const state = this.active(data, sessionId);
+			if (!state) throw new Error("Session Goal 不存在");
+			const goalId = expectedGoalId ?? state.goalId;
+			const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "update_work_plan", payload, goalId);
+			if (replay) return replay;
+			this.current(state, expectedRevision, expectedEpoch, goalId);
+			const reason = requiredText(input.reason, "reason");
+			const timestamp = now();
+			const plan: GoalWorkPlan = state.plan ? copy(state.plan) : { id: randomUUID(), coveredGoalRevision: state.goalRevision, needsReconcile: false, revision: 0, items: {}, createdAt: timestamp, updatedAt: timestamp };
+			const allowedRefs = new Set(goalCriterionRefs(state).map((item) => item.id));
+			let ordinal = Object.keys(plan.items).length;
+			for (const raw of input.upsertItems) {
+				const id = raw.id?.trim() || `W${++ordinal}`;
+				const existing = plan.items[id];
+				const acceptanceCriteria = strings(raw.acceptanceCriteria, `${id}.acceptanceCriteria`);
+				if (!acceptanceCriteria.length) throw new Error(`WorkItem ${id} 至少需要一项验收条件`);
+				const sourceGoalCriteria = strings(raw.sourceGoalCriteria ?? [], `${id}.sourceGoalCriteria`);
+				const unknown = sourceGoalCriteria.filter((ref) => !allowedRefs.has(ref));
+				if (unknown.length) throw new Error(`WorkItem ${id} 引用了未知 Goal 条件：${unknown.join("、")}`);
+				const candidate = {
+					...(existing ?? { id, status: "planned" as const, delegationIds: [], submissions: [], revision: 0, createdAt: timestamp }),
+					title: requiredText(raw.title, `${id}.title`),
+					...(optionalText(raw.description, `${id}.description`) ? { description: raw.description!.trim() } : {}),
+					...(optionalText(raw.assignedAgentId, `${id}.assignedAgentId`) ? { assignedAgentId: raw.assignedAgentId!.trim() } : {}),
+					dependsOn: strings(raw.dependsOn ?? [], `${id}.dependsOn`), acceptanceCriteria, sourceGoalCriteria,
+					updatedAt: timestamp,
+				};
+				const materiallyChanged = Boolean(existing && stable({
+					title: existing.title, description: existing.description, assignedAgentId: existing.assignedAgentId,
+					dependsOn: existing.dependsOn, acceptanceCriteria: existing.acceptanceCriteria, sourceGoalCriteria: existing.sourceGoalCriteria,
+				}) !== stable({
+					title: candidate.title, description: candidate.description, assignedAgentId: candidate.assignedAgentId,
+					dependsOn: candidate.dependsOn, acceptanceCriteria: candidate.acceptanceCriteria, sourceGoalCriteria: candidate.sourceGoalCriteria,
+				}));
+				const acceptanceContractChanged = Boolean(existing && stable({
+					dependsOn: existing.dependsOn, acceptanceCriteria: existing.acceptanceCriteria, sourceGoalCriteria: existing.sourceGoalCriteria,
+				}) !== stable({
+					dependsOn: candidate.dependsOn, acceptanceCriteria: candidate.acceptanceCriteria, sourceGoalCriteria: candidate.sourceGoalCriteria,
+				}));
+				if (existing?.status === "accepted" && acceptanceContractChanged) {
+					const activeDependents = Object.values(plan.items).filter((item) => item.dependsOn.includes(id) && !["planned", "ready", "cancelled"].includes(item.status));
+					if (activeDependents.length) throw new Error(`WorkItem ${id} 的验收契约已被下游使用，先处理：${activeDependents.map((item) => item.id).join("、")}`);
+				}
+				const nextItem: WorkItem = {
+					...candidate,
+					revision: existing ? existing.revision + (materiallyChanged ? 1 : 0) : 0,
+					...(materiallyChanged && existing ? { lastChange: { reason, changedAt: timestamp, previousRevision: existing.revision } } : {}),
+				};
+				if (existing?.status === "accepted" && acceptanceContractChanged) {
+					nextItem.status = "revision";
+					delete nextItem.acceptedSubmissionId;
+				}
+				plan.items[id] = nextItem;
 			}
+			for (const id of strings(input.removeItemIds ?? [], "removeItemIds")) {
+				const item = plan.items[id];
+				if (!item) continue;
+				if (Object.values(plan.items).some((item) => item.id !== id && item.dependsOn.includes(id))) throw new Error(`WorkItem ${id} 仍被依赖`);
+				if (!["planned", "ready"].includes(item.status)) throw new Error(`WorkItem ${id} 已经开始，不能删除；如不再需要请取消并保留执行历史`);
+				if (item.delegationIds.length || item.submissions.length) throw new Error(`WorkItem ${id} 已有执行事实，不能删除`);
+				delete plan.items[id];
+			}
+			for (const id of strings(input.cancelItemIds ?? [], "cancelItemIds")) {
+				const item = plan.items[id];
+				if (!item) throw new Error(`WorkItem ${id} 不存在`);
+				if (item.activeDelegationId) throw new Error(`WorkItem ${id} 仍有活动 Delegation，必须先终止该 Worker 任务`);
+				if (item.status === "cancelled") continue;
+				const previousRevision = item.revision;
+				item.status = "cancelled";
+				item.revision += 1;
+				item.updatedAt = timestamp;
+				item.lastChange = { reason, changedAt: timestamp, previousRevision };
+			}
+			for (const id of strings(input.reopenItemIds ?? [], "reopenItemIds")) {
+				const item = plan.items[id];
+				if (!item) throw new Error(`WorkItem ${id} 不存在`);
+				if (item.status !== "blocked") throw new Error(`只有 blocked WorkItem 可以重新打开：${id}`);
+				const previousRevision = item.revision;
+				item.status = "revision";
+				item.revision += 1;
+				item.updatedAt = timestamp;
+				item.lastChange = { reason, changedAt: timestamp, previousRevision };
+			}
+			for (const item of Object.values(plan.items)) {
+				if (item.status === "cancelled") continue;
+				const unknownGoalRefs = item.sourceGoalCriteria.filter((ref) => !allowedRefs.has(ref));
+				if (unknownGoalRefs.length) throw new Error(`WorkItem ${item.id} 尚未对账当前 Goal 条件：${unknownGoalRefs.join("、")}`);
+				const cancelledDependencies = item.dependsOn.filter((id) => plan.items[id]?.status === "cancelled");
+				if (cancelledDependencies.length) throw new Error(`WorkItem ${item.id} 仍依赖已取消项：${cancelledDependencies.join("、")}`);
+			}
+			assertDag(plan.items);
+			plan.coveredGoalRevision = state.goalRevision;
+			plan.needsReconcile = false;
+			plan.revision += 1;
+			plan.updatedAt = timestamp;
+			if (input.title?.trim()) plan.title = input.title.trim();
+			deriveReady(plan);
+			const next = { ...state, plan, revision: state.revision + 1, updatedAt: timestamp };
+			data.states[state.goalId] = next;
+			this.event(data, { id: `work-plan:${state.goalId}:${plan.revision}`, goalId: state.goalId, sessionId, epoch: next.execution.epoch, kind: "goal_changed", payload: { action: "plan_updated", workPlanId: plan.id, revision: next.revision } });
+			this.commit(data, sessionId, operationId, next.execution.epoch, "update_work_plan", payload, next, next.revision, state.goalId);
+			await this.write(data);
+			return copy(next);
+		});
+	}
+	async noteDelegation(
+		sessionId: string,
+		input: { goalId: string; workItemId: string; delegationId: string; delegationStatus: "running" | "waiting_input" | "completed" | "failed" | "cancelled"; goalEpoch: number; artifactIds?: string[]; summary?: string; submittedAt?: string },
+		operationId: string,
+	): Promise<SessionWorkState> {
+		return this.serialize(async () => {
+			const data = await this.load();
+			const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "delegation_boundary", input, input.goalId);
+			if (replay) return replay;
+			const state = this.byGoalId(data, sessionId, input.goalId);
+			if (!state?.plan) throw new Error("WorkPlan 不存在");
+			if (state.status !== "active") throw new WorkStateOperationConflictError("历史 Goal 的 Delegation 只保留审计", "stale_goal_state");
+			if (state.execution.epoch !== input.goalEpoch) throw new WorkStateOperationConflictError("旧 epoch Delegation 只保留审计", "stale_goal_state");
+			const plan = copy(state.plan);
+			const item = plan.items[input.workItemId];
+			if (!item) throw new Error("WorkItem 不存在");
+			if (["accepted", "cancelled"].includes(item.status)) {
+				// Startup reconciliation and late terminal callbacks are allowed to
+				// observe an already-final WorkItem, but can never regress acceptance.
+				this.commit(data, sessionId, operationId, input.goalEpoch, "delegation_boundary", input, state, state.revision, state.goalId);
+				await this.write(data);
+				return copy(state);
+			}
+			if (!item.delegationIds.includes(input.delegationId)) item.delegationIds.push(input.delegationId);
+			const timestamp = input.submittedAt ?? now();
+			if (input.delegationStatus === "running") {
+				if (!["ready", "revision", "in_progress"].includes(item.status)) throw new Error(`WorkItem ${item.id} 当前不能开始委托`);
+				item.status = "in_progress"; item.activeDelegationId = input.delegationId;
+			} else if (input.delegationStatus === "waiting_input") {
+				item.status = "waiting_input"; item.activeDelegationId = input.delegationId;
+			} else {
+				delete item.activeDelegationId;
+				if (input.delegationStatus === "completed") {
+					if (!item.submissions.some((entry) => entry.delegationId === input.delegationId)) {
+						item.submissions.push({
+							id: randomUUID(), attempt: item.delegationIds.indexOf(input.delegationId) + 1,
+							source: "delegation", delegationId: input.delegationId, resultRef: { kind: "delegation_result", delegationId: input.delegationId },
+							artifactIds: strings(input.artifactIds ?? [], "artifactIds"),
+							...(input.summary?.trim() ? { summary: input.summary.trim() } : {}), submittedAt: timestamp,
+						});
+					}
+					item.status = "submitted";
+				} else if (!["accepted", "cancelled"].includes(item.status)) item.status = "revision";
+			}
+			item.revision += 1; item.updatedAt = timestamp; plan.revision += 1; plan.updatedAt = timestamp; deriveReady(plan);
+			const waiting = Object.values(plan.items).some((entry) => entry.status === "waiting_input");
+			const active = Object.values(plan.items).some((entry) => ["in_progress", "waiting_input"].includes(entry.status));
+			const next: SessionWorkState = { ...state, plan, execution: { ...state.execution, status: waiting ? "waiting_human" : active ? "running" : "idle" }, revision: state.revision + 1, updatedAt: timestamp };
+			data.states[state.goalId] = next;
+			this.event(data, { id: `work-item-boundary:${state.goalId}:${input.delegationId}:${input.delegationStatus}`, goalId: state.goalId, sessionId, epoch: next.execution.epoch, kind: "goal_changed", payload: { action: "delegation_boundary", workPlanId: plan.id, workItemId: item.id, status: item.status, revision: next.revision } });
+			this.commit(data, sessionId, operationId, input.goalEpoch, "delegation_boundary", input, next, next.revision, state.goalId);
+			await this.write(data);
+			return copy(next);
+		});
+	}
+	async advanceManagerWorkItem(
+		sessionId: string, workItemId: string, expectedRevision: number,
+		input: { status: "in_progress" | "submitted"; summary?: string; evidenceRefs?: string[] },
+		operationId: string, expectedEpoch?: number, expectedGoalId?: string,
+	): Promise<SessionWorkState> {
+		const payload = { expectedGoalId, workItemId, expectedRevision, input, expectedEpoch };
+		return this.serialize(async () => {
+			const data = await this.load();
+			const state = this.active(data, sessionId);
+			if (!state?.plan) throw new Error("WorkPlan 不存在");
+			const goalId = expectedGoalId ?? state.goalId;
+			const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "advance_manager_work_item", payload, goalId);
+			if (replay) return replay;
+			this.current(state, expectedRevision, expectedEpoch, goalId);
+			const plan = copy(state.plan);
+			const item = plan.items[workItemId];
+			if (!item) throw new Error("WorkItem 不存在");
+			if (item.assignedAgentId !== state.responsibleAgentId) throw new Error(`WorkItem ${workItemId} 不是 Manager 自己的工作项`);
+			if (item.activeDelegationId) throw new Error(`WorkItem ${workItemId} 已有活动 Delegation，不能按 Manager 工作项推进`);
+			const timestamp = now();
+			if (input.status === "in_progress") {
+				if (!["ready", "revision", "in_progress"].includes(item.status)) throw new Error(`WorkItem ${workItemId} 当前状态 ${item.status}，不能开始`);
+				item.status = "in_progress";
+			} else {
+				if (!["ready", "revision", "in_progress"].includes(item.status)) throw new Error(`WorkItem ${workItemId} 当前状态 ${item.status}，不能提交`);
+				const summary = requiredText(input.summary, "summary");
+				const evidenceRefs = strings(input.evidenceRefs ?? [], "evidenceRefs");
+				item.submissions.push({
+					id: randomUUID(), attempt: item.submissions.length + 1, source: "manager",
+					resultRef: { kind: "manager_summary", evidenceRefs }, artifactIds: [], summary, submittedAt: timestamp,
+				});
+				item.status = "submitted";
+			}
+			item.revision += 1; item.updatedAt = timestamp; plan.revision += 1; plan.updatedAt = timestamp; deriveReady(plan);
+			const active = Object.values(plan.items).some((entry) => entry.status === "in_progress");
+			const next: SessionWorkState = { ...state, plan, execution: { ...state.execution, status: active ? "running" : "idle" }, revision: state.revision + 1, updatedAt: timestamp };
+			data.states[state.goalId] = next;
+			this.event(data, { id: `manager-work-item:${state.goalId}:${workItemId}:${item.revision}`, goalId: state.goalId, sessionId, epoch: next.execution.epoch, kind: "goal_changed", payload: { action: "manager_work_item", workPlanId: plan.id, workItemId, status: item.status, revision: next.revision } });
+			this.commit(data, sessionId, operationId, next.execution.epoch, "advance_manager_work_item", payload, next, next.revision, state.goalId);
+			await this.write(data);
+			return copy(next);
+		});
+	}
+	async reviewWorkItem(
+		sessionId: string, workItemId: string, expectedRevision: number,
+		input: { verdict: "accepted" | "revision" | "blocked"; summary: string; evidenceRefs?: string[] },
+		operationId: string, expectedEpoch?: number, expectedGoalId?: string,
+	): Promise<SessionWorkState> {
+		const payload = { expectedGoalId, workItemId, expectedRevision, input, expectedEpoch };
+		return this.serialize(async () => {
+			const data = await this.load();
+			const state = this.active(data, sessionId);
+			if (!state?.plan) throw new Error("WorkPlan 不存在");
+			const goalId = expectedGoalId ?? state.goalId;
+			const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "review_work_item", payload, goalId);
+			if (replay) return replay;
+			this.current(state, expectedRevision, expectedEpoch, goalId);
+			const plan = copy(state.plan);
+			const item = plan.items[workItemId];
+			if (!item || item.status !== "submitted") throw new Error("只有 submitted WorkItem 可以验收");
+			const submission = [...item.submissions].reverse().find((entry) => !entry.review);
+			if (!submission) throw new Error("没有待验收 Submission");
+			const timestamp = now();
+			submission.review = { verdict: input.verdict, summary: requiredText(input.summary, "summary"), evidenceRefs: strings(input.evidenceRefs ?? [], "evidenceRefs"), reviewedAt: timestamp };
+			item.status = input.verdict;
+			input.verdict === "accepted" ? item.acceptedSubmissionId = submission.id : delete item.acceptedSubmissionId;
+			item.revision += 1; item.updatedAt = timestamp; plan.revision += 1; plan.updatedAt = timestamp; deriveReady(plan);
+			const next = { ...state, plan, revision: state.revision + 1, updatedAt: timestamp };
+			data.states[state.goalId] = next;
+			this.event(data, { id: `work-item-review:${state.goalId}:${submission.id}`, goalId: state.goalId, sessionId, epoch: next.execution.epoch, kind: "goal_changed", payload: { action: "work_item_reviewed", workPlanId: plan.id, workItemId: item.id, status: item.status, revision: next.revision } });
+			this.commit(data, sessionId, operationId, next.execution.epoch, "review_work_item", payload, next, next.revision, state.goalId);
+			await this.write(data);
+			return copy(next);
+		});
+	}
+	async applyCompletionReview(
+		sessionId: string, expectedRevision: number,
+		input: { currentBrief: string; artifactIds?: string[]; review: CompletionReview },
+		operationId: string = `review:${sessionId}:${input.review.goalRevision}:${input.review.id}`, expectedEpoch?: number, expectedGoalId?: string,
+	): Promise<SessionWorkState> {
+		const payload = { expectedGoalId, expectedRevision, input, expectedEpoch };
+		return this.serialize(async () => {
+			const data = await this.load();
+			const state = this.active(data, sessionId);
+			if (!state) throw new Error("Session Goal 不存在");
+			const goalId = expectedGoalId ?? state.goalId;
+			const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "completion_review", payload, goalId);
+			if (replay) return replay;
+			this.current(state, expectedRevision, expectedEpoch, goalId);
+			if (state.reviewMode !== "independent" || input.review.goalRevision !== state.goalRevision) throw new Error("reviewer 判定不属于当前 Goal");
+			if (state.plan && (state.plan.needsReconcile || state.plan.coveredGoalRevision !== state.goalRevision || Object.values(state.plan.items).some((item) => !["accepted", "cancelled"].includes(item.status)))) throw new Error("WorkPlan 未覆盖当前 Goal 或仍有未验收项");
+			if (Object.values(data.decisions).some((item) => item.goalId === state.goalId && item.status === "pending")) throw new Error("仍有待回答的人类决策");
 			const satisfied = input.review.verdict === "satisfied";
 			const next: SessionWorkState = {
-				...current,
-				currentBrief,
-				completionReviews: [...current.completionReviews, input.review],
+				...state, currentBrief: requiredText(input.currentBrief, "currentBrief"),
+				completionReviews: state.completionReviews.some((item) => item.id === input.review.id) ? state.completionReviews : [...state.completionReviews, input.review],
 				status: satisfied ? "resolved" : "active",
-				...(input.artifactIds !== undefined ? { artifactIds: stringList(input.artifactIds, "artifactIds")! } : {}),
-				revision: current.revision + 1,
-				updatedAt: new Date().toISOString(),
+				execution: { ...state.execution, status: satisfied ? "idle" : input.review.verdict === "needs_human" ? "waiting_human" : "idle" },
+				...(input.artifactIds === undefined ? {} : { artifactIds: strings(input.artifactIds, "artifactIds") }),
+				revision: state.revision + 1, updatedAt: now(),
 			};
-			if (satisfied) {
-				delete next.waitingOn;
-				delete next.nextAction;
-			} else {
-				next.nextAction = input.review.verdict === "needs_human"
-					? "根据独立复核结果请求必要的人类确认"
-					: input.review.gaps.join("；") || "根据独立复核结果补齐未满足条件";
-			}
-			data.states[sessionId] = next;
+			if (satisfied) { delete next.waitingOn; delete next.nextAction }
+			else next.nextAction = input.review.verdict === "needs_human" ? "根据复核结果请求人类确认" : input.review.gaps.join("；") || "补齐未满足条件";
+			if (satisfied) this.cancelPendingDecisions(data, state.goalId, next.updatedAt);
+			data.states[state.goalId] = next;
+			this.event(data, { id: `completion-review:${state.goalId}:${input.review.id}`, goalId: state.goalId, sessionId, epoch: next.execution.epoch, kind: "goal_changed", payload: { action: "completion_reviewed", verdict: input.review.verdict, revision: next.revision } });
+			this.commit(data, sessionId, operationId, next.execution.epoch, "completion_review", payload, next, next.revision, state.goalId);
 			await this.write(data);
-			return next;
+			return copy(next);
 		});
 	}
-
+	async applyManagerCompletion(
+		sessionId: string, expectedRevision: number,
+		input: { currentBrief: string; artifactIds?: string[]; criteria: CompletionReviewCriterion[] },
+		operationId: string, expectedEpoch?: number, expectedGoalId?: string,
+	): Promise<SessionWorkState> {
+		const payload = { expectedGoalId, expectedRevision, input, expectedEpoch };
+		return this.serialize(async () => {
+			const data = await this.load();
+			const state = this.active(data, sessionId);
+			if (!state) throw new Error("Session Goal 不存在");
+			const goalId = expectedGoalId ?? state.goalId;
+			const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "manager_completion", payload, goalId);
+			if (replay) return replay;
+			this.current(state, expectedRevision, expectedEpoch, goalId);
+			if (state.reviewMode !== "manager") throw new Error("当前 Goal 必须通过独立 reviewer 完成复核");
+			if (state.plan && (state.plan.needsReconcile || state.plan.coveredGoalRevision !== state.goalRevision || Object.values(state.plan.items).some((item) => !["accepted", "cancelled"].includes(item.status)))) throw new Error("WorkPlan 未覆盖当前 Goal 或仍有未验收项");
+			if (Object.values(data.decisions).some((item) => item.goalId === state.goalId && item.status === "pending")) throw new Error("仍有待回答的人类决策");
+			const expected = goalCriterionRefs(state).map((item) => item.text);
+			if (input.criteria.length !== expected.length) throw new Error(`必须逐项复核全部 ${expected.length} 条 Goal 完成条件`);
+			const criteria = input.criteria.map((criterion, index) => {
+				if (requiredText(criterion.criterion, `criteria[${index}].criterion`) !== expected[index]) throw new Error(`第 ${index + 1} 条复核条件必须与冻结 Goal 条件一致`);
+				if (criterion.status !== "satisfied") throw new Error(`第 ${index + 1} 条 Goal 完成条件尚未满足，不能完成 Goal`);
+				const evidenceRefs = strings(criterion.evidenceRefs, `criteria[${index}].evidenceRefs`);
+				if (!evidenceRefs.length) throw new Error(`第 ${index + 1} 条 Goal 完成条件必须引用至少一条证据`);
+				return {
+					criterion: expected[index]!, status: "satisfied" as const,
+					evidenceRefs,
+					explanation: requiredText(criterion.explanation, `criteria[${index}].explanation`),
+				};
+			});
+			const timestamp = now();
+			const review: CompletionReview = {
+				id: randomUUID(), goalRevision: state.goalRevision, mode: "manager", verdict: "satisfied",
+				criteria, gaps: [], reviewerSessionId: sessionId, reviewedAt: timestamp,
+			};
+			const next: SessionWorkState = {
+				...state, currentBrief: requiredText(input.currentBrief, "currentBrief"),
+				completionReviews: [...state.completionReviews, review], status: "resolved",
+				execution: { ...state.execution, status: "idle" },
+				...(input.artifactIds === undefined ? {} : { artifactIds: strings(input.artifactIds, "artifactIds") }),
+				revision: state.revision + 1, updatedAt: timestamp,
+			};
+			delete next.waitingOn; delete next.nextAction;
+			this.cancelPendingDecisions(data, state.goalId, timestamp);
+			data.states[state.goalId] = next;
+			this.event(data, { id: `manager-completion:${state.goalId}:${review.id}`, goalId: state.goalId, sessionId, epoch: next.execution.epoch, kind: "goal_changed", payload: { action: "completion_reviewed", verdict: review.verdict, revision: next.revision } });
+			this.commit(data, sessionId, operationId, next.execution.epoch, "manager_completion", payload, next, next.revision, state.goalId);
+			await this.write(data);
+			return copy(next);
+		});
+	}
+	async interruptGoal(sessionId: string, expectedRevision: number, input: { kind: GoalInterruption["kind"]; fingerprint: string; delegationIds: string[] }, operationId: string, expectedGoalId?: string): Promise<SessionWorkState> {
+		const payload = { expectedGoalId, expectedRevision, input };
+		return this.serialize(async () => {
+			const data = await this.load();
+			const state = this.active(data, sessionId);
+			if (!state) throw new Error("Session Goal 不存在");
+			const goalId = expectedGoalId ?? state.goalId;
+			const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "interrupt_goal", payload, goalId);
+			if (replay) return replay;
+			this.current(state, expectedRevision, undefined, goalId);
+			if (state.execution.interruption?.fingerprint === input.fingerprint) return copy(state);
+			const epoch = state.execution.epoch + 1;
+			const interruption: GoalInterruption = { id: randomUUID(), kind: input.kind, fingerprint: requiredText(input.fingerprint, "fingerprint"), delegationIds: strings(input.delegationIds, "delegationIds"), interruptedAt: now() };
+			const next: SessionWorkState = { ...state, execution: { epoch, status: "interrupted", interruption }, revision: state.revision + 1, updatedAt: now() };
+			data.states[state.goalId] = next;
+			this.event(data, { id: `goal-interrupted:${state.goalId}:${epoch}`, goalId: state.goalId, sessionId, epoch, kind: "goal_interrupted", payload: { interruption } });
+			this.commit(data, sessionId, operationId, epoch, "interrupt_goal", payload, next, next.revision, state.goalId);
+			await this.write(data);
+			return copy(next);
+		});
+	}
+	async resumeGoal(sessionId: string, expectedRevision: number, input: { ownerId: string; leaseMs?: number }, operationId: string, expectedGoalId?: string): Promise<SessionWorkState> {
+		const payload = { expectedGoalId, expectedRevision, input };
+		return this.serialize(async () => {
+			const data = await this.load();
+			const state = this.active(data, sessionId);
+			if (!state) throw new Error("Session Goal 不存在");
+			const goalId = expectedGoalId ?? state.goalId;
+			const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "resume_goal", payload, goalId);
+			if (replay) return replay;
+			this.current(state, expectedRevision, undefined, goalId);
+			if (!["interrupted", "recovering"].includes(state.execution.status)) throw new Error("只有 interrupted Goal 可以恢复");
+			const timestamp = Date.now();
+			const existing = state.execution.resumeLease;
+			if (existing && new Date(existing.expiresAt).getTime() > timestamp) throw new WorkStateOperationConflictError("Goal 已有有效恢复 lease；相同请求必须重放原 operationId", "stale_goal_state");
+			const leaseMs = Math.max(5_000, Math.min(input.leaseMs ?? 30_000, 300_000));
+			const lease = { ownerId: requiredText(input.ownerId, "ownerId"), token: randomUUID(), expiresAt: new Date(timestamp + leaseMs).toISOString() };
+			const next: SessionWorkState = { ...state, execution: { ...state.execution, status: "recovering", resumeLease: lease }, revision: state.revision + 1, updatedAt: now() };
+			data.states[state.goalId] = next;
+			this.event(data, { id: `goal-recovery:${state.goalId}:${next.execution.epoch}`, goalId: state.goalId, sessionId, epoch: next.execution.epoch, kind: "goal_recovery", payload: { lease, interruption: next.execution.interruption } });
+			this.commit(data, sessionId, operationId, next.execution.epoch, "resume_goal", payload, next, next.revision, state.goalId);
+			await this.write(data);
+			return copy(next);
+		});
+	}
+	async reconcileDelegations(delegations: Array<{
+		id: string; managerSessionId: string; goalId?: string; workItemId?: string; goalEpoch?: number;
+		status: "running" | "waiting_input" | "completed" | "failed" | "cancelled"; revision: number; updatedAt: string;
+		result?: unknown;
+	}>): Promise<{ projected: number; interrupted: number }> {
+		let projected = 0;
+		for (const item of delegations) {
+			if (!item.goalId || !item.workItemId || item.goalEpoch === undefined || !["completed", "failed", "cancelled"].includes(item.status)) continue;
+			const state = await this.getGoal(item.managerSessionId, item.goalId);
+			if (!state?.plan?.items[item.workItemId] || state.execution.epoch !== item.goalEpoch) continue;
+			try {
+				await this.noteDelegation(item.managerSessionId, {
+					goalId: item.goalId, workItemId: item.workItemId, delegationId: item.id, delegationStatus: item.status, goalEpoch: item.goalEpoch,
+					artifactIds: [], submittedAt: item.updatedAt,
+				}, `reconcile-delegation-boundary:${item.id}:${item.revision}`);
+				projected++;
+			} catch (error) { if (!(error instanceof WorkStateOperationConflictError)) throw error }
+		}
+		let interrupted = 0;
+		const sessions = new Map<string, typeof delegations>();
+		for (const item of delegations) {
+			if (!item.result || typeof item.result !== "object" || (item.result as { errorCode?: unknown }).errorCode !== "server_restart" || item.goalEpoch === undefined) continue;
+			const list = sessions.get(item.managerSessionId) ?? [];
+			list.push(item); sessions.set(item.managerSessionId, list);
+		}
+		for (const [sessionId, items] of sessions) {
+			const state = await this.getActive(sessionId);
+			if (!state) continue;
+			const ids = items.filter((item) => item.goalId === state.goalId && item.goalEpoch === state.execution.epoch).map((item) => item.id).sort();
+			if (!ids.length) continue;
+			const fingerprint = `server_restart:${hash(ids)}`;
+			await this.interruptGoal(sessionId, state.revision, { kind: "server_restart", fingerprint, delegationIds: ids }, `reconcile:${fingerprint}`, state.goalId);
+			interrupted++;
+		}
+		for (const item of delegations) {
+			if (!item.result || typeof item.result !== "object" || (item.result as { errorCode?: unknown }).errorCode !== "effect_unknown" || item.goalEpoch === undefined) continue;
+			const state = await this.getActive(item.managerSessionId);
+			if (!state || item.goalId !== state.goalId || state.execution.epoch !== item.goalEpoch || state.execution.status === "interrupted") continue;
+			await this.interruptGoal(
+				item.managerSessionId,
+				state.revision,
+				{ kind: "effect_unknown", fingerprint: "effect_unknown:" + item.id + ":" + item.revision, delegationIds: [item.id] },
+				"effect-unknown:" + item.id + ":" + item.revision,
+				state.goalId,
+			);
+			interrupted++;
+		}
+		return { projected, interrupted };
+	}
 	async removeSession(sessionId: string): Promise<void> {
 		await this.serialize(async () => {
 			const data = await this.load();
-			delete data.states[sessionId];
-			for (const [id, decision] of Object.entries(data.decisions)) {
-				if (decision.sessionId === sessionId) delete data.decisions[id];
-			}
+			for (const [goalId, state] of Object.entries(data.states)) if (state.sessionId === sessionId) delete data.states[goalId];
+			for (const [id, item] of Object.entries(data.decisions)) if (item.sessionId === sessionId) delete data.decisions[id];
+			for (const [id, item] of Object.entries(data.operations)) if (item.sessionId === sessionId) delete data.operations[id];
+			for (const [id, item] of Object.entries(data.outbox)) if (item.sessionId === sessionId) delete data.outbox[id];
 			await this.write(data);
 		});
 	}
-
-	async createDecision(input: Omit<DecisionRequest, "id" | "status" | "createdAt" | "updatedAt">): Promise<DecisionRequest> {
-		const question = text(input.question, "question", true)!;
-		const blockedAction = text(input.blockedAction, "blockedAction", true)!;
-		const resumeHint = text(input.resumeHint, "resumeHint", true)!;
+	async createDecision(input: Omit<DecisionRequest, "id" | "goalId" | "status" | "createdAt" | "updatedAt">, operationId: string = randomUUID(), expectedRevision?: number, expectedGoalId?: string): Promise<DecisionRequest> {
+		const payload = { input, expectedRevision, expectedGoalId };
 		return this.serialize(async () => {
 			const data = await this.load();
-			if (!data.states[input.sessionId]) throw new Error("DecisionRequest 必须属于有 Goal 的 Session");
-			const now = new Date().toISOString();
+			const state = this.active(data, input.sessionId);
+			if (!state) throw new Error("DecisionRequest 必须属于有 Goal 的 Session");
+			const goalId = expectedGoalId ?? state.goalId;
+			const replay = this.replay<DecisionRequest>(data, input.sessionId, operationId, "create_decision", payload, goalId);
+			if (replay) return replay;
+			if (expectedRevision !== undefined) this.current(state, expectedRevision, undefined, goalId);
+			else if (state.goalId !== goalId) throw new WorkStateOperationConflictError("当前 Goal 已变化，请重新读取目标状态", "stale_goal_state");
+			const timestamp = now();
 			const decision: DecisionRequest = {
-				...input,
-				question,
-				context: text(input.context, "context") ?? "",
-				blockedAction,
-				resumeHint,
-				id: randomUUID(),
-				status: "pending",
-				createdAt: now,
-				updatedAt: now,
+				...input, goalId: state.goalId, question: requiredText(input.question, "question"), context: optionalText(input.context, "context") ?? "",
+				blockedAction: requiredText(input.blockedAction, "blockedAction"), resumeHint: requiredText(input.resumeHint, "resumeHint"),
+				id: randomUUID(), status: "pending", createdAt: timestamp, updatedAt: timestamp,
 			};
 			data.decisions[decision.id] = decision;
+			const next = { ...state, waitingOn: decision.question, nextAction: decision.resumeHint, execution: { ...state.execution, status: "waiting_human" as const }, revision: state.revision + 1, updatedAt: timestamp };
+			data.states[state.goalId] = next;
+			this.commit(data, input.sessionId, operationId, state.execution.epoch, "create_decision", payload, decision, next.revision, state.goalId);
 			await this.write(data);
-			return decision;
+			return copy(decision);
 		});
 	}
-
-	async listDecisions(sessionId: string): Promise<DecisionRequest[]> {
-		return Object.values((await this.load()).decisions)
-			.filter((item) => item.sessionId === sessionId)
-			.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+	async listDecisions(sessionId: string, goalId?: string): Promise<DecisionRequest[]> {
+		const data = await this.load();
+		const selectedGoalId = goalId ?? this.active(data, sessionId)?.goalId;
+		if (!selectedGoalId) return [];
+		return Object.values(data.decisions).filter((item) => item.sessionId === sessionId && item.goalId === selectedGoalId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).map(copy);
 	}
-
-	async answerDecision(id: string, answer: string, grantedAuthorizationScope?: string): Promise<DecisionRequest> {
-		const normalizedAnswer = text(answer, "answer", true)!;
+	async answerDecision(id: string, answer: string, grantedAuthorizationScope?: string, operationId: string = randomUUID()): Promise<DecisionRequest> {
 		return this.serialize(async () => {
 			const data = await this.load();
-			const current = data.decisions[id];
-			if (!current) throw new Error("DecisionRequest 不存在");
-			if (current.status !== "pending") throw new Error("DecisionRequest 已处理");
-			const next: DecisionRequest = {
-				...current,
-				status: "answered",
-				answer: normalizedAnswer,
-				...(grantedAuthorizationScope?.trim() ? { grantedAuthorizationScope: grantedAuthorizationScope.trim() } : {}),
-				updatedAt: new Date().toISOString(),
-			};
+			const decision = data.decisions[id];
+			if (!decision) throw new Error("DecisionRequest 不存在");
+			const payload = { id, answer: requiredText(answer, "answer"), grantedAuthorizationScope };
+			const replay = this.replay<DecisionRequest>(data, decision.sessionId, operationId, "answer_decision", payload, decision.goalId);
+			if (replay) return replay;
+			if (decision.status !== "pending") throw new Error("DecisionRequest 已处理");
+			const timestamp = now();
+			const next: DecisionRequest = { ...decision, status: "answered", answer: payload.answer, ...(grantedAuthorizationScope?.trim() ? { grantedAuthorizationScope: grantedAuthorizationScope.trim() } : {}), updatedAt: timestamp };
 			data.decisions[id] = next;
+			const state = this.byGoalId(data, decision.sessionId, decision.goalId);
+			if (!state || state.status !== "active") throw new WorkStateOperationConflictError("历史 Goal 的决策不能再回答", "stale_goal_state");
+			if (state) {
+				const pending = Object.values(data.decisions).some((item) => item.goalId === decision.goalId && item.status === "pending");
+				data.states[state.goalId] = { ...state, waitingOn: pending ? state.waitingOn : undefined, nextAction: decision.resumeHint, execution: { ...state.execution, status: pending ? "waiting_human" : "running" }, revision: state.revision + 1, updatedAt: timestamp };
+				this.event(data, { id: `decision-answered:${decision.goalId}:${id}`, goalId: decision.goalId, sessionId: decision.sessionId, epoch: state.execution.epoch, kind: "decision_answered", payload: { decision: next } });
+			}
+			this.commit(data, decision.sessionId, operationId, state.execution.epoch, "answer_decision", payload, next, state.revision + 1, state.goalId);
 			await this.write(data);
-			return next;
+			return copy(next);
+		});
+	}
+	async pendingOutbox(): Promise<GoalOutboxEvent[]> {
+		return Object.values((await this.load()).outbox).filter((item) => item.status === "pending").sort((a, b) => a.createdAt.localeCompare(b.createdAt)).map(copy);
+	}
+	async markOutboxDelivered(eventId: string): Promise<void> {
+		await this.serialize(async () => {
+			const data = await this.load();
+			const event = data.outbox[eventId];
+			if (!event || event.status === "delivered") return;
+			data.outbox[eventId] = { ...event, status: "delivered", deliveredAt: now() };
+			await this.write(data);
 		});
 	}
 }

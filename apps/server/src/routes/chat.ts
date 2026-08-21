@@ -116,6 +116,7 @@ export async function registerChatRoutes(
 	app.get("/api/sessions", async () => ({ sessions: await store.list() }));
 
 	app.delete<{ Params: { id: string } }>("/api/sessions/:id", async (req, reply) => {
+		await invoker?.cancelManagerSession(req.params.id);
 		const removed = await store.remove(req.params.id);
 		// A fresh window session may only exist as a config (pi writes the
 		// session file lazily) — clean the window store regardless, and only
@@ -185,6 +186,7 @@ export async function registerChatRoutes(
 						teams,
 						sessions: store,
 						invoker,
+						workStates,
 						onError: forwardError,
 						log: (message) => app.log.info(message),
 					},

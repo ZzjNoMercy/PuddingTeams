@@ -3,6 +3,7 @@ import { AgentRuntime } from "../agent-runtime/runtime.js";
 import { AgentInvoker } from "../agent-runtime/invoker.js";
 import { InteractionError } from "../agent-runtime/interaction-broker.js";
 import { TeamsStore } from "../store/teams.js";
+import type { WorkStateStore } from "../store/work-state.js";
 
 /**
  * M3：浏览器只拿 interaction.id；runHandle/sessionHandle 是 worker 私有句柄，
@@ -51,6 +52,7 @@ export function registerInteractionsRoutes(
 	runtime: AgentRuntime,
 	invoker: AgentInvoker,
 	teams: TeamsStore,
+	workStates?: WorkStateStore,
 ): void {
 	// 列出某个窗口下的 pending 审批卡。
 	app.get<{ Querystring: { windowId?: string; sessionId?: string } }>("/api/interactions", async (req) => {
@@ -70,7 +72,7 @@ export function registerInteractionsRoutes(
 	// 提交审批：POST /api/interactions/:id/responses
 	app.post<{
 		Params: { id: string };
-		Body: { requestId?: string; revision?: number; responses?: unknown; windowId?: string };
+		Body: { requestId?: string; revision?: number; responses?: unknown; windowId?: string; expectedGoalId?: string };
 	}>("/api/interactions/:id/responses", async (req, reply) => {
 		const requestId = req.body?.requestId?.trim();
 		const revision = req.body?.revision;
@@ -81,10 +83,21 @@ export function registerInteractionsRoutes(
 		if (!Array.isArray(responses) || responses.length === 0) {
 			return reply.code(400).send({ error: "responses must be a non-empty array" });
 		}
+		if (responses.some((item) => !item || typeof item !== "object" || !["approve", "reject", "answer", "confirm"].includes(String((item as { action?: unknown }).action)))) {
+			return reply.code(400).send({ error: "response action must be approve, reject, answer, or confirm" });
+		}
 		// §12.3 非当前窗口不能审批：windowId 从服务端 delegation 派生，不信任 body。
 		const delegation = await runtime.getDelegationById(req.params.id);
 		if (delegation && req.body?.windowId && delegation.windowId !== req.body.windowId) {
 			return reply.code(403).send({ error: "interaction belongs to another window" });
+		}
+		if (delegation?.goalId) {
+			const expectedGoalId = req.body?.expectedGoalId?.trim();
+			if (!expectedGoalId) return reply.code(400).send({ error: "处理 Goal 审批需要 expectedGoalId" });
+			const activeGoal = await workStates?.getActive(delegation.managerSessionId);
+			if (expectedGoalId !== delegation.goalId || activeGoal?.goalId !== delegation.goalId) {
+				return reply.code(409).send({ error: "该审批属于已结束的 Goal，不能继续处理", code: "stale_goal_state" });
+			}
 		}
 		try {
 			const outcome = await invoker.respond(
@@ -110,7 +123,7 @@ export function registerInteractionsRoutes(
 			return { outcome: stripHandles(outcome) };
 		} catch (err) {
 			if (err instanceof InteractionError) {
-				const status = err.code === "not_found" ? 404 : err.code === "not_pending" ? 409 : 400;
+				const status = err.code === "not_found" ? 404 : err.code === "not_pending" || err.code === "idempotency_conflict" ? 409 : 400;
 				return reply.code(status).send({ error: err.message, code: err.code });
 			}
 			return reply.code(500).send({ error: err instanceof Error ? err.message : String(err) });
@@ -118,9 +131,17 @@ export function registerInteractionsRoutes(
 	});
 
 	// 取消一个 pending interaction（用户主动取消，非静默）。H3：按 interaction id。
-	app.post<{ Params: { id: string } }>("/api/interactions/:id/cancel", async (req, reply) => {
+	app.post<{ Params: { id: string }; Body: { expectedGoalId?: string } }>("/api/interactions/:id/cancel", async (req, reply) => {
 		const delegation = await runtime.getDelegationById(req.params.id);
 		if (!delegation) return reply.code(404).send({ error: "interaction not found" });
+		if (delegation.goalId) {
+			const expectedGoalId = req.body?.expectedGoalId?.trim();
+			if (!expectedGoalId) return reply.code(400).send({ error: "取消 Goal 审批需要 expectedGoalId" });
+			const activeGoal = await workStates?.getActive(delegation.managerSessionId);
+			if (expectedGoalId !== delegation.goalId || activeGoal?.goalId !== delegation.goalId) {
+				return reply.code(409).send({ error: "该审批属于已结束的 Goal，不能继续处理", code: "stale_goal_state" });
+			}
+		}
 		try {
 			await invoker.cancel(delegation.id, undefined);
 			return { ok: true };

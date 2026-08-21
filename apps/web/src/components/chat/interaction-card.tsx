@@ -46,6 +46,7 @@ export function InteractionCard({
 	requests,
 	revision,
 	windowId,
+	goalId,
 	statusHint,
 	compact,
 	onOpenWindow,
@@ -55,6 +56,7 @@ export function InteractionCard({
 	requests?: Array<{ requestId: string; prompt: string; command?: string; path?: string; risk?: string; options?: string[] }>;
 	revision?: number;
 	windowId?: string;
+	goalId?: string;
 	statusHint?: string;
 	compact?: boolean;
 	onOpenWindow?: (windowId: string) => void;
@@ -112,6 +114,7 @@ export function InteractionCard({
 				const outcome = (await submitInteractionResponse(interactionId, {
 					requestId: crypto.randomUUID(),
 					revision: liveRevision ?? revision ?? 0,
+					...(goalId ? { expectedGoalId: goalId } : {}),
 					...(windowId ? { windowId } : {}),
 					responses: (requests ?? []).map((r) => ({
 						requestId: r.requestId,
@@ -158,14 +161,14 @@ export function InteractionCard({
 				setBusy(false);
 			}
 		},
-		[interactionId, liveRevision, revision, requests, scope, windowId],
+		[goalId, interactionId, liveRevision, revision, requests, scope, windowId],
 	);
 
 	const cancel = useCallback(async () => {
 		if (!interactionId) return;
 		setBusy(true);
 		try {
-			await cancelInteraction(interactionId);
+			await cancelInteraction(interactionId, goalId);
 			setStatus("expired");
 			toast.success("已取消该审批");
 		} catch (err) {
@@ -173,7 +176,7 @@ export function InteractionCard({
 		} finally {
 			setBusy(false);
 		}
-	}, [interactionId]);
+	}, [goalId, interactionId]);
 
 	const resolved = status !== "pending" && status !== "busy";
 

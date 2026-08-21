@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Type } from "typebox";
+import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { TeamsStore } from "../store/teams.js";
 import { AgentRuntime } from "../agent-runtime/runtime.js";
 import { DelegationStore } from "../agent-runtime/delegation-store.js";
@@ -436,6 +437,8 @@ test("group running 投影直接追加为隐藏 custom entry，不进入展示�
 	const { teams, sessions } = await makeStack();
 	const summary = await sessions.create();
 	await teams.createWindow({ type: "group", members: ["puddingclaw"], sessionId: summary.id });
+	const liveEvents: AgentSessionEvent[] = [];
+	const unsubscribe = sessions.subscribe(summary.id, (event) => liveEvents.push(event));
 
 	await sessions.appendCustomMessageProjection(summary.id, {
 		customType: "pudding:task_assign",
@@ -457,5 +460,14 @@ test("group running 投影直接追加为隐藏 custom entry，不进入展示�
 	assert.equal(projection.display, false);
 	assert.equal((projection.details as { delegationId?: string }).delegationId, "delegation-1");
 	assert.ok(session.sessionFile, "隐藏投影也必须立即刷出 manager Session JSONL");
+	const liveProjection = liveEvents.find((event) => event.type === "message_start") as
+		| { type: "message_start"; message: { role?: string; customType?: string; display?: boolean; details?: unknown } }
+		| undefined;
+	assert.ok(liveProjection, "隐藏投影必须通过 store 订阅实时广播给已打开的 manager 页面");
+	assert.equal(liveProjection.message.role, "custom");
+	assert.equal(liveProjection.message.customType, "pudding:task_assign");
+	assert.equal(liveProjection.message.display, false);
+	assert.equal((liveProjection.message.details as { delegationId?: string }).delegationId, "delegation-1");
+	unsubscribe();
 	await sessions.disposeAll();
 });

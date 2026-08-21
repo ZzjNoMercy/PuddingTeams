@@ -6,7 +6,7 @@ import path from "node:path";
 import { parseExtensionManifest, ExtensionCatalog } from "./extensions.js";
 import { DriverRegistry } from "./driver-registry.js";
 import { ExtensionRegistry } from "./extension-registry.js";
-import { LocalPiDriver, PI_CAPABILITIES } from "./pi-driver.js";
+import { LocalPiDriver, PI_CAPABILITIES, transientCooldownMs } from "./pi-driver.js";
 import { piConnectorManifest, piExtensionHooks } from "./pi-extension.js";
 import type { AgentEvent, InvocationContext } from "./types.js";
 
@@ -93,6 +93,47 @@ test("Phase6: respond 防御性失败——v1 不支持审批外送", async () =
 test("Phase6: cancel 对未知 runHandle 是 no-op（不抛异常）", async () => {
 	const driver = new LocalPiDriver();
 	await driver.cancel({ runHandle: "nonexistent" }, ctx);
+});
+
+test("Phase6: 429/过载进入同 Session 冷却续跑策略，普通错误不吞", () => {
+	const options = { rateLimitDelayMs: 123, overloadedDelayMs: 456 };
+	assert.equal(transientCooldownMs("429: organization max RPM", options), 123);
+	assert.equal(transientCooldownMs("429: please try again after 1 seconds", options), 1_000);
+	assert.equal(transientCooldownMs("rate limit; retry after 2500 ms", options), 2_500);
+	assert.equal(transientCooldownMs("engine_overloaded_error", options), 456);
+	assert.equal(transientCooldownMs("permission denied", options), undefined);
+});
+
+test("Phase6: 429 冷却后复用同一 AgentSession 与 runHandle 续跑", async () => {
+	const driver = new LocalPiDriver({ transientRecovery: { maxAttempts: 1, rateLimitDelayMs: 0 } });
+	const prompts: string[] = [];
+	const session = {
+		messages: [] as Array<Record<string, unknown>>,
+		subscribe: () => () => undefined,
+		async prompt(message: string) {
+			prompts.push(message);
+			if (prompts.length === 1) {
+				this.messages.push({ role: "assistant", stopReason: "error", errorMessage: "429: organization max RPM" });
+			} else {
+				this.messages.push({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "续跑完成" }] });
+			}
+		},
+		async abort() {},
+	};
+	const drive = (driver as unknown as {
+		drive(session: unknown, message: string, context: InvocationContext, sessionHandle: string, runHandle: string): AsyncIterable<AgentEvent>;
+	}).drive.bind(driver);
+	const events = await collect(drive(session, "原始任务", ctx, "session-1", "delegation-1"));
+	assert.equal(prompts.length, 2);
+	assert.equal(prompts[0], "原始任务");
+	assert.match(prompts[1]!, /已有进度继续/);
+	assert.ok(events.some((event) => event.type === "progress" && event.stage === "rate_limit_wait"));
+	const completed = events.find((event) => event.type === "completed");
+	assert.equal(completed?.type, "completed");
+	if (completed?.type !== "completed") return;
+	assert.equal(completed.result.sessionHandle, "session-1");
+	assert.equal(completed.result.runHandle, "delegation-1");
+	assert.equal(completed.result.content, "续跑完成");
 });
 
 test("Phase6: probe——SDK 随 server 发布，detected/configured 恒 true", async () => {

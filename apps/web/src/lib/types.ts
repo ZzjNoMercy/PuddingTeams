@@ -109,6 +109,8 @@ export interface PiAssistantMessage {
 	provider?: string;
 	model?: string;
 	stopReason?: string;
+	/** Provider/SDK failure text when stopReason === "error". */
+	errorMessage?: string;
 	usage?: PiUsage;
 	timestamp?: number;
 }
@@ -190,6 +192,8 @@ export interface ChatMessage {
 	timestamp: number;
 	streaming: boolean;
 	error?: boolean;
+	/** Raw provider/SDK diagnostic, rendered collapsed and never as primary copy. */
+	errorDetail?: string;
 	name?: string;
 	isError?: boolean;
 	/** role === "assistant"：该轮 usage（provider 计数 + pi 换算的 cost）。 */
@@ -547,8 +551,10 @@ export interface RoomSession {
 	model?: string;
 }
 
-export type SessionWorkStatus = "active" | "waiting_human" | "resolved" | "cancelled";
+export type SessionWorkStatus = "active" | "resolved" | "cancelled";
 export type CompletionReviewMode = "manager" | "independent";
+export type GoalExecutionStatus = "idle" | "running" | "waiting_human" | "interrupted" | "recovering" | "reviewing";
+export type WorkItemStatus = "planned" | "ready" | "in_progress" | "waiting_input" | "submitted" | "revision" | "accepted" | "blocked" | "cancelled";
 
 export interface CompletionReviewCriterion {
 	criterion: string;
@@ -560,18 +566,24 @@ export interface CompletionReviewCriterion {
 export interface CompletionReview {
 	id: string;
 	goalRevision: number;
-	mode: "independent";
+	mode: "manager" | "independent";
 	verdict: "satisfied" | "not_satisfied" | "needs_human";
 	criteria: CompletionReviewCriterion[];
 	gaps: string[];
-	reviewerModel: string;
+	reviewerModel?: string;
 	reviewerSessionId: string;
 	reviewedAt: string;
 }
 
 export interface SessionWorkState {
+	goalId: string;
 	sessionId: string;
 	goal: string;
+	contractProvenance: {
+		criteriaOrigin: "user_input" | "manager_derived";
+		sourceMessageIds: string[];
+		authoredByAgentId?: "manager";
+	};
 	responsibleAgentId: string;
 	participantAgentIds: string[];
 	currentBrief: string;
@@ -583,14 +595,75 @@ export interface SessionWorkState {
 	reviewerModel?: string;
 	completionReviews: CompletionReview[];
 	status: SessionWorkStatus;
+	execution: {
+		epoch: number;
+		status: GoalExecutionStatus;
+		interruption?: {
+			id: string;
+			kind: "user" | "server_restart" | "manager_interrupted" | "effect_unknown";
+			fingerprint: string;
+			delegationIds: string[];
+			interruptedAt: string;
+		};
+		resumeLease?: { ownerId: string; token: string; expiresAt: string };
+	};
+	plan?: GoalWorkPlan;
 	artifactIds: string[];
 	revision: number;
 	createdAt: string;
 	updatedAt: string;
 }
 
+export interface WorkItemSubmission {
+	id: string;
+	attempt: number;
+	source: "delegation" | "manager";
+	delegationId?: string;
+	resultRef: { kind: "delegation_result"; delegationId: string } | { kind: "manager_summary"; evidenceRefs: string[] };
+	artifactIds: string[];
+	summary?: string;
+	submittedAt: string;
+	review?: {
+		verdict: "accepted" | "revision" | "blocked";
+		summary: string;
+		evidenceRefs: string[];
+		reviewedAt: string;
+	};
+}
+
+export interface WorkItem {
+	id: string;
+	title: string;
+	description?: string;
+	assignedAgentId?: string;
+	dependsOn: string[];
+	acceptanceCriteria: string[];
+	sourceGoalCriteria: string[];
+	status: WorkItemStatus;
+	delegationIds: string[];
+	activeDelegationId?: string;
+	submissions: WorkItemSubmission[];
+	acceptedSubmissionId?: string;
+	lastChange?: { reason: string; changedAt: string; previousRevision: number };
+	revision: number;
+	createdAt: string;
+	updatedAt: string;
+}
+
+export interface GoalWorkPlan {
+	id: string;
+	title?: string;
+	coveredGoalRevision: number;
+	needsReconcile: boolean;
+	revision: number;
+	items: Record<string, WorkItem>;
+	createdAt: string;
+	updatedAt: string;
+}
+
 export interface DecisionRequest {
 	id: string;
+	goalId: string;
 	sessionId: string;
 	requestedBy: string;
 	question: string;
@@ -608,8 +681,13 @@ export interface DecisionRequest {
 
 export interface DelegationTrace {
 	id: string;
+	goalId?: string;
 	parentDelegationId?: string;
 	handoffKind?: "request" | "followup";
+	workPlanId?: string;
+	workItemId?: string;
+	attempt?: number;
+	goalEpoch?: number;
 	agentId: string;
 	intent?: string;
 	expectedOutcome?: string;
@@ -620,6 +698,17 @@ export interface DelegationTrace {
 	sessionHandle?: string;
 	/** 该委托提供只读执行过程入口。 */
 	processView?: boolean;
+	createdAt: string;
+	updatedAt: string;
+}
+
+export interface SessionGoalSummary {
+	goalId: string;
+	goal: string;
+	status: SessionWorkStatus;
+	executionStatus: GoalExecutionStatus;
+	pending: number;
+	running: boolean;
 	createdAt: string;
 	updatedAt: string;
 }

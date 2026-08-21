@@ -131,7 +131,7 @@ test("Phase0 anchor: needs_input 后同一 Session 二次 delegate 返回 409 �
 	// 幂等：同一 requestId 重放返回相同结果，不重复执行授权。
 	const replay = await runtime.respond(
 		interactionId,
-		{ requestId: "ui-submit-1", revision: 1, responses: [{ requestId: "perm-1", action: "approve", scope: "once" }] },
+		{ requestId: "ui-submit-1", revision: 0, responses: [{ requestId: "perm-1", action: "approve", scope: "once" }] },
 		{ cwd: process.cwd(), env: {} },
 	);
 	assert.equal(replay.status, "completed", "幂等重放应返回相同终态");

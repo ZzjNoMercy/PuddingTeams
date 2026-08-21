@@ -17,6 +17,8 @@ import type { DelegationTimelineEvent, DelegationTimelineStore } from "./delegat
 
 export interface WorkerProcessInfo {
 	delegationId: string;
+	managerSessionId: string;
+	goalId?: string;
 	agentId: string;
 	status: DelegationRecord["status"];
 	sessionHandle?: string;
@@ -29,7 +31,6 @@ export interface WorkerProcessInfo {
 
 export interface WorkerProcessListItem extends WorkerProcessInfo {
 	updatedAt: string;
-	managerSessionId: string;
 	task?: string;
 	intent?: string;
 	expectedOutcome?: string;
@@ -51,6 +52,8 @@ export class WorkerProcessService {
 		const view = d.sessionHandle && (agent?.connector?.connectorId === "pi" || !agent) ? "session" : "timeline";
 		return {
 			delegationId: d.id,
+			managerSessionId: d.managerSessionId,
+			goalId: d.goalId,
 			agentId: d.agentId,
 			status: d.status,
 			sessionHandle: d.sessionHandle,

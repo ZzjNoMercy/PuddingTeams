@@ -1,9 +1,10 @@
 import type { DelegationRecord, DelegationStore, InteractionRecord } from "./delegation-store.js";
 import type { InteractionResponse } from "./types.js";
+import { createHash } from "node:crypto";
 /** A single interaction error category, mappable to HTTP 4xx. */
 export class InteractionError extends Error {
 	constructor(
-		readonly code: "not_found" | "not_pending" | "stale_revision" | "incomplete_responses" | "invalid_scope" | "expired" | "duplicate",
+		readonly code: "not_found" | "not_pending" | "stale_revision" | "incomplete_responses" | "invalid_scope" | "expired" | "duplicate" | "idempotency_conflict",
 		message: string,
 	) {
 		super(message);
@@ -35,8 +36,17 @@ export class InteractionBroker {
 		const interaction = await this.store.getInteraction(interactionId);
 		if (!interaction) throw new InteractionError("not_found", "interaction not found");
 
-		// Idempotency: a replayed request_id returns the same terminal state.
+		const normalizedPayload = JSON.stringify({
+			revision: input.revision,
+			responses: [...input.responses].sort((a, b) => a.requestId.localeCompare(b.requestId)),
+		});
+		const inputHash = "sha256:" + createHash("sha256").update(normalizedPayload).digest("hex");
+		// Idempotency: a replayed request_id returns the same terminal state only
+		// when the normalized answers are identical.
 		if (interaction.consumedRequestId === input.requestId) {
+			if (interaction.consumedPayloadHash && interaction.consumedPayloadHash !== inputHash) {
+				throw new InteractionError("idempotency_conflict", "same requestId was reused with different responses");
+			}
 			return { interaction, replayed: true };
 		}
 
@@ -56,16 +66,18 @@ export class InteractionBroker {
 		const got = input.responses.map((r) => r.requestId);
 		const missing = [...want].filter((id) => !got.includes(id));
 		const extra = got.filter((id) => !want.has(id));
-		if (missing.length > 0 || extra.length > 0) {
+		const duplicates = got.filter((id, index) => got.indexOf(id) !== index);
+		if (missing.length > 0 || extra.length > 0 || duplicates.length > 0) {
 			throw new InteractionError(
 				"incomplete_responses",
-				`responses must cover exactly the pending requests (missing: ${missing.join(",")}; extra: ${extra.join(",")})`,
+				`responses must cover exactly the pending requests (missing: ${missing.join(",")}; extra: ${extra.join(",")}; duplicate: ${[...new Set(duplicates)].join(",")})`,
 			);
 		}
 
 		// scope 必须在 request options 内（L3：options 为空时只允许不带 scope）。
 		const byId = new Map(interaction.requests.map((r) => [r.requestId, r]));
 		for (const r of input.responses) {
+			if (!["approve", "reject", "answer", "confirm"].includes(r.action)) throw new InteractionError("incomplete_responses", `invalid action for ${r.requestId}`);
 			const req = byId.get(r.requestId);
 			if (!req) continue;
 			if (r.action === "reject") continue;
@@ -84,6 +96,7 @@ export class InteractionBroker {
 			status,
 			revision: interaction.revision + 1,
 			consumedRequestId: input.requestId,
+			consumedPayloadHash: inputHash,
 		});
 		return { interaction: updated!, replayed: false };
 	}

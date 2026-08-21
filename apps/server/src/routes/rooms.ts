@@ -4,7 +4,8 @@ import { PiSessionStore } from "../pi-bridge/session-store.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import { isWorkspaceDirectoryAvailable, type WorkspaceSummary } from "../store/workspaces.js";
 import type { WorkerBinding } from "../store/teams.js";
-import type { WorkStateStore } from "../store/work-state.js";
+import { WorkStateOperationConflictError, type WorkStateStore } from "../store/work-state.js";
+import type { ProductSettingsStore } from "../store/product-settings.js";
 import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -107,6 +108,7 @@ export function registerRoomsRoutes(
 	localFiles?: {
 		open?: (targetPath: string) => Promise<void>;
 		additionalRoots?: readonly string[];
+		productSettings?: ProductSettingsStore;
 	},
 ): void {
 	const openLocalFile = localFiles?.open ?? openNativeFile;
@@ -411,6 +413,7 @@ export function registerRoomsRoutes(
 		try {
 			const sessionIds = await teams.removeWindow(req.params.id);
 			for (const sid of sessionIds) {
+				await invoker?.cancelManagerSession(sid);
 				await sessions.remove(sid);
 				await workStates?.removeSession(sid);
 			}
@@ -431,16 +434,34 @@ export function registerRoomsRoutes(
 	app.post<{ Params: { id: string }; Body: { goal?: string; completionBoundary?: string; reviewMode?: "manager" | "independent"; reviewerModel?: string } }>("/api/rooms/:id/sessions", async (req, reply) => {
 		const w = await teams.getWindow(req.params.id);
 		if (!w) return reply.code(404).send({ error: "window not found" });
+		const requestedGoal = req.body?.goal?.trim();
+		const requestedBoundary = req.body?.completionBoundary?.trim();
+		if ((requestedGoal && !requestedBoundary) || (!requestedGoal && requestedBoundary)) {
+			return reply.code(400).send({ error: "Goal 会话必须同时填写 goal 与 completionBoundary" });
+		}
+		const goalOperationId = typeof req.headers["idempotency-key"] === "string" ? req.headers["idempotency-key"].trim() : "";
+		if (requestedGoal && requestedBoundary && !goalOperationId) return reply.code(400).send({ error: "创建 Goal Session 需要 Idempotency-Key header" });
+		if (requestedGoal && requestedBoundary && workStates) {
+			const replay = await workStates.findGoalCreationOperation(goalOperationId);
+			if (replay) {
+				const owner = await teams.windowForSession(replay.sessionId);
+				const samePayload = owner?.id === w.id && replay.goal === requestedGoal && replay.completionBoundary === requestedBoundary && replay.reviewMode === (req.body.reviewMode ?? "independent") && (replay.reviewerModel ?? "") === (req.body.reviewerModel?.trim() ?? "");
+				if (!samePayload) return reply.code(409).send({ error: "同一 Idempotency-Key 被用于不同 Goal Session 请求", code: "idempotency_conflict" });
+				const session = (await sessions.list()).find((item) => item.id === replay.sessionId);
+				if (!session) return reply.code(409).send({ error: "幂等 Goal 已提交但 Session 不存在", code: "stale_goal_state" });
+				return { session, workState: replay };
+			}
+		}
+		if (requestedGoal && localFiles?.productSettings && (await localFiles.productSettings.get()).harness.goalActivation[w.type] === "disabled") {
+			return reply.code(403).send({ error: `Harness 已禁用 ${w.type} Goal` });
+		}
+		let createdId: string | undefined;
 		try {
 			const created = await sessions.create(undefined, await contextFor(w));
+			createdId = created.id;
 			await teams.addWindowSession(req.params.id, created.id);
-			const goal = req.body?.goal?.trim();
-			const completionBoundary = req.body?.completionBoundary?.trim();
-			if ((goal && !completionBoundary) || (!goal && completionBoundary)) {
-				await teams.removeWindowSession(req.params.id, created.id);
-				await sessions.remove(created.id);
-				return reply.code(400).send({ error: "Goal 会话必须同时填写 goal 与 completionBoundary" });
-			}
+			const goal = requestedGoal;
+			const completionBoundary = requestedBoundary;
 			const workState = goal && completionBoundary && workStates
 				? await workStates.create({
 						sessionId: created.id,
@@ -449,10 +470,17 @@ export function registerRoomsRoutes(
 						reviewMode: req.body.reviewMode,
 						reviewerModel: req.body.reviewerModel,
 						participantAgentIds: w.members,
+						contractProvenance: { criteriaOrigin: "user_input", sourceMessageIds: [] },
+						operationId: goalOperationId,
 					})
 				: null;
 			return { session: created, workState };
 		} catch (err) {
+			if (createdId) {
+				await teams.removeWindowSession(req.params.id, createdId).catch(() => undefined);
+				await sessions.remove(createdId).catch(() => undefined);
+			}
+			if (err instanceof WorkStateOperationConflictError) return reply.code(409).send({ error: err.message, code: err.code });
 			return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
 		}
 	});
@@ -464,6 +492,7 @@ export function registerRoomsRoutes(
 			const { removed, blocked } = await teams.removeWindowSession(req.params.id, req.params.sid);
 			if (blocked) return reply.code(400).send({ error: blocked });
 			if (!removed) return reply.code(404).send({ error: "session not found in window" });
+			await invoker?.cancelManagerSession(req.params.sid);
 			await sessions.remove(req.params.sid);
 			await workStates?.removeSession(req.params.sid);
 			return reply.code(204).send();

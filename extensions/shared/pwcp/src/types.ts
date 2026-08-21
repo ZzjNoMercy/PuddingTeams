@@ -170,6 +170,10 @@ export interface InvocationContext {
 	delegationId?: string;
 	/** 窗口的显式 workspaceId（Runtime 注入）：进程内 Driver 的信任门资源判定用（迁移方案 §7.2）。 */
 	workspaceId?: string;
+	/** Stable local operation identity; Connectors may pass it to upstream idempotency facilities. */
+	operationId?: string;
+	/** Alias for upstream HTTP/RPC APIs that use an idempotency-key convention. */
+	idempotencyKey?: string;
 	/** 已注入凭证的环境变量。 */
 	env: NodeJS.ProcessEnv;
 	signal?: AbortSignal;

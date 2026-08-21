@@ -12,6 +12,7 @@ import { useWorkerProcess } from "@/hooks/useWorkerProcess";
 import { useDelegationTimeline } from "@/hooks/useDelegationTimeline";
 import { fetchRoomDelegationProcesses, type WorkerProcessInfo, type WorkerProcessListItem } from "@/lib/api";
 import type { DelegationTimelineEvent } from "@/lib/types";
+import { timelineForDisplay, type TimelineDisplayEvent } from "@/lib/delegation-timeline-display";
 import { groupForRender, type RenderItem } from "@/lib/events";
 import { useAgentLabels } from "@/lib/avatars";
 import { AssistantGroup, Message } from "./message";
@@ -118,54 +119,6 @@ const activityIcons: Record<DelegationTimelineEvent["kind"], typeof CircleDotIco
 	error: XCircleIcon,
 };
 
-type TimelineDisplayEvent = DelegationTimelineEvent & {
-	displaySeqEnd?: number;
-	displayEventCount?: number;
-};
-
-/**
- * Compatibility renderer for timelines written before token batching moved
- * into the Driver. New timelines already contain one `token.batch` per run;
- * legacy adjacent raw `token` rows are collapsed into the same readable block.
- */
-function coalescePuddingClawTokens(events: DelegationTimelineEvent[]): TimelineDisplayEvent[] {
-	const display: TimelineDisplayEvent[] = [];
-	for (const event of events) {
-		const isToken = event.source === "puddingclaw" && event.sourceEvent === "token";
-		const previous = display.at(-1);
-		if (isToken && previous?.source === "puddingclaw" && previous.sourceEvent === "token") {
-			display[display.length - 1] = {
-				...previous,
-				content: `${previous.content ?? ""}${event.content ?? ""}`,
-				displaySeqEnd: event.seq,
-				displayEventCount: (previous.displayEventCount ?? 1) + 1,
-			};
-			continue;
-		}
-		display.push(isToken ? { ...event, displaySeqEnd: event.seq, displayEventCount: 1 } : event);
-	}
-	return display;
-}
-
-/**
- * Keep the audit stream intact in storage while removing presentation noise:
- * a final response supersedes its token batch, and runtime terminal markers
- * supersede the connector's duplicate done/progress rows.
- */
-function timelineForDisplay(events: DelegationTimelineEvent[]): TimelineDisplayEvent[] {
-	const coalesced = coalescePuddingClawTokens(events);
-	return coalesced.filter((event, index) => {
-		const later = coalesced.slice(index + 1);
-		if ((event.sourceEvent === "token" || event.sourceEvent === "token.batch") && later.some((item) => item.sourceEvent === "final_response")) {
-			return false;
-		}
-		if ((event.sourceEvent === "done" || event.sourceEvent === "runtime.progress") && later.some((item) => item.sourceEvent === "runtime.completed" || item.sourceEvent === "runtime.failed")) {
-			return false;
-		}
-		return true;
-	});
-}
-
 function TimelineEvent({ event }: { event: TimelineDisplayEvent }) {
 	const Icon = event.kind === "tool" && event.metadata?.tool === "command_execution" ? TerminalIcon : activityIcons[event.kind];
 	const failed = event.status === "failed";
@@ -190,14 +143,12 @@ function TimelineEvent({ event }: { event: TimelineDisplayEvent }) {
 					<time className="shrink-0 text-[10px] text-muted-foreground">{time}</time>
 				</div>
 				{event.content ? (
-					event.kind === "assistant" ? (
-						<pre className="mt-2 whitespace-pre-wrap break-words rounded-lg bg-muted/45 px-3 py-2.5 font-sans text-xs leading-relaxed text-foreground/90">{event.content}</pre>
-					) : (
-						<details className="mt-2" open={event.kind === "error" || event.kind === "file" || event.kind === "approval"}>
-							<summary className="cursor-pointer text-xs text-muted-foreground">查看详情</summary>
-							<pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted/60 p-2 font-mono text-[11px] leading-relaxed">{event.content}</pre>
-						</details>
-					)
+					<details className="mt-2">
+						<summary className="cursor-pointer text-xs text-muted-foreground">
+							{event.kind === "assistant" ? "查看回复" : "查看详情"}
+						</summary>
+						<pre className={`mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md p-2 leading-relaxed ${event.kind === "assistant" ? "bg-muted/45 px-3 py-2.5 font-sans text-xs text-foreground/90" : "bg-muted/60 font-mono text-[11px]"}`}>{event.content}</pre>
+					</details>
 				) : null}
 			</div>
 		</div>

@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { serializePiEvent } from "../pi-bridge/bridge.js";
 import type { WorkerProcessService } from "../agent-runtime/worker-process.js";
 import { config } from "../config.js";
+import type { WorkStateStore } from "../store/work-state.js";
 
 /**
  * Worker 执行过程可视化（只读）：pi 回放完整 AgentSession，spawn CLI
@@ -11,11 +12,20 @@ export function registerWorkerProcessRoutes(
 	app: FastifyInstance,
 	service: WorkerProcessService,
 	controls?: { cancel: (delegationId: string, signal?: AbortSignal) => Promise<void> },
+	workStates?: WorkStateStore,
 ): void {
 	/** Cancel one Run without aborting the whole manager Session. */
-	app.post<{ Params: { id: string } }>("/api/delegations/:id/cancel", async (req, reply) => {
+	app.post<{ Params: { id: string }; Body: { expectedGoalId?: string } }>("/api/delegations/:id/cancel", async (req, reply) => {
 		const info = await service.resolve(req.params.id);
 		if (!info) return reply.code(404).send({ error: "delegation not found" });
+		if (info.goalId) {
+			const expectedGoalId = req.body?.expectedGoalId?.trim();
+			if (!expectedGoalId) return reply.code(400).send({ error: "终止 Goal 内的 Worker 任务需要 expectedGoalId" });
+			const activeGoal = await workStates?.getActive(info.managerSessionId);
+			if (expectedGoalId !== info.goalId || activeGoal?.goalId !== info.goalId) {
+				return reply.code(409).send({ error: "该任务属于已结束的 Goal，只能查看执行记录", code: "stale_goal_state" });
+			}
+		}
 		if (info.status !== "running" && info.status !== "waiting_input") {
 			return reply.code(409).send({ error: `delegation is already ${info.status}` });
 		}

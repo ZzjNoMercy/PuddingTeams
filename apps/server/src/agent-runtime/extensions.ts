@@ -182,6 +182,11 @@ export interface ScopedDelegateInput {
 	windowId: string;
 	managerSessionId: string;
 	managerToolCallId?: string;
+	goalId?: string;
+	workPlanId?: string;
+	workItemId?: string;
+	attempt?: number;
+	goalEpoch?: number;
 	parentDelegationId?: string;
 	handoffKind?: "request" | "followup";
 	intent?: string;

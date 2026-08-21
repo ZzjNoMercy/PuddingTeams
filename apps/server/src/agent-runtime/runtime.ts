@@ -22,6 +22,11 @@ export interface DelegateInput {
 	cwdSnapshot: string;
 	managerSessionId: string;
 	managerToolCallId?: string;
+	goalId?: string;
+	workPlanId?: string;
+	workItemId?: string;
+	attempt?: number;
+	goalEpoch?: number;
 	parentDelegationId?: string;
 	handoffKind?: "request" | "followup";
 	intent?: string;
@@ -250,6 +255,11 @@ export class AgentRuntime {
 			cwdSnapshot: input.cwdSnapshot,
 			managerSessionId: input.managerSessionId,
 			managerToolCallId: input.managerToolCallId,
+			goalId: input.goalId,
+			workPlanId: input.workPlanId,
+			workItemId: input.workItemId,
+			attempt: input.attempt,
+			goalEpoch: input.goalEpoch,
 			parentDelegationId: input.parentDelegationId,
 			handoffKind: input.handoffKind,
 			task: input.message,
@@ -271,10 +281,13 @@ export class AgentRuntime {
 		this.runControllers.set(delegation.id, controller);
 		const settleRun = this.trackRun(delegation.id);
 		const signal = ctx.signal ? AbortSignal.any([ctx.signal, controller.signal]) : controller.signal;
+		const requestId = input.requestId ?? randomUUID();
 		const runCtx = this.timelineContext({
 			...ctx,
 			cwd: delegation.cwdSnapshot,
 			delegationId: delegation.id,
+			operationId: requestId,
+			idempotencyKey: requestId,
 			...(delegation.workspaceId ? { workspaceId: delegation.workspaceId } : {}),
 			signal,
 		}, delegation);
@@ -292,7 +305,6 @@ export class AgentRuntime {
 				title: "PuddingTeams 已接收任务",
 			},
 		});
-		const requestId = input.requestId ?? randomUUID();
 		let sessionHandle = knownSession;
 		// 失效会话恢复：continue 撞上 session-not-found（后端删 session/换实例/
 		// 升级换代都会让旧 handle 失效，平台无法也无需区分原因）时，丢弃失效
@@ -861,6 +873,7 @@ export class AgentRuntime {
 					// L1：回到 pending 必须清掉 consumedRequestId，否则第二轮提交
 					// 复用同一 requestId 会被误判为幂等重放。
 					consumedRequestId: undefined,
+					consumedPayloadHash: undefined,
 				});
 				if (event.providerState) {
 					await this.secrets.setProviderState(interaction.id, {

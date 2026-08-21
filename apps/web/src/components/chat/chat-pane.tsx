@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDownIcon, EllipsisIcon, FolderGit2Icon, FolderOpenIcon, LayersIcon, PanelLeftOpenIcon } from "lucide-react";
+import { ChevronDownIcon, EllipsisIcon, FolderGit2Icon, FolderOpenIcon, LayersIcon, ListTreeIcon, PanelLeftOpenIcon } from "lucide-react";
 import { toast } from "sonner";
 import {
 	Conversation,
@@ -91,6 +91,9 @@ function SessionChat({
 	blocked,
 	sessionModel,
 	onSessionModelChange,
+	runtimeOpen,
+	onRuntimeOpenChange,
+	onGoalSummaryChange,
 }: {
 	roomId: string;
 	sessionId: string;
@@ -111,6 +114,9 @@ function SessionChat({
 	/** 会话真实模型 ref（rooms 数据），composer 选择器以此为准。 */
 	sessionModel?: string;
 	onSessionModelChange?: (model: string) => void;
+	runtimeOpen: boolean;
+	onRuntimeOpenChange: (open: boolean) => void;
+	onGoalSummaryChange: (summary: { hasGoal: boolean; pending: number; running: boolean } | null) => void;
 }) {
 	const { messages, historyLoading, status, running, send, stop } = useChat(sessionId);
 	const [goalCreateOpen, setGoalCreateOpen] = useState(false);
@@ -139,6 +145,10 @@ function SessionChat({
 		}
 		return ids;
 	}, [messages]);
+	const workStateSignal = useMemo(
+		() => [...messages].reverse().find((message) => message.role === "custom" && message.customType === "pudding:work_plan_update")?.id,
+		[messages],
+	);
 	// 拆分「等 worker」与「manager 思考」：delegate 工具阻塞在 manager 的 run 里，
 	// run 活跃不等于 manager 在生成。有 running 态委托调用时，composer 提示
 	// 等待哪个 worker，而不是笼统的「处理中」。
@@ -183,7 +193,11 @@ function SessionChat({
 					onCreateOpenChange={setGoalCreateOpen}
 					initialGoal={goalDraft}
 					onGoalStateChange={setHasGoal}
+					onGoalSummaryChange={onGoalSummaryChange}
 					onReady={markWorkStateReady}
+					workStateSignal={workStateSignal}
+					runtimeOpen={runtimeOpen}
+					onRuntimeOpenChange={onRuntimeOpenChange}
 				/>
 				<Conversation initial="instant" resize={layoutReady ? "smooth" : "instant"}>
 					<AtBottomReporter onChange={setAtBottom} />
@@ -266,6 +280,8 @@ export function ChatPane({
 	const [promptValue, setPromptValue] = useState("");
 	const [chatInfoOpen, setChatInfoOpen] = useState(false);
 	const [workerProcessOpen, setWorkerProcessOpen] = useState(false);
+	const [goalRuntimeOpen, setGoalRuntimeOpen] = useState(false);
+	const [goalSummary, setGoalSummary] = useState<{ hasGoal: boolean; pending: number; running: boolean } | null>(null);
 	const [requestedDelegationId, setRequestedDelegationId] = useState<string | null>(null);
 	const [pendingDeleteSession, setPendingDeleteSession] = useState<RoomSession | null>(null);
 	const [renamingSession, setRenamingSession] = useState<RoomSession | null>(null);
@@ -285,6 +301,13 @@ export function ChatPane({
 		setRequestedDelegationId(delegationId);
 		setWorkerProcessOpen(true);
 	}, []);
+	const changeGoalRuntimeOpen = useCallback((open: boolean) => {
+		if (open) {
+			setWorkerProcessOpen(false);
+			setRequestedDelegationId(null);
+		}
+		setGoalRuntimeOpen(open);
+	}, []);
 
 	useEffect(() => {
 		let cancelled = false;
@@ -292,6 +315,8 @@ export function ChatPane({
 			.then((r) => {
 				if (cancelled) return;
 				setWorkerProcessOpen(false);
+				setGoalRuntimeOpen(false);
+				setGoalSummary(null);
 				setRequestedDelegationId(null);
 				setRoom(r);
 				setActiveId(r.activeSession || "");
@@ -343,6 +368,8 @@ export function ChatPane({
 		async (sessionId: string) => {
 			if (sessionId === activeId) return;
 			setWorkerProcessOpen(false);
+			setGoalRuntimeOpen(false);
+			setGoalSummary(null);
 			setRequestedDelegationId(null);
 			try {
 				await setActiveRoomSession(roomId, sessionId);
@@ -361,6 +388,8 @@ export function ChatPane({
 
 	const newSession = useCallback(async () => {
 		setWorkerProcessOpen(false);
+		setGoalRuntimeOpen(false);
+		setGoalSummary(null);
 		setRequestedDelegationId(null);
 		try {
 			const created = await createRoomSession(roomId);
@@ -577,6 +606,20 @@ export function ChatPane({
 						onRename={openSessionRename}
 						onDelete={setPendingDeleteSession}
 					/>
+					{goalSummary?.hasGoal ? (
+						<Button
+							type="button"
+							size="icon"
+							variant="ghost"
+							className={"home-chat-more goal-header-trigger" + (goalRuntimeOpen ? " is-active" : "")}
+							aria-label="目标与执行"
+							title="目标与执行"
+							onClick={() => changeGoalRuntimeOpen(true)}
+						>
+							<ListTreeIcon className="size-4" />
+							{goalSummary.pending > 0 ? <span className="goal-header-badge">{goalSummary.pending}</span> : goalSummary.running ? <span className="goal-header-live" /> : null}
+						</Button>
+					) : null}
 					<Button type="button" size="icon" variant="ghost" className="home-chat-more" aria-label="聊天设置" title="聊天设置" onClick={() => { setWorkerProcessOpen(false); setChatInfoOpen(true); }}>
 						<EllipsisIcon className="size-4" />
 					</Button>
@@ -614,6 +657,9 @@ export function ChatPane({
 					blocked={!room.contextAvailable || status === "gone"}
 					sessionModel={activeSession?.model}
 					onSessionModelChange={handleSessionModelChange}
+					runtimeOpen={goalRuntimeOpen}
+					onRuntimeOpenChange={changeGoalRuntimeOpen}
+					onGoalSummaryChange={setGoalSummary}
 				/>
 				</WorkerProcessProvider>
 			) : null}

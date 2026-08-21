@@ -25,15 +25,71 @@ function textOf(blocks: PiContentBlock[] | undefined): string {
 		.join("\n");
 }
 
+function safeErrorDetail(raw: string): string {
+	return raw
+		.replace(/(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s,;}]+/gi, "$1[已隐藏]")
+		.replace(/\b(?:sk|key)-[a-z0-9_-]{8,}\b/gi, "[已隐藏的密钥]")
+		.slice(0, 4_000);
+}
+
+/** Convert provider/SDK diagnostics into actionable user copy. */
+export function friendlyModelError(raw: string): { content: string; detail: string } {
+	const detail = safeErrorDetail(raw.trim() || "unknown error");
+	const value = detail.toLowerCase();
+	let title = "Manager 本轮回复失败";
+	let explanation = "你的消息已经保存，但模型服务没有成功返回结果。";
+	let action = "请再次发送上一条消息；如果仍然失败，可以刷新页面或切换模型后重试。";
+
+	if (/role ['\"]?tool|tool_calls|preceding message/.test(value)) {
+		title = "会话上下文暂时异常";
+		explanation = "系统在整理之前的工具调用记录时发现顺序不一致，因此安全停止了本轮请求。你的任务尚未开始执行。";
+		action = "请直接重试上一条消息；如果仍然出现此提示，再新建会话继续。";
+	} else if (/context.length|maximum context|too many tokens|token limit|context window/.test(value)) {
+		title = "当前对话内容过长";
+		explanation = "这段对话已经超出所选模型一次能够读取的内容范围。";
+		action = "请新建会话继续，或缩短任务背景、移除不必要的附件后重试。";
+	} else if (/\b401\b|\b403\b|unauthori[sz]ed|forbidden|api key|authentication|credential/.test(value)) {
+		title = "模型服务认证失败";
+		explanation = "当前模型的访问凭证无效、已过期或没有调用权限。";
+		action = "请前往模型设置检查 Provider 凭证，或切换到已配置的模型。";
+	} else if (/\b429\b|rate.?limit|too many requests|quota|capacity|overloaded/.test(value)) {
+		title = "模型服务当前繁忙";
+		explanation = "服务触发了频率、额度或容量限制，你的消息不会丢失。";
+		action = "请稍后重试，或切换到其他可用模型。";
+	} else if (/timeout|timed out|econn|network|fetch failed|socket|connection|gateway/.test(value)) {
+		title = "暂时无法连接模型服务";
+		explanation = "请求在传输过程中超时或连接中断。";
+		action = "请检查网络后重试；如果持续失败，请确认 Provider 地址与服务状态。";
+	} else if (/\b400\b|invalid_request|bad request/.test(value)) {
+		title = "模型请求未被接受";
+		explanation = "模型服务认为本轮请求格式无效，因此没有开始生成回复。";
+		action = "请重试上一条消息；如果问题持续出现，可切换模型并展开技术详情进行排查。";
+	}
+
+	return {
+		content: `**${title}**\n\n${explanation}\n\n${action}`,
+		detail,
+	};
+}
+
 /** Render an assistant pi message into chat view state (non-streaming shape). */
 export function renderPiMessage(m: PiAssistantMessage): {
 	content: string;
 	thinking?: string;
 	toolCalls: ToolCallView[];
 	usage?: PiUsage;
+	error?: boolean;
+	errorDetail?: string;
 } {
 	const blocks = Array.isArray(m.content) ? m.content : [];
 	const content = textOf(blocks);
+	const providerError = m.stopReason === "error" && typeof m.errorMessage === "string"
+		? m.errorMessage.trim()
+		: "";
+	const friendlyError = providerError ? friendlyModelError(providerError) : undefined;
+	const visibleContent = friendlyError
+		? [content, friendlyError.content].filter(Boolean).join("\n\n")
+		: content;
 	const thinking = blocks
 		.filter((b) => b.type === "thinking")
 		.map((b) => b.thinking)
@@ -42,10 +98,12 @@ export function renderPiMessage(m: PiAssistantMessage): {
 		.filter((b): b is PiToolCallBlock => b.type === "toolCall")
 		.map((b) => ({ id: b.id, name: b.name, args: b.arguments, status: "pending" }));
 	return {
-		content,
+		content: visibleContent,
 		thinking: thinking.length ? thinking : undefined,
 		toolCalls,
 		usage: m.usage,
+		error: friendlyError ? true : undefined,
+		errorDetail: friendlyError?.detail,
 	};
 }
 
@@ -81,10 +139,23 @@ function reconcileDelegationStatus(list: ChatMessage[], next: ChatMessage): Chat
 
 	let changed = false;
 	const reconciled = list.map((message) => {
+		if (next.customType === "pudding:task_assign" && details.taskId && message.customType === "pudding:task_result") {
+			const resultDetails = message.details as Record<string, unknown> | undefined;
+			if (resultDetails?.taskId === details.taskId) {
+				changed = true;
+				return {
+					...message,
+					details: {
+						...(next.details && typeof next.details === "object" ? next.details as Record<string, unknown> : {}),
+						...resultDetails,
+					},
+				};
+			}
+		}
 		if (!message.toolCalls.length) return message;
 		const toolCalls = message.toolCalls.map((call) => {
 			if (!isDelegateCall(call)) return call;
-			const callDetails = call.details as { delegationId?: string; interactionId?: string } | undefined;
+			const callDetails = call.details as { delegationId?: string; interactionId?: string; status?: string } | undefined;
 			const matches = Boolean(
 				(details.taskId && call.id === details.taskId)
 				|| (details.delegationId && callDetails?.delegationId === details.delegationId)
@@ -92,12 +163,16 @@ function reconcileDelegationStatus(list: ChatMessage[], next: ChatMessage): Chat
 			);
 			if (!matches) return call;
 			changed = true;
+			const previousStatus = callDetails?.status;
+			const nextStatus = next.customType === "pudding:task_assign" && ["completed", "failed", "cancelled"].includes(previousStatus ?? "")
+				? previousStatus
+				: status;
 			return {
 				...call,
 				details: {
 					...(callDetails ?? {}),
 					...(next.details && typeof next.details === "object" ? next.details as Record<string, unknown> : {}),
-					status,
+					status: nextStatus,
 				},
 			};
 		});
@@ -112,24 +187,48 @@ function reconcileDelegationStatus(list: ChatMessage[], next: ChatMessage): Chat
  * 历史回放与实时事件走同一去重，避免一张变两张。
  */
 function upsertCustomMessage(list: ChatMessage[], next: ChatMessage): ChatMessage[] {
-	const reconciledList = reconcileDelegationStatus(list, next);
-	if (next.customType === "pudding:task_assign") {
+	let effectiveNext = next;
+	if (next.customType === "pudding:task_result") {
 		const taskId = (next.details as { taskId?: string } | undefined)?.taskId;
+		const assign = taskId
+			? list.find((message) =>
+				message.role === "custom"
+				&& message.customType === "pudding:task_assign"
+				&& (message.details as { taskId?: string } | undefined)?.taskId === taskId
+			)
+			: undefined;
+		if (assign?.details && typeof assign.details === "object") {
+			// A terminal card supersedes the running row visually, but it is still
+			// the same Delegation. Preserve process metadata from the append-only
+			// assign event so existing sessions and partial terminal payloads retain
+			// their read-only process entry after completion.
+			effectiveNext = {
+				...next,
+				details: {
+					...(assign.details as Record<string, unknown>),
+					...(next.details && typeof next.details === "object" ? next.details as Record<string, unknown> : {}),
+				},
+			};
+		}
+	}
+	const reconciledList = reconcileDelegationStatus(list, effectiveNext);
+	if (effectiveNext.customType === "pudding:task_assign") {
+		const taskId = (effectiveNext.details as { taskId?: string } | undefined)?.taskId;
 		if (taskId) {
 			const idx = reconciledList.findIndex(
 				(m) =>
 					m.role === "custom" &&
-					m.customType === next.customType &&
+					m.customType === effectiveNext.customType &&
 					(m.details as { taskId?: string } | undefined)?.taskId === taskId,
 			);
 			if (idx >= 0) {
 				const copy = [...reconciledList];
-				copy[idx] = next;
+				copy[idx] = effectiveNext;
 				return copy;
 			}
 		}
 	}
-	return [...reconciledList, next];
+	return [...reconciledList, effectiveNext];
 }
 
 /**
@@ -193,7 +292,15 @@ export function renderHistory(msgs: PiMessage[]): ChatMessage[] {
 					...assistant,
 					toolCalls: assistant.toolCalls.map((t) =>
 						t.id === m.toolCallId
-							? { ...t, status: m.isError ? "error" : "done", result: textOf(m.content), details: m.details, isError: m.isError }
+							? {
+									...t,
+									status: m.isError ? "error" : "done",
+									result: textOf(m.content),
+									details: t.details && typeof t.details === "object"
+										? { ...(t.details as Record<string, unknown>), ...(m.details && typeof m.details === "object" ? m.details as Record<string, unknown> : {}), ...(m.isError ? { status: "failed" } : {}) }
+										: m.details,
+									isError: m.isError,
+								}
 							: t,
 					),
 				};
@@ -280,8 +387,13 @@ function upsertToolCall(messages: ChatMessage[], patch: Partial<ToolCallView> & 
 				const merged = { ...t, ...patch };
 				// details 做浅合并：运行中 onUpdate（sessionHandle 等）与终态 meta
 				// 分多次到达，直接替换会把先到的字段抹掉。
-				if (t.details && patch.details && typeof t.details === "object" && typeof patch.details === "object") {
+				if (patch.details === undefined) {
+					merged.details = t.details;
+				} else if (t.details && typeof t.details === "object" && typeof patch.details === "object") {
 					merged.details = { ...(t.details as Record<string, unknown>), ...(patch.details as Record<string, unknown>) };
+				}
+				if (patch.status === "error" && merged.details && typeof merged.details === "object") {
+					merged.details = { ...(merged.details as Record<string, unknown>), status: "failed" };
 				}
 				return merged;
 			})
@@ -348,13 +460,15 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 	switch (event.type) {
 		case "error": {
 			const message = typeof event.message === "string" ? event.message : "unknown error";
+			const friendly = friendlyModelError(message);
 			return [
 				...messages,
 				{
 					id: uid(),
 					role: "assistant",
-					content: message,
+					content: friendly.content,
 					error: true,
+					errorDetail: friendly.detail,
 					toolCalls: [],
 					timestamp: Date.now(),
 					streaming: false,
@@ -367,8 +481,15 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 			const m = event.message as PiMessage;
 			if (!m) return messages;
 			if (m.role === "custom") {
-				if (m.display === false) return messages;
-				return upsertCustomMessage(messages, renderCustom(m));
+				const next = renderCustom(m);
+				if (m.display === false) {
+					// Hidden manager projections are not cards, but they carry the
+					// delegation/process metadata needed by the original delegate row.
+					return m.customType === "pudding:task_assign"
+						? reconcileDelegationStatus(messages, next)
+						: messages;
+				}
+				return upsertCustomMessage(messages, next);
 			}
 			if (m.role === "user") {
 				return [
@@ -489,7 +610,9 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 												...t,
 												status: tr.isError ? "error" : "done",
 												result: textOf(tr.content),
-												details: tr.details ?? t.details,
+												details: tr.isError && (tr.details ?? t.details) && typeof (tr.details ?? t.details) === "object"
+													? { ...((tr.details ?? t.details) as Record<string, unknown>), status: "failed" }
+													: tr.details ?? t.details,
 												isError: tr.isError,
 											}
 										: t,
