@@ -5,11 +5,36 @@ import { abortSession, fetchMessages, sendMessage, sessionWsUrl, type MessageAtt
 import { markRunningToolCalls, reducePiEvent, renderHistory } from "@/lib/events";
 import type { ChatMessage, ChatStatus, PiMessage } from "@/lib/types";
 
+const HISTORY_CACHE_LIMIT = 8;
+const historyCache = new Map<string, ChatMessage[]>();
+
+function rememberHistory(sessionId: string, messages: ChatMessage[]): ChatMessage[] {
+	historyCache.delete(sessionId);
+	historyCache.set(sessionId, messages);
+	while (historyCache.size > HISTORY_CACHE_LIMIT) {
+		const oldest = historyCache.keys().next().value as string | undefined;
+		if (!oldest) break;
+		historyCache.delete(oldest);
+	}
+	return messages;
+}
+
+async function loadHistorySnapshot(sessionId: string): Promise<ChatMessage[]> {
+	const { messages, runningToolCallIds } = await fetchMessages(sessionId);
+	return rememberHistory(sessionId, markRunningToolCalls(renderHistory(messages as PiMessage[]), runningToolCallIds));
+}
+
+/** 切换 Session 前预热消息快照，避免新会话首帧先渲染空数组。 */
+export async function preloadChatHistory(sessionId: string): Promise<void> {
+	await loadHistorySnapshot(sessionId);
+}
+
 export function useChat(sessionId: string) {
-	// ChatPane is mounted with `key={sessionId}`, so a session switch remounts
-	// this hook and the initial state below is already the "fresh session" state.
-	const [messages, setMessages] = useState<ChatMessage[]>([]);
-	const [historyLoading, setHistoryLoading] = useState(true);
+	// Session 切换会 remount；命中预热/最近访问快照时直接首帧展示，随后仍从
+	// 服务端重对齐，缓存只消除视觉空档，不替代事实源。
+	const cachedHistory = historyCache.get(sessionId);
+	const [messages, setMessages] = useState<ChatMessage[]>(() => cachedHistory ?? []);
+	const [historyLoading, setHistoryLoading] = useState(() => !cachedHistory);
 	const [status, setStatus] = useState<ChatStatus>("connecting");
 	const [running, setRunning] = useState(false);
 	const [error, setError] = useState<string | null>(null);
@@ -34,15 +59,16 @@ export function useChat(sessionId: string) {
 		};
 
 		const loadHistory = (initial = false) =>
-			fetchMessages(sessionId)
-				.then(({ messages: msgs, runningToolCallIds }) => {
-					if (!disposed) setMessages(markRunningToolCalls(renderHistory(msgs as PiMessage[]), runningToolCallIds));
+			loadHistorySnapshot(sessionId)
+				.then((snapshot) => {
+					if (!disposed) setMessages(snapshot);
 					if (initial) markHistoryReady();
 				})
 				.catch((err: unknown) => {
 					const message = err instanceof Error ? err.message : String(err);
 					if (message.endsWith(": 404")) {
 						gone = true;
+						historyCache.delete(sessionId);
 						if (!disposed) {
 							setStatus("gone");
 							setError("会话不存在或已被删除");
@@ -82,7 +108,7 @@ export function useChat(sessionId: string) {
 				} catch {
 					return;
 				}
-				setMessages((prev) => reducePiEvent(prev, event));
+				setMessages((prev) => rememberHistory(sessionId, reducePiEvent(prev, event)));
 				if (event.type === "agent_start" || event.type === "turn_start") setRunning(true);
 				if (event.type === "agent_settled" || event.type === "error") setRunning(false);
 			};

@@ -29,7 +29,6 @@ export function SessionWorkCard({
 	initialGoal = "",
 	onGoalStateChange,
 	onGoalSummaryChange,
-	onReady,
 	workStateSignal,
 	runtimeOpen,
 	onRuntimeOpenChange,
@@ -40,7 +39,6 @@ export function SessionWorkCard({
 	initialGoal?: string;
 	onGoalStateChange?: (hasGoal: boolean) => void;
 	onGoalSummaryChange?: (summary: { hasGoal: boolean; pending: number; running: boolean } | null) => void;
-	onReady?: () => void;
 	workStateSignal?: string;
 	runtimeOpen: boolean;
 	onRuntimeOpenChange: (open: boolean) => void;
@@ -133,7 +131,6 @@ export function SessionWorkCard({
 
 	useEffect(() => {
 		let cancelled = false;
-		let readyFrame: number | null = null;
 		const initial = setTimeout(() => {
 			void refresh()
 				.catch((err: unknown) => {
@@ -142,9 +139,6 @@ export function SessionWorkCard({
 				.finally(() => {
 					if (!cancelled) {
 						setLoading(false);
-						readyFrame = requestAnimationFrame(() => {
-							if (!cancelled) onReady?.();
-						});
 					}
 				});
 		}, 0);
@@ -152,10 +146,9 @@ export function SessionWorkCard({
 		return () => {
 			cancelled = true;
 			clearTimeout(initial);
-			if (readyFrame !== null) cancelAnimationFrame(readyFrame);
 			clearInterval(timer);
 		};
-	}, [onReady, refresh]);
+	}, [refresh]);
 
 	useEffect(() => {
 		if (!workStateSignal) return;
@@ -250,17 +243,17 @@ export function SessionWorkCard({
 					<label className="space-y-1.5 text-sm">
 						<span className="font-medium">完成条件</span>
 						<Textarea value={completionBoundary} onChange={(event) => setCompletionBoundary(event.target.value)} rows={3} placeholder={"每行一个可验证条件，例如：\n功能按需求实现\n相关测试通过\n给出可审核的最终结果"} />
-						<span className="block text-xs text-muted-foreground">创建后作为冻结的验收语义；reviewer 只能解释和核对，不能降低条件。</span>
+						<span className="block text-xs text-muted-foreground">创建后即冻结为验收标准；验收者只能核对证据，不能降低标准。</span>
 					</label>
 					<div className="space-y-2">
-						<div className="text-sm font-medium">完成复核</div>
+						<div className="text-sm font-medium">完成验收</div>
 						<div className="grid grid-cols-2 gap-2">
 							<button type="button" aria-pressed={reviewMode === "independent"} onClick={() => setReviewMode("independent")} className={`rounded-xl border p-3 text-left transition-colors ${reviewMode === "independent" ? "border-primary bg-primary/5" : "hover:bg-muted/50"}`}>
-								<div className="flex items-center gap-2 text-sm font-medium"><ShieldCheckIcon className="size-4" />独立复核</div>
+								<div className="flex items-center gap-2 text-sm font-medium"><ShieldCheckIcon className="size-4" />独立验收</div>
 								<div className="mt-1 text-xs text-muted-foreground">全新只读上下文，逐项核对证据</div>
 							</button>
 							<button type="button" aria-pressed={reviewMode === "manager"} onClick={() => setReviewMode("manager")} className={`rounded-xl border p-3 text-left transition-colors ${reviewMode === "manager" ? "border-primary bg-primary/5" : "hover:bg-muted/50"}`}>
-								<div className="text-sm font-medium">manager 自审</div>
+								<div className="text-sm font-medium">Manager 验收</div>
 								<div className="mt-1 text-xs text-muted-foreground">更快，不增加额外模型调用</div>
 							</button>
 						</div>
@@ -273,7 +266,7 @@ export function SessionWorkCard({
 								</SelectContent>
 							</Select>
 						) : null}
-						{reviewMode === "independent" && reviewerModel !== "__manager__" ? <div className="text-xs text-muted-foreground">冻结目标与证据摘要会发送给所选模型服务进行复核。</div> : null}
+						{reviewMode === "independent" && reviewerModel !== "__manager__" ? <div className="text-xs text-muted-foreground">冻结目标与证据摘要会发送给所选模型服务进行验收。</div> : null}
 					</div>
 				</div>
 				<DialogFooter>
@@ -309,7 +302,6 @@ export function SessionWorkCard({
 			onOpenChange={onRuntimeOpenChange}
 			onGoalSelect={selectGoal}
 			onRetryGoal={retryGoal}
-			onCreateNextGoal={() => { onRuntimeOpenChange(false); onCreateOpenChange(true) }}
 			onAnswerChange={(decisionId, value) => setAnswerById((prev) => ({ ...prev, [decisionId]: value }))}
 			onAnswer={(decision, value) => void answer(decision, value)}
 			onWorkStateChange={(state) => {

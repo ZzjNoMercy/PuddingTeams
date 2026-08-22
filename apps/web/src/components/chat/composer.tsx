@@ -219,7 +219,7 @@ function ComposerInner({
 				{(attachment) => <PromptInputAttachment data={attachment} />}
 			</PromptInputAttachments>
 			<PromptInputTextarea
-				placeholder={disabled ? (busyHint ?? "agent 正在处理…") : "发消息，或输入 / 调用命令"}
+				placeholder="发消息，或输入 / 调用命令"
 				className="home-composer-textarea"
 			/>
 			<PromptInputFooter>

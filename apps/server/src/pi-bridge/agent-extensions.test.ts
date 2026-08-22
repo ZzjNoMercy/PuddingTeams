@@ -6,7 +6,7 @@ import path from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { TeamsStore, type AgentConfig } from "../store/teams.js";
-import { WorkStateStore } from "../store/work-state.js";
+import { goalCriterionRefs, WorkStateStore } from "../store/work-state.js";
 import { PiSessionStore } from "./session-store.js";
 import { AgentRuntime } from "../agent-runtime/runtime.js";
 import { DelegationStore } from "../agent-runtime/delegation-store.js";
@@ -621,6 +621,57 @@ test("产品验收冻结: Goal 上下文在 custom-message turn 前按最新状�
 	assert.doesNotMatch(await textOf(), /尚未设置 Goal/);
 	assert.ok(!getActive().includes(CORE_TOOL_CREATE_GOAL));
 	assert.ok(getActive().includes(CORE_TOOL_UPDATE_WORK_PLAN));
+});
+
+test("Goal 工具契约: 创建使用条件数组，WorkPlan 只回传条件序号", async () => {
+	const teams = await makeTeams([agentConfig("alpha")]);
+	const catalog = new ExtensionCatalog();
+	const invoker = await makeInvoker(teams, "alpha");
+	const workStates = new WorkStateStore(freshDir("pt-goal-criteria-contract-"));
+	await workStates.init();
+	const ctx: ManagerWindowContext = { type: "solo", members: ["alpha"] };
+	const deps = { ...makeDeps(teams, invoker, catalog, ctx), workStates };
+	const plan = await planManagerTools(teams, catalog, ctx);
+	const { pi, handlers, tools } = mockPi();
+	for (const ext of buildManagerExtensionFactories(plan, deps)) {
+		const factory = typeof ext === "function" ? ext : ext.factory;
+		await factory(pi);
+	}
+	const context = handlers.get("context")?.[0];
+	assert.ok(context);
+	await context!({ messages: [{ role: "user", content: "建立两步检查", timestamp: 123 }] }, {});
+	const create = tools.get(CORE_TOOL_CREATE_GOAL)!;
+	await create.execute("create-criteria", {
+		goal: "完成两步检查",
+		completionCriteria: ["后端检查有证据", "前端检查使用后端结论"],
+		completionReviewMode: "manager",
+		activationReason: "需要串行多 Worker 协作",
+		criteriaOrigin: "user_input",
+		sourceMessageIds: ["user:123"],
+	}, undefined, undefined, {} as ExtensionContext);
+	const created = await workStates.getActive("sess-test");
+	assert.ok(created);
+	assert.equal(created.completionBoundary, "后端检查有证据\n前端检查使用后端结论");
+	assert.deepEqual(goalCriterionRefs(created).map((item) => item.id), ["goal:1:1", "goal:1:2"]);
+	const activeContext = await context!({ messages: [] }, {}) as { messages: Array<{ content?: unknown }> };
+	const prompt = String(activeContext.messages.at(-1)?.content);
+	assert.match(prompt, /sourceGoalCriterionIndexes/);
+	assert.match(prompt, /"index":1/);
+	assert.doesNotMatch(prompt, /goal:1:1=/);
+
+	const updatePlan = tools.get(CORE_TOOL_UPDATE_WORK_PLAN)!;
+	await updatePlan.execute("plan-criteria", {
+		goalId: created.goalId,
+		expectedRevision: created.revision,
+		reason: "分别映射两条冻结条件",
+		upsertItems: [
+			{ id: "w1", title: "后端检查", acceptanceCriteria: ["给出证据"], sourceGoalCriterionIndexes: [1] },
+			{ id: "w2", title: "前端检查", dependsOn: ["w1"], acceptanceCriteria: ["使用 W1 结论"], sourceGoalCriterionIndexes: [2] },
+		],
+	}, undefined, undefined, {} as ExtensionContext);
+	const planned = await workStates.getActive("sess-test");
+	assert.deepEqual(planned?.plan?.items.w1?.sourceGoalCriteria, ["goal:1:1"]);
+	assert.deepEqual(planned?.plan?.items.w2?.sourceGoalCriteria, ["goal:1:2"]);
 });
 
 test("模型上下文剔除 display:false 审计投影，保持 toolCall/toolResult 相邻", async () => {

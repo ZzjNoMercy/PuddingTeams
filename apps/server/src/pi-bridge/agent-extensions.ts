@@ -243,7 +243,11 @@ const UpdateWorkStateParams = Type.Object({
 
 const CreateGoalParams = Type.Object({
 	goal: Type.String({ description: "用户已经明确表达、需要持续追踪的目标。" }),
-	completionBoundary: Type.String({ description: "仅把用户已表达的完成语义规范化为逐行条件，不得增加新标准。" }),
+	completionCriteria: Type.Array(Type.String({ minLength: 1 }), {
+		minItems: 1,
+		uniqueItems: true,
+		description: "用户已明确表达的完成条件数组；每个元素是一条独立条件，不得合并、拆分或增加新标准。",
+	}),
 	completionReviewMode: Type.Optional(Type.Union([Type.Literal("manager"), Type.Literal("independent")])),
 	activationReason: Type.String({ description: "为何该请求需要持续执行、追踪或多 Worker 协作。" }),
 	criteriaOrigin: Type.Union([Type.Literal("user_input"), Type.Literal("manager_derived")]),
@@ -261,7 +265,10 @@ const UpdateWorkPlanParams = Type.Object({
 		assignedAgentId: Type.Optional(Type.String()),
 		dependsOn: Type.Optional(Type.Array(Type.String())),
 		acceptanceCriteria: Type.Array(Type.String(), { minItems: 1 }),
-		sourceGoalCriteria: Type.Optional(Type.Array(Type.String())),
+		sourceGoalCriterionIndexes: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), {
+			uniqueItems: true,
+			description: "本 WorkItem 服务的 Goal 完成条件序号，只填写 context 中的 index（从 1 开始）；内部引用由后端生成。",
+		})),
 	})),
 	removeItemIds: Type.Optional(Type.Array(Type.String())),
 	cancelItemIds: Type.Optional(Type.Array(Type.String(), { description: "保留审计历史但取消的 WorkItem；活动委托必须先中断，非取消项不能继续依赖它。" })),
@@ -443,7 +450,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 						`当前摘要：${workState.currentBrief || "（尚未记录）"}`,
 						`等待：${workState.waitingOn || "无"}`,
 						`下一步：${workState.nextAction || "尚未记录"}`,
-						`冻结条件引用：${goalCriterionRefs(workState).map((item) => `${item.id}=${item.text}`).join("；")}`,
+						`冻结 Goal 完成条件（update_work_plan 的 sourceGoalCriterionIndexes 只填写 index）：\n${JSON.stringify(goalCriterionRefs(workState).map((item, index) => ({ index: index + 1, criterion: item.text })))}`,
 						...(workState.plan ? [`Manager WorkPlan（覆盖 Goal r${workState.plan.coveredGoalRevision}${workState.plan.needsReconcile ? "，必须先对账当前 Goal 契约" : ""}）：\n${planLines.join("\n") || "（全部已验收）"}`] : ["Manager WorkPlan：尚未建立。多步骤、依赖或多 Worker 任务先调用 update_work_plan。"]),
 						`Goal 状态写操作必须串行：一次只调用一个 ${CORE_TOOL_UPDATE_WORK_PLAN}/${CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM}/${CORE_TOOL_REVIEW_WORK_ITEM}/${CORE_TOOL_UPDATE_WORK_STATE}，拿到新 revision 后再调用下一个，禁止在同一轮并行提交多个写操作。`,
 						`assignedAgentId=manager 的 WorkItem 开始时调用 ${CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM} 标记 in_progress，完成交付后再标记 submitted，然后调用 ${CORE_TOOL_REVIEW_WORK_ITEM} 验收；不得删除 Manager 工作项绕过提交和验收。worker 委托完成只代表 submitted，同样必须明确验收。`,
@@ -569,10 +576,12 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 				if (activation !== "manager_explicit") throw new Error(`当前 Harness goalActivation.${ctx.type}=${activation}，Manager 无权自动创建 Goal`);
 				const invalidSources = params.sourceMessageIds.filter((id) => !latestUserSourceIds.has(id));
 				if (invalidSources.length) throw new Error(`sourceMessageIds 不是当前上下文中的真实用户消息引用：${invalidSources.join("、")}`);
+				const completionCriteria = params.completionCriteria.map((criterion) => criterion.trim());
+				if (completionCriteria.some((criterion) => !criterion)) throw new Error("completionCriteria 不能包含空条件");
 				const state = await deps.workStates.create({
 					sessionId,
 					goal: params.goal,
-					completionBoundary: params.completionBoundary,
+					completionBoundary: completionCriteria.join("\n"),
 					reviewMode: params.completionReviewMode,
 					participantAgentIds: ctx.members,
 					contractProvenance: {
@@ -598,12 +607,25 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 			parameters: UpdateWorkPlanParams,
 			async execute(toolCallId, params: Static<typeof UpdateWorkPlanParams>) {
 				if (!deps.workStates) throw new Error("Session Work State 未启用");
+				const sessionId = deps.getSessionId();
+				const current = await deps.workStates.getActive(sessionId);
+				if (!current || current.goalId !== params.goalId) throw new Error("当前 Goal 已变化，请重新读取目标状态后再更新 WorkPlan");
+				const criterionRefs = goalCriterionRefs(current);
+				const upsertItems = params.upsertItems.map((item) => {
+					const { sourceGoalCriterionIndexes = [], ...workItem } = item;
+					const sourceGoalCriteria = sourceGoalCriterionIndexes.map((index) => {
+						const criterion = criterionRefs[index - 1];
+						if (!criterion) throw new Error(`Goal 只有 ${criterionRefs.length} 条完成条件，不能引用第 ${index} 条`);
+						return criterion.id;
+					});
+					return { ...workItem, dependsOn: workItem.dependsOn ?? [], sourceGoalCriteria };
+				});
 				const state = await deps.workStates.updatePlan(
-					deps.getSessionId(),
+					sessionId,
 					params.expectedRevision,
 					{
 						title: params.title,
-						upsertItems: params.upsertItems.map((item) => ({ ...item, dependsOn: item.dependsOn ?? [], sourceGoalCriteria: item.sourceGoalCriteria ?? [] })),
+						upsertItems,
 						removeItemIds: params.removeItemIds,
 						cancelItemIds: params.cancelItemIds,
 						reopenItemIds: params.reopenItemIds,

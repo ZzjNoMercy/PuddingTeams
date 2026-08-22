@@ -1058,7 +1058,6 @@ html[data-reduce-motion="true"] *::after {
 .goal-recovery-banner { display: flex; align-items: center; gap: 10px; margin: 10px 13px 0; border: 1px solid color-mix(in oklab, #d8922b 32%, transparent); border-radius: 12px; background: color-mix(in oklab, #d8922b 8%, transparent); padding: 10px; font-size: 10px; }
 .goal-recovery-banner strong { display: block; font-size: 12px; }
 .goal-recovery-banner p { margin-top: 2px; color: var(--muted-foreground); line-height: 1.45; }
-.goal-next-row { display: flex; min-height: 44px; align-items: center; justify-content: space-between; gap: 10px; border-bottom: 1px solid var(--goal-line); padding: 7px 13px; color: var(--goal-text-3); font-size: 9px; }
 .goal-interrupt-row { display: flex; min-height: 42px; align-items: center; justify-content: flex-end; gap: 8px; padding: 7px 13px 0; color: var(--goal-text-3); font-size: 8px; }
 .goal-work-tree { padding: 2px 1px 5px; }
 .goal-root-node { display: flex; min-height: 54px; align-items: center; gap: 9px; border: 1px solid color-mix(in oklab, var(--goal-accent) 16%, transparent); border-radius: 13px; background: linear-gradient(110deg, var(--goal-accent-soft), color-mix(in oklab, var(--goal-accent) 2%, transparent)); padding: 9px 11px; }
@@ -1079,10 +1078,12 @@ html[data-reduce-motion="true"] *::after {
 .goal-plan-node.is-selected { border-color: color-mix(in oklab, var(--goal-accent) 36%, transparent); background: var(--goal-accent-soft); box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--goal-accent) 10%, transparent), 0 7px 20px rgba(0,0,0,.05); }
 .goal-plan-node.is-filtered { opacity: .34; }
 .goal-node-status { display: grid; width: 18px; height: 18px; flex: 0 0 18px; place-items: center; border-radius: 50%; background: color-mix(in oklab, var(--goal-text) 5%, transparent); color: var(--goal-text-3); font-size: 8px; }
-.goal-node-copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 5px; }
-.goal-node-copy strong { overflow: hidden; color: var(--goal-text-2); font-size: 10px; font-weight: 620; text-overflow: ellipsis; white-space: nowrap; }
-.goal-node-copy strong i { display: inline-block; width: 24px; color: var(--goal-text-3); font-size: 8px; font-style: normal; font-weight: 700; }
-.goal-node-copy small { color: var(--goal-text-3); font-size: 8px; }
+.goal-node-copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 4px; }
+.goal-node-copy strong { overflow: hidden; color: var(--goal-text-2); font-size: 10px; font-weight: 620; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
+.goal-node-meta { display: flex; min-width: 0; align-items: center; gap: 4px; color: var(--goal-text-3); font-size: 8px; line-height: 1.35; white-space: nowrap; }
+.goal-node-meta i { flex: 0 0 auto; color: var(--goal-text-2); font-style: normal; font-weight: 720; }
+.goal-node-meta span { overflow: hidden; min-width: 0; text-overflow: ellipsis; }
+.goal-node-meta b { flex: 0 0 auto; font-weight: 500; }
 .goal-plan-node > em { flex: 0 0 auto; border-radius: 999px; padding: 3px 6px; color: var(--goal-text-3); font-size: 8px; font-style: normal; }
 .goal-plan-node.is-accepted { border-color: color-mix(in oklab, #35a56c 34%, transparent); }
 .goal-plan-node.is-accepted .goal-node-status { background: color-mix(in oklab, #35a56c 12%, transparent); color: #35a56c; }

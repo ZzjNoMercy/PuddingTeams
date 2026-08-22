@@ -51,7 +51,7 @@ Worker 内部 Todo 仍由 Worker 自己管理。PuddingTeams 不读取、不合�
 ```ts
 create_session_goal({
   goal,
-  completionBoundary,
+  completionCriteria: string[],
   completionReviewMode,
   activationReason,
   criteriaOrigin: "user_input" | "manager_derived",
@@ -64,7 +64,7 @@ create_session_goal({
 Goal 完成条件的权威来源始终是用户意图，不是 Reviewer 的自由生成：
 
 - 当前 `/goal` 实现由用户在创建表单中逐行填写 `completionBoundary`，每个非空行就是一项冻结条件；
-- 目标 `manager_explicit` 模式允许 Manager 把用户消息中已经明确表达的结果、约束和完成边界规范化成逐行草案，但必须记录 `criteriaOrigin/sourceMessageIds`，不得补充用户未要求的新质量门槛；
+- 目标 `manager_explicit` 模式允许 Manager 把用户消息中已经明确表达的结果、约束和完成边界规范化成 `completionCriteria[]`，每个数组元素是一项条件；core tool 在权威 Store 边界按换行落为 `completionBoundary`，避免模型用分号把多项条件误压成一项。必须记录 `criteriaOrigin/sourceMessageIds`，不得补充用户未要求的新质量门槛；
 - 如果 Manager 需要作出新的产品判断才能写出条件，属于“目标或边界含糊”，必须先询问用户，不能偷偷代填；
 - 用户后续可以显式修改 Goal/完成条件，修改会增加 `goalRevision`，旧版本复核不得应用到新契约。
 
@@ -276,7 +276,7 @@ W2 撰写报告 dependsOn=[W1]
 update_work_plan({
   expectedRevision,
   title?,
-  upsertItems: [{ id?, title, description?, assignedAgentId?, dependsOn, acceptanceCriteria }],
+  upsertItems: [{ id?, title, description?, assignedAgentId?, dependsOn, acceptanceCriteria, sourceGoalCriterionIndexes?: number[] }],
   removeItemIds?: string[],
   reason: string
 })
@@ -297,6 +297,8 @@ review_work_item({
   evidenceRefs?: string[]
 })
 ```
+
+`sourceGoalCriterionIndexes` 是从 1 开始的结构化序号，只引用 context 中展示的 `{index, criterion}`。Manager 不读写 `goal:<revision>:<ordinal>` 内部 ID，也不能把 `id=文本` 展示串回传；core tool 在当前 `goalId/revision` 下把序号原子映射为持久化的 `sourceGoalCriteria` 稳定引用。
 
 执行链：
 

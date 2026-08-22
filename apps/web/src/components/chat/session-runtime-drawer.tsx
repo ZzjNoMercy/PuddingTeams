@@ -1,7 +1,7 @@
 "use client";
 
 import { Fragment, useEffect, useMemo, useState } from "react";
-import { AlertCircleIcon, CheckCircle2Icon, CircleIcon, Clock3Icon, ExternalLinkIcon, GitBranchIcon, HistoryIcon, ListTreeIcon, PauseCircleIcon, PlayIcon, RotateCcwIcon, ShieldCheckIcon, SquareIcon, TargetIcon, XCircleIcon } from "lucide-react";
+import { AlertCircleIcon, CheckCircle2Icon, CircleIcon, Clock3Icon, ExternalLinkIcon, GitBranchIcon, ListTreeIcon, PauseCircleIcon, PlayIcon, RotateCcwIcon, ShieldCheckIcon, SquareIcon, TargetIcon, XCircleIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -11,11 +11,15 @@ import { cancelDelegation, interruptGoal, resumeGoal, reviewWorkItem } from "@/l
 import type { CompletionReview, CompletionReviewCriterion, DecisionRequest, DelegationTrace, SessionGoalSummary, SessionWorkState, WorkItem, WorkItemStatus } from "@/lib/types";
 import { useWorkerProcessDrawer } from "./worker-process-context";
 
-const verdictText: Record<CompletionReview["verdict"], string> = { satisfied: "复核通过", not_satisfied: "未通过", needs_human: "需要人类确认" };
+const verdictText: Record<CompletionReview["verdict"], string> = { satisfied: "验收通过", not_satisfied: "验收未通过", needs_human: "需要人工验收" };
+function reviewMethod(review: CompletionReview): string {
+	return review.mode === "manager" ? "Manager 验收" : review.reviewerModel ? `独立验收 · ${review.reviewerModel}` : "独立验收";
+}
 const itemStatusText: Record<WorkItemStatus, string> = {
 	planned: "等待前置任务验收", ready: "可开始", in_progress: "运行中", waiting_input: "等待输入", submitted: "待验收",
 	revision: "需返修", accepted: "已验收", blocked: "已阻塞", cancelled: "已取消",
 };
+const submissionVerdictText = { accepted: "已验收", revision: "需返修", blocked: "验收受阻" } as const;
 const itemStatusClass: Record<WorkItemStatus, string> = {
 	planned: "is-muted", ready: "is-ready", in_progress: "is-live", waiting_input: "is-waiting",
 	submitted: "is-submitted", revision: "is-revision", accepted: "is-accepted", blocked: "is-blocked", cancelled: "is-muted",
@@ -56,7 +60,7 @@ function executionIsLive(status: SessionWorkState["execution"]["status"]): boole
 function executionText(state: SessionWorkState): string {
 	if (state.status === "resolved") return "已完成";
 	if (state.status === "cancelled") return "已取消";
-	return { idle: "待推进", running: "执行中", waiting_human: "等待决定", interrupted: "已暂停", recovering: "恢复中", reviewing: "复核中" }[state.execution.status];
+	return { idle: "待推进", running: "执行中", waiting_human: "等待决定", interrupted: "已暂停", recovering: "恢复中", reviewing: "验收中" }[state.execution.status];
 }
 function matchesFilter(item: WorkItem, filter: PlanFilter, live = true): boolean {
 	if (filter === "action") return ["submitted", "revision", "blocked", "waiting_input"].includes(item.status);
@@ -74,7 +78,10 @@ function WorkPlanGraph({ goal, items, selectedId, filter, executionStatus, onSel
 			<div className="goal-plan-stage" style={{ gridTemplateColumns: `repeat(${level.length}, minmax(0, 1fr))` }}>
 				{level.map((item) => { const paused = item.status === "in_progress" && executionStatus === "interrupted"; const recovering = item.status === "in_progress" && executionStatus === "recovering"; const visibleStatus = paused ? "已暂停" : recovering ? "恢复中" : itemStatusText[item.status]; return <button type="button" key={item.id} className={"goal-plan-node " + itemStatusClass[item.status] + (paused ? " is-paused" : "") + (selectedId === item.id ? " is-selected" : "") + (!matchesFilter(item, filter, live) ? " is-filtered" : "")} onClick={() => onSelect(item.id)} title={item.id + " · " + visibleStatus + " · 上游 " + (item.dependsOn.join("、") || "无")} aria-pressed={selectedId === item.id}>
 					<span className="goal-node-status">{item.status === "accepted" ? "✓" : paused ? "Ⅱ" : item.status === "in_progress" ? "●" : item.status === "submitted" ? "◷" : item.status === "blocked" ? "!" : "○"}</span>
-					<span className="goal-node-copy"><strong><i>{item.id}</i>{item.title}</strong><small>{item.assignedAgentId ?? "待分配"} · {item.delegationIds.length} 次执行</small></span>
+					<span className="goal-node-copy">
+						<span className="goal-node-meta"><i>{item.id}</i><span>{item.assignedAgentId ?? "待分配"}</span><b>· {item.delegationIds.length} 次执行</b></span>
+						<strong title={item.title}>{item.title}</strong>
+					</span>
 					<em>{visibleStatus}</em>
 				</button>})}
 			</div>
@@ -84,13 +91,13 @@ function WorkPlanGraph({ goal, items, selectedId, filter, executionStatus, onSel
 }
 
 export function SessionRuntimeDrawer({
-	workState, initialWorkItemId, activeGoalId, goals, selectedGoalId, goalLoading, goalLoadError, decisions, delegations, answerById, submitting, open, onOpenChange, onGoalSelect, onRetryGoal, onCreateNextGoal, onAnswerChange, onAnswer, onWorkStateChange,
+	workState, initialWorkItemId, activeGoalId, goals, selectedGoalId, goalLoading, goalLoadError, decisions, delegations, answerById, submitting, open, onOpenChange, onGoalSelect, onRetryGoal, onAnswerChange, onAnswer, onWorkStateChange,
 }: {
 	workState: SessionWorkState; activeGoalId: string | null; goals: SessionGoalSummary[]; decisions: DecisionRequest[]; delegations: DelegationTrace[]; answerById: Record<string, string>;
 	initialWorkItemId?: string;
 	selectedGoalId: string; goalLoading: boolean; goalLoadError?: string;
 	submitting: boolean; open: boolean; onOpenChange: (open: boolean) => void;
-	onGoalSelect: (goalId: string) => void; onRetryGoal: () => void; onCreateNextGoal: () => void;
+	onGoalSelect: (goalId: string) => void; onRetryGoal: () => void;
 	onAnswerChange: (decisionId: string, value: string) => void; onAnswer: (decision: DecisionRequest, value: string) => void;
 	onWorkStateChange: (state: SessionWorkState) => void;
 }) {
@@ -169,20 +176,21 @@ export function SessionRuntimeDrawer({
 				<button type="button" role="tab" title="仅筛选当前真正执行中的 WorkItem；不会启动任务" aria-selected={filter === "running"} className={filter === "running" ? "is-active" : ""} onClick={() => { setFilter("running"); const target = items.find((item) => matchesFilter(item, "running", executionLive)); if (target) { setSelectedId(target.id); setSelectedDelegationId(undefined) } }}>执行中 <span>{running}</span></button>
 			</div>
 			<div className="goal-drawer-scroll">
-				{!activeGoalId ? <div className="goal-next-row"><span>当前 Goal 已结束，可以在本 Session 继续创建新目标。</span><Button size="sm" onClick={onCreateNextGoal}>创建下一个 Goal</Button></div> : null}
 				{workState.plan?.needsReconcile ? <div className="goal-recovery-banner"><AlertCircleIcon className="size-4" /><div><strong>WorkPlan 需要重新对账</strong><p>Goal 契约已更新；现有 accepted 仅是旧版本历史，不能用于完成当前 Goal。Manager 必须更新条件映射后再继续。</p></div></div> : null}
-				{!readOnly && (workState.execution.status === "interrupted" || workState.execution.status === "recovering") ? <div className="goal-recovery-banner"><RotateCcwIcon className="size-4" /><div className="min-w-0 flex-1"><strong>{workState.execution.status === "interrupted" ? "Goal 已暂停" : "正在继续"}</strong><p>暂停不会删除 Goal；继续后会从当前 WorkItem 创建新的执行尝试。</p></div>{workState.execution.status === "interrupted" ? <Button size="sm" disabled={working} onClick={() => void changeRecovery("resume")}><PlayIcon className="size-3.5" />继续 Goal</Button> : null}</div> : canInterrupt ? <div className="goal-interrupt-row"><span>暂停当前 Goal，保留计划和已完成结果</span><Button size="sm" variant="ghost" title="暂停当前 Goal，可稍后继续" disabled={working} onClick={() => void changeRecovery("interrupt")}><PauseCircleIcon className="size-3.5" />暂停 Goal</Button></div> : null}
+				{!readOnly && (workState.execution.status === "interrupted" || workState.execution.status === "recovering") ? <div className="goal-recovery-banner"><RotateCcwIcon className="size-4" /><div className="min-w-0 flex-1"><strong>{workState.execution.status === "interrupted" ? "Goal 已暂停" : "正在继续"}</strong><p>暂停不会删除 Goal；继续后会为当前 WorkItem 新增一条执行记录。</p></div>{workState.execution.status === "interrupted" ? <Button size="sm" disabled={working} onClick={() => void changeRecovery("resume")}><PlayIcon className="size-3.5" />继续 Goal</Button> : null}</div> : canInterrupt ? <div className="goal-interrupt-row"><span>暂停当前 Goal，保留计划和已完成结果</span><Button size="sm" variant="ghost" title="暂停当前 Goal，可稍后继续" disabled={working} onClick={() => void changeRecovery("interrupt")}><PauseCircleIcon className="size-3.5" />暂停 Goal</Button></div> : null}
 				{items.length ? <Section icon={<GitBranchIcon />} title="Goal 任务树" metric={workState.plan?.needsReconcile ? "需对账" : "层级主干 · 依赖合流"} className="goal-tree-section"><WorkPlanGraph goal={workState.goal} items={items} selectedId={selected?.id} filter={filter} executionStatus={workState.execution.status} onSelect={(id) => { setSelectedId(id); setSelectedDelegationId(undefined) }} /></Section> : <Section icon={<GitBranchIcon />} title="执行结构"><p className="text-xs text-muted-foreground">{delegations.length ? "当前是 direct Goal 或尚未建立 Manager WorkPlan；只展示真实 Delegation，不推测 Worker 私有 Todo。" : "尚无 WorkPlan。Manager 会在需要多步骤、依赖或多 Worker 时建立计划。"}</p></Section>}
 				{selected ? <section className="runtime-section goal-selected-detail">
 					{selected.description ? <p className="mb-3 text-xs text-muted-foreground">{selected.description}</p> : null}
 					{selected.lastChange ? <p className="mb-3 rounded-lg bg-muted/50 px-2 py-1.5 text-[11px] text-muted-foreground">最近计划变更：{selected.lastChange.reason} · {formatTime(selected.lastChange.changedAt)}</p> : null}
 					<div className="goal-criteria"><div className="runtime-section-head"><h3>本项验收条件</h3><span className="runtime-section-metric">{selected.acceptanceCriteria.length} 项</span></div>{selected.acceptanceCriteria.map((criterion, index) => <div key={criterion} className="goal-criterion"><span>{index + 1}</span><p>{criterion}</p></div>)}</div>
-					{selectedDelegations.length ? <div className="mt-4"><label className="text-[11px] font-medium" htmlFor="goal-attempt">执行尝试</label><div className="mt-1.5 flex gap-2"><select id="goal-attempt" className="goal-attempt-select" value={effectiveDelegationId ?? ""} onChange={(event) => setSelectedDelegationId(event.target.value)}>{selectedDelegations.map((item, index) => <option key={item.id} value={item.id}>D{index + 1} · {item.agentId} · {item.status}</option>)}</select><Button size="sm" variant="outline" disabled={!effectiveDelegationId} onClick={() => { if (effectiveDelegationId) openProcess(effectiveDelegationId) }}>执行过程</Button>{!readOnly && effectiveDelegationId && selectedDelegations.find((item) => item.id === effectiveDelegationId && (item.status === "running" || item.status === "waiting_input")) ? <Button size="sm" variant="destructive" disabled={working} onClick={() => void terminateDelegation(effectiveDelegationId)}><SquareIcon className="size-3 fill-current" />终止任务</Button> : null}</div></div> : null}
+					{selectedDelegations.length ? <div className="mt-4"><label className="text-[11px] font-medium" htmlFor="goal-attempt">执行记录</label><div className="mt-1.5 flex gap-2"><select id="goal-attempt" className="goal-attempt-select" value={effectiveDelegationId ?? ""} onChange={(event) => setSelectedDelegationId(event.target.value)}>{selectedDelegations.map((item, index) => <option key={item.id} value={item.id}>D{index + 1} · {item.agentId} · {item.status}</option>)}</select><Button size="sm" variant="outline" disabled={!effectiveDelegationId} onClick={() => { if (effectiveDelegationId) openProcess(effectiveDelegationId) }}>执行过程</Button>{!readOnly && effectiveDelegationId && selectedDelegations.find((item) => item.id === effectiveDelegationId && (item.status === "running" || item.status === "waiting_input")) ? <Button size="sm" variant="destructive" disabled={working} onClick={() => void terminateDelegation(effectiveDelegationId)}><SquareIcon className="size-3 fill-current" />终止任务</Button> : null}</div></div> : null}
 					{!readOnly && selected.status === "submitted" ? <div className="goal-review-box"><div className="text-xs font-semibold">Submission 待 Manager 验收</div><Textarea value={reviewSummary} onChange={(event) => setReviewSummary(event.target.value)} rows={3} placeholder="填写验收摘要与证据判断（必填）" /><div className="grid grid-cols-3 gap-2"><Button size="sm" disabled={working || !reviewSummary.trim()} onClick={() => void review("accepted")}>接受</Button><Button size="sm" variant="outline" disabled={working || !reviewSummary.trim()} onClick={() => void review("revision")}>要求返修</Button><Button size="sm" variant="destructive" disabled={working || !reviewSummary.trim()} onClick={() => void review("blocked")}>标记阻塞</Button></div></div> : null}
-					{selected.submissions.length ? <div className="mt-3 space-y-2">{[...selected.submissions].reverse().map((submission) => <div key={submission.id} className="rounded-lg border p-2 text-[11px]"><div className="font-medium">尝试 {submission.attempt} · {submission.review?.verdict ?? "待验收"}</div><p className="mt-1 text-muted-foreground">{submission.review?.summary ?? submission.summary ?? "结果见 Delegation"}</p></div>)}</div> : null}
+					{selected.submissions.length ? <div className="mt-3 space-y-2">{[...selected.submissions].reverse().map((submission) => <div key={submission.id} className="rounded-lg border p-2 text-[11px]"><div className="font-medium">第 {submission.attempt} 次交付 · {submission.review ? submissionVerdictText[submission.review.verdict] : "待验收"}</div><p className="mt-1 text-muted-foreground"><span className="font-medium text-foreground">{submission.review ? "Manager 验收结论：" : "交付摘要："}</span>{submission.review?.summary ?? submission.summary ?? "请在执行过程中查看完整结果"}</p></div>)}</div> : null}
 				</section> : null}
-				<Section icon={<ShieldCheckIcon />} title="Goal 完成条件" metric={latestReview ? latestReview.criteria.filter((item) => item.status === "satisfied").length + "/" + conditions.length : conditions.length + " 项"} className="goal-secondary-section"><div className="space-y-2">{conditions.map((condition, index) => { const criterion = latestReview?.criteria[index]; return <div key={condition + "-" + index} className="flex items-start gap-2 text-xs"><CriterionIcon status={criterion?.status} /><div><div className="font-medium">{condition}</div>{criterion ? <div className="text-[11px] text-muted-foreground">{criterion.explanation}</div> : null}</div></div> })}</div></Section>
-				{reviews.length ? <Section icon={<HistoryIcon className="size-4" />} title="复核轨迹" metric={reviews.length + " 次"}>{reviews.map((review) => <div key={review.id} className="mb-2 rounded-lg border p-2 text-xs"><strong>{verdictText[review.verdict]}</strong><span className="ml-2 text-[10px] text-muted-foreground">{formatTime(review.reviewedAt)}</span></div>)}</Section> : null}
+				<Section icon={<ShieldCheckIcon />} title="Goal 验收" metric={latestReview ? latestReview.criteria.filter((item) => item.status === "satisfied").length + "/" + conditions.length + " 项通过" : conditions.length + " 项标准"} className="goal-secondary-section">
+					<div className="space-y-2">{conditions.map((condition, index) => { const criterion = latestReview?.criteria[index]; return <div key={condition + "-" + index} className="flex items-start gap-2 text-xs"><CriterionIcon status={criterion?.status} /><div><div className="font-medium">{condition}</div>{criterion ? <div className="text-[11px] text-muted-foreground">{criterion.explanation}</div> : null}</div></div> })}</div>
+					{reviews.length === 1 ? <div className="mt-3 flex items-center justify-between gap-3 border-t pt-3 text-[11px]"><span className="font-medium">{verdictText[reviews[0]!.verdict]}</span><span className="text-muted-foreground">{reviewMethod(reviews[0]!)} · {formatTime(reviews[0]!.reviewedAt)}</span></div> : reviews.length > 1 ? <details className="mt-3 border-t pt-3 text-[11px]"><summary className="flex cursor-pointer list-none items-center justify-between gap-3"><span className="font-medium">最近一次：{verdictText[reviews[0]!.verdict]}</span><span className="text-muted-foreground">共 {reviews.length} 次验收 · 查看历史</span></summary><div className="mt-2 space-y-1.5">{reviews.map((review) => <div key={review.id} className="flex items-center justify-between gap-3 rounded-lg bg-muted/45 px-2.5 py-2"><span>{verdictText[review.verdict]}{review.goalRevision !== workState.goalRevision ? " · 旧版标准" : ""}</span><span className="text-muted-foreground">{reviewMethod(review)} · {formatTime(review.reviewedAt)}</span></div>)}</div></details> : null}
+				</Section>
 				{pendingDecisions.length ? <Section icon={<AlertCircleIcon className="size-4" />} title="人工决策" metric={pendingDecisions.length + " 项待回答"}>{pendingDecisions.map((decision) => <div key={decision.id} className="mb-2 rounded-xl border border-amber-500/30 bg-amber-500/5 p-3 text-xs"><div className="font-medium">{decision.question}</div>{!readOnly ? <><div className="mt-2 flex flex-wrap gap-1.5">{decision.options?.map((option) => <Button key={option.id} size="sm" variant="outline" disabled={submitting} onClick={() => onAnswer(decision, option.id)}>{option.label}</Button>)}</div><div className="mt-2 flex gap-1.5"><Input value={answerById[decision.id] ?? ""} onChange={(event) => onAnswerChange(decision.id, event.target.value)} placeholder="输入决定" /><Button size="sm" disabled={submitting || !(answerById[decision.id] ?? "").trim()} onClick={() => onAnswer(decision, answerById[decision.id] ?? "")}>提交</Button></div></> : null}</div>)}</Section> : null}
 				{unplanned.length ? <Section icon={<Clock3Icon className="size-4" />} title="本 Goal 未绑定 WorkItem 的执行" metric={unplanned.length + " 次"}>{unplanned.map((item) => <button key={item.id} type="button" className="goal-unplanned-row" title="当前 Goal 内未绑定 WorkItem 的委托；不包含本 Session 的历史任务" onClick={() => openProcess(item.id)}><span>{item.agentId} · {item.status}</span><ExternalLinkIcon className="size-3" /></button>)}</Section> : null}
 			</div>

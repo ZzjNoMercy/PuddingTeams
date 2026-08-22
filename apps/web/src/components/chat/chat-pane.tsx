@@ -21,7 +21,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { useChat } from "@/hooks/useChat";
+import { preloadChatHistory, useChat } from "@/hooks/useChat";
 import { compactDay } from "@/lib/time";
 import {
 	createRoomSession,
@@ -122,16 +122,14 @@ function SessionChat({
 	const [goalCreateOpen, setGoalCreateOpen] = useState(false);
 	const [goalDraft, setGoalDraft] = useState("");
 	const [hasGoal, setHasGoal] = useState(false);
-	const [workStateReady, setWorkStateReady] = useState(false);
 	const [scrollButtonHost, setScrollButtonHost] = useState<HTMLDivElement | null>(null);
 	const [atBottom, setAtBottom] = useState(true);
 	useEffect(() => onStatus(status), [status, onStatus]);
-	const markWorkStateReady = useCallback(() => setWorkStateReady(true), []);
 	const openGoalCommand = useCallback((initialGoal: string) => {
 		setGoalDraft(initialGoal);
 		setGoalCreateOpen(true);
 	}, []);
-	const layoutReady = !historyLoading && workStateReady;
+	const layoutReady = !historyLoading;
 	const sessionStats = useMemo(() => computeSessionStats(messages), [messages]);
 	// running 态指派卡（pudding:task_assign）在同 taskId 的结果/审批卡到达后
 	// 落定折叠。
@@ -194,7 +192,6 @@ function SessionChat({
 					initialGoal={goalDraft}
 					onGoalStateChange={setHasGoal}
 					onGoalSummaryChange={onGoalSummaryChange}
-					onReady={markWorkStateReady}
 					workStateSignal={workStateSignal}
 					runtimeOpen={runtimeOpen}
 					onRuntimeOpenChange={onRuntimeOpenChange}
@@ -372,7 +369,10 @@ export function ChatPane({
 			setGoalSummary(null);
 			setRequestedDelegationId(null);
 			try {
-				await setActiveRoomSession(roomId, sessionId);
+				await Promise.all([
+					setActiveRoomSession(roomId, sessionId),
+					preloadChatHistory(sessionId).catch(() => undefined),
+				]);
 				if (room) {
 					patchSessions(
 						room.sessions.map((s) => ({ ...s, active: s.id === sessionId })),
