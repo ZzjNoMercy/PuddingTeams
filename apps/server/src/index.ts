@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { config } from "./config.js";
-import { acquireLease, ensurePaths, resolvePuddingTeamsPaths } from "./paths.js";
+import { acquireLease, ensurePaths, puddingTeamsHomeId, resolvePuddingTeamsPaths } from "./paths.js";
 import { PiSessionStore } from "./pi-bridge/session-store.js";
 import { CredentialsStore } from "./store/credentials.js";
 import { TeamsStore } from "./store/teams.js";
@@ -40,6 +40,10 @@ import { DelegationTimelineStore } from "./agent-runtime/delegation-timeline-sto
 import { UploadStore } from "./store/uploads.js";
 import { configureSharedModelRuntime } from "./pi-bridge/model-runtime.js";
 import { registerWebStatic } from "./web-static.js";
+
+// Electron 只需要该变量让自身二进制以 Node 模式启动 server。进入 server 后
+// 立即删除，避免 Connector/Worker 子进程继续继承 Electron 专用开关。
+if (process.env.PUDDINGTEAMS_DESKTOP === "1") delete process.env.ELECTRON_RUN_AS_NODE;
 
 const app = Fastify({ logger: { level: "warn" } });
 
@@ -253,7 +257,9 @@ await teams.ensureSoloWindow(
 	},
 	async (id) => store.isOpen(id) || (await store.list()).some((s) => s.id === id),
 );
-await registerChatRoutes(app, store, teams, workStates, uploads, invoker);
+await registerChatRoutes(app, store, teams, workStates, uploads, invoker, {
+	dataHomeId: puddingTeamsHomeId(paths.home),
+});
 registerIdentityRoutes(app);
 await registerSettingsRoutes(app, defaultCwd, productSettings, workStates);
 await registerProvidersRoutes(app, store);

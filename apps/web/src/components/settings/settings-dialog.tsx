@@ -79,7 +79,7 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
 						) : (
 							<div className="settings-content-column">
 								<div className="settings-section-heading"><h2 id="harness-heading">Harness</h2><p>控制 Manager 上下文预算、Goal 激活与安全恢复。</p></div>
-								<section className="settings-card" aria-labelledby="harness-heading"><HarnessSettingsPanel /></section>
+								<HarnessSettingsPanel />
 							</div>
 						)}
 					</main>

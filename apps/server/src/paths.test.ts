@@ -3,7 +3,7 @@ import assert from "node:assert";
 import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { acquireLease, ensurePaths, resolvePuddingTeamsPaths } from "./paths.js";
+import { acquireLease, ensurePaths, puddingTeamsHomeId, resolvePuddingTeamsPaths } from "./paths.js";
 
 function freshHome(): string {
 	return mkdtempSync(path.join(tmpdir(), "pt-home-"));
@@ -36,6 +36,14 @@ test("绝对路径 PUDDINGTEAMS_HOME 优先于缺省根", () => {
 	const paths = resolvePuddingTeamsPaths({ PUDDINGTEAMS_HOME: "/data/pt" }, "/tmp/pt-user");
 	assert.equal(paths.home, "/data/pt");
 	assert.equal(paths.state, "/data/pt/state");
+});
+
+test("Home 指纹稳定且不暴露路径正文", () => {
+	const home = path.join(tmpdir(), "pt-private-home");
+	const id = puddingTeamsHomeId(home);
+	assert.equal(id, puddingTeamsHomeId(path.resolve(home)));
+	assert.equal(id.length, 64);
+	assert.ok(!id.includes("pt-private-home"));
 });
 
 test("ensurePaths 建出完整目录树", async () => {

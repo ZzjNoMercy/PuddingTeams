@@ -4,6 +4,7 @@
  */
 export interface PuddingTeamsDesktop {
 	isDesktop: boolean;
+	platform: "darwin" | "win32" | "linux";
 	pickDirectory: (initialPath?: string) => Promise<string | null>;
 	revealInFinder: (targetPath: string) => Promise<void>;
 	openExternal: (url: string) => Promise<void>;

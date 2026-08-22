@@ -13,6 +13,8 @@
 
 appId: com.puddingteams.app
 productName: PuddingTeams
+forceCodeSigning: true
+afterPack: scripts/after-pack.mjs
 directories:
   output: release
   buildResources: build
@@ -25,10 +27,30 @@ extraResources:
 mac:
   icon: build/icon.png
   category: public.app-category.productivity
+  hardenedRuntime: true
+  entitlements: signing/entitlements.mac.plist
+  entitlementsInherit: signing/entitlements.mac.inherit.plist
+  notarize: true
+  extendInfo:
+    NSAppTransportSecurity:
+      NSAllowsArbitraryLoads: false
+      NSAllowsLocalNetworking: true
+      NSExceptionDomains:
+        127.0.0.1:
+          NSIncludesSubdomains: false
+          NSTemporaryExceptionAllowsInsecureHTTPLoads: true
+        localhost:
+          NSIncludesSubdomains: false
+          NSTemporaryExceptionAllowsInsecureHTTPLoads: true
   target:
     - target: dmg
       arch: [arm64, x64]
-  identity: null
+win:
+  icon: build/icon.png
+  target:
+    - target: nsis
+      arch: [x64]
+artifactName: ${productName}-${version}-${arch}.${ext}
 dmg:
   title: ${productName}
   contents:
@@ -38,4 +60,14 @@ dmg:
       y: 220
       type: link
       path: /Applications
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: true
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: PuddingTeams
+  uninstallDisplayName: PuddingTeams
+  deleteAppDataOnUninstall: false
 npmRebuild: false

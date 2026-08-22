@@ -71,6 +71,17 @@
 	--ring: #147d8a;
 }
 
+/* Every app screen owns its scrolling internally. Keeping the document viewport
+   fixed prevents Electron/Chromium from exposing window-level bars around the
+   desktop composition when a nested message briefly grows during streaming. */
+html,
+body {
+	width: 100%;
+	height: 100%;
+	min-width: 0;
+	overflow: hidden;
+}
+
 .dark {
 	color-scheme: dark;
 	/* Calm Ops palette: cyan is reserved for active/running/primary actions. */
@@ -228,6 +239,36 @@ html[data-reduce-motion="true"] *::after {
 	box-shadow: 0 12px 30px color-mix(in oklab, black 5%, transparent);
 	padding: 22px 24px;
 }
+.harness-settings { display: flex; flex-direction: column; gap: 12px; }
+.harness-settings-tabs {
+	display: flex;
+	width: fit-content;
+	max-width: 100%;
+	align-items: center;
+	gap: 4px;
+	border-radius: 11px;
+	background: var(--settings-sidebar);
+	padding: 4px;
+}
+.harness-settings-tabs button {
+	display: inline-flex;
+	height: 30px;
+	align-items: center;
+	justify-content: center;
+	border-radius: 8px;
+	padding: 0 12px;
+	color: var(--muted-foreground);
+	font-size: 11px;
+	font-weight: 620;
+	white-space: nowrap;
+	transition: background 140ms ease, color 140ms ease, box-shadow 140ms ease;
+}
+.harness-settings-tabs button:hover { color: var(--foreground); }
+.harness-settings-tabs button[data-active="true"] { background: var(--settings-surface); color: var(--foreground); box-shadow: 0 3px 10px color-mix(in oklab, black 8%, transparent); }
+.harness-settings-tabs button:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.harness-settings-card { min-height: 359px; }
+.harness-settings-pane { display: flex; flex-direction: column; gap: 16px; }
+.harness-settings-footer { display: flex; justify-content: flex-end; margin-top: 20px; border-top: 1px solid var(--settings-line); padding-top: 16px; }
 .appearance-settings { display: flex; flex-direction: column; }
 .preference-row {
 	display: flex;
@@ -1649,6 +1690,8 @@ html[data-nav="expanded"] .nav-primary {
 	--home-manager-text: #0f6f79;
 	--home-success: #167a57;
 	--home-danger: #b13d49;
+	--home-scrollbar-thumb: rgba(64, 81, 90, .24);
+	--home-scrollbar-thumb-hover: rgba(64, 81, 90, .4);
 }
 
 .dark {
@@ -1677,13 +1720,41 @@ html[data-nav="expanded"] .nav-primary {
 	--home-manager-text: #8ce9f3;
 	--home-success: #63dea4;
 	--home-danger: #ff8c95;
+	--home-scrollbar-thumb: rgba(182, 193, 199, .24);
+	--home-scrollbar-thumb-hover: rgba(182, 193, 199, .42);
 }
 
 .home-shell {
+	box-sizing: border-box;
+	width: 100%;
+	max-width: 100%;
+	min-width: 0;
+	overflow: hidden;
 	background: var(--home-canvas);
 	color: var(--home-text);
 	font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Noto Sans SC", sans-serif;
+	scrollbar-color: var(--home-scrollbar-thumb) transparent;
+	scrollbar-width: thin;
 }
+
+/* Chromium/Electron needs the WebKit pseudo-elements; Firefox uses the two
+   properties above. Transparent tracks inherit the current home surface while
+   the inset thumb stays visible without becoming a separate white strip. */
+.home-shell ::-webkit-scrollbar {
+	width: 10px;
+	height: 10px;
+}
+.home-shell ::-webkit-scrollbar-track,
+.home-shell ::-webkit-scrollbar-corner { background: transparent; }
+.home-shell ::-webkit-scrollbar-thumb {
+	min-width: 32px;
+	min-height: 32px;
+	border: 3px solid transparent;
+	border-radius: 999px;
+	background: var(--home-scrollbar-thumb);
+	background-clip: padding-box;
+}
+.home-shell ::-webkit-scrollbar-thumb:hover { background-color: var(--home-scrollbar-thumb-hover); }
 
 .nav-rail {
 	box-sizing: border-box;
@@ -1694,6 +1765,29 @@ html[data-nav="expanded"] .nav-primary {
 	border-right: 1px solid var(--home-line, var(--border));
 	background: var(--home-nav);
 	padding: 14px 10px 12px;
+}
+
+/* Electron macOS uses the real hiddenInset traffic lights. Only the left rail
+   reserves their row; the rest of the interface keeps its existing density.
+   Header surfaces are draggable, while every actual control remains clickable. */
+html[data-desktop-platform="darwin"] .nav-rail {
+	padding-top: 56px;
+	-webkit-app-region: drag;
+}
+html[data-desktop-platform="darwin"] :where(
+	.home-chat-header,
+	.home-workspace-head,
+	.ops-page-header,
+	.agent-config-head
+) { -webkit-app-region: drag; }
+html[data-desktop-platform="darwin"] :where(
+	.nav-rail,
+	.home-chat-header,
+	.home-workspace-head,
+	.ops-page-header,
+	.agent-config-head
+) :where(a, button, input, textarea, select, [role="button"], [role="link"]) {
+	-webkit-app-region: no-drag;
 }
 
 .nav-brand {
@@ -1967,11 +2061,13 @@ html[data-nav="expanded"] .home-workspace-head h1 {
 
 .home-main-stage {
 	position: relative;
+	min-width: 0;
+	overflow: hidden;
 	background:
 		radial-gradient(circle at 90% -10%, color-mix(in oklab, var(--home-accent) 5%, transparent), transparent 32rem),
 		var(--home-surface-1);
 }
-.home-chat-pane { background: transparent; }
+.home-chat-pane { width: 100%; max-width: 100%; min-width: 0; overflow: hidden; background: transparent; }
 .home-chat-header {
 	display: flex;
 	min-height: 66px;
@@ -2129,10 +2225,25 @@ html[data-nav="expanded"] .home-workspace-head h1 {
 .home-session-menu-new:hover { background: var(--home-soft-hover); color: var(--home-text); }
 .home-session-menu-new svg { width: 13px; height: 13px; color: var(--home-text-3) !important; }
 
-.home-session-chat [data-stick-to-bottom-viewport] { scrollbar-width: thin; scrollbar-color: color-mix(in oklab, var(--home-text) 16%, transparent) transparent; }
+.home-session-chat { width: 100%; max-width: 100%; min-width: 0; overflow: hidden; }
+.conversation-scroll-viewport {
+	box-sizing: border-box;
+	min-width: 0;
+	max-width: 100%;
+	overflow-y: auto !important;
+	overscroll-behavior: contain;
+	/* use-stick-to-bottom sets `stable both-edges` inline. One themed trailing
+	   gutter is enough and avoids the detached blank columns shown in Electron. */
+	scrollbar-gutter: stable !important;
+	scrollbar-color: var(--home-scrollbar-thumb) transparent;
+	scrollbar-width: thin;
+}
+.conversation-scroll-viewport::-webkit-scrollbar { width: 10px; height: 10px; }
 .home-message-column {
 	box-sizing: border-box;
 	width: min(780px, calc(100% - 48px));
+	max-width: 100%;
+	min-width: 0;
 	min-height: 100%;
 	margin: 0 auto;
 	gap: 30px;

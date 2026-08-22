@@ -18,6 +18,12 @@ const fields: Array<{ key: keyof typeof defaults; label: string; hint: string }>
 	{ key: "previewTailTokens", label: "尾部预览", hint: "保留结论、风险和引用所在的尾部预算。" },
 	{ key: "readChunkTokens", label: "分页读取", hint: "read_delegation_result 的默认单页预算。" },
 ];
+type HarnessTab = "results" | "activation" | "recovery";
+const harnessTabs: Array<{ id: HarnessTab; label: string }> = [
+	{ id: "results", label: "结果上下文" },
+	{ id: "activation", label: "Goal 激活" },
+	{ id: "recovery", label: "安全恢复" },
+];
 export function HarnessSettingsPanel() {
 	const [value, setValue] = useState<HarnessSettings>({
 		workerResults: defaults,
@@ -25,6 +31,7 @@ export function HarnessSettingsPanel() {
 		goalRecovery: { mode: "safe_auto", directMode: "manual", resumeLeaseMs: 30_000, operationRetentionDays: 30, maxOperationsPerSession: 512 },
 	});
 	const [saving, setSaving] = useState(false);
+	const [tab, setTab] = useState<HarnessTab>("results");
 	useEffect(() => { void getHarnessSettings().then(setValue).catch((error) => toast.error(error instanceof Error ? error.message : String(error))) }, []);
 	const save = async () => {
 		setSaving(true);
@@ -32,18 +39,31 @@ export function HarnessSettingsPanel() {
 		catch (error) { toast.error(error instanceof Error ? error.message : String(error)) }
 		finally { setSaving(false) }
 	};
-	return <div className="space-y-5">
-		<div><h3 className="text-sm font-semibold">Worker 结果上下文</h3><p className="mt-1 text-xs leading-5 text-muted-foreground">超长结果始终无损外置；这里只调整预览和分页预算，不能退回静默硬截断。token 使用 ceil(chars/4) 估算。</p></div>
-		<div className="grid gap-3 sm:grid-cols-2">{fields.map((field) => <label key={field.key} className="space-y-1.5 text-xs"><span className="font-medium">{field.label}</span><Input type="number" min={1} value={value.workerResults[field.key]} onChange={(event) => setValue((current) => ({ ...current, workerResults: { ...current.workerResults, [field.key]: Number(event.target.value) } }))} /><span className="block text-[10px] leading-4 text-muted-foreground">{field.hint}</span></label>)}</div>
-		<div className="border-t pt-4"><h3 className="text-sm font-semibold">Goal 激活</h3><div className="mt-3 grid gap-3 sm:grid-cols-2">
-			{(["solo", "group"] as const).map((kind) => <label key={kind} className="space-y-1.5 text-xs"><span className="font-medium">{kind}</span><select className="h-9 w-full rounded-md border bg-background px-2" value={value.goalActivation[kind]} onChange={(event) => setValue((current) => ({ ...current, goalActivation: { ...current.goalActivation, [kind]: event.target.value as HarnessSettings["goalActivation"][typeof kind] } }))}><option value="manager_explicit">Manager 显式创建</option><option value="user_explicit">仅用户显式创建</option><option value="disabled">禁用</option></select></label>)}
-			<label className="space-y-1.5 text-xs"><span className="font-medium">direct</span><select className="h-9 w-full rounded-md border bg-background px-2" value={value.goalActivation.direct} onChange={(event) => setValue((current) => ({ ...current, goalActivation: { ...current.goalActivation, direct: event.target.value as "user_explicit" | "disabled" } }))}><option value="user_explicit">仅用户显式创建</option><option value="disabled">禁用</option></select></label>
-			<label className="flex items-center gap-2 self-end pb-2 text-xs"><input type="checkbox" checked={value.goalActivation.confirmWhenAmbiguous} onChange={(event) => setValue((current) => ({ ...current, goalActivation: { ...current.goalActivation, confirmWhenAmbiguous: event.target.checked } }))} />目标含糊时先确认</label>
-		</div></div>
-		<div className="border-t pt-4"><h3 className="text-sm font-semibold">恢复与幂等账本</h3><p className="mt-1 text-[11px] text-muted-foreground">direct 始终手动恢复；自动恢复只唤醒 Manager 从安全点决策，不重放旧 Run。</p><div className="mt-3 grid gap-3 sm:grid-cols-2">
-			<label className="space-y-1.5 text-xs"><span className="font-medium">solo/group 恢复</span><select className="h-9 w-full rounded-md border bg-background px-2" value={value.goalRecovery.mode} onChange={(event) => setValue((current) => ({ ...current, goalRecovery: { ...current.goalRecovery, mode: event.target.value as "safe_auto" | "manual" } }))}><option value="safe_auto">安全自动恢复</option><option value="manual">手动恢复</option></select></label>
-			{([{ key: "resumeLeaseMs", label: "恢复租约（毫秒）" }, { key: "operationRetentionDays", label: "幂等记录保留（天）" }, { key: "maxOperationsPerSession", label: "每 Session 最少保留条数" }] as const).map((field) => <label key={field.key} className="space-y-1.5 text-xs"><span className="font-medium">{field.label}</span><Input type="number" min={1} value={value.goalRecovery[field.key]} onChange={(event) => setValue((current) => ({ ...current, goalRecovery: { ...current.goalRecovery, [field.key]: Number(event.target.value) } }))} /></label>)}
-		</div></div>
-		<div className="flex justify-end"><Button disabled={saving} onClick={() => void save()}>{saving ? "保存中…" : "保存"}</Button></div>
+	return <div className="harness-settings">
+		<div className="harness-settings-tabs" role="tablist" aria-label="Harness 配置分类">
+			{harnessTabs.map((item) => <button key={item.id} id={`harness-tab-${item.id}`} type="button" role="tab" aria-selected={tab === item.id} aria-controls={`harness-panel-${item.id}`} data-active={tab === item.id ? "true" : "false"} onClick={() => setTab(item.id)}>{item.label}</button>)}
+		</div>
+		<section id={`harness-panel-${tab}`} className="settings-card harness-settings-card" role="tabpanel" aria-labelledby={`harness-tab-${tab}`}>
+			{tab === "results" ? <div className="harness-settings-pane">
+				<div><h3 className="text-sm font-semibold">Worker 结果上下文</h3><p className="mt-1 text-xs leading-5 text-muted-foreground">超长结果始终无损外置；这里只调整预览和分页预算，不能退回静默硬截断。token 使用 ceil(chars/4) 估算。</p></div>
+				<div className="grid gap-3 sm:grid-cols-2">{fields.map((field) => <label key={field.key} className="space-y-1.5 text-xs"><span className="font-medium">{field.label}</span><Input type="number" min={1} value={value.workerResults[field.key]} onChange={(event) => setValue((current) => ({ ...current, workerResults: { ...current.workerResults, [field.key]: Number(event.target.value) } }))} /><span className="block text-[10px] leading-4 text-muted-foreground">{field.hint}</span></label>)}</div>
+			</div> : null}
+			{tab === "activation" ? <div className="harness-settings-pane">
+				<h3 className="text-sm font-semibold">Goal 激活</h3>
+				<div className="grid gap-3 sm:grid-cols-2">
+					{(["solo", "group"] as const).map((kind) => <label key={kind} className="space-y-1.5 text-xs"><span className="font-medium">{kind}</span><select className="h-9 w-full rounded-md border bg-background px-2" value={value.goalActivation[kind]} onChange={(event) => setValue((current) => ({ ...current, goalActivation: { ...current.goalActivation, [kind]: event.target.value as HarnessSettings["goalActivation"][typeof kind] } }))}><option value="manager_explicit">Manager 显式创建</option><option value="user_explicit">仅用户显式创建</option><option value="disabled">禁用</option></select></label>)}
+					<label className="space-y-1.5 text-xs"><span className="font-medium">direct</span><select className="h-9 w-full rounded-md border bg-background px-2" value={value.goalActivation.direct} onChange={(event) => setValue((current) => ({ ...current, goalActivation: { ...current.goalActivation, direct: event.target.value as "user_explicit" | "disabled" } }))}><option value="user_explicit">仅用户显式创建</option><option value="disabled">禁用</option></select></label>
+					<label className="flex items-center gap-2 self-end pb-2 text-xs"><input type="checkbox" checked={value.goalActivation.confirmWhenAmbiguous} onChange={(event) => setValue((current) => ({ ...current, goalActivation: { ...current.goalActivation, confirmWhenAmbiguous: event.target.checked } }))} />目标含糊时先确认</label>
+				</div>
+			</div> : null}
+			{tab === "recovery" ? <div className="harness-settings-pane">
+				<div><h3 className="text-sm font-semibold">恢复与幂等账本</h3><p className="mt-1 text-[11px] text-muted-foreground">direct 始终手动恢复；自动恢复只唤醒 Manager 从安全点决策，不重放旧 Run。</p></div>
+				<div className="grid gap-3 sm:grid-cols-2">
+					<label className="space-y-1.5 text-xs"><span className="font-medium">solo/group 恢复</span><select className="h-9 w-full rounded-md border bg-background px-2" value={value.goalRecovery.mode} onChange={(event) => setValue((current) => ({ ...current, goalRecovery: { ...current.goalRecovery, mode: event.target.value as "safe_auto" | "manual" } }))}><option value="safe_auto">安全自动恢复</option><option value="manual">手动恢复</option></select></label>
+					{([{ key: "resumeLeaseMs", label: "恢复租约（毫秒）" }, { key: "operationRetentionDays", label: "幂等记录保留（天）" }, { key: "maxOperationsPerSession", label: "每 Session 最少保留条数" }] as const).map((field) => <label key={field.key} className="space-y-1.5 text-xs"><span className="font-medium">{field.label}</span><Input type="number" min={1} value={value.goalRecovery[field.key]} onChange={(event) => setValue((current) => ({ ...current, goalRecovery: { ...current.goalRecovery, [field.key]: Number(event.target.value) } }))} /></label>)}
+				</div>
+			</div> : null}
+			<div className="harness-settings-footer"><Button disabled={saving} onClick={() => void save()}>{saving ? "保存中…" : "保存"}</Button></div>
+		</section>
 	</div>;
 }

@@ -1,5 +1,6 @@
 import { constants as fsConstants } from "node:fs";
 import { access, mkdir, open, readFile, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
@@ -74,6 +75,14 @@ export function resolvePuddingTeamsPaths(env: NodeJS.ProcessEnv = process.env, h
 		logs: path.join(root, "logs"),
 		migrations: path.join(root, "migrations"),
 	};
+}
+
+/**
+ * 本地宿主之间核对数据目录时使用的不可逆指纹。HTTP health 只暴露指纹，
+ * 不把用户 Home 的绝对路径发送给 renderer 或其他本地调用方。
+ */
+export function puddingTeamsHomeId(home: string): string {
+	return createHash("sha256").update(path.resolve(home)).digest("hex");
 }
 
 /** 启动时建目录树并验证可读写；任何一级不可写都拒绝启动。 */

@@ -220,9 +220,9 @@ class PuddingTeamsPaths {
 | Windows | `C:\Users\<user>\.puddingteams` |
 | 自定义盘 | 显式 `PUDDINGTEAMS_HOME=D:\PuddingTeamsData` |
 | Docker | 容器内显式 `PUDDINGTEAMS_HOME=/app/.puddingteams`，宿主使用 bind/named volume |
-| Electron | 主进程显式传入用户数据根；不得从安装目录或 Backend cwd 推导 |
+| Electron | 与 CLI 同样缺省 `~/.puddingteams`；可由绝对路径 `PUDDINGTEAMS_HOME` 覆盖；不得从安装目录、Electron `userData` 或 Backend cwd 推导 |
 
-Electron 的窗口尺寸、最近窗口和更新器状态可以留在 Electron `userData`；PuddingTeams 业务事实必须使用同一 `PUDDINGTEAMS_HOME` 格式。若 Electron 选择把 Home 放在 `userData` 子目录，CLI 必须能通过显式路径打开同一份数据，而不是维护第二套 Schema。
+Electron 的窗口尺寸、桌面日志和更新器状态可以留在 Electron `userData`；PuddingTeams 业务事实必须与 CLI 复用同一 `PUDDINGTEAMS_HOME`（缺省 `~/.puddingteams`），不得在 `userData` 下维护第二套业务数据。pi global 仍由 pi SDK 从当前用户 `~/.pi/agent`（或显式 `PI_CODING_AGENT_DIR`）读取。
 
 ## 6. Agent Profile、用户资源与 `AGENTS.md`
 

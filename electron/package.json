@@ -2,19 +2,25 @@
 	"name": "@puddingteams/electron",
 	"version": "0.1.0",
 	"private": true,
+	"author": "PuddingTeams",
 	"description": "PuddingTeams 桌面宿主（mac/win）：spawn 同一份生产 server，loadURL 加载前端",
 	"main": "dist/main.cjs",
 	"scripts": {
 		"build": "node scripts/build.mjs",
 		"dev:desktop": "node scripts/dev.mjs",
+		"test": "tsx --test src/*.test.ts",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
-		"pack:mac": "node scripts/build.mjs && electron-builder --mac --config electron-builder.yml"
+		"pack:mac": "node scripts/build.mjs && electron-builder --mac --config electron-builder.yml",
+		"pack:mac:arm64": "node scripts/build.mjs && electron-builder --mac dmg --arm64 --config electron-builder.yml",
+		"pack:mac:dir": "node scripts/build.mjs && electron-builder --mac dir --config electron-builder.yml",
+		"pack:win:x64": "node scripts/build.mjs && electron-builder --win nsis --x64 --config electron-builder.yml --config.forceCodeSigning=false"
 	},
 	"devDependencies": {
 		"@types/node": "^24.13.3",
 		"electron": "^43.4.0",
 		"electron-builder": "^26.15.3",
 		"esbuild": "0.28.1",
+		"tsx": "^4.23.5",
 		"typescript": "^5.9.3"
 	}
 }

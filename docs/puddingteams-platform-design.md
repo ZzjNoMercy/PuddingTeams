@@ -143,7 +143,7 @@ PuddingTeams/
 │       └── （无运行时数据目录）    #   用户数据自 2026-08-11 起统一在 PUDDINGTEAMS_HOME（默认 ~/.puddingteams），
 │                                  #   目录树见 docs/2026-08-11-用户数据目录与Workspace上下文迁移方案.md §4；
 │                                  #   早期 apps/server/.teams/ 仅为历史说明
-├── electron/                      # ☐ 已建：壳 + 打包配置（mac 先行，2026-08-14）
+├── electron/                      # ☑ 桌面壳 + macOS Developer ID 签名/公证（复用 ~/.puddingteams 与 pi global）
 ├── workers/                       # ◻ 运行时生成的共享工作目录（gitignore，阶段二）
 └── docs/reference/                # ☐ PuddingClaw 侧文档参考拷贝（已有）
 ```

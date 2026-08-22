@@ -72,8 +72,14 @@ export async function registerChatRoutes(
 	workStates?: WorkStateStore,
 	uploads?: UploadStore,
 	invoker?: AgentInvoker,
+	health?: { dataHomeId?: string },
 ): Promise<void> {
-	app.get("/api/health", async () => ({ ok: true, service: "puddingteams-server", piVersion }));
+	app.get("/api/health", async () => ({
+		ok: true,
+		service: "puddingteams-server",
+		piVersion,
+		...(health?.dataHomeId ? { dataHomeId: health.dataHomeId } : {}),
+	}));
 
 	app.get("/api/models", async () => ({ models: await store.listModels() }));
 
