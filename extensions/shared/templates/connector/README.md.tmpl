@@ -9,7 +9,7 @@ __DISPLAY_NAME__ Connector 双宿主包：PuddingTeams Driver SPI 本体 + pi ex
 - **pi 半边**（`pi/index.ts`）：`pi install` 可装的 pi extension，注册
   `__CONNECTOR_ID___delegate` 工具，让 pi 能把任务委托给本机 __DISPLAY_NAME__ CLI；
 - **PuddingTeams 半边**（`driver/index.ts`）：Driver SPI 本体，`createDriver`
-  工厂注册进 Driver Registry，由房间 Runtime 编排。
+  工厂按 `(config, transport)` 注册进 Driver Registry，由房间 Runtime 编排。
 
 完整的房间能力（manager-worker 编排、HITL 审批闭环、workspace 交接）只有
 PuddingTeams 提供——pi 入口是包的门面，Driver 才是 Connector 的本体。

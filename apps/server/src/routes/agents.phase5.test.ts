@@ -179,7 +179,17 @@ test("Phase5: DEFAULT_TEAMS 新结构——pinned manager + PuddingClaw connecto
 	assert.deepEqual(claw!.connector, {
 		extensionId: "puddingclaw",
 		connectorId: "puddingclaw",
+		transport: "spawn",
 		config: { command: "puddingclaw" },
+	});
+	const httpClaw = agents.find((a) => a.name === "puddingclaw-http");
+	assert.ok(httpClaw, "默认目录必须展示禁用的 PuddingClaw HTTP 测试 Worker");
+	assert.equal(httpClaw!.enabled, false);
+	assert.deepEqual(httpClaw!.connector, {
+		extensionId: "puddingclaw",
+		connectorId: "puddingclaw",
+		transport: "http",
+		config: { endpoint: "http://127.0.0.1:8888" },
 	});
 	await app.close();
 });
@@ -261,6 +271,7 @@ test("Phase5: PuddingClaw Connector 不接受未声明 secret，revision 与 aff
 		payload: {
 			extensionId: "puddingclaw",
 			connectorId: "puddingclaw",
+			transport: "spawn",
 			config: { command: "puddingclaw" },
 			secrets: { PUDDINGCLAW_TOKEN: "sk-secret-value-123" },
 		},
@@ -274,6 +285,7 @@ test("Phase5: PuddingClaw Connector 不接受未声明 secret，revision 与 aff
 		payload: {
 			extensionId: "puddingclaw",
 			connectorId: "puddingclaw",
+			transport: "spawn",
 			config: { command: "puddingclaw" },
 		},
 	});
@@ -448,7 +460,7 @@ test("Phase5: 卸载保护——启用 Agent 或 active Run 引用时 409（§9.
 		path.join(connDir, EXTENSION_MANIFEST_FILE),
 		JSON.stringify({
 			id: "conn-ext", publisher: "test", displayName: "c", version: "1.0.0", source: "external",
-			kind: "connector", engines: { puddingteams: ">=0.1" }, entry: "index.mjs",
+			kind: "connector", engines: { puddingteams: ">=0.1" }, permissions: ["spawn"], entry: "index.mjs",
 			connector: { id: "conn-ext", displayName: "c", apiVersion: "1", defaultTransport: "spawn", supportedTransports: ["spawn"] },
 		}),
 	);
@@ -462,7 +474,7 @@ test("Phase5: 卸载保护——启用 Agent 或 active Run 引用时 409（§9.
 		description: "beta worker",
 		invoke: { type: "command", command: "echo", runArgs: [] },
 		enabled: false,
-		connector: { extensionId: "conn-ext", connectorId: "conn-ext", config: {} },
+		connector: { extensionId: "conn-ext", connectorId: "conn-ext", transport: "spawn", config: {} },
 	});
 	await delegations.createDelegation({ workspaceId: "workspace-1", cwdSnapshot: dir, windowId: "w1", managerSessionId: "s1", agentId: "beta", agentRevision: 0, operation: "run" });
 	const connConflict = await app.inject({ method: "DELETE", url: "/api/extensions/conn-ext" });
@@ -482,7 +494,7 @@ test("Phase5: connector_missing 探测——不静默回退（§9.3.8）", async
 		description: "ghost worker",
 		invoke: { type: "command", command: "echo", runArgs: [] },
 		enabled: true,
-		connector: { extensionId: "uninstalled", connectorId: "uninstalled", config: {} },
+		connector: { extensionId: "uninstalled", connectorId: "uninstalled", transport: "spawn", config: {} },
 	});
 	const res = await app.inject({ method: "POST", url: "/api/agents/ghost/probe" });
 	assert.equal(res.statusCode, 200);

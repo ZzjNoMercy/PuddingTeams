@@ -1,0 +1,4 @@
+{
+  "title": "PuddingTeams Documents",
+  "pages": ["index", "architecture", "deployment", "room", "sessions", "harness", "goals", "workspaces", "prompts", "interactions", "connectors", "connector-development", "operations"]
+}

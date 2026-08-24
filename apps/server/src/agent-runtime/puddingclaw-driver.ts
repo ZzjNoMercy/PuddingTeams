@@ -9,13 +9,18 @@ import type {
 	RunInput,
 	WorkerActivity,
 } from "./types.js";
+import { HttpJsonlError, streamHttpJsonl } from "@puddingteams/pwcp/http-jsonl";
 import { normalizePuddingClawJson, PUDDINGCLAW_CAPABILITIES } from "./normalize.js";
 import { handoffDirFor, handoffRelativePath } from "./handoff.js";
 import { spawnWorker } from "./transport/spawn.js";
 
 export interface PuddingClawDriverOptions {
+	/** Concrete transport selected by the Agent Connector binding. */
+	transport?: "spawn" | "http";
 	/** Executable name/path (default "puddingclaw"). */
 	command?: string;
+	/** PuddingClaw Backend origin for direct Headless HTTP calls. */
+	endpoint?: string;
 	/** Working directory for the child process (workspace root). */
 	cwd?: string;
 	/** Timeout for one run/continue/respond invocation. */
@@ -235,11 +240,23 @@ export class PuddingClawDriver implements AgentDriver {
 	constructor(private readonly opts: PuddingClawDriverOptions = {}) {}
 
 	async capabilities(): Promise<DriverCapabilities> {
-		return PUDDINGCLAW_CAPABILITIES;
+		return { ...PUDDINGCLAW_CAPABILITIES, transport: this.transport() };
+	}
+
+	private transport(): "spawn" | "http" {
+		return this.opts.transport ?? "spawn";
 	}
 
 	private cmd(): string {
 		return this.opts.command ?? "puddingclaw";
+	}
+
+	private endpoint(): string {
+		return (this.opts.endpoint ?? "http://127.0.0.1:8888").replace(/\/+$/, "");
+	}
+
+	private httpUrl(requestPath: string): string {
+		return `${this.endpoint()}${requestPath}`;
 	}
 
 	private ctxCwd(ctx: InvocationContext): string {
@@ -342,6 +359,139 @@ export class PuddingClawDriver implements AgentDriver {
 				{ running: true, recovering: true, recoveryAttempt },
 			);
 			await this.recoveryDelay(ctx.signal);
+		}
+	}
+
+	private async requestHttpJson(
+		requestPath: string,
+		opts: { method?: string; body?: unknown; signal?: AbortSignal; timeoutMs?: number } = {},
+	): Promise<Record<string, unknown>> {
+		let payload: Record<string, unknown> | undefined;
+		await streamHttpJsonl({
+			url: this.httpUrl(requestPath),
+			method: opts.method ?? "GET",
+			body: opts.body,
+			signal: opts.signal,
+			startupMs: Math.min(15_000, opts.timeoutMs ?? 15_000),
+			timeoutMs: opts.timeoutMs ?? 15_000,
+			maxBytes: 1024 * 1024,
+			onJsonLine: (line) => {
+				if (line && typeof line === "object" && !Array.isArray(line)) payload = line as Record<string, unknown>;
+			},
+		});
+		if (!payload) throw new HttpJsonlError("HTTP response did not contain a JSON object", "protocol_error");
+		return payload;
+	}
+
+	private httpFailure(error: HttpJsonlError, requestPath: string): AgentEvent {
+		const detail = (() => {
+			if (!error.responseBody) return error.message;
+			try {
+				const parsed = JSON.parse(error.responseBody) as Record<string, unknown>;
+				return typeof parsed.detail === "string" ? parsed.detail : error.message;
+			} catch {
+				return error.message;
+			}
+		})();
+		const errorCode = error.status === 410
+			? requestPath.includes("/resume") ? "interaction_expired" : requestPath.includes("/cancel") ? "run_expired" : "session_expired"
+			: error.status === 409 && requestPath.includes("/resume")
+				? "interaction_conflict"
+				: error.code;
+		const cancelled = errorCode === "cancelled";
+		return {
+			type: "failed",
+			result: {
+				agentId: this.id,
+				status: cancelled ? "cancelled" : "failed",
+				errorCode,
+				error: cancelled ? "任务已取消" : `PuddingClaw HTTP 调用失败：${stderrSummary(detail).replace(/^：/, "")}`,
+				recoverable: errorCode === "connection_error" || errorCode === "http_error" || errorCode === "interaction_conflict",
+			},
+		};
+	}
+
+	private async runHttp(
+		requestPath: string,
+		body: Record<string, unknown>,
+		ctx: InvocationContext,
+	): Promise<AgentEvent> {
+		const activeMs = this.opts.timeoutMs ?? ctx.timeouts?.activeMs ?? 900_000;
+		const startedAt = Date.now();
+		const recoveryDeadline = startedAt + Math.min(activeMs, this.opts.connectionRecoveryMs ?? activeMs);
+		let recovering = false;
+		let recoveryAttempt = 0;
+		// A connection can disappear after the Backend has announced its Run id.
+		// Keep the latest handle across retry attempts so cancellation during the
+		// recovery delay still reaches the original upstream Run.
+		let activeRunHandle = "";
+
+		for (;;) {
+			const attemptStartedAt = Date.now();
+			const remainingMs = Math.max(1, startedAt + activeMs - attemptStartedAt);
+			const observer = createPuddingClawActivityObserver((projected) => this.emitWorkerActivity(projected, ctx));
+			let terminal: Record<string, unknown> | undefined;
+			try {
+				await streamHttpJsonl({
+					url: this.httpUrl(requestPath),
+					method: "POST",
+					body,
+					signal: ctx.signal,
+					startupMs: ctx.timeouts?.startupMs ?? 30_000,
+					timeoutMs: remainingMs,
+					onJsonLine: (line) => {
+						observer.push(line);
+						if (!line || typeof line !== "object" || Array.isArray(line)) return;
+						const envelope = line as Record<string, unknown>;
+						const data = envelope.data && typeof envelope.data === "object"
+							? envelope.data as Record<string, unknown>
+							: {};
+						const run = data.run && typeof data.run === "object" ? data.run as Record<string, unknown> : {};
+						activeRunHandle = firstText(data.run_id, run.run_id, activeRunHandle, data.session_id);
+						if (envelope.event === "result" && envelope.data && typeof envelope.data === "object") {
+							terminal = envelope.data as Record<string, unknown>;
+						} else if (!envelope.event && (typeof envelope.status === "string" || typeof envelope.outcome === "string")) {
+							// Completed idempotency replays and older Backends return one JSON object.
+							terminal = envelope;
+						}
+					},
+				});
+			} catch (error) {
+				const transportError = error instanceof HttpJsonlError
+					? error
+					: new HttpJsonlError(error instanceof Error ? error.message : String(error), "connection_error");
+				if (transportError.code === "cancelled" && activeRunHandle) {
+					await this.requestHttpJson(`/api/headless/runs/${encodeURIComponent(activeRunHandle)}/cancel`, {
+						method: "POST",
+						timeoutMs: 10_000,
+					}).catch(() => undefined);
+				}
+				const attemptAgeMs = Date.now() - attemptStartedAt;
+				const lostLongResponse = transportError.code === "connection_error"
+					&& attemptAgeMs >= (this.opts.connectionRecoveryMinAgeMs ?? 30_000);
+				const stillRunning = recovering
+					&& transportError.status === 409
+					&& /identical Worker Run is already in progress/i.test(transportError.responseBody ?? transportError.message);
+				if (!(lostLongResponse || stillRunning) || Date.now() >= recoveryDeadline || ctx.signal?.aborted) {
+					return this.httpFailure(transportError, requestPath);
+				}
+				recovering = true;
+				recoveryAttempt += 1;
+				ctx.onUpdate?.(
+					stillRunning ? "上游任务仍在执行，正在等待结果…" : "连接已断开，但上游可能仍在执行；正在恢复同一任务的结果…",
+					{ running: true, recovering: true, recoveryAttempt },
+				);
+				await this.recoveryDelay(ctx.signal);
+				continue;
+			} finally {
+				observer.flush();
+			}
+
+			if (!terminal) {
+				return this.httpFailure(new HttpJsonlError("HTTP JSONL stream ended without a result event", "protocol_error"), requestPath);
+			}
+			ctx.onUpdate?.("worker 执行完成", { httpStatus: 200 });
+			return this.withHandoffPaths(normalizePuddingClawJson(terminal), ctx);
 		}
 	}
 
@@ -461,18 +611,22 @@ export class PuddingClawDriver implements AgentDriver {
 		yield {
 			type: "started",
 		};
+		const payload = {
+			...options,
+			message: input.message,
+			request_id: input.requestId,
+			...(this.transport() === "http" ? { workspace_path: this.ctxCwd(ctx) } : {}),
+			metadata: { ...metadata, caller_id: "puddingteams", caller_name: "PuddingTeams" },
+		};
 		yield this.withResumeState(
-			await this.runCli(
-				["agent", "run", "--input-json", "-", "--jsonl", ...this.exportArgs(ctx)],
-					{
-						...options,
-						message: input.message,
-						request_id: input.requestId,
-						metadata: { ...metadata, caller_id: "puddingteams", caller_name: "PuddingTeams" },
-					},
-				ctx,
-				true,
-			),
+			this.transport() === "http"
+				? await this.runHttp("/api/headless/runs?stream=true", payload, ctx)
+				: await this.runCli(
+					["agent", "run", "--input-json", "-", "--jsonl", ...this.exportArgs(ctx)],
+					payload,
+					ctx,
+					true,
+				),
 			input.message,
 		);
 	}
@@ -484,19 +638,23 @@ export class PuddingClawDriver implements AgentDriver {
 			? options.metadata as Record<string, unknown>
 			: {};
 		yield { type: "started", sessionHandle: input.sessionHandle };
+		const payload = {
+			...options,
+			message: input.message,
+			session_id: input.sessionHandle,
+			request_id: input.requestId,
+			...(this.transport() === "http" ? { workspace_path: this.ctxCwd(ctx) } : {}),
+			metadata: { ...metadata, caller_id: "puddingteams", caller_name: "PuddingTeams" },
+		};
 		yield this.withResumeState(
-			await this.runCli(
-				["agent", "run", "--input-json", "-", "--jsonl", ...this.exportArgs(ctx)],
-					{
-						...options,
-						message: input.message,
-						session_id: input.sessionHandle,
-						request_id: input.requestId,
-						metadata: { ...metadata, caller_id: "puddingteams", caller_name: "PuddingTeams" },
-					},
-				ctx,
-				true,
-			),
+			this.transport() === "http"
+				? await this.runHttp("/api/headless/runs?stream=true", payload, ctx)
+				: await this.runCli(
+					["agent", "run", "--input-json", "-", "--jsonl", ...this.exportArgs(ctx)],
+					payload,
+					ctx,
+					true,
+				),
 			input.message,
 		);
 	}
@@ -533,38 +691,52 @@ export class PuddingClawDriver implements AgentDriver {
 			}
 			ctx.onUpdate?.("正在按你的选择重跑…", { running: true });
 			yield { type: "started", runHandle: input.runHandle };
-			yield await this.runCli(
-				["agent", "run", "--input-json", "-", "--jsonl", ...this.exportArgs(ctx)],
-					{
-						message: `${task}\n\n（用户已明确：使用「${chosen}」执行本任务。）`,
-						request_id: input.requestId,
-						metadata: { caller_id: "puddingteams", caller_name: "PuddingTeams" },
-					},
-				ctx,
-				true,
-			);
+			const payload = {
+				message: `${task}\n\n（用户已明确：使用「${chosen}」执行本任务。）`,
+				request_id: input.requestId,
+				...(this.transport() === "http" ? { workspace_path: this.ctxCwd(ctx) } : {}),
+				metadata: { caller_id: "puddingteams", caller_name: "PuddingTeams" },
+			};
+			yield this.transport() === "http"
+				? await this.runHttp("/api/headless/runs?stream=true", payload, ctx)
+				: await this.runCli(
+					["agent", "run", "--input-json", "-", "--jsonl", ...this.exportArgs(ctx)],
+					payload,
+					ctx,
+					true,
+				);
 			return;
 		}
 		ctx.onUpdate?.("正在提交审批…", { running: true });
 		yield { type: "started", runHandle: input.runHandle };
-		yield await this.runCli(
-			["agent", "respond", input.runHandle, "--input-json", "-", "--jsonl", ...this.exportArgs(ctx)],
-			{
-				continuation_token: token,
-				request_id: input.requestId,
-				decisions: input.responses.map((r) => ({
-					request_id: r.requestId,
-					decision: r.action,
-					...(r.scope ? { scope: r.scope } : {}),
-					...(r.value !== undefined ? { value: r.value } : {}),
-				})),
-			},
-			ctx,
-			true,
-		);
+		const payload = {
+			continuation_token: token,
+			request_id: input.requestId,
+			decisions: input.responses.map((r) => ({
+				request_id: r.requestId,
+				decision: r.action,
+				...(r.scope ? { scope: r.scope } : {}),
+				...(r.value !== undefined ? { value: r.value } : {}),
+			})),
+		};
+		yield this.transport() === "http"
+			? await this.runHttp(`/api/headless/runs/${encodeURIComponent(input.runHandle)}/resume?stream=true`, payload, ctx)
+			: await this.runCli(
+				["agent", "respond", input.runHandle, "--input-json", "-", "--jsonl", ...this.exportArgs(ctx)],
+				payload,
+				ctx,
+				true,
+			);
 	}
 
 	async cancel(input: { runHandle: string }, ctx: InvocationContext): Promise<void> {
+		if (this.transport() === "http") {
+			await this.requestHttpJson(`/api/headless/runs/${encodeURIComponent(input.runHandle)}/cancel`, {
+				method: "POST",
+				timeoutMs: 10_000,
+			}).catch(() => undefined);
+			return;
+		}
 		try {
 			await spawnWorker({
 				command: this.cmd(),
@@ -580,6 +752,73 @@ export class PuddingClawDriver implements AgentDriver {
 	}
 
 	async probe(ctx: InvocationContext): Promise<ProbeResult> {
+		if (this.transport() === "http") {
+			const capabilities = await this.capabilities();
+			try {
+				const raw = await this.requestHttpJson("/api/headless/health", {
+					method: "GET",
+					signal: ctx.signal,
+					timeoutMs: 15_000,
+				});
+				const agentId = typeof raw.agent_id === "string" ? raw.agent_id : undefined;
+				const detected = raw.reachable === true && agentId === "puddingclaw";
+				const configured = raw.configured === true;
+				const protocolVersion = typeof raw.protocol_version === "string" ? raw.protocol_version : undefined;
+				const operations = raw.operations && typeof raw.operations === "object" && !Array.isArray(raw.operations)
+					? raw.operations as Record<string, unknown>
+					: {};
+				const contractIssues: ProbeResult["issues"] = [];
+				if (agentId !== "puddingclaw") {
+					contractIssues.push({ code: "wrong_agent", message: "Endpoint 不是 PuddingClaw Headless API", fixAction: `检查 ${this.endpoint()}` });
+				}
+				if (raw.progress !== "jsonl") {
+					contractIssues.push({ code: "progress_unsupported", message: "Headless API 未声明 JSONL 流式进度" });
+				}
+				for (const operation of ["run", "continue", "respond", "cancel"]) {
+					if (operations[operation] !== true) {
+						contractIssues.push({ code: "operation_unsupported", message: `Headless API 未声明 ${operation} 操作` });
+					}
+				}
+				const compatibility = protocolVersion !== "1"
+					? "untested"
+					: contractIssues.length > 0
+						? "incompatible"
+						: "supported";
+				return {
+					extensionInstalled: true,
+					detected,
+					configured,
+					authenticated: "unknown",
+					enabled: true,
+					compatibility,
+					upstreamVersion: typeof raw.server_version === "string" ? raw.server_version : undefined,
+					version: protocolVersion,
+					transport: "http",
+					capabilities,
+					issues: [
+						...(configured ? [] : [{ code: "not_configured", message: "PuddingClaw HTTP Backend 未配置", fixAction: `检查 ${this.endpoint()}` }]),
+						...(protocolVersion === "1" ? [] : [{ code: "protocol_untested", message: `未经验证的 Headless API 协议版本：${protocolVersion ?? "未声明"}` }]),
+						...contractIssues,
+					],
+				};
+			} catch (error) {
+				return {
+					extensionInstalled: true,
+					detected: false,
+					configured: false,
+					authenticated: "unknown",
+					enabled: true,
+					compatibility: "unknown",
+					transport: "http",
+					capabilities,
+					issues: [{
+						code: error instanceof HttpJsonlError ? error.code : "connection_error",
+						message: `无法连接 PuddingClaw HTTP Backend：${error instanceof Error ? error.message : String(error)}`,
+						fixAction: `确认 ${this.endpoint()} 已启动`,
+					}],
+				};
+			}
+		}
 		const res = await spawnWorker({
 			command: this.cmd(),
 			args: ["doctor", "--json"],
@@ -591,12 +830,14 @@ export class PuddingClawDriver implements AgentDriver {
 		let configured = res.exitCode === 0;
 		const authenticated: boolean | "unknown" = "unknown";
 		let upstreamVersion: string | undefined;
+		let protocolVersion: string | undefined;
 		if (res.stdout.trim()) {
 			try {
 				const raw = JSON.parse(res.stdout.trim()) as Record<string, unknown>;
 				configured = raw.configured === true;
 				detected = detected || raw.cli_version !== undefined;
-				upstreamVersion = typeof raw.server_version === "string" ? raw.server_version : undefined;
+				upstreamVersion = typeof raw.cli_version === "string" ? raw.cli_version : undefined;
+				protocolVersion = typeof raw.protocol_version === "string" ? raw.protocol_version : undefined;
 			} catch {
 				// ignore
 			}
@@ -610,9 +851,9 @@ export class PuddingClawDriver implements AgentDriver {
 			enabled: true,
 			compatibility: detected ? "supported" : "unknown",
 			upstreamVersion,
-			version: undefined,
+			version: protocolVersion,
 			transport: "spawn",
-			capabilities: PUDDINGCLAW_CAPABILITIES,
+			capabilities: await this.capabilities(),
 			issues: [
 				...(configured
 					? []

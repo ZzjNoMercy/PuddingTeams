@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from "electron";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, truncateSync } from "node:fs";
 import os from "node:os";
@@ -372,8 +372,15 @@ if (!app.requestSingleInstanceLock()) {
 			mainWindow.focus();
 		}
 	});
-	if (process.platform === "win32") app.setAppUserModelId("com.puddingteams.app");
-	void app.whenReady().then(bootstrap);
+	void app.whenReady().then(() => {
+		if (process.platform === "win32") {
+			app.setAppUserModelId("com.puddingteams.app");
+			// Windows 会把 Electron 默认的 File/Edit/View/Window 菜单嵌进
+			// 客户区；PuddingTeams 的所有入口都在页面内，彻底移除避免多一行。
+			Menu.setApplicationMenu(null);
+		}
+		return bootstrap();
+	});
 }
 
 app.on("activate", () => {

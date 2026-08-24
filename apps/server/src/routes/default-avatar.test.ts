@@ -72,7 +72,7 @@ async function makeStack() {
 		name: "ava-worker",
 		description: "绑定带头像 connector 的 worker",
 		enabled: true,
-		connector: { extensionId: "ava-conn", connectorId: "ava-conn", config: {} },
+		connector: { extensionId: "ava-conn", connectorId: "ava-conn", transport: "spawn", config: {} },
 	});
 	return { app, teams };
 }

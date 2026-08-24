@@ -11,7 +11,7 @@ import type { AgentRuntime } from "../agent-runtime/runtime.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import type { ExtensionRegistry } from "../agent-runtime/extension-registry.js";
 import type { PiSessionStore } from "../pi-bridge/session-store.js";
-import type { AgentCapabilityBinding } from "../agent-runtime/extensions.js";
+import type { AgentCapabilityBinding, AgentConnectorBinding } from "../agent-runtime/extensions.js";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { previewPiResources } from "../pi-bridge/pi-resources.js";
 import { PI_CONNECTOR_ID } from "../agent-runtime/pi-extension.js";
@@ -68,6 +68,24 @@ function connectorSecurityWarnings(agent: AgentConfig): string[] {
 /** Thin HTTP facade over the worker registry (agents.json) + Phase 5 管理 API（§10.1）。 */
 export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, deps: AgentsRouteDeps = {}): void {
 	const { credentials, runtime, invoker, extensions, sessions } = deps;
+
+	function connectorBindingIssue(binding: unknown): string | undefined {
+		if (!binding || typeof binding !== "object" || Array.isArray(binding)) return undefined;
+		const value = binding as Record<string, unknown>;
+		const extensionId = typeof value.extensionId === "string" ? value.extensionId : "";
+		const connectorId = typeof value.connectorId === "string" ? value.connectorId : "";
+		const transport = typeof value.transport === "string" ? value.transport : "";
+		if (!extensionId || !connectorId || !transport) return "connector 必须声明 extensionId、connectorId 与 transport";
+		const manifest = extensions?.manifestOf(extensionId);
+		if (!manifest) return extensions ? `extension「${extensionId}」未安装` : undefined;
+		if (manifest.kind !== "connector" || manifest.connector.id !== connectorId) {
+			return `extension「${extensionId}」不包含 connector「${connectorId}」`;
+		}
+		if (!(manifest.connector.supportedTransports as string[]).includes(transport)) {
+			return `connector「${connectorId}」不支持 transport「${transport}」`;
+		}
+		return undefined;
+	}
 
 	/**
 	 * 写操作统一响应（§10.1）：先同步撤权，再带 extensionRevision 与受影响
@@ -131,6 +149,8 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 	app.post<{ Body: Partial<Record<string, unknown>> }>("/api/agents", async (req, reply) => {
 		try {
 			const body = { ...(req.body ?? {}) } as Record<string, unknown>;
+			const connectorIssue = connectorBindingIssue(body.connector);
+			if (connectorIssue) return reply.code(400).send({ error: connectorIssue });
 			// name/id 解耦：未显式给内部 id（name）时，从显示名派生并保证唯一。
 			if (typeof body.name !== "string" || !body.name.trim()) {
 				const displayName = typeof body.displayName === "string" ? body.displayName.trim() : "";
@@ -439,6 +459,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		Body: {
 			extensionId?: string;
 			connectorId?: string;
+			transport?: string;
 			config?: Record<string, unknown>;
 			secrets?: Record<string, string>;
 			versionPin?: string;
@@ -447,9 +468,9 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		const agent = await teams.getAgent(req.params.name);
 		if (!agent) return reply.code(404).send({ error: "agent not found" });
 		if (agent.pinned) return reply.code(400).send({ error: "pinned manager 不绑定 Connector" });
-		const { extensionId, connectorId, config } = req.body ?? {};
-		if (!extensionId?.trim() || !connectorId?.trim()) {
-			return reply.code(400).send({ error: "body must be { extensionId, connectorId, config?, secrets? }" });
+		const { extensionId, connectorId, transport, config } = req.body ?? {};
+		if (!extensionId?.trim() || !connectorId?.trim() || !transport?.trim()) {
+			return reply.code(400).send({ error: "body must be { extensionId, connectorId, transport, config?, secrets? }" });
 		}
 		if (config !== undefined && (typeof config !== "object" || config === null || Array.isArray(config))) {
 			return reply.code(400).send({ error: "connector.config 必须是对象" });
@@ -459,12 +480,16 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		if (extensions && (!manifest || manifest.kind !== "connector" || manifest.connector.id !== connectorId)) {
 			return reply.code(400).send({ error: `extension「${extensionId}」未安装或不包含 connector「${connectorId}」` });
 		}
+		if (manifest?.kind === "connector" && !(manifest.connector.supportedTransports as string[]).includes(transport)) {
+			return reply.code(400).send({ error: `connector「${connectorId}」不支持 transport「${transport}」` });
+		}
 		try {
 			const allowedSecretKeys = new Set(manifest?.kind === "connector" ? (manifest.connector.secretSchema ?? []).map((item) => item.key) : []);
 			const secretRefs = await applySecrets(agent.name, req.body?.secrets, agent.connector?.secretRefs, allowedSecretKeys);
 			const updated = await teams.setConnectorBinding(agent.name, {
 				extensionId: extensionId.trim(),
 				connectorId: connectorId.trim(),
+				transport: transport as AgentConnectorBinding["transport"],
 				config: config ?? {},
 				...(secretRefs ? { secretRefs } : {}),
 				...(typeof req.body?.versionPin === "string" ? { versionPin: req.body.versionPin } : {}),

@@ -32,7 +32,7 @@ connector-codex/
 ├── pi/
 │   └── index.ts            # pi 门面：export default (pi: ExtensionAPI) => void，注册 codex_delegate 工具
 ├── driver/
-│   └── index.ts            # Driver 本体：AgentDriver 实现 + createDriver(config) 工厂（manifest entry 指向这里）
+│   └── index.ts            # Driver 本体：AgentDriver 实现 + createDriver(config, transport) 工厂（manifest entry 指向这里）
 ├── core/
 │   └── codex-normalize.ts  # 共享核心：上游 JSONL 事件 → PWCP 归一化（reducer + capabilities 常量），不依赖宿主
 └── assets/
@@ -65,10 +65,12 @@ pi resource-loader 按此字段找入口，`pi install <source>` 后加载 `pi/i
 | `permissions` | 安装时向用户展示的能力申请：`spawn` / `network` / `workspace` / `secrets` |
 | `entry` | Driver 入口（包内相对路径，指向 `driver/index.ts`）；与 `connector.declarative` 互斥 |
 | `connector.id` / `displayName` / `apiVersion` | Connector contribution 身份；`apiVersion` 只支持 `"1"` |
-| `connector.defaultTransport` / `supportedTransports` | `spawn` / `http` / `rpc` / `acp` / `sdk`；default 必须包含在 supported 中 |
-| `connector.configSchema` | JSON Schema 子集，前端据此渲染配置表单。`format: "model"` 使用平台模型目录；`"x-puddingteams-options": "driver"` 调用该 Connector 的动态选项发现。用户只配 executable、transport 和安全设置，不手写命令模板 |
+| `connector.defaultTransport` / `supportedTransports` | `spawn` / `http` / `rpc` / `acp` / `sdk`；default 必须包含在 supported 中，且不得重复。`spawn` 必须申请 `spawn` permission，`http/rpc/acp` 必须申请 `network` permission。Worker 实例把实际选择独立保存为 `AgentConnectorBinding.transport`。当前纯 `connector.declarative` 执行器只接受唯一的 `spawn` transport；HTTP 等方式必须使用代码型 Driver |
+| `connector.configSchema` | JSON Schema 子集，前端据此渲染配置表单。字段可用 `"x-puddingteams-transports": ["spawn"]` 限定只在指定 transport 下显示（必须是 supported 的子集）；`format: "model"` 使用平台模型目录；`"x-puddingteams-options": "driver"` 调用该 Connector 的动态选项发现。transport 由宿主统一渲染，不在 configSchema 重复声明 |
 | `connector.secretSchema` | `[{key, label, required}]`；密钥写 CredentialsStore，只存 secretRefs |
 | `connector.avatar` | 默认头像，包内相对资源路径（如 `assets/codex.svg`） |
+
+代码型 Connector 若声明多个 `supportedTransports`，必须导出 `createDriver(config, transport)`，不能导出忽略 Worker binding 的静态 `driver`。宿主在 probe 与委托入口还会核对 `DriverCapabilities.transport` 和 `AgentConnectorBinding.transport`，不一致时拒绝运行。
 
 ### 3.3 `exports` 与依赖
 

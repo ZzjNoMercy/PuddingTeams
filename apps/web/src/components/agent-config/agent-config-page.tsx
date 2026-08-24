@@ -12,7 +12,9 @@ import {
 	InfoIcon,
 	LoaderIcon,
 	MessageSquareTextIcon,
+	PauseCircleIcon,
 	ChevronDownIcon,
+	PlayIcon,
 	PlugIcon,
 	RefreshCwIcon,
 	SaveIcon,
@@ -90,13 +92,13 @@ const CONNECTOR_SECTIONS: SectionDef[] = [
 	OVERVIEW_SECTION,
 	{ key: "connector", label: "基础接入", description: "选择 Connector Extension、填写接入配置与密钥。", icon: PlugIcon },
 	{ key: "extensions", label: "Extensions", description: "绑定 Capability Extension，为 Worker 注册额外工具。", icon: BoxesIcon },
-	{ key: "status", label: "运行状态", description: "启停 Agent、探测本机接入、查看写操作对会话的影响。", icon: ActivityIcon },
+	{ key: "status", label: "运行状态", description: "启停 Agent、检查接入可用性、查看写操作对会话的影响。", icon: ActivityIcon },
 ];
 
 function probeSummary(probe: AgentProbeResult): string {
 	if (isConnectorProbe(probe)) {
 		if (!probe.extensionInstalled) return "扩展未安装";
-		if (!probe.detected) return "CLI 未检测";
+		if (!probe.detected) return (probe.transport ?? probe.capabilities.transport) === "http" ? "API 不可达" : "CLI 未检测";
 		if (probe.compatibility === "incompatible") return "不兼容";
 		if (probe.authenticated === false) return "凭证无效";
 		return "探测正常";
@@ -420,22 +422,21 @@ export function AgentConfigPage({ name }: { name: string }) {
 					<p className="truncate text-xs text-muted-foreground">{agent.description || "（无描述）"}</p>
 				</div>
 
-				{agent.pinned ? (
-					<span className="agent-config-status">已启用</span>
-				) : (
-					<label className="agent-config-status flex items-center gap-1.5">
-						<input
-							type="checkbox"
-							checked={agent.enabled !== false}
-							disabled={toggling}
-							onChange={(e) => void handleToggleEnabled(e.target.checked)}
-							className="size-4 accent-foreground"
-						/>
-						{agent.enabled !== false ? "已启用" : "已停用"}
-					</label>
-				)}
+				{agent.pinned ? <span className="agent-config-status">始终启用</span> : null}
 
 				<div className="agent-config-actions">
+					{agent.pinned ? null : (
+						<Button
+							size="sm"
+							variant={agent.enabled !== false ? "outline" : "default"}
+							disabled={toggling}
+							onClick={() => void handleToggleEnabled(agent.enabled === false)}
+							title={agent.enabled !== false ? "停用后 Manager 将不再派发新任务" : "启用后允许 Manager 派发新任务"}
+						>
+							{toggling ? <LoaderIcon className="size-3.5 animate-spin" /> : agent.enabled !== false ? <PauseCircleIcon className="size-3.5" /> : <PlayIcon className="size-3.5" />}
+							{toggling ? (agent.enabled !== false ? "停用中…" : "启用中…") : agent.enabled !== false ? "停用" : "启用"}
+						</Button>
+					)}
 					{piMode ? null : (
 						<Button size="sm" variant="outline" disabled={probing} onClick={() => void handleProbe()}>
 							{probing ? <LoaderIcon className="size-3.5 animate-spin" /> : <RefreshCwIcon className="size-3.5" />}

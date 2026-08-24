@@ -118,6 +118,7 @@ test("validate declarative + entry 混排 → 1", async () => {
 			source: "external",
 			kind: "connector",
 			engines: { puddingteams: ">=0.1 <1" },
+			permissions: ["spawn"],
 			entry: "driver/index.ts",
 			connector: {
 				id: "bad-mixed",
@@ -152,6 +153,7 @@ test("validate entry 声明但文件缺失 → 1", async () => {
 			source: "external",
 			kind: "connector",
 			engines: { puddingteams: ">=0.1 <1" },
+			permissions: ["spawn"],
 			entry: "driver/index.ts",
 			connector: {
 				id: "bad-entry",

@@ -1,0 +1,90 @@
+---
+title: 提示词、资源与模型
+description: pi Manager 的提示词装配、Worker 可见性、Workspace 资源和 Provider 配置边界。
+---
+
+<Status tone="preview">PREVIEW</Status>
+
+提示词管理的首要问题不是“在哪里放一大段文字”，而是**谁应该看到哪条规则**。路由信息、Agent 执行规则、群聊协作和项目约定有不同接收者，混在一起会污染上下文并造成越权。
+
+## pi 请求的装配顺序
+
+以 Manager 或 pi Worker 的一次模型请求为例：
+
+| 顺序 | 来源 | 接收者 |
+| --- | --- | --- |
+| 1 | pi 内嵌 base，或原生 `SYSTEM.md` 替换 | 所有 pi Session |
+| 2 | pi 原生 `APPEND_SYSTEM.md` | 所有匹配的 pi Session |
+| 3 | Agent 运行指令 | 当前 Agent 自己 |
+| 4 | Window collaboration | 仅群聊 Manager |
+| 5 | 动态 Worker roster | solo/group Manager |
+| 6 | 最新 Goal 与 WorkPlan 摘要 | 活动 Goal 的 Manager |
+| context | global/Workspace `AGENTS.md`、`CLAUDE.md` | 按信任和开关加载 |
+
+PuddingTeams 用 append 方式加入第 3、4 层，不用 override 替换 pi base。roster 在每个 Manager 回合开始前读取最新 Agent 配置；Goal/WorkPlan 在每次模型请求的 context hook 注入，保证 custom message 触发的恢复轮也不会读到旧状态。
+
+## 四种不要混用的信息
+
+### Agent 描述与责任边界
+
+`description`、`responsibility` 和 capabilities 是给 Manager 做搜索、选择、停止和升级判断的路由材料，同时可用于 UI。它们不进入 Worker 自己的运行提示词，也不构成权限证明。
+
+### Agent 运行指令
+
+运行指令只追加给当前 Agent，适合写执行流程、输出格式、验证要求和交付约定。Manager 不会读取某个 Worker 的长运行指令来做路由。
+
+### 群聊协作提示词
+
+只存在于 group Window，只给 Manager，描述拆分、并行、交接、裁决与汇总规则。solo 没有用户可编辑的 collaboration；direct 没有 Manager，因此不提供 Window Prompt。
+
+### 项目约定
+
+放在 Workspace 的 `AGENTS.md`、`CLAUDE.md` 或项目资源目录，并经过显式 Workspace 信任门。不要把某个项目的规则写进全局 Agent 指令，否则会污染其他 Window。
+
+## pi 原生文件
+
+| 文件 | 语义 |
+| --- | --- |
+| `SYSTEM.md` | 整体替换 pi 内嵌 base；项目版本优先于 global，二选一 |
+| `APPEND_SYSTEM.md` | 追加 base；项目版本优先于 global，二选一 |
+| `AGENTS.md` / `CLAUDE.md` | 作为 context 文件加载；global 一份，Workspace 可按目录层级多份 |
+| `.pi/skills` / `.pi/prompts` | 项目技能与模板资源 |
+
+pi 0.83 没有 `APPEND_AGENTS.md` 约定。Skills 采用渐进式披露，Prompt Templates 由命令调起；它们不是默认全部拼进 system prompt 的正文。
+
+PuddingTeams 的 Workspace 信任与 pi 自身的 project trust 是两道独立门。项目级 `SYSTEM.md`/`APPEND_SYSTEM.md` 是否被 pi 原生加载还受 pi 自己的信任语义约束。
+
+## Global 与 Workspace
+
+`~/.pi/agent/AGENTS.md` 是 pi global context，会作用于 Manager 和本地 pi Worker。只想让 Manager 看到的规则不要放这里。
+
+Agent 的“加载项目上下文/skills/prompts”开关只控制显式 Workspace 来源，不关闭 global。Workspace 必须为 trusted 且批准对应资源类型，内容才会进入装配。
+
+## 非 pi Worker
+
+PuddingTeams 不向 Connector Worker 自动注入 pi system prompt：
+
+- Codex 继续使用 cwd 的 `AGENTS.md` 与自己的配置体系；
+- Claude Code 可以通过 Connector 配置追加 system prompt，并使用自己的 `CLAUDE.md`；
+- PuddingClaw 使用自己的 Agent/Provider 提示词体系；
+- 自定义 Connector 只收到 Manager 生成的具体任务，除非 Driver 明确实现其他行为。
+
+这条边界保证 Connector 不会在不知情的情况下获得 Manager 内部 roster、Goal 控制规则或其他 Worker 的指令。
+
+## 模型与凭据
+
+PuddingTeams 的 pi 模型目录建立在 pi ModelRuntime 上，不再复制一套 Provider Registry。自定义模型目录和默认模型沿用 pi 的 settings/models 约定；平台自己的 Provider Key 保存到：
+
+```text
+<PUDDINGTEAMS_HOME>/secrets/auth.json
+```
+
+而不是写入 Workspace 或聊天记录。每次创建 pi Session 都显式使用共享 ModelRuntime 与平台 auth 路径。
+
+Connector Worker 的模型由 Connector config 决定。Codex 可以通过其 app-server 动态发现模型选项，但任务执行仍走 `codex exec --json`；Claude Code 的可选模型来自它自身设置和稳定别名，最终可用性仍由账号、企业策略和 Provider 校验。
+
+## 有效提示词预览
+
+Agent 配置中的“有效提示词预览”应按真实装配顺序分段显示 base、native append、Agent 指令、Window collaboration、global context 和 Workspace context，并列出启用的 skills/templates。它展示已保存配置；未信任的 Workspace 正文不会出现在预览中。
+
+排错时先问三个问题：这条规则属于谁、它来自哪一层、当前请求的信任/开关是否允许。不要只看最终长字符串猜来源。

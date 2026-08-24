@@ -1,0 +1,83 @@
+---
+title: 交互、审批与交付
+description: Driver Interaction、DecisionRequest、凭据隔离、handoff 与 Artifact 的边界。
+---
+
+<Status tone="preview">PREVIEW</Status>
+
+“需要人回答”至少有两种完全不同的语义：Worker 正在等待一次运行许可，或协作本身需要一个业务决定。PuddingTeams 将它们分开，避免普通对话被误解为授权。
+
+## Driver Interaction
+
+当 Driver 产生 `input_required`，NormalizedResult 带一个公开 Interaction：
+
+- `permission`：是否允许工具、命令、路径或能力；
+- `question`：Worker 在原 Run 中提出的问题；
+- `confirmation`：继续某个有风险或不可逆动作前确认。
+
+Delegation 进入 waiting 状态，而不是 failed。浏览器只得到本地 Interaction ID、可展示请求和过期时间；上游 continuation token 等 `providerState` 被加密保存到私有 Secret store，不进入：
+
+- 浏览器响应；
+- Session JSONL；
+- Delegation 公开记录；
+- Manager 模型上下文。
+
+用户提交回答后，Runtime 使用原 `runHandle`、私有 `interactionHandle` 和 provider state 调用 `Driver.respond`，恢复**同一条 Run**。Connector 未声明 `respond` 时不得产生可恢复 Interaction。
+
+Interaction 默认有 24 小时 TTL。重复回答使用 request ID 幂等；已回答、过期、已取消或上下文 anchor 不匹配的 Interaction 会被拒绝。
+
+## DecisionRequest
+
+DecisionRequest 属于 Goal 控制面，用来处理：
+
+- 业务方案取舍；
+- 用户满意度等主观完成条件；
+- 发布、预算或其他授权范围；
+- 修改 Goal 契约所需的确认；
+- Reviewer 无法仅凭证据判断的条件。
+
+回答后，平台在同一 Manager Session 中开启新的模型轮次，不调用 Worker Driver 的 `respond`。普通聊天内容不会自动提升成额外授权；授权只限 Decision 明确记录的 scope。
+
+## 凭据边界
+
+Extension manifest 用 `secretSchema` 声明需要哪些 Secret。Agent binding 只保存 secret reference；明文由 CredentialsStore 管理，在调用 Driver 时注入 `InvocationContext.env`。
+
+Connector 作者必须遵守：
+
+- 不把 Secret 写进 progress、error、meta 或 Artifact；
+- 不把完整环境变量回显到 Probe；
+- 日志和 stderr 摘要先脱敏；
+- Provider state 与普通 Connector credential 分开保存；
+- UI 只显示 configured/authenticated 等状态，不回显 Key。
+
+当前代码型 Extension 仍在 Server 进程内执行，因此“声明了 secrets 权限”是审查提示，不是强隔离。只安装可信代码，详见[Extension 机制](/docs/connectors/)。
+
+## Handoff
+
+Worker A 的输出要成为 Worker B 的输入时，Manager 应传递明确的意图、预期结果、证据要求和完成边界，并引用稳定 Delegation/Artifact，而不是只说“接着上一个做”。
+
+Delegation 可以记录 `parentDelegationId` 与 handoff kind，形成 A → Manager → B 的可追踪链。单向通知不伪造成需要等待的 Delegation。
+
+文件交接应使用 Workspace 相对路径或显式 Artifact。附件在平台上传目录冻结后，Manager 必须把所需路径写入接力任务；不同 Worker 不共享一个隐式的聊天附件缓存。
+
+## Artifact
+
+Driver 的 completed result 可以返回 `artifacts`。平台只登记明确导出或观察到的新增交付物，不扫描整个脏 Workspace 冒充本次产出。
+
+每个 Artifact 保存：
+
+- 稳定 ID、名称、kind 和来源；
+- Window、Session、Delegation、Goal 等关联；
+- Workspace 工作副本路径；
+- 登记瞬间的只读快照和内容哈希。
+
+`origin: push` 表示 Agent 主动导出；`origin: observe` 表示 Driver 比较任务前后的 git 基线收集新增变更。两者都必须经过路径边界校验。
+
+## 安全判断顺序
+
+遇到需要人介入的卡片时，先判断：
+
+1. 原 Worker Run 是否仍在等待？是则用 Interaction。
+2. 是否是业务取舍或 Goal 契约问题？是则用 DecisionRequest。
+3. 是否需要引用文件证明结果？登记 Artifact。
+4. 是否只是正文太长？使用 Harness 长结果回读，不要把它伪装成审批或 Artifact。

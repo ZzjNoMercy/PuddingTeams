@@ -310,6 +310,8 @@ export interface CatalogEntry {
 export interface AgentConnectorBinding {
 	extensionId: string;
 	connectorId: string;
+	/** 本 Worker 实例实际选择的 transport。 */
+	transport: ConnectorContribution["defaultTransport"];
 	config: Record<string, unknown>;
 	secretRefs?: Record<string, string>;
 	versionPin?: string;

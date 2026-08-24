@@ -3,6 +3,7 @@ import type {
 	AgentEvent,
 	ContinueInput,
 	DriverCapabilities,
+	DriverTransport,
 	InvocationContext,
 	ProbeResult,
 	RespondInput,
@@ -169,7 +170,8 @@ export class __CONNECTOR_ID_PASCAL__Driver implements AgentDriver {
  * Driver 工厂（Driver SPI 入口）：同一 Connector 多 Agent 实例，每实例一份
  * config。ExtensionRegistry 加载 entry 时识别此导出。
  */
-export function createDriver(config: Record<string, unknown>): AgentDriver {
+export function createDriver(config: Record<string, unknown>, transport: DriverTransport): AgentDriver {
+	if (transport !== "spawn") throw new Error(`__DISPLAY_NAME__ Connector 不支持 transport「${transport}」`);
 	return new __CONNECTOR_ID_PASCAL__Driver({
 		command: typeof config.command === "string" && config.command.trim() ? config.command.trim() : undefined,
 	});

@@ -77,6 +77,14 @@ const CONNECTOR_ENTRY = `export function createDriver(config) {
 }
 `;
 
+const STATIC_CONNECTOR_ENTRY = `export const driver = {
+	id: "conn-ext",
+	async capabilities() { return { operations: ["run"], interactionKinds: [], progress: "none", transport: "spawn" }; },
+	async *run() {}, async *continue() {}, async *respond() {},
+	async probe() { return { extensionInstalled: true, detected: true, configured: true, authenticated: "unknown", enabled: true, compatibility: "supported", capabilities: await this.capabilities(), issues: [] }; },
+};
+`;
+
 function writeExtension(dir: string, manifest: Record<string, unknown>, entryCode?: string): string {
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(path.join(dir, EXTENSION_MANIFEST_FILE), JSON.stringify(manifest, null, 2));
@@ -107,6 +115,36 @@ test("Phase5: manifest 校验——禁止混包、kind/engines/permissions 必�
 		() => parseExtensionManifest({ ...connectorManifest(), connector: { id: "x", apiVersion: "1", defaultTransport: "http", supportedTransports: ["spawn"] } }),
 		/defaultTransport 必须包含/,
 	);
+	const httpWithoutNetwork = connectorManifest();
+	httpWithoutNetwork.permissions = ["spawn"];
+	httpWithoutNetwork.connector = {
+		...(httpWithoutNetwork.connector as Record<string, unknown>),
+		supportedTransports: ["spawn", "http"],
+	};
+	assert.throws(() => parseExtensionManifest(httpWithoutNetwork), /network/);
+	const invalidScopedField = connectorManifest();
+	invalidScopedField.connector = {
+		...(invalidScopedField.connector as Record<string, unknown>),
+		configSchema: {
+			type: "object",
+			properties: { endpoint: { type: "string", "x-puddingteams-transports": ["http"] } },
+		},
+	};
+	assert.throws(() => parseExtensionManifest(invalidScopedField), /未支持的 transport/);
+	const declarativeHttp = connectorManifest();
+	declarativeHttp.entry = undefined;
+	declarativeHttp.permissions = ["spawn", "network"];
+	declarativeHttp.connector = {
+		...(declarativeHttp.connector as Record<string, unknown>),
+		supportedTransports: ["spawn", "http"],
+		declarative: {
+			command: "demo",
+			operations: { run: { args: ["run"] } },
+			output: { mode: "single-json" },
+			capabilities: { operations: ["run"], interactionKinds: [] },
+		},
+	};
+	assert.throws(() => parseExtensionManifest(declarativeHttp), /当前只支持唯一 transport:"spawn"/);
 	// 合法 manifest 通过并归一化。
 	const parsed = parseExtensionManifest(capabilityManifest());
 	assert.equal(parsed.kind, "capability");
@@ -128,7 +166,7 @@ test("P3-0: 安装与启用强制校验 engines.puddingteams 和宿主版本", a
 
 	await assert.rejects(() => registry.install(extDir), /要求 PuddingTeams >=2.*当前宿主版本为 0\.1\.0/);
 	assert.equal(registry.get("conn-ext"), undefined);
-	assert.equal(drivers.create("conn-ext", {}), undefined);
+	assert.equal(drivers.create("conn-ext", "spawn", {}), undefined);
 });
 
 test("Phase5: 本地安装 capability/connector 并注册进目录", async () => {
@@ -147,7 +185,7 @@ test("Phase5: 本地安装 capability/connector 并注册进目录", async () =>
 
 	const connDir = writeExtension(path.join(dir, "ext-conn"), connectorManifest(), CONNECTOR_ENTRY);
 	await registry.install(connDir);
-	const driver = drivers.create("conn-ext", {});
+	const driver = drivers.create("conn-ext", "spawn", {});
 	assert.ok(driver, "connector 必须注册 Driver factory 进 DriverRegistry");
 
 	// 重复安装同 id 拒绝。
@@ -158,6 +196,20 @@ test("Phase5: 本地安装 capability/connector 并注册进目录", async () =>
 	assert.equal(caps.length, 1);
 	assert.equal(caps[0]!.manifest.id, "cap-ext");
 	assert.equal(registry.list("connector").length, 1);
+});
+
+test("Connector transport 契约：多 transport 代码包必须导出按 binding 构造的 factory", async () => {
+	const dir = freshDir("pt-multi-transport-");
+	const registry = new ExtensionRegistry(dir, new ExtensionCatalog(), new DriverRegistry());
+	await registry.init({ developerMode: true });
+	const manifest = connectorManifest();
+	manifest.permissions = ["spawn", "network"];
+	manifest.connector = {
+		...(manifest.connector as Record<string, unknown>),
+		supportedTransports: ["spawn", "http"],
+	};
+	const packageDir = writeExtension(path.join(dir, "multi-static"), manifest, STATIC_CONNECTOR_ENTRY);
+	await assert.rejects(() => registry.install(packageDir), /多 transport.*必须导出 createDriver/);
 });
 
 test("P3-0: 本地代码 Extension 受开发者模式闸门控制，关闭后立即停止加载", async () => {
@@ -171,10 +223,10 @@ test("P3-0: 本地代码 Extension 受开发者模式闸门控制，关闭后立
 	await registry.setDeveloperMode(true);
 	const installed = await registry.install(connDir);
 	assert.equal(installed.origin, "local-link");
-	assert.ok(drivers.create("conn-ext", {}));
+	assert.ok(drivers.create("conn-ext", "spawn", {}));
 
 	await registry.setDeveloperMode(false);
-	assert.equal(drivers.create("conn-ext", {}), undefined, "关闭后本地 Driver 必须从运行时撤下");
+	assert.equal(drivers.create("conn-ext", "spawn", {}), undefined, "关闭后本地 Driver 必须从运行时撤下");
 	assert.equal(registry.get("conn-ext")?.loaded, false);
 	assert.match(registry.get("conn-ext")?.loadError ?? "", /开发者模式未开启/);
 });
@@ -191,7 +243,7 @@ test("P3-0: install 与关闭开发者模式串行化，关闭后不会留下迟
 	const disabling = registry.setDeveloperMode(false);
 	await Promise.all([installing, disabling]);
 
-	assert.equal(drivers.create("conn-ext", {}), undefined);
+	assert.equal(drivers.create("conn-ext", "spawn", {}), undefined);
 	assert.equal(registry.get("conn-ext")?.loaded, false);
 });
 
@@ -211,8 +263,8 @@ test("P3-0: 本地 Extension 不能冒名覆盖 builtin Connector contribution",
 		() => registry.install(writeExtension(path.join(dir, "evil"), evilManifest, evilEntry)),
 		/已由 extension.*占用/,
 	);
-	assert.ok(drivers.create("puddingclaw", {}, "puddingclaw"));
-	assert.equal(drivers.create("puddingclaw", {}, "evil-package"), undefined);
+	assert.ok(drivers.create("puddingclaw", "spawn", {}, "puddingclaw"));
+	assert.equal(drivers.create("puddingclaw", "spawn", {}, "evil-package"), undefined);
 });
 
 test("P3-0: registry.json 未知 origin fail-closed，不加载 pre-gate 本地代码", async () => {
@@ -282,7 +334,7 @@ test("P3-0: Extension 更新加载失败时旧版本保持 active 且持久化�
 	await registry.init({ developerMode: true });
 	const extDir = writeExtension(path.join(dir, "connector"), connectorManifest("1.0.0"), CONNECTOR_ENTRY);
 	await registry.install(extDir);
-	assert.equal(drivers.create("conn-ext", {})?.id, "conn-ext");
+	assert.equal(drivers.create("conn-ext", "spawn", {})?.id, "conn-ext");
 
 	writeExtension(
 		extDir,
@@ -294,7 +346,7 @@ test("P3-0: Extension 更新加载失败时旧版本保持 active 且持久化�
 	assert.equal(registry.get("conn-ext")?.version, "1.0.0");
 	assert.equal(registry.get("conn-ext")?.loaded, true);
 	assert.equal(registry.get("conn-ext")?.loadError, undefined);
-	assert.equal(drivers.create("conn-ext", {})?.id, "conn-ext", "失败后必须继续使用旧 factory");
+	assert.equal(drivers.create("conn-ext", "spawn", {})?.id, "conn-ext", "失败后必须继续使用旧 factory");
 	const persisted = JSON.parse(readFileSync(path.join(dir, "registry.json"), "utf-8")) as {
 		extensions: Array<{ version: string }>;
 	};
@@ -337,8 +389,8 @@ test("P3-0: 候选贡献激活冲突时重新注册旧 runtime hooks", async () 
 
 	assert.equal(registry.get("conn-ext")?.version, "1.0.0");
 	assert.equal(registry.get("conn-ext")?.loaded, true);
-	assert.equal(drivers.create("conn-ext", {})?.id, "conn-ext", "旧 contribution 必须恢复");
-	assert.equal(drivers.create("occupied-connector", {})?.id, "occupied-connector", "无关 contribution 不能受影响");
+	assert.equal(drivers.create("conn-ext", "spawn", {})?.id, "conn-ext", "旧 contribution 必须恢复");
+	assert.equal(drivers.create("occupied-connector", "spawn", {})?.id, "occupied-connector", "无关 contribution 不能受影响");
 });
 
 test("Phase5: 卸载移除模块与记录；重启后从 registry.json 重载", async () => {
@@ -376,7 +428,7 @@ test("Phase5: builtin PuddingClaw 在目录中且不可卸载；manifest-only co
 	assert.ok(entry, "PuddingClaw 必须以 builtin 身份进入目录");
 	assert.equal(entry!.origin, "builtin");
 	assert.equal(entry!.manifest.kind, "connector");
-	const driver: AgentDriver | undefined = drivers.create("puddingclaw", { command: "puddingclaw" });
+	const driver: AgentDriver | undefined = drivers.create("puddingclaw", "spawn", { command: "puddingclaw" });
 	assert.ok(driver);
 	const caps: DriverCapabilities = await driver!.capabilities();
 	assert.ok(caps.operations.includes("run"));
@@ -465,7 +517,7 @@ test("P4: user 安装——复制到 packages/<id>/<version>/、记录 digest，
 	const entry = await registry.installUserPackage(src);
 	assert.equal(entry.origin, "user");
 	assert.equal(entry.loaded, true, entry.loadError ?? "");
-	assert.ok(drivers.create("conn-ext", {}));
+	assert.ok(drivers.create("conn-ext", "spawn", {}));
 
 	const copiedDir = path.join(dir, "packages", "conn-ext", "1.0.0");
 	assert.ok(existsSync(path.join(copiedDir, EXTENSION_MANIFEST_FILE)), "内容必须复制到 packages/<id>/<version>/");
@@ -533,7 +585,7 @@ test("P4: user 更新——staging 原子切换；失败保留旧版本目录/�
 	assert.equal(updated.origin, "user");
 	assert.ok(existsSync(path.join(dir, "packages", "conn-ext", "1.1.0", "index.mjs")));
 	assert.ok(existsSync(path.join(dir, "packages", "conn-ext", "1.0.0", "index.mjs")), "旧版本目录不自动删除");
-	assert.equal(drivers.create("conn-ext", {})?.id, "conn-ext");
+	assert.equal(drivers.create("conn-ext", "spawn", {})?.id, "conn-ext");
 
 	// pin 不匹配拒绝。
 	await assert.rejects(() => registry.update("conn-ext", { path: v2, versionPin: "9.9.9" }), /固定版本/);
@@ -547,7 +599,7 @@ test("P4: user 更新——staging 原子切换；失败保留旧版本目录/�
 	await assert.rejects(() => registry.update("conn-ext", { path: v3 }), /candidate activation exploded/);
 	assert.equal(registry.get("conn-ext")?.version, "1.1.0");
 	assert.equal(registry.get("conn-ext")?.loaded, true);
-	assert.equal(drivers.create("conn-ext", {})?.id, "conn-ext", "失败后必须继续使用旧 factory");
+	assert.equal(drivers.create("conn-ext", "spawn", {})?.id, "conn-ext", "失败后必须继续使用旧 factory");
 	assert.equal(existsSync(path.join(dir, "packages", "conn-ext", "1.2.0")), false, "失败候选目录必须清理");
 	assert.ok(existsSync(path.join(dir, "packages", "conn-ext", "1.1.0", "index.mjs")), "旧版本目录必须保留");
 	const persisted = JSON.parse(readFileSync(path.join(dir, "registry.json"), "utf-8")) as {

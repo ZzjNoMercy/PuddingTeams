@@ -1,0 +1,103 @@
+---
+title: Workspace 与数据
+description: 工作目录、信任门、用户数据、Secret、附件和 Artifact 的归属边界。
+---
+
+<Status tone="preview">PREVIEW</Status>
+
+Agent 能读写什么，不应由 Server 从哪个目录启动来决定。PuddingTeams 要求每个 Window 显式拥有一个工作边界：绑定可信 Workspace，或使用平台的中立空目录。
+
+## Workspace 决定四件事
+
+- Driver 的 `cwd`；
+- 相对文件路径的解析根；
+- 是否允许发现项目 `AGENTS.md`、`CLAUDE.md`、skills 和 prompts；
+- Worker Session binding 是否仍可安全续接。
+
+Window 创建 Delegation 时冻结 `workspaceId + cwdSnapshot`。后续项目切换或路径变化会使旧 binding 失效，防止 Agent 把另一个项目的 Session 上下文带进当前工作。
+
+## 无项目不是 Server cwd
+
+没有显式 Workspace 时，cwd 固定为：
+
+```text
+<PUDDINGTEAMS_HOME>/workspaces/unscoped
+```
+
+此时强制关闭项目 context、skills 和 prompts 发现。它不会回退到 PuddingTeams 源码目录或 `process.cwd()`，因此启动命令在哪执行都不会意外把仓库规则注入用户对话。
+
+## 信任门
+
+外部目录第一次登记为 Workspace 时处于 `pending`；平台创建的 managed Workspace 默认 `trusted`。
+
+| 状态 | 行为 |
+| --- | --- |
+| `pending` | 可展示路径和资源摘要，不把正文注入 Agent |
+| `trusted` | 按批准的资源类型和 Agent 开关加载 |
+| `denied` | 保留登记，但拒绝上下文资源装配 |
+
+信任不是一个总开关。`approvedResources` 可以分别允许 context、skills、prompts；最终是否加载还要与 Agent 自己的 `loadWorkspace*` 开关取交集。
+
+平台保存决定时的 canonical path。若 `realpath` 后的真实路径发生变化，例如符号链接改指向另一目录，信任自动回到 pending。撤销信任后，相关活动 Session 标记为需要重新装配，旧上下文不能继续静默使用。
+
+这道门只控制 PuddingTeams 发现并注入的 Workspace 资源。外部 CLI 本身还能访问什么，仍取决于它自己的 sandbox、权限和操作系统账户。
+
+## 用户数据目录
+
+所有业务事实统一位于 `PUDDINGTEAMS_HOME`，默认 `~/.puddingteams`：
+
+```text
+config/product.json
+state/
+  agents.json  windows.json  workspaces.json
+  delegations.json  interactions.json  work-states.json  artifacts.json
+  delegation-timelines/  large-worker-results/
+sessions/                 # Manager pi Session
+sessions/workers/         # pi Worker Session
+extensions/registry.json
+extensions/packages/
+assets/avatars/
+uploads/
+artifacts/blobs/
+workspaces/managed/
+workspaces/unscoped/
+secrets/
+runtime/
+logs/
+migrations/
+```
+
+`PUDDINGTEAMS_HOME` 覆盖值必须是绝对路径，目录启动时会创建并验证可读写。应用安装目录、源码仓库和 Electron `userData` 都不是业务数据事实源。
+
+## pi 全局资源是另一层
+
+PuddingTeams 仍会使用当前用户的 pi 资源目录，默认 `~/.pi/agent`：
+
+- `AGENTS.md` 作为 pi global context；
+- `skills/` 与 `prompts/` 作为共享资源库；
+- pi 原生 `SYSTEM.md`、`APPEND_SYSTEM.md`、settings 与 models 继续遵循 pi 约定。
+
+这不等于 Workspace。无项目 Window 也可能加载 pi global `AGENTS.md`，但绝不会因此把 `~/.pi/agent` 当作 cwd。
+
+平台 Provider Secret 使用自己数据目录下的凭据文件，不要求把 Key 写进项目。Connector Secret 同样以引用形式保存在 Agent binding 中，明文落到受控 Secret store，不进入浏览器状态、Session JSONL 或 Delegation 正文。
+
+## 附件和本地文件
+
+用户附件先冻结到平台受控上传目录，再把明确路径注入当前消息。Manager 接力派活时必须显式传递所需附件路径，不能假定 Worker 自动看到原聊天附件。
+
+Markdown 文件链接按以下规则处理：
+
+- 相对路径基于 Window 的 `cwdSnapshot`；
+- 绝对路径只允许在当前 Workspace 或平台受控附件目录；
+- Server 以 `realpath` 校验存在性、文件类型和目录边界；
+- HTTP(S) 链接才按网络网页处理。
+
+## Artifact 与工作副本
+
+Artifact 注册时把文件字节冻结到 `artifacts/blobs/` 并计算哈希。原 Workspace 路径只是可继续编辑的工作副本；下载、证据核验和跨 Agent 交接使用冻结快照，避免后续修改让旧验收引用失真。
+
+## 备份与迁移
+
+迁移到另一台机器时，至少备份完整的 `PUDDINGTEAMS_HOME`。如果要保留 pi Manager/Worker 的全局提示词和资源，还应单独迁移 `~/.pi/agent`；外部 Codex、Claude Code、PuddingClaw 的账号和 Session 由各自产品管理，不能只靠 PuddingTeams 目录恢复。
+
+备份前建议停止 Server，确保没有状态文件正在原子替换。不要只复制 `windows.json`：Window、Session、Goal、Delegation、Artifact 和 Secret 之间以稳定 ID 关联，拆开备份会留下不可恢复的悬空引用。

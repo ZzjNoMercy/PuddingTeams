@@ -1,0 +1,99 @@
+---
+title: 技术架构
+description: pi、Agent Runtime、Transport、Extension 与 Web/桌面宿主怎样组成 PuddingTeams。
+---
+
+<Status tone="preview">PREVIEW</Status>
+
+PuddingTeams 的核心不是某个 UI 框架，而是一条稳定的控制链：**协作状态属于平台，执行协议属于 Connector，具体 Agent 可以替换。**
+
+```text
+Next.js Web / Electron
+        │ HTTP + WebSocket
+        ▼
+Fastify Server
+  ├─ Window / Session / Goal / Workspace / Artifact
+  ├─ pi Manager Harness
+  ├─ Agent Runtime（幂等、超时、交互、恢复）
+  └─ Extension Registry
+          │ Driver SPI / PWCP
+          ├─ sdk   → pi
+          ├─ spawn → Codex / Claude Code / PuddingClaw
+          └─ http  → 预留，尚未实现
+```
+
+## 技术栈
+
+| 层 | 当前实现 | 作用 |
+| --- | --- | --- |
+| Manager Harness | `@earendil-works/pi-coding-agent` 0.83 | Manager 会话、工具、资源装配和本地 pi Worker |
+| Server | Node.js 20+、TypeScript、Fastify 5 | API、WebSocket、状态存储与 Agent Runtime |
+| Web | Next.js 16、React 19、Tailwind CSS 4 | 聊天、配置、执行 Inspector；生产态静态导出 |
+| Desktop | Electron 43、electron-builder | 启动同一 Server bundle，并加载同源 Web |
+| Build | pnpm 10、esbuild、TypeScript | monorepo、发行 runtime 与 CLI bundle |
+| Protocol | PWCP + Driver SPI | 把不同 Agent 的私有协议归一成相同运行语义 |
+
+生产态不是“一个 Next Server 加一个 API Server”。Next.js 先导出静态页面，再由 Fastify 同源托管；CLI 或 Electron 只需启动一个 Server 进程和一个端口。
+
+## pi 在系统里的位置
+
+pi 有两种职责，不能混为一谈：
+
+1. **Manager Harness**：在 solo 和群聊里接收用户消息，读取最新 roster、Goal 和 WorkPlan，选择并委托 Worker。
+2. **本地 Worker Runtime**：某个 Agent 选择 pi Connector 时，任务在进程内 SDK Session 中执行，不创建 OS 子进程。
+
+PuddingTeams 不复制 pi 的默认系统提示词和资源加载器。它在 pi 原生 base/append 之后追加 Agent 指令、群聊协作规则和动态工作状态。非 pi Connector 不会自动继承这套提示词；它们只收到具体任务文本。
+
+## PWCP：统一语义，不统一命令
+
+不同 Agent 可能把同一动作叫作 `exec`、`resume`、`run` 或一个 HTTP 请求。PWCP 只规定四种平台语义：
+
+| 操作 | 含义 |
+| --- | --- |
+| `run` | 创建新的 Worker Session 并开始第一条 Run |
+| `continue` | 使用不透明 `sessionHandle` 在已有 Session 中开始下一条 Run |
+| `respond` | 回答仍在等待输入的同一条 Run，不重新执行 |
+| `cancel` | 取消当前 Run，不删除 Session |
+
+每次操作必须到达且只到达一个边界：`completed`、`failed` 或 `input_required`。`started` 和 `progress` 是过程，不是终态。Runtime 依赖这个约束做持久化、幂等和恢复。
+
+## Transport
+
+### SDK
+
+`sdk` 表示 Driver 在 Server 进程内调用 SDK。当前 pi Connector 使用该路径。它可以直接维护 pi Session，也能完整回放 thinking、assistant 和 tool 事件。
+
+### Spawn
+
+`spawn` 表示每次操作启动一个无 shell 子进程。共享执行器提供：
+
+- `shell: false`，argv 与命令分离；
+- stdout/stderr 分流，stdout 上限 2 MiB、单条 JSONL 上限 512 KiB；
+- 默认 30 秒首事件检测和 15 分钟活动超时；
+- AbortSignal 取消，先 `SIGTERM`，5 秒后仍未退出再 `SIGKILL`；
+- JSON 或无 stdin 后立即 EOF，避免 CLI 持续等待输入；
+- JSONL 流式解析与非 JSON 诊断隔离。
+
+Codex 与 Claude Code 的第一方 Connector 使用 spawn；PuddingClaw 当前也是内置 spawn Driver。Session 是否可续接取决于上游是否返回可用 handle，而不是取决于进程是否常驻。
+
+### HTTP（即将实现）
+
+`http` 已出现在 Driver capability、manifest transport 与 Probe 类型中，因此未来 HTTP Agent 不需要改变 Window、Goal 或 UI 契约。但当前代码库还没有通用 HTTP Transport、鉴权重试策略或官方 HTTP Connector。
+
+这意味着今天可以在代码型 Driver 内自行实现网络调用，但不能把 `supportedTransports: ["http"]` 当成平台已经提供了 HTTP 执行器。HTTP 正式落地至少还需要：请求/响应 framing、流式事件、幂等键、取消、超时、Secret 注入和 `respond` 恢复语义。
+
+`rpc` 与 `acp` 同样只是能力词汇，尚无平台 Transport 实现。
+
+## Extension Registry
+
+Registry 读取 Extension manifest，校验宿主版本、权限、入口和 Connector contribution，再把 Driver 注册到 Runtime。当前来源分为 builtin、bundled、user 和 local-link；安装记录位于用户数据目录，而不写进应用安装目录。
+
+代码型 Extension 当前在 Server 进程内执行。开发者模式是本地安装的产品门禁，但不是安全沙箱；进程隔离、权限 Broker、签名和社区分发仍是后续边界。详细规则见[Extension 机制](/docs/connectors/)。
+
+## 为什么这样分层
+
+如果 Window 直接依赖 `codex exec` 或某个 Provider 的事件名，替换 Agent 就会同时破坏会话、UI 和恢复逻辑。现在只有 Driver 理解私有协议；上层只依赖 PWCP、NormalizedResult 和 WorkerActivity。由此得到三个工程性质：
+
+- Connector 可以演进，而不迁移 Goal 与协作状态；
+- UI 可以统一观察不同 Worker，而不伪造它们没有提供的事件；
+- Agent 故障只结束一次 Delegation，不会抹掉所属 Session 的长期事实。

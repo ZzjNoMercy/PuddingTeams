@@ -943,6 +943,7 @@ html[data-reduce-motion="true"] *::after {
 .agent-config-card-head { margin-bottom: 15px; }
 .agent-config-card-head h2 { font-size: 13px; font-weight: 680; }
 .agent-config-card-head p { margin-top: 4px; color: var(--muted-foreground); font-size: 10px; line-height: 1.55; }
+.agent-config-probe-result { margin-top: 16px; }
 .agent-config-subsection { padding: 0; background: transparent; }
 .agent-config-field { display: flex; flex-direction: column; gap: 7px; font-size: 12px; }
 .agent-config-field > span,
@@ -1772,7 +1773,16 @@ html[data-nav="expanded"] .nav-primary {
    Header surfaces are draggable, while every actual control remains clickable. */
 html[data-desktop-platform="darwin"] .nav-rail {
 	padding-top: 56px;
+	-webkit-app-region: no-drag;
+}
+html[data-desktop-platform="darwin"] .nav-rail::before {
+	position: absolute;
+	top: 0;
+	right: 0;
+	left: 0;
+	height: 48px;
 	-webkit-app-region: drag;
+	content: "";
 }
 html[data-desktop-platform="darwin"] :where(
 	.home-chat-header,
@@ -1787,6 +1797,20 @@ html[data-desktop-platform="darwin"] :where(
 	.ops-page-header,
 	.agent-config-head
 ) :where(a, button, input, textarea, select, [role="button"], [role="link"]) {
+	-webkit-app-region: no-drag;
+}
+/* Electron calculates draggable regions before visual stacking. A Radix portal
+   can therefore appear above a drag surface while clicks still move the window.
+   Every floating interactive surface must explicitly carve out a no-drag area. */
+html[data-desktop-platform="darwin"] :where(
+	[data-slot="dropdown-menu-content"],
+	[data-slot="dropdown-menu-sub-content"],
+	[data-slot="dialog-overlay"],
+	[data-slot="dialog-content"],
+	[data-slot="select-content"],
+	[data-slot="hover-card-content"],
+	[data-slot="tooltip-content"]
+) {
 	-webkit-app-region: no-drag;
 }
 

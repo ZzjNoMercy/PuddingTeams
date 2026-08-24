@@ -1,0 +1,120 @@
+---
+title: Session Goal
+description: Goal、WorkPlan、Decision、完成复核与中断恢复的完整机制。
+---
+
+<Status tone="preview">PREVIEW</Status>
+
+普通聊天只要求“回复下一句话”；持续工作还需要知道**最终要交付什么、什么证据足以证明完成、遇到中断后从哪里继续**。Session Goal 为这类任务提供结构化状态，但不会强迫每次对话都进入项目管理模式。
+
+## 什么时候创建 Goal
+
+Goal 是显式、可判断完成的持续工作。适合：
+
+- 有清晰交付物的多步骤任务；
+- 需要跨 Worker 接力或并行；
+- 需要等待人类决策后继续；
+- 需要重启后恢复、逐项验收或保留证据。
+
+问候、一次性解释、探索性讨论和没有完成边界的请求不应创建 Goal。solo/group 的 Manager 可以在用户已经给出明确目标时调用 core tool 创建；用户也可以从 UI 或 `/goal` 建立。direct 没有 Manager 回合，只通过用户入口创建。
+
+## Session 与 Goal 的关系
+
+```text
+Session
+  ├─ 历史 Goal A（resolved）
+  ├─ 活动 Goal B（active，最多一个）
+  │    ├─ Goal 契约
+  │    ├─ WorkPlan（solo/group，可选）
+  │    ├─ Decisions
+  │    ├─ Completion Reviews
+  │    └─ Execution epoch
+  └─ 后续 Goal C（A/B 终态后才可创建）
+```
+
+同一 Session 可以串行拥有多个 Goal，以保留连贯对话；同一时刻最多一个 active Goal。新目标不能静默覆盖旧目标，旧 Goal 终态后保留为只读历史。
+
+## Goal 契约
+
+核心字段回答六个问题：
+
+| 字段 | 问题 |
+| --- | --- |
+| `goal` | 最终要实现什么 |
+| `completionBoundary` | 哪些逐项条件满足才算完成 |
+| `responsibleAgentId` | 谁对最终收口负责 |
+| `participantAgentIds` | 谁参与执行 |
+| `currentBrief` / `waitingOn` / `nextAction` | 当前事实、等待对象和下一步 |
+| `artifactIds` | 哪些冻结产物支撑结论 |
+
+完成条件来自用户输入或 Manager 对用户明确意图的结构化整理。Manager 不得按自己的偏好增加验收标准；需要新的业务判断时，应先发起 DecisionRequest。
+
+每次写入都带稳定 `goalId`、当前 revision 和 operation ID。revision 防止两个并行更新覆盖彼此，operation ID 让重复请求返回同一结果而不重复执行。
+
+## WorkPlan 是 Goal 的执行面
+
+solo/group Goal 可以惰性建立一个 WorkPlan，把复杂目标拆成 WorkItem DAG：
+
+```text
+W1 调研 ─┬─> W3 集成 ─> W4 验收
+W2 原型 ─┘
+```
+
+每个 WorkItem 有依赖、负责 Agent、验收条件、Delegation 引用、Submission 和状态。依赖必须是无环图；只有前置项 `accepted` 后，下游才进入 `ready`。
+
+关键区别：
+
+- Worker `completed` 只代表该次委托有结果；
+- 结果绑定到 WorkItem 后成为 `submitted`；
+- Manager 根据该 WorkItem 的验收条件明确给出 `accepted`、`revision` 或 `blocked`；
+- 所有 WorkItem accepted 只代表计划完成，Goal 仍要通过最终 completion review。
+
+Worker 自己的 Todo 只属于该 Worker 的执行过程，不会上升为 Manager WorkPlan。direct Goal 没有 Manager，因此只展示 Goal 契约和当前 Worker Timeline，不伪造 WorkItem DAG。
+
+## DecisionRequest 与 Interaction 不同
+
+| 机制 | 谁提出 | 解决什么 | 回答后怎样继续 |
+| --- | --- | --- | --- |
+| DecisionRequest | Manager / Goal 控制面 | 业务取舍、主观满意、授权范围、目标契约变化 | 在同一 Manager Session 开启下一轮 |
+| Driver Interaction | Worker / Connector | 权限审批、问题或确认，原 Run 正在等待 | `respond` 恢复同一 `runHandle` |
+
+把二者混在一起会产生错误授权：普通聊天答案不能自动批准 Worker 权限，Worker 的权限卡也不能偷偷修改 Goal 完成条件。
+
+## 完成复核
+
+Goal 不是在 Manager 说“完成了”时自动结束。平台要求逐项核对冻结的 `completionBoundary`，并附证据引用。
+
+### Manager 模式
+
+Manager 在无活动委托、无待回答 Decision、WorkPlan 已验收且有最终 brief 时，逐项提交结论和证据。它不能用普通状态更新直接把 Goal 写成 resolved。
+
+### Independent 模式
+
+隔离 Reviewer 只判断既有完成条件，不生成新标准。每一条 criterion 必须与冻结边界逐字、原序对应；结果为：
+
+- `satisfied`：证据足以证明完成；
+- `not_satisfied`：仍有明确缺口；
+- `needs_human`：证据无法替代人的主观判断或授权。
+
+`needs_human` 会转为 DecisionRequest，Goal 保持 active。人类不是默认逐项验收每个 Worker 输出，只处理真正属于人的判断。
+
+## 中断恢复
+
+Goal 的 execution 带递增 epoch。Server 重启、Manager 中断或外部副作用不明时：
+
+1. 保留同一 `goalId`、契约、已验收 WorkItem、Decision、Artifact 和历史 Delegation；
+2. 把崩溃时 Run 视为不再存活，不伪造继续；
+3. 从最后原子安全点创建新的 execution epoch；
+4. 已有 operation ledger 防止重复写；
+5. outbox 保证回答 Decision 和 Goal resume 最终唤醒；
+6. 外部副作用不明的步骤不自动重放，先标记并要求对账。
+
+旧 epoch 的迟到回调、旧 Goal 的交互和 stale revision 都会被 fence 拒绝。这比“重启后把所有 pending task 再跑一遍”更保守，因为文件写入、发布或付款等副作用可能已经发生。
+
+## 实际使用建议
+
+1. 把完成条件写成可观察的结果，不写“尽量好”“做到满意”为唯一标准。
+2. 多步骤或多 Worker 时让 Manager 建 WorkPlan；简单目标不必强拆。
+3. 要求关键 Submission 引用 Delegation 或 Artifact，不只写口头摘要。
+4. 修改 Goal 契约后，先让 WorkPlan 对账新条件，再继续执行。
+5. 在 Inspector 看 Goal、WorkPlan 和证据；聊天主区域继续用来沟通，不把状态面板当第二套聊天。

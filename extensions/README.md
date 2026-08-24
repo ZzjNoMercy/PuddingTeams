@@ -38,7 +38,7 @@ extensions/
 
 | 包 | 内容 | 状态 |
 | --- | --- | --- |
-| pwcp（`shared/pwcp`，`@puddingteams/pwcp`） | PWCP 共享核心：Driver SPI 类型 + spawn/JSONL transport + observe 机械收集（不依赖任何宿主） | 可用 |
+| pwcp（`shared/pwcp`，`@puddingteams/pwcp`） | PWCP 共享核心：Driver SPI 类型 + spawn/JSONL 与 HTTP/NDJSON transport + observe 机械收集（不依赖任何宿主） | 可用 |
 | templates（`shared/templates/`，非包，`.tmpl` 骨架） | `puddingteams extension init` 的模板：`connector/`（代码型双宿主包）、`connector-declarative/`（纯 manifest 声明式包） | 可用（P2-d） |
 | `capabilities/minimal-tool` | 无副作用的真实 Capability 包；验证 catalog → binding → 命名空间工具装配 | 可用（P3 产品闭环） |
 

@@ -15,6 +15,7 @@ Connector/Capability Extension 的本质是**给 pi 扩充连接其他 Agent 的
 
 - `apps/server`：Fastify + pi SDK 后端（Runtime、DriverRegistry、ExtensionRegistry、pi-bridge）。
 - `apps/web`：Next.js 前端（`output: "export"` 静态导出；动态路由一律用查询参数，如 `/agents/config?name=`，不能用 `[param]` 动态段）。
+- `apps/docs`：独立 Next.js + Fumadocs 公开文档站（`output: "export"`）；公开 MDX 直接位于 `apps/docs/*.mdx`，与根目录 `docs/` 的内部设计方案区分。默认本地端口 8936，对外路径 `/docs/`。
 - `extensions/`：所有插件的唯一落点——`connectors/`（Connector 包）、`capabilities/`（Capability 包）、`shared/`（共享核心 @puddingteams/pwcp 与 init 模板）。新增包必须更新 `extensions/README.md` 索引。
 - `packages/puddingteams-cli`：发行 CLI（npm 包，当前 private 不发布）。零依赖 bin + `runtime/`（构建产物，gitignored）。
 
@@ -22,6 +23,7 @@ Connector/Capability Extension 的本质是**给 pi 扩充连接其他 Agent 的
 
 - server：`cd apps/server && pnpm test && pnpm typecheck`（测试用 tsx --test，不是 vitest）。
 - web：`cd apps/web && pnpm typecheck && pnpm lint && pnpm build`。
+- documents：`pnpm docs:typecheck && pnpm --filter @puddingteams/docs run lint && pnpm docs:build`。
 - 发行打包：`pnpm build:runtime`（esbuild 单文件 bundle server/CLI + web 静态产物 + 第一方 extensions 预编译，组装到 `packages/puddingteams-cli/runtime/`）；`pnpm pack:cli` 额外产出 tgz。安装链路：`npm install -g <tgz>` → `puddingteams init` → `puddingteams start` → `puddingteams open`。发行态 server 同源托管 web 静态产物，单进程单端口。
 - 不做任何 git 提交/变更，除非用户明确要求。
 - 未上线项目，不做历史数据兼容：结构变化直接替换，不留兼容适配层。

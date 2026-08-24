@@ -1,0 +1,121 @@
+---
+title: 部署方式
+description: 桌面 App 与源码部署的依赖、端口、数据目录和构建方式。
+---
+
+<Status tone="preview">PREVIEW</Status>
+
+PuddingTeams 有两种运行形态，但只维护一套业务运行时：桌面 App 和 CLI 都启动相同的生产 Server bundle，读取相同的 `PUDDINGTEAMS_HOME`。
+
+## 先区分两类依赖
+
+| 依赖 | 桌面 App | 源码部署 |
+| --- | --- | --- |
+| PuddingTeams 自身 Node 运行时 | Electron 内置 | Node.js 20+ |
+| monorepo 包管理 | 不需要 | pnpm 10.32.1 |
+| Web 浏览器 | App 内置 Chromium | 本机浏览器 |
+| pi SDK | 随发行 runtime 打包 | `pnpm install` 安装 |
+| Codex / Claude Code / PuddingClaw CLI | 使用对应 Connector 时仍需安装 | 使用对应 Connector时仍需安装 |
+| Provider 账号与 API Key | 按所选 Agent/模型提供 | 按所选 Agent/模型提供 |
+
+桌面 App “免 Node”不等于“内置所有 Agent”。它只内置 PuddingTeams 和第一方 Connector 代码；外部 CLI、登录态和上游服务仍属于各自 Agent。
+
+## 桌面 App
+
+当前工程提供 macOS DMG 和 Windows x64 NSIS 构建。安装后启动 App，它会：
+
+1. 解析 `PUDDINGTEAMS_HOME`，默认 `~/.puddingteams`；
+2. 检查是否已有 CLI 管理的 PuddingTeams Server；
+3. 校验数据目录指纹一致后复用，否则启动内置 Server；
+4. 用 Electron 窗口打开本机 loopback 页面；
+5. App 退出时，只停止由它自己启动的 Server。
+
+桌面宿主会合并登录 shell 与 Homebrew、pnpm、bun、cargo、volta 等常见可执行目录，减少从 Finder 启动后找不到 Agent CLI 的问题。
+
+### 从源码构建 App
+
+```bash
+corepack enable
+pnpm install
+
+# 以下命令都会先组装 production runtime，再打包桌面宿主。
+# macOS DMG，默认构建当前配置的架构
+pnpm build:electron
+
+# macOS arm64
+pnpm build:electron:arm64
+
+# Windows x64 NSIS，应在 Windows 构建环境运行
+pnpm build:electron:win:x64
+```
+
+macOS 发行配置要求签名、hardened runtime 与 notarization；正式构建需要相应 Apple 凭据。Windows 当前构建脚本允许不强制代码签名，未签名安装包可能触发 SmartScreen。卸载桌面 App 不会删除 `PUDDINGTEAMS_HOME` 里的业务数据。
+
+## 源码开发运行
+
+```bash
+corepack enable
+pnpm install
+pnpm dev
+```
+
+开发态启动两个端口：
+
+- Server API：`http://127.0.0.1:8933`
+- Next.js Web：`http://127.0.0.1:8934`
+
+根脚本的 `predev` 只清理 8933 和 8934，避免遗留开发进程造成重复实例；不会清理 3000 等无关端口。开发 Web 通过 CORS/WebSocket 访问 8933。
+
+## 源码生产运行
+
+生产 runtime 包含 Server bundle、CLI bundle、Next 静态产物、第一方 Connector、Capability 和脚手架模板：
+
+```bash
+pnpm install
+pnpm build:runtime
+node packages/puddingteams-cli/bin/puddingteams.js start
+```
+
+生产态 Web 由 Server 同源托管，默认只监听 `127.0.0.1:8933`。常用命令：
+
+```bash
+node packages/puddingteams-cli/bin/puddingteams.js status
+node packages/puddingteams-cli/bin/puddingteams.js open
+node packages/puddingteams-cli/bin/puddingteams.js stop
+node packages/puddingteams-cli/bin/puddingteams.js restart --port 8940
+```
+
+仓库也可以用 `pnpm pack:cli` 生成本地 tarball。当前 `@puddingteams/cli` 包标记为 private，文档不承诺公共 npm 安装渠道。
+
+## 初始化与外部 Agent
+
+```bash
+node packages/puddingteams-cli/bin/puddingteams.js init
+node packages/puddingteams-cli/bin/puddingteams.js doctor
+```
+
+`init` 可配置模型 Provider、检查第一方 Connector，并在交互式终端中提示安装上游 CLI。`doctor` 是只读体检：检查 Node、数据目录和各 Worker 可用性；单个可选 Worker 缺失不代表 PuddingTeams 核心故障。
+
+至少准备你实际要用的执行端：
+
+- pi：随 PuddingTeams 依赖安装；模型凭据仍需配置；
+- Codex：安装并登录 Codex CLI；
+- Claude Code：安装并登录 Claude Code CLI；
+- PuddingClaw：准备 PuddingClaw CLI 与可访问的本地 Backend，默认 URL 为 `http://127.0.0.1:8888`。
+
+## 数据目录与多实例
+
+```bash
+PUDDINGTEAMS_HOME=/absolute/path/to/data \
+  node packages/puddingteams-cli/bin/puddingteams.js start --port 8940
+```
+
+`PUDDINGTEAMS_HOME` 必须是绝对路径。每个数据目录实行单写者 Lease：同一个 Home 已有后端存活时，第二个后端会拒绝启动。端口不同也不能绕过这个约束，因为两个进程同时写 Session 和状态文件会破坏事实源。
+
+桌面端修改端口使用 `PUDDINGTEAMS_DESKTOP_PORT`；CLI 使用 `--port` 或 `PORT`。如果 App 发现目标端口上的 PuddingTeams 使用另一份数据目录，它会拒绝复用，而不是静默连接错误的数据。
+
+## 局域网和服务器部署
+
+Server 支持用 `HOST` 改监听地址，并用 `PUDDINGTEAMS_ALLOWED_ORIGINS` 配置浏览器来源。但当前产品以本机单用户、loopback 访问为默认安全模型；它没有完整的互联网暴露、反向代理认证和多租户边界。
+
+因此源码部署到远程主机时，应先自行提供 TLS、身份认证、网络访问控制和 Secret 隔离，不要直接把 Server 端口暴露到公网。

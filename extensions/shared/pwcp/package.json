@@ -1,12 +1,13 @@
 {
 	"name": "@puddingteams/pwcp",
 	"version": "0.1.0",
-	"description": "PWCP 共享核心：Driver SPI 类型 + spawn/JSONL transport + observe 机械收集。不依赖任何宿主（PuddingTeams server 与 pi 共用）。",
+	"description": "PWCP 共享核心：Driver SPI 类型 + spawn/JSONL、HTTP/NDJSON transport + observe 机械收集。不依赖任何宿主（PuddingTeams server 与 pi 共用）。",
 	"type": "module",
 	"exports": {
 		".": "./src/index.ts",
 		"./types": "./src/types.ts",
 		"./spawn": "./src/spawn.ts",
+		"./http-jsonl": "./src/http-jsonl.ts",
 		"./jsonl-lines": "./src/jsonl-lines.ts",
 		"./observe": "./src/observe.ts"
 	},

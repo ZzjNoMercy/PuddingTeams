@@ -679,10 +679,9 @@ export class ExtensionRegistry {
 			// 按 manifest 声明执行 spawn/解码/归一，包内不需要任何代码。
 			if (manifest.connector.declarative) {
 				return {
-					driverFactory: (config) =>
-						createDeclarativeDriverFactory(manifest.connector.id, manifest.connector.declarative!, {
-							packageDir: record.sourcePath,
-						})(config),
+					driverFactory: createDeclarativeDriverFactory(manifest.connector.id, manifest.connector.declarative!, {
+						packageDir: record.sourcePath,
+					}),
 				};
 			}
 			// 既无 entry 又无 declarative 的 manifest-only 包：只登记目录，不注册 driver。
@@ -731,6 +730,9 @@ export class ExtensionRegistry {
 		}
 		if (!hooks.driverFactory && !hooks.driver) {
 			throw new Error(`connector extension「${manifest.id}」未导出 createDriver/driver`);
+		}
+		if (manifest.connector.supportedTransports.length > 1 && !hooks.driverFactory) {
+			throw new Error(`多 transport connector extension「${manifest.id}」必须导出 createDriver(config, transport)`);
 		}
 		if (hooks.driver && hooks.driver.id !== manifest.connector.id) {
 			throw new Error(`Driver id「${hooks.driver.id}」与 connector id「${manifest.connector.id}」不一致`);

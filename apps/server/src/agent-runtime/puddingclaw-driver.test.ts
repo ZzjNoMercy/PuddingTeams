@@ -2,10 +2,13 @@ import { test } from "node:test";
 import assert from "node:assert";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { createPuddingClawActivityObserver, PuddingClawDriver, projectPuddingClawActivity } from "./puddingclaw-driver.js";
+import { puddingClawConnectorManifest, puddingClawExtensionHooks } from "./puddingclaw-extension.js";
 import { normalizePuddingClawJson, PUDDINGCLAW_CAPABILITIES } from "./normalize.js";
-import type { AgentEvent, InvocationContext } from "./types.js";
+import type { AgentEvent, InvocationContext, WorkerActivity } from "./types.js";
 
 /**
  * §8.2 clarify-and-retry：worker 在 Run 启动前的发问（分析模型澄清）没有
@@ -15,6 +18,48 @@ import type { AgentEvent, InvocationContext } from "./types.js";
 
 function freshDir(): string {
 	return mkdtempSync(path.join(tmpdir(), "pt-pc-driver-"));
+}
+
+const STREAM_FIXTURE = [
+	{ event: "run_starting", data: { session_id: "session-http", status: "starting" } },
+	{ event: "run_started", data: { run_id: "run-http", session_id: "session-http" } },
+	{ event: "token", data: { content: "流式", response_id: "response-1" } },
+	{ event: "token", data: { content: "进度", response_id: "response-1" } },
+	{ event: "tool_start", data: { tool: "search", tool_call_id: "tool-1", input: { query: "weather" } } },
+	{ event: "tool_end", data: { tool: "search", tool_call_id: "tool-1", output: { rows: 1 } } },
+	{ event: "final_response", data: { final_response: "最终答复" } },
+	{ event: "result", data: { status: "completed", outcome: "completed", final_response: "最终答复", run_id: "run-http", session_id: "session-http" } },
+];
+
+async function withHttpServer(
+	handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>,
+	run: (endpoint: string) => Promise<void>,
+): Promise<void> {
+	const server = createServer((req, res) => void Promise.resolve(handler(req, res)).catch((error) => {
+		res.statusCode = 500;
+		res.end(String(error));
+	}));
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(0, "127.0.0.1", resolve);
+	});
+	const address = server.address() as AddressInfo;
+	try {
+		await run(`http://127.0.0.1:${address.port}`);
+	} finally {
+		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+	}
+}
+
+function streamFixture(res: ServerResponse): void {
+	res.writeHead(200, { "content-type": "application/x-ndjson", "cache-control": "no-cache" });
+	for (const event of STREAM_FIXTURE) {
+		const line = `${JSON.stringify(event)}\n`;
+		const split = Math.max(1, Math.floor(line.length / 2));
+		res.write(line.slice(0, split));
+		res.write(line.slice(split));
+	}
+	res.end();
 }
 
 /**
@@ -46,6 +91,188 @@ async function collect(iter: AsyncIterable<AgentEvent>): Promise<AgentEvent[]> {
 	for await (const e of iter) out.push(e);
 	return out;
 }
+
+test("PuddingClaw Connector 标准：包声明 spawn/http，实例 Driver 声明实际 transport", async () => {
+	assert.deepEqual(puddingClawConnectorManifest.connector.supportedTransports, ["spawn", "http"]);
+	assert.deepEqual(puddingClawConnectorManifest.permissions, ["spawn", "network"]);
+	const hooks = puddingClawExtensionHooks();
+	assert.ok(hooks.driverFactory);
+	assert.equal((await hooks.driverFactory!({}, "spawn").capabilities()).transport, "spawn");
+	assert.equal((await hooks.driverFactory!({}, "http").capabilities()).transport, "http");
+	assert.throws(() => hooks.driverFactory!({}, "rpc"), /不支持 transport:rpc/);
+});
+
+test("PuddingClaw HTTP：增量 NDJSON 映射为房间活动并归一同一终态", async () => {
+	await withHttpServer(async (req, res) => {
+		if (req.method === "GET" && req.url === "/api/headless/health") {
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(JSON.stringify({
+				agent_id: "puddingclaw",
+				configured: true,
+				reachable: true,
+				protocol_version: "1",
+				server_version: "0.1.19",
+				progress: "jsonl",
+				operations: { run: true, continue: true, respond: true, cancel: true },
+			}));
+			return;
+		}
+		if (req.method === "POST" && req.url === "/api/headless/runs?stream=true") {
+			for await (const _chunk of req) { /* consume request body before streaming */ }
+			streamFixture(res);
+			return;
+		}
+		res.writeHead(404).end();
+	}, async (endpoint) => {
+		const activities: WorkerActivity[] = [];
+		const driver = new PuddingClawDriver({ transport: "http", endpoint });
+		const dir = freshDir();
+		const events = await collect(driver.run(
+			{ message: "测试 HTTP 流", requestId: "http-request-1" },
+			{
+				cwd: dir,
+				env: { ...process.env },
+				onUpdate: (_content, details) => {
+					const activity = (details as { activity?: WorkerActivity } | undefined)?.activity;
+					if (activity) activities.push(activity);
+				},
+			},
+		));
+		const completed = events.at(-1);
+		assert.ok(completed && completed.type === "completed");
+		if (completed.type !== "completed") return;
+		assert.equal(completed.result.content, "最终答复");
+		assert.equal(completed.result.runHandle, "run-http");
+		assert.equal(completed.result.sessionHandle, "session-http");
+		assert.deepEqual(activities.map((activity) => activity.sourceEvent), [
+			"run_starting", "run_started", "token.batch", "tool_start", "tool_end", "final_response",
+		]);
+		assert.equal(activities.find((activity) => activity.sourceEvent === "token.batch")?.content, "流式进度");
+
+		const probe = await driver.probe({ cwd: dir, env: { ...process.env } });
+		assert.equal(probe.transport, "http");
+		assert.equal(probe.detected, true);
+		assert.equal(probe.version, "1");
+		assert.equal(probe.upstreamVersion, "0.1.19");
+		assert.equal(probe.compatibility, "supported");
+	});
+});
+
+test("PuddingClaw HTTP probe：以 Headless API 协议和能力契约判断兼容性，不以 CLI 版本判断", async () => {
+	await withHttpServer((_req, res) => {
+		res.writeHead(200, { "content-type": "application/json" });
+		res.end(JSON.stringify({
+			agent_id: "puddingclaw",
+			cli_version: "0.1.19",
+			server_version: "0.1.19",
+			protocol_version: "2",
+			configured: true,
+			reachable: true,
+			progress: "jsonl",
+			operations: { run: true, continue: true, respond: true, cancel: true },
+		}));
+	}, async (endpoint) => {
+		const probe = await new PuddingClawDriver({ transport: "http", endpoint }).probe({
+			cwd: freshDir(),
+			env: { ...process.env },
+		});
+		assert.equal(probe.detected, true);
+		assert.equal(probe.version, "2");
+		assert.equal(probe.upstreamVersion, "0.1.19");
+		assert.equal(probe.compatibility, "untested");
+		assert.ok(probe.issues.some((issue) => issue.code === "protocol_untested"));
+	});
+});
+
+test("PuddingClaw HTTP：断线恢复等待期间取消仍会终止已知的上游 Run", async () => {
+	let cancelRunId = "";
+	await withHttpServer(async (req, res) => {
+		if (req.method === "POST" && req.url === "/api/headless/runs?stream=true") {
+			for await (const _chunk of req) { /* consume request */ }
+			res.writeHead(200, { "content-type": "application/x-ndjson" });
+			res.write(`${JSON.stringify({ event: "run_started", data: { run_id: "run-to-cancel", session_id: "session-1" } })}\n`);
+			setImmediate(() => res.destroy());
+			return;
+		}
+		if (req.method === "POST" && req.url === "/api/headless/runs/run-to-cancel/cancel") {
+			cancelRunId = "run-to-cancel";
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(JSON.stringify({ status: "cancelled" }));
+			return;
+		}
+		res.writeHead(404).end();
+	}, async (endpoint) => {
+		const controller = new AbortController();
+		const driver = new PuddingClawDriver({
+			transport: "http",
+			endpoint,
+			connectionRecoveryMinAgeMs: 0,
+			connectionRecoveryIntervalMs: 10,
+			connectionRecoveryMs: 2_000,
+		});
+		const events = await collect(driver.run(
+			{ message: "会在恢复窗口取消", requestId: "cancel-recovery-1" },
+			{
+				cwd: freshDir(),
+				env: { ...process.env },
+				signal: controller.signal,
+				onUpdate: (_content, details) => {
+					if ((details as { recovering?: boolean } | undefined)?.recovering) controller.abort();
+				},
+			},
+		));
+		const last = events.at(-1);
+		assert.equal(last?.type, "failed");
+		if (last?.type === "failed") assert.equal(last.result.status, "cancelled");
+		assert.equal(cancelRunId, "run-to-cancel");
+	});
+});
+
+test("PuddingClaw 双传输一致性：同一上游事件序列生成相同 WorkerActivity 与最终文本", async () => {
+	const dir = freshDir();
+	const cli = path.join(dir, "fake-stream-puddingclaw.sh");
+	writeFileSync(cli, [
+		"#!/bin/sh",
+		...STREAM_FIXTURE.map((event) => `printf '%s\\n' '${JSON.stringify(event)}'`),
+		"",
+	].join("\n"));
+	chmodSync(cli, 0o755);
+
+	await withHttpServer(async (req, res) => {
+		if (req.method === "POST" && req.url === "/api/headless/runs?stream=true") {
+			for await (const _chunk of req) { /* consume request body */ }
+			streamFixture(res);
+			return;
+		}
+		res.writeHead(404).end();
+	}, async (endpoint) => {
+		async function execute(driver: PuddingClawDriver): Promise<{ activities: WorkerActivity[]; result: AgentEvent | undefined }> {
+			const activities: WorkerActivity[] = [];
+			const events = await collect(driver.run(
+				{ message: "同一任务", requestId: "same-request" },
+				{
+					cwd: dir,
+					env: { ...process.env },
+					onUpdate: (_content, details) => {
+						const activity = (details as { activity?: WorkerActivity } | undefined)?.activity;
+						if (activity) activities.push(activity);
+					},
+				},
+			));
+			return { activities, result: events.at(-1) };
+		}
+
+		const spawned = await execute(new PuddingClawDriver({ transport: "spawn", command: cli }));
+		const http = await execute(new PuddingClawDriver({ transport: "http", endpoint }));
+		assert.deepEqual(http.activities, spawned.activities);
+		assert.equal(http.result?.type, "completed");
+		assert.equal(spawned.result?.type, "completed");
+		if (http.result?.type === "completed" && spawned.result?.type === "completed") {
+			assert.equal(http.result.result.content, spawned.result.result.content);
+			assert.equal(http.result.result.content, "最终答复");
+		}
+	});
+});
 
 test("PuddingClawDriver：input_required 时原任务文本进 providerState 私有通道", async () => {
 	const dir = freshDir();

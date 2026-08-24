@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { LoaderIcon, RefreshCwIcon, TrashIcon } from "lucide-react";
+import { AlertCircleIcon, CheckCircle2Icon, CheckIcon, LoaderIcon, PauseCircleIcon, PlayIcon, RefreshCwIcon, TrashIcon, XCircleIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -24,10 +24,12 @@ import {
 import type {
 	AgentCapabilityBinding,
 	AgentConfig,
+	AgentConnectorBinding,
 	AgentProbeResult,
 	BindingProbeResult,
 	CatalogEntry,
 	ConnectorProbeResult,
+	ExtensionPermission,
 	MutationResponse,
 	ToolActivation,
 	WorkerProbeResult,
@@ -52,31 +54,71 @@ const ORIGIN_LABELS: Record<CatalogEntry["origin"], string> = {
 	"local-link": "开发者本地链接",
 };
 
+const PERMISSION_LABELS: Record<ExtensionPermission, string> = {
+	spawn: "启动本地进程",
+	network: "访问网络",
+	workspace: "访问工作区",
+	secrets: "读取已授权密钥",
+};
+
+function connectorTransportLabel(transport?: string): string {
+	// The catalog and agent payload arrive independently. During a hot reload or
+	// while an older in-memory server response is still on screen, the binding can
+	// temporarily lack the newly required transport field. Rendering must remain
+	// total; the form below resolves the manifest default and persists it on save.
+	if (!transport) return "未声明（保存时使用默认值）";
+	if (transport === "spawn") return "CLI spawn";
+	if (transport === "http") return "HTTP 流式";
+	if (transport === "sdk") return "进程内 SDK";
+	return transport.toUpperCase();
+}
+
 // ---- probe 展示 ----
 
 /** 探测完成的即时反馈：结果卡渲染在按钮下方、可能在视区外，用 toast 兜底。 */
 function probeToast(probe: AgentProbeResult): void {
-	const healthy = isConnectorProbe(probe) ? probe.detected && probe.compatibility !== "incompatible" : probe.ok;
-	if (healthy) toast.success("探测通过");
+	if (isConnectorProbe(probe)) {
+		const summary = connectorProbeSummary(probe);
+		if (summary.tone === "success") toast.success("接入探测通过");
+		else if (summary.tone === "warning") toast.warning("接入可用，但兼容性待确认");
+		else toast.error("接入探测未通过，详见下方结果卡");
+		return;
+	}
+	if (probe.ok) toast.success("探测通过");
 	else toast.error("探测未通过，详见下方结果卡");
 }
 
-/** §10：按 probe 结果计算接入状态文案（不合并成含糊按钮，只展示状态）。 */
-function connectorStatus(p: ConnectorProbeResult): string {
-	if (!p.extensionInstalled) return "扩展未安装";
-	if (!p.detected) return "CLI 未检测";
-	if (p.authenticated === false) return "待认证";
-	if (p.compatibility === "incompatible") return "不兼容";
-	if (p.compatibility === "untested") return "版本未经验证";
-	if (p.configured && !p.enabled) return "已配置但未启用";
-	if (p.enabled) return "已启用";
-	return "已配置";
+type ConnectorProbeTone = "success" | "warning" | "error";
+
+interface ConnectorProbeSummary {
+	title: string;
+	description: string;
+	tone: ConnectorProbeTone;
 }
 
-function statusVariant(status: string): "secondary" | "destructive" | "outline" {
-	if (status === "已启用") return "secondary";
-	if (["扩展未安装", "CLI 未检测", "待认证", "不兼容"].includes(status)) return "destructive";
-	return "outline";
+/** Probe 回答“接入是否可用”；Worker 是否接活是另一个维度，不能混成同一个结论。 */
+function connectorProbeSummary(probe: ConnectorProbeResult): ConnectorProbeSummary {
+	const transport = probe.transport ?? probe.capabilities.transport;
+	const target = transport === "http" ? "API" : transport === "spawn" ? "CLI" : "接入端";
+	if (!probe.extensionInstalled) return { title: "Connector 扩展未安装", description: "先安装对应扩展，再重新探测接入状态。", tone: "error" };
+	if (!probe.configured) return { title: "接入配置不完整", description: `补全 ${target} 配置后再重新探测。`, tone: "error" };
+	if (!probe.detected) return {
+		title: transport === "http" ? "API 暂时不可达" : transport === "spawn" ? "未检测到 CLI" : "接入端不可用",
+		description: transport === "http" ? "请检查服务地址、端口和上游服务状态。" : "请检查安装路径和运行环境。",
+		tone: "error",
+	};
+	if (probe.authenticated === false) return { title: "认证未通过", description: `${target} 可访问，但当前凭证无法完成认证。`, tone: "error" };
+	if (probe.compatibility === "incompatible") return { title: "协议不兼容", description: "接入端可访问，但协议版本不在当前 Connector 的支持范围内。", tone: "error" };
+	if (probe.compatibility === "untested" || probe.compatibility === "unknown") return {
+		title: "连接可用，兼容性待确认",
+		description: "已连接到接入端，但当前版本尚未经过兼容性验证。",
+		tone: "warning",
+	};
+	return {
+		title: transport === "http" ? "HTTP 接入正常" : transport === "spawn" ? "CLI 接入正常" : "接入正常",
+		description: `${target} 可访问，协议与能力声明已验证。`,
+		tone: "success",
+	};
 }
 
 const COMPATIBILITY_LABELS: Record<ConnectorProbeResult["compatibility"], string> = {
@@ -86,45 +128,88 @@ const COMPATIBILITY_LABELS: Record<ConnectorProbeResult["compatibility"], string
 	unknown: "未知",
 };
 
+const OPERATION_LABELS: Record<ConnectorProbeResult["capabilities"]["operations"][number], string> = {
+	run: "发起任务",
+	continue: "继续会话",
+	respond: "回复交互请求",
+	cancel: "取消任务",
+};
+
+const INTERACTION_LABELS: Record<ConnectorProbeResult["capabilities"]["interactionKinds"][number], string> = {
+	permission: "权限审批",
+	question: "问题确认",
+	confirmation: "操作确认",
+};
+
+const PROGRESS_LABELS: Record<ConnectorProbeResult["capabilities"]["progress"], string> = {
+	none: "无进度回传",
+	coarse: "阶段性进度",
+	stream: "实时流式进度",
+};
+
 function ConnectorProbeView({ probe }: { probe: ConnectorProbeResult }) {
-	const status = connectorStatus(probe);
+	const summary = connectorProbeSummary(probe);
+	const transport = probe.transport ?? probe.capabilities.transport;
+	const capabilityLabels = [
+		...probe.capabilities.operations.map((operation) => OPERATION_LABELS[operation]),
+		...probe.capabilities.interactionKinds.map((kind) => INTERACTION_LABELS[kind]),
+		...(probe.capabilities.progress === "none" ? [] : [PROGRESS_LABELS[probe.capabilities.progress]]),
+	];
+	const detailItems = [
+		{ label: "接入方式", value: connectorTransportLabel(transport) },
+		{ label: "兼容性", value: COMPATIBILITY_LABELS[probe.compatibility] },
+		...(probe.version ? [{ label: "协议版本", value: `v${probe.version}` }] : []),
+		...(probe.upstreamVersion ? [{ label: transport === "http" ? "服务版本" : "CLI 版本", value: `v${probe.upstreamVersion}` }] : []),
+		...(probe.extensionVersion ? [{ label: "Connector", value: `v${probe.extensionVersion}` }] : []),
+	];
 	return (
-		<div className="agent-config-inset flex flex-col gap-2">
-			<div className="flex flex-wrap items-center gap-1.5">
-				<Badge variant={statusVariant(status)}>{status}</Badge>
-				<Badge variant="outline">兼容性：{COMPATIBILITY_LABELS[probe.compatibility]}</Badge>
-				{probe.transport ? <Badge variant="outline">transport: {probe.transport}</Badge> : null}
-				{probe.extensionVersion ? <Badge variant="outline">扩展 v{probe.extensionVersion}</Badge> : null}
-				{probe.upstreamVersion ? <Badge variant="outline">上游 v{probe.upstreamVersion}</Badge> : null}
-			</div>
-			<div className="flex flex-col gap-1">
-				<span className="text-xs text-muted-foreground">支持的操作</span>
-				<div className="flex flex-wrap gap-1">
-					{(["run", "continue", "respond", "cancel"] as const).map((op) => {
-						const supported = probe.capabilities.operations.includes(op);
-						return (
-							<Badge key={op} variant={supported ? "secondary" : "outline"} className={supported ? "" : "opacity-40"}>
-								{op}
-							</Badge>
-						);
-					})}
+		<div className="agent-config-inset overflow-hidden p-0">
+			<div className="flex flex-wrap items-start justify-between gap-3 px-4 py-3.5">
+				<div className="flex min-w-0 items-start gap-2.5">
+					{summary.tone === "success" ? <CheckCircle2Icon className="mt-0.5 size-4 shrink-0 text-primary" /> : null}
+					{summary.tone === "warning" ? <AlertCircleIcon className="mt-0.5 size-4 shrink-0 text-amber-600" /> : null}
+					{summary.tone === "error" ? <XCircleIcon className="mt-0.5 size-4 shrink-0 text-destructive" /> : null}
+					<div className="min-w-0">
+						<p className="text-sm font-semibold leading-5">{summary.title}</p>
+						<p className="mt-0.5 text-xs leading-5 text-muted-foreground">{summary.description}</p>
+					</div>
 				</div>
-				<div className="flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
-					<span>交互类型：{probe.capabilities.interactionKinds.length > 0 ? probe.capabilities.interactionKinds.join(" / ") : "—"}</span>
-					<span>·</span>
-					<span>进度：{probe.capabilities.progress}</span>
-				</div>
+				<Badge variant={probe.enabled ? "secondary" : "outline"} className="shrink-0">
+					{probe.enabled ? "Worker 已启用" : "Worker 已停用"}
+				</Badge>
 			</div>
-			{probe.issues.length > 0 ? (
-				<div className="flex flex-col gap-1">
-					<span className="text-xs text-muted-foreground">问题</span>
-					{probe.issues.map((issue, i) => (
-						<div key={`${issue.code}-${i}`} className="text-xs">
-							<span className="text-destructive">{issue.message}</span>
-							<code className="ml-1 font-mono text-muted-foreground/70">({issue.code})</code>
-							{issue.fixAction ? <span className="ml-1 text-muted-foreground">→ {issue.fixAction}</span> : null}
+			<div className="border-t border-border/60 px-4 py-3.5">
+				<p className="mb-2 text-[11px] font-medium text-muted-foreground">可用能力</p>
+				<div className="grid gap-x-5 gap-y-2 sm:grid-cols-2">
+					{capabilityLabels.map((label) => (
+						<div key={label} className="flex items-center gap-2 text-xs text-foreground/85">
+							<CheckIcon className="size-3.5 shrink-0 text-primary" />
+							<span>{label}</span>
 						</div>
 					))}
+					{capabilityLabels.length === 0 ? <p className="text-xs text-muted-foreground">未声明可用能力</p> : null}
+				</div>
+			</div>
+			<dl className="grid grid-cols-2 gap-x-5 gap-y-3 border-t border-border/60 px-4 py-3.5 sm:grid-cols-5">
+				{detailItems.map((item) => (
+					<div key={item.label} className="min-w-0">
+						<dt className="text-[10px] text-muted-foreground">{item.label}</dt>
+						<dd className="mt-0.5 truncate text-xs font-medium" title={item.value}>{item.value}</dd>
+					</div>
+				))}
+			</dl>
+			{probe.issues.length > 0 ? (
+				<div className="border-t border-border/60 px-4 py-3.5">
+					<p className="mb-1.5 text-[11px] font-medium text-destructive">需要处理</p>
+					<div className="flex flex-col gap-1.5">
+						{probe.issues.map((issue, i) => (
+							<div key={`${issue.code}-${i}`} className="text-xs leading-5">
+								<span className="text-destructive">{issue.message}</span>
+								{issue.fixAction ? <span className="ml-1 text-muted-foreground">建议：{issue.fixAction}</span> : null}
+								<code className="ml-1 font-mono text-[10px] text-muted-foreground/60">{issue.code}</code>
+							</div>
+						))}
+					</div>
 				</div>
 			) : null}
 		</div>
@@ -197,6 +282,7 @@ export function ConnectorSection({
 }) {
 	const [catalog, setCatalog] = useState<CatalogEntry[] | null>(null);
 	const [extensionId, setExtensionId] = useState(agent.connector?.extensionId ?? "");
+	const [transport, setTransport] = useState<AgentConnectorBinding["transport"] | "">(agent.connector?.transport ?? "");
 	const [config, setConfig] = useState<Record<string, unknown>>(agent.connector?.config ?? {});
 	const [secrets, setSecrets] = useState<Record<string, string>>({});
 	const [versionPin, setVersionPin] = useState(agent.connector?.versionPin ?? "");
@@ -209,6 +295,7 @@ export function ConnectorSection({
 	if (prevAgent !== agent) {
 		setPrevAgent(agent);
 		setExtensionId(agent.connector?.extensionId ?? "");
+		setTransport(agent.connector?.transport ?? "");
 		setConfig(agent.connector?.config ?? {});
 		setSecrets({});
 		setVersionPin(agent.connector?.versionPin ?? "");
@@ -233,6 +320,7 @@ export function ConnectorSection({
 
 	const selected = catalog?.find((e) => e.manifest.id === extensionId);
 	const contribution = selected?.manifest.kind === "connector" ? selected.manifest.connector : undefined;
+	const selectedTransport = transport || contribution?.defaultTransport || "";
 	const securityWarnings = (() => {
 		if (contribution?.id === "claude-code") {
 			const mode = typeof config.permissionMode === "string" ? config.permissionMode : "bypassPermissions";
@@ -251,6 +339,8 @@ export function ConnectorSection({
 
 	const handleSelect = (id: string) => {
 		setExtensionId(id);
+		const next = catalog?.find((entry) => entry.manifest.id === id);
+		setTransport(next?.manifest.kind === "connector" ? next.manifest.connector.defaultTransport : "");
 		// 更换 Connector 时配置不继承（schema 不同）。
 		if (id !== agent.connector?.extensionId) setConfig({});
 		setSecrets({});
@@ -263,6 +353,7 @@ export function ConnectorSection({
 			const res = await putAgentConnector(agent.name, {
 				extensionId,
 				connectorId: contribution.id,
+				transport: selectedTransport as AgentConnectorBinding["transport"],
 				config,
 				...(Object.keys(secrets).length > 0 ? { secrets } : {}),
 				...(versionPin.trim() ? { versionPin: versionPin.trim() } : {}),
@@ -307,11 +398,13 @@ export function ConnectorSection({
 				<div className="agent-config-card-head"><h2>Connector</h2><p>选择已安装的 Connector Extension；安装与更新在「扩展」页完成。</p></div>
 			{/* 当前绑定 */}
 			{agent.connector ? (
-				<div className="flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
-					<span>当前绑定：</span>
-					<code className="font-mono">{agent.connector.extensionId}</code>
-					<span>→</span>
-					<code className="font-mono">{agent.connector.connectorId}</code>
+				<div className="flex flex-wrap items-center gap-2 text-xs">
+					<span className="flex items-center gap-1.5 font-medium text-foreground/85">
+						<CheckCircle2Icon className="size-3.5 text-primary" />
+						当前已绑定
+					</span>
+					<code className="font-mono text-muted-foreground">{agent.connector.extensionId} / {agent.connector.connectorId}</code>
+					<Badge variant="secondary">{connectorTransportLabel(agent.connector.transport)}</Badge>
 					{agent.connector.versionPin ? <Badge variant="outline">固定 v{agent.connector.versionPin}</Badge> : null}
 				</div>
 			) : (
@@ -344,29 +437,45 @@ export function ConnectorSection({
 
 			{/* 安装前/保存前展示：来源、权限、版本范围、将注册的能力（§10.1） */}
 			{selected ? (
-				<div className="agent-config-inset flex flex-col gap-1.5 text-xs text-muted-foreground">
-					<div className="flex flex-wrap items-center gap-1.5">
-						<Badge variant="outline">来源：{selected.manifest.source}</Badge>
-						<Badge variant="outline">{ORIGIN_LABELS[selected.origin]}</Badge>
-						<Badge variant="outline">发布者：{selected.manifest.publisher}</Badge>
-						<Badge variant="outline">引擎：{selected.manifest.engines.puddingteams}</Badge>
+				<div className="agent-config-inset overflow-hidden p-0 text-xs">
+					<dl className="grid grid-cols-2 gap-x-5 gap-y-3 px-4 py-3.5 sm:grid-cols-4">
+						<div className="min-w-0">
+							<dt className="text-[10px] text-muted-foreground">安装来源</dt>
+							<dd className="mt-0.5 font-medium">{ORIGIN_LABELS[selected.origin]}</dd>
+						</div>
+						<div className="min-w-0">
+							<dt className="text-[10px] text-muted-foreground">发布者</dt>
+							<dd className="mt-0.5 truncate font-medium" title={selected.manifest.publisher}>{selected.manifest.publisher}</dd>
+						</div>
+						<div className="min-w-0">
+							<dt className="text-[10px] text-muted-foreground">适用 PuddingTeams</dt>
+							<dd className="mt-0.5 font-medium">{selected.manifest.engines.puddingteams}</dd>
+						</div>
+						<div className="min-w-0">
+							<dt className="text-[10px] text-muted-foreground">支持的上游版本</dt>
+							<dd className="mt-0.5 font-medium">{contribution?.supportedUpstreamVersions ?? "未限制"}</dd>
+						</div>
+					</dl>
+					<div className="grid gap-3 border-t border-border/60 px-4 py-3.5 sm:grid-cols-2">
+						<div>
+							<p className="mb-2 text-[10px] text-muted-foreground">支持的接入方式</p>
+							<div className="flex flex-wrap gap-1.5">
+								{contribution?.supportedTransports.map((item) => (
+									<Badge key={item} variant={item === contribution.defaultTransport ? "secondary" : "outline"}>
+										{connectorTransportLabel(item)}{item === contribution.defaultTransport ? " · 默认" : ""}
+									</Badge>
+								))}
+							</div>
+						</div>
+						<div>
+							<p className="mb-2 text-[10px] text-muted-foreground">扩展需要的权限</p>
+							<div className="flex flex-wrap gap-1.5">
+								{selected.manifest.permissions?.length ? selected.manifest.permissions.map((permission) => (
+									<Badge key={permission} variant="outline">{PERMISSION_LABELS[permission]}</Badge>
+								)) : <span className="text-muted-foreground">无需额外权限</span>}
+							</div>
+						</div>
 					</div>
-					{selected.manifest.permissions && selected.manifest.permissions.length > 0 ? (
-						<div className="flex flex-wrap items-center gap-1.5">
-							<span>权限：</span>
-							{selected.manifest.permissions.map((p) => (
-								<Badge key={p} variant="secondary">
-									{p}
-								</Badge>
-							))}
-						</div>
-					) : null}
-					{contribution ? (
-						<div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-							<span>transport：{contribution.supportedTransports.join(" / ")}（默认 {contribution.defaultTransport}）</span>
-							{contribution.supportedUpstreamVersions ? <span>· 上游版本：{contribution.supportedUpstreamVersions}</span> : null}
-						</div>
-					) : null}
 				</div>
 			) : null}
 
@@ -375,7 +484,19 @@ export function ConnectorSection({
 			{contribution ? (
 				<section className="agent-config-card flex flex-col gap-3">
 					<div className="agent-config-card-head"><h2>接入配置</h2><p>按 Connector 声明的 schema 填写；密钥加密存储，只存引用。</p></div>
-					<ConfigSchemaForm schema={contribution.configSchema} value={config} onChange={setConfig} agentName={agent.name} />
+					<label className="flex flex-col gap-1 text-sm">
+						<span className="text-muted-foreground">传输方式</span>
+						<Select value={selectedTransport} onValueChange={(value) => setTransport(value as AgentConnectorBinding["transport"])}>
+							<SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+							<SelectContent>
+								{contribution.supportedTransports.map((item) => (
+									<SelectItem key={item} value={item}>{connectorTransportLabel(item)}</SelectItem>
+								))}
+							</SelectContent>
+						</Select>
+						<span className="text-xs text-muted-foreground/70">此 Worker 实例固定使用所选 transport；切换会影响后续委托。</span>
+					</label>
+					<ConfigSchemaForm schema={contribution.configSchema} value={config} onChange={setConfig} agentName={agent.name} transport={selectedTransport} />
 			{securityWarnings.map((warning) => (
 				<div key={warning} role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 p-2.5 text-xs text-destructive">
 					{warning}
@@ -973,33 +1094,44 @@ export function StatusSection({
 		<div className="flex flex-col gap-3">
 			<section className="agent-config-card">
 				<div className="agent-config-card-head"><h2>启用状态</h2><p>停用后 Manager 不再派活给它，已绑定的 Capability 工具也一并不可用；配置与绑定保留，再启用时恢复。</p></div>
-				<label className="flex items-start gap-2 text-sm">
-					<input
-						type="checkbox"
-						checked={agent.enabled !== false}
+				<div className="agent-config-inset flex flex-wrap items-center justify-between gap-3">
+					<div className="flex min-w-0 items-start gap-2.5">
+						<span className={`mt-1.5 size-2 shrink-0 rounded-full ${agent.enabled !== false ? "bg-primary" : "bg-muted-foreground/40"}`} />
+						<div>
+							<p className="text-sm font-medium">{agent.enabled !== false ? "Worker 当前已启用" : "Worker 当前已停用"}</p>
+							<p className="mt-0.5 text-xs leading-5 text-muted-foreground">
+								{agent.enabled !== false ? "Manager 可以向它派发新任务。" : "Manager 不会向它派发新任务，配置与绑定仍会保留。"}
+							</p>
+						</div>
+					</div>
+					<Button
+						type="button"
+						size="sm"
+						variant={agent.enabled !== false ? "outline" : "default"}
 						disabled={toggling}
-						onChange={(e) => void onToggleEnabled(e.target.checked)}
-						className="mt-0.5 size-4 accent-foreground"
-					/>
-					<span>
-						启用当前 Agent
-						<small className="mt-0.5 block text-xs text-muted-foreground">有进行中的 Run 时会先弹出确认，不会静默中断。</small>
-					</span>
-				</label>
+						onClick={() => void onToggleEnabled(agent.enabled === false)}
+					>
+						{toggling ? <LoaderIcon className="size-3.5 animate-spin" /> : agent.enabled !== false ? <PauseCircleIcon className="size-3.5" /> : <PlayIcon className="size-3.5" />}
+						{toggling ? (agent.enabled !== false ? "停用中…" : "启用中…") : agent.enabled !== false ? "停用 Worker" : "启用 Worker"}
+					</Button>
+				</div>
+				<p className="mt-2 text-[10px] text-muted-foreground/70">如有进行中的 Run，系统会阻止停用，避免任务被静默中断。</p>
 			</section>
 			<section className="agent-config-card">
-				<div className="agent-config-card-head"><h2>接入探测</h2><p>检查本机 CLI 是否安装、登录态与版本兼容性。</p></div>
+				<div className="agent-config-card-head"><h2>接入探测</h2><p>检查当前接入端是否可用，并验证协议版本与能力声明。</p></div>
 				<div>
 					<Button type="button" size="sm" variant="outline" disabled={probing} onClick={() => void handleProbe()}>
 						{probing ? <LoaderIcon className="size-3.5 animate-spin" /> : <RefreshCwIcon className="size-3.5" />}
 						探测
 					</Button>
 				</div>
-				{probe ? (
-					isConnectorProbe(probe) ? <ConnectorProbeView probe={probe} /> : <LegacyProbeView probe={probe} />
-				) : (
-					<p className="text-xs text-muted-foreground/70">尚未探测。列表页的状态灯来自最近一次探测。</p>
-				)}
+				<div className="agent-config-probe-result">
+					{probe ? (
+						isConnectorProbe(probe) ? <ConnectorProbeView probe={probe} /> : <LegacyProbeView probe={probe} />
+					) : (
+						<p className="text-xs text-muted-foreground/70">尚未探测。列表页的状态灯来自最近一次探测。</p>
+					)}
+				</div>
 			</section>
 			<section className="agent-config-card">
 				<div className="agent-config-card-head"><h2>最近写操作影响</h2><p>在本页保存配置、绑定或启停后，这里列出有多少会话受影响。</p></div>

@@ -1,0 +1,203 @@
+---
+title: Connector 开发参考
+description: 从脚手架、manifest、声明式映射到 Driver SPI、HITL 和测试的完整路径。
+---
+
+<Status tone="preview">PREVIEW</Status>
+
+开发 Connector 的第一步不是写适配代码，而是确认上游 Agent 的真实协议能力：它能否无头运行、能否返回稳定 Session handle、怎样流式输出、怎样等待输入、怎样取消，以及什么才是最终回答。
+
+## 先选择实现级别
+
+| 条件 | 声明式 Connector | 代码型 Connector |
+| --- | --- | --- |
+| 一次操作对应一个 CLI 进程 | 必须 | 不限 |
+| Transport | 仅 spawn | spawn/sdk；HTTP 等可自行实现 |
+| 输出 | single JSON 或 JSONL | 任意协议，由 Driver 归一化 |
+| Continue | 可选 | 可选 |
+| HITL `respond` | 不支持 | 可实现 |
+| 自定义动态配置 | 不支持 | `listConfigOptions` |
+| 包内可执行代码 | 无 Driver entry | 有，当前运行在 Server 进程 |
+
+如果 CLI 只需要 argv + JSONL 映射，优先声明式；只有协议、HITL、探测或归一化确实超出 schema 时再使用代码型。
+
+## 生成与校验
+
+安装了发行 CLI 时：
+
+```bash
+puddingteams extension init --type connector --id my-agent ./connector-my-agent
+puddingteams extension init --type connector --declarative --id my-agent ./connector-my-agent
+puddingteams extension validate ./connector-my-agent
+```
+
+在源码仓库内、尚未安装 CLI 时可以使用同一入口：
+
+```bash
+node apps/server/bin/puddingteams.mjs extension init --type connector --id my-agent ./extensions/connectors/my-agent
+node apps/server/bin/puddingteams.mjs extension validate ./extensions/connectors/my-agent
+```
+
+`init` 只写入不存在或空目录。ID 只允许小写字母、数字和连字符。`validate` 与安装共用 manifest 解析器，并检查 entry、模块导出和 `{packageDir}` 引用，全部通过才返回退出码 0。
+
+## 代码型目录
+
+```text
+connector-my-agent/
+├─ package.json
+├─ driver/index.ts       # createDriver / AgentDriver
+├─ core/normalize.ts     # 私有事件 → PWCP，不能依赖宿主
+├─ pi/index.ts           # 可选双宿主门面
+└─ assets/avatar.svg
+```
+
+依赖方向必须保持：`driver` 与 `pi` 都可以依赖 `core`，但二者不能互相 import；`driver` 只依赖 `@puddingteams/pwcp`，不 import Server 内部模块或 pi SDK。
+
+若提供 pi 门面，`@earendil-works/pi-coding-agent` 应为兼容范围明确的 peer dependency，使用宿主注入的 `ExtensionAPI`，不要打包第二份 pi runtime。monorepo 开发时 `@puddingteams/pwcp` 可以是 `workspace:*`，对外发布前必须改成真实 semver。
+
+## Driver SPI
+
+```ts
+interface AgentDriver {
+  id: string
+  capabilities(): Promise<DriverCapabilities>
+  run(input: RunInput, ctx: InvocationContext): AsyncIterable<AgentEvent>
+  continue(input: ContinueInput, ctx: InvocationContext): AsyncIterable<AgentEvent>
+  respond(input: RespondInput, ctx: InvocationContext): AsyncIterable<AgentEvent>
+  cancel?(input: { runHandle: string }, ctx: InvocationContext): Promise<void>
+  probe(ctx: InvocationContext): Promise<ProbeResult>
+  listConfigOptions?(field: string, ctx: InvocationContext): Promise<DriverConfigOption[]>
+}
+```
+
+即使 Connector 不支持 continue/respond，也要提供防御性实现并在 capabilities 中诚实排除。Runtime 按能力声明路由；虚标会把配置问题拖到执行期。
+
+### InvocationContext
+
+Driver 从平台接收：
+
+- `cwd` 和可选 `workspaceId`，不要自己猜项目目录；
+- 已注入 Secret 的 `env`；
+- `signal` 与 startup/active timeout；
+- `delegationId`、`operationId`/`idempotencyKey`；
+- `onUpdate`，用于文本 progress 和结构化 WorkerActivity；
+- 仅 `respond` 时存在的私有 provider state。
+
+不要把 `providerState`、Secret 或绝对宿主路径写进公开结果。
+
+### 事件终止契约
+
+每次 `run`、`continue`、`respond` 必须：
+
+1. 可选发送一个 `started`；
+2. 发送零到多个 `progress`；
+3. 恰好发送一个 `completed`、`failed` 或 `input_required`；
+4. 终态后停止 yield。
+
+`sessionHandle` 用于下一条 Run，`runHandle` 用于当前等待中的 Run；它们是 Driver 私有的不透明值，平台只保存和回传。
+
+### 错误与取消
+
+FailedResult 必须给稳定 `errorCode`、面向用户的脱敏消息和 `recoverable`。参数/用法错误通常不可重试，临时上游错误可恢复。超时和 AbortSignal 必须终止底层工作；spawn 共享执行器会先 TERM、后 KILL，网络 Driver 则应把 signal 传给 fetch/stream。
+
+## WorkerActivity
+
+把过程事件投影成中立形状：
+
+```ts
+{
+  source: "my-agent",
+  sourceEvent: "tool.call.started",
+  kind: "tool",
+  status: "started",
+  title: "运行测试",
+  content: "pnpm test",
+  itemId: "upstream-123"
+}
+```
+
+UI 只依赖 `kind/status/title/content`；`sourceEvent` 用于诊断。不要把 final answer 当普通 progress 重复外送。最终结论只放在 `completed.result.content`，Artifact 放 `result.artifacts`。
+
+## 声明式 Connector
+
+声明式包没有顶层 `entry`，而是在 `connector.declarative` 描述命令、操作和输出映射：
+
+```jsonc
+{
+  "command": "node",
+  "probe": {
+    "args": ["{packageDir}/cli.mjs", "--version"],
+    "versionRegex": "(\\d+\\.\\d+\\.\\d+)"
+  },
+  "operations": {
+    "run": { "args": ["{packageDir}/cli.mjs", "run", "{message}"] },
+    "continue": {
+      "args": ["{packageDir}/cli.mjs", "resume", "{sessionHandle}", "{message}"]
+    }
+  },
+  "output": {
+    "mode": "jsonl",
+    "mapping": {
+      "sessionHandle": "$.session_id@session.started",
+      "runHandle": "$.run_id@session.started",
+      "progress": "$.text@progress",
+      "content": "$.text@message.completed",
+      "usage.inputTokens": "$.usage.input_tokens@done",
+      "usage.outputTokens": "$.usage.output_tokens@done"
+    }
+  },
+  "capabilities": {
+    "operations": ["run", "continue", "cancel"],
+    "interactionKinds": []
+  }
+}
+```
+
+argv 占位符只有 `{message}`、`{sessionHandle}`、`{requestId}`、`{packageDir}`。stdin 支持 `none` 或单个 JSON 后 EOF。输出模式支持 `jsonl` 和 `single-json`。
+
+mapping 目标键只允许：
+
+- `sessionHandle`、`runHandle`；
+- `content`、`progress`、`error`；
+- `usage.inputTokens`、`usage.outputTokens`。
+
+路径语法为 `$.dot.path@event.type[filter=value]`；single-json 模式不能使用事件选择器。声明式 capabilities 必须含 run，不得含 respond，interactionKinds 必须为空。
+
+## HTTP Connector 的当前做法
+
+平台通用 HTTP Transport 尚未实现。如果现在必须接 HTTP Agent，只能使用代码型 Driver，并自行完成：
+
+- request/stream framing 与错误归一；
+- operation ID 到上游幂等键的传递；
+- AbortSignal、连接/活动超时与重试边界；
+- Session/run handle 和 `respond` 语义；
+- Secret 注入、日志脱敏和证书校验。
+
+capabilities 可以诚实声明 `transport: "http"`，但不要假设平台会代替 Driver 发送请求。
+
+## 本地安装与验证
+
+1. 运行 `extension validate`。
+2. 在 PuddingTeams Extension 页开启开发者模式并确认代码执行风险。
+3. 从 Server 本地路径安装，检查权限与宿主版本。
+4. 创建 Agent binding，保存非敏感 config 和 secret refs。
+5. 运行 Probe，区分 detected/configured/authenticated/compatible。
+6. 验证 run、continue、cancel；支持 HITL 时再验证 input_required → respond 同 Run 恢复。
+7. 验证超时、上游非零退出、无效 JSONL、超长行、取消和重复 request ID。
+8. 验证最终正文、Timeline 与 Artifact 不重复、不泄密。
+
+双宿主包还要用 `pi -e <dir>` 单独验证 pi 门面。纯 pi 成功不代表 PuddingTeams Driver 成功，反之亦然。
+
+## 发布前清单
+
+- manifest ID、version、engines 与 contribution 一致；
+- permissions 只声明真实需要的能力；
+- `workspace:*` 已替换为可发布 semver；
+- 包 files 包含 driver/core/pi/assets 和所有 `{packageDir}` 文件；
+- avatar 为包内相对路径，不含绝对路径或 `..`；
+- Probe 不修改用户环境；
+- Secret、provider state、命令敏感参数和绝对路径已脱敏；
+- capabilities 与真实操作完全一致；
+- 文档明确上游 CLI、账号、登录和数据保留依赖。
+
+当前社区安装、签名和官方发布渠道尚未产品化；发布包仍需自行分发和审查。

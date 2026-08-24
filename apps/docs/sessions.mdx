@@ -1,0 +1,82 @@
+---
+title: Session 与连续性
+description: Window、Manager Session、Worker Session 和 Delegation handle 怎样共同维持上下文。
+---
+
+<Status tone="preview">PREVIEW</Status>
+
+Session 的第一职责不是“保存聊天记录”，而是让下一次动作知道应该继续什么。PuddingTeams 为此把用户可见会话、Worker 私有会话和单次委托分开建模。
+
+## 三个时间尺度
+
+| 对象 | 生命周期 | 保存什么 |
+| --- | --- | --- |
+| Window | 长期 | 成员、Workspace、多个 Session、最新 Worker binding |
+| Session | 一段连贯对话 | 消息、可选 Goal、相关委托引用 |
+| Delegation | 一次 Worker Run | 输入、状态、handle、归一化结果与执行时间线 |
+
+Worker Session 不等于 Delegation。第一次 `run` 可以返回 `sessionHandle`；下一次 `continue` 在同一个 Worker Session 中创建新的 Delegation。这样每次执行都可审计，又不会丢失上游 Agent 的多轮上下文。
+
+## 谁拥有哪份会话
+
+- Manager 和本地 pi Worker 的完整消息历史由 pi Session JSONL 保存。
+- spawn/HTTP 等外部 Worker 的 Session 正文归上游 Agent；PuddingTeams 只保存不透明 `sessionHandle`。
+- Window 的 `workerBindings` 只保存“下次续接用哪个 handle”的最新指针，不复制 Worker 历史。
+- 每次 Delegation 仍保留它当时的 handle 和结果，因此新指针不会改写旧记录。
+
+默认路径：
+
+```text
+<PUDDINGTEAMS_HOME>/sessions/          # Manager Session JSONL
+<PUDDINGTEAMS_HOME>/sessions/workers/  # 本地 pi Worker Session JSONL
+<PUDDINGTEAMS_HOME>/state/windows.json
+<PUDDINGTEAMS_HOME>/state/delegations.json
+```
+
+## 什么时候可以 Continue
+
+续接不是“只要有 handle 就继续”。PuddingTeams 同时核对：
+
+- Window 与 Worker 身份；
+- 显式 `workspaceId`；
+- 委托时冻结的 `cwdSnapshot`；
+- Agent 配置修订；
+- Driver 是否声明 `continue`；
+- 目标 Session 当前是否空闲。
+
+其中任一运行边界变化，旧 handle 都可能指向错误的项目、权限或工具集合。平台会拒绝不安全的直接续接，并按 Driver 能力与当前动作决定新建或报出明确错误。
+
+同一 Worker Session 同时最多一条活动或等待输入的 Run。`waiting_input` 仍占用原 Run；用户回答后必须走 `respond` 恢复它，不能再发一个 `run` 冒充继续。
+
+## 消息记录与权威状态
+
+pi JSONL 中除了 user/assistant/toolResult，还可能出现 PuddingTeams custom message，用于展示派活镜像、结果、Goal 恢复提示等。这些消息让重开 Session 后 UI 能恢复时间线，但不是所有领域状态的权威来源。
+
+| 内容 | 权威来源 |
+| --- | --- |
+| 对话顺序与模型可见 tool result | Session JSONL |
+| Delegation 状态和完整归一化结果 | `state/delegations.json` |
+| spawn Worker 的逐事件过程 | `state/delegation-timelines/*.jsonl` |
+| Goal、WorkPlan、Decision | `state/work-states.json` |
+| Artifact 元数据和冻结快照 | `state/artifacts.json` 与 `artifacts/blobs/` |
+
+显示用 custom message 不能反向覆盖这些事实源。比如 `pudding:work_plan_update` 只是隐藏的恢复投影，不能据此重建 WorkPlan。
+
+## 中断和重启
+
+普通 Session 历史可以直接从 JSONL 回放。正在执行的 OS 进程或模型请求则不会因为 Server 重启而继续存活，平台不会伪造“原 Run 仍在运行”。
+
+对于活动 Goal，恢复语义是：保留同一 Session 和 Goal，从最后一个可确认的原子安全点开启新的 execution epoch；已验收工作和冻结 Artifact 可以复用，外部副作用不明的步骤先要求对账。详见[Session Goal](/docs/goals/)。
+
+## 删除边界
+
+- 删除一个 Session：清理其 Goal/工作状态和关联运行控制面；Window 保留。
+- Window 至少保留一个 Session，删除最后一个会被拒绝或以新空 Session 替代。
+- 删除非 solo Window：取消其活动/等待 Delegation，令 Interaction 失效，再清理 Session 和 binding。
+- solo 是固定单例，不允许删除。
+
+删除聊天记录不等于删除外部 Agent 自己保存的历史。Connector 若在上游创建了 Session，应在自己的产品或 Driver 里说明数据保留策略。
+
+## 设计结论
+
+PuddingTeams 不把“模型上下文”误当成“平台记忆”。模型上下文可以截断、压缩或由上游托管；平台仍以稳定 ID、状态文件和 Artifact 保存协作事实。这是不同 Agent 能够接力、恢复和验收的前提。

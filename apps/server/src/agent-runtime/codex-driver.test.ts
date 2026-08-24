@@ -89,7 +89,7 @@ test("P2: 从包目录安装（折叠 manifest + entry 模块）后 DriverRegist
 	const entry = await registry.install(CODEX_PACKAGE_DIR);
 	assert.equal(entry.manifest.id, "codex");
 	assert.equal(entry.loaded, true, entry.loadError ?? "");
-	const driver = drivers.create("codex", { sandbox: "workspace-write" });
+	const driver = drivers.create("codex", "spawn", { sandbox: "workspace-write" });
 	assert.ok(driver instanceof CodexDriver);
 	assert.equal(driver!.id, "codex");
 });
@@ -101,7 +101,7 @@ test("P2: installOrUpdateFromDir——未安装则安装，重复调用走更新
 	assert.equal(first.installed, true);
 	const second = await registry.installOrUpdateFromDir(CODEX_PACKAGE_DIR);
 	assert.equal(second.loaded, true, second.loadError ?? "");
-	assert.equal(drivers.create("codex", {})?.id, "codex");
+	assert.equal(drivers.create("codex", "spawn", {})?.id, "codex");
 });
 
 test("P1: codex respond 防御性失败——headless 不支持跨进程审批", async () => {

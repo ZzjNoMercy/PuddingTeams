@@ -512,6 +512,7 @@ export function putAgentConnector(
 	input: {
 		extensionId: string;
 		connectorId: string;
+		transport: AgentConnectorBinding["transport"];
 		config?: Record<string, unknown>;
 		secrets?: Record<string, string>;
 		versionPin?: string;

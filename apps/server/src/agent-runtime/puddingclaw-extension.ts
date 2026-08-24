@@ -14,21 +14,34 @@ export const puddingClawConnectorManifest: ConnectorExtensionManifest = {
 	id: PUDDINGCLAW_EXTENSION_ID,
 	publisher: "puddingteams",
 	displayName: "PuddingClaw Connector",
-	version: "1.0.0",
+	version: "1.1.0",
 	source: "builtin",
 	kind: "connector",
 	engines: { puddingteams: ">=0.1 <1" },
-	permissions: ["spawn"],
+	permissions: ["spawn", "network"],
 	connector: {
 		id: PUDDINGCLAW_CONNECTOR_ID,
 		displayName: "PuddingClaw",
 		apiVersion: "1",
 		defaultTransport: "spawn",
-		supportedTransports: ["spawn"],
+		supportedTransports: ["spawn", "http"],
 		configSchema: {
 			type: "object",
 			properties: {
-				command: { type: "string", description: "PuddingClaw 可执行文件名或路径", default: "puddingclaw" },
+				command: {
+					type: "string",
+					title: "CLI 命令",
+					description: "spawn 模式使用的 PuddingClaw 可执行文件名或路径",
+					default: "puddingclaw",
+					"x-puddingteams-transports": ["spawn"],
+				},
+				endpoint: {
+					type: "string",
+					title: "HTTP Endpoint",
+					description: "HTTP 模式直连的 PuddingClaw Backend 地址（无需填写 /api/headless）",
+					default: "http://127.0.0.1:8888",
+					"x-puddingteams-transports": ["http"],
+				},
 			},
 		},
 		supportedUpstreamVersions: ">=0.1.2",
@@ -40,9 +53,15 @@ export const puddingClawConnectorManifest: ConnectorExtensionManifest = {
 /** Driver 工厂：用户只配 executable；命令映射是 Driver 代码的一部分（§10）。 */
 export function puddingClawExtensionHooks(): BuiltinExtensionHooks {
 	return {
-		driverFactory: (config) =>
-			new PuddingClawDriver({
+		driverFactory: (config, transport) => {
+			if (transport !== "spawn" && transport !== "http") {
+				throw new Error(`PuddingClaw Connector 不支持 transport:${transport}`);
+			}
+			return new PuddingClawDriver({
+				transport,
 				command: typeof config.command === "string" && config.command.trim() ? config.command : undefined,
-			}),
+				endpoint: typeof config.endpoint === "string" && config.endpoint.trim() ? config.endpoint : undefined,
+			});
+		},
 	};
 }

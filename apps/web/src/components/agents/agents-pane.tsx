@@ -21,7 +21,7 @@ import {
 	setAgentEnabled,
 } from "@/lib/api";
 import { agentRemoved, agentRenamed } from "@/lib/avatars";
-import type { AgentConfig, AgentProbeResult, CatalogEntry, ConflictRun } from "@/lib/types";
+import type { AgentConfig, AgentConnectorBinding, AgentProbeResult, CatalogEntry, ConflictRun } from "@/lib/types";
 import { agentDisplayName, isConnectorProbe } from "@/lib/types";
 import { ManagerAvatar, WorkerAvatar } from "@/components/chat/worker-avatar";
 import { ConfigSchemaForm, SecretSchemaFields } from "@/components/agents/form-parts";
@@ -48,6 +48,13 @@ function parseArgs(text: string): string[] {
 		.split(/[\n,]/)
 		.map((s) => s.trim())
 		.filter(Boolean);
+}
+
+function transportLabel(transport: string): string {
+	if (transport === "spawn") return "CLI spawn";
+	if (transport === "http") return "HTTP 流式";
+	if (transport === "sdk") return "进程内 SDK";
+	return transport.toUpperCase();
 }
 
 /** 探测健康判断：Connector probe 看 detected + 兼容性 + 认证，legacy 看 ok。 */
@@ -94,6 +101,7 @@ function CreateAgentDialog({
 	const [description, setDescription] = useState("");
 	const [catalog, setCatalog] = useState<CatalogEntry[] | null>(null);
 	const [extensionId, setExtensionId] = useState("");
+	const [transport, setTransport] = useState<AgentConnectorBinding["transport"] | "">("");
 	const [config, setConfig] = useState<Record<string, unknown>>({});
 	const [secrets, setSecrets] = useState<Record<string, string>>({});
 	const [command, setCommand] = useState("");
@@ -125,12 +133,14 @@ function CreateAgentDialog({
 	const installed = (catalog ?? []).filter((e) => e.installed && e.loaded);
 	const selected = installed.find((e) => e.manifest.id === extensionId);
 	const contribution = selected?.manifest.kind === "connector" ? selected.manifest.connector : undefined;
+	const selectedTransport = transport || contribution?.defaultTransport || "";
 
 	const reset = () => {
 		setName("");
 		setIdentifier("");
 		setDescription("");
 		setExtensionId("");
+		setTransport("");
 		setConfig({});
 		setSecrets({});
 		setCommand("");
@@ -147,6 +157,7 @@ function CreateAgentDialog({
 			return setError("标识只能包含字母、数字、连字符或下划线，且以字母或数字开头");
 		}
 		if (mode === "connector" && !contribution) return setError("请选择 Connector");
+		if (mode === "connector" && !selectedTransport) return setError("请选择传输方式");
 		if (mode === "command" && !command.trim()) return setError("命令必填");
 		setSaving(true);
 		try {
@@ -160,6 +171,7 @@ function CreateAgentDialog({
 							connector: {
 								extensionId,
 								connectorId: contribution!.id,
+								transport: selectedTransport as AgentConnectorBinding["transport"],
 								config,
 							},
 							enabled,
@@ -183,6 +195,7 @@ function CreateAgentDialog({
 				await putAgentConnector(created.name, {
 					extensionId,
 					connectorId: contribution!.id,
+					transport: selectedTransport as AgentConnectorBinding["transport"],
 					config,
 					secrets,
 				});
@@ -252,6 +265,8 @@ function CreateAgentDialog({
 									value={extensionId}
 									onValueChange={(v) => {
 										setExtensionId(v);
+										const next = installed.find((entry) => entry.manifest.id === v);
+										setTransport(next?.manifest.kind === "connector" ? next.manifest.connector.defaultTransport : "");
 										setConfig({});
 										setSecrets({});
 									}}
@@ -276,7 +291,22 @@ function CreateAgentDialog({
 							{contribution ? (
 								<section className="worker-create-section">
 									<span className="worker-create-label">接入配置</span>
-									<ConfigSchemaForm schema={contribution.configSchema} value={config} onChange={setConfig} />
+									<label className="worker-create-field">
+										<span className="worker-create-label">传输方式<span className="worker-create-required">*</span></span>
+										<Select
+											value={selectedTransport}
+											onValueChange={(value) => setTransport(value as AgentConnectorBinding["transport"])}
+										>
+											<SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+											<SelectContent>
+												{contribution.supportedTransports.map((item) => (
+													<SelectItem key={item} value={item}>{transportLabel(item)}</SelectItem>
+												))}
+											</SelectContent>
+										</Select>
+										<span className="worker-create-hint">Connector 声明支持的运行边界；保存后该 Worker 固定使用此方式。</span>
+									</label>
+									<ConfigSchemaForm schema={contribution.configSchema} value={config} onChange={setConfig} transport={selectedTransport} />
 									<SecretSchemaFields
 										schema={contribution.secretSchema}
 										configuredKeys={[]}
@@ -445,6 +475,7 @@ export function AgentsPane() {
 					</div>
 					<div className="mt-auto flex items-center gap-2 pt-4 text-[11px] text-muted-foreground">
 						<span className="rounded-full bg-foreground/[0.035] px-2 py-0.5">{agent.enabled !== false ? "已启用" : "已停用"}</span>
+						{agent.connector?.transport ? <span className="rounded-full bg-foreground/[0.035] px-2 py-0.5">{transportLabel(agent.connector.transport)}</span> : null}
 						{probes[agent.name] ? <span>{probeSummary(probes[agent.name])}</span> : null}
 					</div>
 				</button>

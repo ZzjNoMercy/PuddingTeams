@@ -208,7 +208,10 @@ function failedEvent(errorCode: string, error: string): AgentEvent {
 
 export const PUDDINGCLAW_CAPABILITIES: DriverCapabilities = {
 	operations: ["run", "continue", "respond", "cancel"],
-	interactionKinds: ["permission", "confirmation"],
+	// PuddingClaw Headless resume currently rejects every external interrupt
+	// except permission_request. Keep the advertised contract narrower than the
+	// generic normalizer's defensive understanding of other needs_input shapes.
+	interactionKinds: ["permission"],
 	// All public Headless JSONL events are projected into the Runtime timeline;
 	// terminal content remains the separately normalized final response.
 	progress: "stream",

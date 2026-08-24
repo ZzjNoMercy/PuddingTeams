@@ -1,0 +1,118 @@
+---
+title: Extension 机制
+description: Connector、Capability、Registry、双宿主包和当前安全边界。
+---
+
+<Status tone="preview">PREVIEW</Status>
+
+Extension 不是“把一段命令放进设置页”。它是一个带身份、版本、权限、宿主范围和生命周期的可安装单元。PuddingTeams 用它保持核心与具体 Agent 协议之间的边界。
+
+## 三类 Extension
+
+| 类型 | 贡献 | 例子 |
+| --- | --- | --- |
+| Connector | 一个 Agent Driver、配置/Secret schema、Probe 与头像 | Codex、Claude Code |
+| Capability | 给 Agent 提供命名空间工具 | minimal-tool 示例 |
+| Shared package | 不直接激活，供 Extension 复用的协议和执行组件 | `@puddingteams/pwcp` |
+
+Connector 负责“怎样运行一个 Agent”；Capability 负责“给 Agent 增加什么可调用工具”。两者都不能接管 Window、Goal 或平台身份。
+
+## Registry
+
+Extension Registry 负责：
+
+1. 读取独立 `pudding-extension.json`，或 `package.json` 中的 `puddingteams` manifest；
+2. 校验 ID、版本、`engines.puddingteams`、permissions、entry 和 contribution；
+3. 导入候选模块并验证导出；
+4. 激活 Driver/工具；
+5. 成功后原子更新 registry，失败则恢复旧 runtime hooks 和持久化记录。
+
+用户数据目录中的来源状态包括：
+
+- `builtin`：仍由 Server 内置的实现；
+- `bundled`：随发行 runtime 审核并预置；
+- `user`：复制到用户 Extension packages 的安装内容；
+- `local-link`：开发态指向本地目录。
+
+Registry 位于 `<PUDDINGTEAMS_HOME>/extensions/registry.json`。发行包升级不会覆盖用户安装记录；Extension 代码也不应把运行数据写回自身包目录。
+
+## Manifest 的核心字段
+
+```jsonc
+{
+  "id": "my-agent",
+  "publisher": "example",
+  "displayName": "My Agent",
+  "version": "1.0.0",
+  "source": "external",
+  "kind": "connector",
+  "engines": { "puddingteams": ">=0.1 <1" },
+  "permissions": ["spawn", "workspace", "secrets"],
+  "entry": "driver/index.ts",
+  "connector": {
+    "id": "my-agent",
+    "displayName": "My Agent",
+    "apiVersion": "1",
+    "defaultTransport": "spawn",
+    "supportedTransports": ["spawn"],
+    "configSchema": { "type": "object", "properties": {} },
+    "secretSchema": [],
+    "avatar": "assets/avatar.svg"
+  }
+}
+```
+
+permissions 是安装审查和未来 Broker 的输入。当前支持的声明包括 spawn、network、workspace、secrets；它们不是操作系统级沙箱本身。
+
+`configSchema` 让 UI 生成普通配置表单，`secretSchema` 让明文进入受控 CredentialsStore。模型字段可以用 `x-puddingteams-options: "driver"` 从上游动态发现选项，避免平台维护一份会过期的私有模型清单。
+
+## 双宿主 Connector
+
+Codex 和 Claude Code Connector 是同一 npm 包、两个入口：
+
+```text
+package.json
+  ├─ pi.extensions       → pi/index.ts
+  │                         注册 <id>_delegate 工具
+  └─ puddingteams.entry  → driver/index.ts
+                            注册 AgentDriver
+```
+
+纯 pi 激活时，包的门面可以直接 spawn CLI 并返回工具结果，但没有 PuddingTeams 的 Window、Delegation 持久化、Web HITL 和 Workspace handoff。
+
+PuddingTeams 激活时不会调用这个 pi 门面承担房间委托。平台自己生成 Manager delegate tool，并经过 `AgentInvoker → AgentRuntime → Driver`。两条路径共用无宿主的事件归一化核心，但生命周期彼此独立。
+
+## 当前 Connector 状态
+
+| Connector | 宿主形式 | Transport | 说明 |
+| --- | --- | --- | --- |
+| pi | Server 内置 | sdk | 进程内 AgentSession |
+| PuddingClaw | Server 内置 | spawn | CLI + 本地 Backend |
+| Codex | bundled 双宿主包 | spawn | `codex exec --json`，支持 run/continue/cancel |
+| Claude Code | bundled 双宿主包 | spawn | headless CLI，支持 run/continue/cancel |
+| Echo | 声明式开发样例 | spawn | 验证无代码 manifest 接入，不是用户 Agent |
+
+HTTP、RPC 和 ACP 已进入 capability/manifest 词汇，但当前没有通用平台 Transport。代码型 Driver 可以自行实现网络协议；文档不把它描述成已交付的官方能力。
+
+## 生命周期与更新
+
+- Probe 检查 Extension 是否安装、上游是否可执行、配置/鉴权和兼容性；
+- Agent binding 保存 config 和 secret refs，不保存明文 Secret；
+- 成员、配置或 Extension 修订变化后，相关 Session/Worker binding 会重新校验；
+- ESM 入口更新使用 cache busting，避免继续执行旧模块；
+- 候选模块必须先验证，激活失败不能留下半更新 Registry。
+
+## 当前安全边界
+
+本地代码型 Extension 只有在用户开启开发者模式并确认风险后才能安装、加载、更新或卸载。开发者模式关闭时，bundled Extension 不受影响，本地代码停止加载。
+
+但当前还没有：
+
+- 独立 Extension Host 进程；
+- 强制权限 Broker；
+- 社区 Registry、签名和完整性校验；
+- 自动把 monorepo 的 `workspace:*` 依赖改写并发布到 npm/pi gallery。
+
+因此本地 Extension 与 Server 进程拥有相同的 Node 权限。只运行自己编写或完成审查的代码；manifest permissions 不能把不可信代码变安全。
+
+下一步见[Connector 开发参考](/docs/connector-development/)。

@@ -52,6 +52,8 @@ export interface AgentConnectorBinding {
 	extensionId: string;
 	/** ConnectorContribution.id。 */
 	connectorId: string;
+	/** 本 Agent 实例实际使用的 transport；必须属于 Connector supportedTransports。 */
+	transport: import("./types.js").DriverTransport;
 	config: Record<string, unknown>;
 	secretRefs?: Record<string, string>;
 	versionPin?: string;
@@ -495,6 +497,26 @@ export async function readManifestFromDir(dirPath: string): Promise<PuddingTeams
 
 const TRANSPORTS = new Set(["spawn", "http", "rpc", "acp", "sdk"]);
 
+function validateTransportConfigAnnotations(schema: unknown, supported: Set<string>): void {
+	if (schema === undefined) return;
+	if (!schema || typeof schema !== "object" || Array.isArray(schema)) return;
+	const properties = (schema as Record<string, unknown>).properties;
+	if (!properties || typeof properties !== "object" || Array.isArray(properties)) return;
+	for (const [name, rawProp] of Object.entries(properties as Record<string, unknown>)) {
+		if (!rawProp || typeof rawProp !== "object" || Array.isArray(rawProp)) continue;
+		const transports = (rawProp as Record<string, unknown>)["x-puddingteams-transports"];
+		if (transports === undefined) continue;
+		if (!Array.isArray(transports) || transports.length === 0) {
+			throw new Error(`connector.configSchema.properties.${name}.x-puddingteams-transports 必须是非空数组`);
+		}
+		for (const transport of transports) {
+			if (typeof transport !== "string" || !supported.has(transport)) {
+				throw new Error(`connector.configSchema.properties.${name} 声明了未支持的 transport：${String(transport)}`);
+			}
+		}
+	}
+}
+
 function requireString(value: unknown, field: string): string {
 	if (typeof value !== "string" || !value.trim()) throw new Error(`manifest.${field} 必须是非空字符串`);
 	return value;
@@ -585,12 +607,23 @@ export function parseExtensionManifest(raw: unknown): PuddingTeamsExtensionManif
 		if (!Array.isArray(c.supportedTransports) || c.supportedTransports.length === 0) {
 			throw new Error("connector.supportedTransports 必须是非空数组");
 		}
+		const supported = new Set<string>();
 		for (const t of c.supportedTransports) {
 			if (!TRANSPORTS.has(t as string)) throw new Error(`connector.supportedTransports 含非法 transport：${String(t)}`);
+			if (supported.has(t as string)) throw new Error(`connector.supportedTransports 含重复 transport：${String(t)}`);
+			supported.add(t as string);
 		}
 		if (!(c.supportedTransports as unknown[]).includes(c.defaultTransport)) {
 			throw new Error("connector.defaultTransport 必须包含在 supportedTransports 中");
 		}
+		const permissionSet = new Set(Array.isArray(permissions) ? permissions as string[] : []);
+		if (supported.has("spawn") && !permissionSet.has("spawn")) {
+			throw new Error('Connector 支持 transport:"spawn" 时 manifest.permissions 必须声明 "spawn"');
+		}
+		if (["http", "rpc", "acp"].some((transport) => supported.has(transport)) && !permissionSet.has("network")) {
+			throw new Error('Connector 支持 http/rpc/acp transport 时 manifest.permissions 必须声明 "network"');
+		}
+		validateTransportConfigAnnotations(c.configSchema, supported);
 		validateSecretSchema(c.secretSchema, "connector.secretSchema");
 		const avatar = validateAvatarPath(c.avatar);
 		// 声明式与代码型互斥：有 entry 走代码型 Connector（§10.3 两级模型）。
@@ -599,6 +632,9 @@ export function parseExtensionManifest(raw: unknown): PuddingTeamsExtensionManif
 				? undefined
 				: (() => {
 						if (entry) throw new Error("connector.declarative 与顶层 entry 互斥（有代码走代码型 Connector）");
+						if (c.defaultTransport !== "spawn" || supported.size !== 1 || !supported.has("spawn")) {
+							throw new Error('connector.declarative 当前只支持唯一 transport:"spawn"');
+						}
 						return validateDeclarative(c.declarative);
 					})();
 		return {

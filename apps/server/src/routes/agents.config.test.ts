@@ -32,7 +32,7 @@ async function makeStack(): Promise<Stack> {
 	await teams.upsertAgent({
 		name: "piworker",
 		description: "pi worker",
-		connector: { extensionId: "pi", connectorId: "pi", config: { model: "openai/gpt-5" } },
+		connector: { extensionId: "pi", connectorId: "pi", transport: "sdk", config: { model: "openai/gpt-5" } },
 	});
 	await teams.upsertAgent({
 		name: "cmdworker",

@@ -1,7 +1,7 @@
-import type { AgentDriver } from "./types.js";
+import type { AgentDriver, DriverTransport } from "./types.js";
 
 /** 按 Connector binding config 构造 Driver 的工厂（同一 Connector 可多实例）。 */
-export type DriverFactory = (config: Record<string, unknown>) => AgentDriver;
+export type DriverFactory = (config: Record<string, unknown>, transport: DriverTransport) => AgentDriver;
 
 /**
  * DriverRegistry：Driver SPI 的注册与选择（方案 §3.1）。
@@ -39,10 +39,15 @@ export class DriverRegistry {
 	}
 
 	/** 按 binding config 构造 Driver：优先工厂，退回已注册的单例。 */
-	create(connectorId: string, config: Record<string, unknown> = {}, ownerId?: string): AgentDriver | undefined {
+	create(
+		connectorId: string,
+		transport: DriverTransport,
+		config: Record<string, unknown> = {},
+		ownerId?: string,
+	): AgentDriver | undefined {
 		if (ownerId !== undefined && this.owners.get(connectorId) !== ownerId) return undefined;
 		const factory = this.factories.get(connectorId);
-		if (factory) return factory(config);
+		if (factory) return factory(config, transport);
 		return this.drivers.get(connectorId);
 	}
 

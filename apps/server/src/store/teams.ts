@@ -220,9 +220,25 @@ export const DEFAULT_TEAMS: AgentConfig[] = [
 		connector: {
 			extensionId: "puddingclaw",
 			connectorId: "puddingclaw",
+			transport: "spawn",
 			config: { command: "puddingclaw" },
 		},
 		enabled: true,
+	},
+	{
+		// 双传输打样：默认展示一个直连 Headless NDJSON 的 HTTP Worker，便于
+		// 前端验证它与 CLI spawn 的房间进度一致。默认禁用，避免 manager 在
+		// 用户尚未确认 Backend 地址前把真实委托路由到测试实例。
+		name: "puddingclaw-http",
+		displayName: "PuddingClaw HTTP",
+		description: "",
+		connector: {
+			extensionId: "puddingclaw",
+			connectorId: "puddingclaw",
+			transport: "http",
+			config: { endpoint: "http://127.0.0.1:8888" },
+		},
+		enabled: false,
 	},
 ];
 
@@ -529,6 +545,9 @@ export class TeamsStore {
 			if (!c.extensionId?.trim() || !c.connectorId?.trim()) {
 				throw new Error(`agent "${agent.name}": connector 需要 extensionId 与 connectorId`);
 			}
+			if (!["spawn", "http", "rpc", "acp", "sdk"].includes(c.transport)) {
+				throw new Error(`agent "${agent.name}": connector.transport 非法`);
+			}
 			if (c.config === undefined || typeof c.config !== "object" || Array.isArray(c.config)) {
 				throw new Error(`agent "${agent.name}": connector.config 必须是对象`);
 			}
@@ -630,6 +649,9 @@ export class TeamsStore {
 		if (connector !== undefined) {
 			if (!connector.extensionId?.trim() || !connector.connectorId?.trim()) {
 				throw new Error("connector 需要 extensionId 与 connectorId");
+			}
+			if (!["spawn", "http", "rpc", "acp", "sdk"].includes(connector.transport)) {
+				throw new Error("connector.transport 非法");
 			}
 			if (typeof connector.config !== "object" || connector.config === null || Array.isArray(connector.config)) {
 				throw new Error("connector.config 必须是对象");

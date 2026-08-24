@@ -114,7 +114,7 @@ test("P2: 从包目录安装（折叠 manifest + entry 模块）后 DriverRegist
 	const entry = await registry.install(CLAUDE_PACKAGE_DIR);
 	assert.equal(entry.manifest.id, "claude-code");
 	assert.equal(entry.loaded, true, entry.loadError ?? "");
-	const driver = drivers.create("claude-code", { permissionMode: "plan" });
+	const driver = drivers.create("claude-code", "spawn", { permissionMode: "plan" });
 	assert.ok(driver instanceof ClaudeCodeDriver);
 	assert.equal(driver!.id, "claude-code");
 });
@@ -126,7 +126,7 @@ test("P2: installOrUpdateFromDir——未安装则安装，重复调用走更新
 	assert.equal(first.installed, true);
 	const second = await registry.installOrUpdateFromDir(CLAUDE_PACKAGE_DIR);
 	assert.equal(second.loaded, true, second.loadError ?? "");
-	assert.equal(drivers.create("claude-code", {})?.id, "claude-code");
+	assert.equal(drivers.create("claude-code", "spawn", {})?.id, "claude-code");
 });
 
 test("P1: claude-code respond 防御性失败——headless 不支持跨进程审批", async () => {

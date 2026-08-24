@@ -155,12 +155,15 @@ export interface WorkerActivityUpdateDetails {
 	[k: string]: unknown;
 }
 
+/** Connector execution boundary selected for one concrete Agent binding. */
+export type DriverTransport = "spawn" | "http" | "rpc" | "acp" | "sdk";
+
 export interface DriverCapabilities {
 	operations: Array<"run" | "continue" | "respond" | "cancel">;
 	interactionKinds: Array<"permission" | "question" | "confirmation">;
 	progress: "none" | "coarse" | "stream";
 	/** spawn=子进程 CLI；http/rpc/acp=网络协议；sdk=进程内 SDK（如本地 pi）。 */
-	transport: "spawn" | "http" | "rpc" | "acp" | "sdk";
+	transport: DriverTransport;
 }
 
 export interface InvocationContext {
@@ -201,7 +204,7 @@ export interface ProbeResult {
 	compatibility: "supported" | "untested" | "incompatible" | "unknown";
 	upstreamVersion?: string;
 	version?: string;
-	transport?: "spawn" | "http" | "rpc" | "acp" | "sdk";
+	transport?: DriverTransport;
 	capabilities: DriverCapabilities;
 	issues: Array<{ code: string; message: string; fixAction?: string }>;
 }

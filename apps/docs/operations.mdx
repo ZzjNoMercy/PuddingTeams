@@ -1,0 +1,142 @@
+---
+title: 运行与排错
+description: CLI、端口、健康检查、日志、常见故障、备份和源码验证命令。
+---
+
+<Status tone="preview">PREVIEW</Status>
+
+排错的最短路径是先确认“进程、数据目录、端口、上游 Agent”四个边界，再看某次 Delegation。不要一开始就删除 Session 或重装应用。
+
+## CLI 速查
+
+```bash
+puddingteams init
+puddingteams doctor [--json]
+puddingteams start [--port 8933]
+puddingteams status
+puddingteams open
+puddingteams restart [--port 8933]
+puddingteams stop
+puddingteams extension init ...
+puddingteams extension validate <path>
+puddingteams version
+```
+
+源码仓库尚未全局安装 CLI 时，将 `puddingteams` 替换为：
+
+```bash
+node packages/puddingteams-cli/bin/puddingteams.js
+```
+
+## 默认地址
+
+| 形态 | 地址 |
+| --- | --- |
+| CLI/生产 Server | `http://127.0.0.1:8933` |
+| 源码开发 API | `http://127.0.0.1:8933` |
+| 源码开发 Web | `http://127.0.0.1:8934` |
+| PuddingAI 官网开发站 | `http://127.0.0.1:8935`，与 Teams 不冲突 |
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:8933/api/health
+```
+
+响应应标识 `puddingteams-server`，并带不可逆的数据目录指纹。桌面端据此判断能否安全复用现有 Server。
+
+## 日志和运行状态
+
+CLI 后台日志默认位于：
+
+```text
+~/.puddingteams/logs/server.log
+```
+
+CLI 管理的 PID/端口记录位于 `~/.puddingteams/run/server.pid`；Server 的单写者 Lease 位于 `~/.puddingteams/runtime/backend.lease`。Electron 自己的桌面日志在 Electron `userData/logs/`，业务状态仍在 `PUDDINGTEAMS_HOME`。
+
+不要把 PID 文件和 Lease 当成同一用途：PID 文件供 CLI 管进程，Lease 防止任意两个 Backend 同时写同一个 Home。
+
+## 常见故障
+
+### “另一个后端正在运行”
+
+先运行 `puddingteams status`，确认 PID、端口和数据目录。若是 CLI 实例，用 `puddingteams stop`；若 App 正在复用它，退出 App 不会停止 CLI 实例。
+
+只有在确认记录中的 PID 已不存在时，Server 才会自动回收 stale Lease。不要在进程仍存活时手工删除 Lease。
+
+### 端口被占用
+
+```bash
+puddingteams start --port 8940
+```
+
+桌面端使用 `PUDDINGTEAMS_DESKTOP_PORT=8940`。如果占用者也是 PuddingTeams，先确认它的数据目录指纹；不同 Home 的实例不能被错误复用。
+
+开发态根 `pnpm dev` 会在启动前清理 8933/8934 的遗留监听，只作用于开发端口。
+
+### Worker detected=false
+
+运行 `puddingteams doctor`，检查 executable、版本、账号登录和 PATH。桌面 App 已合并常见可执行目录，但自定义安装位置仍应加入登录 shell PATH，或在 Connector config 中填写绝对 command 路径。
+
+“Extension 已安装”与“上游 CLI 可执行/已认证”是不同状态。Probe 的 issue 应给出具体修复动作，不要反复重装 Extension。
+
+### Workspace 一直不加载规则
+
+依次检查：
+
+1. Window 是否绑定了显式 Workspace；
+2. trust 是否为 trusted，realpath 是否变化；
+3. approvedResources 是否包含 context/skills/prompts；
+4. Agent 对应的 `loadWorkspace*` 开关是否开启；
+5. pi 自身 project trust 是否允许项目级 SYSTEM/APPEND 文件。
+
+无项目 Window 使用中立 unscoped cwd，本来就不会发现项目资源。
+
+### Continue 变成新 Session
+
+检查 Workspace、cwdSnapshot、Agent revision 和 Connector 是否变化。PuddingTeams 会拒绝把旧 handle 带进新的执行边界；这是数据隔离，不是记忆随机丢失。
+
+### Delegation 一直等待
+
+查看 Interaction 列表和执行 Inspector。`waiting_input` 不是失败，必须回答或取消原 Interaction；再发一条普通消息不会替代 `Driver.respond`。
+
+### Manager 只看到长结果的头尾
+
+这是 Harness 的预期行为。让 Manager 调用 `read_delegation_result` 按 offset 分页回读，或在 Inspector 查看 Delegation 记录。完整正文仍位于受控落盘文件，头尾投影不是截断后的唯一副本。
+
+### Goal 重启后显示 interrupted/recovering
+
+平台正在开启新的 execution epoch，并对账旧 Delegation、Decision、Artifact 和不明外部副作用。不要手工把 Goal 改成 resolved；确认不明步骤后再恢复。
+
+## 备份
+
+```text
+1. puddingteams stop
+2. 备份完整 PUDDINGTEAMS_HOME
+3. 如需 pi 全局资源，再备份 ~/.pi/agent
+4. 分别记录外部 Agent CLI 的版本和登录/Session 迁移方式
+```
+
+Secret 包含在 Home 中，备份介质应加密并限制权限。恢复时保持目录整体一致，不要只复制部分 JSON。
+
+## 源码工程验证
+
+改动 PuddingTeams 源码后，建议至少运行：
+
+```bash
+pnpm --filter @puddingteams/server test
+pnpm --filter @puddingteams/server typecheck
+pnpm --filter @puddingteams/web typecheck
+pnpm --filter @puddingteams/web lint
+pnpm run smoke:golden
+pnpm --filter @puddingteams/web build
+```
+
+仓库提供聚合命令：
+
+```bash
+pnpm verify:baseline
+```
+
+涉及 Codex/Claude Code 的真实 smoke 需要本机已安装并登录对应 CLI；默认 golden smoke 使用确定性的 Echo Connector，不依赖外部账号。

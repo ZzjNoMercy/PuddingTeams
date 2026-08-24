@@ -1,0 +1,96 @@
+---
+title: Harness 与长结果
+description: 委托结果、执行时间线、Artifact 与长正文外置怎样控制上下文而不丢信息。
+---
+
+<Status tone="preview">PREVIEW</Status>
+
+Harness 的职责不是把所有信息都塞给模型，而是让模型在需要时拿到正确的信息，并让完整事实仍可追溯。
+
+<Principle title="第一性原理：存储完整性与上下文经济性必须分离">
+Worker 可能返回几万到几十万 token。全文是交付事实，但不一定应该自动进入 Manager 下一轮上下文。PuddingTeams 先无损保存，再给模型一个有界投影和精确回读工具。
+</Principle>
+
+## 一次委托有四类记录
+
+```text
+Delegation
+  ├─ 归一化结果：状态、正文、handle、usage
+  ├─ Manager toolResult：进入模型上下文的结果投影
+  ├─ Activity Timeline：逐事件执行过程
+  └─ Artifact：Worker 明确交付的文件快照（可选）
+```
+
+它们不能相互替代：
+
+| 记录 | 目的 | 是否自动进入 Manager 上下文 |
+| --- | --- | --- |
+| Delegation result | 完整的归一化执行结论 | 通过 toolResult 投影 |
+| toolResult | 让 Manager 做下一步推理 | 是 |
+| Activity Timeline | 观察 reasoning/tool/file/search 等过程 | 否，只在 Inspector 查看 |
+| Artifact | 稳定引用、下载与验收文件 | 只注入引用，不自动展开全文 |
+
+## 长结果落盘
+
+默认按 `ceil(字符数 / 4)` 估算 token。当正文超过 20,000 个估算 token 时：
+
+1. 完整正文原子写入：
+
+   ```text
+   <PUDDINGTEAMS_HOME>/state/large-worker-results/<delegationId>.txt
+   ```
+
+2. 文件权限设置为 `0600`；
+3. Manager toolResult 只保留约 6,000 token 的头部、2,000 token 的尾部；
+4. 投影附带 `delegationId`、原始字符数、估算 token 数和 `offloaded: true`；
+5. Manager 需要中间内容时调用 `read_delegation_result` 分页读取，默认建议块约 8,000 token。
+
+回读使用字符 `offset` 和 `limit`，返回 `nextOffset`。Server 会核对调用它的 Manager Session 确实拥有该 Delegation；工具不会向模型暴露宿主文件路径。
+
+阈值、头尾预览和回读块大小可以在 Harness 设置中调整，并有安全范围约束。调整原则不是“越大越完整”，而是让 Manager 首次看到足够判断下一步的信息，其余内容用引用按需读取。
+
+## 什么叫“完整结果”
+
+完整性的边界是 Connector 已经归一化出的 `NormalizedResult.content`。如果上游协议发出了很多 token/segment，而 Connector 最后只选择明确的 `final_response`，PuddingTeams 不会把已被 Connector 丢弃的私有协议负载重新拼回来。
+
+因此 Connector 作者必须把“过程”和“结论”分开：
+
+- 中间 reasoning、command、file change、todo 等发送为 `WorkerActivity`；
+- 最终用户可用的回答放进 `completed.result.content`；
+- 不要把全部流式片段再次拼接进最终正文，造成重复和虚假结论。
+
+## Activity Timeline
+
+spawn Connector 可以随 progress 附带 provider-neutral `WorkerActivity`。Runtime 为每条活动分配 Delegation 内单调递增的 `seq`，先追加写入：
+
+```text
+<PUDDINGTEAMS_HOME>/state/delegation-timelines/<delegationId>.jsonl
+```
+
+再通过 REST/WebSocket 提供给 Inspector。UI 依赖 `kind` 和 `status`，不依赖 Codex 或 Claude 的私有事件名；原始 `sourceEvent` 和上游序号只用于诊断。
+
+pi Worker 不需要伪造 Timeline，它直接从 child AgentSession 订阅并回放 pi Session 的 assistant、thinking 和 tool 历史。两种来源在 Inspector 中统一呈现，但事实源仍然分开。
+
+## Artifact 不是长结果文件
+
+长结果文件是 Harness 的上下文外置层，只服务于回读；Artifact 是 Worker 主动交付、用户可引用的产物。
+
+登记 Artifact 时平台会：
+
+- 校验它位于允许的 Workspace/交接目录；
+- 保存名称、kind、大小、Window/Delegation/Goal 等关联；
+- 计算内容哈希；
+- 把登记瞬间的字节冻结到 `artifacts/blobs/<artifactId>`。
+
+Workspace 中的工作副本之后可能继续变化；验收和下载应使用冻结快照与哈希。一个很长的文字回答不会因为落盘就自动变成 Artifact，一个文件也不会因为成为 Artifact 就自动全部进入模型上下文。
+
+## 给使用者的建议
+
+- 让 Worker 在正文开头先给结论和导航，再给证据细节；这会提升 head 预览质量。
+- 对需要后续接力的文件，要求 Worker 显式导出 Artifact，而不是只在正文里写绝对路径。
+- 排错时先看 Timeline 判断执行发生了什么，再看 NormalizedResult 判断 Connector 最终交付了什么。
+- 不要手工编辑 `large-worker-results` 或 timeline 文件；它们由 Delegation ID、权限和状态索引共同约束。
+
+## 为什么不直接截断
+
+直接截断把“节省上下文”变成“丢失事实”，后续 Agent 无法核验被截断部分。无损外置 + 有界投影 + 受权分页回读，把存储、推理和权限三个问题分别解决，也为未来 RAG/全文索引保留了清晰边界。

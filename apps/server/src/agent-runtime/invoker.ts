@@ -225,7 +225,10 @@ export class AgentInvoker {
 		const agent = await this.teams.getAgent(agentName);
 		if (!agent) return undefined;
 		const driver = this.drivers.get(agent.name) ?? this.resolveDriverFor(agent);
-		return driver?.capabilities();
+		if (!driver) return undefined;
+		const capabilities = await driver.capabilities();
+		this.assertBindingTransport(agent, capabilities);
+		return capabilities;
 	}
 
 	/**
@@ -237,7 +240,18 @@ export class AgentInvoker {
 	async driverFor(agentName: string): Promise<AgentDriver | undefined> {
 		const agent = await this.teams.getAgent(agentName);
 		if (!agent || agent.pinned) return undefined;
-		return this.drivers.get(agent.name) ?? this.resolveDriverFor(agent);
+		const driver = this.drivers.get(agent.name) ?? this.resolveDriverFor(agent);
+		if (!driver) return undefined;
+		this.assertBindingTransport(agent, await driver.capabilities());
+		return driver;
+	}
+
+	private assertBindingTransport(agent: AgentConfig, capabilities: DriverCapabilities): void {
+		if (!agent.connector || capabilities.transport === agent.connector.transport) return;
+		throw new Error(
+			`Connector「${agent.connector.connectorId}」返回 transport:${capabilities.transport}，`
+			+ `与 Worker 绑定 transport:${agent.connector.transport} 不一致`,
+		);
 	}
 
 	/** 发起一次委托（run/continue）。 */
@@ -270,6 +284,7 @@ export class AgentInvoker {
 				}
 				const driver = this.drivers.get(freshAgent.name) ?? this.resolveDriverFor(freshAgent);
 				if (!driver) throw new Error(`agent「${freshAgent.name}」没有可用的 Driver（未安装对应 Connector）`);
+				this.assertBindingTransport(freshAgent, await driver.capabilities());
 				const cwd = await this.teams.workspaceFor(windowId);
 				const nextSession = mode === "continue" ? await this.sessionHandleFor(windowId, freshAgent) : undefined;
 				let createdResolve!: () => void;
@@ -858,9 +873,10 @@ export class AgentInvoker {
 	 */
 	private resolveDriverFor(agent: AgentConfig): AgentDriver | undefined {
 		if (agent.connector) {
-			const { connectorId, config } = agent.connector;
+			const { connectorId, transport, config } = agent.connector;
 			return this.drivers.create(
 				connectorId,
+				transport,
 				connectorId === "pi"
 					? {
 							...(config ?? {}),

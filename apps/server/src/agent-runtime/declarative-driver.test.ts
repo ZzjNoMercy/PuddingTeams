@@ -153,14 +153,14 @@ test("P2-c: declarative 校验——与 entry 互斥、capabilities 防虚标、
 test("P2-c: install(echo 包目录) 后 DriverRegistry 可创建 echo Driver", async () => {
 	const { drivers, entryLoaded } = await installEcho();
 	assert.equal(entryLoaded, true);
-	const driver = drivers.create("echo", {});
+	const driver = drivers.create("echo", "spawn", {});
 	assert.ok(driver, "声明式 Driver 必须注册进 DriverRegistry");
 	assert.equal(driver!.id, "echo");
 });
 
 test("P2-c: echo capabilities——诚实声明 run/continue/cancel、无 HITL、stream、spawn", async () => {
 	const { drivers } = await installEcho();
-	const driver = drivers.create("echo", {})!;
+	const driver = drivers.create("echo", "spawn", {})!;
 	assert.deepEqual(await driver.capabilities(), {
 		operations: ["run", "continue", "cancel"],
 		interactionKinds: [],
@@ -171,7 +171,7 @@ test("P2-c: echo capabilities——诚实声明 run/continue/cancel、无 HITL�
 
 test("P2-c: echo run——真 spawn 跑通，mapping 归一出 completed 边界", async () => {
 	const { drivers } = await installEcho();
-	const driver = drivers.create("echo", {})!;
+	const driver = drivers.create("echo", "spawn", {})!;
 	const progress: string[] = [];
 	const events = await collect(
 		driver.run({ message: "你好", requestId: "req-1" }, { ...ctx, onUpdate: (c) => progress.push(c) }),
@@ -192,7 +192,7 @@ test("P2-c: echo run——真 spawn 跑通，mapping 归一出 completed 边界"
 
 test("P2-c: echo continue——sessionHandle 透传给 CLI 并回到边界", async () => {
 	const { drivers } = await installEcho();
-	const driver = drivers.create("echo", {})!;
+	const driver = drivers.create("echo", "spawn", {})!;
 	const events = await collect(
 		driver.continue({ message: "继续", requestId: "req-2", sessionHandle: "echo-fixed-1" }, ctx),
 	);
@@ -207,7 +207,7 @@ test("P2-c: echo continue——sessionHandle 透传给 CLI 并回到边界", asy
 
 test("P2-c: echo probe——detected true，versionRegex 提取 upstreamVersion", async () => {
 	const { drivers } = await installEcho();
-	const driver = drivers.create("echo", {})!;
+	const driver = drivers.create("echo", "spawn", {})!;
 	const probe = await driver.probe(ctx);
 	assert.equal(probe.detected, true);
 	assert.equal(probe.upstreamVersion, "0.1.0");
@@ -217,7 +217,7 @@ test("P2-c: echo probe——detected true，versionRegex 提取 upstreamVersion"
 
 test("P2-c: echo respond 防御性失败——声明式不支持 HITL", async () => {
 	const { drivers } = await installEcho();
-	const driver = drivers.create("echo", {})!;
+	const driver = drivers.create("echo", "spawn", {})!;
 	const events = await collect(
 		driver.respond({ runHandle: "r1", interactionHandle: "i1", requestId: "q1", responses: [] }, ctx),
 	);
@@ -248,7 +248,7 @@ test("P2-c: 无 operations.continue 的声明式 Driver——continue 报 operat
 	writeFileSync(path.join(pkgDir, "package.json"), JSON.stringify({ name: "echo-no-continue", type: "module", puddingteams: manifest }));
 	copyFileSync(path.join(ECHO_PACKAGE_DIR, "cli.mjs"), path.join(pkgDir, "cli.mjs"));
 	await registry.install(pkgDir);
-	const driver = drivers.create("echo", {})!;
+	const driver = drivers.create("echo", "spawn", {})!;
 	const events = await collect(
 		driver.continue({ message: "x", requestId: "req-3", sessionHandle: "s-1" }, ctx),
 	);

@@ -61,8 +61,8 @@ test("Phase6: pi manifest 通过校验——builtin connector、sdk transport、
 test("Phase6: driverFactory 多实例——同一 Connector 按 config 构造独立 Driver", () => {
 	const hooks = piExtensionHooks();
 	assert.ok(hooks.driverFactory, "pi hooks 必须提供 driverFactory");
-	const a = hooks.driverFactory!({ model: "openai/gpt-5" });
-	const b = hooks.driverFactory!({ model: "anthropic/claude-sonnet" });
+	const a = hooks.driverFactory!({ model: "openai/gpt-5" }, "sdk");
+	const b = hooks.driverFactory!({ model: "anthropic/claude-sonnet" }, "sdk");
 	assert.ok(a instanceof LocalPiDriver);
 	assert.ok(b instanceof LocalPiDriver);
 	assert.notEqual(a, b);
@@ -73,7 +73,7 @@ test("Phase6: registerBuiltin 后 DriverRegistry 可按 connectorId 创建 Drive
 	const drivers = new DriverRegistry();
 	const registry = new ExtensionRegistry(freshDir("pi-ext-"), new ExtensionCatalog(), drivers);
 	registry.registerBuiltin(piConnectorManifest, piExtensionHooks());
-	const driver = drivers.create("pi", { piResources: { systemPrompt: "你是测试 worker" } });
+	const driver = drivers.create("pi", "sdk", { piResources: { systemPrompt: "你是测试 worker" } });
 	assert.ok(driver instanceof LocalPiDriver);
 	assert.equal(driver!.id, "pi");
 });

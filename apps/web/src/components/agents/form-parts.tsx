@@ -37,6 +37,8 @@ interface JsonSchemaProp {
 	format?: string;
 	/** Extension annotation: options are discovered by the bound Driver. */
 	"x-puddingteams-options"?: string;
+	/** Only render this field for the selected Connector transport(s). */
+	"x-puddingteams-transports"?: string[];
 	enum?: unknown[];
 	default?: unknown;
 }
@@ -246,12 +248,15 @@ export function ConfigSchemaForm({
 	value,
 	onChange,
 	agentName,
+	transport,
 }: {
 	schema: Record<string, unknown> | undefined;
 	value: Record<string, unknown>;
 	onChange: (next: Record<string, unknown>) => void;
 	/** Existing Agent binding used for Driver-owned dynamic config options. */
 	agentName?: string;
+	/** Concrete transport selected by this Agent binding. */
+	transport?: string;
 }) {
 	const props = simpleProperties(schema);
 	if (!props) {
@@ -261,7 +266,11 @@ export function ConfigSchemaForm({
 	const required = Array.isArray(schema?.required) ? (schema.required as unknown[]).filter((v) => typeof v === "string") : [];
 	return (
 		<div className="flex flex-col gap-2">
-			{Object.entries(props).map(([key, prop]) => {
+			{Object.entries(props)
+				.filter(([, prop]) => !Array.isArray(prop["x-puddingteams-transports"])
+					|| !transport
+					|| prop["x-puddingteams-transports"]!.includes(transport))
+				.map(([key, prop]) => {
 				const label = prop.title ?? key;
 				const current = value[key];
 				const mark = required.includes(key) ? <span className="text-destructive"> *</span> : null;
