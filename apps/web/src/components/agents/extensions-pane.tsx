@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { CableIcon, FileArchiveIcon, FolderOpenIcon, LoaderIcon, PackageIcon, RefreshCwIcon, SearchIcon, ShieldAlertIcon, SparklesIcon, TrashIcon, UploadIcon, WrenchIcon } from "lucide-react";
+import { ArrowRightIcon, CableIcon, CheckCircle2Icon, FileArchiveIcon, FolderOpenIcon, LoaderIcon, PackageIcon, RefreshCwIcon, SearchIcon, ShieldAlertIcon, SparklesIcon, TrashIcon, UploadIcon, WrenchIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -47,6 +47,7 @@ const ORIGIN_LABELS: Record<CatalogEntry["origin"], string> = {
 
 function EntryCard({ entry, onChanged }: { entry: CatalogEntry; onChanged: () => void }) {
 	const { manifest } = entry;
+	const router = useRouter();
 	const [detailsOpen, setDetailsOpen] = useState(false);
 	const [updateOpen, setUpdateOpen] = useState(false);
 	const [updatePath, setUpdatePath] = useState("");
@@ -54,14 +55,28 @@ function EntryCard({ entry, onChanged }: { entry: CatalogEntry; onChanged: () =>
 	const [confirmUninstall, setConfirmUninstall] = useState(false);
 	const [conflict, setConflict] = useState<{ message: string; agents: string[]; runs: ConflictRun[] } | null>(null);
 	const [busy, setBusy] = useState(false);
+	const isLarkCli = manifest.kind === "capability" && manifest.capability.id === "lark-cli";
 	const description = manifest.kind === "connector"
 		? `连接 ${manifest.connector.displayName}，通过 ${manifest.connector.defaultTransport} 运行`
+		: isLarkCli
+			? "为 Manager 或 Pi Worker 注入飞书 CLI 与配套 Skills"
 		: manifest.capability.tools.length > 0
 			? `提供 ${manifest.capability.tools.length} 个工具：${manifest.capability.tools.slice(0, 3).map((tool) => tool.name).join("、")}`
 			: `为兼容的 Worker 提供 ${manifest.capability.displayName} 能力`;
 	const usage = manifest.kind === "connector"
 		? `${manifest.connector.supportedTransports.length} 种传输方式`
-		: `${manifest.capability.tools.length} 个工具`;
+		: isLarkCli
+			? "CLI + Skills"
+			: manifest.capability.tools.length > 0 ? `${manifest.capability.tools.length} 个工具` : "运行时能力";
+	const compatibleTargets = manifest.kind === "capability"
+		? manifest.capability.compatibleConnectors?.includes("pi")
+			? "Manager 或 Pi Worker"
+			: "兼容的 Worker"
+		: "Worker";
+	const openAgentList = () => {
+		setDetailsOpen(false);
+		router.push("/agents");
+	};
 
 	const handleUpdate = async () => {
 		setBusy(true);
@@ -114,40 +129,90 @@ function EntryCard({ entry, onChanged }: { entry: CatalogEntry; onChanged: () =>
 				</div>
 				<div className="ops-extension-meta">
 					<span className={entry.loaded ? "text-foreground" : "text-destructive"}>{entry.loaded ? "已加载" : "加载失败"}</span>
-					<span>v{entry.version} · {usage}</span>
+					<span>插件 v{entry.version} · {usage}</span>
 				</div>
 				<Button type="button" size="sm" variant="secondary" onClick={() => setDetailsOpen(true)}>查看</Button>
 			</div>
 
 			<Dialog open={detailsOpen} onOpenChange={setDetailsOpen}>
-				<DialogContent positionMode="drawer" className="context-drawer extension-detail-drawer">
-					<DialogHeader><DialogTitle>{manifest.displayName}</DialogTitle><DialogDescription>{description}</DialogDescription></DialogHeader>
-					<div className="flex flex-wrap items-center gap-1.5">
-						<Badge variant={entry.loaded ? "secondary" : "destructive"}>{entry.loaded ? "已加载" : "加载失败"}</Badge>
-						<Badge variant="outline">{ORIGIN_LABELS[entry.origin]}</Badge>
-						<Badge variant="outline">{SOURCE_LABELS[manifest.source] ?? manifest.source}</Badge>
-						<Badge variant="outline">v{entry.version}{entry.versionPin ? `（固定 ${entry.versionPin}）` : ""}</Badge>
-						{entry.drifted ? <Badge variant="destructive">本地源已变更</Badge> : null}
+				<DialogContent
+					overlayClassName="extension-detail-overlay"
+					className="extension-detail-dialog max-h-[min(88vh,780px)] gap-0 overflow-hidden p-0 sm:max-w-[700px]"
+				>
+					<DialogHeader className="extension-detail-header">
+						<div className={`extension-detail-hero-icon ${manifest.kind}`}>
+							{manifest.kind === "connector" ? <CableIcon className="size-5" /> : <WrenchIcon className="size-5" />}
+						</div>
+						<div className="min-w-0">
+							<div className="extension-detail-eyebrow">{manifest.kind === "connector" ? "连接插件" : "能力插件"}</div>
+							<DialogTitle className="mt-1 text-xl">{manifest.displayName}</DialogTitle>
+							<DialogDescription className="mt-1.5 leading-6">{description}</DialogDescription>
+						</div>
+					</DialogHeader>
+
+					<div className="extension-detail-scroll">
+						<div className={`extension-detail-status ${entry.loaded ? "is-ready" : "is-error"}`}>
+							{entry.loaded ? <CheckCircle2Icon className="mt-0.5 size-4 shrink-0" /> : <ShieldAlertIcon className="mt-0.5 size-4 shrink-0" />}
+							<div className="min-w-0">
+								<div className="flex flex-wrap items-center gap-2">
+									<strong>{entry.loaded ? "插件已就绪" : "插件加载失败"}</strong>
+									<span className="extension-detail-version">插件版本 v{entry.version}{entry.versionPin ? ` · 固定 ${entry.versionPin}` : ""}</span>
+								</div>
+								<p>{entry.loaded
+									? manifest.kind === "capability"
+										? `已完成插件安装。绑定到 ${compatibleTargets} 后方可生效；CLI 版本将在绑定探测后显示。`
+										: "已完成插件安装。创建或编辑 Worker 时选择该连接插件并完成配置后即可使用。"
+									: "请先处理下方加载错误，再进行绑定。"}</p>
+							</div>
+						</div>
+
+						<section className="extension-detail-section" aria-labelledby={`usage-${manifest.id}`}>
+							<div className="extension-detail-section-heading">
+								<h3 id={`usage-${manifest.id}`}>怎么使用</h3>
+								<span>{manifest.kind === "capability" ? `绑定到 ${compatibleTargets}` : "配置一个 Worker"}</span>
+							</div>
+							<ol className="extension-detail-steps">
+								<li>
+									<span className="extension-detail-step-number">1</span>
+									<div><strong>选择运行它的 Agent</strong><p>{manifest.kind === "capability" ? `前往「智能体」，打开 ${compatibleTargets} 的配置页。` : "前往「智能体」，打开一个 Worker 的配置页。"}</p></div>
+								</li>
+								<li>
+									<span className="extension-detail-step-number">2</span>
+									<div><strong>{manifest.kind === "capability" ? `绑定「${manifest.displayName}」` : `选择「${manifest.displayName}」`}</strong><p>{isLarkCli ? "保持默认 auto 即可：它会先找本机 CLI，找不到再用托管版。添加后点「探测」，若未登录就执行页面给出的登录命令。" : manifest.kind === "capability" ? "在扩展配置中添加它，保存后执行一次环境探测；若未登录，按提示完成认证。" : "填写命令、凭据等必需配置，保存并通过连接探测。"}</p></div>
+								</li>
+								<li>
+									<span className="extension-detail-step-number">3</span>
+									<div><strong>回到房间直接提任务</strong><p>{manifest.kind === "capability" ? isLarkCli ? "例如：读取这个飞书文档并总结。Agent 会按需调用飞书 CLI。" : "直接描述目标；Agent 会按需调用插件提供的能力。" : "把任务交给该 Worker；房间会负责调度、审批和结果交接。"}</p></div>
+								</li>
+							</ol>
+						</section>
+
+						<section className="extension-detail-section" aria-labelledby={`technical-${manifest.id}`}>
+							<div className="extension-detail-section-heading"><h3 id={`technical-${manifest.id}`}>技术信息</h3></div>
+							<dl className="extension-detail-facts">
+								<div><dt>发布者</dt><dd>{manifest.publisher}</dd></div>
+								<div><dt>安装来源</dt><dd>{ORIGIN_LABELS[entry.origin]} · {SOURCE_LABELS[manifest.source] ?? manifest.source}</dd></div>
+								<div><dt>引擎范围</dt><dd>{manifest.engines.puddingteams}</dd></div>
+								<div><dt>{manifest.kind === "connector" ? "连接标识" : "能力标识"}</dt><dd><code>{manifest.kind === "connector" ? manifest.connector.id : manifest.capability.id}</code></dd></div>
+								<div className="wide"><dt>{manifest.kind === "connector" ? "传输方式" : "兼容范围"}</dt><dd>{manifest.kind === "connector" ? `${manifest.connector.supportedTransports.join(" / ")}（默认 ${manifest.connector.defaultTransport}）` : manifest.capability.compatibleConnectors?.join(" / ") || "全部连接插件"}</dd></div>
+								<div className="wide"><dt>权限</dt><dd className="extension-detail-permissions">{manifest.permissions?.length ? manifest.permissions.map((permission) => <span key={permission}>{permission}</span>) : "无额外权限"}</dd></div>
+							</dl>
+						</section>
+
+						{manifest.kind === "capability" && manifest.capability.tools.length > 0 ? <section className="extension-detail-section"><div className="extension-detail-section-heading"><h3>提供的工具</h3><span>{manifest.capability.tools.length} 个</span></div><div className="flex flex-wrap gap-1.5">{manifest.capability.tools.map((tool) => <Badge key={tool.name} variant="outline" title={tool.description}>{tool.name}</Badge>)}</div></section> : null}
+						{entry.drifted ? <p className="extension-detail-warning">本地源已经发生变化，建议更新后再使用。</p> : null}
+						{entry.loadError ? <p className="extension-detail-error">{entry.loadError}</p> : null}
 					</div>
-					<div className="agent-detail-section grid gap-2 text-xs text-muted-foreground">
-						<div><span className="text-foreground">发布者</span> · {manifest.publisher}</div>
-						<div><span className="text-foreground">引擎范围</span> · {manifest.engines.puddingteams}</div>
-						<div><span className="text-foreground">权限</span> · {manifest.permissions?.join(" / ") || "无额外权限"}</div>
-						{manifest.kind === "connector" ? <>
-							<div><span className="text-foreground">Connector</span> · {manifest.connector.id}</div>
-							<div><span className="text-foreground">传输</span> · {manifest.connector.supportedTransports.join(" / ")}（默认 {manifest.connector.defaultTransport}）</div>
-						</> : <>
-							<div><span className="text-foreground">Capability</span> · {manifest.capability.id}</div>
-							<div><span className="text-foreground">兼容范围</span> · {manifest.capability.compatibleConnectors?.join(" / ") || "全部 Connector"}</div>
-						</>}
-					</div>
-					{manifest.kind === "capability" && manifest.capability.tools.length > 0 ? <div className="flex flex-wrap gap-1.5">{manifest.capability.tools.map((tool) => <Badge key={tool.name} variant="outline" title={tool.description}>{tool.name}</Badge>)}</div> : null}
-					{entry.loadError ? <p className="text-xs text-destructive">{entry.loadError}</p> : null}
-					<DialogFooter>
-						{entry.origin === "local-link" || entry.origin === "user" ? <>
-							<Button type="button" variant="ghost" className="mr-auto text-destructive" onClick={() => { setDetailsOpen(false); setConfirmUninstall(true); }}><TrashIcon className="size-3.5" />卸载</Button>
-							<Button type="button" onClick={() => { setDetailsOpen(false); setUpdatePin(entry.versionPin ?? ""); setUpdateOpen(true); }}>更新</Button>
-						</> : <Button type="button" onClick={() => setDetailsOpen(false)}>完成</Button>}
+
+					<DialogFooter className="extension-detail-footer">
+						<div>
+							{entry.origin === "local-link" || entry.origin === "user" ? <Button type="button" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => { setDetailsOpen(false); setConfirmUninstall(true); }}><TrashIcon className="size-3.5" />卸载</Button> : null}
+						</div>
+						<div className="extension-detail-actions">
+							{entry.origin === "local-link" || entry.origin === "user" ? <Button type="button" variant="outline" onClick={() => { setDetailsOpen(false); setUpdatePin(entry.versionPin ?? ""); setUpdateOpen(true); }}>更新</Button> : null}
+							<Button type="button" variant="ghost" onClick={() => setDetailsOpen(false)}>关闭</Button>
+							<Button type="button" disabled={!entry.loaded} onClick={openAgentList}>去智能体绑定<ArrowRightIcon className="size-3.5" /></Button>
+						</div>
 					</DialogFooter>
 				</DialogContent>
 			</Dialog>
@@ -241,10 +306,18 @@ function EntryCard({ entry, onChanged }: { entry: CatalogEntry; onChanged: () =>
 
 function SkillsLibraryView() {
 	const [skills, setSkills] = useState<SkillEntry[] | null>(null);
+	const [query, setQuery] = useState("");
 	const [importPath, setImportPath] = useState("");
 	const [importOpen, setImportOpen] = useState(false);
 	const [importing, setImporting] = useState(false);
 	const [zipInput, setZipInput] = useState<HTMLInputElement | null>(null);
+	const filteredSkills = useMemo(() => {
+		if (!skills) return null;
+		const needle = query.trim().toLowerCase();
+		if (!needle) return skills;
+		return skills.filter((skill) => [skill.name, skill.description]
+			.some((value) => value?.toLowerCase().includes(needle)));
+	}, [query, skills]);
 
 	const refresh = useCallback(async () => {
 		try {
@@ -306,15 +379,23 @@ function SkillsLibraryView() {
 					<div className="flex items-center gap-2 text-sm font-medium"><SparklesIcon className="size-4 text-primary" />Skills 资源库</div>
 					<p className="mt-1 text-xs text-muted-foreground">与 pi CLI 共享；这里只管理资源本体，启用范围在各 Agent 配置页「技能」分区。</p>
 				</div>
-				<Button type="button" size="sm" onClick={() => setImportOpen(true)}><UploadIcon className="size-3.5" />导入 Skill</Button>
+				<div className="flex flex-wrap items-center justify-end gap-2">
+					<label className="ops-extension-search">
+						<SearchIcon className="size-4" />
+						<Input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索 Skills" aria-label="搜索 Skills" />
+					</label>
+					<Button type="button" size="sm" onClick={() => setImportOpen(true)}><UploadIcon className="size-3.5" />导入 Skill</Button>
+				</div>
 			</div>
 			{skills === null ? (
 				<div className="flex items-center justify-center gap-2 pt-12 text-sm text-muted-foreground"><LoaderIcon className="size-4 animate-spin" />加载中…</div>
 			) : skills.length === 0 ? (
 				<div className="ops-empty-state"><div className="text-sm font-medium">资源库还没有 Skill</div><p className="mt-2 text-sm text-muted-foreground">导入包含 SKILL.md 的目录或 zip 文件后，会在这里统一查看。</p></div>
+			) : filteredSkills && filteredSkills.length === 0 ? (
+				<div className="ops-empty-state"><div className="text-sm font-medium">没有匹配的 Skill</div><p className="mt-2 text-sm text-muted-foreground">试试 Skill 名称或描述中的关键词。</p></div>
 			) : (
 				<div className="skills-library-list">
-					{skills.map((skill) => {
+					{filteredSkills?.map((skill) => {
 						return <div key={skill.name} className="skills-library-row flex flex-wrap items-center gap-3 px-4 py-3">
 							<div className="grid size-8 shrink-0 place-items-center rounded-md bg-primary/10 text-primary"><SparklesIcon className="size-4" /></div>
 							<div className="min-w-0 flex-1"><div className="truncate font-mono text-sm">{skill.name}</div><div className="truncate text-xs text-muted-foreground">{skill.description || "无描述"}</div></div>
@@ -370,21 +451,17 @@ export function ExtensionsPane() {
 		});
 	}, [entries, query]);
 
-	const refresh = useCallback(() => {
-		if (view !== "plugins") {
-			return;
-		}
+	const refreshPlugins = useCallback(() => {
 		Promise.all([listExtensionCatalog("connector"), listExtensionCatalog("capability")])
 			.then(([connectors, capabilities]) => setEntries([...connectors, ...capabilities]))
 			.catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)));
-	}, [view]);
+	}, []);
 
-	// tab 计数徽标需要跨视图保留 entries/skillCount：切换分类不再清空，
-	// 回到对应视图时由 effect 重新拉取对齐。
-
+	// 插件数量属于顶层导航信息，不能依赖当前是否打开插件视图；否则刷新
+	// /extensions?tab=skills 或 MCP 时 entries 会一直为空，计数徽标随之消失。
 	useEffect(() => {
-		if (view === "plugins") void refresh();
-	}, [view, refresh]);
+		void refreshPlugins();
+	}, [refreshPlugins]);
 
 	// 挂载即拉一次（tab 徽标要在进入 skills 视图前就有数），此后每次
 	// 切到 skills 视图重新对齐。
@@ -405,8 +482,8 @@ export function ExtensionsPane() {
 		try {
 			setDeveloperModeState(await setDeveloperMode(enabled));
 			setDeveloperWarningOpen(false);
-			refresh();
-			toast.success(enabled ? "开发者模式已开启" : "开发者模式已关闭，本地 Extension 已停止加载");
+			refreshPlugins();
+			toast.success(enabled ? "开发者模式已开启" : "开发者模式已关闭，本地插件已停止加载");
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		}
@@ -428,7 +505,7 @@ export function ExtensionsPane() {
 			setInstallOpen(false);
 			// 安装的 kind 由 manifest 决定；插件视图统一展示 Connector 与 Capability。
 			setView("plugins");
-			refresh();
+			refreshPlugins();
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
@@ -441,7 +518,7 @@ export function ExtensionsPane() {
 			{developerMode ? (
 				<div className="flex items-center justify-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs text-amber-700 dark:text-amber-300">
 					<ShieldAlertIcon className="size-3.5" />
-					开发者模式已开启：本地 Extension 代码与 Server 同进程执行，拥有当前用户权限。
+					开发者模式已开启：本地插件代码与服务端同进程执行，拥有当前用户权限。
 				</div>
 			) : null}
 			<header className="ops-page-header">
@@ -463,7 +540,7 @@ export function ExtensionsPane() {
 					{developerMode && view === "plugins" ? (
 						<Button type="button" size="sm" onClick={() => setInstallOpen(true)}>
 							<PackageIcon className="size-4" />
-							安装本地扩展
+							安装本地插件
 						</Button>
 					) : null}
 				</div>
@@ -472,7 +549,7 @@ export function ExtensionsPane() {
 				{([
 					["skills", "Skills", "任务方法与工作流"],
 					["mcp", "MCP", "外部工具、数据与服务"],
-					["plugins", "插件", "Connector 与 Capability 扩展"],
+					["plugins", "插件", "连接插件与能力插件"],
 				] as const).map(([key, label, description]) => (
 					<button
 						key={key}
@@ -503,16 +580,16 @@ export function ExtensionsPane() {
 					</div>
 				) : entries.length === 0 ? (
 					<div className="pt-20 text-center text-sm text-muted-foreground">
-						还没有已安装插件。开启开发者模式后，可从本地目录安装 Connector 或 Capability。
+						还没有已安装插件。开启开发者模式后，可从本地目录安装连接插件或能力插件。
 					</div>
 				) : (
 					<div className="py-8">
 						<div className="mb-5 flex items-end justify-between gap-5">
-							<div><h2 className="text-base font-semibold tracking-tight">插件</h2><p className="mt-1 text-xs text-muted-foreground">扩充 Agent 的连接方式与运行能力</p></div>
+							<div><h2 className="text-base font-semibold tracking-tight">插件</h2><p className="mt-1 text-xs text-muted-foreground">扩充智能体的连接方式与运行能力</p></div>
 							<label className="ops-extension-search"><SearchIcon className="size-4" /><Input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索插件" aria-label="搜索插件" /></label>
 						</div>
 						{filteredEntries && filteredEntries.length > 0 ? <div className="ops-extension-list">
-							{filteredEntries.map((entry) => <EntryCard key={entry.manifest.id} entry={entry} onChanged={refresh} />)}
+							{filteredEntries.map((entry) => <EntryCard key={entry.manifest.id} entry={entry} onChanged={refreshPlugins} />)}
 						</div> : <div className="ops-empty-state"><div className="text-sm font-medium">没有匹配的插件</div><p className="mt-2 text-sm text-muted-foreground">试试插件名称、标识或能力名称。</p></div>}
 					</div>
 				)}
@@ -522,13 +599,13 @@ export function ExtensionsPane() {
 			<Dialog open={installOpen} onOpenChange={setInstallOpen}>
 				<DialogContent>
 					<DialogHeader>
-						<DialogTitle>安装扩展</DialogTitle>
+						<DialogTitle>安装插件</DialogTitle>
 						<DialogDescription>
 							从本地目录安装：读取目录下的 pudding-extension.json，校验 kind / engines / permissions 后注册。默认本地链接（不复制源码）；勾选复制安装则作为用户包复制进数据目录。
 						</DialogDescription>
 					</DialogHeader>
 					<label className="flex flex-col gap-1 text-sm">
-						<span className="text-muted-foreground">扩展目录路径（服务端本机路径）</span>
+						<span className="text-muted-foreground">插件目录路径（服务端本机路径）</span>
 						<Input
 							value={installPath}
 							onChange={(e) => setInstallPath(e.target.value)}
@@ -561,7 +638,7 @@ export function ExtensionsPane() {
 					<DialogHeader>
 						<DialogTitle>开启开发者模式？</DialogTitle>
 						<DialogDescription>
-							本地代码 Extension 尚未运行在隔离 Extension Host 中。开启后，Extension 可以读取文件、环境变量和凭证，也可能启动进程或访问网络。只加载你信任并已审查的代码。
+							本地插件代码尚未运行在隔离的插件宿主中。开启后，插件可以读取文件、环境变量和凭证，也可能启动进程或访问网络。只加载你信任并已审查的代码。
 						</DialogDescription>
 					</DialogHeader>
 					<DialogFooter>

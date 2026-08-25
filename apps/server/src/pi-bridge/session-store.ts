@@ -1,5 +1,6 @@
 import {
 	createAgentSession,
+	createBashToolDefinition,
 	DefaultResourceLoader,
 	getAgentDir,
 	ModelRuntime,
@@ -12,12 +13,17 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { readFile, unlink } from "node:fs/promises";
 import { existsSync, writeFileSync } from "node:fs";
-import { agentDisplayName } from "../store/teams.js";
+import { agentDisplayName, MANAGER_AGENT_NAME } from "../store/teams.js";
 import type { PiManagerSettings, PiResourceConfig, TeamsStore } from "../store/teams.js";
 import type { WorkStateStore } from "../store/work-state.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import type { ArtifactStore } from "../agent-runtime/artifact-store.js";
-import { ExtensionCatalog, delegateToolName, toolSafeId } from "../agent-runtime/extensions.js";
+import {
+	ExtensionCatalog,
+	delegateToolName,
+	resolveAgentCapabilityRuntime,
+	toolSafeId,
+} from "../agent-runtime/extensions.js";
 import {
 	planManagerTools,
 	buildManagerExtensionFactories,
@@ -117,6 +123,7 @@ export class PiSessionStore {
 		private readonly artifacts?: ArtifactStore,
 		private readonly largeResults?: LargeWorkerResultStore,
 		private readonly productSettings?: ProductSettingsStore,
+		private readonly capabilityStateRoot?: string,
 	) {
 		this.catalog = catalog ?? new ExtensionCatalog();
 		if (this.teamsStore && this.invoker) {
@@ -189,7 +196,11 @@ export class PiSessionStore {
 		cwd: string,
 		settings?: PiManagerSettings,
 		resources?: PiResourceConfig,
-	): Promise<{ loader: DefaultResourceLoader; plan: ManagedToolPlan }> {
+	): Promise<{
+		loader: DefaultResourceLoader;
+		plan: ManagedToolPlan;
+		capabilityRuntime: Awaited<ReturnType<typeof resolveAgentCapabilityRuntime>> | undefined;
+	}> {
 		const agentDir = getAgentDir();
 		let plan: ManagedToolPlan = { managed: new Set(), active: new Set(), agents: [] };
 		let factories: InlineExtension[] = [];
@@ -216,21 +227,40 @@ export class PiSessionStore {
 		const workspaceAccess = this.teamsStore
 			? await this.teamsStore.workspaces.resourceAccessFor(ctx?.workspaceId)
 			: undefined;
+		const manager = await this.teamsStore?.getManager();
+		const capabilityRuntime = manager && this.capabilityStateRoot
+			? await resolveAgentCapabilityRuntime({
+				agent: manager,
+				catalog: this.catalog,
+				stateRoot: this.capabilityStateRoot,
+				cwd,
+				env: process.env,
+			})
+			: undefined;
+		for (const issue of capabilityRuntime?.issues ?? []) {
+			this.debugLog?.(`manager Capability runtime: ${issue.message} (${issue.code})`);
+		}
+		const sessionResources: PiResourceConfig | undefined = capabilityRuntime?.skillPaths.length
+			? {
+					...(resources ?? {}),
+					skillPaths: [...new Set([...(resources?.skillPaths ?? []), ...capabilityRuntime.skillPaths])],
+				}
+			: resources;
 		const loader = new DefaultResourceLoader({
 			cwd,
 			agentDir,
 			settingsManager: SettingsManager.create(cwd, agentDir),
 			extensionFactories: factories,
-			...piResourceLoaderOptions(resources, cwd, agentDir, workspaceAccess),
+			...piResourceLoaderOptions(sessionResources, cwd, agentDir, workspaceAccess),
 			// noExtensions 只控制 pi-native Extension；平台 inline core/delegation
 			// factories 不受影响。Skills/templates/context 全部由 piResources 决定。
 			...(settings?.noExtensions ? { noExtensions: true } : {}),
 			// append-only（提示词管理方案 §3）：manager 运行指令与窗口 guidance
 			// 追加到 pi 原生 append 之后，不覆盖 pi 内嵌默认提示词。
-			appendSystemPromptOverride: (base) => appendPiPrompts(base, resources, guidance),
+			appendSystemPromptOverride: (base) => appendPiPrompts(base, sessionResources, guidance),
 		});
 		await loader.reload();
-		return { loader, plan };
+		return { loader, plan, capabilityRuntime };
 	}
 
 	/** create()/open() 共用的会话装配：loader + 初始 active tools 策略。 */
@@ -246,7 +276,13 @@ export class PiSessionStore {
 	}): Promise<AgentSession> {
 		const settings = await this.managerSettings();
 		const resources = await this.managerResources();
-		const { loader, plan } = await this.managerResourceLoader(opts.ctx, opts.getSessionId, opts.cwd, settings, resources);
+		const { loader, plan, capabilityRuntime } = await this.managerResourceLoader(
+			opts.ctx,
+			opts.getSessionId,
+			opts.cwd,
+			settings,
+			resources,
+		);
 		const guidance = PiSessionStore.resolveGuidance(opts.ctx);
 		// 单聊/群聊 relay：manager 只保留委托工具，不能自己动手。solo 的
 		// manager prompt 只是人格/规则，不影响内置工具；§10.5 的
@@ -271,6 +307,18 @@ export class PiSessionStore {
 			...(settings?.thinkingLevel ? { thinkingLevel: settings.thinkingLevel } : {}),
 			resourceLoader: loader,
 			...(stripBuiltin ? { noTools: "builtin" as const } : {}),
+			...(!stripBuiltin && capabilityRuntime && capabilityRuntime.activeBindings > 0
+				? {
+						customTools: [
+							createBashToolDefinition(opts.cwd, {
+								spawnHook: (spawnCtx) => ({
+									...spawnCtx,
+									env: { ...spawnCtx.env, ...capabilityRuntime.env },
+								}),
+							}) as NonNullable<CreateAgentSessionOptions["customTools"]>[number],
+						],
+					}
+				: {}),
 		});
 		// 激活策略（§3.3）：基础委托工具全窗口默认激活（省掉 search 轮次）；
 		// capability 扩展工具按绑定策略预注册，searchable 的保持 inactive，
@@ -396,7 +444,9 @@ export class PiSessionStore {
 		let reloadPending = 0;
 		for (const [id, assembled] of this.assembledManaged) {
 			if (!this.active.has(id)) continue;
-			if (![...assembled].some((n) => n.startsWith(prefix))) continue;
+			// Manager 自身的 Session runtime（Skills/CLI 环境）不产生 agent_*
+			// 命名空间工具，但其 Capability 变更仍影响所有活跃 manager Session。
+			if (agentName !== MANAGER_AGENT_NAME && ![...assembled].some((n) => n.startsWith(prefix))) continue;
 			affectedSessions++;
 			if (this.runtimeDirty.has(id)) reloadPending++;
 		}
@@ -825,18 +875,43 @@ export class PiSessionStore {
 	 * hidden entry is persisted immediately, does not enter the model queue, and
 	 * is consumed by the web history reducer only to enrich the original tool card.
 	 */
+	private appendProjectionToSession(
+		session: AgentSession,
+		message: { customType: string; content: string; details?: Record<string, unknown> },
+	): number {
+		const entryId = session.sessionManager.appendCustomMessageEntry(
+			message.customType,
+			message.content,
+			false,
+			message.details,
+		);
+		const entry = session.sessionManager.getEntry(entryId);
+		const persistedAt = entry?.timestamp ? Date.parse(entry.timestamp) : Number.NaN;
+		const timestamp = Number.isNaN(persistedAt) ? Date.now() : persistedAt;
+
+		// SessionManager 是持久化事实源；AgentSession.messages 是 HTTP/实时展示镜像。
+		// 直写 SessionManager 不会像 sendCustomMessage 那样同步 agent state，若只
+		// 广播事件，当前页面能看到元数据，但切换会话后的 /messages 会从驻留实例
+		// 读到旧镜像，丢失 delegationId/processView。写入点同时更新两者，避免
+		// 依赖刷新、重启或消费端猜测来修复分叉。
+		session.state.messages.push({
+			role: "custom",
+			customType: message.customType,
+			content: message.content,
+			display: false,
+			details: message.details,
+			timestamp,
+		});
+		return timestamp;
+	}
+
 	async appendCustomMessageProjection(
 		id: string,
 		message: { customType: string; content: string; details?: Record<string, unknown> },
 	): Promise<void> {
 		try {
 			const session = await this.open(id);
-			session.sessionManager.appendCustomMessageEntry(
-				message.customType,
-				message.content,
-				false,
-				message.details,
-			);
+			const timestamp = this.appendProjectionToSession(session, message);
 			await this.ensureSessionFile(id);
 			// SessionManager direct appends do not emit AgentSession events. Mirror
 			// this hidden projection onto the store subscription bus so an already
@@ -850,7 +925,7 @@ export class PiSessionStore {
 					content: message.content,
 					display: false,
 					details: message.details,
-					timestamp: Date.now(),
+					timestamp,
 				},
 			} as AgentSessionEvent);
 		} catch (err) {
@@ -889,12 +964,10 @@ export class PiSessionStore {
 		return this.serializeCustomEvent(async () => {
 			const session = await this.open(id);
 			if (this.hasCustomEvent(session, eventId)) return false;
-			session.sessionManager.appendCustomMessageEntry(
-				message.customType,
-				message.content,
-				false,
-				{ ...(message.details ?? {}), eventId },
-			);
+			this.appendProjectionToSession(session, {
+				...message,
+				details: { ...(message.details ?? {}), eventId },
+			});
 			await this.ensureSessionFile(id);
 			this.deliveredCustomEvents.add(eventId);
 			return true;

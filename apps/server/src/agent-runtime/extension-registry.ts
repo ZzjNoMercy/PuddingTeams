@@ -178,10 +178,23 @@ export class ExtensionRegistry {
 		this.packagesDir = path.join(extensionsDir, "packages");
 	}
 
-	/** 落盘目录 + 重新注册上次安装的本地 Extension（重启恢复）。 */
-	async init(opts: { developerMode?: boolean } = {}): Promise<void> {
+	/**
+	 * 落盘目录 + 重新注册上次安装的 Extension（重启恢复）。发行入口传入
+	 * 当前 bundledIds 后，会先移除已经退出发行物的旧 bundled 记录；用户安装
+	 * 和 local-link 不受影响。
+	 */
+	async init(opts: { developerMode?: boolean; bundledIds?: readonly string[] } = {}): Promise<void> {
 		this.developerMode = opts.developerMode === true;
-		for (const record of await this.readFile()) {
+		let records = await this.readFile();
+		if (opts.bundledIds) {
+			const currentBundled = new Set(opts.bundledIds);
+			const filtered = records.filter(
+				(record) => record.origin !== "bundled" || currentBundled.has(record.manifest.id),
+			);
+			if (filtered.length !== records.length) await this.writeFile(filtered);
+			records = filtered;
+		}
+		for (const record of records) {
 			this.installed.set(record.manifest.id, record);
 			if (record.origin === "local-link") {
 				await this.checkLinkDrift(record);
@@ -309,6 +322,11 @@ export class ExtensionRegistry {
 
 	manifestOf(id: string): PuddingTeamsExtensionManifest | undefined {
 		return this.builtins.get(id)?.manifest ?? this.installed.get(id)?.manifest;
+	}
+
+	/** 动态 probe / Session 资源装配读取已激活的 Capability 模块。 */
+	capabilityModuleOf(id: string): CapabilityExtensionModule | undefined {
+		return this.catalog.get(id);
 	}
 
 	// ---- builtin 注册 ----

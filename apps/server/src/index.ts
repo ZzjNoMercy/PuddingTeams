@@ -118,14 +118,18 @@ extensionRegistry.registerBuiltin(piConnectorManifest, piExtensionHooks({ sessio
 	// pi Connector 的默认头像（lobehub Pi 图标）随 server 包发布。
 	assetsDir: fileURLToPath(new URL("../assets", import.meta.url)),
 });
-await extensionRegistry.init({ developerMode: initialProductSettings.developerMode });
+await extensionRegistry.init({
+	developerMode: initialProductSettings.developerMode,
+	bundledIds: ["codex", "claude-code", "lark-cli"],
+});
 // P2（§9.5 双宿主包）：codex / claude-code Connector 本体在 extensions/connectors/*，
 // 第一方预置 = 启动时按仓库内路径安装/更新，不再代码内嵌 builtin。
 const REPO_CONNECTORS_DIR = fileURLToPath(new URL("../../../extensions/connectors", import.meta.url));
 const REPO_CAPABILITIES_DIR = fileURLToPath(new URL("../../../extensions/capabilities", import.meta.url));
 await extensionRegistry.installOrUpdateFromDir(path.join(REPO_CONNECTORS_DIR, "codex"));
 await extensionRegistry.installOrUpdateFromDir(path.join(REPO_CONNECTORS_DIR, "claude-code"));
-await extensionRegistry.installOrUpdateFromDir(path.join(REPO_CAPABILITIES_DIR, "minimal-tool"));
+await extensionRegistry.installOrUpdateFromDir(path.join(REPO_CAPABILITIES_DIR, "lark-cli"));
+const capabilityStateRoot = path.join(paths.secrets, "capabilities");
 const runtime: AgentRuntime = new AgentRuntime(
 	delegations,
 	interactionSecrets,
@@ -134,9 +138,28 @@ const runtime: AgentRuntime = new AgentRuntime(
 	artifacts,
 	delegationTimelines,
 );
-const invoker = new AgentInvoker(teams, runtime, drivers, credentials, defaultCwd);
+const invoker = new AgentInvoker(
+	teams,
+	runtime,
+	drivers,
+	credentials,
+	defaultCwd,
+	catalog,
+	capabilityStateRoot,
+);
 
-const store = new PiSessionStore(defaultCwd, paths.sessions, teams, invoker, catalog, workStates, artifacts, largeWorkerResults, productSettings);
+const store = new PiSessionStore(
+	defaultCwd,
+	paths.sessions,
+	teams,
+	invoker,
+	catalog,
+	workStates,
+	artifacts,
+	largeWorkerResults,
+	productSettings,
+	capabilityStateRoot,
+);
 invoker.setManagerSender((managerSessionId, message, options) =>
 	store.sendCustomMessage(managerSessionId, message, options),
 );
@@ -269,6 +292,7 @@ await registerAgentsRoutes(app, teams, {
 	invoker,
 	extensions: extensionRegistry,
 	sessions: store,
+	capabilityStateRoot,
 });
 await registerExtensionsRoutes(app, { registry: extensionRegistry, teams, runtime, sessions: store, settings: productSettings });
 registerResourcesRoutes(app);

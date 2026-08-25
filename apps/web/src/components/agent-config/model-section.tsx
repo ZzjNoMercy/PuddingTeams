@@ -104,7 +104,7 @@ function ManagerFields({
 				onChange={(v) => onChange({ manager: { ...draft.manager, builtinTools: v } })}
 			/>
 			<ToggleRow
-				label="不加载 pi-native Extensions"
+				label="不加载 Pi 原生插件"
 				checked={draft.manager.noExtensions ?? false}
 				onChange={(v) => onChange({ manager: { ...draft.manager, noExtensions: v } })}
 			/>

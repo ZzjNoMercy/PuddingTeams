@@ -209,7 +209,7 @@ export function ManagerDialog({
 						checked={builtinTools}
 						onChange={setBuiltinTools}
 					/>
-					<ToggleRow label="不加载 pi-native Extensions" checked={noExtensions} onChange={setNoExtensions} />
+					<ToggleRow label="不加载 Pi 原生插件" checked={noExtensions} onChange={setNoExtensions} />
 					<label className="flex flex-col gap-1 text-sm">
 						<span className="text-muted-foreground">thinking level（运行时即改）</span>
 						<Select value={thinkingLevel} onValueChange={(v) => setThinkingLevel(v as typeof thinkingLevel)}>

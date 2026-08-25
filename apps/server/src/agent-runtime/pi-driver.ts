@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import {
 	createAgentSession,
+	createBashToolDefinition,
 	DefaultResourceLoader,
 	getAgentDir,
 	ModelRuntime,
@@ -39,6 +40,11 @@ export interface LocalPiDriverOptions {
 	 * 未注入（独立使用）时维持只看 Agent 开关的旧语义。
 	 */
 	workspaceAccessFor?: (workspaceId?: string) => Promise<WorkspaceResourceAccess>;
+	/** 已绑定 Capability 给目标 worker Session 追加 Skills 与 bash 环境。 */
+	capabilityRuntimeFor?: (
+		env: NodeJS.ProcessEnv,
+		cwd: string,
+	) => Promise<{ activeBindings: number; skillPaths: string[]; env: NodeJS.ProcessEnv; issues: Array<{ code: string; message: string }> }>;
 	/** 会话存储目录；平台注入 `PUDDINGTEAMS_HOME/sessions/workers`，缺省（独立使用）派生 `<pi agentDir>/puddingteams-worker-sessions`。 */
 	sessionDir?: string;
 	/** 仅供运行时/测试调节；429/过载保持同一 Delegation 与 Session 冷却续跑。 */
@@ -249,16 +255,31 @@ export class LocalPiDriver implements AgentDriver {
 		sessionManager: SessionManager,
 		cwd: string,
 		workspaceAccess?: WorkspaceResourceAccess,
+		invocationEnv: NodeJS.ProcessEnv = process.env,
 	): Promise<AgentSession> {
 		const agentDir = getAgentDir();
+		const capabilityRuntime = this.opts.capabilityRuntimeFor
+			? await this.opts.capabilityRuntimeFor(invocationEnv, cwd)
+			: undefined;
+		const resources: PiResourceConfig | undefined = capabilityRuntime?.skillPaths.length
+			? {
+					...(this.opts.piResources ?? {}),
+					skillPaths: [...new Set([...(this.opts.piResources?.skillPaths ?? []), ...capabilityRuntime.skillPaths])],
+				}
+			: this.opts.piResources;
+		for (const issue of capabilityRuntime?.issues ?? []) {
+			// Worker 的动态 probe 会给用户完整修复建议；会话装配仅保留可见进度，
+			// 不因单个外部 Capability 不可用而阻断普通 Pi 工作。
+			console.warn(`[pi worker capability] ${issue.message} (${issue.code})`);
+		}
 		const loader = new DefaultResourceLoader({
 			cwd,
 			agentDir,
 			settingsManager: SettingsManager.create(cwd, agentDir),
-			...piResourceLoaderOptions(this.opts.piResources, cwd, agentDir, workspaceAccess),
+			...piResourceLoaderOptions(resources, cwd, agentDir, workspaceAccess),
 			// 无 extensionFactories：child pi 不挂载团队委托工具（§9.1 默认不递归）。
 			// append-only（§3）：worker 运行指令只追加，不覆盖 pi 内嵌默认提示词。
-			appendSystemPromptOverride: (base) => appendPiPrompts(base, this.opts.piResources),
+			appendSystemPromptOverride: (base) => appendPiPrompts(base, resources),
 		});
 		await loader.reload();
 		const model = await this.resolveModel();
@@ -271,6 +292,18 @@ export class LocalPiDriver implements AgentDriver {
 				? { thinkingLevel: this.opts.thinkingLevel as PiThinkingLevel }
 				: {}),
 			resourceLoader: loader,
+			...(capabilityRuntime && capabilityRuntime.activeBindings > 0
+				? {
+						customTools: [
+							createBashToolDefinition(cwd, {
+								spawnHook: (spawnCtx) => ({
+									...spawnCtx,
+									env: { ...spawnCtx.env, ...capabilityRuntime.env },
+								}),
+							}) as NonNullable<CreateAgentSessionOptions["customTools"]>[number],
+						],
+					}
+				: {}),
 		});
 		return session;
 	}
@@ -305,12 +338,12 @@ export class LocalPiDriver implements AgentDriver {
 			}
 			const info = (await SessionManager.list(ctx.cwd, this.sessionDir())).find((s) => s.id === sessionHandle);
 			if (!info) throw new Error(`pi worker 会话不存在：${sessionHandle}`);
-			const session = await this.newSession(SessionManager.open(info.path, this.sessionDir()), ctx.cwd, access);
+			const session = await this.newSession(SessionManager.open(info.path, this.sessionDir()), ctx.cwd, access, ctx.env);
 			await this.reconcileModel(session);
 			retainSession(session);
 			return { session, sessionHandle: session.sessionId };
 		}
-		const session = await this.newSession(SessionManager.create(ctx.cwd, this.sessionDir()), ctx.cwd, access);
+		const session = await this.newSession(SessionManager.create(ctx.cwd, this.sessionDir()), ctx.cwd, access, ctx.env);
 		retainSession(session);
 		return { session, sessionHandle: session.sessionId };
 	}

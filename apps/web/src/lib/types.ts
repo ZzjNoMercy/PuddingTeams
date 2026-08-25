@@ -515,7 +515,9 @@ export interface BindingProbeResult {
 	enabled: boolean;
 	activation: string | null;
 	tools: string[];
-	issues: Array<{ code: string; message: string }>;
+	authenticated?: boolean | "unknown";
+	details?: Record<string, unknown>;
+	issues: Array<{ code: string; message: string; fixAction?: string }>;
 }
 
 /** 写操作统一响应里的受影响 manager Session 统计（§10.1）。 */

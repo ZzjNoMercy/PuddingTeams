@@ -1,0 +1,98 @@
+{
+	"name": "@puddingteams/capability-lark-cli",
+	"version": "1.0.0",
+	"description": "PuddingTeams/Pi capability that provisions the official Lark CLI and its embedded Skills.",
+	"type": "module",
+	"license": "MIT",
+	"scripts": {
+		"test": "node --import tsx --test index.test.ts",
+		"typecheck": "tsc -p tsconfig.json --noEmit"
+	},
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"puddingteams",
+		"lark",
+		"feishu",
+		"lark-cli"
+	],
+	"exports": {
+		".": "./index.ts",
+		"./pi": "./pi/index.js"
+	},
+	"files": [
+		"index.ts",
+		"pi",
+		"README.md"
+	],
+	"pi": {
+		"extensions": [
+			"./pi/index.js"
+		]
+	},
+	"puddingteams": {
+		"id": "lark-cli",
+		"publisher": "puddingteams",
+		"displayName": "飞书 CLI",
+		"version": "1.0.0",
+		"source": "trusted",
+		"kind": "capability",
+		"engines": {
+			"puddingteams": ">=0.1 <1"
+		},
+		"permissions": [
+			"spawn",
+			"network",
+			"workspace",
+			"secrets"
+		],
+		"entry": "index.ts",
+			"capability": {
+			"id": "lark-cli",
+			"displayName": "飞书 CLI",
+			"apiVersion": "1",
+			"compatibleConnectors": [
+				"pi"
+			],
+				"configSchema": {
+					"type": "object",
+					"properties": {
+						"authMode": {
+							"type": "string",
+							"title": "登录方式",
+							"default": "auto",
+							"enum": [
+								"auto",
+								"local",
+								"isolated"
+							],
+							"x-puddingteams-enum-labels": {
+								"auto": "自动选择",
+								"local": "沿用本机登录状态",
+								"isolated": "使用独立登录目录"
+							},
+							"description": "检测到本机 CLI 时沿用本机登录状态；由平台安装 CLI 时，为当前绑定单独保存登录状态"
+						},
+						"configDir": {
+							"type": "string",
+							"title": "自定义登录目录",
+							"x-puddingteams-visible-when": {
+								"field": "authMode",
+								"equals": "isolated"
+							},
+							"description": "指定当前绑定单独保存登录状态的位置"
+						}
+					}
+				},
+			"tools": []
+		}
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": ">=0.83.0 <0.84.0"
+	},
+	"devDependencies": {
+		"@types/node": "^24.13.3",
+		"tsx": "^4.23.5",
+		"typescript": "^5.9.3"
+	}
+}

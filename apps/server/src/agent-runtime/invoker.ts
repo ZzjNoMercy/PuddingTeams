@@ -5,6 +5,7 @@ import type { DelegationRecord } from "./delegation-store.js";
 import { DriverRegistry } from "./driver-registry.js";
 import { PuddingClawDriver } from "./puddingclaw-driver.js";
 import type { AgentDriver, DriverCapabilities, InvocationContext } from "./types.js";
+import { ExtensionCatalog, resolveAgentCapabilityRuntime } from "./extensions.js";
 
 export interface AgentInvokeParams {
 	windowId: string;
@@ -81,6 +82,8 @@ export class AgentInvoker {
 		private readonly drivers: DriverRegistry,
 		private readonly credentials?: CredentialsStore,
 		private readonly defaultCwd?: string,
+		private readonly extensionCatalog?: ExtensionCatalog,
+		private readonly capabilityStateRoot?: string,
 	) {}
 
 	/** 注入 manager 会话通知器（PiSessionStore），启动时由 index.ts 调用。 */
@@ -883,6 +886,18 @@ export class AgentInvoker {
 							piResources: agent.piResources,
 							// 信任门判定单点（§7.2）：Driver 装配会话时按 workspaceId 实时判定。
 							workspaceAccessFor: (workspaceId?: string) => this.teams.workspaces.resourceAccessFor(workspaceId),
+							...(this.extensionCatalog && this.capabilityStateRoot
+								? {
+										capabilityRuntimeFor: (env: NodeJS.ProcessEnv, cwd: string) =>
+											resolveAgentCapabilityRuntime({
+												agent,
+												catalog: this.extensionCatalog!,
+												stateRoot: this.capabilityStateRoot!,
+												cwd,
+												env,
+											}),
+									}
+								: {}),
 						}
 					: (config ?? {}),
 				agent.connector.extensionId,

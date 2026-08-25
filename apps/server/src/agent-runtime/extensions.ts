@@ -104,10 +104,47 @@ export interface CapabilityRegistration extends AgentExtensionContext {
 	registerTool(tool: ToolDefinition): void;
 }
 
-/** Capability Extension 运行时模块（本 Phase 仅平台内置，进程内加载）。 */
+export interface CapabilityRuntimeIssue {
+	code: string;
+	message: string;
+	fixAction?: string;
+}
+
+/**
+ * Capability 对目标 Pi Session 的资源贡献。业务 Capability 仍不能注册
+ * Driver/Transport；这里只允许追加 Skill 路径和为该 Session 的 bash 子进程
+ * 合成环境变量。宿主用 binding 级 stateDir 隔离 CLI 自管的认证状态。
+ */
+export interface CapabilitySessionRuntime {
+	skillPaths?: string[];
+	env?: NodeJS.ProcessEnv;
+	details?: Record<string, unknown>;
+	issues?: CapabilityRuntimeIssue[];
+}
+
+export interface CapabilityRuntimeContext {
+	agent: Readonly<AgentSummary & { pinned: boolean; connectorId?: string }>;
+	binding: Readonly<AgentCapabilityBinding>;
+	config: Readonly<Record<string, unknown>>;
+	cwd: string;
+	env: NodeJS.ProcessEnv;
+	/** `<PUDDINGTEAMS_HOME>/secrets/capabilities/<extension>/<agent>/<binding>`。 */
+	stateDir: string;
+}
+
+export interface CapabilityRuntimeContribution {
+	resolveSession(ctx: CapabilityRuntimeContext): CapabilitySessionRuntime | Promise<CapabilitySessionRuntime>;
+	probe?(ctx: CapabilityRuntimeContext):
+		| (CapabilitySessionRuntime & { authenticated?: boolean | "unknown" })
+		| Promise<CapabilitySessionRuntime & { authenticated?: boolean | "unknown" }>;
+}
+
+/** Capability Extension 运行时模块（当前进程内加载，隔离 Host 后迁入 Broker）。 */
 export interface CapabilityExtensionModule {
 	manifest: ExtensionManifest;
 	register(ctx: CapabilityRegistration): void | Promise<void>;
+	/** 可选：给绑定目标自身的 Pi Session 追加 Skills/CLI 环境与动态 probe。 */
+	runtime?: CapabilityRuntimeContribution;
 }
 
 /**
@@ -137,6 +174,79 @@ export class ExtensionCatalog {
 	list(): ExtensionManifest[] {
 		return [...this.modules.values()].map((m) => m.manifest);
 	}
+}
+
+export interface ResolvedCapabilityRuntime {
+	activeBindings: number;
+	skillPaths: string[];
+	env: NodeJS.ProcessEnv;
+	issues: CapabilityRuntimeIssue[];
+	details: Record<string, Record<string, unknown>>;
+}
+
+export function capabilityBindingStateDir(
+	stateRoot: string,
+	extensionId: string,
+	agentId: string,
+	bindingId: string,
+): string {
+	return path.join(stateRoot, toolSafeId(extensionId), toolSafeId(agentId), toolSafeId(bindingId));
+}
+
+/**
+ * 解析一个 Agent 的全部已启用 Capability Session 贡献。每个 binding 使用独立
+ * stateDir；失败只形成诊断并跳过该贡献，不应让普通 Pi 会话无法创建。
+ */
+export async function resolveAgentCapabilityRuntime(input: {
+	agent: AgentConfig;
+	catalog: ExtensionCatalog;
+	stateRoot: string;
+	cwd: string;
+	env?: NodeJS.ProcessEnv;
+}): Promise<ResolvedCapabilityRuntime> {
+	let env = { ...(input.env ?? process.env) };
+	const skillPaths = new Set<string>();
+	const issues: CapabilityRuntimeIssue[] = [];
+	const details: Record<string, Record<string, unknown>> = {};
+	let activeBindings = 0;
+	for (const binding of input.agent.capabilityExtensions ?? []) {
+		if (!binding.enabled) continue;
+		const module = input.catalog.get(binding.extensionId);
+		if (!module?.runtime) continue;
+		activeBindings++;
+		const key = `${binding.extensionId}:${binding.id}`;
+		const stateDir = capabilityBindingStateDir(input.stateRoot, binding.extensionId, input.agent.name, binding.id);
+		try {
+			const resolved = await module.runtime.resolveSession({
+				agent: {
+					id: input.agent.name,
+					name: input.agent.name,
+					description: input.agent.description,
+					capabilities: input.agent.capabilities ?? [],
+					pinned: input.agent.pinned === true,
+					...(input.agent.connector?.connectorId ? { connectorId: input.agent.connector.connectorId } : {}),
+				},
+				binding,
+				config: binding.config ?? {},
+				cwd: input.cwd,
+				env,
+				stateDir,
+			});
+			for (const skillPath of resolved.skillPaths ?? []) {
+				if (path.isAbsolute(skillPath)) skillPaths.add(skillPath);
+				else issues.push({ code: "invalid_skill_path", message: `${key} 返回了非绝对 Skill 路径` });
+			}
+			if (resolved.env) env = { ...env, ...resolved.env };
+			if (resolved.details) details[key] = resolved.details;
+			for (const issue of resolved.issues ?? []) issues.push({ ...issue, code: `${key}:${issue.code}` });
+		} catch (err) {
+			issues.push({
+				code: `${key}:runtime_failed`,
+				message: `Capability「${binding.extensionId}」Session 资源解析失败：${err instanceof Error ? err.message : String(err)}`,
+			});
+		}
+	}
+	return { activeBindings, skillPaths: [...skillPaths], env, issues, details };
 }
 
 // ---- 工具命名空间（§3.3） ----

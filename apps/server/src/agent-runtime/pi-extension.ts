@@ -74,6 +74,10 @@ export function piExtensionHooks(defaults: { sessionDir?: string } = {}): Builti
 					typeof config.workspaceAccessFor === "function"
 						? (config.workspaceAccessFor as LocalPiDriverOptions["workspaceAccessFor"])
 						: undefined,
+				capabilityRuntimeFor:
+					typeof config.capabilityRuntimeFor === "function"
+						? (config.capabilityRuntimeFor as LocalPiDriverOptions["capabilityRuntimeFor"])
+						: undefined,
 				// Agent 未显式配置时用平台默认（PUDDINGTEAMS_HOME/sessions/workers）。
 				sessionDir: str(config.sessionDir) ?? defaults.sessionDir,
 			}),

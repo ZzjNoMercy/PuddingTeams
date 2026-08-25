@@ -33,8 +33,35 @@ async function makeStack() {
 	const app = Fastify({ logger: false });
 	await app.register(websocket);
 	await registerChatRoutes(app, sessions, teams);
-	return { app, dir };
+	return { app, dir, sessions };
 }
+
+test("GET /api/sessions/:id/messages 包含运行中隐藏投影", async () => {
+	const { app, sessions } = await makeStack();
+	const summary = await sessions.create();
+	await sessions.appendCustomMessageProjection(summary.id, {
+		customType: "pudding:task_assign",
+		content: "生成页面",
+		details: {
+			taskId: "call-1",
+			delegationId: "delegation-1",
+			worker: "designer",
+			from: "solo",
+			status: "running",
+			processView: true,
+		},
+	});
+
+	const res = await app.inject({ method: "GET", url: `/api/sessions/${summary.id}/messages` });
+	assert.equal(res.statusCode, 200, res.body);
+	const projection = (res.json() as { messages: Array<{ role?: string; customType?: string; display?: boolean; details?: Record<string, unknown> }> })
+		.messages.find((message) => message.role === "custom" && message.customType === "pudding:task_assign");
+	assert.ok(projection, "驻留 AgentSession 的展示消息必须与 SessionManager 隐藏投影同步");
+	assert.equal(projection.display, false);
+	assert.equal(projection.details?.delegationId, "delegation-1");
+	assert.equal(projection.details?.processView, true);
+	await app.close();
+});
 
 test("GET /api/sessions/:id/messages 对不存在的 Session 返回 404", async () => {
 	const { app } = await makeStack();

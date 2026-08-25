@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { AlertCircleIcon, CheckCircle2Icon, CheckIcon, LoaderIcon, PauseCircleIcon, PlayIcon, RefreshCwIcon, TrashIcon, XCircleIcon } from "lucide-react";
+import { AlertCircleIcon, CheckCircle2Icon, CheckIcon, LoaderIcon, PauseCircleIcon, PlayIcon, PlusIcon, PuzzleIcon, RefreshCwIcon, TrashIcon, XCircleIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -54,6 +54,12 @@ const ORIGIN_LABELS: Record<CatalogEntry["origin"], string> = {
 	"local-link": "开发者本地链接",
 };
 
+const SOURCE_LABELS: Record<string, string> = {
+	builtin: "内置来源",
+	trusted: "可信来源",
+	external: "外部来源",
+};
+
 const PERMISSION_LABELS: Record<ExtensionPermission, string> = {
 	spawn: "启动本地进程",
 	network: "访问网络",
@@ -100,7 +106,7 @@ interface ConnectorProbeSummary {
 function connectorProbeSummary(probe: ConnectorProbeResult): ConnectorProbeSummary {
 	const transport = probe.transport ?? probe.capabilities.transport;
 	const target = transport === "http" ? "API" : transport === "spawn" ? "CLI" : "接入端";
-	if (!probe.extensionInstalled) return { title: "Connector 扩展未安装", description: "先安装对应扩展，再重新探测接入状态。", tone: "error" };
+	if (!probe.extensionInstalled) return { title: "连接插件未安装", description: "先安装对应插件，再重新探测接入状态。", tone: "error" };
 	if (!probe.configured) return { title: "接入配置不完整", description: `补全 ${target} 配置后再重新探测。`, tone: "error" };
 	if (!probe.detected) return {
 		title: transport === "http" ? "API 暂时不可达" : transport === "spawn" ? "未检测到 CLI" : "接入端不可用",
@@ -108,7 +114,7 @@ function connectorProbeSummary(probe: ConnectorProbeResult): ConnectorProbeSumma
 		tone: "error",
 	};
 	if (probe.authenticated === false) return { title: "认证未通过", description: `${target} 可访问，但当前凭证无法完成认证。`, tone: "error" };
-	if (probe.compatibility === "incompatible") return { title: "协议不兼容", description: "接入端可访问，但协议版本不在当前 Connector 的支持范围内。", tone: "error" };
+	if (probe.compatibility === "incompatible") return { title: "协议不兼容", description: "接入端可访问，但协议版本不在当前连接插件的支持范围内。", tone: "error" };
 	if (probe.compatibility === "untested" || probe.compatibility === "unknown") return {
 		title: "连接可用，兼容性待确认",
 		description: "已连接到接入端，但当前版本尚未经过兼容性验证。",
@@ -160,7 +166,7 @@ function ConnectorProbeView({ probe }: { probe: ConnectorProbeResult }) {
 		{ label: "兼容性", value: COMPATIBILITY_LABELS[probe.compatibility] },
 		...(probe.version ? [{ label: "协议版本", value: `v${probe.version}` }] : []),
 		...(probe.upstreamVersion ? [{ label: transport === "http" ? "服务版本" : "CLI 版本", value: `v${probe.upstreamVersion}` }] : []),
-		...(probe.extensionVersion ? [{ label: "Connector", value: `v${probe.extensionVersion}` }] : []),
+		...(probe.extensionVersion ? [{ label: "连接插件版本", value: `v${probe.extensionVersion}` }] : []),
 	];
 	return (
 		<div className="agent-config-inset overflow-hidden p-0">
@@ -236,6 +242,10 @@ function LegacyProbeView({ probe }: { probe: WorkerProbeResult }) {
 }
 
 function BindingProbeView({ probe }: { probe: BindingProbeResult }) {
+	const detailItems = probe.details
+		? Object.entries(probe.details).filter(([, value]) => value !== undefined && value !== null && value !== "")
+		: [];
+	const loginCommand = typeof probe.details?.loginCommand === "string" ? probe.details.loginCommand : undefined;
 	return (
 		<div className="agent-config-inset flex flex-col gap-1.5">
 			<div className="flex flex-wrap items-center gap-1.5">
@@ -244,6 +254,11 @@ function BindingProbeView({ probe }: { probe: BindingProbeResult }) {
 				</Badge>
 				<Badge variant={probe.loaded ? "secondary" : "destructive"}>{probe.loaded ? "已加载" : "加载失败"}</Badge>
 				<Badge variant={probe.enabled ? "secondary" : "outline"}>{probe.enabled ? "已启用" : "已停用"}</Badge>
+				{probe.authenticated !== undefined ? (
+					<Badge variant={probe.authenticated === true ? "secondary" : probe.authenticated === false ? "destructive" : "outline"}>
+						{probe.authenticated === true ? "已登录" : probe.authenticated === false ? "未登录" : "登录状态未知"}
+					</Badge>
+				) : null}
 				{probe.extensionVersion ? <Badge variant="outline">v{probe.extensionVersion}</Badge> : null}
 				{probe.activation ? <Badge variant="outline">激活：{probe.activation}</Badge> : null}
 			</div>
@@ -257,11 +272,28 @@ function BindingProbeView({ probe }: { probe: BindingProbeResult }) {
 					))}
 				</div>
 			) : null}
+			{detailItems.length > 0 ? (
+				<dl className="grid gap-x-4 gap-y-1.5 border-t border-border/60 pt-2 sm:grid-cols-2">
+					{detailItems.filter(([key]) => key !== "loginCommand").map(([key, value]) => (
+						<div key={key} className="min-w-0">
+							<dt className="text-[10px] text-muted-foreground">{key}</dt>
+							<dd className="truncate text-xs" title={String(value)}>{String(value)}</dd>
+						</div>
+					))}
+				</dl>
+			) : null}
+			{loginCommand ? (
+				<div className="border-t border-border/60 pt-2">
+					<span className="text-xs text-muted-foreground">登录命令</span>
+					<pre className="mt-1 overflow-x-auto whitespace-pre-wrap rounded-md bg-background/60 p-2 text-xs">{loginCommand}</pre>
+				</div>
+			) : null}
 			{probe.issues.length > 0 ? (
 				<div className="flex flex-col gap-0.5">
 					{probe.issues.map((issue, i) => (
 						<p key={`${issue.code}-${i}`} className="text-xs text-destructive">
 							{issue.message}
+							{issue.fixAction ? <span className="ml-1 text-muted-foreground">建议：{issue.fixAction}</span> : null}
 							<code className="ml-1 font-mono text-muted-foreground/70">({issue.code})</code>
 						</p>
 					))}
@@ -395,7 +427,7 @@ export function ConnectorSection({
 	return (
 		<div className="flex flex-col gap-3">
 			<section className="agent-config-card flex flex-col gap-3">
-				<div className="agent-config-card-head"><h2>Connector</h2><p>选择已安装的 Connector Extension；安装与更新在「扩展」页完成。</p></div>
+				<div className="agent-config-card-head"><h2>连接插件</h2><p>选择已安装的连接插件；安装与更新在「扩展」页完成。</p></div>
 			{/* 当前绑定 */}
 			{agent.connector ? (
 				<div className="flex flex-wrap items-center gap-2 text-xs">
@@ -408,15 +440,15 @@ export function ConnectorSection({
 					{agent.connector.versionPin ? <Badge variant="outline">固定 v{agent.connector.versionPin}</Badge> : null}
 				</div>
 			) : (
-				<p className="text-xs text-muted-foreground">尚未绑定 Connector。选择下方已安装的 Connector 完成接入。</p>
+				<p className="text-xs text-muted-foreground">尚未绑定连接插件。选择下方已安装的插件完成接入。</p>
 			)}
 
 			{/* Connector 选择/更换（安装扩展是独立动作，在「扩展目录」页完成） */}
 			<label className="flex flex-col gap-1 text-sm">
-				<span className="text-muted-foreground">Connector Extension</span>
+				<span className="text-muted-foreground">连接插件</span>
 				<Select value={extensionId} onValueChange={handleSelect}>
 					<SelectTrigger className="w-full">
-						<SelectValue placeholder="选择已安装的 Connector" />
+						<SelectValue placeholder="选择已安装的连接插件" />
 					</SelectTrigger>
 					<SelectContent>
 						{installed.map((entry) => (
@@ -428,7 +460,7 @@ export function ConnectorSection({
 					</SelectContent>
 				</Select>
 				{installed.length === 0 ? (
-					<span className="text-xs text-muted-foreground/70">没有已安装的 Connector，请先到「扩展」安装。</span>
+					<span className="text-xs text-muted-foreground/70">没有已安装的连接插件，请先到「扩展」安装。</span>
 				) : null}
 			</label>
 			{selected && !selected.loaded ? (
@@ -483,7 +515,7 @@ export function ConnectorSection({
 			</section>
 			{contribution ? (
 				<section className="agent-config-card flex flex-col gap-3">
-					<div className="agent-config-card-head"><h2>接入配置</h2><p>按 Connector 声明的 schema 填写；密钥加密存储，只存引用。</p></div>
+					<div className="agent-config-card-head"><h2>接入配置</h2><p>按连接插件声明的配置项填写；密钥加密存储，只保存引用。</p></div>
 					<label className="flex flex-col gap-1 text-sm">
 						<span className="text-muted-foreground">传输方式</span>
 						<Select value={selectedTransport} onValueChange={(value) => setTransport(value as AgentConnectorBinding["transport"])}>
@@ -619,7 +651,7 @@ export function LegacyInvokeSection({ agent, onSaved }: { agent: AgentConfig; on
 	return (
 		<div className="flex flex-col gap-3">
 			<section className="agent-config-card flex flex-col gap-3">
-				<div className="agent-config-card-head"><h2>接入命令</h2><p>该 Agent 使用 legacy 命令接入。推荐改用 Connector Extension（先创建新 Agent 或在「扩展」安装 Connector）。</p></div>
+				<div className="agent-config-card-head"><h2>接入命令</h2><p>该智能体使用旧版命令接入。推荐改用连接插件：先创建新智能体，或在「扩展」页面安装插件。</p></div>
 			<label className="flex flex-col gap-1 text-sm">
 				<span className="text-muted-foreground">命令（可执行文件或绝对路径）</span>
 				<Input value={command} onChange={(e) => setCommand(e.target.value)} placeholder="puddingclaw" />
@@ -690,21 +722,27 @@ function BindingCard({
 		setPrevBinding(binding);
 		setConfig(binding.config);
 		setSecrets({});
+		setProbe(null);
 	}
 
-	const run = async (action: string, fn: () => Promise<MutationResponse>) => {
+	const run = async (action: string, fn: () => Promise<MutationResponse>): Promise<boolean> => {
 		setBusy(action);
 		try {
 			const res = await fn();
 			onMutation(res);
+			setProbe(null);
+			return true;
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
+			return false;
 		} finally {
 			setBusy(null);
 		}
 	};
 
 	const handleProbe = async () => {
+		setEditOpen(false);
+		setProbe(null);
 		setBusy("probe");
 		try {
 			setProbe(await probeAgentBinding(agent.name, binding.id));
@@ -715,25 +753,47 @@ function BindingCard({
 		}
 	};
 
+	const handleSaveConfig = async () => {
+		const saved = await run("config", () =>
+			patchAgentBinding(agent.name, binding.id, {
+				config,
+				...(Object.keys(secrets).length > 0 ? { secrets } : {}),
+			}),
+		);
+		if (!saved) return;
+		setSecrets({});
+		setEditOpen(false);
+		toast.success("插件配置已保存");
+	};
+
 	return (
-		<div className="agent-config-card flex flex-col gap-2">
-			<div className="flex flex-wrap items-center gap-1.5">
-				<span className="text-sm font-medium">{manifest?.displayName ?? binding.extensionId}</span>
-				{entry ? <Badge variant="outline">v{entry.version}{entry.versionPin ? `（固定 ${entry.versionPin}）` : ""}</Badge> : null}
-				{entry ? <Badge variant="outline">{ORIGIN_LABELS[entry.origin]}</Badge> : null}
-				{!entry ? <Badge variant="destructive">扩展未安装</Badge> : !entry.loaded ? <Badge variant="destructive">加载失败</Badge> : null}
-				<Badge variant={binding.enabled ? "secondary" : "outline"}>{binding.enabled ? "已启用" : "已停用"}</Badge>
-			</div>
-			<div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted-foreground">
-				<code className="font-mono">{binding.extensionId}</code>
-				<span>→</span>
-				<code className="font-mono">{binding.capabilityId}</code>
-				{binding.versionPin ? <Badge variant="outline">绑定固定 v{binding.versionPin}</Badge> : null}
+		<div className="agent-config-card agent-plugin-binding-card flex flex-col gap-3">
+			<div className="agent-plugin-binding-head">
+				<div className="agent-plugin-binding-icon"><PuzzleIcon className="size-4" /></div>
+				<div className="min-w-0 flex-1">
+					<div className="flex flex-wrap items-center gap-2">
+						<span className="text-sm font-semibold">{manifest?.displayName ?? binding.extensionId}</span>
+						<span className={`agent-plugin-state ${binding.enabled ? "enabled" : "disabled"}`}>{binding.enabled ? "已启用" : "已停用"}</span>
+						{!entry ? <Badge variant="destructive">插件未安装</Badge> : !entry.loaded ? <Badge variant="destructive">加载失败</Badge> : null}
+					</div>
+					<div className="agent-plugin-binding-id">
+						<span>插件标识</span>
+						<code>{binding.extensionId}</code>
+						<span aria-hidden="true">·</span>
+						<span>能力标识</span>
+						<code>{binding.capabilityId}</code>
+					</div>
+				</div>
+				<div className="agent-plugin-binding-badges">
+					{entry ? <Badge variant="outline">插件版本 v{entry.version}{entry.versionPin ? `（固定 ${entry.versionPin}）` : ""}</Badge> : null}
+					{entry ? <Badge variant="outline">{ORIGIN_LABELS[entry.origin]}</Badge> : null}
+					{binding.versionPin ? <Badge variant="outline">绑定版本 v{binding.versionPin}</Badge> : null}
+				</div>
 			</div>
 			{/* 工具清单（模块 manifest 声明，命名空间前缀由平台加） */}
 			{manifest && manifest.capability.tools.length > 0 ? (
-				<div className="flex flex-col gap-0.5">
-					<span className="text-xs text-muted-foreground">工具</span>
+				<div className="agent-plugin-tools flex flex-col gap-1.5">
+					<span className="text-[10px] font-medium text-muted-foreground">提供的工具</span>
 					<div className="flex flex-wrap gap-1">
 						{manifest.capability.tools.map((tool) => (
 							<Badge key={tool.name} variant="outline" title={tool.description}>
@@ -746,9 +806,9 @@ function BindingCard({
 			) : null}
 			{entry?.loadError ? <p className="text-xs text-destructive">{entry.loadError}</p> : null}
 
-			<div className="flex flex-wrap items-center gap-2">
+			<div className="agent-plugin-actions flex flex-wrap items-center gap-2">
 				{/* 激活方式：API 不支持清除回“默认”，已设置时只提供 always/searchable */}
-				<Select
+				{manifest && manifest.capability.tools.length > 0 ? <Select
 					value={binding.activation ?? "default"}
 					onValueChange={(v) => {
 						if (v === "default") return;
@@ -760,11 +820,11 @@ function BindingCard({
 						<SelectValue />
 					</SelectTrigger>
 					<SelectContent>
-						{binding.activation === undefined ? <SelectItem value="default">激活：默认（扩展声明）</SelectItem> : null}
-						<SelectItem value="always">激活：always</SelectItem>
-						<SelectItem value="searchable">激活：searchable</SelectItem>
+						{binding.activation === undefined ? <SelectItem value="default">激活方式：插件默认</SelectItem> : null}
+						<SelectItem value="always">激活方式：始终启用</SelectItem>
+						<SelectItem value="searchable">激活方式：按需启用</SelectItem>
 					</SelectContent>
-				</Select>
+				</Select> : null}
 				<Button
 					type="button"
 					size="sm"
@@ -775,14 +835,24 @@ function BindingCard({
 					{busy === "toggle" ? <LoaderIcon className="size-3.5 animate-spin" /> : null}
 					{binding.enabled ? "停用" : "启用"}
 				</Button>
-				<Button type="button" size="sm" variant="outline" disabled={busy !== null} onClick={() => setEditOpen((o) => !o)}>
+				<Button
+					type="button"
+					size="sm"
+					variant="outline"
+					disabled={busy !== null}
+					onClick={() => {
+						const nextOpen = !editOpen;
+						setEditOpen(nextOpen);
+						if (nextOpen) setProbe(null);
+					}}
+				>
 					配置{editOpen ? "（收起）" : ""}
 				</Button>
 				<Button type="button" size="sm" variant="outline" disabled={busy !== null} onClick={() => void handleProbe()}>
 					{busy === "probe" ? <LoaderIcon className="size-3.5 animate-spin" /> : <RefreshCwIcon className="size-3.5" />}
 					探测
 				</Button>
-				<Button type="button" size="sm" variant="ghost" className="ml-auto" disabled={busy !== null} onClick={() => setConfirmDelete(true)}>
+				<Button type="button" size="sm" variant="ghost" className="ml-auto" aria-label={`删除「${manifest?.displayName ?? binding.extensionId}」绑定`} disabled={busy !== null} onClick={() => setConfirmDelete(true)}>
 					<TrashIcon className="size-3.5" />
 				</Button>
 			</div>
@@ -790,7 +860,14 @@ function BindingCard({
 			{editOpen ? (
 				<div className="flex flex-col gap-2 border-t pt-2">
 					<span className="text-xs text-muted-foreground">绑定配置</span>
-					<ConfigSchemaForm schema={manifest?.capability.configSchema} value={config} onChange={setConfig} />
+					<ConfigSchemaForm
+						schema={manifest?.capability.configSchema}
+						value={config}
+						onChange={(next) => {
+							setConfig(next);
+							setProbe(null);
+						}}
+					/>
 					<SecretSchemaFields
 						schema={manifest?.capability.secretSchema}
 						configuredKeys={Object.keys(binding.secretRefs ?? {})}
@@ -802,14 +879,7 @@ function BindingCard({
 							type="button"
 							size="sm"
 							disabled={busy !== null}
-							onClick={() =>
-								void run("config", () =>
-									patchAgentBinding(agent.name, binding.id, {
-										config,
-										...(Object.keys(secrets).length > 0 ? { secrets } : {}),
-									}),
-								).then(() => setSecrets({}))
-							}
+							onClick={() => void handleSaveConfig()}
 						>
 							{busy === "config" ? <LoaderIcon className="size-3.5 animate-spin" /> : null}
 							保存配置
@@ -881,13 +951,14 @@ export function BindingsSection({
 	const entryOf = (extensionId: string) => catalog?.find((e) => e.manifest.id === extensionId);
 
 	// “添加 Extension”只列 kind=capability 且与当前 connectorId 兼容的项（§10.1）。
-	// compatibleConnectors 缺省视为兼容全部；未绑定 Connector 的 Agent 不做过滤。
+	// pinned Manager 的宿主也是 pi；compatibleConnectors 缺省视为兼容全部。
 	const addable = (catalog ?? []).filter((entry) => {
 		if (!entry.installed || !entry.loaded || entry.manifest.kind !== "capability") return false;
 		if ((bindings ?? []).some((b) => b.extensionId === entry.manifest.id)) return false;
 		const compatible = entry.manifest.capability.compatibleConnectors;
-		if (!compatible || !agent.connector) return true;
-		return compatible.includes(agent.connector.connectorId);
+		if (!compatible) return true;
+		const connectorId = agent.pinned ? "pi" : agent.connector?.connectorId;
+		return connectorId ? compatible.includes(connectorId) : false;
 	});
 
 	const addEntry = addable.find((e) => e.manifest.id === addExtensionId);
@@ -924,15 +995,33 @@ export function BindingsSection({
 	};
 
 	return (
-		<div className="flex flex-col gap-3">
-			{bindings === null ? (
-				<div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
-					<LoaderIcon className="size-4 animate-spin" />
-					加载绑定…
+		<div className="agent-plugin-section flex flex-col gap-3">
+			<section className="agent-plugin-overview">
+				<div className="agent-plugin-overview-icon"><PuzzleIcon className="size-5" /></div>
+				<div className="min-w-0">
+					<div className="agent-plugin-overview-label">
+						<span>能力插件</span>
+						{bindings !== null ? <span className="agent-plugin-count">已绑定 {bindings.length} 个</span> : null}
+					</div>
+					<h2>{bindings === null ? "正在读取插件绑定" : bindings.length === 0 ? "尚未绑定能力插件" : "插件能力已接入"}</h2>
+					<p>{agent.pinned
+						? "绑定后，Manager 可在 Pi 会话中使用插件提供的工具、CLI 与技能。"
+						: "这里只展示与当前 Worker 连接方式兼容的插件，绑定后由该 Worker 独立使用。"}</p>
 				</div>
-			) : bindings.length === 0 ? (
-				<p className="text-xs text-muted-foreground">还没有绑定 Capability Extension。基础委托能力由平台自动生成，不占绑定位。</p>
-			) : (
+				{addOpen ? <span className="agent-plugin-mode">正在添加插件</span> : (
+					<Button type="button" size="sm" disabled={bindings === null || catalog === null} onClick={() => setAddOpen(true)}>
+						<PlusIcon className="size-3.5" />
+						添加插件
+					</Button>
+				)}
+			</section>
+
+			{bindings === null ? (
+				<div className="agent-plugin-loading flex items-center gap-2 text-sm text-muted-foreground">
+					<LoaderIcon className="size-4 animate-spin" />
+					正在读取插件绑定…
+				</div>
+			) : bindings.length > 0 ? (
 				bindings.map((binding) => (
 					<BindingCard
 						key={binding.id}
@@ -945,16 +1034,19 @@ export function BindingsSection({
 						}}
 					/>
 				))
-			)}
+			) : null}
 
 			{addOpen ? (
-				<div className="agent-config-card flex flex-col gap-2">
-					<div className="agent-config-card-head"><h2>添加 Extension</h2></div>
+				<div className="agent-config-card agent-plugin-add-card flex flex-col gap-3">
+					<div className="agent-plugin-add-head">
+						<div className="agent-plugin-add-icon"><PlusIcon className="size-4" /></div>
+						<div><h2>添加能力插件</h2><p>选择兼容插件并确认权限，添加后可继续配置和探测。</p></div>
+					</div>
 					{addable.length === 0 ? (
-						<p className="text-xs text-muted-foreground">
-							没有可添加的 Capability Extension{agent.connector ? `（需与 connector「${agent.connector.connectorId}」兼容）` : ""}
-							。可先到「扩展」安装。
-						</p>
+						<div className="agent-plugin-unavailable">
+							<strong>暂无可添加的能力插件</strong>
+							<p>{agent.pinned ? "这里只显示与 Pi 兼容且尚未绑定的插件。" : agent.connector ? `这里只显示与当前连接插件「${agent.connector.connectorId}」兼容且尚未绑定的插件。` : "请先完成 Worker 的基础接入配置。"} 可前往「扩展」页面管理插件。</p>
+						</div>
 					) : (
 						<Select
 							value={addExtensionId}
@@ -966,7 +1058,7 @@ export function BindingsSection({
 							}}
 						>
 							<SelectTrigger className="w-full">
-								<SelectValue placeholder="选择 Capability Extension" />
+								<SelectValue placeholder="选择能力插件" />
 							</SelectTrigger>
 							<SelectContent>
 								{addable.map((entry) => (
@@ -983,25 +1075,25 @@ export function BindingsSection({
 						<>
 							<div className="agent-config-inset flex flex-col gap-1.5 text-xs text-muted-foreground">
 								<div className="flex flex-wrap items-center gap-1.5">
-									<Badge variant="outline">来源：{addManifest.source}</Badge>
+									<Badge variant="outline">来源：{SOURCE_LABELS[addManifest.source] ?? addManifest.source}</Badge>
 									<Badge variant="outline">{ORIGIN_LABELS[addEntry.origin]}</Badge>
 									<Badge variant="outline">发布者：{addManifest.publisher}</Badge>
-									<Badge variant="outline">版本：v{addEntry.version}</Badge>
+									<Badge variant="outline">插件版本：v{addEntry.version}</Badge>
 									<Badge variant="outline">引擎：{addManifest.engines.puddingteams}</Badge>
 								</div>
 								{addManifest.permissions && addManifest.permissions.length > 0 ? (
 									<div className="flex flex-wrap items-center gap-1.5">
-										<span>权限：</span>
-										{addManifest.permissions.map((p) => (
-											<Badge key={p} variant="secondary">
-												{p}
-											</Badge>
-										))}
+									<span>权限：</span>
+									{addManifest.permissions.map((p) => (
+										<Badge key={p} variant="secondary">
+											{PERMISSION_LABELS[p]}
+										</Badge>
+									))}
 									</div>
 								) : null}
 								{addManifest.capability.tools.length > 0 ? (
 									<div className="flex flex-col gap-0.5">
-										<span>将注册的工具</span>
+										<span>将提供的工具</span>
 										{addManifest.capability.tools.map((tool) => (
 											<code key={tool.name} className="truncate font-mono" title={tool.description}>
 												agent_{agent.name}__{addManifest.id}__{tool.name}
@@ -1012,16 +1104,16 @@ export function BindingsSection({
 							</div>
 							<ConfigSchemaForm schema={addManifest.capability.configSchema} value={addConfig} onChange={setAddConfig} />
 							<SecretSchemaFields schema={addManifest.capability.secretSchema} configuredKeys={[]} values={addSecrets} onChange={setAddSecrets} />
-							<Select value={addActivation} onValueChange={(v) => setAddActivation(v as "default" | ToolActivation)}>
+							{addManifest.capability.tools.length > 0 ? <Select value={addActivation} onValueChange={(v) => setAddActivation(v as "default" | ToolActivation)}>
 								<SelectTrigger size="sm">
 									<SelectValue />
 								</SelectTrigger>
 								<SelectContent>
-									<SelectItem value="default">激活：默认（扩展声明）</SelectItem>
-									<SelectItem value="always">激活：always</SelectItem>
-									<SelectItem value="searchable">激活：searchable</SelectItem>
+									<SelectItem value="default">激活方式：插件默认</SelectItem>
+									<SelectItem value="always">激活方式：始终启用</SelectItem>
+									<SelectItem value="searchable">激活方式：按需启用</SelectItem>
 								</SelectContent>
-							</Select>
+							</Select> : null}
 						</>
 					) : null}
 
@@ -1043,13 +1135,7 @@ export function BindingsSection({
 						</Button>
 					</div>
 				</div>
-			) : (
-				<div>
-					<Button type="button" size="sm" variant="outline" onClick={() => setAddOpen(true)}>
-						添加 Extension
-					</Button>
-				</div>
-			)}
+			) : null}
 		</div>
 	);
 }
@@ -1093,7 +1179,7 @@ export function StatusSection({
 	return (
 		<div className="flex flex-col gap-3">
 			<section className="agent-config-card">
-				<div className="agent-config-card-head"><h2>启用状态</h2><p>停用后 Manager 不再派活给它，已绑定的 Capability 工具也一并不可用；配置与绑定保留，再启用时恢复。</p></div>
+				<div className="agent-config-card-head"><h2>启用状态</h2><p>停用后 Manager 不再派发任务，已绑定的插件能力也将不可用；配置与绑定会保留，重新启用后恢复。</p></div>
 				<div className="agent-config-inset flex flex-wrap items-center justify-between gap-3">
 					<div className="flex min-w-0 items-start gap-2.5">
 						<span className={`mt-1.5 size-2 shrink-0 rounded-full ${agent.enabled !== false ? "bg-primary" : "bg-muted-foreground/40"}`} />

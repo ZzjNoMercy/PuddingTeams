@@ -258,7 +258,7 @@ test("init --id 非法字符 → 1", async () => {
 });
 
 test("P3: validate 真实 Capability 包 + init capability 模板闭环", async () => {
-	const real = path.resolve(import.meta.dirname, "../../../../extensions/capabilities/minimal-tool");
+	const real = path.resolve(import.meta.dirname, "../../../../extensions/capabilities/lark-cli");
 	assert.equal((await runBin(["extension", "validate", real])).code, 0);
 	const dir = path.join(freshDir("pt-cap-init-"), "capability");
 	assert.equal(

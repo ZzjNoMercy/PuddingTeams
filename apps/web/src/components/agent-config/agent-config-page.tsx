@@ -86,12 +86,13 @@ const PI_SECTIONS: SectionDef[] = [
 	{ key: "prompt", label: "提示词", description: "运行指令、项目上下文与提示词预览。", icon: MessageSquareTextIcon },
 	{ key: "skills", label: "技能", description: "管理技能库，勾选本 Agent 的选用范围。", icon: SparklesIcon },
 	{ key: "templates", label: "模板", description: "管理可复用提示模板，让常用协作方式保持一致。", icon: BoxIcon },
+	{ key: "extensions", label: "插件", description: "为当前 Pi 会话绑定能力插件，扩充可使用的业务能力。", icon: BoxesIcon },
 ];
 
 const CONNECTOR_SECTIONS: SectionDef[] = [
 	OVERVIEW_SECTION,
-	{ key: "connector", label: "基础接入", description: "选择 Connector Extension、填写接入配置与密钥。", icon: PlugIcon },
-	{ key: "extensions", label: "Extensions", description: "绑定 Capability Extension，为 Worker 注册额外工具。", icon: BoxesIcon },
+	{ key: "connector", label: "基础接入", description: "选择连接插件，填写接入配置与密钥。", icon: PlugIcon },
+	{ key: "extensions", label: "插件", description: "为当前 Worker 绑定兼容的能力插件。", icon: BoxesIcon },
 	{ key: "status", label: "运行状态", description: "启停 Agent、检查接入可用性、查看写操作对会话的影响。", icon: ActivityIcon },
 ];
 
@@ -520,7 +521,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 								<ConnectorSection agent={agent} onMutation={handleMutation} />
 							)
 						) : null}
-						{!piMode && section === "extensions" ? <BindingsSection agent={agent} onMutation={handleMutation} /> : null}
+						{section === "extensions" ? <BindingsSection agent={agent} onMutation={handleMutation} /> : null}
 						{!piMode && section === "status" ? <StatusSection agent={agent} lastMutation={lastMutation} onToggleEnabled={handleToggleEnabled} toggling={toggling} /> : null}
 					</div>
 				</main>

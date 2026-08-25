@@ -459,6 +459,12 @@ test("group running 投影直接追加为隐藏 custom entry，不进入展示�
 	assert.ok(projection && projection.type === "custom_message");
 	assert.equal(projection.display, false);
 	assert.equal((projection.details as { delegationId?: string }).delegationId, "delegation-1");
+	const displayProjection = session.messages.find((message) =>
+		message.role === "custom" && message.customType === "pudding:task_assign",
+	);
+	assert.ok(displayProjection && displayProjection.role === "custom");
+	assert.equal(displayProjection.display, false);
+	assert.equal((displayProjection.details as { delegationId?: string }).delegationId, "delegation-1");
 	assert.ok(session.sessionFile, "隐藏投影也必须立即刷出 manager Session JSONL");
 	const liveProjection = liveEvents.find((event) => event.type === "message_start") as
 		| { type: "message_start"; message: { role?: string; customType?: string; display?: boolean; details?: unknown } }

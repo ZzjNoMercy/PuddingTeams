@@ -20,6 +20,7 @@ import path from "node:path";
  * <home>/artifacts/blobs/
  * <home>/workspaces/{managed/,unscoped/}   # unscoped = 无项目中立 cwd
  * <home>/secrets/{credentials.json,credentials.key,interaction-secrets.json,interactions.key,auth.json}
+ * <home>/secrets/capabilities/<extension>/<agent>/<binding>/ # CLI 自管认证状态
  * <home>/runtime/{backend.lease,tmp/}
  * <home>/logs/  <home>/migrations/
  * ```

@@ -10,7 +10,7 @@
  *   runtime/apps/server/assets/                 pi 默认头像等包内资源
  *   runtime/apps/web/out/                       Next 静态导出产物（server 同源托管）
  *   runtime/extensions/connectors/{codex,claude-code}/   entry 预编译为 .mjs
- *   runtime/extensions/capabilities/minimal-tool/
+ *   runtime/extensions/capabilities/lark-cli/       # 官方 CLI/Skills 自动同步适配层
  *   runtime/extensions/shared/templates/        extension init 脚手架模板
  *
  * 用法：node scripts/build-runtime.mjs [--skip-web]
@@ -93,7 +93,7 @@ step("第一方 extensions（entry 预编译 .ts → .mjs）");
 const FIRST_PARTY = [
 	path.join("extensions", "connectors", "codex"),
 	path.join("extensions", "connectors", "claude-code"),
-	path.join("extensions", "capabilities", "minimal-tool"),
+	path.join("extensions", "capabilities", "lark-cli"),
 ];
 for (const rel of FIRST_PARTY) {
 	const dest = path.join(RUNTIME, rel);

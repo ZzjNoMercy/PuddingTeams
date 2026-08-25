@@ -39,8 +39,26 @@ interface JsonSchemaProp {
 	"x-puddingteams-options"?: string;
 	/** Only render this field for the selected Connector transport(s). */
 	"x-puddingteams-transports"?: string[];
+	/** Optional display labels for string enum values; persisted values stay unchanged. */
+	"x-puddingteams-enum-labels"?: Record<string, string>;
+	/** Only render this field when another schema field resolves to the given value. */
+	"x-puddingteams-visible-when"?: {
+		field: string;
+		equals: string | number | boolean;
+	};
 	enum?: unknown[];
 	default?: unknown;
+}
+
+function isSchemaPropertyVisible(
+	prop: JsonSchemaProp,
+	props: Record<string, JsonSchemaProp>,
+	value: Record<string, unknown>,
+): boolean {
+	const condition = prop["x-puddingteams-visible-when"];
+	if (!condition) return true;
+	const controllingValue = value[condition.field] ?? props[condition.field]?.default;
+	return controllingValue === condition.equals;
 }
 
 /** 提取可简单映射的 object properties；返回 null 表示需要 JSON 回退。 */
@@ -267,9 +285,12 @@ export function ConfigSchemaForm({
 	return (
 		<div className="flex flex-col gap-2">
 			{Object.entries(props)
-				.filter(([, prop]) => !Array.isArray(prop["x-puddingteams-transports"])
-					|| !transport
-					|| prop["x-puddingteams-transports"]!.includes(transport))
+				.filter(([, prop]) => {
+					const transportVisible = !Array.isArray(prop["x-puddingteams-transports"])
+						|| !transport
+						|| prop["x-puddingteams-transports"]!.includes(transport);
+					return transportVisible && isSchemaPropertyVisible(prop, props, value);
+				})
 				.map(([key, prop]) => {
 				const label = prop.title ?? key;
 				const current = value[key];
@@ -325,7 +346,9 @@ export function ConfigSchemaForm({
 					);
 				}
 				if (Array.isArray(prop.enum)) {
-					const enumValue = typeof current === "string" && current ? current : UNSET;
+					const defaultValue = typeof prop.default === "string" ? prop.default : undefined;
+					const enumValue = typeof current === "string" && current ? current : defaultValue ?? UNSET;
+					const enumLabels = prop["x-puddingteams-enum-labels"] ?? {};
 					return (
 						<label key={key} className="flex flex-col gap-1 text-sm">
 							<span className="text-muted-foreground">
@@ -338,6 +361,12 @@ export function ConfigSchemaForm({
 									const updated = { ...value };
 									if (v === UNSET) delete updated[key];
 									else updated[key] = v;
+									for (const [dependentKey, dependentProp] of Object.entries(props)) {
+										if (dependentProp["x-puddingteams-visible-when"]?.field === key
+											&& !isSchemaPropertyVisible(dependentProp, props, updated)) {
+											delete updated[dependentKey];
+										}
+									}
 									onChange(updated);
 								}}
 							>
@@ -345,10 +374,10 @@ export function ConfigSchemaForm({
 									<SelectValue placeholder="请选择" />
 								</SelectTrigger>
 								<SelectContent>
-									{required.includes(key) ? null : <SelectItem value={UNSET}>不设置（默认）</SelectItem>}
+									{required.includes(key) || defaultValue ? null : <SelectItem value={UNSET}>不设置（默认）</SelectItem>}
 									{(prop.enum as string[]).map((option) => (
 										<SelectItem key={option} value={option}>
-											{option}
+											{enumLabels[option] ?? option}
 										</SelectItem>
 									))}
 								</SelectContent>
@@ -522,7 +551,7 @@ export function AvatarEditor({
 					) : null}
 				</div>
 				<p className="text-xs text-muted-foreground">
-					png / jpg / webp / gif，最大 2MB；未上传时使用{agent.pinned ? " PuddingTeams 默认头像" : agent.hasDefaultAvatar ? " Connector 默认头像" : "程序化默认头像"}。
+					png / jpg / webp / gif，最大 2MB；未上传时使用{agent.pinned ? " PuddingTeams 默认头像" : agent.hasDefaultAvatar ? "连接插件默认头像" : "程序化默认头像"}。
 				</p>
 			</div>
 		</div>

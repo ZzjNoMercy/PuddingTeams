@@ -324,7 +324,7 @@ test("Phase5: PuddingClaw Connector 不接受未声明 secret，revision 与 aff
 	await app.close();
 });
 
-test("Phase5: Capability 绑定 CRUD + probe + revision 递增", async () => {
+test("Phase5: Manager 与 Worker 均可配置 Capability；绑定 CRUD + probe + revision 递增", async () => {
 	const { app, teams, registry, dir } = await makeStack();
 	await teams.upsertAgent({
 		name: "alpha",
@@ -341,6 +341,17 @@ test("Phase5: Capability 绑定 CRUD + probe + revision 递增", async () => {
 	assert.equal(early.statusCode, 400);
 
 	await registry.install(writeCapabilityPackage(path.join(dir, "ext-cap")));
+	const managerCreated = await app.inject({
+		method: "POST",
+		url: "/api/agents/manager/extensions",
+		payload: { extensionId: "cap-ext", capabilityId: "cap-ext", config: { owner: "manager" } },
+	});
+	assert.equal(managerCreated.statusCode, 200, managerCreated.body);
+	assert.equal(
+		((await teams.getAgent("manager"))!.capabilityExtensions ?? [])[0]?.extensionId,
+		"cap-ext",
+		"pinned Manager 必须允许独立配置 Capability",
+	);
 	const rev0 = (await teams.getAgent("alpha"))!.extensionRevision ?? 0;
 
 	const created = await app.inject({

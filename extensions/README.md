@@ -30,9 +30,9 @@ extensions/
 
 ### Capabilities（`capabilities/`）
 
-| 包 | 绑定 Agent | 工具 | 状态 |
+| 包 | 绑定 Agent | 能力 | 状态 |
 | --- | --- | --- | --- |
-| —（暂无） | | | |
+| lark-cli（`capabilities/lark-cli`，`@puddingteams/capability-lark-cli`） | pinned Manager / 本地 Pi Worker | 直接从飞书官方渠道自动同步 CLI 与内嵌 `lark-*` Skills，注入 binding 隔离认证目录 | 可用（双宿主，默认未绑定） |
 
 ### Shared（`shared/`）
 
@@ -40,7 +40,6 @@ extensions/
 | --- | --- | --- |
 | pwcp（`shared/pwcp`，`@puddingteams/pwcp`） | PWCP 共享核心：Driver SPI 类型 + spawn/JSONL 与 HTTP/NDJSON transport + observe 机械收集（不依赖任何宿主） | 可用 |
 | templates（`shared/templates/`，非包，`.tmpl` 骨架） | `puddingteams extension init` 的模板：`connector/`（代码型双宿主包）、`connector-declarative/`（纯 manifest 声明式包） | 可用（P2-d） |
-| `capabilities/minimal-tool` | 无副作用的真实 Capability 包；验证 catalog → binding → 命名空间工具装配 | 可用（P3 产品闭环） |
 
 ## 脚手架与校验 CLI
 

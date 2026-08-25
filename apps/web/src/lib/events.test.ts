@@ -71,3 +71,24 @@ test("结果先到、富化指派后到时仍补齐执行过程入口", () => {
 	const call = rendered.find((message) => message.role === "assistant")?.toolCalls[0];
 	assert.deepEqual(call?.details, { taskId: "call-race", delegationId: "D-race", processView: true, status: "completed" });
 });
+
+test("历史重对齐后的实时 thinking 保留 assistant turn 起点", () => {
+	let rendered = renderHistory([{
+		role: "assistant",
+		content: [{ type: "thinking", thinking: "开始分析" }],
+		timestamp: 1_000,
+	}] as unknown as PiMessage[]);
+	assert.equal(rendered[0]?.streaming, false);
+
+	rendered = reducePiEvent(rendered, {
+		type: "message_update",
+		message: {
+			role: "assistant",
+			content: [{ type: "thinking", thinking: "继续分析" }],
+			timestamp: 1_000,
+		},
+	});
+
+	assert.equal(rendered[0]?.streaming, true);
+	assert.equal(rendered[0]?.timestamp, 1_000, "计时必须继续使用原 turn 起点，不能改成重挂载时间");
+});

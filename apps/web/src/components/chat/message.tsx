@@ -958,7 +958,7 @@ function MessageBody({
 					<div className="home-assistant-body">
 						<div className="home-message-meta"><strong>{assistantAs ? assistantLabel : "Manager"}</strong><span>{time}</span></div>
 						{showThinking && (
-							<AssistantReasoning streaming={message.streaming} thinking={message.thinking} />
+							<AssistantReasoning streaming={message.streaming} thinking={message.thinking} startedAt={message.timestamp} />
 						)}
 						{bubbleCalls.length > 0 && (
 							<div className="flex w-full flex-col gap-2">
@@ -1003,7 +1003,18 @@ export function Message({ roomId, ...props }: {
 	);
 }
 
-function AssistantReasoning({ streaming, thinking, className }: { streaming: boolean; thinking?: string; className?: string }) {
+function AssistantReasoning({
+	streaming,
+	thinking,
+	startedAt,
+	className,
+}: {
+	streaming: boolean;
+	thinking?: string;
+	/** pi assistant message timestamp：该 model turn 的稳定起点。 */
+	startedAt: number;
+	className?: string;
+}) {
 	// Freeze the mount-time streaming flag: live messages mount open and auto-close
 	// when the stream ends; history messages mount already collapsed, so switching
 	// sessions never plays an open→close jump (vendored Reasoning auto-closes
@@ -1011,7 +1022,12 @@ function AssistantReasoning({ streaming, thinking, className }: { streaming: boo
 	const [defaultOpen] = useState(() => streaming);
 
 	return (
-		<Reasoning isStreaming={streaming} defaultOpen={defaultOpen} className={className}>
+		<Reasoning
+			isStreaming={streaming}
+			defaultOpen={defaultOpen}
+			startTimeProp={streaming ? startedAt : null}
+			className={className}
+		>
 			<ReasoningTrigger hasContent={Boolean(thinking)} />
 			<ReasoningContent>{thinking ?? ""}</ReasoningContent>
 		</Reasoning>
@@ -1156,7 +1172,7 @@ function AssistantGroupBody({
 							<div className="flex w-full flex-col gap-3">
 								{segments.map((s) => (
 									<div key={s.m.id} className="home-assistant-segment flex w-full flex-col gap-2">
-										{s.showThinking && <AssistantReasoning streaming={s.m.streaming} thinking={s.m.thinking} className="mb-0" />}
+										{s.showThinking && <AssistantReasoning streaming={s.m.streaming} thinking={s.m.thinking} startedAt={s.m.timestamp} className="mb-0" />}
 										{s.showContent && (
 											<MessageResponse
 												className={`home-message-response ${s.m.error ? "text-destructive" : ""}`}

@@ -13,6 +13,7 @@ import { BrainIcon, ChevronDownIcon } from "lucide-react";
 import type { ComponentProps, ReactNode } from "react";
 import { createContext, memo, useContext, useEffect, useState } from "react";
 import { reasoningPlugins } from "@/core/streamdown/plugins";
+import { thinkingElapsedSeconds } from "@/lib/thinking-timing";
 import { Shimmer } from "./shimmer";
 import { ClipboardSafeStreamdown } from "./streamdown";
 
@@ -137,10 +138,12 @@ export type ReasoningTriggerProps = ComponentProps<
 };
 
 const LiveTimer = ({ startTime }: { startTime: number }) => {
-  const [elapsed, setElapsed] = useState(0);
+  const [elapsed, setElapsed] = useState(() =>
+    thinkingElapsedSeconds(startTime),
+  );
 
   useEffect(() => {
-    const calculateElapsed = () => Math.floor((Date.now() - startTime) / 1000);
+    const calculateElapsed = () => thinkingElapsedSeconds(startTime);
     setElapsed(calculateElapsed());
 
     const interval = setInterval(() => {

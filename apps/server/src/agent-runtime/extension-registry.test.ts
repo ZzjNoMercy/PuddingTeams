@@ -704,6 +704,20 @@ test("P4: bundled 预装按发行投影自愈 sourcePath——旧绝对路径失
 	assert.equal(persisted.extensions[0]!.sourcePath, dirB, "sourcePath 必须自愈为重新解析的投影路径");
 });
 
+test("P4: 退出发行物的 bundled Extension 在启动时自动移除", async () => {
+	const dir = freshDir("pt-bundled-retired-");
+	const registry = new ExtensionRegistry(dir, new ExtensionCatalog(), new DriverRegistry());
+	await registry.init();
+	await registry.installOrUpdateFromDir(writeExtension(path.join(dir, "bundled"), connectorManifest(), CONNECTOR_ENTRY));
+	assert.ok(registry.get("conn-ext"));
+
+	const restarted = new ExtensionRegistry(dir, new ExtensionCatalog(), new DriverRegistry());
+	await restarted.init({ bundledIds: [] });
+	assert.equal(restarted.get("conn-ext"), undefined);
+	const persisted = JSON.parse(readFileSync(path.join(dir, "registry.json"), "utf-8")) as { extensions: unknown[] };
+	assert.deepEqual(persisted.extensions, []);
+});
+
 test("P4: 卸载——user 包删除 packages 目录；bundled 拒绝卸载", async () => {
 	const dir = freshDir("pt-uninstall-user-");
 	const registry = new ExtensionRegistry(dir, new ExtensionCatalog(), new DriverRegistry());

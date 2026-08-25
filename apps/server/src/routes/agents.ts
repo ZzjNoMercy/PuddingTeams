@@ -11,7 +11,11 @@ import type { AgentRuntime } from "../agent-runtime/runtime.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import type { ExtensionRegistry } from "../agent-runtime/extension-registry.js";
 import type { PiSessionStore } from "../pi-bridge/session-store.js";
-import type { AgentCapabilityBinding, AgentConnectorBinding } from "../agent-runtime/extensions.js";
+import {
+	capabilityBindingStateDir,
+	type AgentCapabilityBinding,
+	type AgentConnectorBinding,
+} from "../agent-runtime/extensions.js";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { previewPiResources } from "../pi-bridge/pi-resources.js";
 import { PI_CONNECTOR_ID } from "../agent-runtime/pi-extension.js";
@@ -31,6 +35,8 @@ export interface AgentsRouteDeps {
 	extensions?: ExtensionRegistry;
 	/** 写操作后同步撤权并统计受影响 manager Session（§10.1）。 */
 	sessions?: PiSessionStore;
+	/** Capability 自管认证状态的 binding 级隔离根目录。 */
+	capabilityStateRoot?: string;
 }
 
 interface MutationResponse {
@@ -67,7 +73,7 @@ function connectorSecurityWarnings(agent: AgentConfig): string[] {
 
 /** Thin HTTP facade over the worker registry (agents.json) + Phase 5 管理 API（§10.1）。 */
 export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, deps: AgentsRouteDeps = {}): void {
-	const { credentials, runtime, invoker, extensions, sessions } = deps;
+	const { credentials, runtime, invoker, extensions, sessions, capabilityStateRoot } = deps;
 
 	function connectorBindingIssue(binding: unknown): string | undefined {
 		if (!binding || typeof binding !== "object" || Array.isArray(binding)) return undefined;
@@ -522,7 +528,6 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 	}>("/api/agents/:name/extensions", async (req, reply) => {
 		const agent = await teams.getAgent(req.params.name);
 		if (!agent) return reply.code(404).send({ error: "agent not found" });
-		if (agent.pinned) return reply.code(400).send({ error: "pinned manager 不绑定 Capability Extension" });
 		const { extensionId, capabilityId, enabled, config, activation, versionPin } = req.body ?? {};
 		if (!extensionId?.trim() || !capabilityId?.trim()) {
 			return reply.code(400).send({ error: "body must be { extensionId, capabilityId, enabled?, config? }" });
@@ -533,6 +538,14 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		const manifest = extensions?.manifestOf(extensionId);
 		if (extensions && (!manifest || manifest.kind !== "capability" || manifest.capability.id !== capabilityId)) {
 			return reply.code(400).send({ error: `extension「${extensionId}」未安装或不包含 capability「${capabilityId}」` });
+		}
+		if (manifest?.kind === "capability" && manifest.capability.compatibleConnectors?.length) {
+			const targetConnectorId = agent.pinned ? PI_CONNECTOR_ID : agent.connector?.connectorId;
+			if (!targetConnectorId || !manifest.capability.compatibleConnectors.includes(targetConnectorId)) {
+				return reply.code(400).send({
+					error: `capability「${capabilityId}」不兼容当前 Agent 的 Connector「${targetConnectorId ?? "未绑定"}」`,
+				});
+			}
 		}
 		try {
 			const allowedSecretKeys = new Set(manifest?.kind === "capability" ? (manifest.capability.secretSchema ?? []).map((item) => item.key) : []);
@@ -607,14 +620,54 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 			const binding = (agent.capabilityExtensions ?? []).find((b) => b.id === req.params.bindingId);
 			if (!binding) return reply.code(404).send({ error: `binding not found: ${req.params.bindingId}` });
 			const entry = extensions?.get(binding.extensionId);
-			const issues: Array<{ code: string; message: string }> = [];
+			const issues: Array<{ code: string; message: string; fixAction?: string }> = [];
 			if (!entry) issues.push({ code: "not_installed", message: `extension「${binding.extensionId}」未安装` });
 			else if (!entry.loaded) issues.push({ code: "load_failed", message: entry.loadError ?? "模块加载失败" });
 			if (!binding.enabled) issues.push({ code: "disabled", message: "该绑定已禁用" });
 			const tools =
 				entry?.manifest.kind === "capability"
-					? entry.manifest.capability.tools.map((t) => `agent_${agent.name}__${entry.manifest.id}__${t.name}`)
+					? entry.manifest.capability.tools.map((t) =>
+							agent.pinned ? `manager__${entry.manifest.id}__${t.name}` : `agent_${agent.name}__${entry.manifest.id}__${t.name}`,
+						)
 					: [];
+			const module = extensions?.capabilityModuleOf(binding.extensionId);
+			let runtimeProbe:
+				| {
+						authenticated?: boolean | "unknown";
+						details?: Record<string, unknown>;
+						issues?: Array<{ code: string; message: string; fixAction?: string }>;
+					}
+				| undefined;
+			if (module?.runtime?.probe && capabilityStateRoot) {
+				try {
+					runtimeProbe = await module.runtime.probe({
+						agent: {
+							id: agent.name,
+							name: agent.name,
+							description: agent.description,
+							capabilities: agent.capabilities ?? [],
+							pinned: agent.pinned === true,
+							...(agent.connector?.connectorId ? { connectorId: agent.connector.connectorId } : {}),
+						},
+						binding,
+						config: binding.config ?? {},
+						cwd: process.cwd(),
+						env: { ...process.env, ...(agent.env ?? {}) },
+						stateDir: capabilityBindingStateDir(
+							capabilityStateRoot,
+							binding.extensionId,
+							agent.name,
+							binding.id,
+						),
+					});
+					for (const issue of runtimeProbe.issues ?? []) issues.push(issue);
+				} catch (err) {
+					issues.push({
+						code: "runtime_probe_failed",
+						message: err instanceof Error ? err.message : String(err),
+					});
+				}
+			}
 			return {
 				probe: {
 					extensionInstalled: Boolean(entry),
@@ -624,6 +677,8 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 					activation: binding.activation ?? null,
 					tools,
 					issues,
+					...(runtimeProbe?.authenticated !== undefined ? { authenticated: runtimeProbe.authenticated } : {}),
+					...(runtimeProbe?.details ? { details: runtimeProbe.details } : {}),
 				},
 			};
 		},

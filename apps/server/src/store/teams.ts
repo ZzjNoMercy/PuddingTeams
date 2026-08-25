@@ -515,9 +515,7 @@ export class TeamsStore {
 			if (agent.name !== MANAGER_AGENT_NAME) {
 				throw new Error(`agent "${agent.name}": "pi" invoke 仅限保留名 "${MANAGER_AGENT_NAME}"`);
 			}
-			if (agent.connector || (agent.capabilityExtensions ?? []).length > 0) {
-				throw new Error("manager 不绑定 Connector / Capability Extension");
-			}
+			if (agent.connector) throw new Error("manager 不绑定 Connector");
 			agent.pinned = true;
 			agent.enabled = true;
 		} else if (agent.pinned) {
@@ -668,7 +666,6 @@ export class TeamsStore {
 	async addCapabilityBinding(name: string, binding: Omit<AgentCapabilityBinding, "id"> & { id?: string }): Promise<AgentConfig> {
 		const agent = await this.getAgent(name);
 		if (!agent) throw new Error(`agent not found: ${name}`);
-		if (agent.pinned) throw new Error(`agent「${name}」是 pinned 内置 Agent，不绑定 Capability Extension`);
 		if (!binding.extensionId?.trim() || !binding.capabilityId?.trim()) {
 			throw new Error("capability binding 需要 extensionId 与 capabilityId");
 		}

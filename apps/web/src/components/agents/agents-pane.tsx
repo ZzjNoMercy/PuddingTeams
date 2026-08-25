@@ -156,7 +156,7 @@ function CreateAgentDialog({
 		if (identifier.trim() && !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(identifier.trim())) {
 			return setError("标识只能包含字母、数字、连字符或下划线，且以字母或数字开头");
 		}
-		if (mode === "connector" && !contribution) return setError("请选择 Connector");
+		if (mode === "connector" && !contribution) return setError("请选择连接插件");
 		if (mode === "connector" && !selectedTransport) return setError("请选择传输方式");
 		if (mode === "command" && !command.trim()) return setError("命令必填");
 		setSaving(true);
@@ -231,7 +231,7 @@ function CreateAgentDialog({
 								onClick={() => setMode(m)}
 								className={mode === m ? "is-active" : ""}
 							>
-								{m === "connector" ? "Connector 接入" : "命令接入（legacy）"}
+								{m === "connector" ? "连接插件接入" : "命令接入（旧版）"}
 							</button>
 						))}
 					</div>
@@ -260,7 +260,7 @@ function CreateAgentDialog({
 					{mode === "connector" ? (
 						<>
 							<label className="worker-create-field">
-								<span className="worker-create-label">Connector Extension<span className="worker-create-required">*</span></span>
+								<span className="worker-create-label">连接插件<span className="worker-create-required">*</span></span>
 								<Select
 									value={extensionId}
 									onValueChange={(v) => {
@@ -272,7 +272,7 @@ function CreateAgentDialog({
 									}}
 								>
 									<SelectTrigger className="w-full">
-										<SelectValue placeholder="选择已安装的 Connector" />
+									<SelectValue placeholder="选择已安装的连接插件" />
 									</SelectTrigger>
 									<SelectContent>
 										{installed.map((entry) => (
@@ -284,8 +284,8 @@ function CreateAgentDialog({
 								</Select>
 								<span className="worker-create-hint">
 									{installed.length === 0
-										? "没有已安装的 Connector，请先到「扩展」页安装。"
-										: "决定 worker 的运行方式；选中后下方出现该 Connector 的配置项。"}
+									? "没有已安装的连接插件，请先到「扩展」页安装。"
+									: "决定 Worker 的运行方式；选中后下方显示该插件的配置项。"}
 								</span>
 							</label>
 							{contribution ? (
@@ -304,7 +304,7 @@ function CreateAgentDialog({
 												))}
 											</SelectContent>
 										</Select>
-										<span className="worker-create-hint">Connector 声明支持的运行边界；保存后该 Worker 固定使用此方式。</span>
+									<span className="worker-create-hint">连接插件声明支持的运行边界；保存后该 Worker 固定使用此方式。</span>
 									</label>
 									<ConfigSchemaForm schema={contribution.configSchema} value={config} onChange={setConfig} transport={selectedTransport} />
 									<SecretSchemaFields
@@ -564,7 +564,7 @@ export function AgentsPane() {
 								<div className="flex items-center justify-between gap-4">
 									<div className="flex items-center gap-2"><h3 className="text-sm font-semibold">Worker（第三方）</h3>
 									<Badge variant="secondary">{thirdPartyWorkers.length}</Badge>
-									</div><span className="text-xs text-muted-foreground">通过 Connector 添加，默认归入此处</span>
+									</div><span className="text-xs text-muted-foreground">通过连接插件添加，默认归入此处</span>
 								</div>
 								{thirdPartyWorkers.length > 0 ? (
 									<div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
