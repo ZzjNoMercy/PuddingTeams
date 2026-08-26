@@ -6,12 +6,13 @@ import path from "node:path";
 import { serializePiEvent } from "../pi-bridge/bridge.js";
 import { PiSessionStore } from "../pi-bridge/session-store.js";
 import type { TeamsStore } from "../store/teams.js";
-import { dispatchDirectMessage } from "../agent-runtime/direct-dispatch.js";
+import { directWorkerFor, dispatchDirectMessage } from "../agent-runtime/direct-dispatch.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import { config } from "../config.js";
 import type { WorkStateStore } from "../store/work-state.js";
 import type { UploadInput, UploadStore } from "../store/uploads.js";
-import type { PromptOptions } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type PromptOptions } from "@earendil-works/pi-coding-agent";
+import { previewPiResources } from "../pi-bridge/pi-resources.js";
 
 /**
  * Version of the bundled pi SDK, surfaced via /api/health for the About
@@ -84,6 +85,34 @@ export async function registerChatRoutes(
 	app.get("/api/models", async () => ({ models: await store.listModels() }));
 
 	app.get("/api/providers", async () => ({ providers: await store.listProviders() }));
+
+	app.get<{ Params: { id: string } }>("/api/sessions/:id/commands", async (req, reply) => {
+		try {
+			const direct = teams ? await directWorkerFor(teams, req.params.id) : undefined;
+			if (direct && teams) {
+				const agent = await teams.getAgent(direct.workerName);
+				if (!agent || agent.connector?.connectorId !== "pi") return { commands: [] };
+				const preview = await previewPiResources({
+					cwd: direct.window.cwdSnapshot,
+					agentDir: getAgentDir(),
+					resources: agent.piResources,
+					workspaceAccess: await teams.workspaces.resourceAccessFor(direct.window.workspaceId),
+				});
+				return {
+					commands: preview.skills
+						.filter((skill) => skill.enabled)
+						.map((skill) => ({ name: `skill:${skill.name}`, description: skill.description, source: "skill" as const }))
+						.sort((a, b) => a.name.localeCompare(b.name)),
+				};
+			}
+			return { commands: await store.listSkillCommands(req.params.id) };
+		} catch (err) {
+			if (err instanceof Error && err.message.startsWith("Session not found")) {
+				return reply.code(404).send({ error: "session not found" });
+			}
+			throw err;
+		}
+	});
 
 	app.get<{ Params: { id: string } }>("/api/providers/:id/models", async (req, reply) => {
 		if (!(await store.hasProvider(req.params.id))) {

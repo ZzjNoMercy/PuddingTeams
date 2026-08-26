@@ -37,6 +37,22 @@ interface CapabilityRegistration {
 	registerTool(tool: unknown): void;
 }
 
+interface ConnectionContext {
+	env: NodeJS.ProcessEnv;
+}
+
+interface ConnectionStatus {
+	id: string;
+	name: string;
+	description?: string;
+	state: "connected" | "disconnected" | "unavailable" | "error";
+	version?: string;
+	accountName?: string;
+	identity?: string;
+	message?: string;
+	checkedAt: string;
+}
+
 interface CommandResult {
 	code: number;
 	stdout: string;
@@ -457,6 +473,87 @@ async function probeRuntime(ctx: RuntimeContext): Promise<ProbeRuntime> {
 	return { ...resolved, authenticated, details, issues };
 }
 
+/** 扩展总览只读探测：不安装、不更新，也不读取或返回任何 token。 */
+async function listConnections(ctx: ConnectionContext): Promise<ConnectionStatus[]> {
+	const checkedAt = new Date().toISOString();
+	const cliPath = await findLocalCli(ctx.env);
+	if (!cliPath) {
+		return [{
+			id: "default",
+			name: "飞书 CLI",
+			description: "本机飞书账号连接",
+			state: "unavailable",
+			message: "未检测到本机 lark-cli",
+			checkedAt,
+		}];
+	}
+
+	const env = {
+		...ctx.env,
+		LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",
+		LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1",
+	};
+	const versionResult = await runCommand(cliPath, ["--version"], env, 30_000);
+	const version = cliVersion(versionResult);
+	const authResult = await runCommand(cliPath, ["auth", "status", "--json", "--verify"], env, 30_000);
+	if (authResult.code !== 0) {
+		return [{
+			id: "default",
+			name: "飞书 CLI",
+			description: "本机飞书账号连接",
+			state: "disconnected",
+			...(version ? { version } : {}),
+			message: "尚未登录或登录已失效",
+			checkedAt,
+		}];
+	}
+
+	try {
+		const status = JSON.parse(authResult.stdout) as {
+			ok?: unknown;
+			verified?: unknown;
+			identity?: unknown;
+			identities?: { user?: { userName?: unknown; status?: unknown; tokenStatus?: unknown } };
+		};
+		if (status.ok === false || status.verified === false) {
+			return [{
+				id: "default",
+				name: "飞书 CLI",
+				description: "本机飞书账号连接",
+				state: "disconnected",
+				...(version ? { version } : {}),
+				message: "登录凭证验证未通过",
+				checkedAt,
+			}];
+		}
+		const user = status.identities?.user;
+		const identity = status.identity === "bot" ? "机器人身份" : status.identity === "user" || user ? "用户身份" : undefined;
+		const identityStatus = typeof user?.status === "string" ? user.status : undefined;
+		const tokenStatus = typeof user?.tokenStatus === "string" ? user.tokenStatus : undefined;
+		return [{
+			id: "default",
+			name: "飞书 CLI",
+			description: "本机飞书账号连接",
+			state: "connected",
+			...(version ? { version } : {}),
+			...(typeof user?.userName === "string" ? { accountName: user.userName } : {}),
+			...(identity ? { identity } : {}),
+			message: tokenStatus === "valid" || identityStatus === "active" ? "登录状态有效" : "已登录",
+			checkedAt,
+		}];
+	} catch {
+		return [{
+			id: "default",
+			name: "飞书 CLI",
+			description: "本机飞书账号连接",
+			state: "error",
+			...(version ? { version } : {}),
+			message: "无法解析飞书 CLI 登录状态",
+			checkedAt,
+		}];
+	}
+}
+
 export const extension = {
 	manifest: {
 		id: "lark-cli",
@@ -467,11 +564,12 @@ export const extension = {
 		tools: [],
 	},
 	register(_ctx: CapabilityRegistration) {},
+	listConnections,
 	runtime: {
 		resolveSession: resolveRuntime,
 		probe: probeRuntime,
 	},
 };
 
-export { exportOfficialSkills, findLocalCli, parseConfig, probeRuntime, resolveRuntime };
+export { exportOfficialSkills, findLocalCli, listConnections, parseConfig, probeRuntime, resolveRuntime };
 export default extension;

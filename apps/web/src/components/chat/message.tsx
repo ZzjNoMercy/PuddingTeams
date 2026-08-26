@@ -73,6 +73,28 @@ function localPathFromHref(href: string): string | undefined {
 	}
 }
 
+/** Inline code is used heavily for paths in handoff summaries. Keep ordinary
+ * code untouched and only promote values that have a strong path signal. */
+function localPathFromInlineCode(value: string): string | undefined {
+	const candidate = value.trim();
+	if (!candidate || candidate.includes("\n")) return undefined;
+	const localPath = localPathFromHref(candidate);
+	if (!localPath) return undefined;
+	const explicitLocalPath =
+		/^(?:file|sandbox|attachment):/i.test(candidate) ||
+		/^(?:\.{1,2}[\\/]|[\\/]|[a-z]:[\\/])/i.test(candidate);
+	const fileLikePath = /(?:^|[\\/])[^\\/]+\.(?:html?|m?js|cjs|tsx?|jsx|py|jsonl?|mdx?|txt|csv|tsv|pdf|docx?|xlsx?|pptx?|png|jpe?g|webp|gif|svg|zip|tar|gz|toml|ya?ml|xml|sql|sh|zsh|bash|fish|rs|go|java|kt|swift|c|cc|cpp|h|hpp|css|scss|less|vue|svelte|log)$/i.test(localPath);
+	return explicitLocalPath || fileLikePath ? localPath : undefined;
+}
+
+async function openLocalPath(roomId: string, localPath: string) {
+	try {
+		await openRoomFile(roomId, localPath);
+	} catch (error) {
+		toast.error(error instanceof Error ? error.message : "无法打开本地文件");
+	}
+}
+
 function ChatMarkdownLink({ href = "", children, node, ...props }: ComponentProps<"a"> & { node?: unknown }) {
 	void node;
 	const roomId = useContext(RoomFileContext);
@@ -83,13 +105,7 @@ function ChatMarkdownLink({ href = "", children, node, ...props }: ComponentProp
 				type="button"
 				className="home-local-file-link"
 				title={`打开本地文件：${localPath}`}
-				onClick={async () => {
-					try {
-						await openRoomFile(roomId, localPath);
-					} catch (error) {
-						toast.error(error instanceof Error ? error.message : "无法打开本地文件");
-					}
-				}}
+				onClick={() => void openLocalPath(roomId, localPath)}
 			>
 				{children}
 			</button>
@@ -98,9 +114,29 @@ function ChatMarkdownLink({ href = "", children, node, ...props }: ComponentProp
 	return <a href={href} target={href.startsWith("#") ? undefined : "_blank"} rel="noreferrer" {...props}>{children}</a>;
 }
 
+function ChatInlineCode({ children, node, ...props }: ComponentProps<"code"> & { node?: unknown }) {
+	void node;
+	const roomId = useContext(RoomFileContext);
+	const text = typeof children === "string" ? children : undefined;
+	const localPath = text ? localPathFromInlineCode(text) : undefined;
+	if (localPath && roomId) {
+		return (
+			<button
+				type="button"
+				className="home-local-path-code"
+				title={`用系统默认应用打开：${localPath}`}
+				onClick={() => void openLocalPath(roomId, localPath)}
+			>
+				<code {...props}>{children}</code>
+			</button>
+		);
+	}
+	return <code {...props}>{children}</code>;
+}
+
 const chatStreamdownProps = {
 	...streamdownPlugins,
-	components: { a: ChatMarkdownLink },
+	components: { a: ChatMarkdownLink, inlineCode: ChatInlineCode },
 };
 
 /**

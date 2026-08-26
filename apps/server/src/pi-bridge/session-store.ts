@@ -77,6 +77,12 @@ export interface ProviderSummary {
 	baseUrl?: string;
 }
 
+export interface SessionSkillCommand {
+	name: string;
+	description: string;
+	source: "skill";
+}
+
 type PiModel = NonNullable<CreateAgentSessionOptions["model"]>;
 
 /** 纯展示 custom message 等待 run 落定的上限（超时降级 nextTurn）。 */
@@ -761,6 +767,14 @@ export class PiSessionStore {
 		const model = await this.resolveModel(modelRef);
 		await session.setModel(model);
 		return PiSessionStore.summarizeModel(model);
+	}
+
+	/** 当前 manager Session 真实装配的 Skill 命令；与 pi 的 /skill:name 展开清单同源。 */
+	async listSkillCommands(id: string): Promise<SessionSkillCommand[]> {
+		const session = await this.open(id);
+		return session.resourceLoader.getSkills().skills
+			.map((skill) => ({ name: `skill:${skill.name}`, description: skill.description, source: "skill" as const }))
+			.sort((a, b) => a.name.localeCompare(b.name));
 	}
 
 	/** 会话当前名称（未命名返回 ""）；direct 窗口首条消息自动起名前查它。 */

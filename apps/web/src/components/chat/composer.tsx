@@ -8,25 +8,28 @@ import {
 	PromptInputAttachments,
 	PromptInputFooter,
 	PromptInputProvider,
-	PromptInputSelect,
-	PromptInputSelectContent,
-	PromptInputSelectItem,
-	PromptInputSelectTrigger,
-	PromptInputSelectValue,
 	PromptInputSubmit,
 	PromptInputTextarea,
 	PromptInputTools,
 	usePromptInputController,
 	type ChatStatus,
 } from "@/components/ai-elements/prompt-input";
-import { listModels, MODELS_CHANGED_EVENT, setSessionModel, type MessageAttachmentInput } from "@/lib/api";
+import { listModels, listSessionCommands, MODELS_CHANGED_EVENT, setSessionModel, type MessageAttachmentInput, type SessionSlashCommand } from "@/lib/api";
 import { getPreferredModel, setPreferredModel } from "@/lib/model-pref";
 import type { ModelSummary } from "@/lib/types";
 import type { SessionStats } from "@/lib/session-stats";
 import { ChatStatsBar } from "./chat-stats-bar";
-import { SelectGroup, SelectLabel } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
-import { FolderGit2Icon, PaperclipIcon, TargetIcon } from "lucide-react";
+import {
+	DropdownMenu,
+	DropdownMenuContent,
+	DropdownMenuItem,
+	DropdownMenuSub,
+	DropdownMenuSubContent,
+	DropdownMenuSubTrigger,
+	DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { CheckIcon, ChevronDownIcon, FolderGit2Icon, PaperclipIcon, SparklesIcon, TargetIcon } from "lucide-react";
 import type { PromptInputFilePart } from "@/core/uploads";
 
 async function encodeAttachment(item: PromptInputFilePart): Promise<MessageAttachmentInput> {
@@ -113,25 +116,35 @@ function ModelPicker({
 		group.push(m);
 		byProvider.set(m.provider, group);
 	}
+	const selectedModel = models.find((model) => model.id === value);
 
 	return (
-		<PromptInputSelect value={value || undefined} onValueChange={handleChange}>
-			<PromptInputSelectTrigger className="h-8 w-auto gap-1 px-2 text-xs">
-				<PromptInputSelectValue placeholder="选择模型" />
-			</PromptInputSelectTrigger>
-			<PromptInputSelectContent>
+		<DropdownMenu>
+			<DropdownMenuTrigger asChild>
+				<Button type="button" variant="ghost" className="model-picker-trigger h-8 w-auto gap-1 px-2 text-xs">
+					<span className="max-w-44 truncate">{selectedModel?.name ?? "选择模型"}</span>
+					<ChevronDownIcon className="size-3.5 opacity-55" />
+				</Button>
+			</DropdownMenuTrigger>
+			<DropdownMenuContent className="model-picker-menu" align="start" sideOffset={8}>
 				{[...byProvider.entries()].map(([provider, providerModels]) => (
-					<SelectGroup key={provider}>
-						<SelectLabel className="text-sm font-medium text-foreground">{provider}</SelectLabel>
-						{providerModels.map((m) => (
-							<PromptInputSelectItem key={m.id} value={m.id} className="text-xs text-muted-foreground">
-								{m.name}
-							</PromptInputSelectItem>
-						))}
-					</SelectGroup>
+					<DropdownMenuSub key={provider}>
+						<DropdownMenuSubTrigger className="model-picker-provider-item">
+							<span className="min-w-0 flex-1 truncate">{provider}</span>
+							{providerModels.some((model) => model.id === value) ? <span className="model-picker-provider-active" aria-label="当前 Provider" /> : null}
+						</DropdownMenuSubTrigger>
+						<DropdownMenuSubContent className="model-picker-submenu" sideOffset={8}>
+							{providerModels.map((model) => (
+								<DropdownMenuItem key={model.id} className="model-picker-item" onSelect={() => handleChange(model.id)}>
+									<span className="min-w-0 flex-1 truncate">{model.name}</span>
+									{model.id === value ? <CheckIcon className="model-picker-check size-4" /> : null}
+								</DropdownMenuItem>
+							))}
+						</DropdownMenuSubContent>
+					</DropdownMenuSub>
 				))}
-			</PromptInputSelectContent>
-		</PromptInputSelect>
+			</DropdownMenuContent>
+		</DropdownMenu>
 	);
 }
 
@@ -167,30 +180,60 @@ function ComposerInner({
 	onOpenWorkspace: () => void;
 }) {
 	const { textInput, attachments } = usePromptInputController();
+	const [skillCommands, setSkillCommands] = useState<SessionSlashCommand[]>([]);
+	useEffect(() => {
+		let cancelled = false;
+		listSessionCommands(sessionId)
+			.then((commands) => { if (!cancelled) setSkillCommands(commands); })
+			.catch(() => { if (!cancelled) setSkillCommands([]); });
+		return () => { cancelled = true; };
+	}, [sessionId]);
 	const canSend = textInput.value.trim().length > 0 || attachments.files.length > 0;
 	const status: ChatStatus = disabled ? "streaming" : "idle";
-	const trimmed = textInput.value.trim();
-	const showGoalCommand = !disabled && !hasGoal && attachments.files.length === 0 && /^\/(?:g(?:o(?:a(?:l)?)?)?)?$/i.test(trimmed);
+	const commandQuery = !disabled && attachments.files.length === 0 && /^\/[^\s]*$/.test(textInput.value)
+		? textInput.value.slice(1).toLowerCase()
+		: null;
+	const visibleCommands = commandQuery === null ? [] : [
+		...(!hasGoal ? [{ name: "goal", description: "创建一个由 manager 持续推进的目标", source: "goal" as const }] : []),
+		...skillCommands,
+	].filter((command) => command.name.toLowerCase().includes(commandQuery)).slice(0, 8);
+	const chooseSkillCommand = (command: SessionSlashCommand) => {
+		const nextValue = `/${command.name} `;
+		textInput.setInput(nextValue);
+		requestAnimationFrame(() => {
+			const textarea = document.querySelector<HTMLTextAreaElement>(".home-composer-textarea");
+			textarea?.focus();
+			textarea?.setSelectionRange(nextValue.length, nextValue.length);
+		});
+	};
 
 	return (
 		<>
-			{showGoalCommand ? (
-				<div className="mb-2 overflow-hidden rounded-xl border bg-popover p-1 shadow-lg">
-					<button
-						type="button"
-						className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left hover:bg-muted"
-						onClick={() => {
-							textInput.clear();
-							onGoalCommand("");
-						}}
-					>
-						<div className="flex size-8 items-center justify-center rounded-lg bg-primary/10 text-primary"><TargetIcon className="size-4" /></div>
-						<div className="min-w-0 flex-1">
-							<div className="font-mono text-sm font-medium">/goal</div>
-							<div className="text-xs text-muted-foreground">创建一个由 manager 持续推进的目标</div>
-						</div>
-						<span className="text-[11px] text-muted-foreground">Enter</span>
-					</button>
+			{visibleCommands.length > 0 ? (
+				<div className="home-command-menu mb-2 rounded-xl border bg-popover p-1 shadow-lg" role="menu" aria-label="可用命令">
+					{visibleCommands.map((command) => (
+						<button
+							type="button"
+							role="menuitem"
+							key={`${command.source}:${command.name}`}
+							className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left hover:bg-muted"
+							onClick={() => {
+								if (command.source === "goal") {
+									textInput.clear();
+									onGoalCommand("");
+								} else {
+									chooseSkillCommand(command);
+								}
+							}}
+						>
+							<div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">{command.source === "goal" ? <TargetIcon className="size-4" /> : <SparklesIcon className="size-4" />}</div>
+							<div className="min-w-0 flex-1">
+								<div className="truncate font-mono text-sm font-medium">/{command.name}</div>
+								<div className="truncate text-xs text-muted-foreground">{command.description || "显式调用这个 Skill"}</div>
+							</div>
+							<span className="shrink-0 text-[11px] text-muted-foreground">{command.source === "goal" ? "打开" : "填写任务"}</span>
+						</button>
+					))}
 				</div>
 			) : null}
 			<PromptInput

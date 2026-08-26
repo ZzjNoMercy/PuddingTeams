@@ -139,12 +139,37 @@ export interface CapabilityRuntimeContribution {
 		| Promise<CapabilitySessionRuntime & { authenticated?: boolean | "unknown" }>;
 }
 
+export type ExtensionConnectionState = "connected" | "disconnected" | "unavailable" | "error";
+
+/**
+ * 扩展页“连接状态”的只读投影。不得包含 token、secret、认证目录或可复用的
+ * 上游身份标识；不同插件只需返回用户可读的账号与诊断摘要。
+ */
+export interface ExtensionConnectionStatus {
+	id: string;
+	name: string;
+	description?: string;
+	state: ExtensionConnectionState;
+	version?: string;
+	accountName?: string;
+	identity?: string;
+	message?: string;
+	checkedAt: string;
+}
+
+export interface ExtensionConnectionContext {
+	cwd: string;
+	env: NodeJS.ProcessEnv;
+}
+
 /** Capability Extension 运行时模块（当前进程内加载，隔离 Host 后迁入 Broker）。 */
 export interface CapabilityExtensionModule {
 	manifest: ExtensionManifest;
 	register(ctx: CapabilityRegistration): void | Promise<void>;
 	/** 可选：给绑定目标自身的 Pi Session 追加 Skills/CLI 环境与动态 probe。 */
 	runtime?: CapabilityRuntimeContribution;
+	/** 可选：向扩展页贡献只读连接状态；不依赖 Agent binding。 */
+	listConnections?(ctx: ExtensionConnectionContext): ExtensionConnectionStatus[] | Promise<ExtensionConnectionStatus[]>;
 }
 
 /**

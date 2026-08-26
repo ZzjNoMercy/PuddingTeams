@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { type ComponentProps, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { ArrowRightIcon, CableIcon, CheckCircle2Icon, FileArchiveIcon, FolderOpenIcon, LoaderIcon, PackageIcon, RefreshCwIcon, SearchIcon, ShieldAlertIcon, SparklesIcon, TrashIcon, UploadIcon, WrenchIcon } from "lucide-react";
 import { toast } from "sonner";
@@ -10,18 +10,23 @@ import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import {
 	ApiConflictError,
+	getSkillResource,
 	getDeveloperMode,
 	installExtension,
 	importSkillResource,
 	importSkillsZip,
+	listAgents,
 	listExtensionCatalog,
+	listExtensionConnections,
 	listSkillLibrary,
 	pickWorkspaceDirectory,
 	setDeveloperMode,
 	uninstallExtension,
 	updateExtension,
 } from "@/lib/api";
-import type { CatalogEntry, ConflictRun, SkillEntry } from "@/lib/types";
+import { agentDisplayName, type AgentConfig, type CatalogEntry, type ConflictRun, type ExtensionConnectionStatus, type SkillDocument, type SkillEntry } from "@/lib/types";
+import { ClipboardSafeStreamdown } from "@/components/ai-elements/streamdown";
+import { ManagerAvatar, WorkerAvatar } from "@/components/chat/worker-avatar";
 
 /**
  * Extension 接入目录（§10.1）：kind=connector 与 kind=capability 分开的目录
@@ -29,13 +34,61 @@ import type { CatalogEntry, ConflictRun, SkillEntry } from "@/lib/types";
  * 如实展示引用它的 agents / 进行中 runs。
  */
 
-type ExtensionView = "skills" | "mcp" | "plugins";
+type ExtensionView = "skills" | "mcp" | "plugins" | "connections";
+
+type ExtensionTabCounts = Record<ExtensionView, number | null>;
+
+const TAB_COUNT_STORAGE_KEY = "puddingteams:extension-tab-counts";
+const useIsomorphicLayoutEffect = typeof window !== "undefined" ? useLayoutEffect : useEffect;
+
+function cachedTabCounts(): Partial<Record<ExtensionView, number>> {
+	if (typeof window === "undefined") return {};
+	try {
+		const parsed = JSON.parse(window.localStorage.getItem(TAB_COUNT_STORAGE_KEY) ?? "{}") as Record<string, unknown>;
+		return Object.fromEntries(
+			Object.entries(parsed).filter(([, value]) => typeof value === "number" && Number.isInteger(value) && value >= 0),
+		) as Partial<Record<ExtensionView, number>>;
+	} catch {
+		return {};
+	}
+}
+
+function persistTabCount(key: ExtensionView, value: number) {
+	if (typeof window === "undefined") return;
+	try {
+		window.localStorage.setItem(TAB_COUNT_STORAGE_KEY, JSON.stringify({ ...cachedTabCounts(), [key]: value }));
+		window.document.documentElement.style.setProperty(`--extension-${key}-count`, JSON.stringify(String(value)));
+	} catch {
+		// 隐私模式或存储被禁用时，当前页面内的状态仍然正常更新。
+	}
+}
 
 const SOURCE_LABELS: Record<string, string> = {
 	builtin: "内置来源",
 	trusted: "可信来源",
 	external: "外部来源",
 };
+
+function SkillPreviewLink({ href = "", children, node, ...props }: ComponentProps<"a"> & { node?: unknown }) {
+	void node;
+	if (!/^https?:\/\//i.test(href)) return <span className="skill-preview-local-link">{children}</span>;
+	return <a href={href} target="_blank" rel="noreferrer" {...props}>{children}</a>;
+}
+
+function skillPreviewUrlTransform(url: string): string {
+	return /^(?:https?:\/\/|mailto:|#)/i.test(url) ? url : "#";
+}
+
+const skillPreviewMarkdownComponents = { a: SkillPreviewLink };
+
+function normalizeSkillPreviewMarkdown(markdown: string): string {
+	return markdown.replace(/(!?)\[([^\]\n]+)\]\(([^)\n]+)\)/g, (match, imageMarker: string, label: string, rawHref: string) => {
+		const href = rawHref.trim().split(/\s+["']/)[0] ?? "";
+		if (/^(?:https?:\/\/|mailto:|#)/i.test(href)) return match;
+		const safeLabel = label.replace(/`/g, "");
+		return imageMarker ? `**${safeLabel}**` : `\`${safeLabel}\``;
+	});
+}
 
 /** 安装来源三态（文档 §8）：builtin 代码内嵌 / bundled 随发行物 / user 复制安装 / local-link 开发者链接。 */
 const ORIGIN_LABELS: Record<CatalogEntry["origin"], string> = {
@@ -305,12 +358,18 @@ function EntryCard({ entry, onChanged }: { entry: CatalogEntry; onChanged: () =>
 }
 
 function SkillsLibraryView() {
+	const router = useRouter();
 	const [skills, setSkills] = useState<SkillEntry[] | null>(null);
 	const [query, setQuery] = useState("");
 	const [importPath, setImportPath] = useState("");
 	const [importOpen, setImportOpen] = useState(false);
 	const [importing, setImporting] = useState(false);
 	const [zipInput, setZipInput] = useState<HTMLInputElement | null>(null);
+	const [previewSkill, setPreviewSkill] = useState<SkillEntry | null>(null);
+	const [previewDocument, setPreviewDocument] = useState<SkillDocument | null>(null);
+	const [previewAgents, setPreviewAgents] = useState<AgentConfig[] | null>(null);
+	const [previewError, setPreviewError] = useState<string | null>(null);
+	const previewRequest = useRef(0);
 	const filteredSkills = useMemo(() => {
 		if (!skills) return null;
 		const needle = query.trim().toLowerCase();
@@ -372,6 +431,32 @@ function SkillsLibraryView() {
 		}
 	};
 
+	const openPreview = async (skill: SkillEntry) => {
+		const requestId = ++previewRequest.current;
+		setPreviewSkill(skill);
+		setPreviewDocument(null);
+		setPreviewAgents(null);
+		setPreviewError(null);
+		const [documentResult, agentsResult] = await Promise.allSettled([
+			getSkillResource(skill.name),
+			listAgents(),
+		]);
+		if (requestId !== previewRequest.current) return;
+		if (documentResult.status === "fulfilled") setPreviewDocument(documentResult.value);
+		else setPreviewError(documentResult.reason instanceof Error ? documentResult.reason.message : String(documentResult.reason));
+		setPreviewAgents(agentsResult.status === "fulfilled"
+			? agentsResult.value.filter((agent) => agent.piResources?.enabledSkills?.includes(skill.name))
+			: []);
+	};
+
+	const closePreview = () => {
+		previewRequest.current += 1;
+		setPreviewSkill(null);
+		setPreviewDocument(null);
+		setPreviewAgents(null);
+		setPreviewError(null);
+	};
+
 	return (
 		<div className="flex flex-col gap-4 py-6">
 			<div className="flex flex-wrap items-end justify-between gap-3">
@@ -396,13 +481,88 @@ function SkillsLibraryView() {
 			) : (
 				<div className="skills-library-list">
 					{filteredSkills?.map((skill) => {
-						return <div key={skill.name} className="skills-library-row flex flex-wrap items-center gap-3 px-4 py-3">
+						return <button type="button" key={skill.name} className="skills-library-row flex items-center gap-3 px-4 py-3" onClick={() => void openPreview(skill)}>
 							<div className="grid size-8 shrink-0 place-items-center rounded-md bg-primary/10 text-primary"><SparklesIcon className="size-4" /></div>
 							<div className="min-w-0 flex-1"><div className="truncate font-mono text-sm">{skill.name}</div><div className="truncate text-xs text-muted-foreground">{skill.description || "无描述"}</div></div>
-						</div>;
+							<ArrowRightIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+						</button>;
 					})}
 				</div>
 			)}
+			<Dialog open={previewSkill !== null} onOpenChange={(open) => { if (!open) closePreview(); }}>
+				<DialogContent
+					overlayClassName="skill-preview-overlay"
+					className="skill-preview-dialog max-h-[min(88vh,820px)] gap-0 overflow-hidden p-0 sm:max-w-[820px]"
+				>
+					<DialogHeader className="skill-preview-header">
+						<div className="skill-preview-icon"><SparklesIcon className="size-5" /></div>
+						<div className="min-w-0">
+							<div className="skill-preview-eyebrow">Skill 预览</div>
+							<DialogTitle className="mt-1 truncate font-mono text-xl">{previewSkill?.name}</DialogTitle>
+							<DialogDescription className="mt-1.5 line-clamp-2 leading-6">{previewSkill?.description || "这个 Skill 暂无描述。"}</DialogDescription>
+						</div>
+					</DialogHeader>
+
+					<div className="skill-preview-body">
+						<main className="skill-preview-reading">
+							<div className="skill-preview-section-title"><span>使用说明</span><span>SKILL.md</span></div>
+							{previewError ? (
+								<div className="skill-preview-load-error"><ShieldAlertIcon className="size-4" /><span>{previewError}</span></div>
+							) : previewDocument === null ? (
+								<div className="skill-preview-loading"><LoaderIcon className="size-4 animate-spin" />正在读取 Skill…</div>
+							) : previewDocument.content.trim() ? (
+								<ClipboardSafeStreamdown
+									mode="static"
+									controls={false}
+									skipHtml
+									components={skillPreviewMarkdownComponents}
+									urlTransform={skillPreviewUrlTransform}
+									className="skill-preview-markdown"
+								>{normalizeSkillPreviewMarkdown(previewDocument.content)}</ClipboardSafeStreamdown>
+							) : (
+								<div className="skill-preview-empty">SKILL.md 暂无正文。</div>
+							)}
+						</main>
+
+						<aside className="skill-preview-aside">
+							{previewSkill?.disableModelInvocation ? (
+								<section className="skill-preview-aside-section">
+									<div className="skill-preview-aside-label">调用限制</div>
+									<div className="skill-preview-invocation">
+										<ShieldAlertIcon className="skill-preview-invocation-icon" />
+										<div><strong>仅支持手动调用</strong><p>通过 <code>/skill:{previewSkill.name}</code> 显式调用</p></div>
+									</div>
+								</section>
+							) : null}
+
+							<section className="skill-preview-aside-section">
+								<div className="skill-preview-aside-heading"><span className="skill-preview-aside-label">启用范围</span>{previewAgents !== null ? <span>{previewAgents.length} 个 Agent</span> : null}</div>
+								{previewAgents === null ? (
+									<div className="skill-preview-agent-loading"><LoaderIcon className="size-3.5 animate-spin" />正在检查…</div>
+								) : previewAgents.length > 0 ? (
+									<div className="skill-preview-agent-list">{previewAgents.map((agent) => <div key={agent.name} className="skill-preview-agent"><span>{agent.pinned ? <ManagerAvatar size={24} /> : <WorkerAvatar name={agent.name} size={24} />}</span><span className="truncate">{agentDisplayName(agent)}</span></div>)}</div>
+								) : (
+									<p className="skill-preview-aside-empty">尚未被任何 Agent 启用</p>
+								)}
+							</section>
+
+							<section className="skill-preview-aside-section">
+								<div className="skill-preview-aside-label">资源位置</div>
+								<div className="skill-preview-source">pi 全局 Skills</div>
+								<code title={previewSkill?.path}>{previewSkill?.path}</code>
+							</section>
+						</aside>
+					</div>
+
+					<DialogFooter className="skill-preview-footer">
+						<p>启用范围在各 Agent 配置页的「技能」中管理。</p>
+						<div className="skill-preview-actions">
+							<Button type="button" variant="ghost" onClick={closePreview}>关闭</Button>
+							<Button type="button" onClick={() => { closePreview(); router.push("/agents"); }}>管理启用范围<ArrowRightIcon className="size-3.5" /></Button>
+						</div>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
 			<Dialog open={importOpen} onOpenChange={setImportOpen}>
 				<DialogContent>
 					<DialogHeader><DialogTitle>导入 Skill</DialogTitle><DialogDescription>导入后写入 pi 全局 Skills 目录，与 pi CLI 共享。启用范围仍按 Agent 配置的作用域决定。</DialogDescription></DialogHeader>
@@ -417,15 +577,112 @@ function SkillsLibraryView() {
 	);
 }
 
+const CONNECTION_STATE_META: Record<ExtensionConnectionStatus["state"], { label: string; className: string; dot: string }> = {
+	connected: {
+		label: "已连接",
+		className: "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+		dot: "bg-emerald-500",
+	},
+	disconnected: {
+		label: "未登录",
+		className: "border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+		dot: "bg-amber-500",
+	},
+	unavailable: {
+		label: "不可用",
+		className: "border-border bg-muted text-muted-foreground",
+		dot: "bg-muted-foreground/60",
+	},
+	error: {
+		label: "检查失败",
+		className: "border-destructive/25 bg-destructive/10 text-destructive",
+		dot: "bg-destructive",
+	},
+};
+
+function ConnectionsView({
+	connections,
+	loading,
+	onRefresh,
+}: {
+	connections: ExtensionConnectionStatus[] | null;
+	loading: boolean;
+	onRefresh: () => void;
+}) {
+	return (
+		<div className="py-8">
+			<div className="mb-5 flex items-end justify-between gap-5">
+				<div>
+					<h2 className="text-base font-semibold tracking-tight">连接状态</h2>
+					<p className="mt-1 text-xs text-muted-foreground">查看插件连接的外部系统与当前账号状态</p>
+				</div>
+				<Button type="button" size="sm" variant="outline" disabled={loading} onClick={onRefresh}>
+					<RefreshCwIcon className={`size-3.5 ${loading ? "animate-spin" : ""}`} />
+					重新检查
+				</Button>
+			</div>
+
+			{connections === null ? (
+				<div className="flex items-center justify-center gap-2 pt-20 text-sm text-muted-foreground">
+					<LoaderIcon className="size-4 animate-spin" />
+					正在检查连接…
+				</div>
+			) : connections.length === 0 ? (
+				<div className="ops-empty-state mx-auto mt-16 max-w-xl">
+					<div className="text-sm font-medium">还没有可检查的连接</div>
+					<p className="mt-2 text-sm text-muted-foreground">安装支持连接状态的插件后，会统一显示在这里。</p>
+				</div>
+			) : (
+				<div className="grid gap-3 md:grid-cols-2">
+					{connections.map((connection) => {
+						const meta = CONNECTION_STATE_META[connection.state];
+						const checkedAt = new Date(connection.checkedAt);
+						const checkedLabel = Number.isNaN(checkedAt.getTime())
+							? "刚刚检查"
+							: checkedAt.toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+						return (
+							<article key={connection.id} className="rounded-2xl border border-border/80 bg-card px-5 py-4 shadow-sm">
+								<div className="flex flex-wrap items-start gap-3">
+									<div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
+										<CableIcon className="size-5" />
+									</div>
+									<div className="min-w-0 flex-1">
+										<div className="flex flex-wrap items-center gap-2">
+											<h3 className="text-sm font-semibold">{connection.name}</h3>
+											<span className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium ${meta.className}`}>
+												<span className={`size-1.5 rounded-full ${meta.dot}`} />
+												{meta.label}
+											</span>
+										</div>
+										<p className="mt-1 text-xs text-muted-foreground">{connection.description ?? connection.extensionName}</p>
+									</div>
+									<span className="text-[11px] text-muted-foreground">{checkedLabel}</span>
+								</div>
+
+								<div className="mt-4 grid grid-cols-2 gap-3 border-t border-border/70 pt-4 xl:grid-cols-3">
+									<div><div className="text-[11px] text-muted-foreground">账号</div><div className="mt-1 text-sm font-medium">{connection.accountName ?? "—"}</div></div>
+									<div><div className="text-[11px] text-muted-foreground">身份</div><div className="mt-1 text-sm font-medium">{connection.identity ?? "—"}</div></div>
+									<div><div className="text-[11px] text-muted-foreground">CLI 版本</div><div className="mt-1 font-mono text-sm">{connection.version ? `v${connection.version}` : "—"}</div></div>
+								</div>
+								{connection.message ? <p className="mt-3 text-xs text-muted-foreground">{connection.message}</p> : null}
+							</article>
+						);
+					})}
+				</div>
+			)}
+		</div>
+	);
+}
+
 export function ExtensionsPane() {
-	// tab 由 URL 查询参数驱动（/extensions?tab=skills|mcp|plugins）：刷新、
+	// tab 由 URL 查询参数驱动（/extensions?tab=skills|mcp|plugins|connections）：刷新、
 	// 浏览器前进/后退都保持当前分类；静态导出不能用动态段，与
 	// /agents/config?name= 同一约定。
 	const searchParams = useSearchParams();
 	const router = useRouter();
 	const pathname = usePathname();
 	const rawTab = searchParams.get("tab");
-	const view: ExtensionView = rawTab === "skills" || rawTab === "mcp" || rawTab === "plugins" ? rawTab : "plugins";
+	const view: ExtensionView = rawTab === "skills" || rawTab === "mcp" || rawTab === "plugins" || rawTab === "connections" ? rawTab : "plugins";
 	const setView = (key: ExtensionView) => router.replace(`${pathname}?tab=${key}`, { scroll: false });
 	const [entries, setEntries] = useState<CatalogEntry[] | null>(null);
 	const [query, setQuery] = useState("");
@@ -437,9 +694,37 @@ export function ExtensionsPane() {
 	const [developerMode, setDeveloperModeState] = useState(false);
 	const [developerModeLoaded, setDeveloperModeLoaded] = useState(false);
 	const [developerWarningOpen, setDeveloperWarningOpen] = useState(false);
-	// Skills tab 计数：进 skills 视图时随子视图一起刷新（子视图内部增删后
-	// 回到其他 tab 再回来即同步，与插件计数的 refresh 语义一致）。
-	const [skillCount, setSkillCount] = useState<number | null>(null);
+	// 慢接口（尤其连接探测）完成前优先展示上次已知数量，避免刷新时徽标
+	// 消失和 Tab 文案位移。首次无缓存时仍保留一个固定尺寸的加载徽标。
+	const [tabCounts, setTabCounts] = useState<ExtensionTabCounts>({
+		skills: null,
+		mcp: 0,
+		plugins: null,
+		connections: null,
+	});
+	const [connections, setConnections] = useState<ExtensionConnectionStatus[] | null>(null);
+	const [connectionsLoading, setConnectionsLoading] = useState(false);
+	const updateTabCount = useCallback((key: ExtensionView, value: number) => {
+		setTabCounts((current) => current[key] === value ? current : { ...current, [key]: value });
+		persistTabCount(key, value);
+	}, []);
+
+	// 静态预渲染的首个 state 不含 localStorage；hydration 会复用它而不会重跑
+	// lazy initializer。绘制前补入缓存，避免用户看到一段时间的空计数。
+	useIsomorphicLayoutEffect(() => {
+		const cached = cachedTabCounts();
+		setTabCounts((current) => {
+			const next = { ...current };
+			let changed = false;
+			for (const key of ["skills", "plugins", "connections"] as const) {
+				if (next[key] === null && cached[key] !== undefined) {
+					next[key] = cached[key]!;
+					changed = true;
+				}
+			}
+			return changed ? next : current;
+		});
+	}, []);
 	const filteredEntries = useMemo(() => {
 		if (!entries) return null;
 		const needle = query.trim().toLowerCase();
@@ -453,23 +738,52 @@ export function ExtensionsPane() {
 
 	const refreshPlugins = useCallback(() => {
 		Promise.all([listExtensionCatalog("connector"), listExtensionCatalog("capability")])
-			.then(([connectors, capabilities]) => setEntries([...connectors, ...capabilities]))
+			.then(([connectors, capabilities]) => {
+				const nextEntries = [...connectors, ...capabilities];
+				setEntries(nextEntries);
+				updateTabCount("plugins", nextEntries.length);
+			})
 			.catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)));
-	}, []);
+	}, [updateTabCount]);
+
+	const refreshConnections = useCallback(() => {
+		setConnectionsLoading(true);
+		listExtensionConnections()
+			.then((nextConnections) => {
+				setConnections(nextConnections);
+				updateTabCount("connections", nextConnections.length);
+			})
+			.catch((err: unknown) => {
+				setConnections([]);
+				updateTabCount("connections", 0);
+				toast.error(err instanceof Error ? err.message : String(err));
+			})
+			.finally(() => setConnectionsLoading(false));
+	}, [updateTabCount]);
 
 	// 插件数量属于顶层导航信息，不能依赖当前是否打开插件视图；否则刷新
 	// /extensions?tab=skills 或 MCP 时 entries 会一直为空，计数徽标随之消失。
 	useEffect(() => {
 		void refreshPlugins();
-	}, [refreshPlugins]);
+		listExtensionConnections()
+			.then((nextConnections) => {
+				setConnections(nextConnections);
+				updateTabCount("connections", nextConnections.length);
+			})
+			.catch((err: unknown) => {
+				setConnections([]);
+				updateTabCount("connections", 0);
+				toast.error(err instanceof Error ? err.message : String(err));
+			});
+	}, [refreshPlugins, updateTabCount]);
 
 	// 挂载即拉一次（tab 徽标要在进入 skills 视图前就有数），此后每次
 	// 切到 skills 视图重新对齐。
 	useEffect(() => {
 		listSkillLibrary()
-			.then(({ skills }) => setSkillCount(skills.length))
+			.then(({ skills }) => updateTabCount("skills", skills.length))
 			.catch(() => undefined);
-	}, [view]);
+	}, [updateTabCount, view]);
 
 	useEffect(() => {
 		getDeveloperMode()
@@ -524,7 +838,7 @@ export function ExtensionsPane() {
 			<header className="ops-page-header">
 				<div>
 					<h1 className="ops-page-title">扩展</h1>
-					<p className="ops-page-subtitle">统一管理 Skills、MCP 和插件</p>
+					<p className="ops-page-subtitle">统一管理 Skills、MCP、插件和连接状态</p>
 				</div>
 				<div className="flex items-center gap-2">
 					<Button
@@ -550,6 +864,7 @@ export function ExtensionsPane() {
 					["skills", "Skills", "任务方法与工作流"],
 					["mcp", "MCP", "外部工具、数据与服务"],
 					["plugins", "插件", "连接插件与能力插件"],
+					["connections", "连接状态", "外部系统与账号登录状态"],
 				] as const).map(([key, label, description]) => (
 					<button
 						key={key}
@@ -560,10 +875,13 @@ export function ExtensionsPane() {
 						className={`ops-tab ${view === key ? "active" : ""}`}
 					>
 						<span>{label}</span>
-						{key === "plugins" && entries ? <span className="tab-count">{entries.length}</span> : null}
-						{key === "skills" && skillCount !== null ? <span className="tab-count">{skillCount}</span> : null}
-						{/* MCP 尚未接入可执行 server（规划中），计数恒 0。 */}
-						{key === "mcp" ? <span className="tab-count">0</span> : null}
+						<span
+							className={`tab-count ${tabCounts[key] === null ? "is-loading" : ""}`}
+							data-count-key={key}
+							suppressHydrationWarning
+						>
+							{tabCounts[key]}
+						</span>
 						<span className="sr-only">{description}</span>
 					</button>
 				))}
@@ -573,6 +891,8 @@ export function ExtensionsPane() {
 					<SkillsLibraryView />
 				) : view === "mcp" ? (
 					<div className="ops-empty-state mx-auto mt-16 max-w-xl"><div className="text-sm font-medium">MCP 规划中</div><p className="mt-2 text-sm text-muted-foreground">MCP 用于连接外部工具、数据与服务；当前协议尚未接入可执行的 MCP Server，因此暂不提供伪配置动作。</p></div>
+				) : view === "connections" ? (
+					<ConnectionsView connections={connections} loading={connectionsLoading} onRefresh={refreshConnections} />
 				) : entries === null ? (
 					<div className="flex items-center justify-center gap-2 pt-20 text-sm text-muted-foreground">
 						<LoaderIcon className="size-4 animate-spin" />

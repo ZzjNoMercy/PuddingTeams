@@ -3,7 +3,7 @@ import type { ExtensionRegistry } from "../agent-runtime/extension-registry.js";
 import type { AgentRuntime } from "../agent-runtime/runtime.js";
 import type { PiSessionStore } from "../pi-bridge/session-store.js";
 import type { TeamsStore } from "../store/teams.js";
-import type { ExtensionKind } from "../agent-runtime/extensions.js";
+import type { ExtensionConnectionStatus, ExtensionKind } from "../agent-runtime/extensions.js";
 import type { ProductSettingsStore } from "../store/product-settings.js";
 
 export interface ExtensionRouteDeps {
@@ -62,6 +62,37 @@ export function registerExtensionsRoutes(app: FastifyInstance, deps: ExtensionRo
 			return reply.code(400).send({ error: 'kind 必须是 "connector" | "capability"' });
 		}
 		return { extensions: registry.list(kind as ExtensionKind | undefined) };
+	});
+
+	/** 扩展贡献的外部系统连接状态。单个插件探测失败不能拖垮整页。 */
+	app.get("/api/extensions/connections", async () => {
+		const connections: Array<ExtensionConnectionStatus & { extensionId: string; extensionName: string }> = [];
+		for (const entry of registry.list("capability")) {
+			if (!entry.loaded) continue;
+			const module = registry.capabilityModuleOf(entry.manifest.id);
+			if (!module?.listConnections) continue;
+			try {
+				for (const connection of await module.listConnections({ cwd: process.cwd(), env: process.env })) {
+					connections.push({
+						...connection,
+						id: `${entry.manifest.id}:${connection.id}`,
+						extensionId: entry.manifest.id,
+						extensionName: entry.manifest.displayName,
+					});
+				}
+			} catch {
+				connections.push({
+					id: `${entry.manifest.id}:probe-error`,
+					extensionId: entry.manifest.id,
+					extensionName: entry.manifest.displayName,
+					name: entry.manifest.displayName,
+					state: "error" as const,
+					message: "连接状态检查失败",
+					checkedAt: new Date().toISOString(),
+				});
+			}
+		}
+		return { connections };
 	});
 
 	app.post<{ Body: { path?: string; versionPin?: string; mode?: string } }>("/api/extensions/install", async (req, reply) => {

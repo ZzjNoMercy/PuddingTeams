@@ -183,7 +183,7 @@ export function registerRoomsRoutes(
 		return { room: await buildWindowSummary(sessions, teams, w) };
 	});
 
-	/** Open a file referenced by chat markdown. Relative paths resolve from the
+	/** Open a file or directory referenced by chat markdown. Relative paths resolve from the
 	 * room's frozen cwd; absolute paths must still stay inside that cwd or a
 	 * platform-owned attachment root. realpath containment also blocks symlink
 	 * escapes. */
@@ -213,7 +213,8 @@ export function registerRoomsRoutes(
 					return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
 				});
 				if (!allowed) throw new Error("文件不在当前项目或平台附件目录中");
-				if (!(await stat(target)).isFile()) throw new Error("目标不是文件");
+				const targetStat = await stat(target);
+				if (!targetStat.isFile() && !targetStat.isDirectory()) throw new Error("目标不是文件或目录");
 				await openLocalFile(target);
 				return { path: target };
 			} catch (err) {

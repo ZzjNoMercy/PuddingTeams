@@ -130,6 +130,7 @@ function writeCapabilityPackage(dir: string): string {
 		`export const extension = {
 			manifest: { id: "cap-ext", kind: "capability", name: "cap", version: "1", tools: [{ name: "do_thing", activation: "always" }] },
 			register(ctx) {},
+			listConnections() { return [{ id: "main", name: "测试系统", state: "connected", accountName: "测试账号", checkedAt: "2026-08-26T00:00:00.000Z" }]; },
 		};`,
 	);
 	return dir;
@@ -529,6 +530,24 @@ test("Phase5: catalog 必须 kind 过滤且两类不混（§10.1）", async () =
 	assert.equal(connBody.extensions[0]!.origin, "builtin");
 	const capabilities = await app.inject({ method: "GET", url: "/api/extensions/catalog?kind=capability" });
 	assert.equal((capabilities.json() as { extensions: unknown[] }).extensions.length, 0, "预装零个用户 Capability（§10.4）");
+	await app.close();
+});
+
+test("Extension 连接状态 API 聚合插件只读投影", async () => {
+	const { app, registry, dir } = await makeStack();
+	await registry.installOrUpdateFromDir(writeCapabilityPackage(path.join(dir, "connection-cap")));
+	const response = await app.inject({ method: "GET", url: "/api/extensions/connections" });
+	assert.equal(response.statusCode, 200, response.body);
+	const body = response.json() as { connections: Array<{ id: string; extensionId: string; name: string; state: string; accountName?: string }> };
+	assert.deepEqual(body.connections, [{
+		id: "cap-ext:main",
+		extensionId: "cap-ext",
+		extensionName: "测试 Capability",
+		name: "测试系统",
+		state: "connected",
+		accountName: "测试账号",
+		checkedAt: "2026-08-26T00:00:00.000Z",
+	}]);
 	await app.close();
 });
 

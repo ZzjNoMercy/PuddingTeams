@@ -306,6 +306,20 @@ export interface CatalogEntry {
 	drifted?: boolean;
 }
 
+export interface ExtensionConnectionStatus {
+	id: string;
+	extensionId: string;
+	extensionName: string;
+	name: string;
+	description?: string;
+	state: "connected" | "disconnected" | "unavailable" | "error";
+	version?: string;
+	accountName?: string;
+	identity?: string;
+	message?: string;
+	checkedAt: string;
+}
+
 /** Agent 的 Connector 绑定（§10）；secret 明文只进 CredentialsStore。 */
 export interface AgentConnectorBinding {
 	extensionId: string;

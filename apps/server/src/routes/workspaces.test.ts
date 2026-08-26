@@ -67,6 +67,15 @@ test("消息附件从房间 cwd 解析并仅打开允许目录内的文件", asy
 	});
 	assert.equal(openedResponse.statusCode, 200, openedResponse.body);
 	assert.deepEqual(opened, [realpathSync(localFile)]);
+	const localDirectory = path.join(dir, "reports");
+	mkdirSync(localDirectory);
+	const openedDirectoryResponse = await app.inject({
+		method: "POST",
+		url: `/api/rooms/${roomId}/open-file`,
+		payload: { path: "reports" },
+	});
+	assert.equal(openedDirectoryResponse.statusCode, 200, openedDirectoryResponse.body);
+	assert.deepEqual(opened, [realpathSync(localFile), realpathSync(localDirectory)]);
 	const uploadedFile = path.join(attachmentRoot, "frozen.pdf");
 	writeFileSync(uploadedFile, "pdf\n");
 	const uploadedResponse = await app.inject({
@@ -75,7 +84,7 @@ test("消息附件从房间 cwd 解析并仅打开允许目录内的文件", asy
 		payload: { path: uploadedFile },
 	});
 	assert.equal(uploadedResponse.statusCode, 200, uploadedResponse.body);
-	assert.deepEqual(opened, [realpathSync(localFile), realpathSync(uploadedFile)]);
+	assert.deepEqual(opened, [realpathSync(localFile), realpathSync(localDirectory), realpathSync(uploadedFile)]);
 
 	const outsideDir = mkdtempSync(path.join(tmpdir(), "pt-outside-file-"));
 	const outsideFile = path.join(outsideDir, "secret.txt");
@@ -86,7 +95,7 @@ test("消息附件从房间 cwd 解析并仅打开允许目录内的文件", asy
 		payload: { path: outsideFile },
 	});
 	assert.equal(rejected.statusCode, 400, rejected.body);
-	assert.deepEqual(opened, [realpathSync(localFile), realpathSync(uploadedFile)]);
+	assert.deepEqual(opened, [realpathSync(localFile), realpathSync(localDirectory), realpathSync(uploadedFile)]);
 
 	await sessions.disposeAll();
 	await app.close();

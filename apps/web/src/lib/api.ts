@@ -23,6 +23,7 @@ import type {
 	DelegationTrace,
 	DelegationTimelineEvent,
 	DriverConfigOption,
+	ExtensionConnectionStatus,
 	SessionSummary,
 	SessionGoalSummary,
 	SkillDocument,
@@ -195,6 +196,18 @@ export async function fetchMessages(sessionId: string): Promise<{ messages: unkn
 	if (!res.ok) throw new Error(`fetch messages failed: ${res.status}`);
 	const body = (await res.json()) as { messages: unknown[]; runningToolCallIds?: string[] };
 	return { messages: body.messages, runningToolCallIds: body.runningToolCallIds ?? [] };
+}
+
+export interface SessionSlashCommand {
+	name: string;
+	description: string;
+	source: "skill";
+}
+
+export async function listSessionCommands(sessionId: string): Promise<SessionSlashCommand[]> {
+	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/commands`);
+	if (!res.ok) throw new Error(`fetch commands failed: ${res.status}`);
+	return ((await res.json()) as { commands?: SessionSlashCommand[] }).commands ?? [];
 }
 
 export interface MessageAttachmentInput {
@@ -470,6 +483,13 @@ export async function listExtensionCatalog(kind: "connector" | "capability"): Pr
 	const res = await fetch(`${SERVER_URL}/api/extensions/catalog?kind=${kind}`);
 	if (!res.ok) throw new Error(`list extension catalog failed: ${res.status}`);
 	return ((await res.json()) as { extensions: CatalogEntry[] }).extensions;
+}
+
+/** 已安装扩展贡献的外部系统连接状态（只读，不触发登录或更新）。 */
+export async function listExtensionConnections(): Promise<ExtensionConnectionStatus[]> {
+	const res = await fetch(`${SERVER_URL}/api/extensions/connections`);
+	if (!res.ok) throw new Error(`list extension connections failed: ${res.status}`);
+	return ((await res.json()) as { connections: ExtensionConnectionStatus[] }).connections;
 }
 
 /** 从本地目录安装 Extension：link（默认）= 开发者本地链接；copy = 用户安装（复制进数据目录）。 */

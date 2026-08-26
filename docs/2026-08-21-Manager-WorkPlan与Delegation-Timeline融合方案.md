@@ -3,6 +3,8 @@
 > 状态：2026-08-21 已落地。本文同时是领域模型与实现契约；权威聚合位于 `apps/server/src/store/work-state.ts`（v5），Manager core tools 位于 `apps/server/src/pi-bridge/agent-extensions.ts`，恢复/Outbox 调度位于 `apps/server/src/index.ts`，统一抽屉位于 `apps/web/src/components/chat/session-runtime-drawer.tsx`。Driver SPI 仅增加可选幂等透传，不承载 WorkPlan。
 >
 > 交互原型：`designs/manager-workplan-timeline/index.html`，包含深色/浅色主题、Goal 任务树、DAG 对照视图以及普通聊天不显示 Goal 入口的状态。Figma v1 参考稿：[03 · Recommended · Fusion · 1440×900](https://www.figma.com/design/Xa6bhuUx31oRrOMK0tJ8p2?node-id=6-2)；2026-08-21 的 Goal 融合与依赖图收口以本地原型为准。
+>
+> 待审增量：真实环境 Verifier、Submission 验证门禁和 Goal 整合复验尚未实现，设计见 `docs/2026-08-26-真实环境复验与可信验收方案.md`。本文下文仍只描述已落地行为。
 
 ## 1. 结论
 

@@ -3,7 +3,7 @@ import { chmod, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { parseConfig, probeRuntime, resolveRuntime } from "./index.js";
+import { listConnections, parseConfig, probeRuntime, resolveRuntime } from "./index.js";
 
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
@@ -108,4 +108,17 @@ test("探测结果使用中文字段且不暴露 CLI 路径", async () => {
 	assert.equal(probe.details?.["登录用户"], "测试用户");
 	assert.equal(probe.details?.["身份状态"], "active");
 	assert.equal("cliPath" in (probe.details ?? {}), false);
+});
+
+test("连接状态只读展示本机飞书登录，不触发更新或泄露路径", async () => {
+	const root = await mkdtemp(path.join(tmpdir(), "pt-lark-connection-"));
+	const { logPath } = await fakeLarkCli(root);
+	const [connection] = await listConnections({ env: { PATH: root } });
+	assert.equal(connection?.state, "connected");
+	assert.equal(connection?.name, "飞书 CLI");
+	assert.equal(connection?.version, "1.2.3");
+	assert.equal(connection?.accountName, "测试用户");
+	assert.equal(connection?.message, "登录状态有效");
+	assert.equal("cliPath" in (connection ?? {}), false);
+	assert.doesNotMatch(await readFile(logPath, "utf-8"), /^update /m);
 });
