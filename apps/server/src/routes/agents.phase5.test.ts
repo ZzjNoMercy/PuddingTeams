@@ -99,7 +99,14 @@ async function makeStack(): Promise<Stack> {
 	const sessions = new PiSessionStore(dir, path.join(dir, "sessions"), teams, invoker, catalog);
 	const app = Fastify();
 	registerAgentsRoutes(app, teams, { credentials, runtime, invoker, extensions: registry, sessions });
-	registerExtensionsRoutes(app, { registry, teams, runtime, sessions, settings });
+	registerExtensionsRoutes(app, {
+		registry,
+		teams,
+		runtime,
+		sessions,
+		settings,
+		capabilityStateRoot: path.join(dir, "capabilities"),
+	});
 	return { app, teams, credentials, registry, runtime, delegations, drivers, settings, sessions, dir };
 }
 
@@ -127,10 +134,12 @@ function writeCapabilityPackage(dir: string): string {
 	);
 	writeFileSync(
 		path.join(dir, "index.mjs"),
-		`export const extension = {
+		`let installed = false;
+		export const extension = {
 			manifest: { id: "cap-ext", kind: "capability", name: "cap", version: "1", tools: [{ name: "do_thing", activation: "always" }] },
 			register(ctx) {},
-			listConnections() { return [{ id: "main", name: "测试系统", state: "connected", accountName: "测试账号", checkedAt: "2026-08-26T00:00:00.000Z" }]; },
+			listConnections() { return [{ id: "main", name: "测试系统", state: installed ? "connected" : "unavailable", ...(installed ? { accountName: "测试账号" } : { actions: [{ id: "install", label: "安装依赖" }] }), checkedAt: "2026-08-26T00:00:00.000Z" }]; },
+			runConnectionAction(connectionId, actionId) { if (connectionId !== "main" || actionId !== "install") throw new Error("bad action"); installed = true; },
 		};`,
 	);
 	return dir;
@@ -533,21 +542,20 @@ test("Phase5: catalog 必须 kind 过滤且两类不混（§10.1）", async () =
 	await app.close();
 });
 
-test("Extension 连接状态 API 聚合插件只读投影", async () => {
+test("Extension 连接状态 API 聚合只读投影，显式动作与探测解耦", async () => {
 	const { app, registry, dir } = await makeStack();
 	await registry.installOrUpdateFromDir(writeCapabilityPackage(path.join(dir, "connection-cap")));
 	const response = await app.inject({ method: "GET", url: "/api/extensions/connections" });
 	assert.equal(response.statusCode, 200, response.body);
-	const body = response.json() as { connections: Array<{ id: string; extensionId: string; name: string; state: string; accountName?: string }> };
-	assert.deepEqual(body.connections, [{
-		id: "cap-ext:main",
-		extensionId: "cap-ext",
-		extensionName: "测试 Capability",
-		name: "测试系统",
-		state: "connected",
-		accountName: "测试账号",
-		checkedAt: "2026-08-26T00:00:00.000Z",
-	}]);
+	const body = response.json() as { connections: Array<{ id: string; connectionId: string; extensionId: string; state: string; actions?: Array<{ id: string }> }> };
+	assert.equal(body.connections[0]?.id, "cap-ext:main");
+	assert.equal(body.connections[0]?.connectionId, "main");
+	assert.equal(body.connections[0]?.state, "unavailable");
+	assert.equal(body.connections[0]?.actions?.[0]?.id, "install");
+	const action = await app.inject({ method: "POST", url: "/api/extensions/cap-ext/connections/main/actions/install" });
+	assert.equal(action.statusCode, 200, action.body);
+	assert.equal((action.json() as { connection: { state: string; accountName?: string } }).connection.state, "connected");
+	assert.equal((action.json() as { connection: { state: string; accountName?: string } }).connection.accountName, "测试账号");
 	await app.close();
 });
 

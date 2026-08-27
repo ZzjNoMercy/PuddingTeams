@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { listConnections, parseConfig, probeRuntime, resolveRuntime } from "./index.js";
+import { listConnections, parseConfig, probeRuntime, resolveRuntime, runConnectionAction } from "./index.js";
 
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
@@ -48,6 +48,7 @@ test("优先使用本机官方 CLI，自动更新并导出同版本 Skills", asy
 		config: { authMode: "auto" },
 		env: { PATH: root },
 		stateDir,
+		sharedStateDir: path.join(root, "shared"),
 	});
 	assert.deepEqual(runtime.issues, []);
 	assert.equal(runtime.details?.["CLI 来源"], "本机官方版本");
@@ -59,18 +60,20 @@ test("优先使用本机官方 CLI，自动更新并导出同版本 Skills", asy
 	assert.equal(await readFile(path.join(runtime.skillPaths?.[0] ?? "", "lark-test", "SKILL.md"), "utf-8"), "# lark-test/SKILL.md\n");
 	assert.match(await readFile(logPath, "utf-8"), /update --json --skills-layout separate/);
 
-	await resolveRuntime({ config: {}, env: { PATH: root }, stateDir });
+	await resolveRuntime({ config: {}, env: { PATH: root }, stateDir, sharedStateDir: path.join(root, "shared") });
 	const calls = await readFile(logPath, "utf-8");
 	assert.equal(calls.match(/^update /gm)?.length, 1, "新鲜度窗口内不重复调用官方更新");
 });
 
-test("未检测到本机 CLI 时由平台通过官方 npm 包安装", async () => {
+test("探测不隐式安装，用户确认后才通过官方 npm 包安装", async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pt-lark-platform-"));
 	const official = path.join(root, "official-cli");
 	await fakeLarkCli(root);
 	await symlink(path.join(root, "lark-cli"), official);
 	const npmPath = path.join(root, "npm");
+	const npmLog = path.join(root, "npm.log");
 	await writeFile(npmPath, `#!/bin/sh
+echo "$*" >> ${shellQuote(npmLog)}
 while [ "$1" != "--prefix" ]; do shift; done
 shift
 install_root="$1"
@@ -83,7 +86,17 @@ install_root="$1"
 	const npmDir = await mkdtemp(path.join(tmpdir(), "pt-lark-npm-path-"));
 	await symlink(npmPath, path.join(npmDir, "npm"));
 	const stateDir = path.join(root, "binding");
-	const runtime = await resolveRuntime({ config: {}, env: { PATH: npmDir }, stateDir });
+	const sharedStateDir = path.join(root, "shared");
+	const probe = await probeRuntime({ config: {}, env: { PATH: npmDir }, stateDir, sharedStateDir });
+	assert.deepEqual(probe.issues?.map((issue) => issue.code), ["cli_not_installed"]);
+	assert.equal(await access(npmLog).then(() => true, () => false), false, "只读探测不得调用 npm");
+	const [missing] = await listConnections({ env: { PATH: npmDir }, stateDir: sharedStateDir });
+	assert.equal(missing?.state, "unavailable");
+	assert.equal(missing?.actions?.[0]?.id, "install-cli");
+	await runConnectionAction("default", "install-cli", { env: { PATH: npmDir }, stateDir: sharedStateDir });
+	assert.match(await readFile(npmLog, "utf-8"), /install --prefix/);
+
+	const runtime = await resolveRuntime({ config: {}, env: { PATH: npmDir }, stateDir, sharedStateDir });
 	assert.deepEqual(runtime.issues, []);
 	assert.equal(runtime.details?.["CLI 来源"], "平台安装的官方版本");
 	assert.equal(runtime.details?.["登录方式"], "当前绑定独立保存");
@@ -94,26 +107,37 @@ install_root="$1"
 test("官方更新暂时失败时继续使用当前 CLI 与其内嵌 Skills", async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pt-lark-update-fail-"));
 	await fakeLarkCli(root, 1);
-	const runtime = await resolveRuntime({ config: {}, env: { PATH: root }, stateDir: path.join(root, "state") });
+	const runtime = await resolveRuntime({
+		config: {},
+		env: { PATH: root },
+		stateDir: path.join(root, "state"),
+		sharedStateDir: path.join(root, "shared"),
+	});
 	assert.deepEqual(runtime.issues?.map((issue) => issue.code), ["official_update_failed"]);
 	assert.equal(runtime.details?.["CLI 版本"], "1.2.3");
 	assert.equal(runtime.details?.["官方 Skills"], "1 个（与 CLI 同步）");
 });
 
-test("探测结果使用中文字段且不暴露 CLI 路径", async () => {
+	test("探测结果使用中文字段且不暴露 CLI 路径", async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pt-lark-probe-"));
-	await fakeLarkCli(root);
-	const probe = await probeRuntime({ config: {}, env: { PATH: root }, stateDir: path.join(root, "state") });
+	const { logPath } = await fakeLarkCli(root);
+	const probe = await probeRuntime({
+		config: {},
+		env: { PATH: root },
+		stateDir: path.join(root, "state"),
+		sharedStateDir: path.join(root, "shared"),
+	});
 	assert.equal(probe.authenticated, true);
 	assert.equal(probe.details?.["登录用户"], "测试用户");
 	assert.equal(probe.details?.["身份状态"], "active");
 	assert.equal("cliPath" in (probe.details ?? {}), false);
+	assert.doesNotMatch(await readFile(logPath, "utf-8"), /^(update|skills) /m, "探测不得更新 CLI 或同步 Skills");
 });
 
 test("连接状态只读展示本机飞书登录，不触发更新或泄露路径", async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pt-lark-connection-"));
 	const { logPath } = await fakeLarkCli(root);
-	const [connection] = await listConnections({ env: { PATH: root } });
+	const [connection] = await listConnections({ env: { PATH: root }, stateDir: path.join(root, "shared") });
 	assert.equal(connection?.state, "connected");
 	assert.equal(connection?.name, "飞书 CLI");
 	assert.equal(connection?.version, "1.2.3");

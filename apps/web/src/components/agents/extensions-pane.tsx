@@ -20,6 +20,7 @@ import {
 	listExtensionConnections,
 	listSkillLibrary,
 	pickWorkspaceDirectory,
+	runExtensionConnectionAction,
 	setDeveloperMode,
 	uninstallExtension,
 	updateExtension,
@@ -98,7 +99,19 @@ const ORIGIN_LABELS: Record<CatalogEntry["origin"], string> = {
 	"local-link": "开发者本地链接",
 };
 
-function EntryCard({ entry, onChanged }: { entry: CatalogEntry; onChanged: () => void }) {
+type ExtensionConnectionAction = NonNullable<ExtensionConnectionStatus["actions"]>[number];
+
+function EntryCard({
+	entry,
+	connection,
+	onChanged,
+	onConnectionAction,
+}: {
+	entry: CatalogEntry;
+	connection?: ExtensionConnectionStatus;
+	onChanged: () => void;
+	onConnectionAction: (connection: ExtensionConnectionStatus, action: ExtensionConnectionAction) => void;
+}) {
 	const { manifest } = entry;
 	const router = useRouter();
 	const [detailsOpen, setDetailsOpen] = useState(false);
@@ -126,6 +139,7 @@ function EntryCard({ entry, onChanged }: { entry: CatalogEntry; onChanged: () =>
 			? "Manager 或 Pi Worker"
 			: "兼容的 Worker"
 		: "Worker";
+	const cliInstallAction = isLarkCli ? connection?.actions?.find((action) => action.id === "install-cli") : undefined;
 	const openAgentList = () => {
 		setDetailsOpen(false);
 		router.push("/agents");
@@ -184,7 +198,14 @@ function EntryCard({ entry, onChanged }: { entry: CatalogEntry; onChanged: () =>
 					<span className={entry.loaded ? "text-foreground" : "text-destructive"}>{entry.loaded ? "已加载" : "加载失败"}</span>
 					<span>插件 v{entry.version} · {usage}</span>
 				</div>
-				<Button type="button" size="sm" variant="secondary" onClick={() => setDetailsOpen(true)}>查看</Button>
+				<div className="flex items-center gap-2">
+					{connection && cliInstallAction ? (
+						<Button type="button" size="sm" onClick={() => onConnectionAction(connection, cliInstallAction)}>
+							安装 CLI
+						</Button>
+					) : null}
+					<Button type="button" size="sm" variant="secondary" onClick={() => setDetailsOpen(true)}>查看</Button>
+				</div>
 			</div>
 
 			<Dialog open={detailsOpen} onOpenChange={setDetailsOpen}>
@@ -213,11 +234,26 @@ function EntryCard({ entry, onChanged }: { entry: CatalogEntry; onChanged: () =>
 								</div>
 								<p>{entry.loaded
 									? manifest.kind === "capability"
-										? `已完成插件安装。绑定到 ${compatibleTargets} 后方可生效；CLI 版本将在绑定探测后显示。`
+										? isLarkCli
+											? "飞书能力插件已内置。CLI 是独立运行依赖，可在下方检查并按需安装。"
+											: `已完成插件安装。绑定到 ${compatibleTargets} 后方可生效。`
 										: "已完成插件安装。创建或编辑 Worker 时选择该连接插件并完成配置后即可使用。"
 									: "请先处理下方加载错误，再进行绑定。"}</p>
 							</div>
 						</div>
+
+						{isLarkCli ? (
+							<section className="extension-detail-section" aria-labelledby="lark-cli-runtime">
+								<div className="extension-detail-section-heading"><h3 id="lark-cli-runtime">运行依赖</h3><span>飞书官方 CLI</span></div>
+								<div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border/70 bg-muted/35 px-4 py-3">
+									<div className="min-w-0">
+										<div className="text-sm font-medium">{connection ? (connection.state === "unavailable" ? "尚未安装飞书 CLI" : `飞书 CLI ${connection.version ? `v${connection.version}` : "已安装"}`) : "正在检查飞书 CLI…"}</div>
+										<p className="mt-1 text-xs text-muted-foreground">{connection?.message ?? "探测只读取状态，不会自动安装或更新。"}</p>
+									</div>
+									{connection && cliInstallAction ? <Button type="button" size="sm" onClick={() => { setDetailsOpen(false); onConnectionAction(connection, cliInstallAction); }}>安装飞书 CLI</Button> : null}
+								</div>
+							</section>
+						) : null}
 
 						<section className="extension-detail-section" aria-labelledby={`usage-${manifest.id}`}>
 							<div className="extension-detail-section-heading">
@@ -231,7 +267,7 @@ function EntryCard({ entry, onChanged }: { entry: CatalogEntry; onChanged: () =>
 								</li>
 								<li>
 									<span className="extension-detail-step-number">2</span>
-									<div><strong>{manifest.kind === "capability" ? `绑定「${manifest.displayName}」` : `选择「${manifest.displayName}」`}</strong><p>{isLarkCli ? "保持默认 auto 即可：它会先找本机 CLI，找不到再用托管版。添加后点「探测」，若未登录就执行页面给出的登录命令。" : manifest.kind === "capability" ? "在扩展配置中添加它，保存后执行一次环境探测；若未登录，按提示完成认证。" : "填写命令、凭据等必需配置，保存并通过连接探测。"}</p></div>
+									<div><strong>{manifest.kind === "capability" ? `绑定「${manifest.displayName}」` : `选择「${manifest.displayName}」`}</strong><p>{isLarkCli ? "先在本页确认 CLI 已安装，再前往 Agent 配置页完成绑定。绑定后的「探测」只检查版本和登录状态，不会触发安装。" : manifest.kind === "capability" ? "在扩展配置中添加它，保存后执行一次环境探测；若未登录，按提示完成认证。" : "填写命令、凭据等必需配置，保存并通过连接探测。"}</p></div>
 								</li>
 								<li>
 									<span className="extension-detail-step-number">3</span>
@@ -604,10 +640,12 @@ function ConnectionsView({
 	connections,
 	loading,
 	onRefresh,
+	onAction,
 }: {
 	connections: ExtensionConnectionStatus[] | null;
 	loading: boolean;
 	onRefresh: () => void;
+	onAction: (connection: ExtensionConnectionStatus, action: ExtensionConnectionAction) => void;
 }) {
 	return (
 		<div className="py-8">
@@ -636,6 +674,7 @@ function ConnectionsView({
 				<div className="grid gap-3 md:grid-cols-2">
 					{connections.map((connection) => {
 						const meta = CONNECTION_STATE_META[connection.state];
+						const statusLabel = connection.actions?.some((action) => action.id === "install-cli") ? "CLI 未安装" : meta.label;
 						const checkedAt = new Date(connection.checkedAt);
 						const checkedLabel = Number.isNaN(checkedAt.getTime())
 							? "刚刚检查"
@@ -651,7 +690,7 @@ function ConnectionsView({
 											<h3 className="text-sm font-semibold">{connection.name}</h3>
 											<span className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium ${meta.className}`}>
 												<span className={`size-1.5 rounded-full ${meta.dot}`} />
-												{meta.label}
+												{statusLabel}
 											</span>
 										</div>
 										<p className="mt-1 text-xs text-muted-foreground">{connection.description ?? connection.extensionName}</p>
@@ -665,6 +704,13 @@ function ConnectionsView({
 									<div><div className="text-[11px] text-muted-foreground">CLI 版本</div><div className="mt-1 font-mono text-sm">{connection.version ? `v${connection.version}` : "—"}</div></div>
 								</div>
 								{connection.message ? <p className="mt-3 text-xs text-muted-foreground">{connection.message}</p> : null}
+								{connection.actions?.length ? (
+									<div className="mt-4 flex flex-wrap gap-2 border-t border-border/70 pt-4">
+										{connection.actions.map((action) => (
+											<Button key={action.id} type="button" size="sm" onClick={() => onAction(connection, action)}>{action.label}</Button>
+										))}
+									</div>
+								) : null}
 							</article>
 						);
 					})}
@@ -704,6 +750,11 @@ export function ExtensionsPane() {
 	});
 	const [connections, setConnections] = useState<ExtensionConnectionStatus[] | null>(null);
 	const [connectionsLoading, setConnectionsLoading] = useState(false);
+	const [pendingConnectionAction, setPendingConnectionAction] = useState<{
+		connection: ExtensionConnectionStatus;
+		action: ExtensionConnectionAction;
+	} | null>(null);
+	const [connectionActionBusy, setConnectionActionBusy] = useState(false);
 	const updateTabCount = useCallback((key: ExtensionView, value: number) => {
 		setTabCounts((current) => current[key] === value ? current : { ...current, [key]: value });
 		persistTabCount(key, value);
@@ -760,6 +811,24 @@ export function ExtensionsPane() {
 			})
 			.finally(() => setConnectionsLoading(false));
 	}, [updateTabCount]);
+
+	const executeConnectionAction = async () => {
+		if (!pendingConnectionAction) return;
+		setConnectionActionBusy(true);
+		try {
+			const updated = await runExtensionConnectionAction(
+				pendingConnectionAction.connection,
+				pendingConnectionAction.action.id,
+			);
+			setConnections((current) => current?.map((item) => item.id === updated.id ? updated : item) ?? [updated]);
+			toast.success(`${pendingConnectionAction.action.label}已完成`);
+			setPendingConnectionAction(null);
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		} finally {
+			setConnectionActionBusy(false);
+		}
+	};
 
 	// 插件数量属于顶层导航信息，不能依赖当前是否打开插件视图；否则刷新
 	// /extensions?tab=skills 或 MCP 时 entries 会一直为空，计数徽标随之消失。
@@ -892,7 +961,12 @@ export function ExtensionsPane() {
 				) : view === "mcp" ? (
 					<div className="ops-empty-state mx-auto mt-16 max-w-xl"><div className="text-sm font-medium">MCP 规划中</div><p className="mt-2 text-sm text-muted-foreground">MCP 用于连接外部工具、数据与服务；当前协议尚未接入可执行的 MCP Server，因此暂不提供伪配置动作。</p></div>
 				) : view === "connections" ? (
-					<ConnectionsView connections={connections} loading={connectionsLoading} onRefresh={refreshConnections} />
+					<ConnectionsView
+						connections={connections}
+						loading={connectionsLoading}
+						onRefresh={refreshConnections}
+						onAction={(connection, action) => setPendingConnectionAction({ connection, action })}
+					/>
 				) : entries === null ? (
 					<div className="flex items-center justify-center gap-2 pt-20 text-sm text-muted-foreground">
 						<LoaderIcon className="size-4 animate-spin" />
@@ -909,11 +983,44 @@ export function ExtensionsPane() {
 							<label className="ops-extension-search"><SearchIcon className="size-4" /><Input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索插件" aria-label="搜索插件" /></label>
 						</div>
 						{filteredEntries && filteredEntries.length > 0 ? <div className="ops-extension-list">
-							{filteredEntries.map((entry) => <EntryCard key={entry.manifest.id} entry={entry} onChanged={refreshPlugins} />)}
+							{filteredEntries.map((entry) => <EntryCard
+								key={entry.manifest.id}
+								entry={entry}
+								connection={connections?.find((connection) => connection.extensionId === entry.manifest.id)}
+								onChanged={refreshPlugins}
+								onConnectionAction={(connection, action) => setPendingConnectionAction({ connection, action })}
+							/>)}
 						</div> : <div className="ops-empty-state"><div className="text-sm font-medium">没有匹配的插件</div><p className="mt-2 text-sm text-muted-foreground">试试插件名称、标识或能力名称。</p></div>}
 					</div>
 				)}
 			</div>
+
+			<Dialog
+				open={pendingConnectionAction !== null}
+				onOpenChange={(open) => { if (!open && !connectionActionBusy) setPendingConnectionAction(null); }}
+			>
+				<DialogContent>
+					<DialogHeader>
+						<DialogTitle>{pendingConnectionAction?.action.confirmation?.title ?? pendingConnectionAction?.action.label}</DialogTitle>
+						<DialogDescription>
+							{pendingConnectionAction?.action.confirmation?.description ?? pendingConnectionAction?.action.description}
+						</DialogDescription>
+					</DialogHeader>
+					{connectionActionBusy ? (
+						<div className="flex items-center gap-3 rounded-xl border border-primary/20 bg-primary/5 px-4 py-3 text-sm">
+							<LoaderIcon className="size-4 shrink-0 animate-spin text-primary" />
+							<div><div className="font-medium">正在安装飞书官方 CLI…</div><p className="mt-0.5 text-xs text-muted-foreground">正在通过 npm 下载并校验，请保持网络连接。</p></div>
+						</div>
+					) : null}
+					<DialogFooter>
+						<Button type="button" variant="ghost" disabled={connectionActionBusy} onClick={() => setPendingConnectionAction(null)}>取消</Button>
+						<Button type="button" disabled={connectionActionBusy} onClick={() => void executeConnectionAction()}>
+							{connectionActionBusy ? <LoaderIcon className="size-3.5 animate-spin" /> : null}
+							{connectionActionBusy ? "正在安装" : pendingConnectionAction?.action.confirmation?.confirmLabel ?? "继续"}
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
 
 			{/* 安装对话框：从本地目录读取 pudding-extension.json */}
 			<Dialog open={installOpen} onOpenChange={setInstallOpen}>

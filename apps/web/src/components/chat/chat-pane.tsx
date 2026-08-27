@@ -47,6 +47,7 @@ import { WorkspaceTrustBadge, workspaceTrustSuffix } from "./workspace-trust-bad
 import { ChatInfoDialog } from "./chat-info-dialog";
 import { SessionMenu } from "./session-menu";
 import { SessionWorkCard } from "./session-work-card";
+import type { SessionExecutionTurn, SessionRuntimeSummary, SessionRuntimeView } from "./session-activity-drawer";
 import { WorkerProcessDrawer } from "./worker-process-dialog";
 import { WorkerProcessProvider } from "./worker-process-context";
 
@@ -93,7 +94,9 @@ function SessionChat({
 	onSessionModelChange,
 	runtimeOpen,
 	onRuntimeOpenChange,
-	onGoalSummaryChange,
+	runtimeView,
+	onRuntimeViewChange,
+	onRuntimeSummaryChange,
 }: {
 	roomId: string;
 	sessionId: string;
@@ -116,9 +119,19 @@ function SessionChat({
 	onSessionModelChange?: (model: string) => void;
 	runtimeOpen: boolean;
 	onRuntimeOpenChange: (open: boolean) => void;
-	onGoalSummaryChange: (summary: { hasGoal: boolean; pending: number; running: boolean } | null) => void;
+	runtimeView: SessionRuntimeView;
+	onRuntimeViewChange: (view: SessionRuntimeView) => void;
+	onRuntimeSummaryChange: (summary: SessionRuntimeSummary) => void;
 }) {
 	const { messages, historyLoading, status, running, send, stop } = useChat(sessionId);
+	const executionTurns = useMemo<SessionExecutionTurn[]>(() => messages
+		.filter((message) => message.role === "user")
+		.map((message, index) => ({
+			id: message.id,
+			index: index + 1,
+			startedAt: message.timestamp,
+			title: message.content.replace(/\s+/g, " ").trim().slice(0, 48) || "用户消息",
+		})), [messages]);
 	const [goalCreateOpen, setGoalCreateOpen] = useState(false);
 	const [goalDraft, setGoalDraft] = useState("");
 	const [hasGoal, setHasGoal] = useState(false);
@@ -186,15 +199,19 @@ function SessionChat({
 		<div className="home-session-chat relative flex min-h-0 flex-1 flex-col" aria-busy={!layoutReady}>
 			<div className={`flex min-h-0 flex-1 flex-col ${layoutReady ? "visible" : "invisible"}`}>
 				<SessionWorkCard
+					roomId={roomId}
 					sessionId={sessionId}
+					executionTurns={executionTurns}
 					createOpen={goalCreateOpen}
 					onCreateOpenChange={setGoalCreateOpen}
 					initialGoal={goalDraft}
 					onGoalStateChange={setHasGoal}
-					onGoalSummaryChange={onGoalSummaryChange}
+					onRuntimeSummaryChange={onRuntimeSummaryChange}
 					workStateSignal={workStateSignal}
 					runtimeOpen={runtimeOpen}
 					onRuntimeOpenChange={onRuntimeOpenChange}
+					runtimeView={runtimeView}
+					onRuntimeViewChange={onRuntimeViewChange}
 				/>
 				<Conversation initial="instant" resize={layoutReady ? "smooth" : "instant"}>
 					<AtBottomReporter onChange={setAtBottom} />
@@ -278,7 +295,8 @@ export function ChatPane({
 	const [chatInfoOpen, setChatInfoOpen] = useState(false);
 	const [workerProcessOpen, setWorkerProcessOpen] = useState(false);
 	const [goalRuntimeOpen, setGoalRuntimeOpen] = useState(false);
-	const [goalSummary, setGoalSummary] = useState<{ hasGoal: boolean; pending: number; running: boolean } | null>(null);
+	const [runtimeView, setRuntimeView] = useState<SessionRuntimeView>("activity");
+	const [runtimeSummary, setRuntimeSummary] = useState<SessionRuntimeSummary | null>(null);
 	const [requestedDelegationId, setRequestedDelegationId] = useState<string | null>(null);
 	const [pendingDeleteSession, setPendingDeleteSession] = useState<RoomSession | null>(null);
 	const [renamingSession, setRenamingSession] = useState<RoomSession | null>(null);
@@ -295,6 +313,7 @@ export function ChatPane({
 	const [trustReview, setTrustReview] = useState<WorkspaceRecord | null>(null);
 	const openWorkerProcess = useCallback((delegationId: string) => {
 		setChatInfoOpen(false);
+		setGoalRuntimeOpen(false);
 		setRequestedDelegationId(delegationId);
 		setWorkerProcessOpen(true);
 	}, []);
@@ -302,9 +321,11 @@ export function ChatPane({
 		if (open) {
 			setWorkerProcessOpen(false);
 			setRequestedDelegationId(null);
+			if (runtimeView === "goal" && !runtimeSummary?.hasGoal) setRuntimeView("activity");
+			if (runtimeView === "activity" && runtimeSummary?.sessionTotal === 0 && runtimeSummary.hasGoal) setRuntimeView("goal");
 		}
 		setGoalRuntimeOpen(open);
-	}, []);
+	}, [runtimeSummary, runtimeView]);
 
 	useEffect(() => {
 		let cancelled = false;
@@ -313,7 +334,8 @@ export function ChatPane({
 				if (cancelled) return;
 				setWorkerProcessOpen(false);
 				setGoalRuntimeOpen(false);
-				setGoalSummary(null);
+				setRuntimeSummary(null);
+				setRuntimeView("activity");
 				setRequestedDelegationId(null);
 				setRoom(r);
 				setActiveId(r.activeSession || "");
@@ -366,7 +388,8 @@ export function ChatPane({
 			if (sessionId === activeId) return;
 			setWorkerProcessOpen(false);
 			setGoalRuntimeOpen(false);
-			setGoalSummary(null);
+			setRuntimeSummary(null);
+			setRuntimeView("activity");
 			setRequestedDelegationId(null);
 			try {
 				await Promise.all([
@@ -389,7 +412,8 @@ export function ChatPane({
 	const newSession = useCallback(async () => {
 		setWorkerProcessOpen(false);
 		setGoalRuntimeOpen(false);
-		setGoalSummary(null);
+		setRuntimeSummary(null);
+		setRuntimeView("activity");
 		setRequestedDelegationId(null);
 		try {
 			const created = await createRoomSession(roomId);
@@ -571,7 +595,7 @@ export function ChatPane({
 
 	return (
 		<div className="home-chat-pane relative flex h-full min-w-0">
-			<div className="home-chat-primary flex min-w-0 flex-1 flex-col">
+			<div className={`home-chat-primary flex min-w-0 flex-1 flex-col${goalRuntimeOpen ? ` runtime-drawer-open runtime-view-${runtimeView}` : ""}`}>
 			<header className="home-chat-header">
 				<div className="home-chat-identity">
 					{onOpenRoomList ? <Button type="button" size="icon" variant="ghost" className="md:hidden" aria-label="打开对话列表" onClick={onOpenRoomList}><PanelLeftOpenIcon className="size-4" /></Button> : null}
@@ -606,18 +630,18 @@ export function ChatPane({
 						onRename={openSessionRename}
 						onDelete={setPendingDeleteSession}
 					/>
-					{goalSummary?.hasGoal ? (
+					{runtimeSummary && (runtimeSummary.hasGoal || runtimeSummary.sessionTotal > 0) ? (
 						<Button
 							type="button"
 							size="icon"
 							variant="ghost"
 							className={"home-chat-more goal-header-trigger" + (goalRuntimeOpen ? " is-active" : "")}
-							aria-label="目标与执行"
-							title="目标与执行"
+							aria-label="任务与执行"
+							title="任务与执行"
 							onClick={() => changeGoalRuntimeOpen(true)}
 						>
 							<ListTreeIcon className="size-4" />
-							{goalSummary.pending > 0 ? <span className="goal-header-badge">{goalSummary.pending}</span> : goalSummary.running ? <span className="goal-header-live" /> : null}
+							{runtimeSummary.total > 0 ? <span className="goal-header-badge">{runtimeSummary.completed}/{runtimeSummary.total}</span> : runtimeSummary.pending > 0 ? <span className="goal-header-badge">{runtimeSummary.pending}</span> : runtimeSummary.running > 0 ? <span className="goal-header-live" /> : null}
 						</Button>
 					) : null}
 					<Button type="button" size="icon" variant="ghost" className="home-chat-more" aria-label="聊天设置" title="聊天设置" onClick={() => { setWorkerProcessOpen(false); setChatInfoOpen(true); }}>
@@ -659,7 +683,9 @@ export function ChatPane({
 					onSessionModelChange={handleSessionModelChange}
 					runtimeOpen={goalRuntimeOpen}
 					onRuntimeOpenChange={changeGoalRuntimeOpen}
-					onGoalSummaryChange={setGoalSummary}
+					runtimeView={runtimeView}
+					onRuntimeViewChange={setRuntimeView}
+					onRuntimeSummaryChange={setRuntimeSummary}
 				/>
 				</WorkerProcessProvider>
 			) : null}

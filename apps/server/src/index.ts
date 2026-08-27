@@ -294,7 +294,14 @@ await registerAgentsRoutes(app, teams, {
 	sessions: store,
 	capabilityStateRoot,
 });
-await registerExtensionsRoutes(app, { registry: extensionRegistry, teams, runtime, sessions: store, settings: productSettings });
+await registerExtensionsRoutes(app, {
+	registry: extensionRegistry,
+	teams,
+	runtime,
+	sessions: store,
+	settings: productSettings,
+	capabilityStateRoot,
+});
 registerResourcesRoutes(app);
 registerWorkspacesRoutes(app, teams.workspaces, undefined, store);
 await registerRoomsRoutes(app, store, teams, invoker, workStates, {

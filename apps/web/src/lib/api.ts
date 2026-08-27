@@ -492,6 +492,22 @@ export async function listExtensionConnections(): Promise<ExtensionConnectionSta
 	return ((await res.json()) as { connections: ExtensionConnectionStatus[] }).connections;
 }
 
+/** 执行连接卡明确声明、且由用户确认触发的动作。 */
+export async function runExtensionConnectionAction(
+	connection: Pick<ExtensionConnectionStatus, "extensionId" | "connectionId">,
+	actionId: string,
+): Promise<ExtensionConnectionStatus> {
+	const res = await fetch(
+		`${SERVER_URL}/api/extensions/${encodeURIComponent(connection.extensionId)}/connections/${encodeURIComponent(connection.connectionId)}/actions/${encodeURIComponent(actionId)}`,
+		{ method: "POST" },
+	);
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `connection action failed: ${res.status}`);
+	}
+	return ((await res.json()) as { connection: ExtensionConnectionStatus }).connection;
+}
+
 /** 从本地目录安装 Extension：link（默认）= 开发者本地链接；copy = 用户安装（复制进数据目录）。 */
 export async function installExtension(input: { path: string; versionPin?: string; mode?: "link" | "copy" }): Promise<CatalogEntry> {
 	const data = await postJson<{ extension: CatalogEntry }>("/api/extensions/install", input, "install extension failed");

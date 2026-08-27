@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import path from "node:path";
 import {
 	AVATAR_MAX_BYTES,
 	MANAGER_AGENT_NAME,
@@ -659,6 +660,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 							agent.name,
 							binding.id,
 						),
+						sharedStateDir: path.join(capabilityStateRoot, binding.extensionId, "shared"),
 					});
 					for (const issue of runtimeProbe.issues ?? []) issues.push(issue);
 				} catch (err) {

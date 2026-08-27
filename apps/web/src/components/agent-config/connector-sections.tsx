@@ -15,10 +15,12 @@ import {
 	getAgentConnector,
 	listAgentBindings,
 	listExtensionCatalog,
+	listExtensionConnections,
 	patchAgentBinding,
 	probeAgent,
 	probeAgentBinding,
 	putAgentConnector,
+	runExtensionConnectionAction,
 	updateAgent,
 } from "@/lib/api";
 import type {
@@ -30,6 +32,7 @@ import type {
 	CatalogEntry,
 	ConnectorProbeResult,
 	ExtensionPermission,
+	ExtensionConnectionStatus,
 	MutationResponse,
 	ToolActivation,
 	WorkerProbeResult,
@@ -66,6 +69,8 @@ const PERMISSION_LABELS: Record<ExtensionPermission, string> = {
 	workspace: "访问工作区",
 	secrets: "读取已授权密钥",
 };
+
+type ExtensionConnectionAction = NonNullable<ExtensionConnectionStatus["actions"]>[number];
 
 function connectorTransportLabel(transport?: string): string {
 	// The catalog and agent payload arrive independently. During a hot reload or
@@ -715,6 +720,10 @@ function BindingCard({
 	const [probe, setProbe] = useState<BindingProbeResult | null>(null);
 	const [busy, setBusy] = useState<string | null>(null);
 	const [confirmDelete, setConfirmDelete] = useState(false);
+	const [installPrompt, setInstallPrompt] = useState<{
+		connection: ExtensionConnectionStatus;
+		action: ExtensionConnectionAction;
+	} | null>(null);
 
 	// 绑定更新后同步草稿（渲染期间重置）。
 	const [prevBinding, setPrevBinding] = useState(binding);
@@ -745,6 +754,27 @@ function BindingCard({
 		setProbe(null);
 		setBusy("probe");
 		try {
+			const nextProbe = await probeAgentBinding(agent.name, binding.id);
+			setProbe(nextProbe);
+			if (nextProbe.issues.some((issue) => issue.code === "cli_not_installed")) {
+				const connection = (await listExtensionConnections()).find((item) => item.extensionId === binding.extensionId);
+				const action = connection?.actions?.find((item) => item.id === "install-cli");
+				if (connection && action) setInstallPrompt({ connection, action });
+			}
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		} finally {
+			setBusy(null);
+		}
+	};
+
+	const installConnectionDependency = async () => {
+		if (!installPrompt) return;
+		setBusy("install-cli");
+		try {
+			await runExtensionConnectionAction(installPrompt.connection, installPrompt.action.id);
+			toast.success("飞书 CLI 已安装");
+			setInstallPrompt(null);
 			setProbe(await probeAgentBinding(agent.name, binding.id));
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
@@ -889,6 +919,28 @@ function BindingCard({
 			) : null}
 
 			{probe ? <BindingProbeView probe={probe} /> : null}
+
+			<Dialog open={installPrompt !== null} onOpenChange={(open) => { if (!open && busy !== "install-cli") setInstallPrompt(null); }}>
+				<DialogContent>
+					<DialogHeader>
+						<DialogTitle>{installPrompt?.action.confirmation?.title ?? "安装飞书 CLI？"}</DialogTitle>
+						<DialogDescription>{installPrompt?.action.confirmation?.description ?? installPrompt?.action.description}</DialogDescription>
+					</DialogHeader>
+					{busy === "install-cli" ? (
+						<div className="flex items-center gap-3 rounded-xl border border-primary/20 bg-primary/5 px-4 py-3 text-sm">
+							<LoaderIcon className="size-4 shrink-0 animate-spin text-primary" />
+							<div><div className="font-medium">正在安装飞书官方 CLI…</div><p className="mt-0.5 text-xs text-muted-foreground">正在通过 npm 下载并校验，请保持网络连接。</p></div>
+						</div>
+					) : null}
+					<DialogFooter>
+						<Button type="button" variant="ghost" disabled={busy === "install-cli"} onClick={() => setInstallPrompt(null)}>暂不安装</Button>
+						<Button type="button" disabled={busy === "install-cli"} onClick={() => void installConnectionDependency()}>
+							{busy === "install-cli" ? <LoaderIcon className="size-3.5 animate-spin" /> : null}
+							{busy === "install-cli" ? "正在安装" : installPrompt?.action.confirmation?.confirmLabel ?? "开始安装"}
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
 
 			<Dialog open={confirmDelete} onOpenChange={setConfirmDelete}>
 				<DialogContent>

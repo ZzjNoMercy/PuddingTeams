@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import path from "node:path";
 import type { ExtensionRegistry } from "../agent-runtime/extension-registry.js";
 import type { AgentRuntime } from "../agent-runtime/runtime.js";
 import type { PiSessionStore } from "../pi-bridge/session-store.js";
@@ -14,6 +15,8 @@ export interface ExtensionRouteDeps {
 	/** 更新/卸载后标记活跃会话空闲重建。 */
 	sessions?: PiSessionStore;
 	settings: ProductSettingsStore;
+	/** Capability 的共享运行依赖根目录。 */
+	capabilityStateRoot: string;
 }
 
 /**
@@ -22,6 +25,11 @@ export interface ExtensionRouteDeps {
  */
 export function registerExtensionsRoutes(app: FastifyInstance, deps: ExtensionRouteDeps): void {
 	const { registry, teams } = deps;
+	const connectionContext = (extensionId: string) => ({
+		cwd: process.cwd(),
+		env: process.env,
+		stateDir: path.join(deps.capabilityStateRoot, extensionId, "shared"),
+	});
 	let developerModeQueue: Promise<unknown> = Promise.resolve();
 	function serializeDeveloperMode<T>(fn: () => Promise<T>): Promise<T> {
 		const run = developerModeQueue.then(fn, fn);
@@ -66,16 +74,17 @@ export function registerExtensionsRoutes(app: FastifyInstance, deps: ExtensionRo
 
 	/** 扩展贡献的外部系统连接状态。单个插件探测失败不能拖垮整页。 */
 	app.get("/api/extensions/connections", async () => {
-		const connections: Array<ExtensionConnectionStatus & { extensionId: string; extensionName: string }> = [];
+		const connections: Array<ExtensionConnectionStatus & { connectionId: string; extensionId: string; extensionName: string }> = [];
 		for (const entry of registry.list("capability")) {
 			if (!entry.loaded) continue;
 			const module = registry.capabilityModuleOf(entry.manifest.id);
 			if (!module?.listConnections) continue;
 			try {
-				for (const connection of await module.listConnections({ cwd: process.cwd(), env: process.env })) {
+				for (const connection of await module.listConnections(connectionContext(entry.manifest.id))) {
 					connections.push({
 						...connection,
 						id: `${entry.manifest.id}:${connection.id}`,
+						connectionId: connection.id,
 						extensionId: entry.manifest.id,
 						extensionName: entry.manifest.displayName,
 					});
@@ -83,6 +92,7 @@ export function registerExtensionsRoutes(app: FastifyInstance, deps: ExtensionRo
 			} catch {
 				connections.push({
 					id: `${entry.manifest.id}:probe-error`,
+					connectionId: "probe-error",
 					extensionId: entry.manifest.id,
 					extensionName: entry.manifest.displayName,
 					name: entry.manifest.displayName,
@@ -94,6 +104,42 @@ export function registerExtensionsRoutes(app: FastifyInstance, deps: ExtensionRo
 		}
 		return { connections };
 	});
+
+	/** 连接动作必须由插件显式声明并由用户主动触发，探测接口绝不调用。 */
+	app.post<{ Params: { extensionId: string; connectionId: string; actionId: string } }>(
+		"/api/extensions/:extensionId/connections/:connectionId/actions/:actionId",
+		async (req, reply) => {
+			const entry = registry.get(req.params.extensionId);
+			if (!entry || entry.manifest.kind !== "capability" || !entry.loaded) {
+				return reply.code(404).send({ error: "能力插件不存在或尚未加载" });
+			}
+			const module = registry.capabilityModuleOf(entry.manifest.id);
+			if (!module?.listConnections || !module.runConnectionAction) {
+				return reply.code(404).send({ error: "该插件未提供连接动作" });
+			}
+			const ctx = connectionContext(entry.manifest.id);
+			const before = (await module.listConnections(ctx)).find((item) => item.id === req.params.connectionId);
+			if (!before?.actions?.some((action) => action.id === req.params.actionId)) {
+				return reply.code(409).send({ error: "该动作已不可用，请重新检查连接状态" });
+			}
+			try {
+				await module.runConnectionAction(req.params.connectionId, req.params.actionId, ctx);
+				const connection = (await module.listConnections(ctx)).find((item) => item.id === req.params.connectionId);
+				if (!connection) return reply.code(404).send({ error: "连接不存在" });
+				return {
+					connection: {
+						...connection,
+						id: `${entry.manifest.id}:${connection.id}`,
+						connectionId: connection.id,
+						extensionId: entry.manifest.id,
+						extensionName: entry.manifest.displayName,
+					},
+				};
+			} catch (err) {
+				return reply.code(400).send({ error: err instanceof Error ? err.message : "连接动作执行失败" });
+			}
+		},
+	);
 
 	app.post<{ Body: { path?: string; versionPin?: string; mode?: string } }>("/api/extensions/install", async (req, reply) => {
 		const dir = req.body?.path;

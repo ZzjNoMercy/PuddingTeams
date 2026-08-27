@@ -58,6 +58,8 @@ Worker A 的输出要成为 Worker B 的输入时，Manager 应传递明确的�
 
 Delegation 可以记录 `parentDelegationId` 与 handoff kind，形成 A → Manager → B 的可追踪链。单向通知不伪造成需要等待的 Delegation。
 
+这条链只表达因果，不搬运上下文。Manager 对 Worker B 的 `delegate` 调用中，只有 `task` 是实际发送给 B 的新消息；`parentDelegationId` 不会自动注入 A 的完整结果、私有 Session、附件或执行时间线，也不会用 A 的历史 handle 决定 B 的 `session:"continue"`。B 的续接 handle 始终来自 B 在目标 Window 中的最新 worker binding。
+
 文件交接应使用 Workspace 相对路径或显式 Artifact。附件在平台上传目录冻结后，Manager 必须把所需路径写入接力任务；不同 Worker 不共享一个隐式的聊天附件缓存。
 
 ## Artifact

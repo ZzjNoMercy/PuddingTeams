@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="720" viewBox="0 0 1600 720" role="img" aria-labelledby="title description">
+  <title id="title">PuddingTeams open Agent connectivity</title>
+  <desc id="description">Built-in connectors, extensions, remote runtimes and user-owned Agents connect to one Team Room.</desc>
+  <defs>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#061014" flood-opacity="0.34" />
+    </filter>
+    <filter id="soft-shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#061014" flood-opacity="0.24" />
+    </filter>
+    <style>
+      .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif; }
+      .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+      .node-label { fill: #e9f0f1; font-size: 15px; font-weight: 700; letter-spacing: 0.02em; }
+      .node { fill: #162b31; stroke: #3a555c; stroke-width: 1.5; }
+      .connector { stroke: #456168; stroke-width: 2; stroke-linecap: round; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="720" rx="26" fill="#102126" />
+  <path d="M72 648H1528" stroke="#294148" stroke-width="1" />
+
+  <g aria-label="PuddingTeams wordmark">
+    <circle cx="88" cy="72" r="13" fill="none" stroke="#6b86ff" stroke-width="4" />
+    <circle cx="105" cy="72" r="13" fill="none" stroke="#31b2be" stroke-width="4" />
+    <circle cx="96.5" cy="87" r="13" fill="#102126" stroke="#e9f0f1" stroke-width="4" />
+    <text x="130" y="83" class="sans" fill="#f4f7f7" font-size="28" font-weight="750">PuddingTeams</text>
+    <path d="M352 60V90" stroke="#395158" stroke-width="1" />
+    <text x="374" y="81" class="mono" fill="#769098" font-size="13" font-weight="700" letter-spacing="2.2">OPEN CONNECTOR FABRIC</text>
+  </g>
+
+  <g aria-label="Message">
+    <text x="72" y="282" class="sans" fill="#f4f7f7" font-size="72" font-weight="760" letter-spacing="-3.8">Bring every Agent</text>
+    <text x="72" y="362" class="sans" fill="#f4f7f7" font-size="72" font-weight="760" letter-spacing="-3.8">into <tspan fill="#31b2be">one room.</tspan></text>
+    <text x="76" y="441" class="sans" fill="#9bb0b5" font-size="20" font-weight="500">Keep each runtime independent. Keep the goal, session and delivery connected.</text>
+    <g transform="translate(76 507)">
+      <rect width="165" height="38" rx="19" fill="#172d33" stroke="#3b565d" />
+      <circle cx="21" cy="19" r="4" fill="#31b2be" />
+      <text x="36" y="24" class="mono" fill="#b9c9cc" font-size="12" font-weight="700">CONNECTORS</text>
+      <rect x="177" width="148" height="38" rx="19" fill="#172d33" stroke="#3b565d" />
+      <circle cx="198" cy="19" r="4" fill="#6b86ff" />
+      <text x="213" y="24" class="mono" fill="#b9c9cc" font-size="12" font-weight="700">EXTENSIONS</text>
+      <rect x="337" width="188" height="38" rx="19" fill="#172d33" stroke="#3b565d" />
+      <circle cx="358" cy="19" r="4" fill="#d9a545" />
+      <text x="373" y="24" class="mono" fill="#b9c9cc" font-size="12" font-weight="700">YOUR RUNTIME</text>
+    </g>
+  </g>
+
+  <g aria-label="Agent connection network">
+    <ellipse cx="1155" cy="360" rx="374" ry="248" fill="none" stroke="#294148" stroke-width="1.5" />
+    <ellipse cx="1155" cy="360" rx="258" ry="170" fill="none" stroke="#263c43" stroke-width="1.5" />
+
+    <g class="connector">
+      <path d="M1155 360L1155 133" />
+      <path d="M1155 360L1360 189" />
+      <path d="M1155 360L1444 360" />
+      <path d="M1155 360L1350 535" />
+      <path d="M1155 360L1155 595" />
+      <path d="M1155 360L948 535" />
+      <path d="M1155 360L848 360" />
+      <path d="M1155 360L953 189" />
+    </g>
+
+    <g filter="url(#shadow)">
+      <rect x="1037" y="306" width="236" height="108" rx="30" fill="#f4f7f7" />
+      <circle cx="1080" cy="350" r="13" fill="none" stroke="#6b86ff" stroke-width="4" />
+      <circle cx="1097" cy="350" r="13" fill="none" stroke="#31b2be" stroke-width="4" />
+      <circle cx="1088.5" cy="365" r="13" fill="#f4f7f7" stroke="#102126" stroke-width="4" />
+      <text x="1122" y="354" class="sans" fill="#102126" font-size="24" font-weight="760">Team Room</text>
+      <text x="1122" y="382" class="mono" fill="#6d858c" font-size="11" font-weight="700" letter-spacing="1.1">GOAL · SESSION · WORKSPACE</text>
+    </g>
+
+    <g filter="url(#soft-shadow)">
+      <g transform="translate(1080 104)">
+        <rect class="node" width="150" height="58" rx="18" />
+        <rect x="14" y="13" width="32" height="32" rx="10" fill="#6b86ff" />
+        <text x="30" y="35" class="mono" fill="#ffffff" font-size="13" font-weight="800" text-anchor="middle">&gt;_</text>
+        <text x="59" y="35" class="sans node-label">Codex</text>
+      </g>
+      <g transform="translate(1281 160)">
+        <rect class="node" width="158" height="58" rx="18" />
+        <circle cx="30" cy="29" r="16" fill="#d9764e" />
+        <path d="M30 17V41M18 29H42M21.5 20.5L38.5 37.5M38.5 20.5L21.5 37.5" stroke="#fff" stroke-width="2.4" stroke-linecap="round" />
+        <text x="58" y="35" class="sans node-label">Claude Code</text>
+      </g>
+      <g transform="translate(1372 331)">
+        <rect class="node" width="144" height="58" rx="18" />
+        <rect x="14" y="13" width="32" height="32" rx="10" fill="#f4f7f7" />
+        <text x="30" y="35" class="sans" fill="#102126" font-size="18" font-weight="900" text-anchor="middle">π</text>
+        <text x="58" y="35" class="sans node-label">Pi Agent</text>
+      </g>
+      <g transform="translate(1268 506)">
+        <rect class="node" width="164" height="58" rx="18" />
+        <rect x="14" y="13" width="32" height="32" rx="10" fill="#f1c85c" />
+        <text x="30" y="35" class="mono" fill="#6d371f" font-size="11" font-weight="900" text-anchor="middle">PC</text>
+        <text x="58" y="35" class="sans node-label">PuddingClaw</text>
+      </g>
+      <g transform="translate(1077 566)">
+        <rect class="node" width="156" height="58" rx="18" />
+        <rect x="14" y="13" width="32" height="32" rx="10" fill="#31b2be" />
+        <text x="30" y="35" class="mono" fill="#ffffff" font-size="13" font-weight="900" text-anchor="middle">+</text>
+        <text x="58" y="35" class="sans node-label">Your Agent</text>
+      </g>
+      <g transform="translate(868 506)">
+        <rect class="node" width="160" height="58" rx="18" />
+        <rect x="14" y="13" width="32" height="32" rx="10" fill="#4a9d73" />
+        <circle cx="30" cy="29" r="8" fill="none" stroke="#ffffff" stroke-width="2" />
+        <path d="M22 29H38M30 21C33 24 33 34 30 37M30 21C27 24 27 34 30 37" stroke="#ffffff" stroke-width="1.5" />
+        <text x="58" y="35" class="sans node-label">Remote Agent</text>
+      </g>
+      <g transform="translate(772 331)">
+        <rect class="node" width="152" height="58" rx="18" />
+        <rect x="14" y="13" width="32" height="32" rx="10" fill="#287f8a" />
+        <text x="30" y="35" class="mono" fill="#ffffff" font-size="13" font-weight="900" text-anchor="middle">$_</text>
+        <text x="58" y="35" class="sans node-label">Any CLI</text>
+      </g>
+      <g transform="translate(872 160)">
+        <rect class="node" width="162" height="58" rx="18" />
+        <rect x="14" y="13" width="32" height="32" rx="10" fill="#7567c8" />
+        <text x="30" y="35" class="mono" fill="#ffffff" font-size="13" font-weight="900" text-anchor="middle">{ }</text>
+        <text x="58" y="35" class="sans node-label">Any SDK</text>
+      </g>
+    </g>
+  </g>
+
+  <text x="76" y="682" class="mono" fill="#617a81" font-size="12" font-weight="700" letter-spacing="1.6">ROOM AS CHAT · MANAGER + WORKERS · OPEN CONNECTORS</text>
+</svg>

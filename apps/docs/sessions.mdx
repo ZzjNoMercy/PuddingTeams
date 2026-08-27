@@ -17,6 +17,32 @@ Session 的第一职责不是“保存聊天记录”，而是让下一次动作
 
 Worker Session 不等于 Delegation。第一次 `run` 可以返回 `sessionHandle`；下一次 `continue` 在同一个 Worker Session 中创建新的 Delegation。这样每次执行都可审计，又不会丢失上游 Agent 的多轮上下文。
 
+## Delegate 如何续接
+
+Manager 通过目标 Worker 的 `agent_<worker>__delegate` 工具发起每一轮。普通追问的标准输入如下：
+
+```json
+{
+  "task": "继续核对第三条新闻，并给出原始来源",
+  "parentDelegationId": "上一轮的 delegationId",
+  "handoffKind": "followup",
+  "session": "continue"
+}
+```
+
+这四个字段不是一回事：
+
+| 字段 | 作用 |
+| --- | --- |
+| `task` | 真正发送给目标 Worker 的新消息 |
+| `parentDelegationId` | 记录本轮源自当前 Manager Session 中的哪次委托 |
+| `handoffKind` | `followup` 表示追问/返修；带 parent 的 `request` 表示派生出的新下游任务 |
+| `session` | `continue` 使用目标 Window 的最新 Worker binding；`new` 新开 Worker Session |
+
+`session` 缺省为 `continue`。PuddingTeams 负责选择并校验 `workerBindings[agentId].sessionHandle`，再交给 Driver 恢复会话；Worker 不会临场自行选择 handle。某些 CLI Connector 每轮都会 spawn 新进程，但带 resume handle 时仍是同一个逻辑 Worker Session。没有有效 binding 时从新 Worker Session 开始。
+
+`parentDelegationId` 不会自动注入父结果，也不会决定使用哪个 `sessionHandle`。跨 Worker 接力时，Manager 必须把必要摘要、回读内容或 Workspace/Artifact 路径写进 `task`。parent 只能属于当前 Manager Session；新开 Manager Session 后不能继续旧因果链，但如果仍在同一个 Window，仍可能通过窗口 binding 续接旧 Worker Session，并创建新的根 Delegation。
+
 ## 谁拥有哪份会话
 
 - Manager 和本地 pi Worker 的完整消息历史由 pi Session JSONL 保存。

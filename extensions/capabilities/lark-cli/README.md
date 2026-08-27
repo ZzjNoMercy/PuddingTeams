@@ -6,14 +6,16 @@
 
 ## PuddingTeams
 
-在 Manager 或本地 Pi Worker 的配置页添加“飞书 CLI”。平台会自动完成：
+在 Manager 或本地 Pi Worker 的配置页添加“飞书 CLI”。平台按以下流程工作：
 
-- 优先检测 `PATH` 中的本机官方 `lark-cli`，并通过 `lark-cli update` 定期同步；
-- 未检测到时，在当前 binding 的平台运行目录通过官方 npm 包自动安装；
+- 探测只检查 `PATH` 中的本机官方 `lark-cli` 或平台已安装的共享 CLI，以及版本和登录状态；
+- 未检测到时立即返回，不在探测、保存绑定或页面加载时调用 npm；
+- 用户在插件详情、连接状态页或 binding 探测后的弹窗中确认后，才通过官方 npm 包安装共享 CLI；
+- 实际创建 Session 时，本机 CLI 会通过 `lark-cli update` 定期同步；
 - 通过 `lark-cli skills list/read` 导出 CLI 内嵌的同版本 `lark-*` Skills；
-- 探测和实际创建 Session 都会触发上述准备流程，用户不需要单独更新。
+- 安装完成后自动重新探测，继续显示登录状态。
 
-探测结果只显示 CLI 来源与版本、Skills 数量、登录状态和必要的登录命令。Token
+探测结果只显示 CLI 来源与版本、登录状态和必要的登录命令。Token
 由 `lark-cli` 自己读写；PuddingTeams 只向目标 Pi Session 注入 CLI 路径与
 `LARKSUITE_CLI_CONFIG_DIR`，不会把 Token 写入 Agent 配置或会话记录。
 自动登录方式在使用本机 CLI 时沿用本机登录状态；平台安装 CLI 时为当前

@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { cancelDelegation, interruptGoal, resumeGoal, reviewWorkItem } from "@/lib/api";
 import type { CompletionReview, CompletionReviewCriterion, DecisionRequest, DelegationTrace, SessionGoalSummary, SessionWorkState, WorkItem, WorkItemStatus } from "@/lib/types";
+import { RuntimeViewTabs, type SessionRuntimeView } from "./session-activity-drawer";
 import { useWorkerProcessDrawer } from "./worker-process-context";
 
 const verdictText: Record<CompletionReview["verdict"], string> = { satisfied: "验收通过", not_satisfied: "验收未通过", needs_human: "需要人工验收" };
@@ -91,12 +92,13 @@ function WorkPlanGraph({ goal, items, selectedId, filter, executionStatus, onSel
 }
 
 export function SessionRuntimeDrawer({
-	workState, initialWorkItemId, activeGoalId, goals, selectedGoalId, goalLoading, goalLoadError, decisions, delegations, answerById, submitting, open, onOpenChange, onGoalSelect, onRetryGoal, onAnswerChange, onAnswer, onWorkStateChange,
+	workState, initialWorkItemId, activeGoalId, goals, selectedGoalId, goalLoading, goalLoadError, decisions, delegations, answerById, submitting, open, onOpenChange, onRuntimeViewChange, onGoalSelect, onRetryGoal, onAnswerChange, onAnswer, onWorkStateChange,
 }: {
 	workState: SessionWorkState; activeGoalId: string | null; goals: SessionGoalSummary[]; decisions: DecisionRequest[]; delegations: DelegationTrace[]; answerById: Record<string, string>;
 	initialWorkItemId?: string;
 	selectedGoalId: string; goalLoading: boolean; goalLoadError?: string;
 	submitting: boolean; open: boolean; onOpenChange: (open: boolean) => void;
+	onRuntimeViewChange: (view: SessionRuntimeView) => void;
 	onGoalSelect: (goalId: string) => void; onRetryGoal: () => void;
 	onAnswerChange: (decisionId: string, value: string) => void; onAnswer: (decision: DecisionRequest, value: string) => void;
 	onWorkStateChange: (state: SessionWorkState) => void;
@@ -157,13 +159,14 @@ export function SessionRuntimeDrawer({
 	};
 	const openProcess = (id: string) => { onOpenChange(false); setTimeout(() => openWorkerProcess(id), 0) };
 
-	return <Dialog open={open} onOpenChange={onOpenChange}>
-		<DialogContent positionMode="drawer" overlayClassName="goal-runtime-overlay" className="context-drawer runtime-drawer goal-runtime-drawer grid grid-rows-[auto_auto_auto_minmax(0,1fr)] gap-0 p-0">
+	return <Dialog modal={false} open={open} onOpenChange={onOpenChange}>
+		<DialogContent positionMode="drawer" overlayClassName="goal-runtime-overlay" className="context-drawer runtime-drawer goal-runtime-drawer task-runtime-drawer is-goal grid grid-rows-[auto_auto_auto_auto_minmax(0,1fr)] gap-0 p-0">
 			<DialogHeader className="runtime-drawer-head goal-drawer-head">
-				<div className="goal-drawer-title-row"><DialogTitle><ListTreeIcon />目标与执行</DialogTitle><span className={"goal-state-label is-" + (goalLoading ? "loading" : workState.status === "active" ? workState.execution.status : workState.status)}><i />{goalLoading ? "载入中" : executionText(workState)}</span>{goals.length > 1 ? <select className="goal-history-select" aria-label="选择当前或历史 Goal" title={goals.find((goal) => goal.goalId === selectedGoalId)?.goal} value={selectedGoalId} disabled={goalLoading} onChange={(event) => onGoalSelect(event.target.value)}>{goals.map((goal) => <option key={goal.goalId} value={goal.goalId}>{goal.goalId === activeGoalId ? "当前" : goal.status === "resolved" ? "已完成" : "已取消"} · {formatTime(goal.createdAt)} · {goal.goal}</option>)}</select> : null}</div>
+				<div className="goal-drawer-title-row"><DialogTitle><ListTreeIcon />任务与执行</DialogTitle><span className={"goal-state-label is-" + (goalLoading ? "loading" : workState.status === "active" ? workState.execution.status : workState.status)}><i />{goalLoading ? "载入中" : executionText(workState)}</span>{goals.length > 1 ? <select className="goal-history-select" aria-label="选择当前或历史 Goal" title={goals.find((goal) => goal.goalId === selectedGoalId)?.goal} value={selectedGoalId} disabled={goalLoading} onChange={(event) => onGoalSelect(event.target.value)}>{goals.map((goal) => <option key={goal.goalId} value={goal.goalId}>{goal.goalId === activeGoalId ? "当前" : goal.status === "resolved" ? "已完成" : "已取消"} · {formatTime(goal.createdAt)} · {goal.goal}</option>)}</select> : null}</div>
 				<DialogDescription className="sr-only">查看当前目标的计划、验收与执行记录</DialogDescription>
 				<span className="goal-progress-label">{goalLoading ? "加载中" : `${accepted}/${items.filter((item) => item.status !== "cancelled").length || conditions.length} 已验收`}</span>
 			</DialogHeader>
+			<RuntimeViewTabs view="goal" hasGoal onViewChange={onRuntimeViewChange} />
 			{goalLoading || goalLoadError ? <div className="goal-view-loading" role="status"><strong>{goalLoadError ? "Goal 加载失败" : "正在加载 Goal…"}</strong>{goalLoadError ? <><span>{goalLoadError}</span><Button size="sm" variant="outline" onClick={onRetryGoal}>重新加载</Button></> : null}</div> : <>
 			<div className="goal-plan-summary">
 				<div className="goal-summary-copy"><span>SESSION GOAL</span><strong title={workState.goal}>{workState.goal}</strong><small>{workState.currentBrief || "尚未记录当前进度"}</small></div>

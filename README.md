@@ -3,7 +3,7 @@
 **把不同 Agent 拉进同一间房，让目标、过程与交付持续可见。**
 
 <p align="center">
-  <img src="apps/docs/public/assets/puddingteams-connectivity.png" width="960" alt="PuddingTeams Agent Connector 拓扑：Codex、Claude Code、Pi、PuddingClaw 与其他 Agent 接入同一个 Team Room" />
+  <img src="apps/docs/public/assets/puddingteams-connectivity.png" width="960" alt="PuddingTeams 开放连接图：内置 Connector、Extension、远程运行时和用户自己的 Agent 接入同一个 Team Room" />
 </p>
 
 PuddingTeams 是一个本地优先的多 Agent 协作系统。它不是“同时打开几个聊天窗口”，而是把共同目标、Manager 计划、Worker 执行、人的决策与 Workspace 交付保存在一条可恢复的协作链上。

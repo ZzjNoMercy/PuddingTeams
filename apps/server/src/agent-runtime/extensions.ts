@@ -130,6 +130,8 @@ export interface CapabilityRuntimeContext {
 	env: NodeJS.ProcessEnv;
 	/** `<PUDDINGTEAMS_HOME>/secrets/capabilities/<extension>/<agent>/<binding>`。 */
 	stateDir: string;
+	/** 同一 Capability 所有绑定共享的运行依赖目录，不存放 binding 独占凭据。 */
+	sharedStateDir: string;
 }
 
 export interface CapabilityRuntimeContribution {
@@ -154,12 +156,26 @@ export interface ExtensionConnectionStatus {
 	accountName?: string;
 	identity?: string;
 	message?: string;
+	actions?: ExtensionConnectionAction[];
 	checkedAt: string;
+}
+
+export interface ExtensionConnectionAction {
+	id: string;
+	label: string;
+	description?: string;
+	confirmation?: {
+		title: string;
+		description: string;
+		confirmLabel: string;
+	};
 }
 
 export interface ExtensionConnectionContext {
 	cwd: string;
 	env: NodeJS.ProcessEnv;
+	/** `<PUDDINGTEAMS_HOME>/secrets/capabilities/<extension>/shared`。 */
+	stateDir: string;
 }
 
 /** Capability Extension 运行时模块（当前进程内加载，隔离 Host 后迁入 Broker）。 */
@@ -170,6 +186,12 @@ export interface CapabilityExtensionModule {
 	runtime?: CapabilityRuntimeContribution;
 	/** 可选：向扩展页贡献只读连接状态；不依赖 Agent binding。 */
 	listConnections?(ctx: ExtensionConnectionContext): ExtensionConnectionStatus[] | Promise<ExtensionConnectionStatus[]>;
+	/** 可选：执行连接卡声明的显式动作；探测本身不得隐式调用。 */
+	runConnectionAction?(
+		connectionId: string,
+		actionId: string,
+		ctx: ExtensionConnectionContext,
+	): void | Promise<void>;
 }
 
 /**
@@ -241,6 +263,7 @@ export async function resolveAgentCapabilityRuntime(input: {
 		activeBindings++;
 		const key = `${binding.extensionId}:${binding.id}`;
 		const stateDir = capabilityBindingStateDir(input.stateRoot, binding.extensionId, input.agent.name, binding.id);
+		const sharedStateDir = path.join(input.stateRoot, binding.extensionId, "shared");
 		try {
 			const resolved = await module.runtime.resolveSession({
 				agent: {
@@ -256,6 +279,7 @@ export async function resolveAgentCapabilityRuntime(input: {
 				cwd: input.cwd,
 				env,
 				stateDir,
+				sharedStateDir,
 			});
 			for (const skillPath of resolved.skillPaths ?? []) {
 				if (path.isAbsolute(skillPath)) skillPaths.add(skillPath);

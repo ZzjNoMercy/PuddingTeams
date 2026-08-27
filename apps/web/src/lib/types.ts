@@ -308,6 +308,7 @@ export interface CatalogEntry {
 
 export interface ExtensionConnectionStatus {
 	id: string;
+	connectionId: string;
 	extensionId: string;
 	extensionName: string;
 	name: string;
@@ -317,6 +318,16 @@ export interface ExtensionConnectionStatus {
 	accountName?: string;
 	identity?: string;
 	message?: string;
+	actions?: Array<{
+		id: string;
+		label: string;
+		description?: string;
+		confirmation?: {
+			title: string;
+			description: string;
+			confirmLabel: string;
+		};
+	}>;
 	checkedAt: string;
 }
 

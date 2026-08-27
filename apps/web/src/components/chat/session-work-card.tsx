@@ -14,35 +14,46 @@ import {
 } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { answerDecisionRequest, getSessionWorkState, listModels, putSessionWorkState } from "@/lib/api";
+import { answerDecisionRequest, fetchRoomDelegationProcesses, getSessionWorkState, listModels, putSessionWorkState, type WorkerProcessListItem } from "@/lib/api";
 import type { CompletionReviewMode, DecisionRequest, DelegationTrace, ModelSummary, SessionGoalSummary, SessionWorkState } from "@/lib/types";
+import { groupActivitiesByTurn, SessionActivityDrawer, type SessionExecutionTurn, type SessionRuntimeSummary, type SessionRuntimeView, RuntimeViewTabs } from "./session-activity-drawer";
 import { SessionRuntimeDrawer } from "./session-runtime-drawer";
+import { useWorkerProcessDrawer } from "./worker-process-context";
 
 function isExecutionLive(status: SessionWorkState["execution"]["status"]): boolean {
 	return status === "running" || status === "recovering" || status === "reviewing";
 }
 
 export function SessionWorkCard({
+	roomId,
 	sessionId,
+	executionTurns,
 	createOpen,
 	onCreateOpenChange,
 	initialGoal = "",
 	onGoalStateChange,
-	onGoalSummaryChange,
+	onRuntimeSummaryChange,
 	workStateSignal,
 	runtimeOpen,
 	onRuntimeOpenChange,
+	runtimeView,
+	onRuntimeViewChange,
 }: {
+	roomId: string;
 	sessionId: string;
+	executionTurns: SessionExecutionTurn[];
 	createOpen: boolean;
 	onCreateOpenChange: (open: boolean) => void;
 	initialGoal?: string;
 	onGoalStateChange?: (hasGoal: boolean) => void;
-	onGoalSummaryChange?: (summary: { hasGoal: boolean; pending: number; running: boolean } | null) => void;
+	onRuntimeSummaryChange?: (summary: SessionRuntimeSummary) => void;
 	workStateSignal?: string;
 	runtimeOpen: boolean;
 	onRuntimeOpenChange: (open: boolean) => void;
+	runtimeView: SessionRuntimeView;
+	onRuntimeViewChange: (view: SessionRuntimeView) => void;
 }) {
+	const { openWorkerProcess } = useWorkerProcessDrawer();
 	const [workState, setWorkState] = useState<SessionWorkState | null>(null);
 	const [activeGoalId, setActiveGoalId] = useState<string | null>(null);
 	const [goals, setGoals] = useState<SessionGoalSummary[]>([]);
@@ -60,6 +71,9 @@ export function SessionWorkCard({
 	const [goalLoading, setGoalLoading] = useState(false);
 	const [goalLoadError, setGoalLoadError] = useState<string>();
 	const [autoFocusWorkItemId, setAutoFocusWorkItemId] = useState<string>();
+	const [activityItems, setActivityItems] = useState<WorkerProcessListItem[]>([]);
+	const [activityLoading, setActivityLoading] = useState(true);
+	const [activityError, setActivityError] = useState<string>();
 	const requestSequence = useRef(0);
 	const viewedGoalRef = useRef<string | undefined>(undefined);
 	const autoOpenedWorkItems = useRef(new Set<string>());
@@ -81,9 +95,10 @@ export function SessionWorkCard({
 		if (unseen.length) {
 			const latest = unseen.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
 			setAutoFocusWorkItemId(latest?.id);
+			onRuntimeViewChange("goal");
 			onRuntimeOpenChange(true);
 		}
-	}, [onRuntimeOpenChange]);
+	}, [onRuntimeOpenChange, onRuntimeViewChange]);
 
 	const refresh = useCallback(async (goalIdOverride?: string) => {
 		const requestedGoalId = goalIdOverride ?? viewedGoalRef.current;
@@ -102,12 +117,6 @@ export function SessionWorkCard({
 			setGoalLoadError(undefined);
 			setAutoFocusWorkItemId(undefined);
 			setGoalLoading(false);
-			const activeSummary = result.goals.find((item) => item.goalId === result.activeGoalId);
-			onGoalSummaryChange?.(result.goals.length ? {
-				hasGoal: true,
-				pending: activeSummary?.pending ?? 0,
-				running: activeSummary?.running ?? false,
-			} : null);
 		} catch (error) {
 			if (requestId === requestSequence.current) {
 				setGoalLoading(false);
@@ -115,7 +124,18 @@ export function SessionWorkCard({
 			}
 			throw error;
 		}
-	}, [autoOpenStartedWorkItem, onGoalStateChange, onGoalSummaryChange, sessionId]);
+	}, [autoOpenStartedWorkItem, onGoalStateChange, sessionId]);
+
+	const refreshActivity = useCallback(async () => {
+		try {
+			setActivityItems(await fetchRoomDelegationProcesses(roomId, sessionId));
+			setActivityError(undefined);
+		} catch (error) {
+			setActivityError(error instanceof Error ? error.message : String(error));
+		} finally {
+			setActivityLoading(false);
+		}
+	}, [roomId, sessionId]);
 
 	useEffect(() => {
 		if (!createOpen) return;
@@ -151,11 +171,35 @@ export function SessionWorkCard({
 	}, [refresh]);
 
 	useEffect(() => {
+		const initial = setTimeout(() => void refreshActivity(), 0);
+		const timer = setInterval(() => void refreshActivity(), 2500);
+		return () => {
+			clearTimeout(initial);
+			clearInterval(timer);
+		};
+	}, [refreshActivity]);
+
+	useEffect(() => {
 		if (!workStateSignal) return;
 		void refresh().catch(() => undefined);
 	}, [refresh, workStateSignal]);
 
 	const pending = useMemo(() => decisions.filter((item) => item.status === "pending"), [decisions]);
+	const activeGoalSummary = goals.find((item) => item.goalId === activeGoalId);
+	const currentTurnItems = useMemo(() => groupActivitiesByTurn(activityItems, executionTurns).find((group) => group.isCurrent)?.items ?? [], [activityItems, executionTurns]);
+	const activityRunning = currentTurnItems.filter((item) => item.status === "running").length;
+	const activityPending = currentTurnItems.filter((item) => item.status === "waiting_input").length;
+	const activityCompleted = currentTurnItems.filter((item) => item.status === "completed").length;
+	useEffect(() => {
+		onRuntimeSummaryChange?.({
+			hasGoal: goals.length > 0,
+			sessionTotal: activityItems.length,
+			total: currentTurnItems.length,
+			completed: activityCompleted,
+			pending: Math.max(activeGoalSummary?.pending ?? 0, activityPending),
+			running: activityRunning || (activeGoalSummary?.running ? 1 : 0),
+		});
+	}, [activeGoalSummary?.pending, activeGoalSummary?.running, activityCompleted, activityItems.length, activityPending, activityRunning, currentTurnItems.length, goals.length, onRuntimeSummaryChange]);
 
 	const createGoal = useCallback(async () => {
 		if (!goal.trim() || !completionBoundary.trim()) return;
@@ -183,7 +227,6 @@ export function SessionWorkCard({
 			setDelegations([]);
 			setAnswerById({});
 			onGoalStateChange?.(true);
-			onGoalSummaryChange?.({ hasGoal: true, pending: 0, running: false });
 			onCreateOpenChange(false);
 			toast.success(hasHistory ? "已创建下一个 Goal，已切换到最新目标" : "已创建 Goal");
 		} catch (err) {
@@ -191,7 +234,7 @@ export function SessionWorkCard({
 		} finally {
 			setSubmitting(false);
 		}
-	}, [activeGoalId, completionBoundary, goal, goals.length, onCreateOpenChange, onGoalStateChange, onGoalSummaryChange, reviewMode, reviewerModel, sessionId]);
+	}, [activeGoalId, completionBoundary, goal, goals.length, onCreateOpenChange, onGoalStateChange, reviewMode, reviewerModel, sessionId]);
 
 	const selectGoal = useCallback((goalId: string) => {
 		requestSequence.current += 1;
@@ -277,14 +320,26 @@ export function SessionWorkCard({
 		</Dialog>
 	);
 
-	if (loading) return createDialog;
-	if (!workState) {
-		return <>{createDialog}<Dialog open={runtimeOpen} onOpenChange={onRuntimeOpenChange}><DialogContent positionMode="drawer" className="context-drawer runtime-drawer goal-runtime-drawer gap-0 p-0"><DialogHeader className="runtime-drawer-head goal-drawer-head"><DialogTitle>目标与执行</DialogTitle><DialogDescription className="sr-only">目标状态加载结果</DialogDescription></DialogHeader><div className="goal-view-loading" role="status"><strong>{goalLoading ? "正在加载 Goal…" : "Goal 加载失败"}</strong>{goalLoadError ? <span>{goalLoadError}</span> : null}{!goalLoading ? <Button size="sm" variant="outline" onClick={retryGoal}>重新加载</Button> : null}</div></DialogContent></Dialog></>;
-	}
-
 	return (
 		<>
 		{createDialog}
+		{runtimeView === "activity" ? (
+			<SessionActivityDrawer
+				items={activityItems}
+				turns={executionTurns}
+				loading={activityLoading}
+				error={activityError}
+				hasGoal={goals.length > 0}
+				open={runtimeOpen}
+				onOpenChange={onRuntimeOpenChange}
+				onRetry={() => void refreshActivity()}
+				onViewChange={onRuntimeViewChange}
+				onOpenProcess={(delegationId) => {
+					onRuntimeOpenChange(false);
+					setTimeout(() => openWorkerProcess(delegationId), 0);
+				}}
+			/>
+		) : workState ? (
 		<SessionRuntimeDrawer
 			key={`${workState.goalId}:${autoFocusWorkItemId ?? ""}`}
 			workState={workState}
@@ -300,6 +355,7 @@ export function SessionWorkCard({
 			submitting={submitting}
 			open={runtimeOpen}
 			onOpenChange={onRuntimeOpenChange}
+			onRuntimeViewChange={onRuntimeViewChange}
 			onGoalSelect={selectGoal}
 			onRetryGoal={retryGoal}
 			onAnswerChange={(decisionId, value) => setAnswerById((prev) => ({ ...prev, [decisionId]: value }))}
@@ -312,13 +368,20 @@ export function SessionWorkCard({
 				const nextPending = pending.length + items.filter((item) => item.status === "submitted").length + (state.plan?.needsReconcile ? 1 : 0) + (state.execution.status === "interrupted" ? 1 : 0);
 				const nextRunning = isExecutionLive(state.execution.status);
 				setGoals((previous) => previous.map((item) => item.goalId === state.goalId ? { ...item, goal: state.goal, status: state.status, executionStatus: state.execution.status, pending: nextPending, running: nextRunning, updatedAt: state.updatedAt } : item));
-				onGoalSummaryChange?.({
-					hasGoal: true,
-					pending: nextPending,
-					running: nextRunning,
-				});
 			}}
 		/>
+		) : (
+			<Dialog modal={false} open={runtimeOpen} onOpenChange={onRuntimeOpenChange}>
+				<DialogContent positionMode="drawer" overlayClassName="goal-runtime-overlay" className="context-drawer runtime-drawer task-runtime-drawer is-goal grid grid-rows-[auto_auto_minmax(0,1fr)] gap-0 p-0">
+					<DialogHeader className="runtime-drawer-head goal-drawer-head task-runtime-head">
+						<DialogTitle>任务与执行</DialogTitle>
+						<DialogDescription className="sr-only">Goal 状态加载结果</DialogDescription>
+					</DialogHeader>
+					<RuntimeViewTabs view="goal" hasGoal onViewChange={onRuntimeViewChange} />
+					<div className="goal-view-loading" role="status"><strong>{loading || goalLoading ? "正在加载 Goal…" : "Goal 加载失败"}</strong>{goalLoadError ? <span>{goalLoadError}</span> : null}{!loading && !goalLoading ? <Button size="sm" variant="outline" onClick={retryGoal}>重新加载</Button> : null}</div>
+				</DialogContent>
+			</Dialog>
+		)}
 		</>
 	);
 }
