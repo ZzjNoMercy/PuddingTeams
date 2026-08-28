@@ -56,11 +56,11 @@ export function NavRail({ view }: { view: AppView }) {
 	}, []);
 	const username = identity?.user.displayName || identity?.user.username || "本地用户";
 
-	const toggleExpanded = () => {
+	const toggleWebExpanded = () => {
 		const next = document.documentElement.dataset.nav !== "expanded";
 		if (next) document.documentElement.dataset.nav = "expanded";
 		else delete document.documentElement.dataset.nav;
-		localStorage.setItem("puddingteams:nav-collapsed", next ? "0" : "1");
+		localStorage.setItem("puddingteams:web-nav-expanded", next ? "1" : "0");
 	};
 
 	const itemClass = (active: boolean) =>
@@ -70,7 +70,7 @@ export function NavRail({ view }: { view: AppView }) {
 		);
 
 	return (
-		<div className="nav-rail flex shrink-0 flex-col">
+		<div className="nav-rail flex shrink-0 flex-col" data-app-sidebar="nav">
 			<Link href="/" className="nav-brand" title="PuddingTeams" aria-label="PuddingTeams 首页">
 				<ProductAvatar size={38} shape="square" className="nav-brand-mark" />
 				<span className="nav-brand-name nav-label">PuddingTeams</span>
@@ -149,7 +149,7 @@ export function NavRail({ view }: { view: AppView }) {
 				type="button"
 				title="展开或收起侧边栏"
 				aria-label="展开或收起侧边栏"
-				onClick={toggleExpanded}
+				onClick={toggleWebExpanded}
 				className="nav-edge-toggle"
 			>
 				<ChevronRightIcon className="nav-collapsed-only size-3.5" aria-hidden="true" />

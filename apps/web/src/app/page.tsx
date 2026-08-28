@@ -6,6 +6,7 @@ import { ChatPane } from "@/components/chat/chat-pane";
 import { CreateWindowDialog } from "@/components/chat/create-window-dialog";
 import { SessionList } from "@/components/chat/session-list";
 import { NavRail } from "@/components/chat/nav-rail";
+import { DesktopTitlebar } from "@/components/desktop-titlebar";
 import { deleteRoom, listRooms } from "@/lib/api";
 import type { RoomSummary } from "@/lib/types";
 
@@ -129,39 +130,44 @@ export default function Home() {
 	);
 
 	return (
-		<div className="home-shell flex h-dvh">
-			<NavRail view="chat" />
-			{roomsOpen ? <button type="button" className="fixed inset-0 z-30 bg-black/30 md:hidden" aria-label="关闭对话列表" onClick={() => setRoomsOpen(false)} /> : null}
-			<SessionList
-				rooms={rooms}
-				selectedId={selectedId}
-				onSelect={selectRoom}
-				onNew={handleNew}
-				onDelete={handleDelete}
-				open={roomsOpen}
-				onClose={() => setRoomsOpen(false)}
-			/>
-			<main className="home-main-stage flex min-w-0 flex-1 flex-col">
-				{selectedId ? (
-					<ChatPane
-						key={selectedId}
-						roomId={selectedId}
-						onOpenWindow={openWindow}
-						onRoomUpdated={handleRoomUpdated}
-						onOpenRoomList={() => setRoomsOpen(true)}
-						onRoomsMayHaveChanged={handleRoomsMayHaveChanged}
+		<div className="home-shell desktop-app-frame h-dvh">
+			<DesktopTitlebar />
+			<div className="desktop-app-body">
+				{roomsOpen ? <button type="button" className="fixed inset-0 z-30 bg-black/30 md:hidden" aria-label="关闭对话列表" onClick={() => setRoomsOpen(false)} /> : null}
+				<div className="desktop-sidebar-stack" data-app-sidebar-shell>
+					<NavRail view="chat" />
+					<SessionList
+						rooms={rooms}
+						selectedId={selectedId}
+						onSelect={selectRoom}
+						onNew={handleNew}
+						onDelete={handleDelete}
+						open={roomsOpen}
+						onClose={() => setRoomsOpen(false)}
 					/>
-				) : (
-					<div className="flex flex-1 flex-col items-center justify-center gap-4 bg-muted/30">
-						<p className="text-sm text-muted-foreground">选择左侧窗口，或发起一个新对话</p>
-						{loadError ? (
-							<p className="text-xs text-destructive">
-								无法连接 backend（{loadError}）。请确认 server 已启动。
-							</p>
-						) : null}
-					</div>
-				)}
-			</main>
+				</div>
+				<main className="home-main-stage flex min-w-0 flex-1 flex-col">
+					{selectedId ? (
+						<ChatPane
+							key={selectedId}
+							roomId={selectedId}
+							onOpenWindow={openWindow}
+							onRoomUpdated={handleRoomUpdated}
+							onOpenRoomList={() => setRoomsOpen(true)}
+							onRoomsMayHaveChanged={handleRoomsMayHaveChanged}
+						/>
+					) : (
+						<div className="flex flex-1 flex-col items-center justify-center gap-4 bg-muted/30">
+							<p className="text-sm text-muted-foreground">选择左侧窗口，或发起一个新对话</p>
+							{loadError ? (
+								<p className="text-xs text-destructive">
+									无法连接 backend（{loadError}）。请确认 server 已启动。
+								</p>
+							) : null}
+						</div>
+					)}
+				</main>
+			</div>
 			<CreateWindowDialog
 				open={createOpen}
 				onOpenChange={setCreateOpen}

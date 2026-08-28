@@ -4,6 +4,7 @@ import { Suspense } from "react";
 import { useSearchParams } from "next/navigation";
 import { AgentConfigPage } from "@/components/agent-config/agent-config-page";
 import { NavRail } from "@/components/chat/nav-rail";
+import { DesktopTitlebar } from "@/components/desktop-titlebar";
 
 // 静态导出（output: "export"）不支持动态段 /agents/[name]，改为查询参数
 // /agents/config?name=xxx。useSearchParams 必须包在 Suspense 里（Next 静态导
@@ -18,11 +19,16 @@ function AgentConfigContent() {
 
 export default function Page() {
 	return (
-		<div className="flex h-dvh">
-			<NavRail view="agents" />
-			<Suspense>
-				<AgentConfigContent />
-			</Suspense>
+		<div className="desktop-app-frame h-dvh">
+			<DesktopTitlebar />
+			<div className="desktop-app-body">
+				<div className="desktop-sidebar-stack desktop-sidebar-nav-only" data-app-sidebar-shell>
+					<NavRail view="agents" />
+				</div>
+				<Suspense>
+					<AgentConfigContent />
+				</Suspense>
+			</div>
 		</div>
 	);
 }

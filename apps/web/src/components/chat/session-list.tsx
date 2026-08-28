@@ -106,7 +106,7 @@ export function SessionList({
 	);
 
 	return (
-		<aside className={`home-rooms-panel ${open ? "max-md:flex" : "max-md:hidden"}`}>
+		<aside className={`home-rooms-panel ${open ? "max-md:flex" : "max-md:hidden"}`} data-app-sidebar="rooms">
 			<div className="home-workspace-head">
 				<h1>PuddingTeams</h1>
 				<button type="button" onClick={onNew} aria-label="发起对话" title="发起对话" className="home-new-room"><PlusIcon /></button>

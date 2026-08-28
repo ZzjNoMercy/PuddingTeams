@@ -2326,10 +2326,7 @@ body {
 	border: none;
 }
 
-/* ---- 主导航展开/收起 ----
-   由 html[data-nav="expanded"] 驱动（layout 内联脚本在首帧绘制前按 localStorage
-   设置，缺省收起）。布局与文字显隐全走 CSS，NavRail 的 React 渲染与状态无关，
-   SSR/客户端 HTML 恒一致：无 hydration mismatch，也无"先收后展"的闪动。 */
+/* ---- 主导航图标栏 ---- */
 .nav-rail {
 	width: 4.25rem;
 	align-items: center;
@@ -2395,31 +2392,6 @@ body {
 .nav-label,
 .nav-expanded-only {
 	display: none;
-}
-
-html[data-nav="expanded"] .nav-rail {
-	width: 11rem;
-	align-items: stretch;
-	padding-inline: 0.5rem;
-}
-
-html[data-nav="expanded"] .nav-item {
-	width: 100%;
-	justify-content: flex-start;
-	gap: 0.625rem;
-	padding-inline: 0.625rem;
-	font-size: 0.875rem;
-}
-
-html[data-nav="expanded"] .nav-brand {
-	width: 100%;
-	justify-content: flex-start;
-	gap: 0.75rem;
-	padding-inline: 0.35rem;
-}
-
-html[data-nav="expanded"] .nav-primary {
-	align-items: stretch;
 }
 
 @media (max-width: 720px) {
@@ -2533,6 +2505,174 @@ html[data-nav="expanded"] .nav-primary {
 	scrollbar-width: thin;
 }
 
+/* ---- Electron 桌面窗口框架 ----
+   Web 端标题栏高度为 0；macOS 桌面壳显示一条与原生交通灯共存的应用工具栏。
+   主内容始终单独占据剩余高度，侧栏隐藏时不会留下空图标轨。 */
+.desktop-app-frame {
+	display: flex;
+	min-width: 0;
+	flex-direction: column;
+	overflow: hidden;
+}
+
+.desktop-app-body {
+	display: flex;
+	min-width: 0;
+	min-height: 0;
+	flex: 1;
+	overflow: hidden;
+}
+
+.desktop-sidebar-stack {
+	display: flex;
+	min-width: 0;
+	min-height: 0;
+	flex-shrink: 0;
+}
+
+.desktop-titlebar { display: none; }
+
+html[data-desktop-platform="darwin"] { --desktop-titlebar-height: 52px; }
+
+html[data-desktop-platform="darwin"] .desktop-titlebar {
+	box-sizing: border-box;
+	display: flex;
+	height: var(--desktop-titlebar-height);
+	min-height: var(--desktop-titlebar-height);
+	align-items: center;
+	gap: 5px;
+	border-bottom: 1px solid var(--home-line, var(--border));
+	background: color-mix(in oklab, var(--home-nav, var(--background)) 94%, transparent);
+	color: var(--home-text-2, var(--muted-foreground));
+	padding: 0 12px 0 0;
+	-webkit-app-region: drag;
+}
+
+.desktop-titlebar-traffic-zone {
+	width: 82px;
+	height: 100%;
+	flex-shrink: 0;
+}
+
+.desktop-titlebar-button {
+	display: grid;
+	width: 32px;
+	height: 32px;
+	padding: 0;
+	place-items: center;
+	border: 0;
+	border-radius: 9px;
+	background: transparent;
+	color: var(--home-text-3, var(--muted-foreground));
+	cursor: pointer;
+	-webkit-app-region: no-drag;
+	transition: background-color 120ms ease, color 120ms ease;
+}
+
+.desktop-titlebar-button svg { width: 17px; height: 17px; }
+.desktop-titlebar-button:hover,
+.desktop-titlebar-button[data-state="open"] {
+	background: var(--home-soft-hover, var(--muted));
+	color: var(--home-text, var(--foreground));
+}
+.desktop-titlebar-button:focus-visible {
+	outline: 2px solid var(--home-accent, var(--ring));
+	outline-offset: 1px;
+}
+
+.desktop-titlebar-drag-fill { min-width: 24px; flex: 1; align-self: stretch; }
+
+html[data-desktop-platform="darwin"] .desktop-sidebar-stack {
+	width: 462px;
+	overflow: clip;
+	opacity: 1;
+	transform: translateX(0);
+	will-change: width, opacity, transform;
+	transition:
+		width 280ms cubic-bezier(0.22, 1, 0.36, 1),
+		transform 280ms cubic-bezier(0.22, 1, 0.36, 1),
+		opacity 280ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+html[data-desktop-platform="darwin"] .desktop-sidebar-stack.desktop-sidebar-nav-only {
+	width: 176px;
+}
+
+html[data-desktop-platform="darwin"][data-sidebar="hidden"] .desktop-sidebar-stack {
+	width: 0;
+	opacity: 0;
+	transform: translateX(-6px);
+	pointer-events: none;
+	transition:
+		width 280ms cubic-bezier(0.4, 0, 0.2, 1),
+		transform 280ms cubic-bezier(0.4, 0, 0.2, 1),
+		opacity 280ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* 桌面端侧栏内部布局恒定保持展开态（完整导航宽度 + 文字标签），不随
+   data-sidebar 切换。收起只由上面的 data-sidebar 规则对整个 stack 做
+   width/opacity/transform 同步收边——overflow: clip 让两列作为一块刚性
+   表面整体滑出并同时淡出，而不是先把抽屉挤压变窄再消失。 */
+html[data-desktop-platform="darwin"] .nav-rail {
+	width: 176px;
+	min-width: 176px;
+	align-items: stretch;
+	padding-inline: 10px;
+}
+
+html[data-desktop-platform="darwin"] .nav-brand {
+	width: 100%;
+	justify-content: flex-start;
+	gap: 10px;
+	padding-inline: 2px;
+}
+
+html[data-desktop-platform="darwin"] .nav-primary {
+	align-items: stretch;
+}
+
+html[data-desktop-platform="darwin"] .nav-item {
+	width: 100%;
+	justify-content: flex-start;
+	gap: 10px;
+	padding-inline: 12px;
+	font-size: 12px;
+	font-weight: 560;
+}
+
+html[data-desktop-platform="darwin"] .nav-label {
+	display: inline;
+}
+
+html[data-desktop-platform="darwin"] .nav-user {
+	width: 100%;
+	justify-content: flex-start;
+	gap: 10px;
+	padding-inline: 2px;
+}
+
+html[data-desktop-platform="darwin"] .nav-user-name {
+	display: block;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+html[data-desktop-platform="darwin"] .home-workspace-head h1 {
+	display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	html[data-desktop-platform="darwin"] .desktop-sidebar-stack {
+		transition: none;
+	}
+}
+
+html[data-reduce-motion="true"][data-desktop-platform="darwin"] .desktop-sidebar-stack {
+	transition: none;
+}
+
 /* Chromium/Electron needs the WebKit pseudo-elements; Firefox uses the two
    properties above. Transparent tracks inherit the current home surface while
    the inset thumb stays visible without becoming a separate white strip. */
@@ -2563,37 +2703,6 @@ html[data-nav="expanded"] .nav-primary {
 	padding: 14px 10px 12px;
 }
 
-/* Electron macOS uses the real hiddenInset traffic lights. Only the left rail
-   reserves their row; the rest of the interface keeps its existing density.
-   Header surfaces are draggable, while every actual control remains clickable. */
-html[data-desktop-platform="darwin"] .nav-rail {
-	padding-top: 56px;
-	-webkit-app-region: no-drag;
-}
-html[data-desktop-platform="darwin"] .nav-rail::before {
-	position: absolute;
-	top: 0;
-	right: 0;
-	left: 0;
-	height: 48px;
-	-webkit-app-region: drag;
-	content: "";
-}
-html[data-desktop-platform="darwin"] :where(
-	.home-chat-header,
-	.home-workspace-head,
-	.ops-page-header,
-	.agent-config-head
-) { -webkit-app-region: drag; }
-html[data-desktop-platform="darwin"] :where(
-	.nav-rail,
-	.home-chat-header,
-	.home-workspace-head,
-	.ops-page-header,
-	.agent-config-head
-) :where(a, button, input, textarea, select, [role="button"], [role="link"]) {
-	-webkit-app-region: no-drag;
-}
 /* Electron calculates draggable regions before visual stacking. A Radix portal
    can therefore appear above a drag surface while clicks still move the window.
    Every floating interactive surface must explicitly carve out a no-drag area. */
@@ -2647,42 +2756,6 @@ html[data-desktop-platform="darwin"] :where(
 .nav-item[aria-current="page"]::before { top: 12px; bottom: 12px; left: -10px; width: 3px; }
 .nav-item:focus-visible { outline: 2px solid var(--home-accent, var(--ring)); outline-offset: 2px; }
 
-html[data-nav="expanded"] .nav-rail {
-	width: 176px;
-	min-width: 176px;
-	align-items: stretch;
-	padding-inline: 10px;
-}
-html[data-nav="expanded"] .nav-brand {
-	width: 100%;
-	justify-content: flex-start;
-	gap: 10px;
-	padding-inline: 2px;
-}
-html[data-nav="expanded"] .nav-primary { align-items: stretch; }
-html[data-nav="expanded"] .nav-item {
-	width: 100%;
-	justify-content: flex-start;
-	gap: 10px;
-	padding-inline: 12px;
-	font-size: 12px;
-	font-weight: 560;
-}
-html[data-nav="expanded"] .nav-item[aria-current="page"]::before { left: -10px; }
-html[data-nav="expanded"] .nav-user {
-	width: 100%;
-	justify-content: flex-start;
-	gap: 10px;
-	padding-inline: 2px;
-}
-html[data-nav="expanded"] .nav-user-name {
-	display: block;
-	min-width: 0;
-	overflow: hidden;
-	text-overflow: ellipsis;
-	white-space: nowrap;
-}
-
 .nav-user {
 	display: flex;
 	width: 42px;
@@ -2707,7 +2780,63 @@ html[data-nav="expanded"] .nav-user-name {
 }
 .nav-user-name { display: none; }
 
-/* ---- 侧栏展开/收起：右边缘中点的悬浮箭头，悬停侧栏时出现 ---- */
+/* 浏览器开发态保留原有的两档导航宽度；Electron 使用顶部原生标题栏，
+   因此不会显示这个边缘按钮，也不会读取 data-nav。 */
+html:not([data-desktop-platform])[data-nav="expanded"] .nav-rail {
+	width: 176px;
+	min-width: 176px;
+	align-items: stretch;
+	padding-inline: 10px;
+}
+
+html:not([data-desktop-platform])[data-nav="expanded"] .nav-brand {
+	width: 100%;
+	justify-content: flex-start;
+	gap: 10px;
+	padding-inline: 2px;
+}
+
+html:not([data-desktop-platform])[data-nav="expanded"] .nav-primary {
+	align-items: stretch;
+}
+
+html:not([data-desktop-platform])[data-nav="expanded"] .nav-item {
+	width: 100%;
+	justify-content: flex-start;
+	gap: 10px;
+	padding-inline: 12px;
+	font-size: 12px;
+	font-weight: 560;
+}
+
+html:not([data-desktop-platform])[data-nav="expanded"] .nav-label,
+html:not([data-desktop-platform])[data-nav="expanded"] .nav-expanded-only {
+	display: inline;
+}
+
+html:not([data-desktop-platform])[data-nav="expanded"] .nav-collapsed-only {
+	display: none;
+}
+
+html:not([data-desktop-platform])[data-nav="expanded"] .nav-user {
+	width: 100%;
+	justify-content: flex-start;
+	gap: 10px;
+	padding-inline: 2px;
+}
+
+html:not([data-desktop-platform])[data-nav="expanded"] .nav-user-name {
+	display: block;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+html:not([data-desktop-platform])[data-nav="expanded"] .home-workspace-head h1 {
+	display: none;
+}
+
 .nav-rail { position: relative; }
 
 .nav-edge-toggle {
@@ -2725,23 +2854,17 @@ html[data-nav="expanded"] .nav-user-name {
 	background: var(--home-nav);
 	color: var(--home-text-2, var(--muted-foreground));
 	cursor: pointer;
-	opacity: 0;
+	opacity: 0.68;
 	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.14);
 	transform: translateY(-50%);
 	transition: opacity 120ms ease, color 120ms ease, border-color 120ms ease;
 }
+
 .nav-rail:hover .nav-edge-toggle,
-.nav-edge-toggle:focus-visible {
-	opacity: 1;
-}
-.nav-edge-toggle:hover {
-	border-color: var(--home-accent, var(--ring));
-	color: var(--home-text, var(--foreground));
-}
-.nav-edge-toggle:focus-visible {
-	outline: 2px solid var(--home-accent, var(--ring));
-	outline-offset: 2px;
-}
+.nav-edge-toggle:focus-visible { opacity: 1; }
+.nav-edge-toggle:hover { border-color: var(--home-accent, var(--ring)); color: var(--home-text, var(--foreground)); }
+.nav-edge-toggle:focus-visible { outline: 2px solid var(--home-accent, var(--ring)); outline-offset: 2px; }
+html[data-desktop-platform] .nav-edge-toggle { display: none; }
 
 /* ---- 用户行兼作设置菜单触发器 ---- */
 button.nav-user {
@@ -2784,12 +2907,6 @@ button.nav-user:focus-visible {
 	font-size: 15px;
 	font-weight: 700;
 	letter-spacing: -0.01em;
-}
-
-/* 品牌名在 nav rail 展开态已有展示，列表头部不再重复；收起时 rail 只剩
-   图标，这里保留标题。 */
-html[data-nav="expanded"] .home-workspace-head h1 {
-	display: none;
 }
 
 .home-new-room,
@@ -3445,15 +3562,6 @@ html[data-nav="expanded"] .home-workspace-head h1 {
 @media (max-width: 560px) {
 	.home-create-dialog { width: calc(100% - 28px); padding: 18px; border-radius: 18px; }
 	.home-worker-picker { grid-template-columns: 1fr; }
-}
-
-html[data-nav="expanded"] .nav-label,
-html[data-nav="expanded"] .nav-expanded-only {
-	display: inline;
-}
-
-html[data-nav="expanded"] .nav-collapsed-only {
-	display: none;
 }
 
 /* ---- Add Worker modal：分段控件 + 明确的字段标签/辅助说明 ---- */
