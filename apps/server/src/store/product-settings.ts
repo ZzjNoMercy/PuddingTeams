@@ -6,10 +6,12 @@ import {
 	validateWorkerResultContext,
 	type WorkerResultContextSettings,
 } from "./large-worker-result.js";
+import type { HarnessCodeSearchProvider } from "../pi-bridge/code-search.js";
 
 export interface ProductSettings {
 	developerMode: boolean;
 	harness: {
+		codeSearch: { defaultProvider: HarnessCodeSearchProvider };
 		workerResults: WorkerResultContextSettings;
 		goalActivation: { solo: "manager_explicit" | "user_explicit" | "disabled"; group: "manager_explicit" | "user_explicit" | "disabled"; direct: "user_explicit" | "disabled"; confirmWhenAmbiguous: boolean };
 		goalRecovery: { mode: "safe_auto" | "manual"; directMode: "manual"; resumeLeaseMs: number; operationRetentionDays: number; maxOperationsPerSession: number };
@@ -18,6 +20,7 @@ export interface ProductSettings {
 
 export type GoalActivationSettings = ProductSettings["harness"]["goalActivation"];
 export type GoalRecoverySettings = ProductSettings["harness"]["goalRecovery"];
+export type HarnessCodeSearchSettings = ProductSettings["harness"]["codeSearch"];
 
 export class ProductSettingsStore {
 	private readonly file: string;
@@ -33,6 +36,9 @@ export class ProductSettingsStore {
 			return {
 				developerMode: parsed.developerMode === true,
 				harness: {
+					codeSearch: {
+						defaultProvider: parsed.harness?.codeSearch?.defaultProvider === "fff" ? "fff" : "builtin",
+					},
 					workerResults: validateWorkerResultContext(parsed.harness?.workerResults ?? {}),
 					goalActivation: {
 						solo: parsed.harness?.goalActivation?.solo ?? "manager_explicit",
@@ -54,6 +60,7 @@ export class ProductSettingsStore {
 			return {
 				developerMode: false,
 				harness: {
+					codeSearch: { defaultProvider: "builtin" },
 					workerResults: DEFAULT_WORKER_RESULT_CONTEXT,
 					goalActivation: { solo: "manager_explicit", group: "manager_explicit", direct: "user_explicit", confirmWhenAmbiguous: true },
 					goalRecovery: { mode: "safe_auto", directMode: "manual", resumeLeaseMs: 30_000, operationRetentionDays: 30, maxOperationsPerSession: 512 },
@@ -80,12 +87,15 @@ export class ProductSettingsStore {
 	}
 
 	async setHarness(input: {
+		codeSearch?: Partial<HarnessCodeSearchSettings>;
 		workerResults?: Partial<WorkerResultContextSettings>;
 		goalActivation?: Partial<GoalActivationSettings>;
 		goalRecovery?: Partial<GoalRecoverySettings>;
 	}): Promise<ProductSettings> {
 		const run = this.queue.then(async () => {
 			const current = await this.get();
+			const codeSearch = { ...current.harness.codeSearch, ...(input.codeSearch ?? {}) };
+			if (!["builtin", "fff"].includes(codeSearch.defaultProvider)) throw new Error("codeSearch.defaultProvider 无效");
 			const activation = { ...current.harness.goalActivation, ...(input.goalActivation ?? {}) };
 			if (!["manager_explicit", "user_explicit", "disabled"].includes(activation.solo)) throw new Error("goalActivation.solo 无效");
 			if (!["manager_explicit", "user_explicit", "disabled"].includes(activation.group)) throw new Error("goalActivation.group 无效");
@@ -99,6 +109,7 @@ export class ProductSettingsStore {
 			const settings: ProductSettings = {
 				...current,
 				harness: {
+					codeSearch,
 					workerResults: input.workerResults ? validateWorkerResultContext({ ...current.harness.workerResults, ...input.workerResults }) : current.harness.workerResults,
 					goalActivation: activation,
 					goalRecovery: {

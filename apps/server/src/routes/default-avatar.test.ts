@@ -161,3 +161,25 @@ test("§11: pinned manager（无 connector 绑定）回退到 pi Connector 的�
 	assert.equal(res.headers["content-type"], "image/svg+xml");
 	assert.equal(res.body, SVG_ASSET);
 });
+
+test("§11: 首装把发行内置 Designer 头像复制到用户数据目录", async () => {
+	const dir = freshDir("pt-avatar-designer-");
+	const bundledAssets = path.join(dir, "bundled-assets");
+	mkdirSync(bundledAssets, { recursive: true });
+	writeFileSync(path.join(bundledAssets, "pi-b.webp"), Buffer.from("RIFFxxxxWEBP", "ascii"));
+	const teams = new TeamsStore(
+		{
+			state: path.join(dir, "state"),
+			assets: path.join(dir, "assets"),
+			managedWorkspaces: path.join(dir, "managed"),
+			bundledAssets,
+		},
+		dir,
+	);
+	await teams.init();
+	const designer = await teams.getAgent("pi-b");
+	assert.equal(designer?.avatar, "pi-b.webp");
+	const avatar = await teams.readAvatar("pi-b");
+	assert.equal(avatar?.mime, "image/webp");
+	assert.equal(avatar?.buf.toString("ascii"), "RIFFxxxxWEBP");
+});

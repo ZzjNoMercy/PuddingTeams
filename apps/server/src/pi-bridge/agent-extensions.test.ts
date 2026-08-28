@@ -216,13 +216,22 @@ test("Phase4: 激活策略——委托工具全窗口默认激活，capability �
 		"group 默认激活 core + 拉人工具 + 成员委托工具（省掉 search 轮次）",
 	);
 
-	// solo（无窗口上下文）：roster 为全部启用 Agent（含内置 puddingclaw），
+	// solo（无窗口上下文）：roster 为全部启用 Agent（含发行内置 Worker），
 	// 激活集为 core + 建房工具 + 全部委托工具。
 	const solo = await planManagerTools(teams, catalog, undefined);
 	assert.ok(solo.managed.has(delegateToolName("alpha")) && solo.managed.has(delegateToolName("beta")));
 	assert.deepEqual(
 		[...solo.active],
-		[...core, CORE_TOOL_CREATE_GROUP, delegateToolName("alpha"), delegateToolName("beta"), delegateToolName("puddingclaw")],
+		[
+			...core,
+			CORE_TOOL_CREATE_GROUP,
+			delegateToolName("alpha"),
+			delegateToolName("beta"),
+			delegateToolName("claude-code"),
+			delegateToolName("codex"),
+			delegateToolName("pi-b"),
+			delegateToolName("puddingclaw"),
+		],
 	);
 
 	// 禁用 beta 后掉出 roster（装配期即不可见）。

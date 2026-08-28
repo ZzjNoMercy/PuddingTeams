@@ -83,6 +83,14 @@ function ManagerFields({
 	return (
 		<div className="agent-config-subsection flex flex-col gap-3">
 			<label className="flex flex-col gap-1 text-sm">
+				<span className="text-muted-foreground">代码搜索</span>
+				<Select value={draft.manager.codeSearch ?? "off"} onValueChange={(value) => onChange({ manager: { ...draft.manager, codeSearch: value as PiManagerSettings["codeSearch"] } })}>
+					<SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+					<SelectContent><SelectItem value="off">关闭（默认）</SelectItem><SelectItem value="builtin">Pi 内置 grep/find</SelectItem><SelectItem value="fff">FFF Workspace 索引</SelectItem></SelectContent>
+				</Select>
+				<span className="text-xs text-muted-foreground/70">仅 Solo Manager 生效；Direct/Group relay 始终关闭搜索。</span>
+			</label>
+			<label className="flex flex-col gap-1 text-sm">
 				<span className="text-muted-foreground">默认模型（provider/modelId）</span>
 				<Input
 					value={draft.manager.model ?? ""}
@@ -180,7 +188,15 @@ export function ModelSection({
 			) : schema === null ? (
 				<p className="text-xs text-muted-foreground">加载配置 schema…</p>
 			) : (
-				<div className="agent-config-subsection">
+				<div className="agent-config-subsection flex flex-col gap-3">
+					<label className="flex flex-col gap-1 text-sm">
+						<span className="text-muted-foreground">代码搜索</span>
+						<Select value={draft.codeSearch} onValueChange={(value) => onChange({ codeSearch: value as ConfigDraft["codeSearch"] })}>
+							<SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+							<SelectContent><SelectItem value="inherit">继承 Harness 默认</SelectItem><SelectItem value="builtin">Pi 内置 grep/find</SelectItem><SelectItem value="fff">FFF Workspace 索引</SelectItem></SelectContent>
+						</Select>
+						<span className="text-xs text-muted-foreground/70">FFF 只索引当前已信任 Workspace，并按 Workspace 独立保存状态。</span>
+					</label>
 					<ConfigSchemaForm
 						schema={schema}
 						value={draft.connectorConfig}

@@ -32,7 +32,7 @@ export interface RoomSummary {
 	sessions: RoomSessionSummary[];
 	activeSession: string;
 	pinned: boolean;
-	/** Per-worker last session handle (multi-turn continuity). */
+	/** Active room Session's per-worker continuation handles. */
 	workerBindings: Record<string, WorkerBinding>;
 	/** 群聊协作提示词（仅 Group 可编辑；Direct 固定 relay，写入会被拒绝）。 */
 	prompt: string;
@@ -91,7 +91,7 @@ async function buildWindowSummary(
 		}),
 		activeSession: active,
 		pinned: Boolean(w.pinned),
-		workerBindings: w.workerBindings ?? {},
+		workerBindings: w.workerBindings?.[active] ?? {},
 		prompt: w.prompt ?? "",
 		cwdSnapshot: w.cwdSnapshot,
 		contextAvailable,
@@ -108,11 +108,14 @@ export function registerRoomsRoutes(
 	localFiles?: {
 		open?: (targetPath: string) => Promise<void>;
 		additionalRoots?: readonly string[];
+		/** Platform attachment root; access is narrowed to this window's Session subdirectories. */
+		attachmentRoot?: string;
 		productSettings?: ProductSettingsStore;
 	},
 ): void {
 	const openLocalFile = localFiles?.open ?? openNativeFile;
 	const additionalFileRoots = localFiles?.additionalRoots ?? [];
+	const attachmentRoot = localFiles?.attachmentRoot;
 	const contextFor = async (w: WindowConfig) => ({
 		type: w.type,
 		members: w.members,
@@ -207,7 +210,16 @@ export function registerRoomsRoutes(
 				const extraRoots = await Promise.all(
 					additionalFileRoots.map((root) => realpath(root).catch(() => undefined)),
 				);
-				const allowedRoots = [workspaceRoot, ...extraRoots.filter((root): root is string => Boolean(root))];
+				const attachmentRoots = attachmentRoot
+					? await Promise.all([window.activeSession].map((sessionId) =>
+						realpath(path.join(attachmentRoot, sessionId.replace(/[^A-Za-z0-9_-]/g, "_"))).catch(() => undefined),
+					))
+					: [];
+				const allowedRoots = [
+					workspaceRoot,
+					...extraRoots.filter((root): root is string => Boolean(root)),
+					...attachmentRoots.filter((root): root is string => Boolean(root)),
+				];
 				const allowed = allowedRoots.some((root) => {
 					const relative = path.relative(root, target);
 					return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
@@ -412,11 +424,25 @@ export function registerRoomsRoutes(
 		if (!w) return reply.code(404).send({ error: "window not found" });
 		if (w.pinned) return reply.code(405).send({ error: "solo 窗口不可删除" });
 		try {
-			const sessionIds = await teams.removeWindow(req.params.id);
-			for (const sid of sessionIds) {
-				await invoker?.cancelManagerSession(sid);
-				await sessions.remove(sid);
-				await workStates?.removeSession(sid);
+			const remove = async () => {
+				const sessionIds = await teams.removeWindow(req.params.id);
+				for (const sid of sessionIds) {
+					await sessions.remove(sid);
+					await workStates?.removeSession(sid);
+				}
+			};
+			if (invoker) {
+				await invoker.closeWindow(
+					req.params.id,
+					async () => {
+						const current = await teams.getWindow(req.params.id);
+						if (!current) throw new Error("window not found");
+						if (current.pinned) throw new Error("solo 窗口不可删除");
+					},
+					remove,
+				);
+			} else {
+				await remove();
 			}
 			return reply.code(204).send();
 		} catch (err) {
@@ -490,13 +516,29 @@ export function registerRoomsRoutes(
 	app.delete<{ Params: { id: string; sid: string } }>(
 		"/api/rooms/:id/sessions/:sid",
 		async (req, reply) => {
-			const { removed, blocked } = await teams.removeWindowSession(req.params.id, req.params.sid);
-			if (blocked) return reply.code(400).send({ error: blocked });
-			if (!removed) return reply.code(404).send({ error: "session not found in window" });
-			await invoker?.cancelManagerSession(req.params.sid);
-			await sessions.remove(req.params.sid);
-			await workStates?.removeSession(req.params.sid);
-			return reply.code(204).send();
+			try {
+				const remove = async () => {
+					const { removed, blocked } = await teams.removeWindowSession(req.params.id, req.params.sid);
+					if (blocked) throw new Error(blocked);
+					if (!removed) throw new Error("session not found in window");
+					await sessions.remove(req.params.sid);
+					await workStates?.removeSession(req.params.sid);
+				};
+				const preflight = async () => {
+					const current = await teams.getWindow(req.params.id);
+					if (!current?.sessions.includes(req.params.sid)) throw new Error("session not found in window");
+					if (current.sessions.length <= 1) throw new Error("窗口至少要保留一个会话");
+				};
+				if (invoker) await invoker.closeManagerSession(req.params.sid, preflight, remove);
+				else {
+					await preflight();
+					await remove();
+				}
+				return reply.code(204).send();
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				return reply.code(message === "session not found in window" ? 404 : 400).send({ error: message });
+			}
 		},
 	);
 

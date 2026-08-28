@@ -304,6 +304,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 			manager?: Record<string, unknown>;
 			connector?: { config?: Record<string, unknown> } | null;
 			piResources?: AgentConfig["piResources"] | null;
+			codeSearch?: AgentConfig["codeSearch"];
 		};
 	}>("/api/agents/:name/config", async (req, reply) => {
 		const agent = await teams.getAgent(req.params.name);
@@ -329,6 +330,9 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		if (body.manager !== undefined) {
 			return reply.code(400).send({ error: "manager 配置区仅适用于 pinned manager" });
 		}
+		if (body.codeSearch !== undefined && agent.connector?.connectorId !== "pi") {
+			return reply.code(400).send({ error: "codeSearch 仅适用于 pi Worker" });
+		}
 		if (body.description !== undefined && typeof body.description !== "string") {
 			return reply.code(400).send({ error: "description 必须是字符串" });
 		}
@@ -344,6 +348,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		}
 		try {
 			const next: AgentConfig = { ...agent };
+			if (body.codeSearch !== undefined) next.codeSearch = body.codeSearch;
 			if (body.description !== undefined) next.description = body.description;
 			if (body.displayName !== undefined) {
 				// null/空串 = 清除显示名（展示回退内部 id）；归一化在 upsertAgent。

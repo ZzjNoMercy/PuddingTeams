@@ -46,13 +46,14 @@ test("Window 不选项目时使用默认 cwd，worker binding 仍冻结该上下
 	const defaultCwd = realpathSync(dir);
 	assert.equal(window.workspaceId, undefined);
 	assert.equal(await store.workspaceFor(window.id), defaultCwd);
-	await store.rememberWorkerSession(window.id, "alpha", "plain-worker", undefined, defaultCwd, agent.extensionRevision ?? 0);
-	assert.deepEqual((await store.getWindow(window.id))?.workerBindings?.alpha, {
+	await store.rememberWorkerSession(window.id, "plain-chat", "alpha", "plain-worker", undefined, defaultCwd, agent.extensionRevision ?? 0);
+	assert.deepEqual((await store.getWindow(window.id))?.workerBindings?.["plain-chat"]?.alpha, {
 		sessionHandle: "plain-worker",
+		targetWindowId: window.id,
 		workspaceId: undefined,
 		cwdSnapshot: defaultCwd,
 		agentRevision: agent.extensionRevision ?? 0,
-		updatedAt: (await store.getWindow(window.id))!.workerBindings!.alpha!.updatedAt,
+		updatedAt: (await store.getWindow(window.id))!.workerBindings!["plain-chat"]!.alpha!.updatedAt,
 	});
 });
 
@@ -98,13 +99,14 @@ test("direct Window 去重包含 workspaceId，worker binding 记录项目与 Ag
 
 	assert.equal((await store.findDirectWindow("alpha", a.id))?.id, wa.id);
 	assert.equal((await store.findDirectWindow("alpha", b.id))?.id, wb.id);
-	await store.rememberWorkerSession(wa.id, "alpha", "worker-a", a.id, a.canonicalPath, agent.extensionRevision ?? 0);
-	assert.deepEqual((await store.getWindow(wa.id))?.workerBindings?.alpha, {
+	await store.rememberWorkerSession(wa.id, "sa", "alpha", "worker-a", a.id, a.canonicalPath, agent.extensionRevision ?? 0);
+	assert.deepEqual((await store.getWindow(wa.id))?.workerBindings?.sa?.alpha, {
 		sessionHandle: "worker-a",
+		targetWindowId: wa.id,
 		workspaceId: a.id,
 		cwdSnapshot: a.canonicalPath,
 		agentRevision: agent.extensionRevision ?? 0,
-		updatedAt: (await store.getWindow(wa.id))!.workerBindings!.alpha!.updatedAt,
+		updatedAt: (await store.getWindow(wa.id))!.workerBindings!.sa!.alpha!.updatedAt,
 	});
 });
 
@@ -114,7 +116,7 @@ test("显式原地切换原子替换 workspace/manager sessions 并清空 worker
 	const b = await store.workspaces.createManaged("B");
 	const window = await store.createWindow({ type: "group", members: ["alpha", "beta"], workspaceId: a.id, sessionId: "old-1" });
 	await store.addWindowSession(window.id, "old-2");
-	await store.rememberWorkerSession(window.id, "alpha", "worker-a", a.id, a.canonicalPath, 1);
+	await store.rememberWorkerSession(window.id, "old-2", "alpha", "worker-a", a.id, a.canonicalPath, 1);
 
 	const switched = await store.replaceWindowWorkspace(window.id, b.id, "new-1");
 	assert.deepEqual(switched.previousSessionIds, ["old-2", "old-1"]);

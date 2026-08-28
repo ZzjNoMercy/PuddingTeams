@@ -14,5 +14,8 @@
 	],
 	"engines": {
 		"node": ">=20"
+	},
+	"dependencies": {
+		"@ff-labs/fff-node": "0.10.5"
 	}
 }

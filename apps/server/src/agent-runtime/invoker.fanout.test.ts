@@ -103,6 +103,9 @@ async function makeStack(variant: "completed" | "failed" | "needs_input", manage
 	await teams.upsertAgent(agent);
 	const savedAgent = await teams.getAgent("puddingclaw");
 	const window = await teams.createWindow({ type: "direct", members: ["puddingclaw"], sessionId: "direct-sess-1" });
+	if (managerSessionId !== window.activeSession) {
+		await teams.ensureSoloWindow(async () => ({ id: managerSessionId }), async () => true);
+	}
 
 	const delegations = new DelegationStore(freshDir("pt-fanout-dlg-"));
 	await delegations.init();

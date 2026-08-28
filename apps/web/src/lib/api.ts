@@ -348,6 +348,7 @@ export async function setDefaultModel(provider: string, model: string): Promise<
 }
 
 export interface HarnessSettings {
+	codeSearch: { defaultProvider: "builtin" | "fff" };
 	workerResults: {
 		offloadThresholdTokens: number;
 		previewHeadTokens: number;
@@ -687,6 +688,7 @@ export function putAgentConfig(
 		manager?: Partial<PiManagerSettings>;
 		connector?: { config?: Record<string, unknown> };
 		piResources?: PiResourceConfig | null;
+		codeSearch?: AgentConfig["codeSearch"];
 	},
 ): Promise<MutationResponse> {
 	return postJson<MutationResponse>(

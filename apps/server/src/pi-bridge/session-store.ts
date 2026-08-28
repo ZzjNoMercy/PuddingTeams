@@ -44,6 +44,11 @@ import {
 import type { CompletionReview } from "../store/work-state.js";
 import type { LargeWorkerResultStore } from "../store/large-worker-result.js";
 import type { ProductSettingsStore } from "../store/product-settings.js";
+import {
+	buildWorkspaceFffExtension,
+	stripUnmanagedPiFff,
+	type ManagerCodeSearchProvider,
+} from "./code-search.js";
 
 export interface SessionSummary {
 	id: string;
@@ -130,6 +135,7 @@ export class PiSessionStore {
 		private readonly largeResults?: LargeWorkerResultStore,
 		private readonly productSettings?: ProductSettingsStore,
 		private readonly capabilityStateRoot?: string,
+		private readonly fffStateRoot?: string,
 	) {
 		this.catalog = catalog ?? new ExtensionCatalog();
 		if (this.teamsStore && this.invoker) {
@@ -206,6 +212,7 @@ export class PiSessionStore {
 		loader: DefaultResourceLoader;
 		plan: ManagedToolPlan;
 		capabilityRuntime: Awaited<ReturnType<typeof resolveAgentCapabilityRuntime>> | undefined;
+		codeSearch: ManagerCodeSearchProvider;
 	}> {
 		const agentDir = getAgentDir();
 		let plan: ManagedToolPlan = { managed: new Set(), active: new Set(), agents: [] };
@@ -233,6 +240,23 @@ export class PiSessionStore {
 		const workspaceAccess = this.teamsStore
 			? await this.teamsStore.workspaces.resourceAccessFor(ctx?.workspaceId)
 			: undefined;
+		// Manager 搜索仅在 solo 生效；direct/group 的 relay 权限边界始终只有委托工具。
+		const codeSearch: ManagerCodeSearchProvider = ctx?.type === "solo"
+			? (settings?.codeSearch ?? "off")
+			: "off";
+		if (codeSearch === "fff" && ctx?.workspaceId && this.teamsStore && this.fffStateRoot) {
+			const workspace = await this.teamsStore.workspaces.get(ctx.workspaceId);
+			if (workspace?.trust.state === "trusted") {
+				factories.push(await buildWorkspaceFffExtension({
+					stateRoot: this.fffStateRoot,
+					workspace: {
+						id: workspace.id,
+						canonicalPath: workspace.canonicalPath,
+						trusted: true,
+					},
+				}));
+			}
+		}
 		const manager = await this.teamsStore?.getManager();
 		const capabilityRuntime = manager && this.capabilityStateRoot
 			? await resolveAgentCapabilityRuntime({
@@ -261,12 +285,13 @@ export class PiSessionStore {
 			// noExtensions 只控制 pi-native Extension；平台 inline core/delegation
 			// factories 不受影响。Skills/templates/context 全部由 piResources 决定。
 			...(settings?.noExtensions ? { noExtensions: true } : {}),
+			extensionsOverride: stripUnmanagedPiFff,
 			// append-only（提示词管理方案 §3）：manager 运行指令与窗口 guidance
 			// 追加到 pi 原生 append 之后，不覆盖 pi 内嵌默认提示词。
 			appendSystemPromptOverride: (base) => appendPiPrompts(base, sessionResources, guidance),
 		});
 		await loader.reload();
-		return { loader, plan, capabilityRuntime };
+		return { loader, plan, capabilityRuntime, codeSearch };
 	}
 
 	/** create()/open() 共用的会话装配：loader + 初始 active tools 策略。 */
@@ -282,7 +307,7 @@ export class PiSessionStore {
 	}): Promise<AgentSession> {
 		const settings = await this.managerSettings();
 		const resources = await this.managerResources();
-		const { loader, plan, capabilityRuntime } = await this.managerResourceLoader(
+		const { loader, plan, capabilityRuntime, codeSearch } = await this.managerResourceLoader(
 			opts.ctx,
 			opts.getSessionId,
 			opts.cwd,
@@ -324,8 +349,12 @@ export class PiSessionStore {
 							}) as NonNullable<CreateAgentSessionOptions["customTools"]>[number],
 						],
 					}
-				: {}),
+					: {}),
 		});
+		// createAgentSession() only constructs registered extensions. Embedded
+		// hosts must bind them explicitly so session_start receives this Session's
+		// cwd (FFF uses it as the index root).
+		await session.bindExtensions({ mode: "rpc" });
 		// 激活策略（§3.3）：基础委托工具全窗口默认激活（省掉 search 轮次）；
 		// capability 扩展工具按绑定策略预注册，searchable 的保持 inactive，
 		// 由 search_agent_tools 按需纯加法激活。
@@ -345,9 +374,9 @@ export class PiSessionStore {
 			}
 		}
 		const current = session.getActiveToolNames();
-		session.setActiveToolsByName(
-			current.filter((n) => !plan.managed.has(n) || plan.active.has(n) || replayed.has(n)),
-		);
+		const next = current.filter((n) => !plan.managed.has(n) || plan.active.has(n) || replayed.has(n));
+		if (codeSearch === "builtin" && !stripBuiltin) next.push("grep", "find");
+		session.setActiveToolsByName([...new Set(next)]);
 		this.assembledManaged.set(session.sessionId, plan.managed);
 		this.attachForwarder(session);
 		return session;

@@ -80,7 +80,12 @@ await credentials.init();
 // 不读写 pi 全局 agentDir 的 auth.json。必须先于任何 sharedModelRuntime 使用。
 configureSharedModelRuntime({ authPath: path.join(paths.secrets, "auth.json") });
 const teams = new TeamsStore(
-	{ state: paths.state, assets: paths.assets, managedWorkspaces: paths.managedWorkspaces },
+	{
+		state: paths.state,
+		assets: paths.assets,
+		managedWorkspaces: paths.managedWorkspaces,
+		bundledAssets: fileURLToPath(new URL("../assets", import.meta.url)),
+	},
 	defaultCwd,
 	config.workerTimeoutMs,
 	credentials,
@@ -114,7 +119,8 @@ extensionRegistry.registerBuiltin(puddingClawConnectorManifest, puddingClawExten
 	// PuddingClaw 默认头像（布丁狗）随 server 包发布。
 	assetsDir: fileURLToPath(new URL("../assets", import.meta.url)),
 });
-extensionRegistry.registerBuiltin(piConnectorManifest, piExtensionHooks({ sessionDir: paths.workerSessions }), {
+const fffStateRoot = path.join(paths.runtime, "fff", "workspaces");
+extensionRegistry.registerBuiltin(piConnectorManifest, piExtensionHooks({ sessionDir: paths.workerSessions, fffStateRoot }), {
 	// pi Connector 的默认头像（lobehub Pi 图标）随 server 包发布。
 	assetsDir: fileURLToPath(new URL("../assets", import.meta.url)),
 });
@@ -146,6 +152,8 @@ const invoker = new AgentInvoker(
 	defaultCwd,
 	catalog,
 	capabilityStateRoot,
+	productSettings,
+	fffStateRoot,
 );
 
 const store = new PiSessionStore(
@@ -159,6 +167,7 @@ const store = new PiSessionStore(
 	largeWorkerResults,
 	productSettings,
 	capabilityStateRoot,
+	fffStateRoot,
 );
 invoker.setManagerSender((managerSessionId, message, options) =>
 	store.sendCustomMessage(managerSessionId, message, options),
@@ -284,7 +293,7 @@ await registerChatRoutes(app, store, teams, workStates, uploads, invoker, {
 	dataHomeId: puddingTeamsHomeId(paths.home),
 });
 registerIdentityRoutes(app);
-await registerSettingsRoutes(app, defaultCwd, productSettings, workStates);
+await registerSettingsRoutes(app, defaultCwd, productSettings, workStates, () => store.markAllDirty());
 await registerProvidersRoutes(app, store);
 await registerAgentsRoutes(app, teams, {
 	credentials,
@@ -305,7 +314,7 @@ await registerExtensionsRoutes(app, {
 registerResourcesRoutes(app);
 registerWorkspacesRoutes(app, teams.workspaces, undefined, store);
 await registerRoomsRoutes(app, store, teams, invoker, workStates, {
-	additionalRoots: [paths.uploads],
+	attachmentRoot: paths.uploads,
 	productSettings,
 });
 await registerInteractionsRoutes(app, runtime, invoker, teams, workStates);

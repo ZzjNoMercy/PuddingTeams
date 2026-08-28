@@ -17,6 +17,7 @@ export interface ConfigDraft {
 	escalateWhen: string;
 	/** pinned manager 的 SDK 配置（worker 不用）。 */
 	manager: PiManagerSettings;
+	codeSearch: "inherit" | "builtin" | "fff";
 	/** pi worker 的 connector config（pinned 不用）。 */
 	connectorConfig: Record<string, unknown>;
 	systemPrompt: string;
@@ -49,6 +50,7 @@ export function draftFromAgent(agent: AgentConfig): ConfigDraft {
 		excludes: (agent.responsibility?.excludes ?? []).join("\n"),
 		escalateWhen: (agent.responsibility?.escalateWhen ?? []).join("\n"),
 		manager: { ...(agent.manager ?? {}) },
+		codeSearch: agent.codeSearch ?? "inherit",
 		connectorConfig: { ...(agent.connector?.config ?? {}) },
 		systemPrompt: resources.systemPrompt ?? "",
 		skillPaths: (resources.skillPaths ?? []).join("\n"),
@@ -113,6 +115,7 @@ export function buildConfigBody(
 	manager?: Partial<PiManagerSettings>;
 	connector?: { config: Record<string, unknown> };
 	piResources: PiResourceConfig;
+	codeSearch?: AgentConfig["codeSearch"];
 } {
 	const base = {
 		// 空串 → null：服务端清除显示名，展示回退内部 id。
@@ -123,6 +126,7 @@ export function buildConfigBody(
 	};
 	if (agent.pinned) {
 		const manager: Partial<PiManagerSettings> = {
+			codeSearch: draft.manager.codeSearch ?? "off",
 			builtinTools: draft.manager.builtinTools ?? true,
 			noExtensions: draft.manager.noExtensions ?? false,
 		};
@@ -130,7 +134,7 @@ export function buildConfigBody(
 		if (draft.manager.thinkingLevel) manager.thinkingLevel = draft.manager.thinkingLevel;
 		return { ...base, manager };
 	}
-	return { ...base, connector: { config: draft.connectorConfig } };
+	return { ...base, codeSearch: draft.codeSearch, connector: { config: draft.connectorConfig } };
 }
 
 /** 本配置页只承载 pinned manager 与 pi Connector worker。 */

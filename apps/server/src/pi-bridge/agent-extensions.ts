@@ -995,41 +995,6 @@ async function resolveDirectWindowForDelegation(
  */
 function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps): (pi: ExtensionAPI) => void {
 	const solo = !deps.ctx || deps.ctx.type === "solo";
-	let soloSummary = "";
-
-	/** solo 摘要：该 worker 单聊窗口的现有会话，供 session: "new"|"continue" 选择。 */
-	const refreshSoloSummary = async (): Promise<void> => {
-		if (!solo) return;
-		try {
-			const workspaceId = deps.ctx?.workspaceId;
-			// 与 resolveDirectWindowForDelegation 的复用策略一致：先看当前项目
-			// exact 窗口，否则该 worker 的任一单聊（派活时会原地切到当前项目）。
-			const exact = await deps.store.findDirectWindow(agent.name, workspaceId, deps.ctx?.cwd);
-			const reused = exact
-				? undefined
-				: (await deps.store.listWindows()).find((w) => w.type === "direct" && w.members[0] === agent.name);
-			const direct = exact ?? reused;
-			let windowInfo = "单聊：无（首次派活时自动创建）";
-			if (direct) {
-				const byId = new Map((await deps.sessions.list()).map((s) => [s.id, s]));
-				const infos = direct.sessions.map((id) => byId.get(id)).filter((s): s is NonNullable<typeof s> => Boolean(s));
-				const suffix = reused ? "（绑定了其他项目，派活时自动切换到当前项目）" : "";
-				windowInfo = infos.length
-					? `单聊现有会话${suffix}：${infos
-							.slice(0, 3)
-							.map(
-								(s) =>
-									`「${s.firstMessage || "新对话"}」（最近活跃 ${s.modifiedAt.slice(0, 16).replace("T", " ")}）`,
-							)
-							.join("；")}`
-					: `单聊：已有窗口${suffix}，暂无历史会话`;
-			}
-			soloSummary = windowInfo;
-		} catch {
-			// Best-effort: a stale/empty summary never blocks delegation.
-		}
-	};
-	void refreshSoloSummary();
 
 	const baseDescription = [
 		`把任务委托给 worker「${agentDisplayName(agent)}」（${agent.responsibility?.identity ? `${agent.responsibility.identity}；` : ""}${agent.description || "无描述"}）并返回最终结果。`,
@@ -1049,8 +1014,7 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 				return [
 					baseDescription,
 					"当前是 solo 对话：派活会自动路由到该 worker 的单聊窗口（没有则自动创建），并把任务与结果同步到该单聊的消息流。",
-					'参数 `session`：默认 "continue" 续接该 worker 单聊中正在进行的会话；任务与现有会话无关时传 "new"。',
-					`该 worker 的单聊现状：${soloSummary || "（摘要加载中）"}`,
+					'参数 `session`：默认 "continue" 只续接当前房间 Session 与该 worker 的上下文；任务与当前对话无关时传 "new"。单聊窗口仅镜像任务与结果。',
 				].join(" ");
 			},
 			parameters: DelegateParams,
@@ -1083,8 +1047,8 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 					throw new Error(`worker「${agent.name}」不在当前窗口的成员中，委托被拒绝。`);
 				}
 
-				// §4.1: solo tasks run inside the worker's direct window, so the
-				// worker session continuity lives where the user can see it.
+				// §4.1: solo tasks execute in the worker's direct window for visibility,
+				// while continuation remains owned by this source manager Session.
 				let targetWindow = window;
 				if (isSoloContext) {
 					if (!window) throw new Error("当前 manager Session 不属于任何窗口，不能派活");
@@ -1238,7 +1202,6 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 							...extraDetails,
 						},
 					);
-					void refreshSoloSummary();
 					return ok;
 				};
 				const soloMeta = async (

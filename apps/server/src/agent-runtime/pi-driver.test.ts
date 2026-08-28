@@ -6,7 +6,7 @@ import path from "node:path";
 import { parseExtensionManifest, ExtensionCatalog } from "./extensions.js";
 import { DriverRegistry } from "./driver-registry.js";
 import { ExtensionRegistry } from "./extension-registry.js";
-import { LocalPiDriver, PI_CAPABILITIES, transientCooldownMs } from "./pi-driver.js";
+import { LocalPiDriver, PI_CAPABILITIES, piSearchFingerprint, transientCooldownMs } from "./pi-driver.js";
 import { piConnectorManifest, piExtensionHooks } from "./pi-extension.js";
 import type { AgentEvent, InvocationContext } from "./types.js";
 
@@ -102,6 +102,12 @@ test("Phase6: 429/过载进入同 Session 冷却续跑策略，普通错误不�
 	assert.equal(transientCooldownMs("rate limit; retry after 2500 ms", options), 2_500);
 	assert.equal(transientCooldownMs("engine_overloaded_error", options), 456);
 	assert.equal(transientCooldownMs("permission denied", options), undefined);
+});
+
+test("Pi Worker 搜索指纹包含 Workspace trust，撤权后不能复用旧 FFF Session", () => {
+	const trusted = { provider: "fff" as const, workspace: { id: "w", canonicalPath: "/repo", trusted: true } };
+	const denied = { provider: "fff" as const, workspace: { id: "w", canonicalPath: "/repo", trusted: false } };
+	assert.notEqual(piSearchFingerprint(trusted), piSearchFingerprint(denied));
 });
 
 test("Phase6: 429 冷却后复用同一 AgentSession 与 runHandle 续跑", async () => {

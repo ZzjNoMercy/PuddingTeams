@@ -1,12 +1,13 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, realpath, writeFile, rename, unlink } from "node:fs/promises";
+import { copyFile, mkdir, readFile, realpath, writeFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { CredentialsStore } from "./credentials.js";
 import { spawnWorker } from "../agent-runtime/transport/spawn.js";
 import { ensureHandoffGuidance } from "../agent-runtime/handoff.js";
 import type { AgentCapabilityBinding, AgentConnectorBinding } from "../agent-runtime/extensions.js";
 import { WorkspaceStore, type WorkspaceTrust } from "./workspaces.js";
+import type { ManagerCodeSearchProvider, WorkerCodeSearchOverride } from "../pi-bridge/code-search.js";
 
 export interface CommandInvoke {
 	type: "command";
@@ -27,6 +28,8 @@ export type AgentInvoke = CommandInvoke | PiInvoke;
 
 /** Pi manager 的可编辑配置（§10.5，挂在 pinned 条目上）。 */
 export interface PiManagerSettings {
+	/** Manager 独立搜索策略；默认 off。relay 窗口始终关闭。 */
+	codeSearch?: ManagerCodeSearchProvider;
 	/** 默认模型（"provider/modelId"）；新建会话时应用。 */
 	model?: string;
 	/** 内置工具开关（默认 true；false → noTools:"builtin"）。 */
@@ -95,6 +98,8 @@ export interface AgentResponsibilityProfile {
 }
 
 export interface AgentConfig {
+	/** Pi worker 可覆盖 Harness 默认搜索实现。 */
+	codeSearch?: WorkerCodeSearchOverride;
 	/**
 	 * Agent 的不可变内部 id（工具命名空间 agent_<agentId>__*、windows/credentials/
 	 * delegations 的存储键、REST 路径参数）。创建后不可改；创建时可由 displayName
@@ -144,12 +149,20 @@ export type WindowType = "solo" | "direct" | "group";
 /** 会话绑定：每个 worker 不透明的 Session handle（Phase 1，替换旧 workerSessions）。 */
 export interface WorkerBinding {
 	sessionHandle?: string;
+	/** Window in which this Worker Session executes; prevents cross-window handle reuse. */
+	targetWindowId: string;
 	/** 缺省表示未选择项目；此时 cwdSnapshot 是平台默认运行目录。 */
 	workspaceId?: string;
 	cwdSnapshot: string;
 	agentRevision: number;
 	updatedAt: string;
 }
+
+/**
+ * Worker 连续性属于一次 PuddingTeams 房间 Session，而不是整个 Window。
+ * 外层 key 是 manager/room Session id，内层 key 是 Worker id。
+ */
+export type SessionWorkerBindings = Record<string, Record<string, WorkerBinding>>;
 
 export interface WindowConfig {
 	/** Stable window id. The solo singleton always uses "solo". */
@@ -169,8 +182,8 @@ export interface WindowConfig {
 	 * worker 通道），服务端拒绝写入；Solo 无协作段。
 	 */
 	prompt?: string;
-	/** Per-worker last session handle, for multi-turn continuity (§7.1). */
-	workerBindings?: Record<string, WorkerBinding>;
+	/** Per-room-Session, per-worker handles for isolated multi-turn continuity (§7.1). */
+	workerBindings?: SessionWorkerBindings;
 	/** 可选的平台项目身份；未选择时沿用平台原有默认 cwd。 */
 	workspaceId?: string;
 	/** Window 创建时冻结的 cwd；无项目模式也必须持久化。 */
@@ -210,6 +223,44 @@ export const DEFAULT_TEAMS: AgentConfig[] = [
 		enabled: true,
 		capabilities: [],
 		manager: {},
+	},
+	{
+		// 首装内置 Designer：继承平台默认模型，不烤入开发机上的 provider、
+		// skills 或 systemPrompt，确保换一台电脑也能安全创建并继续配置。
+		name: "pi-b",
+		displayName: "Designer",
+		description: "负责UI/UX设计和PPT制作",
+		connector: {
+			extensionId: "pi",
+			connectorId: "pi",
+			transport: "sdk",
+			config: {},
+		},
+		enabled: true,
+	},
+	{
+		// 第一方双宿主 Connector 随发行物预置；这里只创建可见 Worker 实例，
+		// 上游 CLI/登录态仍由每台电脑独立探测和配置。
+		name: "claude-code",
+		description: "Anthropic Claude Code CLI worker（spawn + stream-json 流式）",
+		connector: {
+			extensionId: "claude-code",
+			connectorId: "claude-code",
+			transport: "spawn",
+			config: {},
+		},
+		enabled: true,
+	},
+	{
+		name: "codex",
+		description: "OpenAI Codex CLI worker（spawn + JSONL 流式）",
+		connector: {
+			extensionId: "codex",
+			connectorId: "codex",
+			transport: "spawn",
+			config: {},
+		},
+		enabled: true,
 	},
 	{
 		// 决策 20：旧结构直接替换——PuddingClaw 以第一方 Connector binding 接入。
@@ -292,6 +343,8 @@ export interface TeamsStoreDirs {
 	assets: string;
 	/** 平台管理项目（managed workspace）根目录。 */
 	managedWorkspaces: string;
+	/** 随 App 发布的只读资源目录；首装时复制需要独立头像的内置 Worker 资源。 */
+	bundledAssets?: string;
 }
 
 export class TeamsStore {
@@ -339,7 +392,18 @@ export class TeamsStore {
 		this.defaultCwdSnapshot = await realpath(path.resolve(this.cwd));
 		await this.workspaces.init();
 		if (!existsSync(this.agentsFile)) {
-			await this.writeAgents(DEFAULT_TEAMS);
+			const defaults = structuredClone(DEFAULT_TEAMS);
+			const designerAvatar = this.dirs.bundledAssets
+				? path.join(this.dirs.bundledAssets, "pi-b.webp")
+				: undefined;
+			if (designerAvatar && existsSync(designerAvatar)) {
+				const fileName = "pi-b.webp";
+				await mkdir(path.join(this.dirs.assets, "avatars"), { recursive: true });
+				await copyFile(designerAvatar, path.join(this.dirs.assets, "avatars", fileName));
+				const designer = defaults.find((agent) => agent.name === "pi-b");
+				if (designer) designer.avatar = fileName;
+			}
+			await this.writeAgents(defaults);
 		}
 		const agents = await this.loadAgentsFile();
 		const manager = agents.find((agent) => agent.name === MANAGER_AGENT_NAME);
@@ -509,6 +573,9 @@ export class TeamsStore {
 		if (!agent.responsibility) delete agent.responsibility;
 		agent.piResources = this.normalizePiResources(agent.piResources);
 		if (!agent.piResources) delete agent.piResources;
+		if (agent.codeSearch !== undefined && !["inherit", "builtin", "fff"].includes(agent.codeSearch)) {
+			throw new Error(`agent "${agent.name}": codeSearch 必须是 inherit | builtin | fff`);
+		}
 		const invoke = agent.invoke;
 		if (invoke?.type === "pi") {
 			// §10.5：pi 类型只放开给 pinned 保留名 manager，且强制启用。
@@ -552,6 +619,9 @@ export class TeamsStore {
 		}
 		if (agent.piResources && !agent.pinned && agent.connector?.connectorId !== "pi") {
 			throw new Error(`agent "${agent.name}": piResources 仅适用于 pi Agent`);
+		}
+		if (agent.codeSearch && (agent.pinned || agent.connector?.connectorId !== "pi")) {
+			throw new Error(`agent "${agent.name}": codeSearch 仅适用于 pi Worker`);
 		}
 		if (agent.capabilityExtensions !== undefined) {
 			if (!Array.isArray(agent.capabilityExtensions)) {
@@ -732,6 +802,12 @@ export class TeamsStore {
 	/** 校验并归一化 manager 可编辑配置。 */
 	private validateManagerSettings(input: Record<string, unknown>): PiManagerSettings {
 		const out: PiManagerSettings = {};
+		if (input.codeSearch !== undefined) {
+			if (!["off", "builtin", "fff"].includes(input.codeSearch as string)) {
+				throw new Error("manager.codeSearch 必须是 off | builtin | fff");
+			}
+			out.codeSearch = input.codeSearch as ManagerCodeSearchProvider;
+		}
 		if (input.model !== undefined) {
 			if (typeof input.model !== "string" || !input.model.trim()) throw new Error("manager.model 必须是非空字符串");
 			out.model = input.model.trim();
@@ -1019,6 +1095,7 @@ export class TeamsStore {
 				const created = await createSession(solo.workspaceId, solo.cwdSnapshot);
 				solo.sessions = [created.id];
 				solo.activeSession = created.id;
+				solo.workerBindings = {};
 				data.windows[solo.id] = solo;
 				await this.writeWindows(data);
 				return solo;
@@ -1231,6 +1308,7 @@ export class TeamsStore {
 			}
 			w.sessions = w.sessions.filter((s) => s !== sessionId);
 			if (w.activeSession === sessionId) w.activeSession = w.sessions[0]!;
+			if (w.workerBindings) delete w.workerBindings[sessionId];
 			await this.writeWindows(data);
 			res = { removed: true };
 		});
@@ -1272,20 +1350,17 @@ export class TeamsStore {
 				if (w.sessions.length <= 1) continue;
 				w.sessions = w.sessions.filter((s) => s !== sessionId);
 				if (w.activeSession === sessionId) w.activeSession = w.sessions[0]!;
+				if (w.workerBindings) delete w.workerBindings[sessionId];
 				changed = true;
 			}
 			if (changed) await this.writeWindows(data);
 		});
 	}
 
-	private async readWorkerSession(windowId: string, worker: string): Promise<string | undefined> {
-		const w = await this.getWindow(windowId);
-		return w?.workerBindings?.[worker]?.sessionHandle;
-	}
-
-	/** Record the worker session handle for continuity. Best-effort, non-fatal. */
+	/** Record the worker handle under the conversation Session that owns it. Best-effort, non-fatal. */
 	async rememberWorkerSession(
 		windowId: string,
+		managerSessionId: string,
 		worker: string,
 		sessionHandle: string | undefined,
 		workspaceId: string | undefined,
@@ -1295,16 +1370,31 @@ export class TeamsStore {
 		if (!sessionHandle) return;
 		await this.serialize(async () => {
 			const data = await this.loadWindowsFile();
-			const w = data.windows[windowId];
-			if (!w) return;
+			const target = data.windows[windowId];
+			const owner = Object.values(data.windows).find((window) => window.sessions.includes(managerSessionId));
+			if (!target || !owner) return;
+			const legalTarget = owner.type === "solo"
+				? target.type === "direct" && target.members.includes(worker)
+				: target.id === owner.id;
+			if (!legalTarget) return;
 			// A run that finishes after a workspace/config transition must never
-			// repopulate the new window with its old opaque session handle.
-			if (w.workspaceId !== workspaceId || (await this.workspaceFor(w.id)) !== cwdSnapshot) return;
+			// repopulate the new conversation with its old opaque session handle.
+			if (target.workspaceId !== workspaceId || (await this.workspaceFor(target.id)) !== cwdSnapshot) return;
 			const currentAgent = (await this.loadAgentsFile()).find((agent) => agent.name === worker);
 			if (!currentAgent || (currentAgent.extensionRevision ?? 0) !== agentRevision) return;
-			w.workerBindings = {
-				...(w.workerBindings ?? {}),
-				[worker]: { sessionHandle, workspaceId, cwdSnapshot, agentRevision, updatedAt: new Date().toISOString() },
+			// Rebuild only from Session ids still owned by this Window. Besides pruning
+			// deleted sessions, this directly replaces the old Window-flat shape.
+			const retained = Object.fromEntries(
+				owner.sessions
+					.filter((sessionId) => owner.workerBindings?.[sessionId])
+					.map((sessionId) => [sessionId, owner.workerBindings![sessionId]!]),
+			);
+			owner.workerBindings = {
+				...retained,
+				[managerSessionId]: {
+					...(retained[managerSessionId] ?? {}),
+					[worker]: { sessionHandle, targetWindowId: target.id, workspaceId, cwdSnapshot, agentRevision, updatedAt: new Date().toISOString() },
+				},
 			};
 			await this.writeWindows(data);
 		}).catch(() => undefined);

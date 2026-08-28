@@ -355,7 +355,7 @@ export interface ScopedDelegateInput {
 	evidenceRequirements?: string[];
 	completionBoundary?: string;
 	message: string;
-	/** "run" 新开 worker session；"continue" 续接窗口记录的 session。 */
+	/** "run" 新开 Worker Session；"continue" 续接当前房间 Session 的 Worker binding。 */
 	mode: "run" | "continue";
 	signal?: AbortSignal;
 	onUpdate?: (content: string, details?: unknown) => void;

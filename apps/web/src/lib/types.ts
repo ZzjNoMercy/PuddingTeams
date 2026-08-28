@@ -356,6 +356,7 @@ export interface AgentCapabilityBinding {
 
 /** Pi manager 的可编辑配置（§10.5，挂在 pinned 条目上）。 */
 export interface PiManagerSettings {
+	codeSearch?: "off" | "builtin" | "fff";
 	model?: string;
 	builtinTools?: boolean;
 	noExtensions?: boolean;
@@ -459,6 +460,7 @@ export interface AgentResponsibilityProfile {
 }
 
 export interface AgentConfig {
+	codeSearch?: "inherit" | "builtin" | "fff";
 	/** 不可变内部 id（委托工具名 agent_<id>__delegate、URL 参数、存储键）。创建后不可改。 */
 	name: string;
 	/** 用户可见显示名，可随时改；缺省时展示回退 name。 */
@@ -774,8 +776,8 @@ export interface RoomSummary {
 	activeSession: string;
 	/** Solo only: pinned singleton, never deletable. */
 	pinned: boolean;
-	/** Per-worker last session handle (multi-turn continuity). */
-	workerBindings: Record<string, { sessionHandle?: string; workspaceId?: string; cwdSnapshot: string; agentRevision: number; updatedAt: string }>;
+	/** Active room Session's per-worker continuation handles. */
+	workerBindings: Record<string, { sessionHandle?: string; targetWindowId: string; workspaceId?: string; cwdSnapshot: string; agentRevision: number; updatedAt: string }>;
 	/** User-edited window system prompt ('' = default relay guidance). */
 	prompt: string;
 	/** Window 创建时冻结的实际运行目录；未选项目时用于保持上下文身份。 */

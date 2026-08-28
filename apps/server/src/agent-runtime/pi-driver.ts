@@ -11,6 +11,7 @@ import {
 	type AgentSession,
 	type AgentSessionEvent,
 	type CreateAgentSessionOptions,
+	type InlineExtension,
 } from "@earendil-works/pi-coding-agent";
 import type {
 	AgentDriver,
@@ -26,6 +27,12 @@ import { sharedModelRuntime } from "../pi-bridge/model-runtime.js";
 import type { PiResourceConfig } from "../store/teams.js";
 import type { WorkspaceResourceAccess } from "../store/workspaces.js";
 import { appendPiPrompts, piResourceLoaderOptions } from "../pi-bridge/pi-resources.js";
+import {
+	buildWorkspaceFffExtension,
+	stripUnmanagedPiFff,
+	type HarnessCodeSearchProvider,
+	type WorkspaceCodeSearchScope,
+} from "../pi-bridge/code-search.js";
 
 export interface LocalPiDriverOptions {
 	/** 模型引用：`${provider}/${modelId}` 或裸 modelId；留空用 pi 默认模型。 */
@@ -40,6 +47,12 @@ export interface LocalPiDriverOptions {
 	 * 未注入（独立使用）时维持只看 Agent 开关的旧语义。
 	 */
 	workspaceAccessFor?: (workspaceId?: string) => Promise<WorkspaceResourceAccess>;
+	/** 平台解析后的有效搜索策略；FFF 必须同时带已信任 workspace scope。 */
+	codeSearchFor?: (workspaceId?: string) => Promise<{
+		provider: HarnessCodeSearchProvider;
+		workspace?: WorkspaceCodeSearchScope;
+	}>;
+	fffStateRoot?: string;
 	/** 已绑定 Capability 给目标 worker Session 追加 Skills 与 bash 环境。 */
 	capabilityRuntimeFor?: (
 		env: NodeJS.ProcessEnv,
@@ -72,6 +85,7 @@ export const PI_CAPABILITIES: DriverCapabilities = {
  * 共享，否则 continue/cancel 找不到 run 时创建的 AgentSession。
  */
 const sessionsByHandle = new Map<string, AgentSession>();
+const searchFingerprintByHandle = new Map<string, string>();
 const runningByRunHandle = new Map<string, AgentSession>();
 
 /** 执行过程可视化：按 sessionHandle 查驻留的 worker 会话（不在池里=未在跑/已被淘汰）。 */
@@ -86,13 +100,15 @@ function modelRuntime(): Promise<ModelRuntime> {
 /** 驻留上限：超出时淘汰最老的空闲 session（正在跑的不动）。 */
 const MAX_RESIDENT_SESSIONS = 32;
 
-function retainSession(session: AgentSession): void {
+function retainSession(session: AgentSession, searchFingerprint?: string): void {
 	sessionsByHandle.set(session.sessionId, session);
+	if (searchFingerprint) searchFingerprintByHandle.set(session.sessionId, searchFingerprint);
 	if (sessionsByHandle.size <= MAX_RESIDENT_SESSIONS) return;
 	for (const [id, s] of sessionsByHandle) {
 		if (sessionsByHandle.size <= MAX_RESIDENT_SESSIONS) break;
 		if ([...runningByRunHandle.values()].includes(s)) continue;
 		sessionsByHandle.delete(id);
+		searchFingerprintByHandle.delete(id);
 		s.dispose();
 	}
 }
@@ -200,6 +216,17 @@ export function transientCooldownMs(error: string, options: LocalPiDriverOptions
 	return undefined;
 }
 
+export function piSearchFingerprint(
+	codeSearch?: Awaited<ReturnType<NonNullable<LocalPiDriverOptions["codeSearchFor"]>>>,
+): string {
+	return JSON.stringify([
+		codeSearch?.provider ?? "sdk-default",
+		codeSearch?.workspace?.id ?? null,
+		codeSearch?.workspace?.canonicalPath ?? null,
+		codeSearch?.workspace?.trusted ?? false,
+	]);
+}
+
 async function waitForCooldown(ms: number, signal?: AbortSignal): Promise<boolean> {
 	if (signal?.aborted) return false;
 	return new Promise<boolean>((resolve) => {
@@ -255,6 +282,7 @@ export class LocalPiDriver implements AgentDriver {
 		sessionManager: SessionManager,
 		cwd: string,
 		workspaceAccess?: WorkspaceResourceAccess,
+		codeSearch?: Awaited<ReturnType<NonNullable<LocalPiDriverOptions["codeSearchFor"]>>>,
 		invocationEnv: NodeJS.ProcessEnv = process.env,
 	): Promise<AgentSession> {
 		const agentDir = getAgentDir();
@@ -272,11 +300,20 @@ export class LocalPiDriver implements AgentDriver {
 			// 不因单个外部 Capability 不可用而阻断普通 Pi 工作。
 			console.warn(`[pi worker capability] ${issue.message} (${issue.code})`);
 		}
+		const extensionFactories: InlineExtension[] = [];
+		if (codeSearch?.provider === "fff" && codeSearch.workspace?.trusted && this.opts.fffStateRoot) {
+			extensionFactories.push(await buildWorkspaceFffExtension({
+				stateRoot: this.opts.fffStateRoot,
+				workspace: codeSearch.workspace,
+			}));
+		}
 		const loader = new DefaultResourceLoader({
 			cwd,
 			agentDir,
 			settingsManager: SettingsManager.create(cwd, agentDir),
 			...piResourceLoaderOptions(resources, cwd, agentDir, workspaceAccess),
+			...(extensionFactories.length ? { extensionFactories } : {}),
+			extensionsOverride: stripUnmanagedPiFff,
 			// 无 extensionFactories：child pi 不挂载团队委托工具（§9.1 默认不递归）。
 			// append-only（§3）：worker 运行指令只追加，不覆盖 pi 内嵌默认提示词。
 			appendSystemPromptOverride: (base) => appendPiPrompts(base, resources),
@@ -303,8 +340,16 @@ export class LocalPiDriver implements AgentDriver {
 							}) as NonNullable<CreateAgentSessionOptions["customTools"]>[number],
 						],
 					}
-				: {}),
+					: {}),
 		});
+		// SDK embedding does not emit extension lifecycle events automatically.
+		// Without this, pi-fff keeps its construction-time process.cwd() and can
+		// index the server source tree instead of the selected Workspace.
+		await session.bindExtensions({ mode: "rpc" });
+		if (codeSearch?.provider === "builtin") {
+			const active = session.getActiveToolNames();
+			session.setActiveToolsByName([...new Set([...active, "grep", "find"])]);
+		}
 		return session;
 	}
 
@@ -330,21 +375,28 @@ export class LocalPiDriver implements AgentDriver {
 		const access = this.opts.workspaceAccessFor
 			? await this.opts.workspaceAccessFor(ctx.workspaceId)
 			: undefined;
+		const codeSearch = this.opts.codeSearchFor ? await this.opts.codeSearchFor(ctx.workspaceId) : undefined;
+		const searchFingerprint = piSearchFingerprint(codeSearch);
 		if (sessionHandle) {
 			const live = sessionsByHandle.get(sessionHandle);
-			if (live) {
+			if (live && searchFingerprintByHandle.get(sessionHandle) === searchFingerprint) {
 				await this.reconcileModel(live);
 				return { session: live, sessionHandle };
 			}
+			if (live) {
+				sessionsByHandle.delete(sessionHandle);
+				searchFingerprintByHandle.delete(sessionHandle);
+				live.dispose();
+			}
 			const info = (await SessionManager.list(ctx.cwd, this.sessionDir())).find((s) => s.id === sessionHandle);
 			if (!info) throw new Error(`pi worker 会话不存在：${sessionHandle}`);
-			const session = await this.newSession(SessionManager.open(info.path, this.sessionDir()), ctx.cwd, access, ctx.env);
+			const session = await this.newSession(SessionManager.open(info.path, this.sessionDir()), ctx.cwd, access, codeSearch, ctx.env);
 			await this.reconcileModel(session);
-			retainSession(session);
+			retainSession(session, searchFingerprint);
 			return { session, sessionHandle: session.sessionId };
 		}
-		const session = await this.newSession(SessionManager.create(ctx.cwd, this.sessionDir()), ctx.cwd, access, ctx.env);
-		retainSession(session);
+		const session = await this.newSession(SessionManager.create(ctx.cwd, this.sessionDir()), ctx.cwd, access, codeSearch, ctx.env);
+		retainSession(session, searchFingerprint);
 		return { session, sessionHandle: session.sessionId };
 	}
 

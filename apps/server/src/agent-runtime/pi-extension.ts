@@ -59,7 +59,7 @@ function str(value: unknown): string | undefined {
 }
 
 /** Driver 工厂：同一 Connector 多 Agent 实例（§9.3.7），每实例一份 config。 */
-export function piExtensionHooks(defaults: { sessionDir?: string } = {}): BuiltinExtensionHooks {
+export function piExtensionHooks(defaults: { sessionDir?: string; fffStateRoot?: string } = {}): BuiltinExtensionHooks {
 	return {
 		driverFactory: (config) =>
 			new LocalPiDriver({
@@ -74,6 +74,11 @@ export function piExtensionHooks(defaults: { sessionDir?: string } = {}): Builti
 					typeof config.workspaceAccessFor === "function"
 						? (config.workspaceAccessFor as LocalPiDriverOptions["workspaceAccessFor"])
 						: undefined,
+				codeSearchFor:
+					typeof config.codeSearchFor === "function"
+						? (config.codeSearchFor as LocalPiDriverOptions["codeSearchFor"])
+						: undefined,
+				fffStateRoot: str(config.fffStateRoot) ?? defaults.fffStateRoot,
 				capabilityRuntimeFor:
 					typeof config.capabilityRuntimeFor === "function"
 						? (config.capabilityRuntimeFor as LocalPiDriverOptions["capabilityRuntimeFor"])

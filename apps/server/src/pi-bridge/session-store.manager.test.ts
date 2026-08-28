@@ -39,8 +39,20 @@ async function makeStack(catalog?: ExtensionCatalog) {
 		ttlMs: 24 * 60 * 60 * 1000,
 	});
 	const invoker = new AgentInvoker(teams, runtime, drivers, undefined, dir);
-	const sessions = new PiSessionStore(dir, path.join(dir, "sessions"), teams, invoker, catalog);
-	return { teams, sessions, invoker, drivers, dir };
+	const sessions = new PiSessionStore(
+		dir,
+		path.join(dir, "sessions"),
+		teams,
+		invoker,
+		catalog,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		path.join(dir, "fff"),
+	);
+	return { teams, sessions, invoker, drivers, runtime, dir };
 }
 
 test("P3-R: Agent 运行指令与 Window collaboration 分层；Direct 固定 relay 不可覆盖", async () => {
@@ -74,6 +86,37 @@ test("Phase5: thinking level 新建会话即生效，运行中会话即时 setTh
 	// 新会话同样应用最新配置。
 	const s2 = await sessions.create();
 	assert.equal((await sessions.open(s2.id)).thinkingLevel, "max");
+	await sessions.disposeAll();
+});
+
+test("Manager 代码搜索默认关闭，Solo 显式 builtin 才激活 grep/find", async () => {
+	const { teams, sessions, dir } = await makeStack();
+	const context = { type: "solo" as const, members: [], cwd: dir };
+	const disabled = await sessions.create(undefined, context);
+	assert.ok(!((await sessions.open(disabled.id)).getActiveToolNames().includes("grep")));
+	await teams.updateManager({ manager: { codeSearch: "builtin" } });
+	const enabled = await sessions.create(undefined, context);
+	const active = (await sessions.open(enabled.id)).getActiveToolNames();
+	assert.ok(active.includes("grep"));
+	assert.ok(active.includes("find"));
+	await sessions.disposeAll();
+});
+
+test("Solo Manager 的 FFF 只在 trusted Workspace 装配 override 工具", async () => {
+	const { teams, sessions } = await makeStack();
+	const workspace = await teams.workspaces.createManaged("fff-project");
+	await teams.updateManager({ manager: { codeSearch: "fff" } });
+	const summary = await sessions.create(undefined, {
+		type: "solo",
+		members: [],
+		workspaceId: workspace.id,
+		cwd: workspace.canonicalPath,
+	});
+	const tools = (await sessions.open(summary.id)).getAllTools().map((tool) => tool.name);
+	assert.ok(tools.includes("grep"));
+	assert.ok(tools.includes("find"));
+	assert.ok(tools.includes("multi_grep"));
+	assert.ok(!tools.includes("ffgrep"), "受控 FFF 必须固定 override 模式");
 	await sessions.disposeAll();
 });
 
@@ -248,13 +291,201 @@ test("P3-1: worker Session 只在相同 Workspace 与 Agent 配置修订下续�
 		workspaceId: project.id,
 		sessionId: "manager-a",
 	});
-	await teams.rememberWorkerSession(window.id, agent.name, "worker-a", project.id, project.canonicalPath, agent.extensionRevision ?? 0);
-	assert.equal(await invoker.sessionHandleFor(window.id, agent), "worker-a");
+	await teams.rememberWorkerSession(window.id, "manager-a", agent.name, "worker-a", project.id, project.canonicalPath, agent.extensionRevision ?? 0);
+	assert.equal(await invoker.sessionHandleFor(window.id, "manager-a", agent), "worker-a");
 
 	const revised = await teams.upsertAgent({ ...agent, description: "v2" });
-	assert.equal(await invoker.sessionHandleFor(window.id, revised), undefined, "Agent 配置变化必须新建 worker Session");
-	await teams.rememberWorkerSession(window.id, agent.name, "stale-project", "another-workspace", project.canonicalPath, revised.extensionRevision ?? 0);
-	assert.equal(await invoker.sessionHandleFor(window.id, revised), undefined, "其他项目的 Session handle 不得续接");
+	assert.equal(await invoker.sessionHandleFor(window.id, "manager-a", revised), undefined, "Agent 配置变化必须新建 worker Session");
+	await teams.rememberWorkerSession(window.id, "manager-a", agent.name, "stale-project", "another-workspace", project.canonicalPath, revised.extensionRevision ?? 0);
+	assert.equal(await invoker.sessionHandleFor(window.id, "manager-a", revised), undefined, "其他项目的 Session handle 不得续接");
+});
+
+test("房间 Session 隔离 Worker handle：新 Session 为空，切回旧 Session 恢复各自上下文", async () => {
+	const { teams, invoker } = await makeStack();
+	const project = await teams.workspaces.createManaged("隔离项目");
+	const agent = await teams.upsertAgent({
+		name: "alpha",
+		description: "alpha",
+		invoke: { type: "command", command: "alpha", runArgs: [] },
+	});
+	const window = await teams.createWindow({
+		type: "direct",
+		members: ["alpha"],
+		workspaceId: project.id,
+		sessionId: "room-a",
+	});
+	await teams.rememberWorkerSession(window.id, "room-a", agent.name, "worker-a", project.id, project.canonicalPath, agent.extensionRevision ?? 0);
+	await teams.addWindowSession(window.id, "room-b");
+	assert.equal(await invoker.sessionHandleFor(window.id, "room-b", agent), undefined, "新建房间 Session 不得继承旧 Worker 上下文");
+	await teams.rememberWorkerSession(window.id, "room-b", agent.name, "worker-b", project.id, project.canonicalPath, agent.extensionRevision ?? 0);
+	assert.equal(await invoker.sessionHandleFor(window.id, "room-a", agent), "worker-a");
+	assert.equal(await invoker.sessionHandleFor(window.id, "room-b", agent), "worker-b");
+	await teams.removeWindowSession(window.id, "room-b");
+	assert.equal((await teams.getWindow(window.id))?.workerBindings?.["room-b"], undefined, "删除房间 Session 必须清理其 Worker binding");
+});
+
+test("continue 端到端按房间 Session 选择 Worker：新会话 run，切回旧会话 continue", async () => {
+	const { teams, invoker, drivers } = await makeStack();
+	const agent = await teams.upsertAgent({
+		name: "alpha",
+		description: "alpha",
+		invoke: { type: "command", command: "alpha", runArgs: [] },
+	});
+	const calls: string[] = [];
+	let sequence = 0;
+	const driver: AgentDriver = {
+		id: "alpha",
+		async capabilities() {
+			return { operations: ["run", "continue"], interactionKinds: [], progress: "none", transport: "spawn" };
+		},
+		async *run(): AsyncIterable<AgentEvent> {
+			const handle = `worker-${++sequence}`;
+			calls.push(`run:${handle}`);
+			yield { type: "completed", result: { agentId: "alpha", status: "completed", sessionHandle: handle, content: "ok" } };
+		},
+		async *continue(input): AsyncIterable<AgentEvent> {
+			calls.push(`continue:${input.sessionHandle}`);
+			yield { type: "completed", result: { agentId: "alpha", status: "completed", sessionHandle: input.sessionHandle, content: "ok" } };
+		},
+		async *respond(): AsyncIterable<AgentEvent> { throw new Error("unused"); },
+		async probe() {
+			return {
+				extensionInstalled: true, detected: true, configured: true, authenticated: "unknown" as const,
+				enabled: true, compatibility: "supported" as const,
+				capabilities: { operations: ["run", "continue"] as const, interactionKinds: [] as const, progress: "none" as const, transport: "spawn" as const }, issues: [],
+			};
+		},
+	};
+	drivers.register(driver);
+	const window = await teams.createWindow({ type: "direct", members: ["alpha"], sessionId: "room-a" });
+
+	await invoker.delegate({ windowId: window.id, managerSessionId: "room-a", agent, message: "a1", mode: "continue" });
+	for (let i = 0; i < 20 && !(await invoker.sessionHandleFor(window.id, "room-a", agent)); i += 1) {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	await teams.addWindowSession(window.id, "room-b");
+	await invoker.delegate({ windowId: window.id, managerSessionId: "room-b", agent, message: "b1", mode: "continue" });
+	for (let i = 0; i < 20 && !(await invoker.sessionHandleFor(window.id, "room-b", agent)); i += 1) {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	await invoker.delegate({ windowId: window.id, managerSessionId: "room-a", agent, message: "a2", mode: "continue" });
+
+	assert.deepEqual(calls, ["run:worker-1", "run:worker-2", "continue:worker-1"]);
+});
+
+test("solo 委托到 direct 执行窗口时，Worker handle 归属来源房间 Session", async () => {
+	const { teams, invoker, dir } = await makeStack();
+	const agent = await teams.upsertAgent({
+		name: "alpha",
+		description: "alpha",
+		invoke: { type: "command", command: "alpha", runArgs: [] },
+	});
+	const solo = await teams.ensureSoloWindow(async () => ({ id: "solo-room-a" }), async () => true);
+	const direct = await teams.createWindow({
+		type: "direct",
+		members: ["alpha"],
+		sessionId: "direct-mirror",
+	});
+
+	await teams.rememberWorkerSession(
+		direct.id,
+		solo.activeSession,
+		agent.name,
+		"worker-from-solo-a",
+		undefined,
+		realpathSync(dir),
+		agent.extensionRevision ?? 0,
+	);
+	assert.equal(await invoker.sessionHandleFor(direct.id, solo.activeSession, agent), "worker-from-solo-a");
+	assert.equal(
+		(await teams.getWindow(solo.id))?.workerBindings?.[solo.activeSession]?.alpha?.sessionHandle,
+		"worker-from-solo-a",
+		"binding 必须写入 manager Session 的属主窗口",
+	);
+	assert.equal((await teams.getWindow(direct.id))?.workerBindings?.["direct-mirror"], undefined, "镜像 direct Session 不得吸收来源上下文");
+
+	await teams.addWindowSession(solo.id, "solo-room-b");
+	assert.equal(await invoker.sessionHandleFor(direct.id, "solo-room-b", agent), undefined, "同一执行窗口也不得跨房间 Session 续接");
+
+	const group = await teams.createWindow({ type: "group", members: ["alpha"], sessionId: "group-room" });
+	await teams.rememberWorkerSession(
+		direct.id,
+		"group-room",
+		agent.name,
+		"illegal-cross-window",
+		undefined,
+		realpathSync(dir),
+		agent.extensionRevision ?? 0,
+	);
+	assert.equal(await invoker.sessionHandleFor(direct.id, "group-room", agent), undefined, "非 solo 房间不得借用其他执行窗口的 handle");
+	assert.equal((await teams.getWindow(group.id))?.workerBindings?.["group-room"], undefined);
+});
+
+test("删除房间 Session 在生命周期闸门内先取消 Run；最后一个 Session 拒绝删除", async () => {
+	const { teams, invoker, drivers, runtime } = await makeStack();
+	const agent = await teams.upsertAgent({
+		name: "alpha",
+		description: "alpha",
+		invoke: { type: "command", command: "alpha", runArgs: [] },
+	});
+	let sequence = 0;
+	const driver: AgentDriver = {
+		id: "alpha",
+		async capabilities() {
+			return { operations: ["run", "cancel"], interactionKinds: ["permission"], progress: "none", transport: "spawn" };
+		},
+		async *run(): AsyncIterable<AgentEvent> {
+			const suffix = ++sequence;
+			yield { type: "started", sessionHandle: `worker-${suffix}`, runHandle: `run-${suffix}` };
+			yield {
+				type: "input_required",
+				result: {
+					agentId: "alpha",
+					status: "needs_input",
+					sessionHandle: `worker-${suffix}`,
+					runHandle: `run-${suffix}`,
+					interaction: { id: `provider-${suffix}`, kind: "permission", requests: [{ requestId: `perm-${suffix}`, prompt: "允许？", options: ["once", "reject"] }] },
+				},
+			};
+		},
+		async *continue(): AsyncIterable<AgentEvent> { throw new Error("unused"); },
+		async *respond(): AsyncIterable<AgentEvent> { throw new Error("unused"); },
+		async cancel() {},
+		async probe() {
+			return {
+				extensionInstalled: true, detected: true, configured: true, authenticated: "unknown" as const,
+				enabled: true, compatibility: "supported" as const,
+				capabilities: { operations: ["run", "cancel"] as const, interactionKinds: ["permission"] as const, progress: "none" as const, transport: "spawn" as const }, issues: [],
+			};
+		},
+	};
+	drivers.register(driver);
+	const window = await teams.createWindow({ type: "direct", members: ["alpha"], sessionId: "room-a" });
+	await teams.addWindowSession(window.id, "room-b");
+
+	const first = await invoker.delegate({ windowId: window.id, managerSessionId: "room-a", agent, message: "a", mode: "run" });
+	assert.equal(first.status, "needs_input");
+	await invoker.closeManagerSession(
+		"room-a",
+		async () => {
+			const current = await teams.getWindow(window.id);
+			if (!current || current.sessions.length <= 1) throw new Error("blocked");
+		},
+		async () => {
+			const removed = await teams.removeWindowSession(window.id, "room-a");
+			assert.equal(removed.removed, true);
+		},
+	);
+	assert.equal((await runtime.getDelegation(first.delegationId!))?.status, "cancelled");
+	assert.equal((await teams.getWindow(window.id))?.sessions.includes("room-a"), false);
+
+	const last = await invoker.delegate({ windowId: window.id, managerSessionId: "room-b", agent, message: "b", mode: "run" });
+	await assert.rejects(
+		() => invoker.closeManagerSession("room-b", async () => { throw new Error("窗口至少要保留一个会话"); }, async () => undefined),
+		/窗口至少要保留一个会话/,
+	);
+	assert.equal((await runtime.getDelegation(last.delegationId!))?.status, "waiting_input", "preflight 失败不得误取消最后会话的 Run");
+	await invoker.cancel(last.delegationId!);
 });
 
 test("P3-1: 无项目 Window 的 cwdSnapshot 变化后拒绝恢复旧 Interaction", async () => {

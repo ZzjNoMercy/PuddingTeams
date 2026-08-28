@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import type { WebSocket } from "@fastify/websocket";
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
+import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { serializePiEvent } from "../pi-bridge/bridge.js";
 import { PiSessionStore } from "../pi-bridge/session-store.js";
@@ -56,6 +57,30 @@ interface WsHandlerParams {
  * browser sees them even when the HTTP POST already returned.
  */
 const socketsBySession = new Map<string, Set<WebSocket>>();
+
+interface LocalPathReference { token: string; absolutePath: string }
+
+function localPathReferences(content: string): LocalPathReference[] {
+	const found: LocalPathReference[] = [];
+	const add = (token: string, value: string): void => {
+		const absolutePath = value.trim();
+		if (path.isAbsolute(absolutePath) && !found.some((item) => item.token === token)) found.push({ token, absolutePath });
+	};
+	for (const match of content.matchAll(/`(\/[^`\n]+)`/g)) add(match[1]!, match[1]!);
+	for (const match of content.matchAll(/file:\/\/[^\s`<>]+/g)) {
+		try { add(match[0], fileURLToPath(match[0])); } catch { /* malformed URI remains ordinary text */ }
+	}
+	for (const match of content.matchAll(/(?:^|\s)(\/[^\s`"'<>]+)/g)) {
+		const token = match[1]!.replace(/[),.;:!?]+$/, "");
+		add(token, token);
+	}
+	return found;
+}
+
+function isWithin(candidate: string, root: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
 
 function forwardError(sessionId: string, message: string): void {
 	const sockets = socketsBySession.get(sessionId);
@@ -151,16 +176,32 @@ export async function registerChatRoutes(
 	app.get("/api/sessions", async () => ({ sessions: await store.list() }));
 
 	app.delete<{ Params: { id: string } }>("/api/sessions/:id", async (req, reply) => {
-		await invoker?.cancelManagerSession(req.params.id);
-		const removed = await store.remove(req.params.id);
-		// A fresh window session may only exist as a config (pi writes the
-		// session file lazily) — clean the window store regardless, and only
-		// 404 when nothing existed at all.
-		const inWindow = teams ? await teams.windowForSession(req.params.id) : undefined;
-		await teams?.removeSessionFromWindows(req.params.id);
-		await workStates?.removeSession(req.params.id);
-		if (!removed && !inWindow) return reply.code(404).send({ error: "session not found" });
-		return reply.code(204).send();
+		try {
+			let existed = false;
+			const preflight = async () => {
+				const owner = teams ? await teams.windowForSession(req.params.id) : undefined;
+				if (owner?.sessions.length === 1) throw new Error("窗口至少要保留一个会话");
+			};
+			const remove = async () => {
+				// A fresh window session may only exist as a config (pi writes the
+				// session file lazily) — clean the window store regardless, and only
+				// 404 when nothing existed at all.
+				const inWindow = teams ? await teams.windowForSession(req.params.id) : undefined;
+				const removed = await store.remove(req.params.id);
+				await teams?.removeSessionFromWindows(req.params.id);
+				await workStates?.removeSession(req.params.id);
+				existed = removed || Boolean(inWindow);
+			};
+			if (invoker) await invoker.closeManagerSession(req.params.id, preflight, remove);
+			else {
+				await preflight();
+				await remove();
+			}
+			if (!existed) return reply.code(404).send({ error: "session not found" });
+			return reply.code(204).send();
+		} catch (err) {
+			return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+		}
 	});
 
 	app.post<{ Params: { id: string }; Body: { model?: string } }>(
@@ -189,8 +230,27 @@ export async function registerChatRoutes(
 			}
 			if (!Array.isArray(attachments)) return reply.code(400).send({ error: "attachments must be an array" });
 			let stored = [] as Awaited<ReturnType<UploadStore["save"]>>;
+			let promptContent = content ?? "";
 			try {
-				stored = attachments.length ? await uploads?.save(req.params.id, attachments) ?? [] : [];
+				const window = await teams?.windowForSession(req.params.id);
+				const workspaceRoot = await realpath(window?.cwdSnapshot ?? process.cwd()).catch(() => path.resolve(window?.cwdSnapshot ?? process.cwd()));
+				const external: Array<LocalPathReference & { canonicalPath: string; dev: number | bigint; ino: number | bigint }> = [];
+				for (const reference of localPathReferences(promptContent)) {
+					const canonicalPath = await realpath(reference.absolutePath).catch(() => undefined);
+					if (!canonicalPath) throw new Error(`绝对路径不存在或不可访问，未交给 Agent：${reference.absolutePath}`);
+					const info = await stat(canonicalPath);
+					if (isWithin(canonicalPath, workspaceRoot)) continue;
+					if (info.isDirectory()) {
+						throw new Error(`目录「${reference.absolutePath}」不属于当前 Workspace；请先登记为 Workspace 或配置明确的临时挂载范围`);
+					}
+					if (info.isFile()) external.push({ ...reference, canonicalPath, dev: info.dev, ino: info.ino });
+				}
+				if (external.length && !uploads) throw new Error("平台未启用会话附件冻结，不能读取 Workspace 外文件");
+				stored = await uploads?.saveWithLocalFiles(req.params.id, attachments, external.map((item) => ({ path: item.canonicalPath, dev: item.dev, ino: item.ino }))) ?? [];
+				const frozen = stored.slice(attachments.length);
+				for (let index = 0; index < external.length; index++) {
+					promptContent = promptContent.split(external[index]!.token).join(frozen[index]!.path);
+				}
 			} catch (err) {
 				return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
 			}
@@ -198,7 +258,7 @@ export async function registerChatRoutes(
 			const attachmentText = stored.length
 				? `\n\n用户附件（平台冻结路径，可按需读取并在委托任务中原样传递）：\n${stored.map((item) => `- ${item.name} (${item.mediaType}, ${item.size} bytes): ${item.path}`).join("\n")}`
 				: "";
-			const promptText = `${content || "请处理所附文件。"}${attachmentText}`;
+			const promptText = `${promptContent || "请处理所附文件。"}${attachmentText}`;
 			const images = stored
 				.filter((item) => item.mediaType.startsWith("image/"))
 				.map((item) => ({ type: "image" as const, data: item.base64, mimeType: item.mediaType }));

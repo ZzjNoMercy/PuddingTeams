@@ -176,7 +176,7 @@ test("P3-0 API: 关闭开发者模式的持久化窗口会阻塞并发本地安�
 	await app.close();
 });
 
-test("Phase5: DEFAULT_TEAMS 新结构——pinned manager + PuddingClaw connector binding（决策 20）", async () => {
+test("Phase5: DEFAULT_TEAMS 新结构——pinned manager + 三个发行内置 Worker + PuddingClaw", async () => {
 	const { app } = await makeStack();
 	const res = await app.inject({ method: "GET", url: "/api/agents" });
 	const { agents } = res.json() as { agents: Array<Record<string, unknown>> };
@@ -184,6 +184,28 @@ test("Phase5: DEFAULT_TEAMS 新结构——pinned manager + PuddingClaw connecto
 	assert.ok(manager, "agents.json 必须含 pinned manager 条目");
 	assert.equal(manager!.pinned, true);
 	assert.deepEqual(manager!.invoke, { type: "pi" });
+	const designer = agents.find((a) => a.name === "pi-b");
+	assert.deepEqual(designer, {
+		name: "pi-b",
+		displayName: "Designer",
+		description: "负责UI/UX设计和PPT制作",
+		connector: { extensionId: "pi", connectorId: "pi", transport: "sdk", config: {} },
+		enabled: true,
+	});
+	const claude = agents.find((a) => a.name === "claude-code");
+	assert.deepEqual(claude, {
+		name: "claude-code",
+		description: "Anthropic Claude Code CLI worker（spawn + stream-json 流式）",
+		connector: { extensionId: "claude-code", connectorId: "claude-code", transport: "spawn", config: {} },
+		enabled: true,
+	});
+	const codex = agents.find((a) => a.name === "codex");
+	assert.deepEqual(codex, {
+		name: "codex",
+		description: "OpenAI Codex CLI worker（spawn + JSONL 流式）",
+		connector: { extensionId: "codex", connectorId: "codex", transport: "spawn", config: {} },
+		enabled: true,
+	});
 	const claw = agents.find((a) => a.name === "puddingclaw");
 	assert.ok(claw);
 	assert.deepEqual(claw!.connector, {

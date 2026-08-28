@@ -18,20 +18,22 @@ const fields: Array<{ key: keyof typeof defaults; label: string; hint: string }>
 	{ key: "previewTailTokens", label: "尾部预览", hint: "保留结论、风险和引用所在的尾部预算。" },
 	{ key: "readChunkTokens", label: "分页读取", hint: "read_delegation_result 的默认单页预算。" },
 ];
-type HarnessTab = "results" | "activation" | "recovery";
+type HarnessTab = "search" | "results" | "activation" | "recovery";
 const harnessTabs: Array<{ id: HarnessTab; label: string }> = [
+	{ id: "search", label: "代码搜索" },
 	{ id: "results", label: "结果上下文" },
 	{ id: "activation", label: "Goal 激活" },
 	{ id: "recovery", label: "安全恢复" },
 ];
 export function HarnessSettingsPanel() {
 	const [value, setValue] = useState<HarnessSettings>({
+		codeSearch: { defaultProvider: "builtin" },
 		workerResults: defaults,
 		goalActivation: { solo: "manager_explicit", group: "manager_explicit", direct: "user_explicit", confirmWhenAmbiguous: true },
 		goalRecovery: { mode: "safe_auto", directMode: "manual", resumeLeaseMs: 30_000, operationRetentionDays: 30, maxOperationsPerSession: 512 },
 	});
 	const [saving, setSaving] = useState(false);
-	const [tab, setTab] = useState<HarnessTab>("results");
+	const [tab, setTab] = useState<HarnessTab>("search");
 	useEffect(() => { void getHarnessSettings().then(setValue).catch((error) => toast.error(error instanceof Error ? error.message : String(error))) }, []);
 	const save = async () => {
 		setSaving(true);
@@ -44,6 +46,10 @@ export function HarnessSettingsPanel() {
 			{harnessTabs.map((item) => <button key={item.id} id={`harness-tab-${item.id}`} type="button" role="tab" aria-selected={tab === item.id} aria-controls={`harness-panel-${item.id}`} data-active={tab === item.id ? "true" : "false"} onClick={() => setTab(item.id)}>{item.label}</button>)}
 		</div>
 		<section id={`harness-panel-${tab}`} className="settings-card harness-settings-card" role="tabpanel" aria-labelledby={`harness-tab-${tab}`}>
+			{tab === "search" ? <div className="harness-settings-pane">
+				<div><h3 className="text-sm font-semibold">Worker 默认代码搜索</h3><p className="mt-1 text-xs leading-5 text-muted-foreground">Worker 可用 inherit / builtin / fff 单独覆盖。FFF 只为当前已信任 Workspace 建索引，状态不会跨 Workspace 共享。</p></div>
+				<label className="space-y-1.5 text-xs"><span className="font-medium">默认实现</span><select className="h-9 w-full rounded-md border bg-background px-2" value={value.codeSearch.defaultProvider} onChange={(event) => setValue((current) => ({ ...current, codeSearch: { defaultProvider: event.target.value as "builtin" | "fff" } }))}><option value="builtin">Pi 内置 grep/find</option><option value="fff">FFF Workspace 索引</option></select></label>
+			</div> : null}
 			{tab === "results" ? <div className="harness-settings-pane">
 				<div><h3 className="text-sm font-semibold">Worker 结果上下文</h3><p className="mt-1 text-xs leading-5 text-muted-foreground">超长结果始终无损外置；这里只调整预览和分页预算，不能退回静默硬截断。token 使用 ceil(chars/4) 估算。</p></div>
 				<div className="grid gap-3 sm:grid-cols-2">{fields.map((field) => <label key={field.key} className="space-y-1.5 text-xs"><span className="font-medium">{field.label}</span><Input type="number" min={1} value={value.workerResults[field.key]} onChange={(event) => setValue((current) => ({ ...current, workerResults: { ...current.workerResults, [field.key]: Number(event.target.value) } }))} /><span className="block text-[10px] leading-4 text-muted-foreground">{field.hint}</span></label>)}</div>

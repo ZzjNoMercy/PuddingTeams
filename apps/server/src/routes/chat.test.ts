@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import Fastify from "fastify";
@@ -13,6 +13,7 @@ import { AgentRuntime } from "../agent-runtime/runtime.js";
 import { AgentInvoker } from "../agent-runtime/invoker.js";
 import { PiSessionStore } from "../pi-bridge/session-store.js";
 import { registerChatRoutes } from "./chat.js";
+import { UploadStore } from "../store/uploads.js";
 
 async function makeStack() {
 	const dir = mkdtempSync(path.join(tmpdir(), "pt-chat-routes-"));
@@ -120,6 +121,55 @@ test("GET /api/sessions/:id/messages 对非「不存在」错误保持 500 穿�
 	await registerChatRoutes(app, broken);
 	const res = await app.inject({ method: "GET", url: "/api/sessions/x/messages" });
 	assert.equal(res.statusCode, 500, res.body);
+	await app.close();
+});
+
+test("消息入口把 Workspace 外绝对文件冻结为会话附件，外部目录拒绝隐式挂载", async () => {
+	const { teams, dir } = await makeStack();
+	const sessionId = "freeze-session";
+	await teams.createWindow({ type: "direct", members: ["puddingclaw"], sessionId });
+	const sourceRoot = mkdtempSync(path.join(tmpdir(), "pt-chat-external-"));
+	const source = path.join(sourceRoot, "notes.txt");
+	writeFileSync(source, "frozen-content", "utf-8");
+	let received = "";
+	const fakeSession = {
+		messages: [],
+		prompt: async (text: string) => { received = text; },
+	};
+	const fakeStore = {
+		open: async () => fakeSession,
+		generateSessionTitle: async () => undefined,
+	} as unknown as PiSessionStore;
+	const uploads = new UploadStore(path.join(dir, "uploads"));
+	await uploads.init();
+	const app = Fastify({ logger: false });
+	await app.register(websocket);
+	await registerChatRoutes(app, fakeStore, teams, undefined, uploads);
+	const fileResponse = await app.inject({
+		method: "POST",
+		url: `/api/sessions/${sessionId}/messages`,
+		payload: { content: `读取 \`${source}\`` },
+	});
+	assert.equal(fileResponse.statusCode, 200, fileResponse.body);
+	assert.ok(!received.includes(source), "模型输入不得继续引用可变的 Workspace 外源文件");
+	assert.match(received, /uploads\/freeze-session\//);
+	const frozenPath = (fileResponse.json() as { attachments: Array<{ path: string }> }).attachments[0]!.path;
+	assert.equal(readFileSync(frozenPath, "utf-8"), "frozen-content");
+
+	const directoryResponse = await app.inject({
+		method: "POST",
+		url: `/api/sessions/${sessionId}/messages`,
+		payload: { content: `读取目录 \`${sourceRoot}\`` },
+	});
+	assert.equal(directoryResponse.statusCode, 400, directoryResponse.body);
+	assert.match(directoryResponse.body, /登记为 Workspace|临时挂载/);
+	const missingResponse = await app.inject({
+		method: "POST",
+		url: `/api/sessions/${sessionId}/messages`,
+		payload: { content: "读取 `/definitely/not/a/real/puddingteams-file.txt`" },
+	});
+	assert.equal(missingResponse.statusCode, 400, missingResponse.body);
+	assert.match(missingResponse.body, /不存在或不可访问/);
 	await app.close();
 });
 

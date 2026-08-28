@@ -17,7 +17,7 @@ import { registerWorkspacesRoutes } from "./workspaces.js";
 async function makeStack(
 	nativePicker?: (initialPath: string) => Promise<string | undefined>,
 	fileOpener?: (targetPath: string) => Promise<void>,
-	additionalFileRoots: readonly string[] = [],
+	attachmentRoot?: string,
 ) {
 	const dir = mkdtempSync(path.join(tmpdir(), "pt-workspace-routes-"));
 	process.env.PI_CODING_AGENT_DIR = path.join(dir, "agent-dir");
@@ -36,7 +36,7 @@ async function makeStack(
 	registerWorkspacesRoutes(app, teams.workspaces, nativePicker);
 	registerRoomsRoutes(app, sessions, teams, invoker, undefined, {
 		open: fileOpener,
-		additionalRoots: additionalFileRoots,
+		attachmentRoot,
 	});
 	return { app, teams, sessions, delegations, dir };
 }
@@ -49,7 +49,7 @@ test("消息附件从房间 cwd 解析并仅打开允许目录内的文件", asy
 		async (targetPath) => {
 			opened.push(targetPath);
 		},
-		[attachmentRoot],
+		attachmentRoot,
 	);
 	const created = await app.inject({
 		method: "POST",
@@ -57,6 +57,7 @@ test("消息附件从房间 cwd 解析并仅打开允许目录内的文件", asy
 		payload: { type: "direct", members: ["alpha"] },
 	});
 	const roomId = created.json().room.id as string;
+	const activeSession = created.json().room.activeSession as string;
 	const localFile = path.join(dir, "add.py");
 	writeFileSync(localFile, "print('ok')\n");
 
@@ -76,7 +77,9 @@ test("消息附件从房间 cwd 解析并仅打开允许目录内的文件", asy
 	});
 	assert.equal(openedDirectoryResponse.statusCode, 200, openedDirectoryResponse.body);
 	assert.deepEqual(opened, [realpathSync(localFile), realpathSync(localDirectory)]);
-	const uploadedFile = path.join(attachmentRoot, "frozen.pdf");
+	const activeAttachmentDir = path.join(attachmentRoot, activeSession);
+	mkdirSync(activeAttachmentDir);
+	const uploadedFile = path.join(activeAttachmentDir, "frozen.pdf");
 	writeFileSync(uploadedFile, "pdf\n");
 	const uploadedResponse = await app.inject({
 		method: "POST",
@@ -85,6 +88,15 @@ test("消息附件从房间 cwd 解析并仅打开允许目录内的文件", asy
 	});
 	assert.equal(uploadedResponse.statusCode, 200, uploadedResponse.body);
 	assert.deepEqual(opened, [realpathSync(localFile), realpathSync(localDirectory), realpathSync(uploadedFile)]);
+
+	const nextSession = await app.inject({ method: "POST", url: `/api/rooms/${roomId}/sessions`, payload: {} });
+	assert.equal(nextSession.statusCode, 200, nextSession.body);
+	const historicalRejected = await app.inject({
+		method: "POST",
+		url: `/api/rooms/${roomId}/open-file`,
+		payload: { path: uploadedFile },
+	});
+	assert.equal(historicalRejected.statusCode, 400, historicalRejected.body);
 
 	const outsideDir = mkdtempSync(path.join(tmpdir(), "pt-outside-file-"));
 	const outsideFile = path.join(outsideDir, "secret.txt");
