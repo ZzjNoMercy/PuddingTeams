@@ -11,7 +11,7 @@ Session 的第一职责不是“保存聊天记录”，而是让下一次动作
 
 | 对象 | 生命周期 | 保存什么 |
 | --- | --- | --- |
-| Window | 长期 | 成员、Workspace、多个 Session、最新 Worker binding |
+| Window | 长期 | 成员、Workspace、多个 Session，以及各 Session 的 Worker binding |
 | Session | 一段连贯对话 | 消息、可选 Goal、相关委托引用 |
 | Delegation | 一次 Worker Run | 输入、状态、handle、归一化结果与执行时间线 |
 
@@ -37,17 +37,17 @@ Manager 通过目标 Worker 的 `agent_<worker>__delegate` 工具发起每一轮
 | `task` | 真正发送给目标 Worker 的新消息 |
 | `parentDelegationId` | 记录本轮源自当前 Manager Session 中的哪次委托 |
 | `handoffKind` | `followup` 表示追问/返修；带 parent 的 `request` 表示派生出的新下游任务 |
-| `session` | `continue` 使用目标 Window 的最新 Worker binding；`new` 新开 Worker Session |
+| `session` | `continue` 使用当前房间 Session 对该 Worker 的 binding；`new` 新开 Worker Session |
 
-`session` 缺省为 `continue`。PuddingTeams 负责选择并校验 `workerBindings[agentId].sessionHandle`，再交给 Driver 恢复会话；Worker 不会临场自行选择 handle。某些 CLI Connector 每轮都会 spawn 新进程，但带 resume handle 时仍是同一个逻辑 Worker Session。没有有效 binding 时从新 Worker Session 开始。
+`session` 缺省为 `continue`。PuddingTeams 负责选择并校验 `workerBindings[managerSessionId][agentId].sessionHandle`，再交给 Driver 恢复会话；Worker 不会临场自行选择 handle。某些 CLI Connector 每轮都会 spawn 新进程，但带 resume handle 时仍是同一个逻辑 Worker Session。当前房间 Session 没有有效 binding 时从新 Worker Session 开始。
 
-`parentDelegationId` 不会自动注入父结果，也不会决定使用哪个 `sessionHandle`。跨 Worker 接力时，Manager 必须把必要摘要、回读内容或 Workspace/Artifact 路径写进 `task`。parent 只能属于当前 Manager Session；新开 Manager Session 后不能继续旧因果链，但如果仍在同一个 Window，仍可能通过窗口 binding 续接旧 Worker Session，并创建新的根 Delegation。
+`parentDelegationId` 不会自动注入父结果，也不会决定使用哪个 `sessionHandle`。跨 Worker 接力时，Manager 必须把必要摘要、回读内容或 Workspace/Artifact 路径写进 `task`。parent 只能属于当前 Manager Session；新开房间 Session 后既不能继续旧因果链，也不会继承旧 Worker Session。切回旧房间 Session 时，才恢复它自己的 binding。
 
 ## 谁拥有哪份会话
 
 - Manager 和本地 pi Worker 的完整消息历史由 pi Session JSONL 保存。
 - spawn/HTTP 等外部 Worker 的 Session 正文归上游 Agent；PuddingTeams 只保存不透明 `sessionHandle`。
-- Window 的 `workerBindings` 只保存“下次续接用哪个 handle”的最新指针，不复制 Worker 历史。
+- Window 的 `workerBindings[managerSessionId][agentId]` 只保存“这个房间 Session 下次续接该 Worker 用哪个 handle”的指针，不复制 Worker 历史。
 - 每次 Delegation 仍保留它当时的 handle 和结果，因此新指针不会改写旧记录。
 
 默认路径：
@@ -64,6 +64,8 @@ Manager 通过目标 Worker 的 `agent_<worker>__delegate` 工具发起每一轮
 续接不是“只要有 handle 就继续”。PuddingTeams 同时核对：
 
 - Window 与 Worker 身份；
+- 当前房间 Session 的归属；
+- binding 冻结的实际执行窗口；
 - 显式 `workspaceId`；
 - 委托时冻结的 `cwdSnapshot`；
 - Agent 配置修订；

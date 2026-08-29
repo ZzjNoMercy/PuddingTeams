@@ -4,7 +4,7 @@
 >
 > 交互原型：`designs/manager-workplan-timeline/index.html`，包含深色/浅色主题、Goal 任务树、DAG 对照视图以及普通聊天不显示 Goal 入口的状态。Figma v1 参考稿：[03 · Recommended · Fusion · 1440×900](https://www.figma.com/design/Xa6bhuUx31oRrOMK0tJ8p2?node-id=6-2)；2026-08-21 的 Goal 融合与依赖图收口以本地原型为准。
 >
-> 待审增量：真实环境 Verifier、Submission 验证门禁和 Goal 整合复验尚未实现，设计见 `docs/2026-08-26-真实环境复验与可信验收方案.md`。本文下文仍只描述已落地行为。
+> 待审增量：ExecutionReceipt、Workspace 写入所有权、远端 Run 对账/未知态、真实环境 Verifier、Submission 验证门禁和 Goal 整合复验尚未实现；合并后的最终开发方案见 `docs/2026-08-26-真实环境复验与可信验收方案.md`。本文下文仍只描述已落地行为。
 
 ## 1. 结论
 
