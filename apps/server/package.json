@@ -14,7 +14,7 @@
     "test": "tsx --test \"src/**/*.test.ts\""
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "0.83.0",
+    "@earendil-works/pi-coding-agent": "0.84.4",
     "@fastify/cors": "^11.3.0",
     "@fastify/websocket": "^11.3.0",
     "@ff-labs/pi-fff": "0.10.5",
