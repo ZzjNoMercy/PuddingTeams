@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { CheckIcon, ExternalLinkIcon, ShieldAlertIcon, XIcon } from "lucide-react";
+import { ArrowRightLeftIcon, CheckIcon, ExternalLinkIcon, ShieldAlertIcon, XIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -9,7 +9,7 @@ import { cancelInteraction, getInteraction, submitInteractionResponse } from "@/
 import { useAgentLabel } from "@/lib/avatars";
 import { WorkerAvatar } from "./worker-avatar";
 
-type CardStatus = "pending" | "busy" | "approved" | "rejected" | "expired" | "failed";
+type CardStatus = "pending" | "busy" | "approved" | "rejected" | "expired" | "failed" | "replaced";
 
 function statusLabel(status: CardStatus): string {
 	switch (status) {
@@ -25,6 +25,8 @@ function statusLabel(status: CardStatus): string {
 			return "已过期";
 		case "failed":
 			return "处理失败";
+		case "replaced":
+			return "已换 Worker";
 		default:
 			return status;
 	}
@@ -47,6 +49,8 @@ export function InteractionCard({
 	revision,
 	windowId,
 	goalId,
+	source,
+	workerStarted,
 	statusHint,
 	compact,
 	onOpenWindow,
@@ -57,6 +61,8 @@ export function InteractionCard({
 	revision?: number;
 	windowId?: string;
 	goalId?: string;
+	source?: "worker" | "platform_policy";
+	workerStarted?: boolean;
 	statusHint?: string;
 	compact?: boolean;
 	onOpenWindow?: (windowId: string) => void;
@@ -70,6 +76,19 @@ export function InteractionCard({
 	// 多轮审批（needs_input 后同 id、revision+1）：以服务端对账的 revision 为准，
 	// props 里的 revision 只是首渲染快照。
 	const [liveRevision, setLiveRevision] = useState<number | undefined>(revision);
+	const [liveSource, setLiveSource] = useState<"worker" | "platform_policy">(source ?? "worker");
+	const [liveWorkerStarted, setLiveWorkerStarted] = useState(workerStarted ?? false);
+	const [replacementCandidates, setReplacementCandidates] = useState<Array<{
+		agentId: string;
+		displayName: string;
+		readOnlyEnforcement: "sandbox" | "remote_policy";
+	}>>([]);
+	const [replacementCandidatesLoaded, setReplacementCandidatesLoaded] = useState(false);
+	const [replacementMode, setReplacementMode] = useState(false);
+	const [selectedReplacement, setSelectedReplacement] = useState<string>();
+	const [replacementLabel, setReplacementLabel] = useState<string>();
+	const [replacementFailed, setReplacementFailed] = useState(false);
+	const platformAdmission = liveSource === "platform_policy";
 	const reqs = requests ?? [];
 	const firstReq = reqs[0];
 	// M4：授权范围从服务端 options 派生，去掉 "reject"（那是动作不是范围），
@@ -84,30 +103,64 @@ export function InteractionCard({
 	useEffect(() => {
 		if (!interactionId) return;
 		let cancelled = false;
-		getInteraction(interactionId)
-			.then(({ interaction }) => {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const refresh = async () => {
+			try {
+				const { interaction, delegation } = await getInteraction(interactionId);
 				if (cancelled) return;
 				setLiveRevision(interaction.revision);
+				setLiveSource(interaction.source);
+				setLiveWorkerStarted(delegation?.workerStarted ?? false);
+				setReplacementCandidates(interaction.replacementCandidates ?? []);
+				setReplacementCandidatesLoaded(true);
+				setSelectedReplacement((current) => current ?? interaction.replacementCandidates?.[0]?.agentId);
+				if (interaction.decision?.chosenAction === "select_another_worker") {
+					setReplacementLabel(
+						interaction.replacementCandidates?.find((item) => item.agentId === interaction.decision?.replacementAgentId)?.displayName
+							?? interaction.decision.replacementAgentId,
+					);
+					if (interaction.application?.status === "applied") {
+						setStatus("replaced");
+						setBusy(false);
+						return;
+					}
+					if (interaction.application?.status === "failed") setReplacementFailed(true);
+				}
+				if (interaction.application?.status === "failed") {
+					setStatus("failed");
+					setBusy(false);
+					return;
+				}
+				if (interaction.source === "platform_policy" && interaction.application?.status === "applying") {
+					setStatus("busy");
+					setBusy(true);
+					timer = setTimeout(() => void refresh(), 1_500);
+					return;
+				}
 				const s = interaction.status as CardStatus;
 				if (s === "approved" || s === "rejected" || s === "expired" || s === "failed") {
 					setStatus(s);
 					setBusy(false);
 				}
-			})
-			.catch((err: unknown) => {
+			} catch (err: unknown) {
 				// L3：服务端明确 404（已删除/过期）→ 卡片转已过期；网络错误保留 pending。
 				if (!cancelled && err instanceof Error && /404|not found/i.test(err.message)) {
 					setStatus("expired");
 					setBusy(false);
+				} else if (!cancelled) {
+					timer = setTimeout(() => void refresh(), 2_000);
 				}
-			});
+			}
+		};
+		void refresh();
 		return () => {
 			cancelled = true;
+			if (timer) clearTimeout(timer);
 		};
 	}, [interactionId]);
 
 	const submit = useCallback(
-		async (action: "approve" | "reject" | "confirm", chosenScope?: string) => {
+		async (action: "approve" | "reject" | "confirm", chosenScope?: string, value?: unknown) => {
 			if (!interactionId) return;
 			setBusy(true);
 			try {
@@ -120,16 +173,30 @@ export function InteractionCard({
 						requestId: r.requestId,
 						action,
 						scope: action === "reject" ? undefined : chosenScope ?? scope,
+						value,
 					})),
 				})) as { outcome?: { status?: string; result?: { error?: string } } };
 				const status = outcome?.outcome?.status;
+				if (status === "replaced") {
+					const selected = replacementCandidates.find((item) => item.agentId === value);
+					setReplacementLabel(selected?.displayName ?? (typeof value === "string" ? value : undefined));
+					setStatus("replaced");
+					setReplacementMode(false);
+					toast.success(`已改派给 ${selected?.displayName ?? "替代 Worker"}`);
+					return;
+				}
 				if (status === "failed" || status === "rejected") {
 					// M1：失败/被拒不能显示成功。
 					toast.error(outcome.outcome!.result?.error ?? "审批处理失败");
 					getInteraction(interactionId)
 						.then(({ interaction }) => {
 							setLiveRevision(interaction.revision);
-							setStatus(interaction.status as CardStatus);
+							setReplacementCandidates(interaction.replacementCandidates ?? []);
+							setReplacementCandidatesLoaded(true);
+							if (interaction.application?.status === "failed") {
+								setReplacementFailed(interaction.decision?.chosenAction === "select_another_worker");
+								setStatus("failed");
+							} else setStatus(interaction.status as CardStatus);
 						})
 						.catch(() => undefined);
 					return;
@@ -147,6 +214,7 @@ export function InteractionCard({
 					return;
 				}
 				setStatus(action === "reject" ? "rejected" : "approved");
+				if (platformAdmission && action !== "reject") setLiveWorkerStarted(true);
 				toast.success(action === "reject" ? "已拒绝该请求" : "已批准");
 			} catch (err) {
 				toast.error(err instanceof Error ? err.message : String(err));
@@ -154,14 +222,19 @@ export function InteractionCard({
 				getInteraction(interactionId)
 					.then(({ interaction }) => {
 						setLiveRevision(interaction.revision);
-						setStatus(interaction.status as CardStatus);
+						setReplacementCandidates(interaction.replacementCandidates ?? []);
+						setReplacementCandidatesLoaded(true);
+						if (interaction.application?.status === "failed") {
+							setReplacementFailed(interaction.decision?.chosenAction === "select_another_worker");
+							setStatus("failed");
+						} else setStatus(interaction.status as CardStatus);
 					})
 					.catch(() => undefined);
 			} finally {
 				setBusy(false);
 			}
 		},
-		[goalId, interactionId, liveRevision, revision, requests, scope, windowId],
+		[goalId, interactionId, liveRevision, platformAdmission, replacementCandidates, revision, requests, scope, windowId],
 	);
 
 	const cancel = useCallback(async () => {
@@ -178,7 +251,9 @@ export function InteractionCard({
 		}
 	}, [goalId, interactionId]);
 
-	const resolved = status !== "pending" && status !== "busy";
+	// A failed platform application can still own a pre-start Delegation. Keep a
+	// single explicit Cancel action available so the user can close that task.
+	const resolved = status !== "pending" && status !== "busy" && !(platformAdmission && status === "failed" && !replacementFailed);
 
 	return (
 		<div className="w-full overflow-hidden rounded-lg border border-border/60 bg-muted/60">
@@ -213,11 +288,23 @@ export function InteractionCard({
 									: "secondary"
 						}
 					>
-						{statusLabel(status)}
+						{platformAdmission && status === "pending" ? "等待 Teams 准入" : platformAdmission && status === "approved" ? "已允许使用" : statusLabel(status)}
 					</Badge>
 				</div>
 			</div>
 			<div className="flex flex-col gap-2.5 p-3">
+				{platformAdmission ? (
+					<div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-2 text-xs">
+						<p className="font-medium">
+							{status === "replaced" ? `原 Worker 未启动，已改派给 ${replacementLabel ?? "替代 Worker"}` : liveWorkerStarted ? "Worker 已开始执行" : "Worker 尚未启动"}
+						</p>
+						<p className="mt-1 text-muted-foreground">
+							{status === "replaced"
+								? "新 Worker 使用独立 Delegation 和会话，原 Worker 不会再启动。"
+								: "继续仅允许 Teams 使用这个 Worker，不会改变其权限，也不代表只读已得到保证。"}
+						</p>
+					</div>
+				) : workerStarted === false ? <p className="text-xs text-muted-foreground">Worker 尚未启动</p> : null}
 				{reqs.map((r) => (
 					<div key={r.requestId} className="flex flex-col gap-1">
 						<p className="text-sm whitespace-pre-wrap">{r.prompt}</p>
@@ -233,7 +320,7 @@ export function InteractionCard({
 
 				{!resolved && !statusHint?.includes("conflict") ? (
 					<>
-						{allowedScopes.length > 1 && status !== "busy" ? (
+						{!platformAdmission && allowedScopes.length > 1 && status !== "busy" ? (
 							<div className="flex items-center gap-1.5 text-xs text-muted-foreground">
 								<span>授权范围：</span>
 								{allowedScopes.map((s) => (
@@ -250,22 +337,58 @@ export function InteractionCard({
 								))}
 							</div>
 						) : null}
+						{platformAdmission && !replacementMode && replacementCandidatesLoaded && replacementCandidates.length === 0 && status !== "failed" ? (
+							<p className="text-xs text-muted-foreground">当前没有其它声明了强制只读能力的可用 Worker。</p>
+						) : null}
+						{platformAdmission && replacementMode ? (
+							<div className="rounded-md border border-border/70 bg-background/70 p-2.5">
+								<p className="text-xs font-medium">选择能验证只读能力的 Worker</p>
+								<div className="mt-2 flex flex-col gap-1.5">
+									{replacementCandidates.map((candidate) => (
+										<button
+											key={candidate.agentId}
+											type="button"
+											onClick={() => setSelectedReplacement(candidate.agentId)}
+											className={`flex items-center justify-between rounded-md border px-2.5 py-2 text-left text-xs ${selectedReplacement === candidate.agentId ? "border-primary bg-primary/5" : "border-border/60 hover:bg-muted"}`}
+										>
+											<span className="font-medium">{candidate.displayName}</span>
+											<span className="text-muted-foreground">{candidate.readOnlyEnforcement === "sandbox" ? "只读沙箱" : "远端只读策略"}</span>
+										</button>
+									))}
+								</div>
+								<div className="mt-2 flex items-center gap-2">
+									<Button type="button" size="sm" disabled={busy || !selectedReplacement} onClick={() => void submit("approve", "select_another_worker", selectedReplacement)}>
+										<ArrowRightLeftIcon className="size-3.5" />
+										确认改派
+									</Button>
+									<Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => setReplacementMode(false)}>返回</Button>
+								</div>
+							</div>
+						) : (
 						<div className="flex items-center gap-2">
+						{status !== "failed" ? (
 							<Button type="button" size="sm" disabled={busy} onClick={() => void submit("approve", scope)}>
 								{busy ? null : <CheckIcon className="size-3.5" />}
-								允许
+								{platformAdmission ? "继续使用" : "允许"}
 							</Button>
+						) : null}
+						{platformAdmission && status !== "failed" && replacementCandidates.length > 0 ? (
+							<Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => setReplacementMode(true)}>
+								<ArrowRightLeftIcon className="size-3.5" />
+								换 Worker
+							</Button>
+						) : null}
 							<Button
 								type="button"
 								size="sm"
 								variant="outline"
 								disabled={busy}
-								onClick={() => void submit("reject")}
+							onClick={() => void (status === "failed" && platformAdmission ? cancel() : submit("reject"))}
 							>
 								<XIcon className="size-3.5" />
-								拒绝
+								{platformAdmission ? "取消任务" : "拒绝"}
 							</Button>
-							{interactionId ? (
+							{interactionId && !platformAdmission ? (
 								<Button
 									type="button"
 									size="sm"
@@ -278,6 +401,7 @@ export function InteractionCard({
 								</Button>
 							) : null}
 						</div>
+						)}
 					</>
 				) : resolved ? (
 					<p className="text-xs text-muted-foreground">{statusLabel(status)}</p>

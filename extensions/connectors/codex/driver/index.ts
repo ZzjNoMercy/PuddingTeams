@@ -55,7 +55,13 @@ export class CodexDriver implements AgentDriver {
 	constructor(private readonly opts: CodexDriverOptions = {}) {}
 
 	async capabilities(): Promise<DriverCapabilities> {
-		return CODEX_CAPABILITIES;
+		return {
+			...CODEX_CAPABILITIES,
+			workspace: {
+				...CODEX_CAPABILITIES.workspace!,
+				readOnlyEnforcement: this.opts.sandbox === "read-only" ? "sandbox" : "none",
+			},
+		};
 	}
 
 	private cmd(): string {

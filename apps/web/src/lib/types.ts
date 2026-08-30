@@ -600,7 +600,7 @@ export interface RoomSession {
 export type SessionWorkStatus = "active" | "resolved" | "cancelled";
 export type CompletionReviewMode = "manager" | "independent";
 export type GoalExecutionStatus = "idle" | "running" | "waiting_human" | "interrupted" | "recovering" | "reviewing";
-export type WorkItemStatus = "planned" | "ready" | "in_progress" | "waiting_input" | "submitted" | "revision" | "accepted" | "blocked" | "cancelled";
+export type WorkItemStatus = "planned" | "ready" | "in_progress" | "waiting_admission" | "waiting_input" | "submitted" | "revision" | "accepted" | "blocked" | "cancelled";
 export type VerificationMode = "manager_review" | "independent_evidence_review" | "environment_verified";
 export type VerificationStatus = "pending" | "running" | "waiting_input" | "passed" | "failed" | "blocked" | "stale";
 export type WorkspaceAccessMode = "read_only_shared" | "exclusive_write" | "isolated_worktree";
@@ -842,7 +842,9 @@ export interface DelegationTrace {
 	expectedOutcome?: string;
 	evidenceRequirements?: string[];
 	completionBoundary?: string;
-	executionState: "admitted" | "running" | "waiting_input" | "reported_completed" | "reported_failed" | "cancel_requested" | "reconciling" | "cancelled" | "observation_lost";
+	executionState: "admitted" | "waiting_admission" | "running" | "waiting_input" | "reported_completed" | "reported_failed" | "cancel_requested" | "reconciling" | "cancelled" | "observation_lost";
+	workerStarted?: boolean;
+	readOnlyAssessment?: "verified" | "unverified_user_accepted" | "not_required";
 	receipt?: {
 		contractHash?: string;
 		collectionStatus?: "complete" | "partial" | "failed";

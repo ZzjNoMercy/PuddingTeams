@@ -191,11 +191,28 @@ export async function setSessionModel(sessionId: string, model: string): Promise
 	}
 }
 
-export async function fetchMessages(sessionId: string): Promise<{ messages: unknown[]; runningToolCallIds: string[] }> {
+export interface RecoveredToolResult {
+	toolCallId: string;
+	toolName: string;
+	text: string;
+	details?: Record<string, unknown>;
+	isError: boolean;
+}
+
+export interface AbortSessionResult {
+	aborted: boolean;
+	reconciledToolResults: number;
+}
+
+export async function fetchMessages(sessionId: string): Promise<{ messages: unknown[]; runningToolCallIds: string[]; recoveredToolResults: RecoveredToolResult[] }> {
 	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/messages`);
 	if (!res.ok) throw new Error(`fetch messages failed: ${res.status}`);
-	const body = (await res.json()) as { messages: unknown[]; runningToolCallIds?: string[] };
-	return { messages: body.messages, runningToolCallIds: body.runningToolCallIds ?? [] };
+	const body = (await res.json()) as { messages: unknown[]; runningToolCallIds?: string[]; recoveredToolResults?: RecoveredToolResult[] };
+	return {
+		messages: body.messages,
+		runningToolCallIds: body.runningToolCallIds ?? [],
+		recoveredToolResults: body.recoveredToolResults ?? [],
+	};
 }
 
 export interface SessionSlashCommand {
@@ -225,8 +242,21 @@ export async function sendMessage(sessionId: string, content: string, attachment
 	if (!res.ok) throw new Error(`send message failed: ${res.status}`);
 }
 
-export async function abortSession(sessionId: string): Promise<void> {
-	await fetch(`${SERVER_URL}/api/sessions/${sessionId}/abort`, { method: "POST" });
+export async function abortSession(sessionId: string): Promise<AbortSessionResult> {
+	let res: Response;
+	try {
+		res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/abort`, {
+			method: "POST",
+			signal: AbortSignal.timeout(15_000),
+		});
+	} catch (err) {
+		if (err instanceof DOMException && err.name === "TimeoutError") throw new Error("停止请求超时，任务状态尚未确认，请刷新后重试");
+		throw err;
+	}
+	const body = (await res.json().catch(() => null)) as (AbortSessionResult & { error?: string }) | null;
+	if (!res.ok) throw new Error(body?.error ?? `stop session failed: ${res.status}`);
+	if (!body?.aborted) throw new Error(body?.error ?? "服务端未确认任务已停止");
+	return body;
 }
 
 /** Cancel one delegated worker Run without aborting the manager Session. */
@@ -273,6 +303,8 @@ export interface WorkerProcessInfo {
 	goalId?: string;
 	agentId: string;
 	executionState: ExecutionState;
+	workerStarted: boolean;
+	readOnlyAssessment?: "verified" | "unverified_user_accepted" | "not_required";
 	/** 后端根据 Delegation 与 WorkState 生成的权威三轴投影。 */
 	trustProjection: CollaborationTrustProjection;
 	receipt?: ExecutionReceiptView;
@@ -292,7 +324,7 @@ export interface WorkerProcessListItem extends WorkerProcessInfo {
 
 /** Execution / Verification / Settlement are intentionally independent axes. */
 export type ExecutionState =
-	| "admitted" | "running" | "waiting_input" | "reported_completed" | "reported_failed"
+	| "admitted" | "waiting_admission" | "running" | "waiting_input" | "reported_completed" | "reported_failed"
 	| "cancel_requested" | "reconciling" | "cancelled" | "observation_lost";
 export type VerificationProjection =
 	| "not_required" | "unverified" | "pending" | "running" | "waiting_input"
@@ -310,6 +342,7 @@ export interface ExecutionReceiptView {
 	issues?: string[];
 	sealedAt?: string;
 	artifactCapture?: Array<{ artifactId?: string; status?: string; issue?: string }>;
+	workerStarted?: boolean;
 }
 
 /** Exact trust fields emitted by the server, or locally projected from WorkState. */
@@ -519,6 +552,30 @@ export async function probeAgent(name: string): Promise<AgentProbeResult> {
 		throw new Error(body?.error ?? `probe failed: ${res.status}`);
 	}
 	return ((await res.json()) as { probe: AgentProbeResult }).probe;
+}
+
+export interface AgentExecutionCapabilities {
+	agentId: string;
+	agentRevision: number;
+	connectorId: string;
+	transport: "sdk" | "spawn" | "http";
+	workspace: {
+		honorsInvocationCwd: boolean;
+		readOnlyEnforcement: "none" | "sandbox" | "remote_policy";
+		isolatedWorkspace: boolean;
+		mutationInterception: "none" | "pre_mutation";
+	};
+	verificationSource: "connector_declared";
+	securityWarnings: string[];
+}
+
+export async function getAgentExecutionCapabilities(name: string): Promise<AgentExecutionCapabilities> {
+	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}/execution-capabilities`);
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `load execution capabilities failed: ${res.status}`);
+	}
+	return (await res.json()) as AgentExecutionCapabilities;
 }
 
 export async function listAgentConnectorConfigOptions(name: string, field: string): Promise<DriverConfigOption[]> {
@@ -1251,11 +1308,30 @@ export interface InteractionRequestView {
 export interface InteractionView {
 	id: string;
 	delegationId: string;
+	source: "worker" | "platform_policy";
 	kind: "permission" | "question" | "confirmation";
 	requests: InteractionRequestView[];
 	status: "pending" | "responding" | "approved" | "rejected" | "expired" | "failed";
 	revision: number;
 	expiresAt?: string;
+	policySummary?: {
+		reasonCode: "read_only_not_enforceable" | "cwd_not_honored";
+		allowedActions: Array<"cancel" | "proceed_with_worker" | "select_another_worker">;
+		workerStarted: false;
+	};
+	application?: {
+		status: "pending" | "applying" | "applied" | "failed";
+		failureCode?: string;
+		replacementAgentId?: string;
+		replacementDelegationId?: string;
+	};
+	decision?: { chosenAction: "cancel" | "proceed_with_worker" | "select_another_worker"; replacementAgentId?: string };
+	replacementCandidates?: Array<{
+		agentId: string;
+		displayName: string;
+		readOnlyEnforcement: "sandbox" | "remote_policy";
+		verificationSource: "connector_declared";
+	}>;
 }
 
 export interface InteractionDelegationView {
@@ -1265,6 +1341,7 @@ export interface InteractionDelegationView {
 	goalId?: string;
 	agentId: string;
 	status: string;
+	workerStarted: boolean;
 	createdAt: string;
 	updatedAt: string;
 }
@@ -1294,7 +1371,7 @@ export interface InteractionResponseSubmit {
 	revision: number;
 	expectedGoalId?: string;
 	windowId?: string;
-	responses: Array<{ requestId: string; action: string; scope?: string }>;
+	responses: Array<{ requestId: string; action: string; scope?: string; value?: unknown }>;
 }
 
 /** 提交审批（approve / reject / confirm）。 */

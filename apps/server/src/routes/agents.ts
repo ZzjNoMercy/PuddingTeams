@@ -153,6 +153,32 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		};
 	});
 
+	app.get<{ Params: { name: string } }>("/api/agents/:name/execution-capabilities", async (req, reply) => {
+		const agent = await teams.getAgent(req.params.name);
+		if (!agent) return reply.code(404).send({ error: "agent not found" });
+		if (!invoker) return reply.code(503).send({ error: "Agent Runtime 未启用" });
+		try {
+			const capabilities = await invoker.capabilitiesFor(agent.name);
+			if (!capabilities) return reply.code(404).send({ error: "Connector driver unavailable" });
+			const workspace = capabilities.workspace ?? {
+				honorsInvocationCwd: false,
+				readOnlyEnforcement: "none" as const,
+				isolatedWorkspace: false,
+			};
+			return {
+				agentId: agent.name,
+				agentRevision: agent.extensionRevision ?? 0,
+				connectorId: agent.connector?.connectorId ?? agent.name,
+				transport: capabilities.transport,
+				workspace: { ...workspace, mutationInterception: capabilities.workspace?.mutationInterception ?? "none" },
+				verificationSource: "connector_declared",
+				securityWarnings: connectorSecurityWarnings(agent),
+			};
+		} catch (err) {
+			return reply.code(502).send({ error: err instanceof Error ? err.message : String(err) });
+		}
+	});
+
 	app.post<{ Body: Partial<Record<string, unknown>> }>("/api/agents", async (req, reply) => {
 		try {
 			const body = { ...(req.body ?? {}) } as Record<string, unknown>;

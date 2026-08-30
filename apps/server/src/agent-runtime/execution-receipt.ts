@@ -9,6 +9,7 @@ import type {
 
 export type ExecutionState =
 	| "admitted"
+	| "waiting_admission"
 	| "running"
 	| "waiting_input"
 	| "reported_completed"
@@ -52,6 +53,7 @@ export interface ExecutionReceipt extends ExecutionReceiptPayload {
 	workspaceChangeSetId?: string;
 	integrity: "clean" | "suspect" | "violation";
 	issues: string[];
+	workerStarted: boolean;
 	sealedAt: string;
 }
 
@@ -77,6 +79,7 @@ export interface ReceiptContractSnapshot {
 	agentId: string;
 	agentRevision: number;
 	createdAt: string;
+	workerStarted?: boolean;
 	workspaceExecutionScopeId?: string;
 	workspaceChangeSetId?: string;
 }
@@ -198,6 +201,7 @@ export function sealExecutionReceipt(input: {
 		...(input.contract.workspaceChangeSetId ? { workspaceChangeSetId: input.contract.workspaceChangeSetId } : {}),
 		integrity,
 		issues,
+		workerStarted: input.contract.workerStarted ?? true,
 		startedAt: input.contract.createdAt,
 		observedAt,
 		observer: { connectorId: input.connectorId, transport: input.transport },

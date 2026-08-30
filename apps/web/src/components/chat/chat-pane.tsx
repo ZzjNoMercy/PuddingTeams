@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDownIcon, EllipsisIcon, FolderGit2Icon, FolderOpenIcon, LayersIcon, ListTreeIcon, PanelLeftOpenIcon } from "lucide-react";
+import { ChevronDownIcon, EllipsisIcon, FolderGit2Icon, FolderOpenIcon, InfoIcon, LayersIcon, ListTreeIcon, PanelLeftOpenIcon } from "lucide-react";
 import { toast } from "sonner";
 import {
 	Conversation,
@@ -20,6 +20,7 @@ import {
 	DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { preloadChatHistory, useChat } from "@/hooks/useChat";
 import { compactDay } from "@/lib/time";
@@ -43,7 +44,7 @@ import { AssistantGroup, Message } from "./message";
 import { ManagerAvatar, MemberStack, WorkerAvatar } from "./worker-avatar";
 import { DirectoryPickerDialog } from "./directory-picker-dialog";
 import { WorkspaceTrustDialog, needsTrustDecision } from "./workspace-trust-dialog";
-import { WorkspaceTrustBadge, workspaceTrustSuffix } from "./workspace-trust-badge";
+import { WorkspaceTrustBadge } from "./workspace-trust-badge";
 import { ChatInfoDialog } from "./chat-info-dialog";
 import { SessionMenu } from "./session-menu";
 import { SessionWorkCard } from "./session-work-card";
@@ -123,7 +124,17 @@ function SessionChat({
 	onRuntimeViewChange: (view: SessionRuntimeView) => void;
 	onRuntimeSummaryChange: (summary: SessionRuntimeSummary) => void;
 }) {
-	const { messages, historyLoading, status, running, send, stop } = useChat(sessionId);
+	const { messages, historyLoading, status, running, stopping, send, stop } = useChat(sessionId);
+	const handleStop = useCallback(async () => {
+		try {
+			const result = await stop();
+			toast.success(result.reconciledToolResults > 0
+				? `任务已停止，已保存 ${result.reconciledToolResults} 个工具结果`
+				: "任务已停止");
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		}
+	}, [stop]);
 	const executionTurns = useMemo<SessionExecutionTurn[]>(() => messages
 		.filter((message) => message.role === "user")
 		.map((message, index) => ({
@@ -245,7 +256,9 @@ function SessionChat({
 				) : null}
 				<Composer
 					sessionId={sessionId}
-					disabled={running || Boolean(blocked)}
+					disabled={running || stopping || Boolean(blocked)}
+					stopAvailable={running || stopping}
+					stopping={stopping}
 					busyHint={busyHint}
 					hasGoal={hasGoal}
 					workspaceLabel={workspaceLabel}
@@ -256,7 +269,7 @@ function SessionChat({
 					statsVisible={atBottom}
 					onModelChanged={onSessionModelChange}
 					onSend={send}
-					onStop={stop}
+					onStop={handleStop}
 					onGoalCommand={openGoalCommand}
 					onOpenWorkspace={onOpenWorkspace}
 					scrollButtonHostRef={setScrollButtonHost}
@@ -581,9 +594,10 @@ export function ChatPane({
 				? members[0]?.description || `与 ${members[0] ? agentDisplayName(members[0]) : ""} 单聊`
 				: "理解消息、组织协作并汇总结果";
 	const workspaceTargetReady = switchToDefault || Boolean(targetWorkspaceId || workspacePath.trim());
-	const currentContextLabel = room?.workspace ? `${room.workspace.name} · ${room.workspace.rootPath}` : `默认目录 · ${room?.cwdSnapshot ?? ""}`;
 	const workspaceLabel = room?.workspace ? `项目 · ${room.workspace.name}` : "默认目录";
 	const currentWorkspacePath = room?.workspace?.rootPath ?? room?.cwdSnapshot ?? "";
+	const recentWorkspaceOptions = workspaceOptions.filter((item) => item.id !== room?.workspace?.id);
+	const selectedRecentWorkspace = recentWorkspaceOptions.find((item) => item.id === targetWorkspaceId);
 	const newWindowLabel = type === "group" ? "新建群聊" : "新建/打开单聊";
 	const directoryPickerInitialPath =
 		workspacePath || workspaceOptions.find((item) => item.id === targetWorkspaceId)?.rootPath || room?.cwdSnapshot || "";
@@ -807,28 +821,42 @@ export function ChatPane({
 					if (!open) setDirectoryPickerOpen(false);
 				}}
 			>
-				<DialogContent className="sm:max-w-lg">
-					<DialogHeader>
-						<DialogTitle>打开项目</DialogTitle>
-						<DialogDescription className="flex items-center gap-2 truncate" title={currentContextLabel}>
-							<span className="truncate">当前：{currentContextLabel}</span>
-							{room?.workspace ? <WorkspaceTrustBadge trust={room.workspace.trust} /> : null}
-						</DialogDescription>
+				<DialogContent className="workspace-switch-dialog sm:max-w-[600px]">
+					<DialogHeader className="workspace-switch-header">
+						<div className="workspace-switch-heading-icon" aria-hidden="true"><FolderGit2Icon /></div>
+						<div className="min-w-0">
+							<DialogTitle>打开项目</DialogTitle>
+							<DialogDescription>选择新的工作目录或最近项目。</DialogDescription>
+						</div>
 					</DialogHeader>
-					{switchToDefault ? (
-						<div className="flex items-center gap-3 rounded-md border bg-muted/30 px-3 py-2.5">
-							<FolderGit2Icon className="size-4 text-muted-foreground" />
-							<div className="min-w-0 flex-1">
-								<div className="text-sm font-medium">默认目录</div>
-								<div className="text-xs text-muted-foreground">使用平台默认运行目录</div>
+
+					<div className="workspace-switch-current">
+						<div className="workspace-switch-current-icon" aria-hidden="true"><FolderGit2Icon /></div>
+						<div className="min-w-0 flex-1">
+							<div className="workspace-switch-current-label">
+								<span>当前项目</span>
+								{room?.workspace ? <WorkspaceTrustBadge trust={room.workspace.trust} /> : null}
 							</div>
+							<strong>{room?.workspace?.name ?? "默认目录"}</strong>
+							<code title={currentWorkspacePath}>{currentWorkspacePath || "未设置目录"}</code>
+						</div>
+					</div>
+
+					{switchToDefault ? (
+						<div className="workspace-switch-default-card">
+							<div className="workspace-switch-option-icon"><FolderGit2Icon /></div>
+							<div className="min-w-0 flex-1">
+								<strong>默认目录</strong>
+								<small>新会话将使用平台默认运行目录</small>
+							</div>
+							<span className="workspace-switch-selected">已选择</span>
 							<Button type="button" size="sm" variant="ghost" onClick={() => setSwitchToDefault(false)}>更改</Button>
 						</div>
 					) : (
-						<div className="flex flex-col gap-4">
-							<label className="flex flex-col gap-1.5 text-sm">
-								<span className="font-medium">项目文件夹</span>
-								<div className="flex gap-2">
+						<div className="workspace-switch-body">
+							<label className="workspace-switch-field">
+								<span className="workspace-switch-label">项目文件夹</span>
+								<div className="workspace-switch-input-row">
 									<Input
 										value={workspacePath}
 										onChange={(e) => {
@@ -836,54 +864,80 @@ export function ChatPane({
 											if (e.target.value) setTargetWorkspaceId("");
 										}}
 										placeholder="选择文件夹或输入绝对目录"
-										className="min-w-0 font-mono text-xs"
+										className="workspace-switch-path"
 									/>
-									<Button type="button" variant="outline" onClick={() => setDirectoryPickerOpen(true)}>
+									<Button type="button" variant="outline" className="workspace-switch-browse" onClick={() => setDirectoryPickerOpen(true)}>
 										<FolderOpenIcon className="size-4" />
 										浏览…
 									</Button>
 								</div>
 							</label>
-							{workspaceOptions.some((item) => item.id !== room?.workspace?.id) ? (
-								<label className="flex flex-col gap-1.5 text-sm">
-									<span className="text-muted-foreground">最近项目</span>
-									<select
-										value={targetWorkspaceId}
-										onChange={(e) => {
-											setTargetWorkspaceId(e.target.value);
-											if (e.target.value) setWorkspacePath("");
-										}}
-										className="h-9 rounded-md border bg-background px-2"
-									>
-										<option value="">选择最近项目</option>
-										{workspaceOptions.filter((item) => item.id !== room?.workspace?.id).map((item) => (
-											<option key={item.id} value={item.id} disabled={!item.available}>{item.name} — {item.rootPath}{item.available ? "" : "（失效）"}{workspaceTrustSuffix(item.trust)}</option>
-										))}
-									</select>
-								</label>
-							) : null}
-							{room?.workspace ? (
-								<Button
-									type="button"
-									variant="link"
-									className="h-auto w-fit px-0 text-muted-foreground"
-									onClick={() => {
-										setSwitchToDefault(true);
-										setWorkspacePath("");
-										setTargetWorkspaceId("");
-									}}
-								>
-									不使用项目，切回默认目录
-								</Button>
+							{recentWorkspaceOptions.length > 0 || room?.workspace ? (
+								<div className="workspace-switch-field">
+									<div className="workspace-switch-label-row">
+										<span className="workspace-switch-label">最近项目</span>
+										{room?.workspace ? (
+											<button
+												type="button"
+												className="workspace-switch-default-button"
+												onClick={() => {
+													setSwitchToDefault(true);
+													setWorkspacePath("");
+													setTargetWorkspaceId("");
+												}}
+											>
+												<FolderGit2Icon aria-hidden="true" />
+												使用默认目录
+											</button>
+										) : null}
+									</div>
+									{recentWorkspaceOptions.length > 0 ? (
+										<Select
+											value={targetWorkspaceId}
+											onValueChange={(value) => {
+												setTargetWorkspaceId(value);
+												setWorkspacePath("");
+											}}
+										>
+											<SelectTrigger className="workspace-switch-select" aria-label="最近项目">
+												<SelectValue placeholder="选择最近项目">
+													{selectedRecentWorkspace ? `${selectedRecentWorkspace.name} · ${selectedRecentWorkspace.rootPath}` : undefined}
+												</SelectValue>
+											</SelectTrigger>
+											<SelectContent position="popper" align="start" className="workspace-switch-select-content">
+												{recentWorkspaceOptions.map((item) => (
+													<SelectItem
+														key={item.id}
+														value={item.id}
+														disabled={!item.available}
+														textValue={`${item.name} ${item.rootPath}`}
+														className="workspace-switch-select-item"
+													>
+														<span className="workspace-switch-select-copy">
+															<span className="workspace-switch-select-name">
+																<strong>{item.name}</strong>
+																{!item.available ? <em>失效</em> : item.trust.state !== "trusted" ? <em>{item.trust.state === "pending" ? "待信任" : "已拒绝"}</em> : null}
+															</span>
+															<code>{item.rootPath}</code>
+														</span>
+													</SelectItem>
+												))}
+											</SelectContent>
+										</Select>
+									) : null}
+								</div>
 							) : null}
 						</div>
 					)}
-					<p className="text-xs text-muted-foreground">
-						{type === "solo"
-							? "切换后会停止当前任务，并开始一个新会话。"
-							: `“${newWindowLabel}”会保留当前对话；“替换当前”会停止当前任务，并开始一个新会话。`}
-					</p>
-					<DialogFooter>
+					<div className="workspace-switch-note">
+						<InfoIcon aria-hidden="true" />
+						<p>
+							{type === "solo"
+								? "切换项目会停止当前任务，并开始一个新会话。"
+								: `“${newWindowLabel}”会保留当前对话；“替换当前”会停止当前任务，并开始一个新会话。`}
+						</p>
+					</div>
+					<DialogFooter className="workspace-switch-footer">
 						<Button type="button" variant="ghost" onClick={() => setWorkspaceOpen(false)}>取消</Button>
 						{type !== "solo" ? (
 							<Button type="button" variant="outline" disabled={switchingWorkspace || !workspaceTargetReady} onClick={() => void saveWorkspaceSwitch("in_place")}>

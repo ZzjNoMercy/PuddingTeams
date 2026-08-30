@@ -386,6 +386,75 @@ test("委托结果正文携带 delegationId，followup 凭它接力成功", asyn
 	assert.ok(secondText.includes("done"), `followup 必须被接受并完成：${secondText}`);
 });
 
+test("solo 委托的启动前失败先结束 manager 工具，不被单聊镜像阻塞", async () => {
+	const teams = await makeTeams([agentConfig("alpha")]);
+	await teams.ensureSoloWindow(async () => ({ id: "sess-test" }), async () => true);
+	await teams.createWindow({ type: "direct", members: ["alpha"], sessionId: "sess-alpha" });
+	const saved = (await teams.getAgent("alpha"))!;
+	const invoker = {
+		requireAgent: async () => saved,
+		delegate: async () => ({
+			status: "failed",
+			content: "worker「alpha」执行出错：Connector 无法强制只读",
+			details: { errorCode: "workspace_policy_blocked" },
+			delegationId: "delegation-preflight",
+			waitingInput: false,
+		}),
+	} as unknown as AgentInvoker;
+
+	let mirrorStarted = false;
+	let releaseMirror!: () => void;
+	const mirrorGate = new Promise<void>((resolve) => { releaseMirror = resolve; });
+	const sessions = {
+		sendCustomMessage: async () => undefined,
+		ensureSessionFile: async () => undefined,
+		open: async () => ({
+			isIdle: true,
+			waitForIdle: async () => undefined,
+			sendCustomMessage: async () => {
+				mirrorStarted = true;
+				await mirrorGate;
+			},
+		}),
+	};
+	const catalog = new ExtensionCatalog();
+	const deps: ManagerExtensionDeps = {
+		store: teams,
+		sessions: sessions as never,
+		invoker,
+		catalog,
+		getSessionId: () => "sess-test",
+		ctx: undefined,
+		resolveContext: async () => undefined,
+	};
+	const plan = await planManagerTools(teams, catalog, undefined);
+	const { pi, tools } = mockPi();
+	for (const ext of buildManagerExtensionFactories(plan, deps)) {
+		const factory = typeof ext === "function" ? ext : ext.factory;
+		await factory(pi);
+	}
+
+	const execute = tools.get(delegateToolName("alpha"))!.execute(
+		"call-preflight",
+		{ task: "inspect only" },
+		undefined,
+		undefined,
+		{} as ExtensionContext,
+	);
+	await assert.rejects(
+		Promise.race([
+			execute,
+			new Promise<never>((_resolve, reject) =>
+				setTimeout(() => reject(new Error("manager tool remained running")), 250),
+			),
+		]),
+		/Connector 无法强制只读/,
+	);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(mirrorStarted, true, "终态镜像仍应在后台尝试");
+	releaseMirror();
+});
+
 test("群聊委托: 立即持久化 running 投影，且 session:new 真正新开 worker 会话", async () => {
 	const teams = await makeTeams([agentConfig("alpha")]);
 	const invoker = await makeInvoker(teams, "alpha");

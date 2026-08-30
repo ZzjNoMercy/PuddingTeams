@@ -18,12 +18,12 @@ function reviewMethod(review: CompletionReview): string {
 	return review.mode === "manager" ? "Manager 验收" : review.reviewerModel ? `独立验收 · ${review.reviewerModel}` : "独立验收";
 }
 const itemStatusText: Record<WorkItemStatus, string> = {
-	planned: "等待前置任务验收", ready: "可开始", in_progress: "运行中", waiting_input: "等待输入", submitted: "待验收",
+	planned: "等待前置任务验收", ready: "可开始", in_progress: "运行中", waiting_admission: "等待 Teams 准入", waiting_input: "等待输入", submitted: "待验收",
 	revision: "需返修", accepted: "已验收", blocked: "已阻塞", cancelled: "已取消",
 };
 const submissionVerdictText = { accepted: "已验收", revision: "需返修", blocked: "验收受阻" } as const;
 const itemStatusClass: Record<WorkItemStatus, string> = {
-	planned: "is-muted", ready: "is-ready", in_progress: "is-live", waiting_input: "is-waiting",
+	planned: "is-muted", ready: "is-ready", in_progress: "is-live", waiting_admission: "is-waiting", waiting_input: "is-waiting",
 	submitted: "is-submitted", revision: "is-revision", accepted: "is-accepted", blocked: "is-blocked", cancelled: "is-muted",
 };
 function boundaryLines(value: string): string[] { return value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean) }
@@ -65,7 +65,7 @@ function executionText(state: SessionWorkState): string {
 	return { idle: "待推进", running: "执行中", waiting_human: "等待决定", interrupted: "已暂停", recovering: "恢复中", reviewing: "验收中" }[state.execution.status];
 }
 function matchesFilter(item: WorkItem, filter: PlanFilter, live = true): boolean {
-	if (filter === "action") return ["submitted", "revision", "blocked", "waiting_input"].includes(item.status);
+	if (filter === "action") return ["submitted", "revision", "blocked", "waiting_admission", "waiting_input"].includes(item.status);
 	if (filter === "running") return live && item.status === "in_progress";
 	return true;
 }
@@ -117,7 +117,7 @@ export function SessionRuntimeDrawer({
 	const selected = workState.plan?.items[selectedId ?? ""]
 		?? workState.plan?.items[initialWorkItemId ?? ""]
 		?? items.find((item) => item.status === "submitted")
-		?? items.find((item) => item.status === "in_progress" || item.status === "waiting_input")
+		?? items.find((item) => item.status === "in_progress" || item.status === "waiting_admission" || item.status === "waiting_input")
 		?? items.find((item) => item.status === "revision" || item.status === "blocked")
 		?? items[0];
 	const selectedDelegations = selected ? selected.delegationIds.map((id) => delegations.find((item) => item.id === id)).filter((item): item is DelegationTrace => Boolean(item)) : [];
@@ -228,7 +228,7 @@ export function SessionRuntimeDrawer({
 							{latestSubmission.verifications.length ? latestSubmission.verifications.map((verification) => <div key={verification.id} className="border-t pt-2"><div className="font-medium text-foreground">Verification · {verification.mode} · {verification.status}</div><p>{verification.environmentMode}{verification.verifierAgentId ? ` · ${verification.verifierAgentId}` : ""}{verification.environmentProfileId ? ` · profile ${verification.environmentProfileId.slice(0, 12)}…` : ""}</p><p>平台观测 {verification.observations?.length ?? 0} · evidence refs {verification.evidenceRefs.length} · integrity {verification.integrity}</p>{verification.failureReason ? <p className="text-destructive">{verification.failureReason}</p> : null}<div className="mt-1 space-y-1">{verification.criteria.map((criterion, index) => <p key={criterion.criterion + index}><b className="text-foreground">{criterion.status}</b> · {criterion.criterion} · {criterion.explanation}</p>)}</div></div>) : <p>尚无复验记录。</p>}
 						</div>
 					</details> : null}
-					{selectedDelegations.length ? <div className="mt-4"><label className="text-[11px] font-medium" htmlFor="goal-attempt">执行记录</label><div className="mt-1.5 flex gap-2"><select id="goal-attempt" className="goal-attempt-select" value={effectiveDelegationId ?? ""} onChange={(event) => setSelectedDelegationId(event.target.value)}>{selectedDelegations.map((item, index) => <option key={item.id} value={item.id}>D{index + 1} · {item.agentId} · {item.executionState}</option>)}</select><Button size="sm" variant="outline" disabled={!effectiveDelegationId} onClick={() => { if (effectiveDelegationId) openProcess(effectiveDelegationId) }}>执行过程</Button>{!readOnly && effectiveDelegationId && selectedDelegations.find((item) => item.id === effectiveDelegationId && (item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "reconciling")) ? <Button size="sm" variant="destructive" disabled={working} onClick={() => void terminateDelegation(effectiveDelegationId)}><SquareIcon className="size-3 fill-current" />终止任务</Button> : null}</div></div> : null}
+					{selectedDelegations.length ? <div className="mt-4"><label className="text-[11px] font-medium" htmlFor="goal-attempt">执行记录</label><div className="mt-1.5 flex gap-2"><select id="goal-attempt" className="goal-attempt-select" value={effectiveDelegationId ?? ""} onChange={(event) => setSelectedDelegationId(event.target.value)}>{selectedDelegations.map((item, index) => <option key={item.id} value={item.id}>D{index + 1} · {item.agentId} · {item.executionState}</option>)}</select><Button size="sm" variant="outline" disabled={!effectiveDelegationId || selectedDelegations.some((item) => item.id === effectiveDelegationId && item.workerStarted === false)} onClick={() => { if (effectiveDelegationId) openProcess(effectiveDelegationId) }}>执行过程</Button>{!readOnly && effectiveDelegationId && selectedDelegations.find((item) => item.id === effectiveDelegationId && (item.executionState === "waiting_admission" || item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "reconciling")) ? <Button size="sm" variant="destructive" disabled={working} onClick={() => void terminateDelegation(effectiveDelegationId)}><SquareIcon className="size-3 fill-current" />终止任务</Button> : null}</div></div> : null}
 					{!readOnly && selected.status === "submitted" ? <div className="goal-review-box"><div className="text-xs font-semibold">Submission 待 Manager 验收</div><Textarea value={reviewSummary} onChange={(event) => setReviewSummary(event.target.value)} rows={3} placeholder="填写验收摘要与证据判断（必填）" /><div className="grid grid-cols-3 gap-2"><Button size="sm" disabled={working || !reviewSummary.trim()} onClick={() => void review("accepted")}>接受</Button><Button size="sm" variant="outline" disabled={working || !reviewSummary.trim()} onClick={() => void review("revision")}>要求返修</Button><Button size="sm" variant="destructive" disabled={working || !reviewSummary.trim()} onClick={() => void review("blocked")}>标记阻塞</Button></div></div> : null}
 					{selected.submissions.length ? <div className="mt-3 space-y-2">{[...selected.submissions].reverse().map((submission) => <div key={submission.id} className="rounded-lg border p-2 text-[11px]"><div className="font-medium">第 {submission.attempt} 次交付 · {submission.review ? submissionVerdictText[submission.review.verdict] : "待验收"}</div><p className="mt-1 text-muted-foreground"><span className="font-medium text-foreground">{submission.review ? "Manager 验收结论：" : "交付摘要："}</span>{submission.review?.summary ?? submission.summary ?? "请在执行过程中查看完整结果"}</p></div>)}</div> : null}
 				</section> : null}

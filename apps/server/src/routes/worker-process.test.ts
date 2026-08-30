@@ -228,6 +228,7 @@ test("已结束委托：从 JSONL 回放 worker 会话历史，live=false", asyn
 		managerSessionId: "s1",
 		agentId: "pi-worker",
 		executionState: "observation_lost",
+		workerStarted: false,
 		sessionHandle: handle,
 		createdAt: d.createdAt,
 		live: false,

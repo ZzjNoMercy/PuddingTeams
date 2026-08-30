@@ -213,7 +213,7 @@ export function registerWorkStateRoutes(
 				accepted: items.filter((item) => item.status === "accepted").length,
 				total: items.filter((item) => item.status !== "cancelled").length,
 				pendingReview: items.filter((item) => item.status === "submitted").length,
-				running: items.filter((item) => item.status === "in_progress" || item.status === "waiting_input").length,
+				running: items.filter((item) => item.status === "in_progress" || item.status === "waiting_admission" || item.status === "waiting_input").length,
 			};
 		} catch (err) { return sendError(reply, err) }
 	});
@@ -236,7 +236,7 @@ export function registerWorkStateRoutes(
 			if (!req.body.expectedGoalId?.trim()) return reply.code(400).send({ error: "暂停 Goal 需要 expectedGoalId" });
 			const current = await workStates.getActive(req.params.id);
 			if (!current) return reply.code(404).send({ error: "当前没有进行中的 Goal" });
-			const active = runtime ? (await runtime.listDelegations(undefined, req.params.id)).filter((item) => item.goalId === current.goalId && (item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling")) : [];
+			const active = runtime ? (await runtime.listDelegations(undefined, req.params.id)).filter((item) => item.goalId === current.goalId && (item.executionState === "waiting_admission" || item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling")) : [];
 			const key = idempotencyKey(req.headers as Record<string, unknown>);
 			const workState = await workStates.interruptGoal(req.params.id, req.body.expectedRevision, {
 				kind: req.body.kind ?? "user",

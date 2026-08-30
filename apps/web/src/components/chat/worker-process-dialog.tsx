@@ -188,6 +188,9 @@ function WorkerProcessRouter({
 	info: WorkerProcessInfo;
 	full: boolean;
 }) {
+	if (!info.workerStarted) {
+		return <div className="flex flex-1 items-center justify-center px-6 text-center text-sm text-muted-foreground">Worker 尚未启动，当前正在等待 Teams 准入决定。</div>;
+	}
 	return info.view === "session"
 		? <WorkerProcessBody delegationId={info.delegationId} full={full} />
 		: <WorkerTimelineBody delegationId={info.delegationId} />;

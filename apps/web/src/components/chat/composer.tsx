@@ -151,6 +151,8 @@ function ModelPicker({
 function ComposerInner({
 	sessionId,
 	disabled,
+	stopAvailable,
+	stopping,
 	busyHint,
 	hasGoal,
 	workspaceLabel,
@@ -165,6 +167,8 @@ function ComposerInner({
 }: {
 	sessionId: string;
 	disabled: boolean;
+	stopAvailable: boolean;
+	stopping: boolean;
 	/** run 活跃但 manager 在等 worker（delegate 阻塞中）时的等待文案。 */
 	busyHint?: string;
 	hasGoal: boolean;
@@ -175,7 +179,7 @@ function ComposerInner({
 	sessionModel?: string;
 	onModelChanged?: (model: string) => void;
 	onSend: (text: string, attachments?: MessageAttachmentInput[]) => void | Promise<void>;
-	onStop: () => void;
+	onStop: () => void | Promise<void>;
 	onGoalCommand: (initialGoal: string) => void;
 	onOpenWorkspace: () => void;
 }) {
@@ -189,7 +193,7 @@ function ComposerInner({
 		return () => { cancelled = true; };
 	}, [sessionId]);
 	const canSend = textInput.value.trim().length > 0 || attachments.files.length > 0;
-	const status: ChatStatus = disabled ? "streaming" : "idle";
+	const status: ChatStatus = stopAvailable ? "streaming" : "idle";
 	const commandQuery = !disabled && attachments.files.length === 0 && /^\/[^\s]*$/.test(textInput.value)
 		? textInput.value.slice(1).toLowerCase()
 		: null;
@@ -283,16 +287,16 @@ function ComposerInner({
 						<FolderGit2Icon className="size-3.5" />
 						<span className="truncate">{workspaceLabel}</span>
 					</Button>
-					<span className="text-muted-foreground px-1 text-xs">{disabled ? (busyHint ?? "处理中…") : ""}</span>
+					<span className="text-muted-foreground px-1 text-xs">{stopping ? "正在停止并保存结果…" : stopAvailable ? (busyHint ?? "处理中…") : ""}</span>
 				</PromptInputTools>
 				<PromptInputSubmit
 					status={status}
-					disabled={!disabled && !canSend}
-					aria-label={disabled ? "停止" : "发送"}
+					disabled={stopping || (!stopAvailable && (disabled || !canSend))}
+					aria-label={stopping ? "正在停止" : stopAvailable ? "停止" : "发送"}
 					onClick={(e) => {
-						if (disabled) {
+						if (stopAvailable && !stopping) {
 							e.preventDefault();
-							onStop();
+							void onStop();
 						}
 					}}
 				/>
@@ -305,6 +309,8 @@ function ComposerInner({
 export function Composer({
 	sessionId,
 	disabled,
+	stopAvailable = false,
+	stopping = false,
 	busyHint,
 	hasGoal,
 	workspaceLabel,
@@ -322,6 +328,8 @@ export function Composer({
 }: {
 	sessionId: string;
 	disabled: boolean;
+	stopAvailable?: boolean;
+	stopping?: boolean;
 	busyHint?: string;
 	hasGoal: boolean;
 	workspaceLabel: string;
@@ -334,7 +342,7 @@ export function Composer({
 	statsVisible?: boolean;
 	onModelChanged?: (model: string) => void;
 	onSend: (text: string, attachments?: MessageAttachmentInput[]) => void | Promise<void>;
-	onStop: () => void;
+	onStop: () => void | Promise<void>;
 	onGoalCommand: (initialGoal: string) => void;
 	onOpenWorkspace: () => void;
 	scrollButtonHostRef?: (node: HTMLDivElement | null) => void;
@@ -347,8 +355,10 @@ export function Composer({
 				<div ref={scrollButtonHostRef} className="home-scroll-to-bottom-host" />
 				<PromptInputProvider>
 					<ComposerInner
-						sessionId={sessionId}
-						disabled={disabled}
+							sessionId={sessionId}
+							disabled={disabled}
+							stopAvailable={stopAvailable}
+							stopping={stopping}
 						busyHint={busyHint}
 						hasGoal={hasGoal}
 						workspaceLabel={workspaceLabel}

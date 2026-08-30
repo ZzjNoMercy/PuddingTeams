@@ -31,6 +31,7 @@ function baseDelegation(): Omit<DelegationRecord, "id" | "purpose" | "executionS
 		managerToolCallId: "call_1",
 		agentId: "puddingclaw",
 		agentRevision: 0,
+		workerStarted: false,
 		operation: "run",
 	};
 }

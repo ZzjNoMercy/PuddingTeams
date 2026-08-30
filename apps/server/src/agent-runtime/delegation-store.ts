@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { ExecutionReceipt, ExecutionState } from "./execution-receipt.js";
-import type { DriverTransport, InteractionRequest, NormalizedResult } from "./types.js";
+import type { DriverTransport, DriverWorkspaceCapabilities, InteractionRequest, NormalizedResult } from "./types.js";
 import type { WorkspaceExecutionPolicy } from "./workspace-execution.js";
 
 export interface DelegationRecord {
@@ -45,6 +45,19 @@ export interface DelegationRecord {
 	agentRevision: number;
 	driverId?: string;
 	driverTransport?: DriverTransport;
+	/** Driver capability snapshot used for the admission decision. */
+	workspaceCapabilities?: DriverWorkspaceCapabilities;
+	capabilityFingerprint?: string;
+	readOnlyAssessment?: "verified" | "unverified_user_accepted" | "not_required";
+	admissionInteractionId?: string;
+	/**
+	 * Durable proof that every replacement-specific lifecycle guard (including
+	 * the WorkState reservation when present) committed before Driver start.
+	 */
+	replacementAdmissionReady?: boolean;
+	workerStarted: boolean;
+	/** Persisted business options required to start a pre-admission Delegation later. */
+	options?: Record<string, unknown>;
 	operation: "run" | "continue";
 	sessionHandle?: string;
 	runHandle?: string;
@@ -70,12 +83,35 @@ export interface DelegationRecord {
 export interface InteractionRecord {
 	id: string;
 	delegationId: string;
+	source: "worker" | "platform_policy";
 	kind: "permission" | "question" | "confirmation";
 	requests: InteractionRequest[];
 	status: "pending" | "responding" | "approved" | "rejected" | "expired" | "failed";
 	revision: number;
-	/** 指向加密存储（InteractionSecretStore）中的 provider state。 */
-	providerStateRef: string;
+	/** 指向加密存储（InteractionSecretStore）中的 provider state；仅 worker source 存在。 */
+	providerStateRef?: string;
+	policyContext?: {
+		reasonCode: "read_only_not_enforceable" | "cwd_not_honored";
+		capabilityFingerprint: string;
+		allowedActions: Array<"cancel" | "proceed_with_worker" | "select_another_worker">;
+		workerStarted: false;
+	};
+	decision?: {
+		chosenAction: "cancel" | "proceed_with_worker" | "select_another_worker";
+		replacementAgentId?: string;
+		actorId: string;
+		decidedAt: string;
+		requestId: string;
+	};
+	application?: {
+		operationId: string;
+		status: "pending" | "applying" | "applied" | "failed";
+		readOnlyAssessment?: "verified" | "unverified_user_accepted" | "not_required";
+		failureCode?: string;
+		replacementAgentId?: string;
+		replacementDelegationId?: string;
+		updatedAt: string;
+	};
 	/** 幂等键：已经消费的响应 request_id（重放时直接返回终态）。 */
 	consumedRequestId?: string;
 	/** Payload hash paired with consumedRequestId; same key + different answers is a conflict. */
@@ -129,7 +165,7 @@ export class DelegationStore {
 			const raw = await readFile(file, "utf-8");
 			const parsed = JSON.parse(raw) as { [k: string]: unknown };
 			if (parsed.version !== 2) {
-				throw new Error(`${path.basename(file)} 必须使用 v2；项目未上线，不读取旧结构，请移走旧文件后重启`);
+				throw new Error(`${path.basename(file)} 必须使用 v2；项目未上线，不读取其它结构，请移走不匹配文件后重启`);
 			}
 			return parsed ?? {};
 		} catch (err: unknown) {
@@ -147,18 +183,30 @@ export class DelegationStore {
 
 	private async loadDelegations(): Promise<Record<string, DelegationRecord>> {
 		const raw = await this.readFile(this.delegationsFile);
-		return (raw.delegations ?? {}) as Record<string, DelegationRecord>;
+		const records = (raw.delegations ?? {}) as Record<string, DelegationRecord>;
+		return Object.fromEntries(Object.entries(records).map(([id, record]) => [id, {
+			...record,
+			// v2 gained this additive boundary flag; records written before the
+			// boundary existed are necessarily pre-observation and therefore false.
+			workerStarted: record.workerStarted === true,
+		}])) as Record<string, DelegationRecord>;
 	}
 
 	private async loadInteractions(): Promise<Record<string, InteractionRecord>> {
 		const raw = await this.readFile(this.interactionsFile);
-		return (raw.interactions ?? {}) as Record<string, InteractionRecord>;
+		const records = (raw.interactions ?? {}) as Record<string, InteractionRecord>;
+		return Object.fromEntries(Object.entries(records).map(([id, record]) => [id, {
+			...record,
+			// Existing v2 interactions predate Teams platform-policy admission and
+			// are therefore Worker-originated.
+			source: record.source ?? "worker",
+		}])) as Record<string, InteractionRecord>;
 	}
 
 	// ---- delegations ----
 
 	async createDelegation(
-		input: Omit<DelegationRecord, "id" | "purpose" | "executionState" | "revision" | "createdAt" | "updatedAt">
+		input: Omit<DelegationRecord, "id" | "purpose" | "executionState" | "workerStarted" | "revision" | "createdAt" | "updatedAt">
 			& { purpose?: DelegationRecord["purpose"] },
 	): Promise<DelegationRecord> {
 		const now = new Date().toISOString();
@@ -167,12 +215,16 @@ export class DelegationStore {
 			purpose: input.purpose ?? "execution",
 			id: randomUUID(),
 			executionState: "admitted",
+			workerStarted: false,
 			revision: 0,
 			createdAt: now,
 			updatedAt: now,
 		};
 		await this.serialize(async () => {
 			const all = await this.loadDelegations();
+			if (record.operationId && Object.values(all).some((item) => item.operationId === record.operationId)) {
+				throw new Error(`Delegation operationId 已存在：${record.operationId}`);
+			}
 			all[record.id] = record;
 			await this.writeFile(this.delegationsFile, { version: 2, delegations: all } satisfies DelegationsFile);
 		});
@@ -220,6 +272,8 @@ export class DelegationStore {
 			"driverTransport", "operation", "sessionHandle", "runHandle", "executionState", "result",
 			"receipt", "workspaceExecutionScopeId", "workspaceChangeSetId", "purpose",
 			"workspaceExecutionPolicy", "executionCwd",
+			"workspaceCapabilities", "capabilityFingerprint", "readOnlyAssessment", "admissionInteractionId", "workerStarted", "options",
+			"replacementAdmissionReady",
 			"verificationId", "verifiesSubmissionId", "environmentProfileId", "verificationEnvironmentId",
 		];
 		for (const key of immutableKeys) {
@@ -274,10 +328,13 @@ export class DelegationStore {
 
 	// ---- interactions ----
 
-	async createInteraction(input: Omit<InteractionRecord, "id" | "status" | "revision" | "createdAt" | "updatedAt">): Promise<InteractionRecord> {
+	async createInteraction(
+		input: Omit<InteractionRecord, "id" | "source" | "status" | "revision" | "createdAt" | "updatedAt"> & { source?: InteractionRecord["source"] },
+	): Promise<InteractionRecord> {
 		const now = new Date().toISOString();
 		const record: InteractionRecord = {
 			...input,
+			source: input.source ?? "worker",
 			id: randomUUID(),
 			status: "pending",
 			revision: 0,
@@ -315,6 +372,64 @@ export class DelegationStore {
 			await this.writeFile(this.interactionsFile, { version: 2, interactions: all } satisfies InteractionsFile);
 		});
 		return updated;
+	}
+
+	/** Atomic status/revision compare-and-set for consuming one human decision. */
+	async transitionInteraction(
+		id: string,
+		expectedRevision: number,
+		allowedStatuses: readonly InteractionRecord["status"][],
+		patch: Partial<Omit<InteractionRecord, "id" | "createdAt">>,
+	): Promise<{ applied: boolean; record?: InteractionRecord }> {
+		let result: { applied: boolean; record?: InteractionRecord } = { applied: false };
+		await this.serialize(async () => {
+			const all = await this.loadInteractions();
+			const rec = all[id];
+			if (!rec) return;
+			if (rec.revision !== expectedRevision || !allowedStatuses.includes(rec.status)) {
+				result = { applied: false, record: rec };
+				return;
+			}
+			const next: InteractionRecord = {
+				...rec,
+				...patch,
+				id: rec.id,
+				createdAt: rec.createdAt,
+				revision: patch.revision ?? rec.revision,
+				updatedAt: new Date().toISOString(),
+			};
+			all[id] = next;
+			await this.writeFile(this.interactionsFile, { version: 2, interactions: all } satisfies InteractionsFile);
+			result = { applied: true, record: next };
+		});
+		return result;
+	}
+
+	/** Atomic application-state CAS. A terminal application can never be
+	 * rewritten by a later best-effort projection or recovery pass. */
+	async transitionInteractionApplication(
+		id: string,
+		allowedStatuses: readonly NonNullable<InteractionRecord["application"]>["status"][],
+		patch: Partial<NonNullable<InteractionRecord["application"]>>,
+	): Promise<{ applied: boolean; record?: InteractionRecord }> {
+		let result: { applied: boolean; record?: InteractionRecord } = { applied: false };
+		await this.serialize(async () => {
+			const all = await this.loadInteractions();
+			const rec = all[id];
+			if (!rec?.application || !allowedStatuses.includes(rec.application.status)) {
+				result = { applied: false, record: rec };
+				return;
+			}
+			const next: InteractionRecord = {
+				...rec,
+				application: { ...rec.application, ...patch, updatedAt: new Date().toISOString() },
+				updatedAt: new Date().toISOString(),
+			};
+			all[id] = next;
+			await this.writeFile(this.interactionsFile, { version: 2, interactions: all } satisfies InteractionsFile);
+			result = { applied: true, record: next };
+		});
+		return result;
 	}
 
 	async listInteractions(windowId?: string): Promise<InteractionRecord[]> {

@@ -635,6 +635,71 @@ test("P3-1: cancel abort 真实 Run，迟到 completed 不能复活 cancelled De
 	assert.ok((await runtime.getDelegation(delegation.id))?.receipt?.sealedAt);
 });
 
+test("Manager AbortSignal 不把远端流中断伪封为 driver_error", async () => {
+	const { delegations, secrets } = await makeRuntime();
+	const controller = new AbortController();
+	const driver: AgentDriver = {
+		id: "remote-stream",
+		async capabilities() { return { operations: ["run"], interactionKinds: [], progress: "stream", transport: "http" }; },
+		async *run(_input, ctx) {
+			await new Promise<void>((resolve) => {
+				if (ctx.signal?.aborted) resolve();
+				else ctx.signal?.addEventListener("abort", () => resolve(), { once: true });
+			});
+			throw new Error("stream aborted");
+		},
+		async *continue() {}, async *respond() {}, async probe() { throw new Error("unused"); },
+	};
+	const runtime = new AgentRuntime(delegations, secrets, () => driver);
+	const outcomePromise = runtime.delegate(
+		{ ...PROJECT, windowId: "window-signal", managerSessionId: "manager-signal", managerToolCallId: "call-signal", agentId: driver.id, message: "x", mode: "run" },
+		{ cwd: process.cwd(), env: {}, signal: controller.signal },
+	);
+	while ((await runtime.listDelegations("window-signal"))[0]?.executionState !== "running") {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	controller.abort();
+	const outcome = await outcomePromise;
+	assert.equal(outcome.result.status, "failed");
+	assert.equal(outcome.result.status === "failed" ? outcome.result.errorCode : undefined, "observation_lost");
+	const stored = (await runtime.listDelegations("window-signal"))[0];
+	assert.equal(stored?.executionState, "observation_lost");
+	assert.equal(stored?.receipt, undefined);
+	assert.notEqual(stored?.result && "errorCode" in stored.result ? stored.result.errorCode : undefined, "driver_error");
+});
+
+test("Manager AbortSignal 后远端事件流正常结束也进入 observation_lost，不伪造 no_boundary_event", async () => {
+	const { delegations, secrets } = await makeRuntime();
+	const controller = new AbortController();
+	const driver: AgentDriver = {
+		id: "remote-clean-end",
+		async capabilities() { return { operations: ["run"], interactionKinds: [], progress: "stream", transport: "http" }; },
+		async *run(_input, ctx) {
+			await new Promise<void>((resolve) => {
+				if (ctx.signal?.aborted) resolve();
+				else ctx.signal?.addEventListener("abort", () => resolve(), { once: true });
+			});
+			if (false) yield { type: "started" } as AgentEvent;
+		},
+		async *continue() {}, async *respond() {}, async probe() { throw new Error("unused"); },
+	};
+	const runtime = new AgentRuntime(delegations, secrets, () => driver);
+	const outcomePromise = runtime.delegate(
+		{ ...PROJECT, windowId: "window-clean-end", managerSessionId: "manager-clean-end", managerToolCallId: "call-clean-end", agentId: driver.id, message: "x", mode: "run" },
+		{ cwd: process.cwd(), env: {}, signal: controller.signal },
+	);
+	while ((await runtime.listDelegations("window-clean-end"))[0]?.executionState !== "running") {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	controller.abort();
+	const outcome = await outcomePromise;
+	assert.equal(outcome.result.status === "failed" ? outcome.result.errorCode : undefined, "observation_lost");
+	const stored = (await runtime.listDelegations("window-clean-end"))[0];
+	assert.equal(stored?.executionState, "observation_lost");
+	assert.equal(stored?.receipt, undefined);
+	assert.notEqual(stored?.result && "errorCode" in stored.result ? stored.result.errorCode : undefined, "no_boundary_event");
+});
+
 test("本地 observable Driver 在 abort 后无 boundary 但进程已退出时仍可确认 cancelled", async () => {
 	const dir = freshDir();
 	const store = new DelegationStore(dir);
@@ -684,6 +749,7 @@ test("P3-1: terminal CAS 阻止 reported_completed 被 cancelled 覆盖", async 
 		schemaVersion: 1 as const, id: `receipt:${delegation.id}`, delegationId: delegation.id, operationId: delegation.id,
 		contractHash: "sha256:test", reportedOutcome: "completed" as const, upstream: {}, reportedEvidence: [], reportedArtifacts: [],
 		requirementResults: [], artifactCapture: [], collectionStatus: "complete" as const, integrity: "clean" as const, issues: [],
+		workerStarted: true,
 		startedAt: delegation.createdAt, observedAt: delegation.createdAt, observer: { connectorId: "slow", transport: "spawn" as const }, sealedAt: delegation.createdAt,
 	};
 	const completed = await store.transitionDelegation(delegation.id, ["running"], { executionState: "reported_completed", result, receipt });

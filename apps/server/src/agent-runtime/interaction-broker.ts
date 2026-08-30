@@ -32,6 +32,7 @@ export class InteractionBroker {
 	async submit(
 		interactionId: string,
 		input: { requestId: string; revision: number; responses: InteractionResponse[] },
+		decisionPatch?: (status: "approved" | "rejected", interaction: InteractionRecord) => Partial<Omit<InteractionRecord, "id" | "createdAt">>,
 	): Promise<{ interaction: InteractionRecord; replayed: boolean }> {
 		const interaction = await this.store.getInteraction(interactionId);
 		if (!interaction) throw new InteractionError("not_found", "interaction not found");
@@ -92,13 +93,21 @@ export class InteractionBroker {
 		const anyReject = input.responses.some((r) => r.action === "reject");
 		const status = anyReject ? "rejected" : "approved";
 
-		const updated = await this.store.updateInteraction(interactionId, {
+		const applied = await this.store.transitionInteraction(interactionId, interaction.revision, ["pending"], {
 			status,
 			revision: interaction.revision + 1,
 			consumedRequestId: input.requestId,
 			consumedPayloadHash: inputHash,
+			...(decisionPatch?.(status, interaction) ?? {}),
 		});
-		return { interaction: updated!, replayed: false };
+		if (!applied.applied || !applied.record) {
+			const current = applied.record ?? await this.store.getInteraction(interactionId);
+			if (current?.consumedRequestId === input.requestId && current.consumedPayloadHash === inputHash) {
+				return { interaction: current, replayed: true };
+			}
+			throw new InteractionError("not_pending", `interaction is ${current?.status ?? "missing"}`);
+		}
+		return { interaction: applied.record, replayed: false };
 	}
 
 	/** Advance the owning delegation when the interaction resolves. */

@@ -17,6 +17,7 @@ import { agentDisplayName, MANAGER_AGENT_NAME } from "../store/teams.js";
 import type { PiManagerSettings, PiResourceConfig, TeamsStore } from "../store/teams.js";
 import type { WorkStateStore } from "../store/work-state.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
+import type { DelegationRecord } from "../agent-runtime/delegation-store.js";
 import type { ArtifactStore } from "../agent-runtime/artifact-store.js";
 import {
 	ExtensionCatalog,
@@ -95,10 +96,135 @@ export interface SessionSkillCommand {
 	source: "skill";
 }
 
+export interface RecoveredToolResult {
+	toolCallId: string;
+	toolName: string;
+	text: string;
+	details?: Record<string, unknown>;
+	isError: boolean;
+}
+
+export interface AbortSessionResult {
+	aborted: boolean;
+	reconciledToolResults: number;
+}
+
+export interface RecoveredToolCallState {
+	runningToolCallIds: string[];
+	recoveredToolResults: RecoveredToolResult[];
+}
+
+interface CapturedToolExecution {
+	toolCallId: string;
+	toolName: string;
+	ended?: boolean;
+	result?: unknown;
+	isError?: boolean;
+}
+
 type PiModel = NonNullable<CreateAgentSessionOptions["model"]>;
 
 /** 纯展示 custom message 等待 run 落定的上限（超时降级 nextTurn）。 */
 const CUSTOM_MESSAGE_IDLE_WAIT_MS = 15_000;
+
+function stringifyUnknown(value: unknown): string {
+	if (value instanceof Error) return value.message;
+	if (typeof value === "string") return value;
+	try {
+		return JSON.stringify(value, null, 2) ?? String(value);
+	} catch {
+		return String(value);
+	}
+}
+
+function capturedToolResult(execution: CapturedToolExecution): RecoveredToolResult | undefined {
+	if (execution.ended !== true) return undefined;
+	const result = execution.result;
+	if (result && typeof result === "object" && !Array.isArray(result)) {
+		const record = result as { content?: unknown; details?: unknown };
+		const blocks = Array.isArray(record.content) ? record.content : undefined;
+		const text = blocks
+			?.filter((block): block is { type: "text"; text: string } =>
+				Boolean(block) && typeof block === "object" && (block as { type?: unknown }).type === "text" && typeof (block as { text?: unknown }).text === "string",
+			)
+			.map((block) => block.text)
+			.join("\n");
+		return {
+			toolCallId: execution.toolCallId,
+			toolName: execution.toolName,
+			text: text || stringifyUnknown(result),
+			...(record.details && typeof record.details === "object" && !Array.isArray(record.details)
+				? { details: record.details as Record<string, unknown> }
+				: {}),
+			isError: execution.isError === true,
+		};
+	}
+	return {
+		toolCallId: execution.toolCallId,
+		toolName: execution.toolName,
+		text: stringifyUnknown(result),
+		isError: execution.isError === true,
+	};
+}
+
+function delegationToolResult(delegation: DelegationRecord): RecoveredToolResult {
+	if (delegation.executionState === "waiting_admission") {
+		return {
+			toolCallId: delegation.managerToolCallId!,
+			toolName: delegateToolName(delegation.agentId),
+			text: `Teams 无法验证 worker「${delegation.agentId}」满足本任务的只读预期；Worker 尚未启动，正在等待用户决定。`,
+			details: {
+				worker: delegation.agentId,
+				status: "needs_input",
+				source: "platform_policy",
+				workerStarted: false,
+				interactionId: delegation.admissionInteractionId,
+				delegationId: delegation.id,
+				executionState: delegation.executionState,
+				...(delegation.goalId ? { goalId: delegation.goalId } : {}),
+				...(delegation.workPlanId ? { workPlanId: delegation.workPlanId } : {}),
+				...(delegation.workItemId ? { workItemId: delegation.workItemId } : {}),
+			},
+			isError: false,
+		};
+	}
+	const result = delegation.result;
+	const completed = delegation.executionState === "reported_completed";
+	const cancelled = delegation.executionState === "cancelled" || result?.status === "cancelled";
+	const resultError = result && "error" in result ? result.error : undefined;
+	const resultContent = result?.status === "completed" ? result.content : undefined;
+	const text = completed
+		? (resultContent || `worker「${delegation.agentId}」已完成任务。`)
+		: cancelled
+			? `worker「${delegation.agentId}」任务已取消${resultError ? `：${resultError}` : "。"}`
+			: delegation.executionState === "observation_lost"
+				? `worker「${delegation.agentId}」的执行观测已丢失，当前效果未知，请先对账原 Run。`
+				: `worker「${delegation.agentId}」执行出错${resultError ? `：${resultError}` : "。"}`;
+	const reportedStatus = result?.status ?? (completed ? "completed" : cancelled ? "cancelled" : "failed");
+	return {
+		toolCallId: delegation.managerToolCallId!,
+		toolName: delegateToolName(delegation.agentId),
+		text,
+		details: {
+			worker: delegation.agentId,
+			status: completed ? "completed" : cancelled ? "cancelled" : "failed",
+			reportedStatus,
+			delegationId: delegation.id,
+			executionState: delegation.executionState,
+			processView: true,
+			...(delegation.sessionHandle ? { sessionHandle: delegation.sessionHandle } : {}),
+			...(delegation.goalId ? { goalId: delegation.goalId } : {}),
+			...(delegation.workPlanId ? { workPlanId: delegation.workPlanId } : {}),
+			...(delegation.workItemId ? { workItemId: delegation.workItemId } : {}),
+			...(result && "errorCode" in result
+				? { errorCode: result.errorCode }
+				: delegation.executionState === "observation_lost"
+					? { errorCode: "observation_lost" }
+					: {}),
+		},
+		isError: !completed,
+	};
+}
 
 /**
  * Owns the pi AgentSession lifecycle for a single backend process.
@@ -121,6 +247,15 @@ export class PiSessionStore {
 	private listeners = new Map<string, Set<(event: AgentSessionEvent) => void>>();
 	/** 已挂过转发器的实例，避免重复 subscribe 导致事件翻倍。 */
 	private forwarded = new WeakSet<AgentSession>();
+	/**
+	 * Parallel tool results are emitted live in completion order, but pi only
+	 * appends their toolResult messages later in assistant source order.  Keep
+	 * the completed live outcomes until their durable message arrives so abort
+	 * can close every toolCall without losing an already-observed error.
+	 */
+	private toolExecutions = new Map<string, Map<string, CapturedToolExecution>>();
+	/** Serializes platform-authored repairs for one Session. */
+	private toolRepairQueues = new Map<string, Promise<unknown>>();
 	/** Serializes receiver-side eventId checks with their JSONL append. */
 	private customEventQueue: Promise<unknown> = Promise.resolve();
 	private deliveredCustomEvents = new Set<string>();
@@ -128,6 +263,16 @@ export class PiSessionStore {
 	private serializeCustomEvent<T>(fn: () => Promise<T>): Promise<T> {
 		const run = this.customEventQueue.then(fn, fn);
 		this.customEventQueue = run.then(() => undefined, () => undefined);
+		return run;
+	}
+	private serializeToolRepair<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
+		const previous = this.toolRepairQueues.get(sessionId) ?? Promise.resolve();
+		const run = previous.then(fn, fn);
+		const tail = run.then(() => undefined, () => undefined);
+		this.toolRepairQueues.set(sessionId, tail);
+		void tail.finally(() => {
+			if (this.toolRepairQueues.get(sessionId) === tail) this.toolRepairQueues.delete(sessionId);
+		});
 		return run;
 	}
 
@@ -398,9 +543,47 @@ export class PiSessionStore {
 
 	/** Forward SDK and platform-authored projection events through the same WS bus. */
 	private forwardEvent(id: string, event: AgentSessionEvent): void {
+		this.captureToolExecutionEvent(id, event);
+		this.emitEvent(id, event);
+	}
+
+	/** Notify subscribers without feeding a platform-authored repair back into the live ledger. */
+	private emitEvent(id: string, event: AgentSessionEvent): void {
 		const set = this.listeners.get(id);
 		if (!set) return;
 		for (const listener of set) listener(event);
+	}
+
+	private captureToolExecutionEvent(id: string, event: AgentSessionEvent): void {
+		if (event.type === "tool_execution_start") {
+			let executions = this.toolExecutions.get(id);
+			if (!executions) {
+				executions = new Map();
+				this.toolExecutions.set(id, executions);
+			}
+			executions.set(event.toolCallId, { toolCallId: event.toolCallId, toolName: event.toolName });
+			return;
+		}
+		if (event.type === "tool_execution_end") {
+			let executions = this.toolExecutions.get(id);
+			if (!executions) {
+				executions = new Map();
+				this.toolExecutions.set(id, executions);
+			}
+			executions.set(event.toolCallId, {
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				ended: true,
+				result: event.result,
+				isError: event.isError,
+			});
+			return;
+		}
+		if (event.type === "message_start" && event.message.role === "toolResult") {
+			const executions = this.toolExecutions.get(id);
+			executions?.delete(event.message.toolCallId);
+			if (executions?.size === 0) this.toolExecutions.delete(id);
+		}
 	}
 
 	/**
@@ -790,11 +973,215 @@ export class PiSessionStore {
 		return session;
 	}
 
-	async abort(id: string): Promise<boolean> {
-		const session = this.active.get(id);
-		if (!session) return false;
-		await session.abort();
+	private pendingToolCalls(session: AgentSession): Array<{ id: string; name: string }> {
+		const calls: Array<{ id: string; name: string }> = [];
+		const seen = new Set<string>();
+		const settled = new Set<string>();
+		for (const entry of session.sessionManager.getBranch()) {
+			if (entry.type !== "message") continue;
+			const message = entry.message as {
+				role?: string;
+				toolCallId?: string;
+				content?: Array<{ type?: string; id?: string; name?: string }>;
+			};
+			if (message.role === "toolResult" && message.toolCallId) {
+				settled.add(message.toolCallId);
+				continue;
+			}
+			if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+			for (const block of message.content) {
+				if (block?.type !== "toolCall" || !block.id || seen.has(block.id)) continue;
+				seen.add(block.id);
+				calls.push({ id: block.id, name: block.name ?? "unknown" });
+			}
+		}
+		return calls.filter((call) => !settled.has(call.id));
+	}
+
+	private appendRecoveredToolResult(session: AgentSession, result: RecoveredToolResult): boolean {
+		if (!this.pendingToolCalls(session).some((call) => call.id === result.toolCallId)) return false;
+		const timestamp = Date.now();
+		const message = {
+			role: "toolResult" as const,
+			toolCallId: result.toolCallId,
+			toolName: result.toolName,
+			content: [{ type: "text" as const, text: result.text }],
+			details: result.details,
+			isError: result.isError,
+			timestamp,
+		};
+		session.sessionManager.appendMessage(message);
+		// SessionManager is the durable source; the resident AgentSession state is
+		// the HTTP replay source.  Update both at the same write boundary.
+		session.state.messages.push(message);
+		this.toolExecutions.get(session.sessionId)?.delete(result.toolCallId);
+		this.emitEvent(session.sessionId, {
+			type: "tool_execution_end",
+			toolCallId: result.toolCallId,
+			toolName: result.toolName,
+			result: { content: message.content, details: result.details },
+			isError: result.isError,
+		} as AgentSessionEvent);
 		return true;
+	}
+
+	private async terminalDelegationResults(
+		managerSessionId: string,
+		pendingCalls: Map<string, string>,
+	): Promise<Map<string, RecoveredToolResult>> {
+		const recovered = new Map<string, RecoveredToolResult>();
+		if (!this.invoker || pendingCalls.size === 0) return recovered;
+		const recoverableStates = new Set(["waiting_admission", "reported_completed", "reported_failed", "cancelled", "observation_lost"]);
+		const grouped = new Map<string, DelegationRecord[]>();
+		for (const delegation of await this.invoker.delegationsForManagerSession(managerSessionId)) {
+			const callId = delegation.managerToolCallId;
+			const expectedName = callId ? pendingCalls.get(callId) : undefined;
+			if (!callId || !expectedName || expectedName !== delegateToolName(delegation.agentId) || !recoverableStates.has(delegation.executionState)) continue;
+			const group = grouped.get(callId) ?? [];
+			group.push(delegation);
+			grouped.set(callId, group);
+		}
+		for (const [callId, delegations] of grouped) {
+			if (delegations.length === 1) {
+				const delegation = delegations[0]!;
+				let result = delegationToolResult(delegation);
+				if (delegation.executionState === "reported_completed" && delegation.result?.status === "completed" && this.largeResults && this.productSettings) {
+					const projection = await this.largeResults.project(
+						delegation.id,
+						delegation.result.content ?? "",
+						(await this.productSettings.get()).harness.workerResults,
+					);
+					result = {
+						...result,
+						text: `${projection.text}\n\n（delegationId：${delegation.id}——需要该 worker 接力/追问时，用 handoffKind="followup" 并把它填进 parentDelegationId）`,
+						details: { ...(result.details ?? {}), ...projection },
+					};
+				}
+				recovered.set(callId, result);
+				continue;
+			}
+			recovered.set(callId, {
+				toolCallId: callId,
+				toolName: pendingCalls.get(callId)!,
+				text: "检测到多个 Delegation 绑定同一个 manager 工具调用，无法安全选择结果。",
+				details: {
+					status: "failed",
+					errorCode: "delegation_projection_conflict",
+					delegationIds: delegations.map((delegation) => delegation.id),
+				},
+				isError: true,
+			});
+		}
+		return recovered;
+	}
+
+	/**
+	 * Refresh recovery: terminal Delegations are authoritative even when the pi
+	 * turn lost its native toolResult.  While the SDK is still streaming we only
+	 * return an overlay (physical append would race its later native result); once
+	 * idle, append the missing result idempotently to the Session JSONL.
+	 */
+	async recoverToolCallState(id: string): Promise<RecoveredToolCallState> {
+		return this.serializeToolRepair(id, async () => {
+			const session = await this.open(id);
+			const pending = this.pendingToolCalls(session);
+			const pendingCalls = new Map(pending.map((call) => [call.id, call.name]));
+			const delegationResults = await this.terminalDelegationResults(id, pendingCalls);
+			const captured = this.toolExecutions.get(id);
+			const results = pending.flatMap((call) => {
+				const observed = capturedToolResult(captured?.get(call.id) ?? { toolCallId: call.id, toolName: call.name });
+				const result = observed ?? delegationResults.get(call.id);
+				return result ? [{ ...result, toolName: call.name || result.toolName }] : [];
+			});
+			if (!session.isStreaming) {
+				let wrote = false;
+				for (const result of results) wrote = this.appendRecoveredToolResult(session, result) || wrote;
+				if (wrote) await this.ensureSessionFile(id);
+			}
+			const terminalIds = new Set(results.map((result) => result.toolCallId));
+			const running = new Set(
+				pending
+					.filter((call) => !terminalIds.has(call.id) && captured?.get(call.id)?.ended !== true && captured?.has(call.id))
+					.map((call) => call.id),
+			);
+			if (this.invoker) {
+				for (const callId of await this.invoker.runningDelegateToolCallIds(id)) {
+					if (pendingCalls.has(callId) && !terminalIds.has(callId)) running.add(callId);
+				}
+			}
+			return { recoveredToolResults: results, runningToolCallIds: [...running] };
+		});
+	}
+
+	/** Compatibility helper for callers that only need terminal overlays. */
+	async recoverTerminalToolResults(id: string): Promise<RecoveredToolResult[]> {
+		return (await this.recoverToolCallState(id)).recoveredToolResults;
+	}
+
+	/**
+	 * Stop external execution before entering the short JSONL repair critical
+	 * section. AgentSession/Driver cancellation is bounded: an uncooperative tool
+	 * must not monopolize the repair queue and make refresh hang behind Stop.
+	 */
+	async abort(id: string): Promise<AbortSessionResult> {
+		const session = this.active.get(id);
+		const wasRunning = Boolean(session && (session.isStreaming || !session.isIdle));
+		let abortError: unknown;
+		const bounded = async <T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> => {
+			let timer: NodeJS.Timeout | undefined;
+			try {
+				return await Promise.race([
+					promise,
+					new Promise<T>((_resolve, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); }),
+				]);
+			} finally {
+				if (timer) clearTimeout(timer);
+			}
+		};
+		const cancelPromise = this.invoker
+			? bounded(this.invoker.cancelManagerSession(id), 8_000, "停止 Worker/Teams 准入超时；执行效果可能未知")
+			: Promise.resolve(0);
+		const managerAbortPromise = wasRunning && session
+			? bounded(session.abort(), 5_000, "停止 Manager 超时；未结束工具的执行效果未知").then(() => undefined)
+			: Promise.resolve();
+		const [cancelResult, managerAbortResult] = await Promise.allSettled([cancelPromise, managerAbortPromise]);
+		const cancelledDelegations = cancelResult.status === "fulfilled" ? cancelResult.value : 0;
+		if (cancelResult.status === "rejected") abortError = cancelResult.reason;
+		if (managerAbortResult.status === "rejected") abortError ??= managerAbortResult.reason;
+
+		if (!session) {
+			const recovered = cancelledDelegations > 0 ? await this.recoverToolCallState(id) : undefined;
+			if (abortError) throw abortError;
+			return { aborted: cancelledDelegations > 0, reconciledToolResults: recovered?.recoveredToolResults.length ?? 0 };
+		}
+
+		return this.serializeToolRepair(id, async () => {
+
+			const pending = this.pendingToolCalls(session);
+			const pendingCalls = new Map(pending.map((call) => [call.id, call.name]));
+			const delegationResults = await this.terminalDelegationResults(id, pendingCalls);
+			const captured = this.toolExecutions.get(id);
+			let reconciledToolResults = 0;
+			for (const call of pending) {
+				const delegationResult = delegationResults.get(call.id);
+				const observedResult = capturedToolResult(captured?.get(call.id) ?? { toolCallId: call.id, toolName: call.name });
+				const result = observedResult
+					? { ...observedResult, toolName: call.name || observedResult.toolName }
+					: delegationResult
+						? { ...delegationResult, toolName: call.name || delegationResult.toolName }
+						: {
+							toolCallId: call.id,
+							toolName: call.name,
+							text: "Manager 已停止等待该工具调用；中断前未观测到执行面的终态，实际效果未知。",
+							details: { status: "interrupted", errorCode: "manager_aborted_effect_unknown" },
+							isError: true,
+						};
+				if (this.appendRecoveredToolResult(session, result)) reconciledToolResults++;
+			}
+			if (reconciledToolResults > 0) await this.ensureSessionFile(id);
+			if (abortError) throw abortError;
+			return { aborted: wasRunning || cancelledDelegations > 0, reconciledToolResults };
+		});
 	}
 
 	/** Switch the model of a live session (pi SDK supports runtime setModel). */
@@ -853,6 +1240,7 @@ export class PiSessionStore {
 		}
 		this.assembledManaged.delete(id);
 		this.runtimeDirty.delete(id);
+		this.toolExecutions.delete(id);
 	}
 
 	/** True when the session is currently open in this process (even if it has
@@ -1033,35 +1421,31 @@ export class PiSessionStore {
 	 */
 	async appendToolResultIfPending(
 		id: string,
-		input: { toolCallId: string; toolName: string; text: string; details?: Record<string, unknown> },
+		input: { toolCallId: string; toolName: string; text: string; details?: Record<string, unknown>; isError?: boolean },
 	): Promise<boolean> {
 		try {
-			const session = await this.open(id);
-			const msgs = session.messages as unknown as Array<{
-				role?: string;
-				toolCallId?: string;
-				content?: unknown;
-			}>;
-			if (msgs.some((m) => m.role === "toolResult" && m.toolCallId === input.toolCallId)) return true;
-			const hasCall = msgs.some(
-				(m) =>
-					m.role === "assistant" &&
-					Array.isArray(m.content) &&
-					m.content.some(
-						(b) => Boolean(b) && typeof b === "object" && (b as { type?: unknown }).type === "toolCall" && (b as { id?: unknown }).id === input.toolCallId,
-					),
-			);
-			if (!hasCall) return false;
-			session.sessionManager.appendMessage({
-				role: "toolResult",
-				toolCallId: input.toolCallId,
-				toolName: input.toolName,
-				content: [{ type: "text", text: input.text }],
-				details: input.details,
-				isError: true,
-				timestamp: Date.now(),
+			return await this.serializeToolRepair(id, async () => {
+				const session = await this.open(id);
+				const messages = session.sessionManager.getBranch()
+					.filter((entry) => entry.type === "message")
+					.map((entry) => entry.message) as Array<{ role?: string; toolCallId?: string; content?: unknown }>;
+				if (messages.some((message) => message.role === "toolResult" && message.toolCallId === input.toolCallId)) return true;
+				let actualToolName: string | undefined;
+				for (const message of messages) {
+					if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+					const block = message.content.find((candidate) =>
+						Boolean(candidate) && typeof candidate === "object" && (candidate as { type?: unknown }).type === "toolCall" && (candidate as { id?: unknown }).id === input.toolCallId,
+					) as { name?: unknown } | undefined;
+					if (typeof block?.name === "string") {
+						actualToolName = block.name;
+						break;
+					}
+				}
+				if (!actualToolName) return false;
+				const wrote = this.appendRecoveredToolResult(session, { ...input, toolName: actualToolName, isError: input.isError ?? true });
+				if (wrote) await this.ensureSessionFile(id);
+				return wrote;
 			});
-			return true;
 		} catch (err) {
 			this.debugLog?.(`appendToolResultIfPending failed: ${err instanceof Error ? err.message : String(err)}`);
 			return false;

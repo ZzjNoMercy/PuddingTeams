@@ -6,7 +6,7 @@ export type SessionWorkStatus = "active" | "resolved" | "cancelled";
 export type GoalExecutionStatus = "idle" | "running" | "waiting_human" | "interrupted" | "recovering" | "reviewing";
 export type CompletionReviewMode = "manager" | "independent";
 export type CompletionReviewVerdict = "satisfied" | "not_satisfied" | "needs_human";
-export type WorkItemStatus = "planned" | "ready" | "in_progress" | "waiting_input" | "submitted" | "revision" | "accepted" | "blocked" | "cancelled";
+export type WorkItemStatus = "planned" | "ready" | "in_progress" | "waiting_admission" | "waiting_input" | "submitted" | "revision" | "accepted" | "blocked" | "cancelled";
 export type VerificationMode = "manager_review" | "independent_evidence_review" | "environment_verified";
 export type VerificationTrigger = "manager_request" | "auto_on_submission";
 export type VerificationStatus = "pending" | "running" | "waiting_input" | "passed" | "failed" | "blocked" | "stale";
@@ -337,7 +337,8 @@ function defaultWorkspaceExecutionPolicy(): WorkspaceExecutionPolicy {
 	return { mode: "read_only_shared", source: "harness_default", reason: "Harness 默认 Workspace 策略", baselineStrategy: "git_tree", promoteOnAcceptance: false };
 }
 export function workItemContractHash(state: Pick<SessionWorkState, "goalId" | "goalRevision" | "execution">, plan: Pick<GoalWorkPlan, "id">, item: Pick<WorkItem, "id" | "revision" | "title" | "description" | "acceptanceCriteria" | "sourceGoalCriteria" | "verificationPolicy" | "workspaceExecutionPolicy">): string {
-	return hash({ goalId: state.goalId, goalRevision: state.goalRevision, goalEpoch: state.execution.epoch, workPlanId: plan.id, workItemId: item.id, workItemRevision: item.revision, title: item.title, description: item.description, acceptanceCriteria: item.acceptanceCriteria, sourceGoalCriteria: item.sourceGoalCriteria, verificationPolicy: item.verificationPolicy, workspaceExecutionPolicy: item.workspaceExecutionPolicy });
+	const { frozenAtRevision: _runtimeFreeze, ...verificationContract } = item.verificationPolicy;
+	return hash({ goalId: state.goalId, goalRevision: state.goalRevision, goalEpoch: state.execution.epoch, workPlanId: plan.id, workItemId: item.id, workItemRevision: item.revision, title: item.title, description: item.description, acceptanceCriteria: item.acceptanceCriteria, sourceGoalCriteria: item.sourceGoalCriteria, verificationPolicy: verificationContract, workspaceExecutionPolicy: item.workspaceExecutionPolicy });
 }
 
 export function goalCriterionRefs(state: Pick<SessionWorkState, "goalRevision" | "completionBoundary">): Array<{ id: string; text: string }> {
@@ -754,9 +755,54 @@ export class WorkStateStore {
 			return copy(next);
 		});
 	}
+	/** Atomically move a WorkItem's active slot from a pre-start admission to its
+	 * replacement. The Driver start hook may proceed only after this CAS commits. */
+	async reserveReplacementDelegation(input: {
+		sessionId: string;
+		goalId: string;
+		workItemId: string;
+		goalEpoch: number;
+		goalRevision?: number;
+		workItemRevision?: number;
+		originalDelegationId: string;
+		replacementDelegationId: string;
+	}): Promise<SessionWorkState> {
+		const operationId = `replacement-reservation:${input.originalDelegationId}:${input.replacementDelegationId}`;
+		return this.serialize(async () => {
+			const data = await this.load();
+			const replay = this.replay<SessionWorkState>(data, input.sessionId, operationId, "replacement_reservation", input, input.goalId);
+			if (replay) return replay;
+			const state = this.byGoalId(data, input.sessionId, input.goalId);
+			if (!state?.plan || state.status !== "active") throw new WorkStateOperationConflictError("改派所属 Goal 已结束", "stale_goal_state");
+			if (state.execution.epoch !== input.goalEpoch || (input.goalRevision !== undefined && state.goalRevision !== input.goalRevision)) {
+				throw new WorkStateOperationConflictError("改派期间 Goal 已变化", "stale_goal_state");
+			}
+			const plan = copy(state.plan);
+			const item = plan.items[input.workItemId];
+			if (!item || (input.workItemRevision !== undefined && item.revision !== input.workItemRevision)) {
+				throw new WorkStateOperationConflictError("改派期间 WorkItem 已变化", "stale_goal_state");
+			}
+			if (item.activeDelegationId !== input.originalDelegationId || item.status !== "waiting_admission") {
+				throw new WorkStateOperationConflictError("原 Delegation 已不再占用该 WorkItem", "stale_goal_state");
+			}
+			if (!item.delegationIds.includes(input.replacementDelegationId)) item.delegationIds.push(input.replacementDelegationId);
+			item.activeDelegationId = input.replacementDelegationId;
+			item.status = "in_progress";
+			item.updatedAt = now();
+			plan.revision += 1;
+			plan.updatedAt = item.updatedAt;
+			const next: SessionWorkState = { ...state, plan, execution: { ...state.execution, status: "running" }, revision: state.revision + 1, updatedAt: item.updatedAt };
+			data.states[state.goalId] = next;
+			this.event(data, { id: `work-item-replacement:${state.goalId}:${input.originalDelegationId}:${input.replacementDelegationId}`, goalId: state.goalId, sessionId: input.sessionId, epoch: next.execution.epoch, kind: "goal_changed", payload: { action: "delegation_replaced", workPlanId: plan.id, workItemId: item.id, status: item.status, revision: next.revision } });
+			this.commit(data, input.sessionId, operationId, input.goalEpoch, "replacement_reservation", input, next, next.revision, state.goalId);
+			await this.write(data);
+			return copy(next);
+		});
+	}
+
 	async noteDelegation(
 		sessionId: string,
-		input: { goalId: string; workItemId: string; delegationId: string; delegationStatus: "running" | "waiting_input" | "completed" | "failed" | "cancelled"; goalEpoch: number; artifactIds?: string[]; summary?: string; submittedAt?: string; executionReceipt?: ExecutionReceipt; workspaceChangeSet?: WorkspaceChangeSet },
+		input: { goalId: string; workItemId: string; delegationId: string; delegationStatus: "running" | "waiting_admission" | "waiting_input" | "completed" | "failed" | "cancelled"; goalEpoch: number; artifactIds?: string[]; summary?: string; submittedAt?: string; executionReceipt?: ExecutionReceipt; workspaceChangeSet?: WorkspaceChangeSet },
 		operationId: string,
 	): Promise<SessionWorkState> {
 		return this.serialize(async () => {
@@ -781,15 +827,21 @@ export class WorkStateStore {
 			const timestamp = input.submittedAt ?? now();
 			if (input.delegationStatus === "running") {
 				if (item.activeDelegationId && item.activeDelegationId !== input.delegationId) throw new Error(`WorkItem ${item.id} 已有活动 Delegation ${item.activeDelegationId}，写入必须串行`);
-				if (!["ready", "revision", "in_progress"].includes(item.status)) throw new Error(`WorkItem ${item.id} 当前不能开始委托`);
+				if (!["ready", "revision", "in_progress", "waiting_admission", "waiting_input"].includes(item.status)) throw new Error(`WorkItem ${item.id} 当前不能开始委托`);
 				if (item.verificationPolicy.frozenAtRevision === undefined) item.verificationPolicy.frozenAtRevision = item.revision;
 				item.status = "in_progress"; item.activeDelegationId = input.delegationId;
-			} else if (input.delegationStatus === "waiting_input") {
-				if (item.activeDelegationId && item.activeDelegationId !== input.delegationId) throw new Error(`WorkItem ${item.id} 的 waiting_input 不属于当前活动 Delegation`);
-				item.status = "waiting_input"; item.activeDelegationId = input.delegationId;
+			} else if (input.delegationStatus === "waiting_input" || input.delegationStatus === "waiting_admission") {
+				if (item.activeDelegationId && item.activeDelegationId !== input.delegationId) throw new Error(`WorkItem ${item.id} 的 ${input.delegationStatus} 不属于当前活动 Delegation`);
+				item.status = input.delegationStatus; item.activeDelegationId = input.delegationId;
 			} else {
-				delete item.activeDelegationId;
-				if (input.delegationStatus === "completed") {
+				// A replacement may already own the active slot when the original
+				// admission's cancelled boundary is replayed. Keep the late terminal as
+				// audit only; it must never clear or regress the newer Delegation.
+				const delegationIndex = item.delegationIds.indexOf(input.delegationId);
+				const hasNewerDelegation = delegationIndex >= 0 && delegationIndex < item.delegationIds.length - 1;
+				const superseded = hasNewerDelegation || Boolean(item.activeDelegationId && item.activeDelegationId !== input.delegationId);
+				if (!superseded) delete item.activeDelegationId;
+				if (input.delegationStatus === "completed" && !superseded) {
 					if (!item.submissions.some((entry) => entry.delegationId === input.delegationId)) {
 						const receipt = input.executionReceipt;
 						if (!receipt) throw new Error("completed Delegation 必须提供 sealed ExecutionReceipt");
@@ -812,14 +864,14 @@ export class WorkStateStore {
 						});
 					}
 					item.status = "submitted";
-				} else if (!["accepted", "cancelled"].includes(item.status)) item.status = "revision";
+				} else if (!superseded && !["accepted", "cancelled"].includes(item.status)) item.status = "revision";
 			}
 			// WorkItem.revision is the frozen execution/acceptance contract revision.
 			// Runtime lifecycle changes advance the plan and state revisions, but must
 			// not invalidate the contract hash captured before delegation starts.
 			item.updatedAt = timestamp; plan.revision += 1; plan.updatedAt = timestamp; deriveReady(plan);
-			const waiting = Object.values(plan.items).some((entry) => entry.status === "waiting_input");
-			const active = Object.values(plan.items).some((entry) => ["in_progress", "waiting_input"].includes(entry.status));
+			const waiting = Object.values(plan.items).some((entry) => entry.status === "waiting_input" || entry.status === "waiting_admission");
+			const active = Object.values(plan.items).some((entry) => ["in_progress", "waiting_admission", "waiting_input"].includes(entry.status));
 			const next: SessionWorkState = { ...state, plan, execution: { ...state.execution, status: waiting ? "waiting_human" : active ? "running" : "idle" }, revision: state.revision + 1, updatedAt: timestamp };
 			data.states[state.goalId] = next;
 			this.event(data, { id: `work-item-boundary:${state.goalId}:${input.delegationId}:${input.delegationStatus}`, goalId: state.goalId, sessionId, epoch: next.execution.epoch, kind: "goal_changed", payload: { action: "delegation_boundary", workPlanId: plan.id, workItemId: item.id, status: item.status, revision: next.revision } });
@@ -1187,17 +1239,17 @@ export class WorkStateStore {
 	}
 	async reconcileDelegations(delegations: Array<{
 		id: string; managerSessionId: string; goalId?: string; workItemId?: string; goalEpoch?: number;
-		executionState: "admitted" | "running" | "waiting_input" | "reported_completed" | "reported_failed" | "cancel_requested" | "reconciling" | "cancelled" | "observation_lost"; revision: number; updatedAt: string;
+		executionState: "admitted" | "waiting_admission" | "running" | "waiting_input" | "reported_completed" | "reported_failed" | "cancel_requested" | "reconciling" | "cancelled" | "observation_lost"; revision: number; updatedAt: string;
 		receipt?: ExecutionReceipt;
 		result?: unknown;
 	}>): Promise<{ projected: number; interrupted: number }> {
 		let projected = 0;
 		for (const item of delegations) {
-			if (item.goalId && item.workItemId && item.goalEpoch !== undefined && (item.executionState === "waiting_input" || item.executionState === "running" || item.executionState === "reconciling")) {
+			if (item.goalId && item.workItemId && item.goalEpoch !== undefined && (item.executionState === "waiting_admission" || item.executionState === "waiting_input" || item.executionState === "running" || item.executionState === "reconciling")) {
 				const state = await this.getGoal(item.managerSessionId, item.goalId);
 				if (state?.plan?.items[item.workItemId] && state.execution.epoch === item.goalEpoch) {
 					try {
-						await this.noteDelegation(item.managerSessionId, { goalId: item.goalId, workItemId: item.workItemId, delegationId: item.id, delegationStatus: item.executionState === "waiting_input" ? "waiting_input" : "running", goalEpoch: item.goalEpoch }, `reconcile-delegation-active:${item.id}:${item.revision}`);
+						await this.noteDelegation(item.managerSessionId, { goalId: item.goalId, workItemId: item.workItemId, delegationId: item.id, delegationStatus: item.executionState === "waiting_admission" ? "waiting_admission" : item.executionState === "waiting_input" ? "waiting_input" : "running", goalEpoch: item.goalEpoch }, `reconcile-delegation-active:${item.id}:${item.revision}`);
 						projected++;
 					} catch (error) { if (!(error instanceof WorkStateOperationConflictError)) throw error }
 				}

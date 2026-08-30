@@ -515,6 +515,8 @@ function DelegateCard({ call, onOpenWindow, timestamp }: { call: ToolCallView; o
 				goalId?: string;
 				processView?: boolean;
 				revision?: number;
+				source?: "worker" | "platform_policy";
+				workerStarted?: boolean;
 				requests?: Array<{ requestId: string; prompt: string; command?: string; path?: string; risk?: string; options?: string[] }>;
 		  }
 		| undefined;
@@ -556,6 +558,8 @@ function DelegateCard({ call, onOpenWindow, timestamp }: { call: ToolCallView; o
 					requests={details.requests}
 					revision={details.revision}
 					windowId={details.windowId}
+					source={details.source}
+					workerStarted={details.workerStarted}
 					onOpenWindow={onOpenWindow}
 				/>
 			</div>
@@ -793,6 +797,8 @@ function CustomMessageEntry({
 				sessionHandle?: string;
 				processView?: boolean;
 				revision?: number;
+				source?: "worker" | "platform_policy";
+				workerStarted?: boolean;
 				usage?: TaskUsage;
 				requests?: Array<{ requestId: string; prompt: string; command?: string; path?: string; risk?: string; options?: string[] }>;
 		  }
@@ -896,8 +902,10 @@ function CustomMessageEntry({
 					worker={details?.worker ?? "worker"}
 					goalId={details?.goalId}
 				requests={details?.requests}
-				revision={details?.revision}
+					revision={details?.revision}
 				windowId={details?.windowId}
+				source={details?.source}
+				workerStarted={details?.workerStarted}
 				onOpenWindow={undefined}
 			/>
 		);

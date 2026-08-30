@@ -40,7 +40,7 @@ function isActive(executionState: string): boolean {
 }
 
 const executionLabels: Record<string, string> = {
-	admitted: "已接纳", running: "执行中", waiting_input: "等待输入", reported_completed: "Worker 已报告完成",
+	admitted: "已接纳", waiting_admission: "等待 Teams 准入", running: "执行中", waiting_input: "等待输入", reported_completed: "Worker 已报告完成",
 	reported_failed: "Worker 已报告失败", cancel_requested: "取消请求中", reconciling: "正在重挂原 Run", cancelled: "已取消", observation_lost: "失去观测 · effect_unknown",
 };
 const verificationLabels: Record<string, string> = {
@@ -179,10 +179,10 @@ export function SessionActivityDrawer({
 	const current = groups.find((group) => group.isCurrent) ?? groups[0]!;
 	const selected = (selectedTurnId ? groups.find((group) => group.id === selectedTurnId) : undefined) ?? current;
 	const running = current.items.filter((item) => item.executionState === "running" || item.executionState === "reconciling").length;
-	const pending = current.items.filter((item) => item.executionState === "waiting_input").length;
+	const pending = current.items.filter((item) => item.executionState === "waiting_input" || item.executionState === "waiting_admission").length;
 	const completed = current.items.filter((item) => item.executionState === "reported_completed").length;
 	const selectedRunning = selected.items.filter((item) => item.executionState === "running" || item.executionState === "reconciling").length;
-	const selectedPending = selected.items.filter((item) => item.executionState === "waiting_input").length;
+	const selectedPending = selected.items.filter((item) => item.executionState === "waiting_input" || item.executionState === "waiting_admission").length;
 	const selectedCompleted = selected.items.filter((item) => item.executionState === "reported_completed").length;
 
 	useEffect(() => {

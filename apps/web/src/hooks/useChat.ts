@@ -2,11 +2,16 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { abortSession, fetchMessages, sendMessage, sessionWsUrl, type MessageAttachmentInput } from "@/lib/api";
-import { markRunningToolCalls, reducePiEvent, renderHistory } from "@/lib/events";
+import { applyRecoveredToolResults, markRunningToolCalls, reducePiEvent, renderHistory, replayPiEvents } from "@/lib/events";
 import type { ChatMessage, ChatStatus, PiMessage } from "@/lib/types";
 
 const HISTORY_CACHE_LIMIT = 8;
 const historyCache = new Map<string, ChatMessage[]>();
+
+interface HistorySnapshot {
+	messages: ChatMessage[];
+	hasRunning: boolean;
+}
 
 function rememberHistory(sessionId: string, messages: ChatMessage[]): ChatMessage[] {
 	historyCache.delete(sessionId);
@@ -19,14 +24,20 @@ function rememberHistory(sessionId: string, messages: ChatMessage[]): ChatMessag
 	return messages;
 }
 
-async function loadHistorySnapshot(sessionId: string): Promise<ChatMessage[]> {
-	const { messages, runningToolCallIds } = await fetchMessages(sessionId);
-	return rememberHistory(sessionId, markRunningToolCalls(renderHistory(messages as PiMessage[]), runningToolCallIds));
+async function loadHistorySnapshot(sessionId: string): Promise<HistorySnapshot> {
+	const { messages, runningToolCallIds, recoveredToolResults } = await fetchMessages(sessionId);
+	const rendered = renderHistory(messages as PiMessage[]);
+	const reconciled = markRunningToolCalls(applyRecoveredToolResults(rendered, recoveredToolResults), runningToolCallIds);
+	return {
+		messages: reconciled,
+		hasRunning: reconciled.some((message) => message.toolCalls.some((call) => call.status === "running")),
+	};
 }
 
 /** 切换 Session 前预热消息快照，避免新会话首帧先渲染空数组。 */
 export async function preloadChatHistory(sessionId: string): Promise<void> {
-	await loadHistorySnapshot(sessionId);
+	const snapshot = await loadHistorySnapshot(sessionId);
+	rememberHistory(sessionId, snapshot.messages);
 }
 
 export function useChat(sessionId: string) {
@@ -36,9 +47,39 @@ export function useChat(sessionId: string) {
 	const [messages, setMessages] = useState<ChatMessage[]>(() => cachedHistory ?? []);
 	const [historyLoading, setHistoryLoading] = useState(() => !cachedHistory);
 	const [status, setStatus] = useState<ChatStatus>("connecting");
-	const [running, setRunning] = useState(false);
+	const [running, setRunning] = useState(() => cachedHistory?.some((message) => message.toolCalls.some((call) => call.status === "running")) ?? false);
+	const [stopping, setStopping] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const wsRef = useRef<WebSocket | null>(null);
+	const stoppingRef = useRef(false);
+	const activityVersionRef = useRef(0);
+	const messageEventSeqRef = useRef(0);
+	const snapshotRequestRef = useRef(0);
+	const activeSnapshotRequestRef = useRef<number | null>(null);
+	const wsEventsRef = useRef<Array<{ seq: number; event: { type: string; [key: string]: unknown } }>>([]);
+	const beginHistorySnapshot = useCallback(() => {
+		const requestId = ++snapshotRequestRef.current;
+		activeSnapshotRequestRef.current = requestId;
+		wsEventsRef.current = [];
+		return { requestId, baselineSeq: messageEventSeqRef.current };
+	}, []);
+
+	const applyHistorySnapshot = useCallback((snapshot: HistorySnapshot, baselineSeq: number): HistorySnapshot => {
+		const cutoffSeq = messageEventSeqRef.current;
+		const messages = replayPiEvents(
+			snapshot.messages,
+			wsEventsRef.current
+				.filter((entry) => entry.seq > baselineSeq && entry.seq <= cutoffSeq)
+				.map((entry) => entry.event),
+		);
+		wsEventsRef.current = wsEventsRef.current.filter((entry) => entry.seq > cutoffSeq);
+		rememberHistory(sessionId, messages);
+		setMessages(messages);
+		return {
+			messages,
+			hasRunning: messages.some((message) => message.toolCalls.some((call) => call.status === "running")),
+		};
+	}, [sessionId]);
 
 	useEffect(() => {
 		if (!sessionId) return;
@@ -58,13 +99,22 @@ export function useChat(sessionId: string) {
 			});
 		};
 
-		const loadHistory = (initial = false) =>
-			loadHistorySnapshot(sessionId)
+		const loadHistory = (initial = false) => {
+			const activityVersion = activityVersionRef.current;
+			const { requestId, baselineSeq } = beginHistorySnapshot();
+			return loadHistorySnapshot(sessionId)
 				.then((snapshot) => {
-					if (!disposed) setMessages(snapshot);
+					if (!disposed && snapshotRequestRef.current === requestId) {
+						const merged = applyHistorySnapshot(snapshot, baselineSeq);
+						activeSnapshotRequestRef.current = null;
+						// A WS start/settled event arriving after this request began is
+						// newer than the HTTP snapshot and must win the running flag race.
+						if (activityVersionRef.current === activityVersion) setRunning(merged.hasRunning);
+					}
 					if (initial) markHistoryReady();
 				})
 				.catch((err: unknown) => {
+					if (snapshotRequestRef.current === requestId) activeSnapshotRequestRef.current = null;
 					const message = err instanceof Error ? err.message : String(err);
 					if (message.endsWith(": 404")) {
 						gone = true;
@@ -78,6 +128,7 @@ export function useChat(sessionId: string) {
 					}
 					if (initial) markHistoryReady();
 				});
+		};
 
 		void loadHistory(true);
 
@@ -97,6 +148,7 @@ export function useChat(sessionId: string) {
 				// if a turn is still live, the reloaded history + new events
 				// restore an accurate view.
 				if (wasReconnect) {
+					activityVersionRef.current += 1;
 					setRunning(false);
 					void loadHistory();
 				}
@@ -108,9 +160,19 @@ export function useChat(sessionId: string) {
 				} catch {
 					return;
 				}
+				messageEventSeqRef.current += 1;
+				if (activeSnapshotRequestRef.current !== null) {
+					wsEventsRef.current.push({ seq: messageEventSeqRef.current, event });
+				}
 				setMessages((prev) => rememberHistory(sessionId, reducePiEvent(prev, event)));
-				if (event.type === "agent_start" || event.type === "turn_start") setRunning(true);
-				if (event.type === "agent_settled" || event.type === "error") setRunning(false);
+				if (event.type === "agent_start" || event.type === "turn_start") {
+					activityVersionRef.current += 1;
+					setRunning(true);
+				}
+				if (event.type === "agent_settled" || event.type === "error") {
+					activityVersionRef.current += 1;
+					setRunning(false);
+				}
 			};
 			ws.onclose = (ev) => {
 				if (disposed) return;
@@ -155,7 +217,7 @@ export function useChat(sessionId: string) {
 				ws.close();
 			}
 		};
-	}, [sessionId]);
+	}, [applyHistorySnapshot, beginHistorySnapshot, sessionId]);
 
 	const send = useCallback(
 		async (text: string, attachments: MessageAttachmentInput[] = []) => {
@@ -170,9 +232,37 @@ export function useChat(sessionId: string) {
 		[sessionId, running],
 	);
 
-	const stop = useCallback(() => {
-		void abortSession(sessionId).catch(() => undefined);
-	}, [sessionId]);
+	const stop = useCallback(async () => {
+		if (stoppingRef.current) throw new Error("停止请求正在处理中");
+		stoppingRef.current = true;
+		setStopping(true);
+		setError(null);
+		try {
+			const result = await abortSession(sessionId);
+			setRunning(false);
+			let historyRequestId: number | undefined;
+			try {
+				const { requestId, baselineSeq } = beginHistorySnapshot();
+				historyRequestId = requestId;
+				const snapshot = await loadHistorySnapshot(sessionId);
+				if (snapshotRequestRef.current === requestId) {
+					applyHistorySnapshot(snapshot, baselineSeq);
+					activeSnapshotRequestRef.current = null;
+				}
+			} catch (err) {
+				if (historyRequestId !== undefined && snapshotRequestRef.current === historyRequestId) activeSnapshotRequestRef.current = null;
+				throw new Error(`任务已停止，但结果刷新失败：${err instanceof Error ? err.message : String(err)}`);
+			}
+			return result;
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			setError(message);
+			throw err;
+		} finally {
+			stoppingRef.current = false;
+			setStopping(false);
+		}
+	}, [applyHistorySnapshot, beginHistorySnapshot, sessionId]);
 
-	return { messages, historyLoading, status, running, error, send, stop };
+	return { messages, historyLoading, status, running, stopping, error, send, stop };
 }

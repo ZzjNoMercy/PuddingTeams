@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { reducePiEvent, renderHistory } from "./events";
+import { applyRecoveredToolResults, markRunningToolCalls, reducePiEvent, renderHistory, replayPiEvents } from "./events";
 import type { PiMessage } from "./types";
 
 test("历史回放保留 running 投影里的 Delegation 与执行过程入口", () => {
@@ -33,6 +33,61 @@ test("历史回放保留 running 投影里的 Delegation 与执行过程入口",
 	assert.deepEqual(call?.details, {
 		taskId: "call-1", delegationId: "D1", goalId: "G1", workItemId: "W2", processView: true, status: "failed",
 	});
+});
+
+test("延迟 toolResult 按 toolCallId 回填原 assistant，不误绑到最新一轮", () => {
+	const rendered = renderHistory([
+		{
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call-old", name: "bash", arguments: { command: "false" } }],
+			timestamp: 1,
+		},
+		{ role: "assistant", content: [{ type: "text", text: "后续一轮" }], timestamp: 2 },
+		{
+			role: "toolResult", toolCallId: "call-old", toolName: "bash",
+			content: [{ type: "text", text: "exit 1" }], details: { exitCode: 1 }, isError: true, timestamp: 3,
+		},
+	] as unknown as PiMessage[]);
+	assert.equal(rendered[0]?.toolCalls[0]?.status, "error");
+	assert.equal(rendered[0]?.toolCalls[0]?.result, "exit 1");
+	assert.equal(rendered[1]?.toolCalls.length, 0);
+});
+
+test("刷新 overlay 分别恢复并行工具的 terminal 与 running 状态", () => {
+	let rendered = renderHistory([{
+		role: "assistant",
+		content: [
+			{ type: "toolCall", id: "call-failed", name: "bash", arguments: { command: "false" } },
+			{ type: "toolCall", id: "call-running", name: "bash", arguments: { command: "long-running" } },
+		],
+		timestamp: 1,
+	}] as unknown as PiMessage[]);
+	rendered = applyRecoveredToolResults(rendered, [{
+		toolCallId: "call-failed", toolName: "bash", text: "exit 1",
+		details: { exitCode: 1, errorCode: "command_failed" }, isError: true,
+	}]);
+	rendered = markRunningToolCalls(rendered, ["call-running"]);
+	assert.equal(rendered[0]?.toolCalls[0]?.status, "error");
+	assert.equal(rendered[0]?.toolCalls[0]?.result, "exit 1");
+	assert.equal((rendered[0]?.toolCalls[0]?.details as { errorCode?: string })?.errorCode, "command_failed");
+	assert.equal(rendered[0]?.toolCalls[1]?.status, "running");
+});
+
+test("延迟 HTTP 历史响应重放请求期间的 WS 失败事件，不覆盖较新错误", () => {
+	const staleSnapshot = renderHistory([{
+		role: "assistant",
+		content: [{ type: "toolCall", id: "call-race", name: "bash", arguments: { command: "false" } }],
+		timestamp: 1,
+	}] as unknown as PiMessage[]);
+	const merged = replayPiEvents(staleSnapshot, [{
+		type: "tool_execution_end",
+		toolCallId: "call-race",
+		toolName: "bash",
+		result: { content: [{ type: "text", text: "fatal from WS" }], details: { exitCode: 128 } },
+		isError: true,
+	}]);
+	assert.equal(merged[0]?.toolCalls[0]?.status, "error");
+	assert.equal(merged[0]?.toolCalls[0]?.result, "fatal from WS");
 });
 
 test("实时 tool 终态不会抹掉先到的执行过程元数据", () => {

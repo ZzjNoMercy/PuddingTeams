@@ -23,6 +23,7 @@ import type {
 	AgentDriver,
 	AgentEvent,
 	AgentOperation,
+	DriverCapabilities,
 	InvocationContext,
 	InteractionResponse,
 	NeedsInputResult,
@@ -68,8 +69,14 @@ export interface DelegateInput {
 	workspaceExecutionPolicy?: WorkspaceExecutionPolicy;
 	/** Internal lifecycle hook: fires only after the immutable Run record exists. */
 	onCreated?: (delegation: DelegationRecord) => void;
+	/** Fires after the Driver produces its first event; platform admission uses this as the honest start boundary. */
+	onDriverStarted?: (delegation: DelegationRecord) => void;
+	/** Durable external gate evaluated after Delegation creation but before Driver invocation. */
+	beforeDriverStart?: (delegation: DelegationRecord) => Promise<void>;
 	/** Driver resolved from the same immutable Agent snapshot as agentRevision. */
 	driver?: AgentDriver;
+	/** Internal resume path for a platform-policy Interaction; never accepted from Manager prompts. */
+	resumeDelegationId?: string;
 }
 
 export interface RuntimeOutcome {
@@ -104,6 +111,17 @@ export class SessionConflictError extends Error {
 const STALE_SESSION_PATTERN = /session[^\n]*not found/i;
 function isStaleSessionFailure(event: AgentEvent): boolean {
 	return event.type === "failed" && typeof event.result.error === "string" && STALE_SESSION_PATTERN.test(event.result.error);
+}
+
+function capabilityFingerprint(agentRevision: number, driverId: string, capabilities: DriverCapabilities): string {
+	return `sha256:${createHash("sha256").update(JSON.stringify({
+		agentRevision,
+		driverId,
+		transport: capabilities.transport,
+		workspace: capabilities.workspace ?? null,
+		interactionKinds: [...capabilities.interactionKinds].sort(),
+		operations: [...capabilities.operations].sort(),
+	})).digest("hex")}`;
 }
 
 /**
@@ -272,11 +290,75 @@ export class AgentRuntime {
 		};
 	}
 
+	/**
+	 * An aborted consumer stream is a cancellation observation, not a Driver
+	 * failure boundary. Local transports end with this iterator; remote transports
+	 * remain effect-unknown unless their own cancel/reconcile protocol confirms a
+	 * terminal state.
+	 */
+	private async settleAbortedDriverStream(
+		delegation: DelegationRecord,
+		agentId: string,
+		ctx: InvocationContext,
+	): Promise<{ result: Exclude<NormalizedResult, NeedsInputResult>; delegation: DelegationRecord }> {
+		const requested = await this.withDelegationTransition(delegation.id, async () => {
+			const current = await this.delegations.getDelegation(delegation.id);
+			if (!current || !["running", "reconciling"].includes(current.executionState)) return { record: current, applied: false };
+			return this.delegations.transitionDelegation(delegation.id, ["running", "reconciling"], {
+				executionState: "cancel_requested",
+				revision: current.revision + 1,
+			});
+		});
+		let current = requested.record ?? await this.delegations.getDelegation(delegation.id);
+		const localLifecycle = delegation.driverTransport === "spawn" || delegation.driverTransport === "sdk" || delegation.driverTransport === undefined;
+		let result: Exclude<NormalizedResult, NeedsInputResult>;
+		if (current?.executionState === "cancel_requested" && localLifecycle) {
+			result = {
+				agentId,
+				status: "cancelled",
+				errorCode: "cancelled",
+				error: "Manager 已停止等待，本地执行流已确认退出",
+				recoverable: true,
+			};
+			const sealed = await this.withDelegationTransition(delegation.id, () =>
+				this.sealTerminal(current!, ["cancel_requested"], "cancelled", result, ctx),
+			);
+			current = sealed.record ?? current;
+			if (sealed.applied) await this.recordBoundary(delegation, { type: "failed", result });
+		} else if (current?.executionState === "cancel_requested") {
+			result = {
+				agentId,
+				status: "failed",
+				errorCode: "observation_lost",
+				error: "Manager 已停止等待，但远端执行是否停止无法确认",
+				recoverable: true,
+			};
+			const lost = await this.withDelegationTransition(delegation.id, () =>
+				this.delegations.transitionDelegation(delegation.id, ["cancel_requested"], {
+					executionState: "observation_lost",
+					revision: current!.revision + 1,
+				}),
+			);
+			current = lost.record ?? current;
+			if (lost.applied && this.workspaceExecution && current?.workspaceExecutionScopeId) {
+				const scope = await this.workspaceExecution.get(current.workspaceExecutionScopeId);
+				await this.workspaceExecution.fence(current.workspaceExecutionScopeId, scope?.ownerToken).catch(() => undefined);
+			}
+		} else {
+			const stored = current?.result;
+			result = stored && stored.status !== "needs_input"
+				? stored
+				: { agentId, status: "failed", errorCode: "cancel_pending", error: "取消状态正在收敛", recoverable: true };
+		}
+		return { result, delegation: current ?? delegation };
+	}
+
 	async delegate(input: DelegateInput, ctx: InvocationContext): Promise<RuntimeOutcome> {
 		const driver = input.driver ?? (await this.resolveDriver(input.agentId));
 		if (!driver) throw new Error(`agent not found or no driver: ${input.agentId}`);
 		const driverCapabilities = await driver.capabilities();
 		const requestId = input.requestId ?? randomUUID();
+		const fingerprint = capabilityFingerprint(input.agentRevision, driver.id, driverCapabilities);
 		if (input.purpose === "verification" && input.verificationEnvironmentId && driverCapabilities.transport !== "spawn" && driverCapabilities.transport !== "sdk") {
 			throw new Error("首期 environment_verified 只允许本地 spawn/sdk Driver；远端协议尚不能证明签发环境绑定");
 		}
@@ -297,8 +379,14 @@ export class AgentRuntime {
 		}
 		let delegation: DelegationRecord;
 		try {
-			delegation = await this.delegations.createDelegation({
-			operationId: requestId,
+			if (input.resumeDelegationId) {
+				const existing = await this.delegations.getDelegation(input.resumeDelegationId);
+				if (!existing || existing.executionState !== "admitted") throw new Error("admission Delegation 已失效，不能启动");
+				if (existing.agentId !== input.agentId || existing.operationId !== requestId) throw new Error("admission Delegation 身份不匹配");
+				if (existing.capabilityFingerprint !== fingerprint) throw new Error("Worker 能力已变化，需要重新准入评估");
+				delegation = existing;
+			} else delegation = await this.delegations.createDelegation({
+				operationId: requestId,
 			contractHash: input.contractHash,
 			windowId: input.windowId,
 			workspaceId: input.workspaceId,
@@ -326,10 +414,18 @@ export class AgentRuntime {
 			completionBoundary: input.completionBoundary,
 			agentId: input.agentId,
 			agentRevision: input.agentRevision,
-			driverId: driver.id,
-			driverTransport: driverCapabilities.transport,
-			operation: input.mode,
-			sessionHandle: knownSession,
+				driverId: driver.id,
+				driverTransport: driverCapabilities.transport,
+				workspaceCapabilities: driverCapabilities.workspace,
+				capabilityFingerprint: fingerprint,
+				readOnlyAssessment: input.workspaceExecutionPolicy?.mode === "read_only_shared"
+					? driverCapabilities.workspace?.readOnlyEnforcement === "sandbox" || driverCapabilities.workspace?.readOnlyEnforcement === "remote_policy"
+						? "verified"
+						: undefined
+					: "not_required",
+				operation: input.mode,
+				sessionHandle: knownSession,
+				options: input.options,
 			workspaceExecutionScopeId: input.workspaceExecutionScopeId,
 			workspaceChangeSetId: input.workspaceChangeSetId,
 			workspaceExecutionPolicy: input.workspaceExecutionPolicy,
@@ -338,6 +434,50 @@ export class AgentRuntime {
 		} catch (error) {
 			if (knownSession && this.activeRuns.get(knownSession) === "pending") this.activeRuns.delete(knownSession);
 			throw error;
+		}
+		const readOnlyRequired = input.workspaceExecutionPolicy?.mode === "read_only_shared";
+		const readOnlyEnforced = driverCapabilities.workspace?.readOnlyEnforcement === "sandbox"
+			|| driverCapabilities.workspace?.readOnlyEnforcement === "remote_policy";
+		if (readOnlyRequired && !readOnlyEnforced && delegation.readOnlyAssessment !== "unverified_user_accepted") {
+			const requestId = `admission:${delegation.id}`;
+			const interaction = await this.delegations.createInteraction({
+				delegationId: delegation.id,
+				source: "platform_policy",
+				kind: "confirmation",
+				requests: [{
+					requestId,
+					prompt: `Teams 无法验证 Worker「${delegation.agentId}」会保持只读。是否仍允许 Teams 使用这个 Worker 执行本任务？`,
+					risk: "继续只代表 Teams 准入该 Worker，不会修改 Worker 权限；若产生文件变更，仍按原任务契约记录偏差。",
+					options: ["proceed_with_worker", "select_another_worker"],
+				}],
+				policyContext: {
+					reasonCode: "read_only_not_enforceable",
+					capabilityFingerprint: fingerprint,
+					allowedActions: ["cancel", "proceed_with_worker", "select_another_worker"],
+					workerStarted: false,
+				},
+				expiresAt: new Date(Date.now() + this.ttl.ttlMs).toISOString(),
+			});
+			const waiting = await this.delegations.transitionDelegation(delegation.id, ["admitted"], {
+				executionState: "waiting_admission",
+				admissionInteractionId: interaction.id,
+				revision: delegation.revision + 1,
+			});
+			delegation = waiting.record ?? delegation;
+			if (knownSession && this.activeRuns.get(knownSession) === "pending") this.activeRuns.delete(knownSession);
+			input.onCreated?.(delegation);
+			const result: NeedsInputResult = {
+				agentId: delegation.agentId,
+				status: "needs_input",
+				interaction: {
+					id: interaction.id,
+					kind: interaction.kind,
+					requests: interaction.requests,
+					expiresAt: interaction.expiresAt,
+				},
+				meta: { source: "platform_policy", workerStarted: false },
+			};
+			return { status: "needs_input", result, delegation, interaction };
 		}
 		if (this.workspaceExecution && input.workspaceExecutionPolicy && !verificationEnvironment) {
 			try {
@@ -349,8 +489,10 @@ export class AgentRuntime {
 					? "strong" as const
 					: "none" as const;
 				if (mode === "read_only_shared" && readOnlyEnforcement === "none") {
-					if (driverCapabilities.workspace?.honorsInvocationCwd !== true) throw new Error("Connector 无法强制只读，也不保证 InvocationContext.cwd，不能安全执行");
-					mode = "isolated_worktree";
+					if (delegation.readOnlyAssessment !== "unverified_user_accepted") throw new Error("Worker 只读能力未验证，且尚未获得 Teams 准入决定");
+					// Conservative coordination only: acquire the target Workspace lease.
+					// This does not grant or change Worker permissions.
+					mode = "exclusive_write";
 				}
 				if (mode === "isolated_worktree" && driverCapabilities.workspace?.honorsInvocationCwd !== true) throw new Error("Connector 不保证使用平台注入 cwd，不能进入隔离 worktree");
 				const scope = await this.workspaceExecution.begin({
@@ -365,7 +507,7 @@ export class AgentRuntime {
 					readOnlyEnforcement,
 				});
 				delegation = (await this.delegations.updateDelegation(delegation.id, {
-					workspaceExecutionPolicy: { ...input.workspaceExecutionPolicy, mode },
+					workspaceExecutionPolicy: input.workspaceExecutionPolicy,
 					workspaceExecutionScopeId: scope.id,
 					executionCwd: scope.executionCwd,
 				})) ?? delegation;
@@ -382,7 +524,31 @@ export class AgentRuntime {
 				return { status: "failed", result: blocked, delegation: terminal.record ?? delegation };
 			}
 		}
-		await this.delegations.transitionDelegation(delegation.id, ["admitted"], { executionState: "running" });
+		const started = await this.delegations.transitionDelegation(delegation.id, ["admitted"], {
+			executionState: "running",
+			revision: delegation.revision + 1,
+		});
+		if (!started.applied || !started.record) throw new Error(`Delegation ${delegation.id} 启动边界已失效`);
+		delegation = started.record;
+		if (input.beforeDriverStart) {
+			try {
+				await input.beforeDriverStart(delegation);
+				delegation = (await this.delegations.updateDelegation(delegation.id, {
+					replacementAdmissionReady: true,
+				})) ?? delegation;
+			} catch (error) {
+				const blocked: Exclude<NormalizedResult, NeedsInputResult> = {
+					agentId: input.agentId,
+					status: "blocked",
+					errorCode: "replacement_reservation_failed",
+					error: error instanceof Error ? error.message : String(error),
+					recoverable: true,
+				};
+				const terminal = await this.sealTerminal(delegation, ["running"], "reported_failed", blocked, { ...ctx, cwd: input.cwdSnapshot });
+				if (knownSession) this.activeRuns.delete(knownSession);
+				return { status: "failed", result: blocked, delegation: terminal.record ?? delegation };
+			}
+		}
 		if (knownSession) this.activeRuns.set(knownSession, delegation.id);
 		this.activeDelegations.add(delegation.id);
 		input.onCreated?.(delegation);
@@ -429,6 +595,21 @@ export class AgentRuntime {
 		// 升级换代都会让旧 handle 失效，平台无法也无需区分原因）时，丢弃失效
 		// handle 以新会话透明重跑一次，而不是把失败抛给上层让 manager 连环试错。
 		let staleRetried = false;
+		let workerStartObserved = delegation.workerStarted;
+		const markWorkerStarted = async (notify = true): Promise<void> => {
+			if (workerStartObserved) return;
+			const current = await this.delegations.getDelegation(delegation.id);
+			if (!current || current.executionState !== "running") return;
+			const marked = await this.delegations.transitionDelegation(delegation.id, ["running"], {
+				executionState: "running",
+				workerStarted: true,
+				revision: current.revision + 1,
+			});
+			if (!marked.applied || !marked.record) return;
+			workerStartObserved = true;
+			delegation = marked.record;
+			if (notify) input.onDriverStarted?.(delegation);
+		};
 		const startRun = (fresh: boolean): AsyncIterable<AgentEvent> =>
 			fresh || input.mode === "run" || !sessionHandle
 				? driver.run({ message: input.message, requestId, options: input.options }, runCtx)
@@ -441,6 +622,7 @@ export class AgentRuntime {
 			for (;;) {
 				let restart = false;
 				for await (const event of events) {
+					await markWorkerStarted();
 					if (!staleRetried && knownSession && input.mode !== "run" && isStaleSessionFailure(event)) {
 						staleRetried = true;
 						restart = true;
@@ -477,6 +659,13 @@ export class AgentRuntime {
 		} catch (err) {
 			if (sessionHandle) this.releaseSession(sessionHandle, delegation.id);
 			else if (knownSession) this.activeRuns.delete(knownSession);
+			if (ctx.signal?.aborted) {
+				const interrupted = await this.settleAbortedDriverStream(delegation, input.agentId, runCtx);
+				this.runControllers.delete(delegation.id);
+				this.activeDelegations.delete(delegation.id);
+				settleRun();
+				return { status: "failed", result: interrupted.result, delegation: interrupted.delegation };
+			}
 			const cancelling = await this.delegations.getDelegation(delegation.id);
 			if (cancelling?.executionState === "cancel_requested") {
 				const pending: NormalizedResult = { agentId: input.agentId, status: "failed", errorCode: "cancel_pending", error: "取消请求正在等待执行面确认", recoverable: true };
@@ -508,8 +697,16 @@ export class AgentRuntime {
 			throw err;
 		}
 		// 驱动没有产生边界事件（协议错误）。
+		await markWorkerStarted(false);
 		if (sessionHandle) this.releaseSession(sessionHandle, delegation.id);
 		else if (knownSession) this.activeRuns.delete(knownSession);
+		if (ctx.signal?.aborted) {
+			const interrupted = await this.settleAbortedDriverStream(delegation, input.agentId, runCtx);
+			this.runControllers.delete(delegation.id);
+			this.activeDelegations.delete(delegation.id);
+			settleRun();
+			return { status: "failed", result: interrupted.result, delegation: interrupted.delegation };
+		}
 		const cancelling = await this.delegations.getDelegation(delegation.id);
 		if (cancelling?.executionState === "cancel_requested") {
 			const pending: NormalizedResult = { agentId: input.agentId, status: "failed", errorCode: "cancel_pending", error: "取消请求正在等待执行面确认", recoverable: true };
@@ -687,6 +884,7 @@ export class AgentRuntime {
 		// needs.interaction.id 是本地占位，真实句柄在 driver 的私有字段里。
 		const interaction = await this.delegations.createInteraction({
 			delegationId: delegation.id,
+			source: "worker",
 			kind: needs.interaction.kind,
 			requests: needs.interaction.requests,
 			providerStateRef: `${delegation.id}/${needs.interaction.id || "main"}`,
@@ -779,6 +977,7 @@ export class AgentRuntime {
 				agentId: delegation.agentId,
 				agentRevision: delegation.agentRevision,
 				createdAt: delegation.createdAt,
+				workerStarted: delegation.workerStarted,
 				workspaceExecutionScopeId: delegation.workspaceExecutionScopeId,
 				workspaceChangeSetId: delegation.workspaceChangeSetId,
 			},
@@ -848,6 +1047,222 @@ export class AgentRuntime {
 		return this.secrets.getProviderState(interactionId);
 	}
 
+	private admissionResumeInput(delegation: DelegationRecord, driver: AgentDriver): DelegateInput {
+		return {
+			windowId: delegation.windowId,
+			workspaceId: delegation.workspaceId,
+			cwdSnapshot: delegation.cwdSnapshot,
+			managerSessionId: delegation.managerSessionId,
+			managerToolCallId: delegation.managerToolCallId,
+			contractHash: delegation.contractHash,
+			purpose: delegation.purpose,
+			verificationId: delegation.verificationId,
+			verifiesSubmissionId: delegation.verifiesSubmissionId,
+			environmentProfileId: delegation.environmentProfileId,
+			verificationEnvironmentId: delegation.verificationEnvironmentId,
+			goalId: delegation.goalId,
+			workPlanId: delegation.workPlanId,
+			workItemId: delegation.workItemId,
+			attempt: delegation.attempt,
+			goalEpoch: delegation.goalEpoch,
+			goalRevision: delegation.goalRevision,
+			workItemRevision: delegation.workItemRevision,
+			parentDelegationId: delegation.parentDelegationId,
+			handoffKind: delegation.handoffKind,
+			intent: delegation.intent,
+			expectedOutcome: delegation.expectedOutcome,
+			evidenceRequirements: delegation.evidenceRequirements,
+			completionBoundary: delegation.completionBoundary,
+			agentId: delegation.agentId,
+			agentRevision: delegation.agentRevision,
+			message: delegation.task ?? "",
+			mode: delegation.operation,
+			sessionHandle: delegation.sessionHandle,
+			options: delegation.options,
+			requestId: delegation.operationId ?? delegation.id,
+			workspaceExecutionScopeId: delegation.workspaceExecutionScopeId,
+			workspaceChangeSetId: delegation.workspaceChangeSetId,
+			workspaceExecutionPolicy: delegation.workspaceExecutionPolicy,
+			driver,
+			resumeDelegationId: delegation.id,
+		};
+	}
+
+	/**
+	 * Consume a platform admission as a replacement decision. This only closes
+	 * the pre-start Delegation; AgentInvoker owns Worker selection and creates the
+	 * causally linked replacement under the current room/workspace policy.
+	 */
+	async beginAdmissionReplacement(
+		interactionId: string,
+		input: { requestId: string; revision: number; responses: InteractionResponse[] },
+		replacementAgentId: string,
+		ctx: InvocationContext,
+	): Promise<{ delegation: DelegationRecord; interaction: InteractionRecord; replayed: boolean }> {
+		const interaction = await this.delegations.getInteraction(interactionId);
+		if (!interaction || interaction.source !== "platform_policy") throw new InteractionError("not_found", "Teams admission interaction not found");
+		const delegation = await this.delegations.getDelegation(interaction.delegationId);
+		if (!delegation) throw new InteractionError("not_found", "delegation not found");
+		if (!replacementAgentId.trim() || replacementAgentId === delegation.agentId) throw new InteractionError("invalid_scope", "replacement Worker must be different from the current Worker");
+		if (input.responses.length !== 1 || input.responses[0]?.action !== "approve" || input.responses[0].scope !== "select_another_worker") {
+			throw new InteractionError("invalid_scope", "换 Worker 必须使用 select_another_worker 响应");
+		}
+		const timestamp = new Date().toISOString();
+		const { interaction: decided, replayed } = await this.broker.submit(interactionId, input, () => ({
+			decision: { chosenAction: "select_another_worker", replacementAgentId, actorId: "local-user", decidedAt: timestamp, requestId: input.requestId },
+			application: { operationId: `admission-replacement:${delegation.id}`, status: "applying", replacementAgentId, updatedAt: timestamp },
+		}));
+		if (replayed) return { delegation, interaction: decided, replayed: true };
+		const result: Exclude<NormalizedResult, NeedsInputResult> = {
+			agentId: delegation.agentId,
+			status: "cancelled",
+			errorCode: "admission_replaced",
+			error: `用户选择改派给 Worker「${replacementAgentId}」；原 Worker 未启动`,
+			recoverable: true,
+		};
+		const terminal = await this.withDelegationTransition(delegation.id, () =>
+			this.sealTerminal(delegation, ["waiting_admission"], "cancelled", result, ctx),
+		);
+		if (!terminal.applied || !terminal.record) {
+			await this.delegations.transitionInteractionApplication(interactionId, ["applying"], {
+				operationId: `admission-replacement:${delegation.id}`,
+				status: "failed",
+				replacementAgentId,
+				failureCode: "delegation_not_pending",
+			});
+			throw new InteractionError("not_pending", `delegation is ${terminal.record?.executionState ?? "missing"}`);
+		}
+		return { delegation: terminal.record, interaction: decided, replayed: false };
+	}
+
+	async completeAdmissionReplacement(interactionId: string, replacementDelegationId: string): Promise<InteractionRecord> {
+		const interaction = await this.delegations.getInteraction(interactionId);
+		if (!interaction?.application || interaction.decision?.chosenAction !== "select_another_worker") throw new InteractionError("not_pending", "replacement admission is not applying");
+		const transitioned = await this.delegations.transitionInteractionApplication(interactionId, ["applying"], {
+			status: "applied",
+			replacementDelegationId,
+		});
+		if (transitioned.applied && transitioned.record) return transitioned.record;
+		const current = transitioned.record ?? await this.delegations.getInteraction(interactionId);
+		if (current?.application?.status === "applied" && current.application.replacementDelegationId === replacementDelegationId) return current;
+		throw new InteractionError("not_pending", `replacement application is ${current?.application?.status ?? "missing"}`);
+	}
+
+	async failAdmissionReplacement(interactionId: string, failureCode: string, replacementDelegationId?: string): Promise<void> {
+		const interaction = await this.delegations.getInteraction(interactionId);
+		if (!interaction?.application || interaction.decision?.chosenAction !== "select_another_worker") return;
+		await this.delegations.transitionInteractionApplication(interactionId, ["applying"], {
+			status: "failed",
+			failureCode,
+			...(replacementDelegationId ? { replacementDelegationId } : {}),
+		});
+	}
+
+	private async respondPlatformPolicy(
+		interaction: InteractionRecord,
+		delegation: DelegationRecord,
+		input: { requestId: string; revision: number; responses: InteractionResponse[] },
+		ctx: InvocationContext,
+		driverSnapshot: AgentDriver | undefined,
+		onAdmitted?: (continuing: boolean) => void,
+	): Promise<RespondOutcome> {
+		if (input.responses.some((response) => response.action !== "reject" && (response.action !== "approve" || response.scope !== "proceed_with_worker"))) {
+			throw new InteractionError("invalid_scope", "Teams 准入只接受取消或 proceed_with_worker；不能借由响应 payload 改写 Worker 权限");
+		}
+		const decisionTime = new Date().toISOString();
+		const { interaction: decided, replayed } = await this.broker.submit(interaction.id, input, (status) => {
+			const rejected = status === "rejected";
+			return {
+				decision: {
+					chosenAction: rejected ? "cancel" : "proceed_with_worker",
+					actorId: "local-user",
+					decidedAt: decisionTime,
+					requestId: input.requestId,
+				},
+				application: {
+					operationId: `admission:${delegation.id}`,
+					status: rejected ? "applied" : "applying",
+					...(rejected ? {} : { readOnlyAssessment: "unverified_user_accepted" as const }),
+					updatedAt: decisionTime,
+				},
+			};
+		});
+		if (replayed) {
+			onAdmitted?.(false);
+			const current = await this.delegations.getDelegation(delegation.id) ?? delegation;
+			return {
+				status: current.executionState === "cancelled" ? "rejected" : current.executionState === "waiting_admission" ? "needs_input" : current.executionState === "reported_completed" ? "completed" : "failed",
+				result: current.result ?? {
+					agentId: current.agentId,
+					status: current.executionState === "cancelled" ? "cancelled" : "failed",
+					errorCode: "admission_replayed",
+					error: "该 Teams 准入决定已经处理",
+					recoverable: current.executionState !== "cancelled",
+				},
+				delegation: current,
+				interaction: decided,
+			};
+		}
+		const rejected = decided.status === "rejected";
+		if (rejected) {
+			const result: Exclude<NormalizedResult, NeedsInputResult> = {
+				agentId: delegation.agentId,
+				status: "cancelled",
+				errorCode: "admission_rejected",
+				error: "用户未允许 Teams 在能力缺口下使用该 Worker",
+				recoverable: true,
+			};
+			const terminal = await this.sealTerminal(delegation, ["waiting_admission"], "cancelled", result, ctx);
+			onAdmitted?.(false);
+			return { status: "rejected", result, delegation: terminal.record ?? delegation, interaction: decided };
+		}
+
+		const driver = driverSnapshot ?? await this.resolveDriver(delegation.agentId);
+		if (!driver) throw new InteractionError("not_found", `no driver for agent ${delegation.agentId}`);
+		const capabilities = await driver.capabilities();
+		const fingerprint = capabilityFingerprint(delegation.agentRevision, driver.id, capabilities);
+		if (fingerprint !== interaction.policyContext?.capabilityFingerprint || fingerprint !== delegation.capabilityFingerprint) {
+			await this.delegations.updateInteraction(interaction.id, {
+				status: "failed",
+				application: { operationId: `admission:${delegation.id}`, status: "failed", failureCode: "capability_stale", updatedAt: new Date().toISOString() },
+			});
+			onAdmitted?.(false);
+			throw new InteractionError("stale_revision", "Worker 能力已变化，请重新发起准入确认");
+		}
+		const admitted = await this.delegations.transitionDelegation(delegation.id, ["waiting_admission"], {
+			executionState: "admitted",
+			readOnlyAssessment: "unverified_user_accepted",
+			revision: delegation.revision + 1,
+		});
+		if (!admitted.applied || !admitted.record) {
+			await this.delegations.updateInteraction(interaction.id, {
+				application: { operationId: `admission:${delegation.id}`, status: "failed", failureCode: "delegation_not_pending", updatedAt: new Date().toISOString() },
+			});
+			onAdmitted?.(false);
+			throw new InteractionError("not_pending", `delegation is ${admitted.record?.executionState ?? "missing"}`);
+		}
+		try {
+			const resumeInput = this.admissionResumeInput(admitted.record, driver);
+			resumeInput.onDriverStarted = () => {
+				void this.delegations.updateInteraction(interaction.id, {
+					application: { operationId: `admission:${delegation.id}`, status: "applied", readOnlyAssessment: "unverified_user_accepted", updatedAt: new Date().toISOString() },
+				}).finally(() => onAdmitted?.(true));
+			};
+			const outcome = await this.delegate(resumeInput, ctx);
+			await this.delegations.updateInteraction(interaction.id, {
+				application: { operationId: `admission:${delegation.id}`, status: "applied", readOnlyAssessment: "unverified_user_accepted", updatedAt: new Date().toISOString() },
+			});
+			return outcome.status === "needs_input"
+				? outcome
+				: { ...outcome, interaction: await this.delegations.getInteraction(interaction.id) };
+		} catch (error) {
+			await this.delegations.updateInteraction(interaction.id, {
+				application: { operationId: `admission:${delegation.id}`, status: "failed", failureCode: "start_failed", updatedAt: new Date().toISOString() },
+			});
+			throw error;
+		}
+	}
+
 	/**
 	 * 提交审批：校验通过后调用 Driver.respond 恢复同一条 Run。
 	 * 若再次 needs_input：更新同一 interaction 的 revision。
@@ -863,6 +1278,10 @@ export class AgentRuntime {
 		if (!interaction) throw new InteractionError("not_found", "interaction not found");
 		const delegation = await this.delegations.getDelegation(interaction.delegationId);
 		if (!delegation) throw new InteractionError("not_found", "delegation not found");
+		if (interaction.source === "platform_policy" && interaction.status === "pending" && interaction.expiresAt && Date.parse(interaction.expiresAt) < Date.now()) {
+			await this.expireAdmissionRequests();
+			throw new InteractionError("expired", "Teams 准入请求已过期，Worker 未启动");
+		}
 
 		// M3：同一 interaction 同时在飞（双签 / 两个标签页）时，拒绝第二次调用，
 		// 绝不并发调 driver.respond。
@@ -874,6 +1293,14 @@ export class AgentRuntime {
 				delegation,
 				interaction,
 			};
+		}
+		if (interaction.source === "platform_policy") {
+			this.responding.add(interactionId);
+			try {
+				return await this.respondPlatformPolicy(interaction, delegation, input, ctx, driverSnapshot, onAdmitted);
+			} finally {
+				this.responding.delete(interactionId);
+			}
 		}
 
 		const driver = driverSnapshot ?? (await this.resolveDriver(delegation.agentId));
@@ -1178,7 +1605,32 @@ export class AgentRuntime {
 	}
 
 	/** 取消先记 cancel_requested；只有 Driver 明确确认后才封存 cancelled Receipt。 */
-	async cancel(delegationId: string, ctx: InvocationContext): Promise<void> {
+	async cancel(delegationId: string, ctx: InvocationContext): Promise<boolean> {
+		const before = await this.delegations.getDelegation(delegationId);
+		if (!before) throw new Error("delegation not found");
+		if (before.executionState === "waiting_admission") {
+			const result: Exclude<NormalizedResult, NeedsInputResult> = {
+				agentId: before.agentId,
+				status: "cancelled",
+				errorCode: "admission_cancelled",
+				error: "Teams 准入请求已取消，Worker 未启动",
+				recoverable: true,
+			};
+			const sealed = await this.withDelegationTransition(delegationId, () =>
+				this.sealTerminal(before, ["waiting_admission"], "cancelled", result, ctx),
+			);
+			if (sealed.applied) {
+				for (const interaction of await this.delegations.listInteractions()) {
+					if (interaction.delegationId === delegationId && interaction.status === "pending") {
+						await this.delegations.updateInteraction(interaction.id, {
+							status: "rejected",
+							decision: { chosenAction: "cancel", actorId: "local-user", decidedAt: new Date().toISOString(), requestId: `cancel:${interaction.id}` },
+						});
+					}
+				}
+			}
+			return sealed.applied;
+		}
 		const requested = await this.withDelegationTransition(delegationId, async () => {
 			const record = await this.delegations.getDelegation(delegationId);
 			if (!record) throw new Error("delegation not found");
@@ -1188,7 +1640,7 @@ export class AgentRuntime {
 				revision: record.revision + 1,
 			});
 		});
-		if (!requested.applied || !requested.record) return;
+		if (!requested.applied || !requested.record) return false;
 		const delegation = requested.record;
 		let driver: AgentDriver | undefined;
 		let confirmation: "none" | "acknowledged" | "observable" = "none";
@@ -1227,7 +1679,7 @@ export class AgentRuntime {
 			}
 		}
 		const latest = await this.delegations.getDelegation(delegationId);
-		if (!latest || latest.executionState !== "cancel_requested") return;
+		if (!latest || latest.executionState !== "cancel_requested") return true;
 		// acknowledged means the upstream explicitly promises that cancel has
 		// taken effect. observable requires a real terminal event/reconciliation;
 		// if that event had arrived it would already have won the CAS above.
@@ -1260,6 +1712,7 @@ export class AgentRuntime {
 		await this.expireDelegationInteractions(delegationId);
 		if (delegation.sessionHandle) this.releaseSession(delegation.sessionHandle, delegationId);
 		this.activeDelegations.delete(delegationId);
+		return true;
 	}
 
 	/** Startup recovery follows execution ownership: local processes are known dead,
@@ -1463,6 +1916,111 @@ export class AgentRuntime {
 		return this.delegations.listDelegations(windowId, managerSessionId);
 	}
 
+	/** Settle expired platform admissions without ever resolving or cancelling a Driver Run. */
+	async expireAdmissionRequests(now = Date.now()): Promise<number> {
+		let expired = 0;
+		for (const interaction of await this.delegations.listInteractions()) {
+			if (interaction.source !== "platform_policy" || interaction.status !== "pending" || !interaction.expiresAt || Date.parse(interaction.expiresAt) >= now) continue;
+			const delegation = await this.delegations.getDelegation(interaction.delegationId);
+			if (!delegation || delegation.executionState !== "waiting_admission") continue;
+			const result: Exclude<NormalizedResult, NeedsInputResult> = {
+				agentId: delegation.agentId,
+				status: "cancelled",
+				errorCode: "admission_expired",
+				error: "Teams 准入请求已过期，Worker 未启动",
+				recoverable: true,
+			};
+			const terminal = await this.withDelegationTransition(delegation.id, () =>
+				this.sealTerminal(delegation, ["waiting_admission"], "cancelled", result, { cwd: delegation.cwdSnapshot, env: process.env }),
+			);
+			if (!terminal.applied) continue;
+			const timestamp = new Date(now).toISOString();
+			await this.delegations.updateInteraction(interaction.id, {
+				status: "expired",
+				decision: { chosenAction: "cancel", actorId: "system:ttl", decidedAt: timestamp, requestId: `expire:${interaction.id}` },
+				application: { operationId: `admission:${delegation.id}`, status: "applied", updatedAt: timestamp },
+			});
+			expired++;
+		}
+		return expired;
+	}
+
+	/**
+	 * Startup convergence for a decision that became durable before its start
+	 * application journal did. We never guess or duplicate a Worker start: a
+	 * pre-start delegation is cancelled and surfaced as a failed application;
+	 * a delegation that crossed the atomic workerStarted boundary is recorded as
+	 * applied and normal Run reconciliation remains authoritative.
+	 */
+	async reconcileAdmissionApplications(): Promise<number> {
+		let reconciled = 0;
+		const allDelegations = await this.delegations.listDelegations();
+		for (const interaction of await this.delegations.listInteractions()) {
+			if (interaction.source !== "platform_policy" || interaction.status !== "approved" || (interaction.application && interaction.application.status !== "applying")) continue;
+			const operationId = interaction.application?.operationId ?? `admission:${interaction.delegationId}`;
+			const delegation = await this.delegations.getDelegation(interaction.delegationId);
+			if (!delegation) {
+				await this.delegations.updateInteraction(interaction.id, {
+					application: { operationId, status: "failed", failureCode: "delegation_missing", updatedAt: new Date().toISOString() },
+				});
+				reconciled++;
+				continue;
+			}
+			if (interaction.decision?.chosenAction === "select_another_worker") {
+				const replacements = allDelegations.filter((item) =>
+					item.id !== delegation.id
+					&& (item.operationId === operationId || item.parentDelegationId === delegation.id),
+				);
+				if (replacements.length === 1) {
+					const replacement = replacements[0]!;
+					const ready = replacement.replacementAdmissionReady === true;
+					await this.delegations.transitionInteractionApplication(interaction.id, ["applying"], {
+						operationId,
+						status: ready ? "applied" : "failed",
+						...(ready ? { failureCode: undefined } : { failureCode: "replacement_start_unconfirmed" }),
+						replacementAgentId: replacement.agentId,
+						replacementDelegationId: replacement.id,
+					});
+					reconciled++;
+					continue;
+				}
+				if (replacements.length > 1) {
+					await this.delegations.transitionInteractionApplication(interaction.id, ["applying"], {
+						operationId,
+						status: "failed",
+						failureCode: "replacement_identity_conflict",
+					});
+					reconciled++;
+					continue;
+				}
+			}
+			if (delegation.workerStarted) {
+				await this.delegations.updateInteraction(interaction.id, {
+					application: { operationId, status: "applied", readOnlyAssessment: "unverified_user_accepted", updatedAt: new Date().toISOString() },
+				});
+				reconciled++;
+				continue;
+			}
+			if (delegation.executionState === "waiting_admission" || delegation.executionState === "admitted") {
+				const result: Exclude<NormalizedResult, NeedsInputResult> = {
+					agentId: delegation.agentId,
+					status: "cancelled",
+					errorCode: "admission_application_interrupted",
+					error: "Teams 准入决定已保存，但服务重启前未确认 Worker 启动；为避免重复执行，任务已取消",
+					recoverable: true,
+				};
+				await this.withDelegationTransition(delegation.id, () =>
+					this.sealTerminal(delegation, [delegation.executionState], "cancelled", result, { cwd: delegation.cwdSnapshot, env: process.env }),
+				);
+			}
+			await this.delegations.updateInteraction(interaction.id, {
+				application: { operationId, status: "failed", failureCode: "start_confirmation_lost", updatedAt: new Date().toISOString() },
+			});
+			reconciled++;
+		}
+		return reconciled;
+	}
+
 	async verificationObservations(delegationId: string): Promise<Array<{ id: string; delegationId: string; kind: "tool" | "file" | "search"; title: string; contentHash: string; itemId?: string }>> {
 		if (!this.timeline) return [];
 		return (await this.timeline.list(delegationId))
@@ -1532,6 +2090,7 @@ export class AgentRuntime {
 
 	/** 列出窗口下的 interactions（审批卡列表对账，H3）。 */
 	async listInteractions(windowId?: string): Promise<InteractionRecord[]> {
+		await this.expireAdmissionRequests();
 		return this.delegations.listInteractions(windowId);
 	}
 

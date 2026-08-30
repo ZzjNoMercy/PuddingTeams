@@ -214,7 +214,7 @@ export function registerExtensionsRoutes(app: FastifyInstance, deps: ExtensionRo
 				entry.manifest.kind === "connector" && deps.runtime
 					? (await deps.runtime.listDelegations()).filter(
 							(d) =>
-									(d.executionState === "admitted" || d.executionState === "running" || d.executionState === "waiting_input" || d.executionState === "cancel_requested" || d.executionState === "reconciling") &&
+									(d.executionState === "admitted" || d.executionState === "waiting_admission" || d.executionState === "running" || d.executionState === "waiting_input" || d.executionState === "cancel_requested" || d.executionState === "reconciling") &&
 								bound.some((a) => a.name === d.agentId),
 						)
 					: [];

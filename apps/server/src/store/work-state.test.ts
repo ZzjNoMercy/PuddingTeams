@@ -187,7 +187,7 @@ test("Goal v5: WorkItem DAG、Submission、验收与幂等闭环", async () => {
 	);
 });
 
-test("启动对账: reconciling/running/needs_input 都投影为活跃工作项且不触发 effect_unknown", async () => {
+test("启动对账: reconciling/waiting_input/waiting_admission 都投影为活跃工作项且不触发 effect_unknown", async () => {
 	const store = new WorkStateStore(mkdtempSync(path.join(tmpdir(), "pt-work-reconcile-active-")));
 	await store.init();
 	const goal = await store.create({ sessionId: "active-reconcile", goal: "恢复远端任务", completionBoundary: "任务有可信边界" });
@@ -195,20 +195,76 @@ test("启动对账: reconciling/running/needs_input 都投影为活跃工作项�
 		upsertItems: [
 			{ id: "W1", title: "重挂中", dependsOn: [], acceptanceCriteria: ["有终态"] },
 			{ id: "W2", title: "待输入", dependsOn: [], acceptanceCriteria: ["输入后继续"] },
+			{ id: "W3", title: "待准入", dependsOn: [], acceptanceCriteria: ["准入后继续"] },
 		],
 		reason: "覆盖恢复态投影",
 	}, "plan-active", 1, goal.goalId);
 	const outcome = await store.reconcileDelegations([
 		{ id: "D-reconciling", managerSessionId: "active-reconcile", goalId: goal.goalId, workItemId: "W1", goalEpoch: 1, executionState: "reconciling", revision: 2, updatedAt: new Date().toISOString() },
 		{ id: "D-input", managerSessionId: "active-reconcile", goalId: goal.goalId, workItemId: "W2", goalEpoch: 1, executionState: "waiting_input", revision: 3, updatedAt: new Date().toISOString() },
+		{ id: "D-admission", managerSessionId: "active-reconcile", goalId: goal.goalId, workItemId: "W3", goalEpoch: 1, executionState: "waiting_admission", revision: 4, updatedAt: new Date().toISOString() },
 	]);
-	assert.equal(outcome.projected, 2);
+	assert.equal(outcome.projected, 3);
 	assert.equal(outcome.interrupted, 0);
 	const current = await store.get("active-reconcile");
 	assert.equal(current?.plan?.items.W1?.status, "in_progress");
 	assert.equal(current?.plan?.items.W2?.status, "waiting_input");
+	assert.equal(current?.plan?.items.W3?.status, "waiting_admission");
+	assert.equal(current?.execution.status, "waiting_human");
 	assert.equal(current?.execution.interruption, undefined);
 	assert.ok((current?.revision ?? 0) > planned.revision);
+});
+
+test("改派 reservation 原子切换 active Delegation，旧终态不得清除或回退新任务", async () => {
+	const store = new WorkStateStore(mkdtempSync(path.join(tmpdir(), "pt-work-state-replacement-")));
+	await store.init();
+	const goal = await store.create({ sessionId: "replace", goal: "只读检查", completionBoundary: "检查完成", operationId: "create" });
+	const planned = await store.updatePlan("replace", goal.revision, {
+		upsertItems: [{ id: "W1", title: "检查", assignedAgentId: "unsafe", dependsOn: [], acceptanceCriteria: ["检查完成"], sourceGoalCriteria: ["goal:1:1"] }],
+		reason: "plan",
+	}, "plan", goal.execution.epoch, goal.goalId);
+	const item = planned.plan!.items.W1!;
+	await store.noteDelegation("replace", { goalId: goal.goalId, workItemId: "W1", delegationId: "D-old", delegationStatus: "waiting_admission", goalEpoch: goal.execution.epoch }, "old-waiting");
+	await assert.rejects(() => store.reserveReplacementDelegation({
+		sessionId: "replace", goalId: goal.goalId, workItemId: "W1", goalEpoch: goal.execution.epoch,
+		goalRevision: goal.goalRevision + 1, workItemRevision: item.revision,
+		originalDelegationId: "D-old", replacementDelegationId: "D-stale",
+	}), (error: unknown) => error instanceof WorkStateOperationConflictError && error.code === "stale_goal_state");
+	const reserved = await store.reserveReplacementDelegation({
+		sessionId: "replace",
+		goalId: goal.goalId,
+		workItemId: "W1",
+		goalEpoch: goal.execution.epoch,
+		goalRevision: goal.goalRevision,
+		workItemRevision: item.revision,
+		originalDelegationId: "D-old",
+		replacementDelegationId: "D-new",
+	});
+	assert.equal(reserved.plan?.items.W1?.activeDelegationId, "D-new");
+	assert.equal(reserved.plan?.items.W1?.status, "in_progress");
+	const afterOldTerminal = await store.noteDelegation("replace", { goalId: goal.goalId, workItemId: "W1", delegationId: "D-old", delegationStatus: "cancelled", goalEpoch: goal.execution.epoch }, "old-cancelled");
+	assert.equal(afterOldTerminal.plan?.items.W1?.activeDelegationId, "D-new");
+	assert.equal(afterOldTerminal.plan?.items.W1?.status, "in_progress");
+	assert.deepEqual(afterOldTerminal.plan?.items.W1?.delegationIds, ["D-old", "D-new"]);
+	const currentItem = afterOldTerminal.plan!.items.W1!;
+	const afterNewTerminal = await store.noteDelegation("replace", {
+		goalId: goal.goalId,
+		workItemId: "W1",
+		delegationId: "D-new",
+		delegationStatus: "completed",
+		goalEpoch: goal.execution.epoch,
+		executionReceipt: sealedReceipt(afterOldTerminal, currentItem, "D-new"),
+	}, "new-completed");
+	assert.equal(afterNewTerminal.plan?.items.W1?.status, "submitted");
+	const afterLateOldTerminal = await store.noteDelegation("replace", {
+		goalId: goal.goalId,
+		workItemId: "W1",
+		delegationId: "D-old",
+		delegationStatus: "cancelled",
+		goalEpoch: goal.execution.epoch,
+	}, "old-cancelled-after-new");
+	assert.equal(afterLateOldTerminal.plan?.items.W1?.status, "submitted", "replacement 已提交后，旧终态只能作为审计事实");
+	assert.equal(afterLateOldTerminal.plan?.items.W1?.submissions.at(-1)?.delegationId, "D-new");
 });
 
 test("Goal v5: Manager 工作项必须开始、提交、验收，完成时逐条落 Goal 条件", async () => {

@@ -890,7 +890,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 						if (current.goalId !== goalId) throw new Error("当前 Goal 已变化，请重新读取目标状态后再提交。");
 						if (current.revision !== revision) throw new WorkStateConflictError(current);
 						const delegations = (await deps.invoker.delegationsForManagerSession(sessionId)).filter((item) => item.goalId === current.goalId);
-						const active = delegations.filter((item) => item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling");
+						const active = delegations.filter((item) => item.executionState === "waiting_admission" || item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling");
 						if (active.length > 0) throw new Error(`仍有 ${active.length} 个委托正在执行或等待输入，不能完成 Goal`);
 						const pendingDecisions = (await deps.workStates.listDecisions(sessionId, current.goalId)).filter((item) => item.status === "pending");
 						if (pendingDecisions.length > 0) throw new Error(`仍有 ${pendingDecisions.length} 个待回答的人类决策，不能完成 Goal`);
@@ -1487,7 +1487,7 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 				let boundaryState: Awaited<ReturnType<WorkStateStore["noteDelegation"]>> | undefined;
 				if (params.workItemId && goal && result.delegationId && deps.workStates) {
 					const boundaryStatus = result.status === "needs_input" || result.status === "conflict"
-						? "waiting_input"
+						? picked.source === "platform_policy" ? "waiting_admission" : "waiting_input"
 						: result.status === "completed"
 							? "completed"
 							: "failed";
@@ -1590,7 +1590,11 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 
 				if (result.status === "failed") {
 					const text = result.content;
-					await soloMeta("failed", text);
+					// The Delegation/Receipt is already terminal.  End the manager tool
+					// immediately so pi persists the failing toolResult; mirroring that
+					// result into a possibly-busy worker direct Session is best-effort UI
+					// work and must not keep the source card falsely "running".
+					void soloMeta("failed", text);
 					throw new Error(text);
 				}
 

@@ -10,6 +10,7 @@ import type {
 	PiUsage,
 	ToolCallView,
 } from "./types";
+import type { RecoveredToolResult } from "./api";
 
 let idCounter = 0;
 export function uid(): string {
@@ -278,14 +279,9 @@ export function renderHistory(msgs: PiMessage[]): ChatMessage[] {
 			continue;
 		}
 		if (m.role === "toolResult") {
-			// Fold tool results into the matching tool call of the latest assistant message.
-			let idx = -1;
-			for (let i = out.length - 1; i >= 0; i--) {
-				if (out[i]!.role === "assistant") {
-					idx = i;
-					break;
-				}
-			}
+			// Delayed/recovered results may arrive after later assistant turns. Always
+			// attach by toolCallId instead of assuming the latest assistant owns it.
+			const idx = findMessageWithTool(out, m.toolCallId);
 			if (idx >= 0) {
 				const assistant = out[idx]!;
 				out[idx] = {
@@ -361,6 +357,25 @@ export function markRunningToolCalls(messages: ChatMessage[], runningIds: string
 	return changed ? next : messages;
 }
 
+/** Merge refresh-time terminal projections by toolCallId without inventing cards. */
+export function applyRecoveredToolResults(messages: ChatMessage[], results: RecoveredToolResult[]): ChatMessage[] {
+	return results.reduce((next, result) => reducePiEvent(next, {
+		type: "tool_execution_end",
+		toolCallId: result.toolCallId,
+		toolName: result.toolName,
+		result: {
+			content: [{ type: "text", text: result.text }],
+			details: result.details,
+		},
+		isError: result.isError,
+	}), messages);
+}
+
+/** Replay WS events that arrived after an HTTP history request began. */
+export function replayPiEvents(messages: ChatMessage[], events: Array<{ type: string; [key: string]: unknown }>): ChatMessage[] {
+	return events.reduce((current, event) => reducePiEvent(current, event), messages);
+}
+
 function findLastAssistant(messages: ChatMessage[]): number {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		if (messages[i]!.role === "assistant") return i;
@@ -377,7 +392,8 @@ function findMessageWithTool(messages: ChatMessage[], toolCallId: string): numbe
 }
 
 function upsertToolCall(messages: ChatMessage[], patch: Partial<ToolCallView> & { id: string }): ChatMessage[] {
-	const idx = findLastAssistant(messages);
+	const existingIndex = findMessageWithTool(messages, patch.id);
+	const idx = existingIndex >= 0 ? existingIndex : findLastAssistant(messages);
 	if (idx < 0) return messages;
 	const msg = messages[idx]!;
 	const existing = msg.toolCalls.find((t) => t.id === patch.id);

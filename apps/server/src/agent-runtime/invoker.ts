@@ -11,6 +11,8 @@ import { resolveWorkerCodeSearch } from "../pi-bridge/code-search.js";
 import type { WorkspaceExecutionPolicy } from "./workspace-execution.js";
 
 export interface AgentInvokeParams {
+	/** Internal stable operation identity (replacement/recovery); manager tools omit it. */
+	operationId?: string;
 	windowId: string;
 	managerSessionId: string;
 	managerToolCallId?: string;
@@ -42,6 +44,17 @@ export interface AgentInvokeParams {
 	model?: string;
 	signal?: AbortSignal;
 	onUpdate?: (content: string, details?: unknown) => void;
+	/** Internal admission-replacement barrier; not exposed to manager tools. */
+	onDelegationCreated?: (delegation: DelegationRecord) => void;
+	/** Durable WorkState reservation checked after record creation and before Driver invocation. */
+	onBeforeDriverStart?: (delegation: DelegationRecord) => Promise<void>;
+}
+
+export interface ReplacementWorkerCandidate {
+	agentId: string;
+	displayName: string;
+	readOnlyEnforcement: "sandbox" | "remote_policy";
+	verificationSource: "connector_declared";
 }
 
 export interface AgentInvokeResult {
@@ -87,6 +100,21 @@ export class AgentInvoker {
 				options: { triggerTurn: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 		  ) => Promise<void>)
 		| undefined;
+	private durableManagerSender:
+		| ((
+				managerSessionId: string,
+				eventId: string,
+				message: { customType: string; content: string; details?: Record<string, unknown> },
+				options: { triggerTurn: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+		  ) => Promise<void>)
+		| undefined;
+	private delegationStateObserver: (() => Promise<void>) | undefined;
+	private replacementWindowResolver:
+		| ((delegation: DelegationRecord, agent: AgentConfig) => Promise<string>)
+		| undefined;
+	private replacementStateGuard:
+		| ((original: DelegationRecord, replacement: DelegationRecord, agent: AgentConfig, windowId: string) => Promise<void>)
+		| undefined;
 
 	constructor(
 		private readonly teams: TeamsStore,
@@ -105,6 +133,30 @@ export class AgentInvoker {
 		sender: AgentInvoker["managerSender"],
 	): void {
 		this.managerSender = sender;
+	}
+
+	setDurableManagerSender(sender: NonNullable<AgentInvoker["durableManagerSender"]>): void {
+		this.durableManagerSender = sender;
+	}
+
+	setDelegationStateObserver(observer: () => Promise<void>): void {
+		this.delegationStateObserver = observer;
+	}
+
+	setReplacementWindowResolver(resolver: (delegation: DelegationRecord, agent: AgentConfig) => Promise<string>): void {
+		this.replacementWindowResolver = resolver;
+	}
+
+	setReplacementStateGuard(guard: (original: DelegationRecord, replacement: DelegationRecord, agent: AgentConfig, windowId: string) => Promise<void>): void {
+		this.replacementStateGuard = guard;
+	}
+
+	private observeDelegationState(): void {
+		void this.delegationStateObserver?.().catch(() => undefined);
+	}
+
+	private async reconcileDelegationState(): Promise<void> {
+		await this.delegationStateObserver?.();
 	}
 
 	/**
@@ -174,7 +226,7 @@ export class AgentInvoker {
 
 	async activeDelegations(windowId: string) {
 		return (await this.runtime.listDelegations(windowId)).filter(
-			(d) => d.executionState === "running" || d.executionState === "waiting_input" || d.executionState === "cancel_requested" || d.executionState === "reconciling",
+			(d) => d.executionState === "waiting_admission" || d.executionState === "running" || d.executionState === "waiting_input" || d.executionState === "cancel_requested" || d.executionState === "reconciling",
 		);
 	}
 
@@ -189,7 +241,7 @@ export class AgentInvoker {
 		const close = async () => {
 			await preflight();
 			const active = (await this.runtime.listDelegations(undefined, managerSessionId))
-				.filter((item) => item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling");
+				.filter((item) => item.executionState === "waiting_admission" || item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling");
 			for (const item of active) await this.cancelUnlocked(item.id, signal);
 			return transition();
 		};
@@ -210,7 +262,7 @@ export class AgentInvoker {
 			const active = (await this.runtime.listDelegations()).filter(
 				(item) =>
 					(item.windowId === windowId || sessionIds.has(item.managerSessionId))
-					&& (item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling"),
+					&& (item.executionState === "waiting_admission" || item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling"),
 			);
 			for (const item of active) await this.cancelUnlocked(item.id, signal);
 			return transition();
@@ -250,7 +302,7 @@ export class AgentInvoker {
 				const related = (await this.runtime.listDelegations()).filter(
 					(item) =>
 						(item.windowId === source.id || source.sessions.includes(item.managerSessionId)) &&
-						(item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling"),
+						(item.executionState === "waiting_admission" || item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling"),
 				);
 				for (const delegation of related) await this.cancelUnlocked(delegation.id);
 
@@ -292,6 +344,40 @@ export class AgentInvoker {
 		const capabilities = await driver.capabilities();
 		this.assertBindingTransport(agent, capabilities);
 		return capabilities;
+	}
+
+	/** Eligible alternatives are server-derived and must actually close the
+	 * current read-only capability gap. The response path recomputes this list. */
+	async replacementCandidates(interactionId: string): Promise<ReplacementWorkerCandidate[]> {
+		const interaction = await this.runtime.getInteraction(interactionId);
+		const delegation = await this.runtime.getDelegationById(interactionId);
+		if (!interaction || interaction.source !== "platform_policy" || !delegation) return [];
+		const owner = await this.teams.windowForSession(delegation.managerSessionId);
+		const executionWindow = await this.teams.getWindow(delegation.windowId);
+		if (!owner || !executionWindow) return [];
+		if (owner.type !== "solo" && owner.id !== executionWindow.id) return [];
+		const available = owner.type === "solo"
+			? (await this.teams.listAgents()).filter((agent) => agent.enabled !== false && !agent.pinned)
+			: await this.teams.windowMembers(executionWindow.id);
+		const assessed = await Promise.all(available
+			.filter((agent) => agent.name !== delegation.agentId)
+			.map(async (agent): Promise<ReplacementWorkerCandidate | undefined> => {
+				try {
+					const capabilities = await this.capabilitiesFor(agent.name);
+					const enforcement = capabilities?.workspace?.readOnlyEnforcement;
+					if (!capabilities?.operations.includes("run") || capabilities.workspace?.honorsInvocationCwd !== true) return undefined;
+					if (enforcement !== "sandbox" && enforcement !== "remote_policy") return undefined;
+					return {
+						agentId: agent.name,
+						displayName: agentDisplayName(agent),
+						readOnlyEnforcement: enforcement,
+						verificationSource: "connector_declared",
+					};
+				} catch {
+					return undefined;
+				}
+			}));
+		return assessed.filter((item): item is ReplacementWorkerCandidate => Boolean(item));
 	}
 
 	/**
@@ -393,9 +479,13 @@ export class AgentInvoker {
 						message,
 						mode,
 						sessionHandle: nextSession,
-						requestId: undefined,
+						requestId: params.operationId,
 						options: params.model ? { model: params.model } : undefined,
-						onCreated: () => createdResolve(),
+						onCreated: (record) => {
+							params.onDelegationCreated?.(record);
+							createdResolve();
+						},
+						beforeDriverStart: params.onBeforeDriverStart,
 						driver,
 					},
 					{
@@ -405,7 +495,14 @@ export class AgentInvoker {
 						onUpdate: params.onUpdate,
 					},
 				);
-				void runPromise.catch(createdReject);
+				// Runtime admission can itself produce a durable terminal result (for
+				// example workspace_policy_blocked) before the Driver starts, so
+				// onCreated is intentionally never fired on that path.  Release the
+				// admission barrier on either signal: onCreated keeps normal long runs
+				// non-blocking, while an early settled Runtime outcome prevents the
+				// manager delegate tool from hanging forever over an already-terminal
+				// Delegation.
+				void runPromise.then(createdResolve, createdReject);
 				await created;
 				return { agent: freshAgent, sessionHandle: nextSession, runPromise };
 			});
@@ -451,6 +548,7 @@ export class AgentInvoker {
 		switch (delegation.status) {
 			case "needs_input": {
 				const interaction = delegation.interaction!;
+				const platformPolicy = interaction.source === "platform_policy";
 				// §6.5：向 manager session 追加安全投影（无 token），前端按
 				// interactionId 渲染/折叠审批卡。
 				if (this.managerSender && managerSessionId) {
@@ -458,9 +556,13 @@ export class AgentInvoker {
 						managerSessionId,
 						{
 							customType: "pudding:interaction_required",
-							content: `worker「${agentDisplayName(agent)}」需要人工审批才能继续。`,
+							content: platformPolicy
+								? `Teams 无法验证 worker「${agentDisplayName(agent)}」满足本任务的只读预期；Worker 尚未启动。`
+								: `worker「${agentDisplayName(agent)}」需要人工审批才能继续。`,
 							details: {
 								interactionId: interaction.id,
+								source: interaction.source,
+								workerStarted: d.workerStarted,
 								delegationId: d.id,
 								...(d.goalId ? { goalId: d.goalId } : {}),
 								worker: agent.name,
@@ -482,9 +584,13 @@ export class AgentInvoker {
 				return {
 					...base,
 					status: "needs_input",
-					content: `worker「${agentDisplayName(agent)}」需要人工审批才能继续（已保存待处理请求，不会重跑任务）。`,
+					content: platformPolicy
+						? `Teams 需要用户确认是否仍使用 worker「${agentDisplayName(agent)}」；Worker 尚未启动。`
+						: `worker「${agentDisplayName(agent)}」需要人工审批才能继续（已保存待处理请求，不会重跑任务）。`,
 					details: {
 						interactionId: interaction.id,
+						source: interaction.source,
+						workerStarted: d.workerStarted,
 						delegationId: d.id,
 						...(d.goalId ? { goalId: d.goalId } : {}),
 						kind: interaction.kind,
@@ -506,12 +612,7 @@ export class AgentInvoker {
 			case "failed": {
 				const result = delegation.result;
 				const cancelled = result?.status === "cancelled";
-				const err =
-					result && result.status === "failed"
-						? result.error
-						: result && result.status === "cancelled"
-							? result.error
-							: "worker 执行失败";
+				const err = result && "error" in result ? result.error : "worker 执行失败";
 				return {
 					...base,
 					status: cancelled ? "cancelled" : "failed",
@@ -546,11 +647,20 @@ export class AgentInvoker {
 	/** 提交审批：用户点击允许/拒绝后调用（对应 /api/interactions/:id/responses）。 */
 	async respond(
 		interactionId: string,
-		input: { requestId: string; revision: number; responses: Array<{ requestId: string; action: string; scope?: string }> },
+		input: { requestId: string; revision: number; responses: Array<{ requestId: string; action: string; scope?: string; value?: unknown }> },
 		signal?: AbortSignal,
 	): Promise<AgentInvokeResult> {
 		const delegation = await this.runtime.getDelegationById(interactionId);
 		if (!delegation) throw new Error("interaction or delegation not found");
+		const interaction = await this.runtime.getInteraction(interactionId);
+		const platformPolicy = interaction?.source === "platform_policy";
+		const replacementResponse = platformPolicy
+			? input.responses.find((response) => response.scope === "select_another_worker")
+			: undefined;
+		if (replacementResponse) {
+			const replacementAgentId = typeof replacementResponse.value === "string" ? replacementResponse.value.trim() : "";
+			return this.replaceAdmissionWorker(interactionId, input, delegation, replacementAgentId, signal);
+		}
 		const managerOwner = await this.teams.windowForSession(delegation.managerSessionId);
 		if (!managerOwner) throw new Error("manager Session 已被删除，不能继续审批");
 		const targets = await this.outcomeTargets(delegation);
@@ -578,17 +688,22 @@ export class AgentInvoker {
 				});
 				const responsePromise = this.respondUnlocked(interactionId, input, signal, (continuing) => {
 					if (continuing) {
+						this.observeDelegationState();
 						// Approval is resolved at admission time, not when the resumed worker
 						// eventually finishes. This immediately reconciles the task card in
 						// both the manager room and the mirrored worker direct room.
 						const resumed = {
 							customType: "pudding:interaction_resolved",
-							content: `worker「${workerLabel}」的审批已通过，任务继续执行中。`,
-							details: {
-								interactionId,
-								delegationId: delegation.id,
-								worker: delegation.agentId,
-								status: "approved",
+							content: platformPolicy
+								? `Teams 准入已确认，worker「${workerLabel}」开始执行；其只读能力仍为未验证。`
+								: `worker「${workerLabel}」的审批已通过，任务继续执行中。`,
+								details: {
+									interactionId,
+									delegationId: delegation.id,
+									worker: delegation.agentId,
+									status: "approved",
+									source: platformPolicy ? "platform_policy" : "worker",
+									workerStarted: true,
 							},
 						};
 						if (targets.manager) this.sendOutcome(targets.manager, resumed, { triggerTurn: false });
@@ -596,7 +711,10 @@ export class AgentInvoker {
 					}
 					admittedResolve(continuing);
 				});
-				void responsePromise.catch(admittedReject);
+				void responsePromise.catch((error) => {
+					this.observeDelegationState();
+					admittedReject(error);
+				});
 				await Promise.race([admitted, responsePromise.then(() => undefined)]);
 				return { admitted, responsePromise };
 			},
@@ -610,7 +728,7 @@ export class AgentInvoker {
 				continuing
 					? {
 							status: "approved",
-							content: "审批已受理，任务继续执行中。",
+							content: platformPolicy ? "Teams 准入决定已受理，Worker 开始执行。" : "审批已受理，任务继续执行中。",
 							details: { interactionId, admitted: true },
 							delegationId: delegation.id,
 							waitingInput: false,
@@ -619,6 +737,249 @@ export class AgentInvoker {
 			),
 			prepared.responsePromise,
 		]);
+	}
+
+	private async replaceAdmissionWorker(
+		interactionId: string,
+		input: { requestId: string; revision: number; responses: Array<{ requestId: string; action: string; scope?: string; value?: unknown }> },
+		original: DelegationRecord,
+		replacementAgentId: string,
+		signal?: AbortSignal,
+	): Promise<AgentInvokeResult> {
+		const currentInteraction = await this.runtime.getInteraction(interactionId);
+		const replayCandidate = currentInteraction?.consumedRequestId === input.requestId;
+		const candidate = replayCandidate
+			? undefined
+			: (await this.replacementCandidates(interactionId)).find((item) => item.agentId === replacementAgentId);
+		if (!replayCandidate && !candidate) throw new Error("所选 Worker 已不可用或不能补足当前只读能力，请刷新后重选");
+		const originalAgent = await this.teams.getAgent(original.agentId);
+		const begun = await this.runtime.beginAdmissionReplacement(
+			interactionId,
+			{
+				requestId: input.requestId,
+				revision: input.revision,
+				responses: input.responses.map((response) => ({
+					requestId: response.requestId,
+					action: response.action as "approve" | "reject" | "answer" | "confirm",
+					scope: response.scope,
+					value: response.value,
+				})),
+			},
+			replacementAgentId,
+			{ cwd: original.cwdSnapshot, env: process.env, signal },
+		);
+		if (begun.replayed) {
+			const application = begun.interaction.application;
+			if (application?.status === "failed") {
+				throw new Error(`该改派请求已失败（${application.failureCode ?? "replacement_failed"}）`);
+			}
+			if (application?.status !== "applied") throw new Error("该改派请求正在处理中，请稍候刷新");
+			const replacementDelegationId = application.replacementDelegationId;
+			if (!replacementDelegationId) throw new Error("改派记录缺少 replacement Delegation，已拒绝伪造成功状态");
+			const replacementLabel = (await this.teams.getAgent(replacementAgentId))?.displayName ?? replacementAgentId;
+			return {
+				status: "replaced",
+				content: `任务已改派给 worker「${replacementLabel}」。`,
+				details: { interactionId, originalDelegationId: original.id, replacementDelegationId, replacementWorker: replacementAgentId, replayed: true },
+				delegationId: replacementDelegationId,
+				waitingInput: false,
+			};
+		}
+		if (!candidate) throw new Error("改派候选状态已失效，请刷新后重选");
+		const replacementAgent = await this.requireAgent(replacementAgentId);
+		const owner = await this.teams.windowForSession(original.managerSessionId);
+		let replacementWindowId = original.windowId;
+		try {
+			if (owner?.type === "solo") {
+				if (!this.replacementWindowResolver) throw new Error("无法为替代 Worker 创建执行窗口");
+				replacementWindowId = await this.replacementWindowResolver(original, replacementAgent);
+			}
+		} catch (error) {
+			await this.runtime.failAdmissionReplacement(interactionId, "replacement_window_unavailable");
+			await this.reconcileDelegationState();
+			await this.projectReplacementStartFailure(original, interactionId, replacementAgentId, error);
+			throw error;
+		}
+
+		let createdResolve!: (delegation: DelegationRecord) => void;
+		let createdReject!: (error: unknown) => void;
+		let createdSeen = false;
+		const created = new Promise<DelegationRecord>((resolve, reject) => {
+			createdResolve = resolve;
+			createdReject = reject;
+		});
+		const runPromise = this.delegate({
+			operationId: `admission-replacement:${original.id}`,
+			windowId: replacementWindowId,
+			managerSessionId: original.managerSessionId,
+			goalId: original.goalId,
+			workPlanId: original.workPlanId,
+			workItemId: original.workItemId,
+			attempt: (original.attempt ?? 0) + 1,
+			goalEpoch: original.goalEpoch,
+			goalRevision: original.goalRevision,
+			workItemRevision: original.workItemRevision,
+			contractHash: original.contractHash,
+			workspaceExecutionPolicy: original.workspaceExecutionPolicy,
+			purpose: original.purpose,
+			verificationId: original.verificationId,
+			verifiesSubmissionId: original.verifiesSubmissionId,
+			environmentProfileId: original.environmentProfileId,
+			verificationEnvironmentId: original.verificationEnvironmentId,
+			parentDelegationId: original.id,
+			handoffKind: "request",
+			intent: original.intent,
+			expectedOutcome: original.expectedOutcome,
+			evidenceRequirements: original.evidenceRequirements,
+			completionBoundary: original.completionBoundary,
+			agent: replacementAgent,
+			message: original.task ?? "",
+			mode: "run",
+			model: typeof original.options?.model === "string" ? original.options.model : undefined,
+			signal,
+			onBeforeDriverStart: async (replacement) => {
+				if (!this.replacementStateGuard) throw new Error("replacement WorkState guard is unavailable");
+				await this.replacementStateGuard(original, replacement, replacementAgent, replacementWindowId);
+			},
+			onDelegationCreated: (replacement) => {
+				createdSeen = true;
+				createdResolve(replacement);
+			},
+		});
+		void runPromise.then((outcome) => {
+			if (!createdSeen) createdReject(new Error(outcome.content || "replacement Delegation failed before Driver start"));
+		}, createdReject);
+		let replacement: DelegationRecord | undefined;
+		try {
+			replacement = await created;
+			if (replacement.replacementAdmissionReady !== true) {
+				if (replacement.executionState === "waiting_admission") {
+					await this.runtime.cancel(replacement.id, { cwd: replacement.cwdSnapshot, env: process.env }).catch(() => undefined);
+					replacement = await this.runtime.getDelegation(replacement.id) ?? replacement;
+				}
+				throw new Error("替代 Worker 的能力或执行上下文在启动前发生变化，改派未生效");
+			}
+			await this.runtime.completeAdmissionReplacement(interactionId, replacement.id);
+		} catch (error) {
+			if (!replacement) {
+				const matches = (await this.runtime.listDelegations(original.windowId, original.managerSessionId))
+					.filter((item) => item.operationId === `admission-replacement:${original.id}` && item.parentDelegationId === original.id);
+				if (matches.length === 1) replacement = matches[0];
+			}
+			await this.runtime.failAdmissionReplacement(interactionId, "replacement_start_failed", replacement?.id);
+			await this.reconcileDelegationState().catch(() => undefined);
+			await this.projectReplacementStartFailure(original, interactionId, replacementAgentId, error, replacement);
+			throw error;
+		}
+		// WorkState projection is derived state. Once the application CAS is
+		// applied, a transient projection error must not rewrite it to failed while
+		// the replacement Worker continues running.
+		await this.reconcileDelegationState().catch(() => undefined);
+		const replacementWindow = await this.teams.getWindow(replacementWindowId);
+		if (replacementWindow?.activeSession && replacementWindow.activeSession !== original.managerSessionId) {
+			this.sendOutcome(replacementWindow.activeSession, {
+				customType: "pudding:task_assign",
+				content: `Teams 已将任务改派给 worker「${candidate.displayName}」。`,
+				details: { taskId: replacement.id, delegationId: replacement.id, worker: replacement.agentId, status: "running", replacement: true, parentDelegationId: original.id, processView: true },
+			}, { triggerTurn: false });
+		}
+
+		const originalLabel = agentDisplayName(originalAgent ?? { name: original.agentId });
+		const targets = await this.outcomeTargets(original);
+		const resolved = {
+			customType: "pudding:interaction_resolved",
+			content: `已将任务从 worker「${originalLabel}」改派给「${candidate.displayName}」；原 Worker 未启动。`,
+			details: {
+				interactionId,
+				delegationId: original.id,
+				replacementDelegationId: replacement.id,
+				worker: original.agentId,
+				replacementWorker: replacementAgentId,
+				status: "replaced",
+				source: "platform_policy",
+				workerStarted: false,
+			},
+		};
+		if (targets.manager) this.sendOutcome(targets.manager, resolved, { triggerTurn: false });
+		if (targets.direct) this.sendOutcome(targets.direct, resolved, { triggerTurn: false });
+		void runPromise.then(
+			(outcome) => this.projectReplacementOutcome(replacement!.id, candidate.displayName, outcome).catch(() => undefined),
+			(error: unknown) => this.projectReplacementFailure(replacement!.id, candidate.displayName, error).catch(() => undefined),
+		);
+		return {
+			status: "replaced",
+			content: `任务已改派给 worker「${candidate.displayName}」。`,
+			details: { interactionId, originalDelegationId: original.id, replacementDelegationId: replacement.id, replacementWorker: replacementAgentId },
+			delegationId: replacement.id,
+			waitingInput: replacement.executionState === "waiting_admission" || replacement.executionState === "waiting_input",
+		};
+	}
+
+	private async projectReplacementOutcome(delegationId: string, workerLabel: string, outcome: AgentInvokeResult): Promise<void> {
+		await this.reconcileDelegationState();
+		const delegation = await this.runtime.getDelegation(delegationId);
+		if (!delegation) return;
+		const targets = await this.outcomeTargets(delegation);
+		if (outcome.status === "needs_input") {
+			if (targets.direct) {
+				this.sendOutcome(targets.direct, {
+					customType: "pudding:interaction_required",
+					content: `改派后的 worker「${workerLabel}」需要人工确认。`,
+					details: { ...outcome.details, delegationId, worker: delegation.agentId, status: "pending", replacement: true },
+				}, { triggerTurn: false });
+			}
+			return;
+		}
+		const owner = await this.teams.windowForSession(delegation.managerSessionId);
+		const message = {
+			customType: "pudding:task_result",
+			content: outcome.status === "completed" ? outcome.content : `改派后的 worker「${workerLabel}」执行失败：${outcome.content}`,
+			details: { delegationId, worker: delegation.agentId, status: outcome.status, replacement: true, ...outcome.details },
+		};
+		if (targets.manager) {
+			const options = owner?.type === "direct" ? { triggerTurn: false } as const : { triggerTurn: true, deliverAs: "followUp" } as const;
+			if (this.durableManagerSender) await this.durableManagerSender(targets.manager, `replacement-result:${delegation.id}:${delegation.revision}`, message, options);
+			else this.sendOutcome(targets.manager, message, options);
+		}
+		if (targets.direct) {
+			if (this.durableManagerSender) await this.durableManagerSender(targets.direct, `replacement-result:${delegation.id}:${delegation.revision}`, message, { triggerTurn: false });
+			else this.sendOutcome(targets.direct, message, { triggerTurn: false });
+		}
+	}
+
+	private async projectReplacementFailure(delegationId: string, workerLabel: string, error: unknown): Promise<void> {
+		await this.reconcileDelegationState().catch(() => undefined);
+		const delegation = await this.runtime.getDelegation(delegationId);
+		if (!delegation) return;
+		const targets = await this.outcomeTargets(delegation);
+		const message = {
+			customType: "pudding:task_result",
+			content: `改派后的 worker「${workerLabel}」启动失败：${error instanceof Error ? error.message : String(error)}`,
+			details: { delegationId, worker: delegation.agentId, status: "failed", replacement: true },
+		};
+		if (targets.manager) {
+			if (this.durableManagerSender) await this.durableManagerSender(targets.manager, `replacement-result:${delegation.id}:${delegation.revision}`, message, { triggerTurn: true, deliverAs: "followUp" });
+			else this.sendOutcome(targets.manager, message, { triggerTurn: true, deliverAs: "followUp" });
+		}
+		if (targets.direct) {
+			if (this.durableManagerSender) await this.durableManagerSender(targets.direct, `replacement-result:${delegation.id}:${delegation.revision}`, message, { triggerTurn: false });
+			else this.sendOutcome(targets.direct, message, { triggerTurn: false });
+		}
+	}
+
+	private async projectReplacementStartFailure(original: DelegationRecord, interactionId: string, replacementAgentId: string, error: unknown, replacement?: DelegationRecord): Promise<void> {
+		if (!this.durableManagerSender) return;
+		const owner = await this.teams.windowForSession(original.managerSessionId);
+		await this.durableManagerSender(
+			original.managerSessionId,
+			replacement ? `replacement-result:${replacement.id}:${replacement.revision}` : `replacement-start-failed:${original.id}:${interactionId}`,
+			{
+				customType: "pudding:task_result",
+				content: `任务未能改派给 worker「${replacementAgentId}」：${error instanceof Error ? error.message : String(error)}`,
+				details: { interactionId, delegationId: replacement?.id ?? original.id, originalDelegationId: original.id, replacementWorker: replacementAgentId, status: "failed", replacement: true },
+			},
+			owner?.type === "direct" ? { triggerTurn: false } : { triggerTurn: true, deliverAs: "followUp" },
+		);
 	}
 
 	/**
@@ -650,7 +1011,7 @@ export class AgentInvoker {
 
 	private async respondUnlocked(
 		interactionId: string,
-		input: { requestId: string; revision: number; responses: Array<{ requestId: string; action: string; scope?: string }> },
+		input: { requestId: string; revision: number; responses: Array<{ requestId: string; action: string; scope?: string; value?: unknown }> },
 		signal?: AbortSignal,
 		onAdmitted?: (continuing: boolean) => void,
 	): Promise<AgentInvokeResult> {
@@ -695,6 +1056,7 @@ export class AgentInvoker {
 					requestId: r.requestId,
 					action: r.action as "approve" | "reject" | "answer" | "confirm",
 					scope: r.scope,
+					value: r.value,
 				})),
 			},
 			{ cwd, env: ctxEnv, signal },
@@ -702,6 +1064,7 @@ export class AgentInvoker {
 			onAdmitted,
 		);
 		const d = outcome.delegation;
+		this.observeDelegationState();
 		if (d.sessionHandle) {
 			this.rememberSession(d);
 		}
@@ -747,15 +1110,16 @@ export class AgentInvoker {
 				};
 			}
 			case "rejected": {
+				const source = outcome.interaction?.source ?? "worker";
 				const resolved = {
 					customType: "pudding:interaction_resolved",
-					content: `worker「${workerLabel}」的审批被拒绝，任务已取消。`,
-					details: { interactionId, delegationId: d.id, worker: d.agentId, status: "rejected" },
+					content: source === "platform_policy" ? `用户未允许 Teams 使用 worker「${workerLabel}」，任务未启动。` : `worker「${workerLabel}」的审批被拒绝，任务已取消。`,
+					details: { interactionId, delegationId: d.id, worker: d.agentId, status: "rejected", source, workerStarted: d.workerStarted },
 				};
 				const taskResult = {
 					customType: "pudding:task_result",
-					content: "审批被拒绝，任务已取消。",
-					details: { interactionId, delegationId: d.id, worker: d.agentId, status: "cancelled" },
+					content: source === "platform_policy" ? "Teams 准入被取消，Worker 未启动。" : "审批被拒绝，任务已取消。",
+					details: { interactionId, delegationId: d.id, worker: d.agentId, status: "cancelled", source, workerStarted: d.workerStarted },
 				};
 				if (targets.manager) {
 					this.sendOutcome(targets.manager, resolved, { triggerTurn: false });
@@ -804,8 +1168,10 @@ export class AgentInvoker {
 					const required = {
 						customType: "pudding:interaction_required",
 						content: `worker「${workerLabel}」需要更多审批才能继续。`,
-						details: {
-							interactionId: outcome.interaction.id,
+							details: {
+								interactionId: outcome.interaction.id,
+								source: outcome.interaction.source,
+								workerStarted: d.workerStarted,
 							delegationId: d.id,
 							worker: d.agentId,
 							status: "pending",
@@ -828,6 +1194,8 @@ export class AgentInvoker {
 					content: `worker「${workerLabel}」需要更多审批。`,
 					details: {
 						interactionId: outcome.interaction?.id,
+						source: outcome.interaction?.source,
+						workerStarted: d.workerStarted,
 						delegationId: d.id,
 						revision: outcome.interaction?.revision,
 						requests: outcome.interaction?.requests,
@@ -855,7 +1223,7 @@ export class AgentInvoker {
 	/** Delete/session lifecycle boundary: seal every active Run before its owner disappears. */
 	async cancelManagerSession(managerSessionId: string, signal?: AbortSignal): Promise<number> {
 		const candidateCount = (await this.runtime.listDelegations(undefined, managerSessionId))
-			.filter((item) => item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling").length;
+			.filter((item) => item.executionState === "waiting_admission" || item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling").length;
 		await this.closeManagerSession(managerSessionId, async () => undefined, async () => undefined, signal);
 		return candidateCount;
 	}
@@ -907,20 +1275,21 @@ export class AgentInvoker {
 	private async cancelUnlocked(delegationId: string, signal?: AbortSignal): Promise<void> {
 		const delegation = await this.runtime.getDelegation(delegationId);
 		if (!delegation) throw new Error("delegation not found");
-		const wasWaitingInput = delegation.executionState === "waiting_input";
+		const wasWaitingInput = delegation.executionState === "waiting_input" || delegation.executionState === "waiting_admission";
 		const agent = await this.teams.getAgent(delegation.agentId);
-		await this.runtime.cancel(delegationId, {
+		const applied = await this.runtime.cancel(delegationId, {
 			cwd: delegation.cwdSnapshot,
 			env: agent ? await this.envFor(agent) : process.env,
 			signal,
 		});
+		this.observeDelegationState();
 
 		// running 委托仍占着 manager 的 delegate tool call：abort 后 delegate()
 		// 会自然返回 cancelled toolResult，manager 随即继续生成，不另发重复卡。
 		// waiting_input 的 tool call 已经在审批边界返回；此时若只封存
 		// Delegation，manager 永远收不到新的终态。因此显式投影取消结果并唤醒
 		// manager 完成本轮闭环，同时同步到 worker 单聊窗口。
-		if (wasWaitingInput) await this.notifyWaitingCancellation(delegation);
+		if (applied && wasWaitingInput) await this.notifyWaitingCancellation(delegation);
 	}
 
 	private async notifyWaitingCancellation(delegation: DelegationRecord): Promise<void> {

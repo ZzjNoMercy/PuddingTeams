@@ -52,7 +52,7 @@ export function registerWorkerProcessRoutes(
 				return reply.code(409).send({ error: "该任务属于已结束的 Goal，只能查看执行记录", code: "stale_goal_state" });
 			}
 		}
-		if (info.executionState !== "running" && info.executionState !== "waiting_input" && info.executionState !== "reconciling") {
+		if (info.executionState !== "waiting_admission" && info.executionState !== "running" && info.executionState !== "waiting_input" && info.executionState !== "reconciling") {
 			return reply.code(409).send({ error: `delegation is already ${info.executionState}` });
 		}
 		if (!controls) return reply.code(501).send({ error: "delegation cancellation is unavailable" });

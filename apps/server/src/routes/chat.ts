@@ -305,18 +305,24 @@ export async function registerChatRoutes(
 		},
 	);
 
-	app.post<{ Params: { id: string } }>("/api/sessions/:id/abort", async (req) => {
-		const aborted = await store.abort(req.params.id);
-		return { aborted };
+	app.post<{ Params: { id: string } }>("/api/sessions/:id/abort", async (req, reply) => {
+		try {
+			const result = await store.abort(req.params.id);
+			if (!result.aborted) {
+				return reply.code(409).send({ ...result, error: "当前会话没有正在运行的任务" });
+			}
+			return result;
+		} catch (err) {
+			app.log.error({ err, sessionId: req.params.id }, "abort failed");
+			return reply.code(500).send({ aborted: false, reconciledToolResults: 0, error: err instanceof Error ? err.message : String(err) });
+		}
 	});
 
 	app.get<{ Params: { id: string } }>("/api/sessions/:id/messages", async (req, reply) => {
 		try {
+			const toolCallState = await store.recoverToolCallState(req.params.id);
 			const session = await store.open(req.params.id);
-			// 仍在执行的委托（delegate 工具调用阻塞中）：前端历史重放会把无
-			// toolResult 的调用一律降级"已中断"，需要这个清单把它们标回 running。
-			const runningToolCallIds = invoker ? await invoker.runningDelegateToolCallIds(req.params.id) : [];
-			return { messages: session.messages, runningToolCallIds };
+			return { messages: session.messages, ...toolCallState };
 		} catch (err) {
 			if (err instanceof Error && err.message.startsWith("Session not found")) {
 				return reply.code(404).send({ error: "session not found" });

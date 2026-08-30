@@ -14,6 +14,7 @@ import { AgentInvoker } from "../agent-runtime/invoker.js";
 import { PiSessionStore } from "../pi-bridge/session-store.js";
 import { registerChatRoutes } from "./chat.js";
 import { UploadStore } from "../store/uploads.js";
+import type { AgentDriver } from "../agent-runtime/types.js";
 
 async function makeStack() {
 	const dir = mkdtempSync(path.join(tmpdir(), "pt-chat-routes-"));
@@ -33,8 +34,8 @@ async function makeStack() {
 	const sessions = new PiSessionStore(dir, path.join(dir, "sessions"), teams, invoker);
 	const app = Fastify({ logger: false });
 	await app.register(websocket);
-	await registerChatRoutes(app, sessions, teams);
-	return { app, dir, sessions, teams };
+	await registerChatRoutes(app, sessions, teams, undefined, undefined, invoker);
+	return { app, dir, sessions, teams, delegations, drivers, runtime, invoker };
 }
 
 function writeSkill(agentDir: string, name: string, description: string): void {
@@ -107,6 +108,201 @@ test("GET /api/sessions/:id/messages 对不存在的 Session 返回 404", async 
 	const res = await app.inject({ method: "GET", url: "/api/sessions/does-not-exist/messages" });
 	assert.equal(res.statusCode, 404, res.body);
 	assert.deepEqual(res.json(), { error: "session not found" });
+	await app.close();
+});
+
+test("POST /abort 在服务端未确认运行时返回可见失败而非假成功", async () => {
+	const { app, sessions } = await makeStack();
+	const summary = await sessions.create();
+	const res = await app.inject({ method: "POST", url: `/api/sessions/${summary.id}/abort` });
+	assert.equal(res.statusCode, 409, res.body);
+	assert.deepEqual(res.json(), { aborted: false, reconciledToolResults: 0, error: "当前会话没有正在运行的任务" });
+	await app.close();
+});
+
+test("Manager abort 不响应时停止有服务端截止时间，随后刷新不被 repair queue 锁死", async () => {
+	const { app, sessions } = await makeStack();
+	const summary = await sessions.create();
+	const session = await sessions.open(summary.id);
+	Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
+	Object.defineProperty(session, "isIdle", { configurable: true, get: () => false });
+	Object.defineProperty(session, "abort", { configurable: true, value: () => new Promise<void>(() => undefined) });
+	const startedAt = Date.now();
+	const stop = await app.inject({ method: "POST", url: `/api/sessions/${summary.id}/abort` });
+	assert.equal(stop.statusCode, 500, stop.body);
+	assert.match((stop.json() as { error: string }).error, /停止 Manager 超时/);
+	assert.ok(Date.now() - startedAt < 7_000, "服务端停止必须在 deadline 后返回");
+	const refreshStartedAt = Date.now();
+	const refreshed = await app.inject({ method: "GET", url: `/api/sessions/${summary.id}/messages` });
+	assert.equal(refreshed.statusCode, 200, refreshed.body);
+	assert.ok(Date.now() - refreshStartedAt < 1_000, "刷新不得等待已经超时的 abort promise");
+	await app.close();
+});
+
+test("waiting_admission 刷新补回 needs_input，停止只取消 Teams 准入且不启动 Worker", async () => {
+	const { app, sessions, runtime, dir } = await makeStack();
+	const summary = await sessions.create();
+	const session = await sessions.open(summary.id);
+	const assistant = {
+		role: "assistant" as const,
+		content: [{ type: "toolCall" as const, id: "call-admission", name: "agent_claude-code__delegate", arguments: { task: "只读查询" } }],
+		api: "openai", provider: "openai", model: "fake",
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: "toolUse" as const,
+		timestamp: Date.now(),
+	};
+	session.sessionManager.appendMessage(assistant as never);
+	session.state.messages.push(assistant as never);
+	await sessions.ensureSessionFile(summary.id);
+	let driverStarted = false;
+	const driver: AgentDriver = {
+		id: "claude-code",
+		async capabilities() { return { operations: ["run"], interactionKinds: [], progress: "none", transport: "spawn", workspace: { honorsInvocationCwd: true, readOnlyEnforcement: "none", mutationObservation: [] } }; },
+		async *run() { driverStarted = true; }, async *continue() {}, async *respond() {},
+		async probe() { throw new Error("unused"); },
+	};
+	const pending = await runtime.delegate({
+		cwdSnapshot: dir, windowId: "manager-window", managerSessionId: summary.id, managerToolCallId: "call-admission",
+		agentId: driver.id, agentRevision: 0, message: "只读查询", mode: "run",
+		workspaceExecutionPolicy: { mode: "read_only_shared", source: "manager_derived", reason: "只读", baselineStrategy: "filesystem_manifest", promoteOnAcceptance: false },
+		driver,
+	}, { cwd: dir, env: {} });
+	assert.equal(pending.status, "needs_input");
+	assert.equal(driverStarted, false);
+
+	const refreshed = await app.inject({ method: "GET", url: `/api/sessions/${summary.id}/messages` });
+	assert.equal(refreshed.statusCode, 200, refreshed.body);
+	const recovered = (refreshed.json() as { messages: Array<{ role?: string; toolCallId?: string; details?: Record<string, unknown> }> }).messages
+		.find((message) => message.role === "toolResult" && message.toolCallId === "call-admission");
+	assert.equal(recovered?.details?.status, "needs_input");
+	assert.equal(recovered?.details?.source, "platform_policy");
+	assert.equal(recovered?.details?.workerStarted, false);
+
+	const stopped = await app.inject({ method: "POST", url: `/api/sessions/${summary.id}/abort` });
+	assert.equal(stopped.statusCode, 200, stopped.body);
+	assert.equal(stopped.json().aborted, true);
+	assert.equal((await runtime.getDelegation(pending.delegation.id))?.executionState, "cancelled");
+	assert.equal((await runtime.getDelegation(pending.delegation.id))?.receipt?.workerStarted, false);
+	assert.equal(driverStarted, false);
+	await app.close();
+});
+
+test("并行工具一项失败后停止并刷新：原错误与 Delegation 终态都只持久化一次", async () => {
+	const { app, sessions, teams, drivers, runtime, dir } = await makeStack();
+	const summary = await sessions.create();
+	await teams.ensureSoloWindow(async () => ({ id: summary.id }), async () => true);
+	const session = await sessions.open(summary.id);
+	const assistant = {
+		role: "assistant" as const,
+		content: [
+			{ type: "toolCall" as const, id: "call-bash", name: "bash", arguments: { command: "git branch --show-current" } },
+			{ type: "toolCall" as const, id: "call-delegate", name: "agent_claude-code__delegate", arguments: { task: "查询分支" } },
+		],
+		api: "openai",
+		provider: "openai",
+		model: "fake",
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: "toolUse" as const,
+		timestamp: Date.now(),
+	};
+	session.sessionManager.appendMessage(assistant as never);
+	session.state.messages.push(assistant as never);
+	await sessions.ensureSessionFile(summary.id);
+
+	const driver: AgentDriver = {
+		id: "claude-code",
+		async capabilities() { return { operations: ["run"], interactionKinds: [], progress: "none", transport: "spawn" }; },
+		async *run() {
+			yield { type: "failed", result: { agentId: "claude-code", status: "failed", errorCode: "workspace_policy_blocked", error: "workspace policy denied", recoverable: true } };
+		},
+		async *continue() {},
+		async *respond() {},
+		async probe() { throw new Error("unused"); },
+	};
+	drivers.register(driver);
+	await runtime.delegate({
+		cwdSnapshot: dir,
+		windowId: "manager-window",
+		managerSessionId: summary.id,
+		managerToolCallId: "call-delegate",
+		agentId: driver.id,
+		agentRevision: 0,
+		message: "查询分支",
+		mode: "run",
+	}, { cwd: dir, env: {} });
+
+	const emit = (sessions as unknown as { forwardEvent: (id: string, event: Record<string, unknown>) => void }).forwardEvent.bind(sessions);
+	emit(summary.id, { type: "tool_execution_start", toolCallId: "call-bash", toolName: "bash", args: { command: "git branch --show-current" } });
+	emit(summary.id, {
+		type: "tool_execution_end",
+		toolCallId: "call-bash",
+		toolName: "bash",
+		result: { content: [{ type: "text", text: "fatal: not a git repository" }], details: { exitCode: 128 } },
+		isError: true,
+	});
+
+	let live = true;
+	Object.defineProperty(session, "isStreaming", { configurable: true, get: () => live });
+	Object.defineProperty(session, "isIdle", { configurable: true, get: () => !live });
+	Object.defineProperty(session, "abort", { configurable: true, value: async () => { live = false; } });
+	const stop = await app.inject({ method: "POST", url: `/api/sessions/${summary.id}/abort` });
+	assert.equal(stop.statusCode, 200, stop.body);
+	assert.deepEqual(stop.json(), { aborted: true, reconciledToolResults: 2 });
+	assert.equal(await sessions.appendToolResultIfPending(summary.id, {
+		toolCallId: "call-bash", toolName: "bash", text: "duplicate must not be appended", details: { exitCode: 999 },
+	}), true);
+	assert.equal(await sessions.appendToolResultIfPending(summary.id, {
+		toolCallId: "call-bash", toolName: "bash", text: "duplicate must not be appended", details: { exitCode: 999 },
+	}), true);
+
+	await sessions.dispose(summary.id);
+	const refreshed = await app.inject({ method: "GET", url: `/api/sessions/${summary.id}/messages` });
+	assert.equal(refreshed.statusCode, 200, refreshed.body);
+	const body = refreshed.json() as { messages: Array<{ role?: string; toolCallId?: string; content?: Array<{ text?: string }>; details?: Record<string, unknown> }> };
+	const results = body.messages.filter((message) => message.role === "toolResult");
+	assert.equal(results.filter((message) => message.toolCallId === "call-bash").length, 1);
+	assert.equal(results.filter((message) => message.toolCallId === "call-delegate").length, 1);
+	assert.equal(results.find((message) => message.toolCallId === "call-bash")?.content?.[0]?.text, "fatal: not a git repository");
+	assert.equal(results.find((message) => message.toolCallId === "call-delegate")?.details?.errorCode, "workspace_policy_blocked");
+	await app.close();
+});
+
+test("并行普通工具刷新：已结束项回放原错误，未结束项保持 running", async () => {
+	const { app, sessions } = await makeStack();
+	const summary = await sessions.create();
+	const session = await sessions.open(summary.id);
+	const assistant = {
+		role: "assistant" as const,
+		content: [
+			{ type: "toolCall" as const, id: "call-failed", name: "bash", arguments: { command: "false" } },
+			{ type: "toolCall" as const, id: "call-running", name: "bash", arguments: { command: "long-running" } },
+		],
+		api: "openai", provider: "openai", model: "fake",
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: "toolUse" as const,
+		timestamp: Date.now(),
+	};
+	session.sessionManager.appendMessage(assistant as never);
+	session.state.messages.push(assistant as never);
+	const emit = (sessions as unknown as { forwardEvent: (id: string, event: Record<string, unknown>) => void }).forwardEvent.bind(sessions);
+	emit(summary.id, { type: "tool_execution_start", toolCallId: "call-failed", toolName: "bash", args: { command: "false" } });
+	emit(summary.id, { type: "tool_execution_start", toolCallId: "call-running", toolName: "bash", args: { command: "long-running" } });
+	emit(summary.id, {
+		type: "tool_execution_end", toolCallId: "call-failed", toolName: "bash", isError: true,
+		result: { content: [{ type: "text", text: "exit 1" }], details: { exitCode: 1 } },
+	});
+	Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
+
+	const refreshed = await app.inject({ method: "GET", url: `/api/sessions/${summary.id}/messages` });
+	assert.equal(refreshed.statusCode, 200, refreshed.body);
+	const body = refreshed.json() as {
+		messages: Array<{ role?: string; toolCallId?: string }>;
+		runningToolCallIds: string[];
+		recoveredToolResults: Array<{ toolCallId: string; text: string; isError: boolean }>;
+	};
+	assert.deepEqual(body.runningToolCallIds, ["call-running"]);
+	assert.deepEqual(body.recoveredToolResults, [{ toolCallId: "call-failed", toolName: "bash", text: "exit 1", details: { exitCode: 1 }, isError: true }]);
+	assert.equal(body.messages.some((message) => message.role === "toolResult"), false, "streaming 时不得抢先写原生 toolResult");
 	await app.close();
 });
 

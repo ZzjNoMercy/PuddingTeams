@@ -1,11 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
 	ChevronDownIcon,
-	FileArchiveIcon,
 	FileTextIcon,
-	FolderOpenIcon,
 	LoaderIcon,
 	PencilIcon,
 	PlusIcon,
@@ -41,6 +39,7 @@ import {
 } from "@/lib/api";
 import type { AgentConfig, PiPreviewResource, ResourceDiagnostic } from "@/lib/types";
 import type { ConfigDraft } from "@/components/agent-config/draft";
+import { SkillImportDialog } from "@/components/skills/skill-import-dialog";
 
 /**
  * 技能 / 模板分区（共用）：库资源表格 + 本 Agent 选用 toggle（白名单语义，
@@ -132,7 +131,6 @@ export function ResourceLibrarySection({
 	const [importOpen, setImportOpen] = useState(false);
 	const [importPath, setImportPath] = useState("");
 	const [importing, setImporting] = useState(false);
-	const zipInputRef = useRef<HTMLInputElement>(null);
 	const [pendingDelete, setPendingDelete] = useState<string | null>(null);
 	const [deleting, setDeleting] = useState(false);
 
@@ -327,7 +325,7 @@ export function ResourceLibrarySection({
 				<div className="flex shrink-0 items-center gap-2">
 					<Button size="sm" variant="outline" onClick={() => setImportOpen(true)}>
 						<UploadIcon className="size-3.5" />
-						导入
+						{kind === "skills" ? "导入 Skill" : "导入"}
 					</Button>
 					<Button size="sm" onClick={openCreate}>
 						<PlusIcon className="size-3.5" />
@@ -548,70 +546,47 @@ export function ResourceLibrarySection({
 				</DialogContent>
 			</Dialog>
 
-			{/* 导入对话框 */}
-			<Dialog open={importOpen} onOpenChange={setImportOpen}>
-				<DialogContent>
-					<DialogHeader>
-						<DialogTitle>导入到库</DialogTitle>
-						<DialogDescription>{text.importHint}</DialogDescription>
-					</DialogHeader>
-					<div className="flex flex-col gap-3">
-						<div className="flex items-center gap-1.5">
-							<Input
-								value={importPath}
-								onChange={(e) => setImportPath(e.target.value)}
-								placeholder={kind === "skills" ? "/path/to/skill-dir（含 SKILL.md）或 skills.zip" : "/path/to/template.md"}
-								className="flex-1 font-mono text-xs"
-							/>
-							{kind === "skills" ? (
-								<Button type="button" size="sm" variant="outline" onClick={() => void handlePickDirectory()}>
-									<FolderOpenIcon className="size-3.5" />
-									选择目录
-								</Button>
-							) : null}
-						</div>
-						{kind === "skills" ? (
-							<>
-								<div className="flex items-center gap-2 text-xs text-muted-foreground/70">
-									<span className="h-px flex-1 bg-border" />
-									或从 zip 批量导入
-									<span className="h-px flex-1 bg-border" />
-								</div>
-								<input
-									ref={zipInputRef}
-									type="file"
-									accept=".zip,application/zip"
-									className="hidden"
-									onChange={(e) => {
-										const file = e.target.files?.[0];
-										e.target.value = "";
-										if (file) void handleImportZip(file);
-									}}
+			{/* Skill 的两个入口共用同一套导入交互；模板继续使用单文件路径导入。 */}
+			{kind === "skills" ? (
+				<SkillImportDialog
+					open={importOpen}
+					onOpenChange={setImportOpen}
+					path={importPath}
+					onPathChange={setImportPath}
+					onPickDirectory={handlePickDirectory}
+					onImportPath={handleImport}
+					onImportZip={handleImportZip}
+					importing={importing}
+				/>
+			) : (
+				<Dialog open={importOpen} onOpenChange={setImportOpen}>
+					<DialogContent>
+						<DialogHeader>
+							<DialogTitle>导入到库</DialogTitle>
+							<DialogDescription>{text.importHint}</DialogDescription>
+						</DialogHeader>
+						<div className="flex flex-col gap-3">
+							<div className="flex items-center gap-1.5">
+								<Input
+									value={importPath}
+									onChange={(e) => setImportPath(e.target.value)}
+									placeholder="/path/to/template.md"
+									className="flex-1 font-mono text-xs"
 								/>
-								<Button
-									type="button"
-									size="sm"
-									variant="outline"
-									disabled={importing}
-									onClick={() => zipInputRef.current?.click()}
-								>
-									{importing ? <LoaderIcon className="size-3.5 animate-spin" /> : <FileArchiveIcon className="size-3.5" />}
-									选择 zip 文件
+							</div>
+							<DialogFooter>
+								<Button type="button" variant="ghost" onClick={() => setImportOpen(false)}>
+									取消
 								</Button>
-							</>
-						) : null}
-						<DialogFooter>
-							<Button type="button" variant="ghost" onClick={() => setImportOpen(false)}>
-								取消
-							</Button>
-							<Button type="button" disabled={importing || !importPath.trim()} onClick={() => void handleImport()}>
-								{importing ? <LoaderIcon className="size-3.5 animate-spin" /> : null}
-								导入
-							</Button>
-						</DialogFooter>
-					</div>
-				</DialogContent>
-			</Dialog>
+								<Button type="button" disabled={importing || !importPath.trim()} onClick={() => void handleImport()}>
+									{importing ? <LoaderIcon className="size-3.5 animate-spin" /> : null}
+									导入
+								</Button>
+							</DialogFooter>
+						</div>
+					</DialogContent>
+				</Dialog>
+			)}
 
 			{/* 删除确认 */}
 			<Dialog open={pendingDelete !== null} onOpenChange={(open) => !open && setPendingDelete(null)}>

@@ -189,6 +189,53 @@ const store = new PiSessionStore(
 invoker.setManagerSender((managerSessionId, message, options) =>
 	store.sendCustomMessage(managerSessionId, message, options),
 );
+invoker.setDurableManagerSender((managerSessionId, eventId, message, options) =>
+	store.appendCustomMessageIfAbsent(managerSessionId, eventId, message, options).then(() => undefined),
+);
+invoker.setDelegationStateObserver(async () => {
+	await workStates.reconcileDelegations(await runtime.listDelegations());
+});
+invoker.setReplacementWindowResolver(async (delegation, agent) => {
+	const window = await teams.ensureDirectWindow(
+		agent.name,
+		delegation.workspaceId,
+		() => store.create(undefined, {
+			type: "direct",
+			members: [agent.name],
+			workspaceId: delegation.workspaceId,
+			cwd: delegation.cwdSnapshot,
+		}),
+		{ cwdSnapshot: delegation.cwdSnapshot },
+	);
+	return window.id;
+});
+invoker.setReplacementStateGuard(async (original, replacement, agent, replacementWindowId) => {
+	const [owner, target] = await Promise.all([
+		teams.windowForSession(original.managerSessionId),
+		teams.getWindow(replacementWindowId),
+	]);
+	if (!owner || !target || target.workspaceId !== original.workspaceId || target.cwdSnapshot !== original.cwdSnapshot) {
+		throw new Error("改派期间房间或 Workspace 已变化");
+	}
+	if (owner.type === "solo") {
+		if (target.type !== "direct" || target.members[0] !== agent.name || owner.workspaceId !== original.workspaceId || owner.cwdSnapshot !== original.cwdSnapshot) {
+			throw new Error("改派目标已不属于当前 Solo Workspace");
+		}
+	} else if (owner.id !== original.windowId || target.id !== owner.id || !target.members.includes(agent.name)) {
+		throw new Error("改派期间群成员或房间归属已变化");
+	}
+	if (!original.goalId || !original.workItemId || original.goalEpoch === undefined) return;
+	await workStates.reserveReplacementDelegation({
+		sessionId: original.managerSessionId,
+		goalId: original.goalId!,
+		workItemId: original.workItemId!,
+		goalEpoch: original.goalEpoch!,
+		goalRevision: original.goalRevision,
+		workItemRevision: original.workItemRevision,
+		originalDelegationId: original.id,
+		replacementDelegationId: replacement.id,
+	});
+});
 // 启动对账：本地生命周期绑定进程按已确认消失结算；远端 Run 按 Driver 能力
 // 查询/重挂，无法确认的副作用进入 observation_lost/effect_unknown。
 // 已确认的本地中断补写 manager 会话——有真实工具调用的补合成 toolResult
@@ -222,6 +269,94 @@ const reconciledOrphans = await runtime.reconcileOrphanedRuns(async (orphan, res
 	}
 });
 if (reconciledOrphans > 0) app.log.info({ reconciled: reconciledOrphans }, "reconciled orphaned delegations from previous process");
+async function sweepExpiredAdmissions(): Promise<number> {
+	const before = (await runtime.listInteractions())
+		.filter((item) => item.source === "platform_policy" && item.status === "pending")
+		.map((item) => item.delegationId);
+	const expired = await runtime.expireAdmissionRequests();
+	if (expired === 0) return 0;
+	const delegations = await runtime.listDelegations();
+	await workStates.reconcileDelegations(delegations);
+	for (const delegation of delegations) {
+		if (!before.includes(delegation.id) || delegation.executionState !== "cancelled") continue;
+		if (!delegation.result || !("errorCode" in delegation.result) || delegation.result.errorCode !== "admission_expired") continue;
+		const owner = await teams.windowForSession(delegation.managerSessionId);
+		await store.appendCustomMessageIfAbsent(
+			delegation.managerSessionId,
+			`admission-expired:${delegation.id}:${delegation.revision}`,
+			{
+				customType: "pudding:task_result",
+				content: `Teams 准入请求已过期，worker「${delegation.agentId}」未启动，任务已取消。`,
+				details: { delegationId: delegation.id, worker: delegation.agentId, status: "cancelled", errorCode: "admission_expired", workerStarted: false },
+			},
+			owner?.type === "direct" ? { triggerTurn: false } : { triggerTurn: true, deliverAs: "followUp" },
+		);
+	}
+	return expired;
+}
+const expiredAdmissions = await sweepExpiredAdmissions();
+if (expiredAdmissions > 0) app.log.info({ expiredAdmissions }, "expired stale Teams admission requests");
+const reconciledAdmissions = await runtime.reconcileAdmissionApplications();
+if (reconciledAdmissions > 0) app.log.info({ reconciledAdmissions }, "reconciled Teams admission application journals");
+async function projectDurableReplacementOutcomes(): Promise<number> {
+	let projected = 0;
+	const [delegations, interactions] = await Promise.all([runtime.listDelegations(), runtime.listInteractions()]);
+	for (const delegation of delegations) {
+		if (!delegation.parentDelegationId || !["reported_completed", "reported_failed", "cancelled", "observation_lost"].includes(delegation.executionState)) continue;
+		const interaction = interactions.find((item) =>
+			item.delegationId === delegation.parentDelegationId
+			&& item.source === "platform_policy"
+			&& item.decision?.chosenAction === "select_another_worker"
+			&& item.application?.replacementDelegationId === delegation.id,
+		);
+		if (!interaction) continue;
+		const owner = await teams.windowForSession(delegation.managerSessionId);
+		const executionWindow = await teams.getWindow(delegation.windowId).catch(() => undefined);
+		const directSessionId = executionWindow?.activeSession && executionWindow.activeSession !== delegation.managerSessionId
+			? executionWindow.activeSession
+			: undefined;
+		const completed = delegation.executionState === "reported_completed";
+		const content = completed
+			? delegation.result?.status === "completed" ? delegation.result.content ?? "改派后的 Worker 已完成任务。" : "改派后的 Worker 已完成任务。"
+			: delegation.result && "error" in delegation.result ? `改派后的 worker「${delegation.agentId}」执行失败：${delegation.result.error}` : `改派后的 worker「${delegation.agentId}」未完成任务。`;
+		await store.appendCustomMessageIfAbsent(
+			delegation.managerSessionId,
+			`replacement-result:${delegation.id}:${delegation.revision}`,
+			{ customType: "pudding:task_result", content, details: { interactionId: interaction.id, delegationId: delegation.id, worker: delegation.agentId, status: completed ? "completed" : "failed", replacement: true } },
+			owner?.type === "direct" ? { triggerTurn: false } : { triggerTurn: true, deliverAs: "followUp" },
+		);
+		if (directSessionId) {
+			await store.appendCustomMessageIfAbsent(
+				directSessionId,
+				`replacement-result:${delegation.id}:${delegation.revision}`,
+				{ customType: "pudding:task_result", content, details: { interactionId: interaction.id, delegationId: delegation.id, worker: delegation.agentId, status: completed ? "completed" : "failed", replacement: true } },
+				{ triggerTurn: false },
+			);
+		}
+		projected++;
+	}
+	return projected;
+}
+const recoveredReplacementResults = await projectDurableReplacementOutcomes();
+if (recoveredReplacementResults > 0) app.log.info({ recoveredReplacementResults }, "recovered durable replacement outcomes");
+// Crash window repair: a Delegation/Interaction boundary may already be durable
+// while the manager JSONL still lacks its single delegate toolResult. Repair both
+// terminal outcomes and waiting_admission (needs_input) before HTTP opens.
+const recoverableManagerSessions = new Set(
+	(await runtime.listDelegations())
+		.filter((item) => Boolean(item.managerToolCallId) && ["waiting_admission", "reported_completed", "reported_failed", "cancelled", "observation_lost"].includes(item.executionState))
+		.map((item) => item.managerSessionId),
+);
+let recoveredManagerSessions = 0;
+for (const sessionId of recoverableManagerSessions) {
+	try {
+		const recovered = await store.recoverToolCallState(sessionId);
+		if (recovered.recoveredToolResults.length > 0) recoveredManagerSessions++;
+	} catch (error) {
+		app.log.warn({ error, sessionId }, "failed to repair manager tool results during startup");
+	}
+}
+if (recoveredManagerSessions > 0) app.log.info({ recoveredManagerSessions }, "repaired manager delegate tool results during startup");
 // Goal recovery runs after Runtime has reconciled/sealed Runs and before HTTP
 // opens. Terminal Delegations are projected into WorkItem submissions exactly
 // once; restart orphans advance one Goal epoch and never resurrect the old Run.
@@ -299,6 +434,14 @@ function scheduleGoalOutboxDrain(): Promise<void> {
 await scheduleGoalOutboxDrain();
 const goalOutboxTimer = setInterval(() => void scheduleGoalOutboxDrain(), 2_500);
 goalOutboxTimer.unref();
+const admissionExpiryTimer = setInterval(() => {
+	void sweepExpiredAdmissions().catch((error) => app.log.warn({ error }, "failed to sweep expired Teams admission requests"));
+}, 5_000);
+admissionExpiryTimer.unref();
+const replacementOutcomeTimer = setInterval(() => {
+	void projectDurableReplacementOutcomes().catch((error) => app.log.warn({ error }, "failed to project replacement outcomes"));
+}, 5_000);
+replacementOutcomeTimer.unref();
 // §1/§2 产品模型：solo 窗口是置顶单例，服务端启动即保证存在。
 await teams.ensureSoloWindow(
 	async (workspaceId, cwdSnapshot) => {
@@ -398,6 +541,8 @@ try {
 async function shutdown(): Promise<void> {
 	app.log.info("shutting down");
 	clearInterval(goalOutboxTimer);
+	clearInterval(admissionExpiryTimer);
+	clearInterval(replacementOutcomeTimer);
 	await goalOutboxDrain;
 	await store.disposeAll();
 	await app.close();

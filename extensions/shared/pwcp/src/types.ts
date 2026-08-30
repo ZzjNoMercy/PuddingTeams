@@ -191,6 +191,8 @@ export type DriverCancelConfirmation = "none" | "acknowledged" | "observable";
 export interface DriverWorkspaceCapabilities {
 	honorsInvocationCwd: boolean;
 	readOnlyEnforcement: "none" | "sandbox" | "remote_policy";
+	/** True only when every controlled Workspace mutation is intercepted before the side effect and the same Run can resume through respond(). */
+	mutationInterception?: "none" | "pre_mutation";
 	mutationObservation: Array<"event_stream" | "git_diff" | "filesystem_diff">;
 }
 

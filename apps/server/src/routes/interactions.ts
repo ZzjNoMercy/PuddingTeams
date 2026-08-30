@@ -23,20 +23,28 @@ function stripHandles<T extends { runHandle?: string; sessionHandle?: string }>(
 function projectInteraction(interaction: {
 	id: string;
 	delegationId: string;
+	source: "worker" | "platform_policy";
 	kind: string;
 	requests: unknown[];
 	status: string;
 	revision: number;
 	expiresAt?: string;
+	policyContext?: unknown;
+	decision?: unknown;
+	application?: unknown;
 }) {
 	return {
 		id: interaction.id,
 		delegationId: interaction.delegationId,
+		source: interaction.source,
 		kind: interaction.kind,
 		requests: interaction.requests,
 		status: interaction.status,
 		revision: interaction.revision,
 		expiresAt: interaction.expiresAt,
+		...(interaction.policyContext ? { policySummary: interaction.policyContext } : {}),
+		...(interaction.decision ? { decision: interaction.decision } : {}),
+		...(interaction.application ? { application: interaction.application } : {}),
 	};
 }
 
@@ -56,9 +64,21 @@ export function registerInteractionsRoutes(
 ): void {
 	// 列出某个窗口下的 pending 审批卡。
 	app.get<{ Querystring: { windowId?: string; sessionId?: string } }>("/api/interactions", async (req) => {
-		const { windowId } = req.query;
-		const interactions = await runtime.listInteractions(windowId);
-		return { interactions: interactions.map(projectInteraction) };
+		const { windowId, sessionId } = req.query;
+		let interactions = await runtime.listInteractions(windowId);
+		if (sessionId) {
+			const pairs = await Promise.all(interactions.map(async (interaction) => ({
+				interaction,
+				delegation: await runtime.getDelegationById(interaction.id),
+			})));
+			interactions = pairs.filter((pair) => pair.delegation?.managerSessionId === sessionId).map((pair) => pair.interaction);
+		}
+		return {
+			interactions: await Promise.all(interactions.map(async (interaction) => ({
+				...projectInteraction(interaction),
+				replacementCandidates: await invoker.replacementCandidates(interaction.id),
+			}))),
+		};
 	});
 
 	// 单个 interaction（含请求集合，供审批卡对账/刷新恢复）。H3：按 interaction id。
@@ -66,7 +86,13 @@ export function registerInteractionsRoutes(
 		const interaction = await runtime.getInteraction(req.params.id);
 		if (!interaction) return reply.code(404).send({ error: "interaction not found" });
 		const delegation = await runtime.getDelegationById(req.params.id);
-		return { interaction: projectInteraction(interaction), delegation };
+		return {
+			interaction: {
+				...projectInteraction(interaction),
+				replacementCandidates: await invoker.replacementCandidates(interaction.id),
+			},
+			delegation,
+		};
 	});
 
 	// 提交审批：POST /api/interactions/:id/responses
@@ -95,7 +121,11 @@ export function registerInteractionsRoutes(
 			const expectedGoalId = req.body?.expectedGoalId?.trim();
 			if (!expectedGoalId) return reply.code(400).send({ error: "处理 Goal 审批需要 expectedGoalId" });
 			const activeGoal = await workStates?.getActive(delegation.managerSessionId);
-			if (expectedGoalId !== delegation.goalId || activeGoal?.goalId !== delegation.goalId) {
+			const workItem = delegation.workItemId ? activeGoal?.plan?.items[delegation.workItemId] : undefined;
+			if (expectedGoalId !== delegation.goalId || activeGoal?.goalId !== delegation.goalId
+				|| (delegation.goalEpoch !== undefined && activeGoal.execution.epoch !== delegation.goalEpoch)
+				|| (delegation.goalRevision !== undefined && activeGoal.goalRevision !== delegation.goalRevision)
+				|| (delegation.workItemId && (!workItem || (delegation.workItemRevision !== undefined && workItem.revision !== delegation.workItemRevision)))) {
 				return reply.code(409).send({ error: "该审批属于已结束的 Goal，不能继续处理", code: "stale_goal_state" });
 			}
 		}
@@ -105,10 +135,11 @@ export function registerInteractionsRoutes(
 				{
 					requestId,
 					revision,
-					responses: (responses as Array<{ requestId: string; action: string; scope?: string }>).map((r) => ({
+					responses: (responses as Array<{ requestId: string; action: string; scope?: string; value?: unknown }>).map((r) => ({
 						requestId: String(r.requestId),
 						action: String(r.action),
 						scope: r.scope ? String(r.scope) : undefined,
+						value: r.value,
 					})),
 				},
 				undefined,
@@ -117,7 +148,7 @@ export function registerInteractionsRoutes(
 			if (outcome.status === "failed" && (outcome.details as { errorCode?: string }).errorCode === "responding") {
 				return reply.code(409).send({ error: "该审批正在处理中，请稍候", code: "responding", outcome });
 			}
-			if (outcome.status === "failed" || outcome.status === "cancelled") {
+			if (outcome.status === "failed") {
 				return reply.code(502).send({ error: outcome.content ?? "审批处理失败", code: outcome.status, outcome });
 			}
 			return { outcome: stripHandles(outcome) };

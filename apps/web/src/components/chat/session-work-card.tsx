@@ -79,7 +79,7 @@ export function SessionWorkCard({
 	const autoOpenedWorkItems = useRef(new Set<string>());
 	const autoOpenStartedWorkItem = useCallback((state: SessionWorkState | null, currentGoalId: string | null) => {
 		if (!state || state.status !== "active" || state.goalId !== currentGoalId) return;
-		const started = Object.values(state.plan?.items ?? {}).filter((item) => item.status === "in_progress" || item.status === "waiting_input");
+		const started = Object.values(state.plan?.items ?? {}).filter((item) => item.status === "in_progress" || item.status === "waiting_admission" || item.status === "waiting_input");
 		const unseen: typeof started = [];
 		for (const item of started) {
 			const key = `puddingteams:goal-auto-open:${state.goalId}:${item.id}`;
@@ -188,7 +188,7 @@ export function SessionWorkCard({
 	const activeGoalSummary = goals.find((item) => item.goalId === activeGoalId);
 	const currentTurnItems = useMemo(() => groupActivitiesByTurn(activityItems, executionTurns).find((group) => group.isCurrent)?.items ?? [], [activityItems, executionTurns]);
 	const activityRunning = currentTurnItems.filter((item) => item.executionState === "running" || item.executionState === "reconciling").length;
-	const activityPending = currentTurnItems.filter((item) => item.executionState === "waiting_input").length;
+	const activityPending = currentTurnItems.filter((item) => item.executionState === "waiting_input" || item.executionState === "waiting_admission").length;
 	const activityCompleted = currentTurnItems.filter((item) => item.executionState === "reported_completed").length;
 	useEffect(() => {
 		onRuntimeSummaryChange?.({

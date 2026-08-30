@@ -2,7 +2,7 @@
 
 import { type ComponentProps, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { ArrowRightIcon, CableIcon, CheckCircle2Icon, FileArchiveIcon, FolderOpenIcon, LoaderIcon, PackageIcon, RefreshCwIcon, SearchIcon, ShieldAlertIcon, SparklesIcon, TrashIcon, UploadIcon, WrenchIcon } from "lucide-react";
+import { ArrowRightIcon, CableIcon, CheckCircle2Icon, LoaderIcon, PackageIcon, RefreshCwIcon, SearchIcon, ShieldAlertIcon, SparklesIcon, TrashIcon, UploadIcon, WrenchIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -28,6 +28,7 @@ import {
 import { agentDisplayName, type AgentConfig, type CatalogEntry, type ConflictRun, type ExtensionConnectionStatus, type SkillDocument, type SkillEntry } from "@/lib/types";
 import { ClipboardSafeStreamdown } from "@/components/ai-elements/streamdown";
 import { ManagerAvatar, WorkerAvatar } from "@/components/chat/worker-avatar";
+import { SkillImportDialog } from "@/components/skills/skill-import-dialog";
 
 /**
  * Extension 接入目录（§10.1）：kind=connector 与 kind=capability 分开的目录
@@ -400,7 +401,6 @@ function SkillsLibraryView() {
 	const [importPath, setImportPath] = useState("");
 	const [importOpen, setImportOpen] = useState(false);
 	const [importing, setImporting] = useState(false);
-	const [zipInput, setZipInput] = useState<HTMLInputElement | null>(null);
 	const [previewSkill, setPreviewSkill] = useState<SkillEntry | null>(null);
 	const [previewDocument, setPreviewDocument] = useState<SkillDocument | null>(null);
 	const [previewAgents, setPreviewAgents] = useState<AgentConfig[] | null>(null);
@@ -599,16 +599,16 @@ function SkillsLibraryView() {
 					</DialogFooter>
 				</DialogContent>
 			</Dialog>
-			<Dialog open={importOpen} onOpenChange={setImportOpen}>
-				<DialogContent>
-					<DialogHeader><DialogTitle>导入 Skill</DialogTitle><DialogDescription>导入后写入 pi 全局 Skills 目录，与 pi CLI 共享。启用范围仍按 Agent 配置的作用域决定。</DialogDescription></DialogHeader>
-					<div className="flex flex-col gap-3">
-						<div className="flex gap-2"><Input value={importPath} onChange={(e) => setImportPath(e.target.value)} placeholder="/path/to/skill-dir 或 skills.zip" className="font-mono text-xs" /><Button type="button" variant="outline" onClick={() => void pickSkillDirectory()}><FolderOpenIcon className="size-3.5" />选择目录</Button><Button type="button" variant="outline" onClick={() => zipInput?.click()}><FileArchiveIcon className="size-3.5" />选择 zip</Button></div>
-						<input ref={setZipInput} type="file" accept=".zip,application/zip" className="hidden" onChange={(e) => { const file = e.target.files?.[0]; e.target.value = ""; if (file) void importZip(file); }} />
-					</div>
-					<DialogFooter><Button type="button" variant="ghost" onClick={() => setImportOpen(false)}>取消</Button><Button type="button" disabled={importing || !importPath.trim()} onClick={() => void importSkill()}>{importing ? <LoaderIcon className="size-3.5 animate-spin" /> : null}导入</Button></DialogFooter>
-				</DialogContent>
-			</Dialog>
+			<SkillImportDialog
+				open={importOpen}
+				onOpenChange={setImportOpen}
+				path={importPath}
+				onPathChange={setImportPath}
+				onPickDirectory={pickSkillDirectory}
+				onImportPath={importSkill}
+				onImportZip={importZip}
+				importing={importing}
+			/>
 		</div>
 	);
 }

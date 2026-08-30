@@ -13,6 +13,7 @@ import {
 	addAgentBinding,
 	deleteAgentBinding,
 	getAgentConnector,
+	getAgentExecutionCapabilities,
 	listAgentBindings,
 	listExtensionCatalog,
 	listExtensionConnections,
@@ -22,6 +23,7 @@ import {
 	putAgentConnector,
 	runExtensionConnectionAction,
 	updateAgent,
+	type AgentExecutionCapabilities,
 } from "@/lib/api";
 import type {
 	AgentCapabilityBinding,
@@ -334,6 +336,7 @@ export function ConnectorSection({
 	const [saving, setSaving] = useState(false);
 	const [probe, setProbe] = useState<AgentProbeResult | null>(null);
 	const [probing, setProbing] = useState(false);
+	const [executionCapabilities, setExecutionCapabilities] = useState<AgentExecutionCapabilities | null>(null);
 
 	// Agent 切换/外部更新时重置表单（渲染期间随 prop 变化重置，避免 effect 级联渲染）。
 	const [prevAgent, setPrevAgent] = useState(agent);
@@ -345,6 +348,7 @@ export function ConnectorSection({
 		setSecrets({});
 		setVersionPin(agent.connector?.versionPin ?? "");
 		setProbe(null);
+		setExecutionCapabilities(null);
 	}
 
 	useEffect(() => {
@@ -358,10 +362,13 @@ export function ConnectorSection({
 			});
 		// GET connector 拿贡献 manifest（catalog 已含，这里保底刷新绑定态）。
 		getAgentConnector(agent.name).catch(() => undefined);
+		getAgentExecutionCapabilities(agent.name)
+			.then((value) => { if (!cancelled) setExecutionCapabilities(value); })
+			.catch(() => { if (!cancelled) setExecutionCapabilities(null); });
 		return () => {
 			cancelled = true;
 		};
-	}, [agent.name]);
+	}, [agent.name, agent.extensionRevision]);
 
 	const selected = catalog?.find((e) => e.manifest.id === extensionId);
 	const contribution = selected?.manifest.kind === "connector" ? selected.manifest.connector : undefined;
@@ -529,6 +536,22 @@ export function ConnectorSection({
 			{contribution ? (
 				<section className="agent-config-card flex flex-col gap-3">
 					<div className="agent-config-card-head"><h2>接入配置</h2><p>按连接插件声明的配置项填写；密钥加密存储，只保存引用。</p></div>
+					{executionCapabilities ? (
+						<div className="agent-config-inset p-3 text-xs">
+							<p className="font-medium">当前执行能力（Connector 声明）</p>
+							<div className="mt-2 flex flex-wrap gap-1.5">
+								<Badge variant={executionCapabilities.workspace.readOnlyEnforcement === "none" ? "destructive" : "secondary"}>
+									只读：{executionCapabilities.workspace.readOnlyEnforcement === "sandbox" ? "Worker 沙箱保证" : executionCapabilities.workspace.readOnlyEnforcement === "remote_policy" ? "远端策略保证" : "无法验证"}
+								</Badge>
+								<Badge variant="outline">cwd：{executionCapabilities.workspace.honorsInvocationCwd ? "遵循" : "未保证"}</Badge>
+								<Badge variant="outline">隔离目录：{executionCapabilities.workspace.isolatedWorkspace ? "支持" : "未声明"}</Badge>
+								<Badge variant="outline">写前拦截：{executionCapabilities.workspace.mutationInterception === "pre_mutation" ? "支持" : "不支持"}</Badge>
+							</div>
+							{executionCapabilities.workspace.readOnlyEnforcement === "none" ? (
+								<p className="mt-2 text-destructive">只读任务不会自动修改 Worker 权限；执行前由 Teams 请求用户决定是否仍使用该 Worker。</p>
+							) : null}
+						</div>
+					) : null}
 					<label className="flex flex-col gap-1 text-sm">
 						<span className="text-muted-foreground">传输方式</span>
 						<Select value={selectedTransport} onValueChange={(value) => setTransport(value as AgentConnectorBinding["transport"])}>

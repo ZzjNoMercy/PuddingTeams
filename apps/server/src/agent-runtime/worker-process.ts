@@ -21,6 +21,8 @@ export interface WorkerProcessInfo {
 	goalId?: string;
 	agentId: string;
 	executionState: DelegationRecord["executionState"];
+	workerStarted: boolean;
+	readOnlyAssessment?: DelegationRecord["readOnlyAssessment"];
 	receipt?: DelegationRecord["receipt"];
 	sessionHandle?: string;
 	/** 委托创建时间：worker 会话跨任务续接，前端按它切出本次委托的消息片段。 */
@@ -57,6 +59,8 @@ export class WorkerProcessService {
 			goalId: d.goalId,
 			agentId: d.agentId,
 			executionState: d.executionState,
+			workerStarted: d.workerStarted,
+			readOnlyAssessment: d.readOnlyAssessment,
 			receipt: d.receipt,
 			sessionHandle: d.sessionHandle,
 			createdAt: d.createdAt,
