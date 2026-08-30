@@ -187,7 +187,7 @@ export async function setSessionModel(sessionId: string, model: string): Promise
 	});
 	if (!res.ok) {
 		const body = (await res.json().catch(() => null)) as { error?: string } | null;
-		throw new Error(body?.error ?? `set model failed: ${res.status}`);
+		throw new Error(sessionApiError(body?.error, `set model failed: ${res.status}`));
 	}
 }
 
@@ -233,13 +233,20 @@ export interface MessageAttachmentInput {
 	data: string;
 }
 
+function sessionApiError(error: string | undefined, fallback: string): string {
+	return error === "session_context_inactive" ? "该会话属于另一个项目，请先切回对应项目" : (error ?? fallback);
+}
+
 export async function sendMessage(sessionId: string, content: string, attachments: MessageAttachmentInput[] = []): Promise<void> {
 	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/messages`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify({ content, attachments }),
 	});
-	if (!res.ok) throw new Error(`send message failed: ${res.status}`);
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(sessionApiError(body?.error, `send message failed: ${res.status}`));
+	}
 }
 
 export async function abortSession(sessionId: string): Promise<AbortSessionResult> {
@@ -254,7 +261,7 @@ export async function abortSession(sessionId: string): Promise<AbortSessionResul
 		throw err;
 	}
 	const body = (await res.json().catch(() => null)) as (AbortSessionResult & { error?: string }) | null;
-	if (!res.ok) throw new Error(body?.error ?? `stop session failed: ${res.status}`);
+	if (!res.ok) throw new Error(sessionApiError(body?.error, `stop session failed: ${res.status}`));
 	if (!body?.aborted) throw new Error(body?.error ?? "服务端未确认任务已停止");
 	return body;
 }
@@ -1126,15 +1133,15 @@ export async function switchRoomWorkspace(
 	roomId: string,
 	workspaceId: string | null,
 	mode: "new_window" | "in_place" = "new_window",
-): Promise<{ room: RoomSummary; existed: boolean }> {
+	): Promise<{ room: RoomSummary; existed: boolean; restored: boolean }> {
 	const res = await fetch(`${SERVER_URL}/api/rooms/${roomId}/switch-workspace`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify({ workspaceId, mode }),
 	});
-	const body = (await res.json()) as { room?: RoomSummary; existed?: boolean; error?: string };
+	const body = (await res.json()) as { room?: RoomSummary; existed?: boolean; restored?: boolean; error?: string };
 	if (!res.ok) throw new Error(body.error ?? `switch workspace failed: ${res.status}`);
-	return { room: body.room!, existed: body.existed === true };
+	return { room: body.room!, existed: body.existed === true, restored: body.restored === true };
 }
 
 export async function getDeveloperMode(): Promise<boolean> {

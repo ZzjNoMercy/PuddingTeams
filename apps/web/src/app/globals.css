@@ -776,7 +776,60 @@ html[data-reduce-motion="true"] *::after {
 	box-shadow: 0 14px 30px color-mix(in oklab, black 10%, transparent);
 	transform: translateY(-1px);
 }
-.ops-agent-card:focus-within { outline: 2px solid color-mix(in oklab, var(--ring) 72%, transparent); outline-offset: 2px; }
+.ops-agent-main:focus-visible { outline: none; }
+.ops-agent-card:has(.ops-agent-main:focus-visible) {
+	outline: 2px solid color-mix(in oklab, var(--ring) 72%, transparent);
+	outline-offset: 2px;
+}
+
+/* Agent 卡片菜单沿用 Calm Ops 的轻浮层语言，避免默认系统菜单的粗边框与高对比。 */
+.ops-agent-menu[data-slot="dropdown-menu-content"] {
+	border: 0;
+	border-radius: 13px;
+	background: color-mix(in oklab, var(--popover) 95%, var(--background) 5%);
+	box-shadow:
+		0 18px 46px color-mix(in oklab, black 14%, transparent),
+		inset 0 0 0 1px color-mix(in oklab, var(--foreground) 9%, transparent);
+	padding: 6px;
+	backdrop-filter: blur(16px);
+}
+.ops-agent-menu [data-slot="dropdown-menu-item"] {
+	min-height: 34px;
+	gap: 9px;
+	border-radius: 9px;
+	padding: 0 9px;
+	color: color-mix(in oklab, var(--foreground) 82%, var(--muted-foreground) 18%);
+	font-size: 12px;
+	font-weight: 450;
+	transition: background-color 140ms ease, color 140ms ease;
+}
+.ops-agent-menu [data-slot="dropdown-menu-item"] svg {
+	width: 15px;
+	height: 15px;
+	color: var(--muted-foreground);
+	stroke-width: 1.8;
+	transition: color 140ms ease;
+}
+.ops-agent-menu [data-slot="dropdown-menu-item"]:focus,
+.ops-agent-menu [data-slot="dropdown-menu-item"][data-highlighted] {
+	background: color-mix(in oklab, var(--foreground) 6%, transparent);
+	color: var(--foreground);
+}
+.ops-agent-menu [data-slot="dropdown-menu-item"]:focus svg,
+.ops-agent-menu [data-slot="dropdown-menu-item"][data-highlighted] svg { color: var(--foreground); }
+.ops-agent-menu [data-slot="dropdown-menu-separator"] {
+	height: 1px;
+	margin: 5px 4px;
+	background: color-mix(in oklab, var(--foreground) 8%, transparent);
+}
+.ops-agent-menu [data-slot="dropdown-menu-item"][data-variant="destructive"] {
+	color: color-mix(in oklab, var(--destructive) 82%, var(--foreground) 18%);
+}
+.ops-agent-menu [data-slot="dropdown-menu-item"][data-variant="destructive"]:focus,
+.ops-agent-menu [data-slot="dropdown-menu-item"][data-variant="destructive"][data-highlighted] {
+	background: color-mix(in oklab, var(--destructive) 9%, transparent);
+	color: var(--destructive);
+}
 
 .ops-agent-avatar {
 	display: grid;
@@ -3200,13 +3253,113 @@ button.nav-user:focus-visible {
 .conversation-scroll-viewport::-webkit-scrollbar { width: 10px; height: 10px; }
 .home-message-column {
 	box-sizing: border-box;
-	width: min(780px, calc(100% - 48px));
+	/* 左侧额外 48px 留给 Query 输入轴；宽屏仍保持 780px 阅读列。 */
+	width: min(780px, calc(100% - 96px));
 	max-width: 100%;
 	min-width: 0;
 	min-height: 100%;
 	margin: 0 auto;
 	gap: 30px;
 	padding: 38px 0 150px;
+}
+.home-query-axis {
+	position: absolute;
+	top: 50%;
+	/* 输入轴属于抽屉边缘导航，不跟随正文阅读列居中。 */
+	left: 18px;
+	z-index: 8;
+	width: 38px;
+	transform: translateY(-50%);
+	pointer-events: none;
+}
+.home-query-axis-rail {
+	display: flex;
+	max-height: min(46vh, 320px);
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 3px;
+	overflow-y: auto;
+	padding: 7px 5px;
+	scrollbar-width: none;
+}
+.home-query-axis-rail::-webkit-scrollbar { display: none; }
+.home-query-axis-tick {
+	position: relative;
+	display: grid;
+	width: 32px;
+	height: 8px;
+	flex: 0 0 auto;
+	align-items: center;
+	border-radius: 4px;
+	pointer-events: auto;
+}
+.home-query-axis-mark {
+	display: block;
+	width: 10px;
+	height: 2px;
+	border-radius: 999px;
+	background: color-mix(in oklab, var(--home-text-3) 46%, transparent);
+	transition: width 190ms cubic-bezier(.2,.75,.2,1), height 160ms ease, background-color 160ms ease, box-shadow 160ms ease;
+}
+.home-query-axis-tick.is-active .home-query-axis-mark {
+	height: 3px;
+	background: var(--home-text);
+}
+.home-query-axis-tick.is-near-2 .home-query-axis-mark { width: 14px; }
+.home-query-axis-tick.is-near-1 .home-query-axis-mark { width: 20px; }
+.home-query-axis-tick.is-preview .home-query-axis-mark,
+.home-query-axis-tick:hover .home-query-axis-mark {
+	width: 30px;
+	height: 3px;
+	background: var(--home-text);
+}
+.home-query-axis-tick:focus-visible { outline: none; }
+.home-query-axis-tick:focus-visible .home-query-axis-mark {
+	background: var(--home-text-2);
+	box-shadow: 0 0 0 2px color-mix(in oklab, var(--home-accent) 42%, transparent);
+}
+.home-query-axis-tooltip {
+	position: absolute;
+	left: calc(100% + 12px);
+	z-index: 10;
+	display: grid;
+	width: max-content;
+	max-width: min(320px, calc(100vw - 140px));
+	gap: 3px;
+	transform: translate(0, -50%) scale(1);
+	transform-origin: left center;
+	border: 1px solid var(--home-line);
+	border-radius: 12px;
+	background: var(--home-menu);
+	box-shadow: 0 16px 44px var(--home-shadow);
+	opacity: 1;
+	padding: 9px 11px 10px;
+	color: var(--home-text-2);
+	font-size: 11px;
+	font-weight: 500;
+	line-height: 1.55;
+	text-align: left;
+	pointer-events: none;
+	animation: home-query-axis-tooltip-in 190ms cubic-bezier(.2,.75,.2,1) both;
+}
+.home-query-axis-tooltip small {
+	color: var(--home-text-3);
+	font-size: 8px;
+	font-weight: 680;
+	letter-spacing: .08em;
+	line-height: 1.4;
+	text-transform: uppercase;
+}
+.home-query-axis-tooltip > span {
+	display: -webkit-box;
+	overflow: hidden;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 3;
+	text-wrap: pretty;
+}
+@keyframes home-query-axis-tooltip-in {
+	from { transform: translate(7px, -50%) scale(.98); opacity: 0; }
+	to { transform: translate(0, -50%) scale(1); opacity: 1; }
 }
 .home-session-marker { display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 4px; color: var(--home-text-3); font-size: 10px; }
 .home-session-marker span { width: 46px; height: 1px; background: var(--home-line); }
@@ -3247,6 +3400,33 @@ button.nav-user:focus-visible {
 .home-message-response :where(h1,h2,h3,h4) { color: var(--home-text); font-size: 14px; line-height: 1.5; }
 .home-message-response :where(p,ul,ol,pre,blockquote) { margin-top: .5em; margin-bottom: .5em; }
 .home-message-response code { font-size: .9em; }
+.home-message-actions {
+	display: flex;
+	height: 26px;
+	align-items: center;
+	gap: 2px;
+	margin-top: 5px;
+	color: var(--home-text-3);
+	opacity: .68;
+}
+.home-message-action {
+	display: inline-grid;
+	width: 26px;
+	height: 26px;
+	place-items: center;
+	border-radius: 7px;
+	transition: background-color 140ms ease, color 140ms ease, opacity 140ms ease;
+}
+.home-message-action svg { width: 15px; height: 15px; stroke-width: 1.75; }
+.home-message-action:hover { background: var(--home-hover); color: var(--home-text); }
+.home-message-action:focus-visible {
+	color: var(--home-text);
+	outline: 2px solid color-mix(in oklab, var(--primary) 52%, transparent);
+	outline-offset: 1px;
+}
+.home-assistant-message:hover .home-message-actions,
+.home-worker-entry:hover .home-message-actions,
+.home-message-actions:focus-within { opacity: 1; }
 /* 合并气泡段内：正文首尾段落的 .5em 外边距会与 flex gap 叠加造成间距不均，收掉。 */
 .home-assistant-segment .home-message-response > :first-child { margin-top: 0; }
 .home-assistant-segment .home-message-response > :last-child { margin-bottom: 0; }
@@ -3472,6 +3652,7 @@ button.nav-user:focus-visible {
 
 @media (max-width: 767px) {
 	.home-rooms-panel { position: fixed; inset: 0 auto 0 68px; z-index: 40; width: 286px; min-width: 286px; box-shadow: 20px 0 50px var(--home-shadow); }
+	.home-query-axis { display: none; }
 	.home-message-column { width: calc(100% - 28px); padding-top: 24px; }
 	.home-chat-header { padding-inline: 12px; }
 	.home-chat-subtitle { max-width: 42vw; }

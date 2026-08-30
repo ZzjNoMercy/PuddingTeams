@@ -1338,6 +1338,10 @@ export class WorkStateStore {
 		if (!selectedGoalId) return [];
 		return Object.values(data.decisions).filter((item) => item.sessionId === sessionId && item.goalId === selectedGoalId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).map(copy);
 	}
+	async getDecision(id: string): Promise<DecisionRequest | undefined> {
+		const decision = (await this.load()).decisions[id];
+		return decision ? copy(decision) : undefined;
+	}
 	async answerDecision(id: string, answer: string, grantedAuthorizationScope?: string, operationId: string = randomUUID()): Promise<DecisionRequest> {
 		return this.serialize(async () => {
 			const data = await this.load();

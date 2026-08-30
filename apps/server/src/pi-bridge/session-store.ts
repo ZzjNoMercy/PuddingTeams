@@ -11,7 +11,7 @@ import {
 	type CreateAgentSessionOptions,
 	type InlineExtension,
 } from "@earendil-works/pi-coding-agent";
-import { readFile, unlink } from "node:fs/promises";
+import { readFile, realpath, unlink } from "node:fs/promises";
 import { existsSync, writeFileSync } from "node:fs";
 import { agentDisplayName, MANAGER_AGENT_NAME } from "../store/teams.js";
 import type { PiManagerSettings, PiResourceConfig, TeamsStore } from "../store/teams.js";
@@ -89,6 +89,8 @@ export interface ProviderSummary {
 	/** API endpoint (base URL) the provider talks to, when it has one. */
 	baseUrl?: string;
 }
+
+export type DurableCustomMessageDisposition = "delivered" | "duplicate" | "deferred";
 
 export interface SessionSkillCommand {
 	name: string;
@@ -647,13 +649,11 @@ export class PiSessionStore {
 	async markWorkspaceDirty(workspaceId: string): Promise<number> {
 		if (!this.teamsStore) return 0;
 		let marked = 0;
-		for (const w of await this.teamsStore.listWindows()) {
-			if (w.workspaceId !== workspaceId) continue;
-			for (const id of w.sessions) {
-				if (!this.active.has(id)) continue;
-				this.runtimeDirty.add(id);
-				marked++;
-			}
+		for (const id of this.active.keys()) {
+			const context = await this.teamsStore.contextForSession(id);
+			if (context?.workspaceId !== workspaceId) continue;
+			this.runtimeDirty.add(id);
+			marked++;
 		}
 		return marked;
 	}
@@ -683,13 +683,14 @@ export class PiSessionStore {
 		sessionId: string,
 	): Promise<ManagerWindowContext | undefined> {
 		if (!this.teamsStore) return undefined;
-		const w = await this.teamsStore.windowForSession(sessionId);
-		if (!w) return undefined;
-		const cwd = await this.teamsStore.workspaceFor(w.id);
+		const context = await this.teamsStore.contextForSession(sessionId);
+		if (!context) return undefined;
+		const w = context.window;
+		const cwd = await this.teamsStore.workspaceForSession(sessionId);
 		// 显示名快照：提示词（guidance/roster）渲染显示名，members 仍是内部 id。
 		const displayNames: Record<string, string> = {};
 		for (const a of await this.teamsStore.listAgents()) displayNames[a.name] = agentDisplayName(a);
-		return { type: w.type, members: w.members, displayNames, prompt: w.prompt, workspaceId: w.workspaceId, cwd };
+		return { type: w.type, members: w.members, displayNames, prompt: w.prompt, workspaceId: context.workspaceId, cwd };
 	}
 
 	/** Shared model runtime (auth + model catalog)：进程级单例（model-runtime.ts），
@@ -962,8 +963,16 @@ export class PiSessionStore {
 			throw new Error(`Session has no Window owner: ${id}`);
 		}
 		const cwd = ctx?.cwd ?? this.cwd;
+		const sessionManager = SessionManager.open(info.path, this.sessionDir);
+		const [recordedCwd, expectedCwd] = await Promise.all([
+			realpath(sessionManager.getCwd()).catch(() => sessionManager.getCwd()),
+			realpath(cwd).catch(() => cwd),
+		]);
+		if (recordedCwd !== expectedCwd) {
+			throw new Error(`Session cwd does not match its Window context: ${id}`);
+		}
 		const session = await this.assembleSession({
-			sessionManager: SessionManager.open(info.path, this.sessionDir),
+			sessionManager,
 			ctx,
 			cwd,
 			getSessionId: () => id,
@@ -1186,6 +1195,7 @@ export class PiSessionStore {
 
 	/** Switch the model of a live session (pi SDK supports runtime setModel). */
 	async setModel(id: string, modelRef: string): Promise<ModelSummary> {
+		await this.requireActiveContext(id);
 		const session = await this.open(id);
 		const model = await this.resolveModel(modelRef);
 		await session.setModel(model);
@@ -1211,6 +1221,7 @@ export class PiSessionStore {
 		const trimmed = name.trim();
 		if (!trimmed) throw new Error("会话名称不能为空");
 		if (trimmed.length > 60) throw new Error("会话名称不能超过 60 个字符");
+		await this.requireActiveContext(id);
 		const session = await this.open(id);
 		session.setSessionName(trimmed);
 		return this.summarize(session);
@@ -1230,6 +1241,49 @@ export class PiSessionStore {
 			if (err.code !== "ENOENT") throw err;
 		});
 		return true;
+	}
+
+	/** Stop and unload a Session while preserving its JSONL for workspace restoration. */
+	async suspend(id: string): Promise<void> {
+		const session = this.active.get(id);
+		if (session?.isStreaming) await session.abort().catch(() => undefined);
+		await this.dispose(id);
+	}
+
+	private async requireActiveContext(id: string): Promise<void> {
+		const context = await this.teamsStore?.contextForSession(id);
+		if (context && !context.active) throw new Error("该会话所属项目未激活，请先切换回对应项目");
+	}
+
+	/** Run a state-changing operation under the same lifecycle gate as workspace switching. */
+	async withActiveContextLifecycle<T>(id: string, action: () => Promise<T>): Promise<T> {
+		if (this.invoker) return this.invoker.withActiveSessionLifecycle(id, action);
+		await this.requireActiveContext(id);
+		return action();
+	}
+
+	/** Persist a possibly fileless live Session before its context is parked. */
+	async prepareForParking(id: string): Promise<void> {
+		await this.requireActiveContext(id);
+		const session = await this.open(id);
+		if (session.isStreaming) await session.abort();
+		await this.ensureSessionFile(id);
+		const persisted = (await SessionManager.listAll(this.sessionDir)).some((session) => session.id === id);
+		if (!persisted) throw new Error(`Session could not be persisted before workspace switch: ${id}`);
+	}
+
+	/** Open once to verify that a parked JSONL exists and its recorded cwd matches its frozen context. */
+	async validateStoredContext(id: string): Promise<void> {
+		const context = await this.teamsStore?.contextForSession(id);
+		if (!context) throw new Error(`Session has no Window owner: ${id}`);
+		const info = (await SessionManager.listAll(this.sessionDir)).find((session) => session.id === id);
+		if (!info) throw new Error(`Session not found: ${id}`);
+		const stored = SessionManager.open(info.path, this.sessionDir);
+		const [recordedCwd, expectedCwd] = await Promise.all([
+			realpath(stored.getCwd()).catch(() => stored.getCwd()),
+			realpath(context.cwdSnapshot).catch(() => context.cwdSnapshot),
+		]);
+		if (recordedCwd !== expectedCwd) throw new Error(`Session cwd does not match its Window context: ${id}`);
 	}
 
 	async dispose(id: string): Promise<void> {
@@ -1263,23 +1317,54 @@ export class PiSessionStore {
 		message: { customType: string; content: string; details?: Record<string, unknown> },
 		options: { triggerTurn: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
-		const session = await this.open(id);
-		if (!options.triggerTurn && !session.isIdle) {
-			await Promise.race([
-				session.waitForIdle(),
-				new Promise<void>((resolve) => setTimeout(resolve, CUSTOM_MESSAGE_IDLE_WAIT_MS)),
-			]).catch(() => undefined);
+		if (!options.triggerTurn || !this.invoker) {
+			return this.deliverCustomMessageUnlocked(id, message, options);
 		}
-		const deliverAs = options.triggerTurn
-			? (options.deliverAs ?? "followUp")
-			: session.isIdle
-				? undefined
-				: "nextTurn";
-		await session.sendCustomMessage(
-			{ customType: message.customType, content: message.content, display: true, details: message.details },
-			{ ...options, deliverAs },
-		);
-		await this.ensureSessionFile(id);
+		try {
+			return await this.invoker.withActiveSessionLifecycle(id, () =>
+				this.deliverCustomMessageUnlocked(id, message, options),
+			);
+		} catch (err) {
+			if (!(err instanceof Error) || !err.message.includes("所属项目未激活")) throw err;
+			// The switch won the lifecycle race. Keep the terminal fact as audit,
+			// but never enqueue a model turn into the parked context.
+			return this.deliverCustomMessageUnlocked(id, message, { triggerTurn: false });
+		}
+	}
+
+	private async deliverCustomMessageUnlocked(
+		id: string,
+		message: { customType: string; content: string; details?: Record<string, unknown> },
+		options: { triggerTurn: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+	): Promise<void> {
+		const context = await this.teamsStore?.contextForSession(id);
+		const parked = Boolean(context && !context.active);
+		// Terminal/audit projections may finish after a switch. Preserve those
+		// facts in the old JSONL, but a parked context must never wake the model.
+		const effectiveOptions: { triggerTurn: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" } = parked
+			? { triggerTurn: false }
+			: options;
+		const session = await this.open(id);
+		try {
+			if (!effectiveOptions.triggerTurn && !session.isIdle) {
+				await Promise.race([
+					session.waitForIdle(),
+					new Promise<void>((resolve) => setTimeout(resolve, CUSTOM_MESSAGE_IDLE_WAIT_MS)),
+				]).catch(() => undefined);
+			}
+			const deliverAs = effectiveOptions.triggerTurn
+				? (effectiveOptions.deliverAs ?? "followUp")
+				: session.isIdle
+					? undefined
+					: "nextTurn";
+			await session.sendCustomMessage(
+				{ customType: message.customType, content: message.content, display: true, details: message.details },
+				{ ...effectiveOptions, deliverAs },
+			);
+			await this.ensureSessionFile(id);
+		} finally {
+			if (parked) await this.dispose(id);
+		}
 	}
 
 	/**
@@ -1380,16 +1465,42 @@ export class PiSessionStore {
 		eventId: string,
 		message: { customType: string; content: string; details?: Record<string, unknown> },
 		options: { triggerTurn: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
-	): Promise<boolean> {
+	): Promise<DurableCustomMessageDisposition> {
 		return this.serializeCustomEvent(async () => {
-			const session = await this.open(id);
-			if (this.hasCustomEvent(session, eventId)) return false;
-			await this.deliverCustomMessage(id, {
-				...message,
-				details: { ...(message.details ?? {}), eventId },
-			}, options);
-			this.deliveredCustomEvents.add(eventId);
-			return true;
+			const deliver = async (): Promise<DurableCustomMessageDisposition> => {
+				const session = await this.open(id);
+				if (this.hasCustomEvent(session, eventId)) return "duplicate";
+				await this.deliverCustomMessageUnlocked(id, {
+					...message,
+					details: { ...(message.details ?? {}), eventId },
+				}, options);
+				this.deliveredCustomEvents.add(eventId);
+				return "delivered";
+			};
+			if (!options.triggerTurn) return deliver();
+			try {
+				return await this.withActiveContextLifecycle(id, deliver);
+			} catch (err) {
+				if (!(err instanceof Error) || !err.message.includes("所属项目未激活")) throw err;
+				// A durable wake-up that loses the workspace-switch race remains pending.
+				// Preserve a separately-deduped audit fact, but never consume the real
+				// eventId: reactivation must still be able to deliver the actual trigger.
+				const auditEventId = `${eventId}:deferred-audit`;
+				const parked = Boolean((await this.teamsStore?.contextForSession(id))?.active === false);
+				try {
+					const session = await this.open(id);
+					if (!this.hasCustomEvent(session, auditEventId)) {
+						await this.deliverCustomMessageUnlocked(id, {
+							...message,
+							details: { ...(message.details ?? {}), eventId: auditEventId, deferredEventId: eventId },
+						}, { triggerTurn: false });
+						this.deliveredCustomEvents.add(auditEventId);
+					}
+				} finally {
+					if (parked) await this.dispose(id);
+				}
+				return "deferred";
+			}
 		});
 	}
 
@@ -1400,15 +1511,20 @@ export class PiSessionStore {
 		message: { customType: string; content: string; details?: Record<string, unknown> },
 	): Promise<boolean> {
 		return this.serializeCustomEvent(async () => {
-			const session = await this.open(id);
-			if (this.hasCustomEvent(session, eventId)) return false;
-			this.appendProjectionToSession(session, {
-				...message,
-				details: { ...(message.details ?? {}), eventId },
-			});
-			await this.ensureSessionFile(id);
-			this.deliveredCustomEvents.add(eventId);
-			return true;
+			const parked = Boolean((await this.teamsStore?.contextForSession(id))?.active === false);
+			try {
+				const session = await this.open(id);
+				if (this.hasCustomEvent(session, eventId)) return false;
+				this.appendProjectionToSession(session, {
+					...message,
+					details: { ...(message.details ?? {}), eventId },
+				});
+				await this.ensureSessionFile(id);
+				this.deliveredCustomEvents.add(eventId);
+				return true;
+			} finally {
+				if (parked) await this.dispose(id);
+			}
 		});
 	}
 
@@ -1425,26 +1541,31 @@ export class PiSessionStore {
 	): Promise<boolean> {
 		try {
 			return await this.serializeToolRepair(id, async () => {
-				const session = await this.open(id);
-				const messages = session.sessionManager.getBranch()
-					.filter((entry) => entry.type === "message")
-					.map((entry) => entry.message) as Array<{ role?: string; toolCallId?: string; content?: unknown }>;
-				if (messages.some((message) => message.role === "toolResult" && message.toolCallId === input.toolCallId)) return true;
-				let actualToolName: string | undefined;
-				for (const message of messages) {
-					if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
-					const block = message.content.find((candidate) =>
-						Boolean(candidate) && typeof candidate === "object" && (candidate as { type?: unknown }).type === "toolCall" && (candidate as { id?: unknown }).id === input.toolCallId,
-					) as { name?: unknown } | undefined;
-					if (typeof block?.name === "string") {
-						actualToolName = block.name;
-						break;
+				const parked = Boolean((await this.teamsStore?.contextForSession(id))?.active === false);
+				try {
+					const session = await this.open(id);
+					const messages = session.sessionManager.getBranch()
+						.filter((entry) => entry.type === "message")
+						.map((entry) => entry.message) as Array<{ role?: string; toolCallId?: string; content?: unknown }>;
+					if (messages.some((message) => message.role === "toolResult" && message.toolCallId === input.toolCallId)) return true;
+					let actualToolName: string | undefined;
+					for (const message of messages) {
+						if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+						const block = message.content.find((candidate) =>
+							Boolean(candidate) && typeof candidate === "object" && (candidate as { type?: unknown }).type === "toolCall" && (candidate as { id?: unknown }).id === input.toolCallId,
+						) as { name?: unknown } | undefined;
+						if (typeof block?.name === "string") {
+							actualToolName = block.name;
+							break;
+						}
 					}
+					if (!actualToolName) return false;
+					const wrote = this.appendRecoveredToolResult(session, { ...input, toolName: actualToolName, isError: input.isError ?? true });
+					if (wrote) await this.ensureSessionFile(id);
+					return wrote;
+				} finally {
+					if (parked) await this.dispose(id);
 				}
-				if (!actualToolName) return false;
-				const wrote = this.appendRecoveredToolResult(session, { ...input, toolName: actualToolName, isError: input.isError ?? true });
-				if (wrote) await this.ensureSessionFile(id);
-				return wrote;
 			});
 		} catch (err) {
 			this.debugLog?.(`appendToolResultIfPending failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -1462,6 +1583,7 @@ export class PiSessionStore {
 	 * stays memory-only, as before.
 	 */
 	async ensureSessionFile(id: string): Promise<void> {
+		const parked = Boolean((await this.teamsStore?.contextForSession(id))?.active === false);
 		try {
 			const session = await this.open(id);
 			const sm = session.sessionManager as unknown as {
@@ -1478,6 +1600,8 @@ export class PiSessionStore {
 			}
 		} catch {
 			// memory-only fallback
+		} finally {
+			if (parked) await this.dispose(id);
 		}
 	}
 

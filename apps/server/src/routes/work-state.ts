@@ -33,6 +33,7 @@ export function registerWorkStateRoutes(
 		if (err instanceof WorkStateConflictError) return reply.code(409).send({ error: err.message, current: err.current, code: "stale_goal_state" });
 		if (err instanceof WorkStateOperationConflictError) return reply.code(409).send({ error: err.message, code: err.code });
 		const message = err instanceof Error ? err.message : String(err);
+		if (message.includes("所属项目未激活")) return reply.code(409).send({ error: "session_context_inactive" });
 		return reply.code(message.includes("not found") || message.includes("不存在") ? 404 : 400).send({ error: message });
 	};
 	const publicDelegation = (item: Awaited<ReturnType<AgentRuntime["listDelegations"]>>[number]) => ({
@@ -258,10 +259,12 @@ export function registerWorkStateRoutes(
 			await requireOwnedSession(req.params.id);
 			if (!req.body.expectedGoalId?.trim()) return reply.code(400).send({ error: "恢复 Goal 需要 expectedGoalId" });
 			const key = idempotencyKey(req.headers as Record<string, unknown>);
-			const workState = await workStates.resumeGoal(req.params.id, req.body.expectedRevision, {
-				ownerId: req.body.ownerId?.trim() || "user",
-				leaseMs: req.body.leaseMs,
-			}, key, req.body.expectedGoalId);
+			const workState = await sessions.withActiveContextLifecycle(req.params.id, () =>
+				workStates.resumeGoal(req.params.id, req.body.expectedRevision, {
+					ownerId: req.body.ownerId?.trim() || "user",
+					leaseMs: req.body.leaseMs,
+				}, key, req.body.expectedGoalId),
+			);
 			return { workState };
 		} catch (err) { return sendError(reply, err) }
 	});
@@ -312,9 +315,14 @@ export function registerWorkStateRoutes(
 			const answer = req.body?.answer?.trim();
 			if (!answer) return reply.code(400).send({ error: "answer 必填" });
 			const key = idempotencyKey(req.headers as Record<string, unknown>);
-			const decision = await workStates.answerDecision(req.params.id, answer, req.body?.grantedAuthorizationScope, key);
+			const pending = await workStates.getDecision(req.params.id);
+			if (!pending) return reply.code(404).send({ error: "DecisionRequest 不存在" });
+			await requireOwnedSession(pending.sessionId);
+			const decision = await sessions.withActiveContextLifecycle(pending.sessionId, () =>
+				workStates.answerDecision(req.params.id, answer, req.body?.grantedAuthorizationScope, key),
+			);
 			const eventId = `decision-answered:${decision.goalId}:${decision.id}`;
-			await sessions.appendCustomMessageIfAbsent(
+			const disposition = await sessions.appendCustomMessageIfAbsent(
 				decision.sessionId,
 				eventId,
 				{
@@ -324,7 +332,7 @@ export function registerWorkStateRoutes(
 				},
 				{ triggerTurn: true, deliverAs: "followUp" },
 			);
-			await workStates.markOutboxDelivered(eventId);
+			if (disposition !== "deferred") await workStates.markOutboxDelivered(eventId);
 			return { decision };
 		} catch (err) {
 			return sendError(reply, err);

@@ -139,7 +139,7 @@ async function makeStack(variant: "completed" | "failed" | "needs_input", manage
 		{ cwd: window.cwdSnapshot, env: {} },
 	);
 	assert.equal(delegated.status, "needs_input");
-	return { invoker, interactionId: delegated.interaction!.id, delegationId: delegated.delegation.id, sent, window };
+	return { invoker, interactionId: delegated.interaction!.id, delegationId: delegated.delegation.id, sent, window, teams, runtime };
 }
 
 const approve = {
@@ -147,6 +147,15 @@ const approve = {
 	revision: 0,
 	responses: [{ requestId: "perm-1", action: "approve", scope: "once" }],
 };
+
+test("parked manager Session 的待审批 Run 不得恢复", async () => {
+	const { invoker, interactionId, teams, runtime } = await makeStack("completed");
+	const workspace = await teams.workspaces.createManaged("other-project");
+	await teams.replaceWindowWorkspace("solo", workspace.id, "manager-other");
+
+	await assert.rejects(() => invoker.respond(interactionId, approve), /审批所属项目未激活/);
+	assert.equal((await runtime.getInteraction(interactionId))?.status, "pending", "拒绝必须发生在消费审批或调用 Driver 之前");
+});
 
 /** 受理即返回后，结果扇出在后台续跑：轮询直到消息到齐。 */
 async function waitForSent(sent: Sent[], count: number): Promise<void> {

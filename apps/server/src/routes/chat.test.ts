@@ -111,6 +111,41 @@ test("GET /api/sessions/:id/messages 对不存在的 Session 返回 404", async 
 	await app.close();
 });
 
+test("停驻项目的 Session 拒绝消息写入，切回前不会误用当前项目 cwd", async () => {
+	const { app, sessions, teams } = await makeStack();
+	const solo = await teams.ensureSoloWindow(
+		(workspaceId, cwd) => sessions.create(undefined, { type: "solo", members: [], workspaceId, cwd }),
+		async (id) => (await sessions.list()).some((session) => session.id === id),
+	);
+	const workspace = await teams.workspaces.createManaged("parked-chat");
+	const target = await teams.contextForWorkspace(workspace.id);
+	const targetSession = await sessions.create(undefined, {
+		type: "solo",
+		members: [],
+		workspaceId: workspace.id,
+		cwd: target.cwdSnapshot,
+	});
+	await teams.replaceWindowWorkspace(solo.id, workspace.id, targetSession.id, solo);
+
+	const res = await app.inject({
+		method: "POST",
+		url: `/api/sessions/${solo.activeSession}/messages`,
+		payload: { content: "不应写入未激活项目" },
+	});
+	assert.equal(res.statusCode, 409, res.body);
+	assert.deepEqual(res.json(), { error: "session_context_inactive" });
+	await sessions.sendCustomMessage(
+		solo.activeSession,
+		{ customType: "pudding:late_audit", content: "迟到终态只记审计" },
+		{ triggerTurn: true, deliverAs: "followUp" },
+	);
+	assert.equal(sessions.isOpen(solo.activeSession), false, "parked 审计写入后必须卸载，不能驻留或唤醒模型");
+	const persisted = (await sessions.list()).find((session) => session.id === solo.activeSession)!;
+	assert.match(readFileSync(persisted.sessionFile, "utf8"), /pudding:late_audit/);
+	await sessions.disposeAll();
+	await app.close();
+});
+
 test("POST /abort 在服务端未确认运行时返回可见失败而非假成功", async () => {
 	const { app, sessions } = await makeStack();
 	const summary = await sessions.create();

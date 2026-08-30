@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
 	PromptInput,
@@ -164,6 +164,7 @@ function ComposerInner({
 	onStop,
 	onGoalCommand,
 	onOpenWorkspace,
+	draft,
 }: {
 	sessionId: string;
 	disabled: boolean;
@@ -182,8 +183,22 @@ function ComposerInner({
 	onStop: () => void | Promise<void>;
 	onGoalCommand: (initialGoal: string) => void;
 	onOpenWorkspace: () => void;
+	draft?: { id: number; content: string };
 }) {
 	const { textInput, attachments } = usePromptInputController();
+	const handledDraftId = useRef<number | null>(null);
+	useEffect(() => {
+		if (!draft || handledDraftId.current === draft.id) return;
+		handledDraftId.current = draft.id;
+		const current = textInput.value.trimEnd();
+		const next = current ? `${current}\n${draft.content}` : draft.content;
+		textInput.setInput(next);
+		requestAnimationFrame(() => {
+			const textarea = document.querySelector<HTMLTextAreaElement>(".home-composer-textarea");
+			textarea?.focus();
+			textarea?.setSelectionRange(next.length, next.length);
+		});
+	}, [draft, textInput]);
 	const [skillCommands, setSkillCommands] = useState<SessionSlashCommand[]>([]);
 	useEffect(() => {
 		let cancelled = false;
@@ -325,6 +340,7 @@ export function Composer({
 	onGoalCommand,
 	onOpenWorkspace,
 	scrollButtonHostRef,
+	draft,
 }: {
 	sessionId: string;
 	disabled: boolean;
@@ -346,6 +362,7 @@ export function Composer({
 	onGoalCommand: (initialGoal: string) => void;
 	onOpenWorkspace: () => void;
 	scrollButtonHostRef?: (node: HTMLDivElement | null) => void;
+	draft?: { id: number; content: string };
 }) {
 	return (
 		<div className="home-composer-wrap">
@@ -370,6 +387,7 @@ export function Composer({
 						onStop={onStop}
 						onGoalCommand={onGoalCommand}
 						onOpenWorkspace={onOpenWorkspace}
+						draft={draft}
 					/>
 				</PromptInputProvider>
 			</div>

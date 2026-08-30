@@ -17,6 +17,7 @@ function directWindow(overrides: Partial<WindowConfig> = {}): WindowConfig {
 		cwdSnapshot: "/tmp",
 		createdAt: new Date(0).toISOString(),
 		...overrides,
+		parkedContexts: overrides.parkedContexts ?? {},
 	};
 }
 

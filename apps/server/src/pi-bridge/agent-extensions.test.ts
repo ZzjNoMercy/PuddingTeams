@@ -1040,7 +1040,7 @@ test("manager 拉人: group invite_to_group 加入新成员，roster 重算后�
 	assert.deepEqual((await store.getWindow(window.id))!.members, ["alpha", "beta", "gamma"], "重复拉人不改动成员");
 });
 
-test("solo 派活: worker 单聊绑在其他项目时复用并原地切换到 solo 当前项目", async () => {
+test("solo 派活: worker 单聊绑在其他项目时保留原窗口，并为当前项目创建独立单聊", async () => {
 	const { store, cwd } = await makeTeamsWithCwd([agentConfig("alpha")]);
 	const invoker = await makeInvoker(store, "alpha");
 	// solo 单例（无项目，默认 cwd）；alpha 的单聊绑在项目 A。
@@ -1120,12 +1120,15 @@ test("solo 派活: worker 单聊绑在其他项目时复用并原地切换到 so
 	);
 	const details = result.details as { windowId?: string };
 	await new Promise<void>((resolve) => setImmediate(resolve));
-	assert.equal(details.windowId, direct.id, "必须复用既有单聊，不得按项目另开窗口");
-	const after = (await store.getWindow(direct.id))!;
-	assert.equal(after.workspaceId, undefined, "复用后窗口必须已原地切到 solo 当前上下文（无项目）");
-	assert.deepEqual(createdIds, ["sess-new-1"], "只发生原地切换的一次会话重建，不得走 ensureDirectWindow 新建窗口");
-	assert.deepEqual(removedIds, ["sess-alpha"], "原地切换后旧会话被清理，新会话成为窗口活跃会话");
-	assert.equal((await store.listWindows()).filter((w) => w.type === "direct" && w.members[0] === "alpha").length, 1, "同一 worker 仍然只有一个单聊");
+	assert.notEqual(details.windowId, direct.id, "不同项目必须使用不同单聊窗口，不能挪用旧窗口");
+	const target = (await store.getWindow(details.windowId!))!;
+	assert.equal(target.workspaceId, undefined, "新单聊必须绑定 solo 当前上下文（未选项目）");
+	const preserved = (await store.getWindow(direct.id))!;
+	assert.equal(preserved.workspaceId, wsA.id, "原项目单聊必须保留原绑定");
+	assert.equal(preserved.activeSession, "sess-alpha", "原项目 Session 历史不得被替换");
+	assert.deepEqual(createdIds, ["sess-new-1"], "当前项目只创建一个新的单聊 Session");
+	assert.deepEqual(removedIds, [], "切换项目不得删除旧项目 Session");
+	assert.equal((await store.listWindows()).filter((w) => w.type === "direct" && w.members[0] === "alpha").length, 2, "同一 worker 可按项目拥有独立单聊");
 
 	const visibleAssign = visibleMessages.find((item) =>
 		item.message.customType === "pudding:task_assign" && item.message.details?.taskId === "call-1"
@@ -1140,7 +1143,7 @@ test("solo 派活: worker 单聊绑在其他项目时复用并原地切换到 so
 	assert.equal(enriched.message.customType, "pudding:task_assign");
 	assert.equal(enriched.message.details?.taskId, "call-1");
 	assert.equal(enriched.message.details?.from, "solo");
-	assert.equal(enriched.message.details?.windowId, direct.id);
+	assert.equal(enriched.message.details?.windowId, target.id);
 	assert.equal(enriched.message.details?.delegationId, (result.details as { delegationId?: string }).delegationId);
 	assert.equal(enriched.message.details?.processView, true);
 	assert.equal(enriched.message.details?.sessionHandle, "alpha-sess");

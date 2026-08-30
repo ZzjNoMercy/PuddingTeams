@@ -35,12 +35,12 @@ import {
 	switchRoomWorkspace,
 	updateRoom,
 } from "@/lib/api";
-import { agentDisplayName, type ChatStatus, type RoomSession, type RoomSummary, type WorkspaceRecord } from "@/lib/types";
+import { agentDisplayName, type ChatMessage, type ChatStatus, type RoomSession, type RoomSummary, type WorkspaceRecord } from "@/lib/types";
 import { Composer } from "./composer";
 import { computeSessionStats } from "@/lib/session-stats";
 import { delegateWorker, groupForRender, isDelegateCall } from "@/lib/events";
 import { useAgentLabels } from "@/lib/avatars";
-import { AssistantGroup, Message } from "./message";
+import { AssistantGroup, Message, MessageQuickActionProvider } from "./message";
 import { ManagerAvatar, MemberStack, WorkerAvatar } from "./worker-avatar";
 import { DirectoryPickerDialog } from "./directory-picker-dialog";
 import { WorkspaceTrustDialog, needsTrustDecision } from "./workspace-trust-dialog";
@@ -57,6 +57,127 @@ function AtBottomReporter({ onChange }: { onChange: (atBottom: boolean) => void 
 	const { isAtBottom } = useStickToBottomContext();
 	useEffect(() => onChange(isAtBottom), [isAtBottom, onChange]);
 	return null;
+}
+
+type QueryAxisItem = Pick<ChatMessage, "id" | "content">;
+
+/**
+ * Query 输入轴：把每轮用户输入映射成一枚可跳转刻度。当前刻度随聊天滚动
+ * 自动更新；使用当前 Conversation 自己的 viewport，避免与执行过程抽屉串台。
+ */
+function QueryInputAxis({ items }: { items: QueryAxisItem[] }) {
+	const axisRef = useRef<HTMLElement>(null);
+	const [activeId, setActiveId] = useState(items.at(-1)?.id ?? "");
+	const [preview, setPreview] = useState<{ content: string; index: number; top: number } | null>(null);
+
+	useEffect(() => {
+		if (items.length < 2) return;
+		const root = axisRef.current?.closest('[role="log"]');
+		if (!root) return;
+		const scroller = root.querySelector<HTMLElement>(".conversation-scroll-viewport");
+		if (!scroller) return;
+		let frame = 0;
+		const update = () => {
+			cancelAnimationFrame(frame);
+			frame = requestAnimationFrame(() => {
+				const viewport = scroller.getBoundingClientRect();
+				const anchor = viewport.top + Math.min(190, viewport.height * 0.34);
+				const targets = Array.from(root.querySelectorAll<HTMLElement>("[data-query-axis-id]"));
+				if (targets.length === 0) return;
+				let current = targets[0]!;
+				if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 4) {
+					current = targets[targets.length - 1]!;
+				} else {
+					for (const target of targets) {
+						if (target.getBoundingClientRect().top <= anchor) current = target;
+						else break;
+					}
+				}
+				setActiveId(current.dataset.queryAxisId ?? "");
+			});
+		};
+		update();
+		scroller.addEventListener("scroll", update, { passive: true });
+		const observer = new ResizeObserver(update);
+		observer.observe(scroller);
+		return () => {
+			cancelAnimationFrame(frame);
+			scroller.removeEventListener("scroll", update);
+			observer.disconnect();
+		};
+	}, [items]);
+
+	useEffect(() => {
+		const active = Array.from(axisRef.current?.querySelectorAll<HTMLElement>("[data-axis-target]") ?? [])
+			.find((element) => element.dataset.axisTarget === activeId);
+		const rail = axisRef.current?.querySelector<HTMLElement>(".home-query-axis-rail");
+		if (!active || !rail) return;
+		const top = active.offsetTop;
+		const bottom = top + active.offsetHeight;
+		if (top < rail.scrollTop) rail.scrollTop = top;
+		else if (bottom > rail.scrollTop + rail.clientHeight) rail.scrollTop = bottom - rail.clientHeight;
+	}, [activeId]);
+
+	if (items.length < 2) return null;
+
+	const jumpTo = (id: string) => {
+		const root = axisRef.current?.closest('[role="log"]');
+		const target = Array.from(root?.querySelectorAll<HTMLElement>("[data-query-axis-id]") ?? [])
+			.find((element) => element.dataset.queryAxisId === id);
+		if (!target) return;
+		target.scrollIntoView({
+			behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+			block: "start",
+		});
+	};
+	const showPreview = (target: HTMLButtonElement, content: string, index: number) => {
+		const axis = axisRef.current?.getBoundingClientRect();
+		if (!axis) return;
+		const tick = target.getBoundingClientRect();
+		setPreview({ content, index, top: tick.top - axis.top + tick.height / 2 });
+	};
+
+	return (
+		<nav ref={axisRef} className="home-query-axis" aria-label={`Query 输入轴，共 ${items.length} 条`}>
+			<div className="home-query-axis-rail">
+				{items.map((item, index) => {
+					const active = item.id === activeId;
+					const summary = item.content.replace(/\s+/g, " ").trim() || `Query ${index + 1}`;
+					const previewDistance = preview ? Math.abs(preview.index - index) : null;
+					const proximityClass = previewDistance === 0
+						? " is-preview"
+						: previewDistance === 1
+							? " is-near-1"
+							: previewDistance === 2
+								? " is-near-2"
+								: "";
+					return (
+						<button
+							key={item.id}
+							type="button"
+							className={`home-query-axis-tick${active ? " is-active" : ""}${proximityClass}`}
+							data-axis-target={item.id}
+							onClick={() => jumpTo(item.id)}
+							onMouseEnter={(event) => showPreview(event.currentTarget, summary, index)}
+							onMouseLeave={() => setPreview(null)}
+							onFocus={(event) => showPreview(event.currentTarget, summary, index)}
+							onBlur={() => setPreview(null)}
+							aria-current={active ? "step" : undefined}
+							aria-label={`跳转到 Query ${index + 1}：${summary.slice(0, 48)}`}
+						>
+							<span className="home-query-axis-mark" />
+						</button>
+					);
+				})}
+			</div>
+			{preview ? (
+				<span className="home-query-axis-tooltip" role="tooltip" style={{ top: preview.top }}>
+					<small>Query {String(preview.index + 1).padStart(2, "0")}</small>
+					<span>{preview.content}</span>
+				</span>
+			) : null}
+		</nav>
+	);
 }
 
 function statusLabelOf(status: ChatStatus): string {
@@ -143,11 +264,20 @@ function SessionChat({
 			startedAt: message.timestamp,
 			title: message.content.replace(/\s+/g, " ").trim().slice(0, 48) || "用户消息",
 		})), [messages]);
+	const queryAxisItems = useMemo<QueryAxisItem[]>(() => messages
+		.filter((message) => message.role === "user" || (message.role === "custom" && message.customType === "pudding:user_message"))
+		.map(({ id, content }) => ({ id, content })), [messages]);
 	const [goalCreateOpen, setGoalCreateOpen] = useState(false);
 	const [goalDraft, setGoalDraft] = useState("");
 	const [hasGoal, setHasGoal] = useState(false);
 	const [scrollButtonHost, setScrollButtonHost] = useState<HTMLDivElement | null>(null);
 	const [atBottom, setAtBottom] = useState(true);
+	const [composerDraft, setComposerDraft] = useState<{ id: number; content: string }>();
+	const composerDraftId = useRef(0);
+	const draftFromMessage = useCallback((content: string) => {
+		composerDraftId.current += 1;
+		setComposerDraft({ id: composerDraftId.current, content });
+	}, []);
 	useEffect(() => onStatus(status), [status, onStatus]);
 	const openGoalCommand = useCallback((initialGoal: string) => {
 		setGoalDraft(initialGoal);
@@ -224,31 +354,34 @@ function SessionChat({
 					runtimeView={runtimeView}
 					onRuntimeViewChange={onRuntimeViewChange}
 				/>
-				<Conversation initial="instant" resize={layoutReady ? "smooth" : "instant"}>
-					<AtBottomReporter onChange={setAtBottom} />
-					<ConversationContent className="home-message-column">
-						<div className="home-session-marker"><span />{sessionLabel}{sessionModifiedAt ? ` · ${compactDay(sessionModifiedAt)}` : ""}<span /></div>
-						{messages.length === 0 ? (
-							<div className="flex flex-1 items-center justify-center pt-20 text-sm text-muted-foreground">
-								{emptyHint ?? "开始和 pi manager 对话"}
-							</div>
-						) : (
-							groupForRender(messages).map((item) =>
-								"kind" in item ? (
-									<AssistantGroup key={item.id} roomId={roomId} messages={item.messages} windowType={windowType} onOpenWindow={onOpenWindow} />
-								) : (
-									<Message key={item.id} roomId={roomId} message={item} windowType={windowType} onOpenWindow={onOpenWindow} resolvedTaskIds={resolvedTaskIds} />
-								),
-							)
-						)}
-					</ConversationContent>
-					<ConversationScrollButton
-						portalTarget={scrollButtonHost}
-						className="home-scroll-to-bottom"
-						aria-label="回到底部"
-						title="回到底部"
-					/>
-				</Conversation>
+				<MessageQuickActionProvider onDraft={draftFromMessage}>
+					<Conversation initial="instant" resize={layoutReady ? "smooth" : "instant"}>
+						<AtBottomReporter onChange={setAtBottom} />
+						<QueryInputAxis items={queryAxisItems} />
+						<ConversationContent className="home-message-column">
+							<div className="home-session-marker"><span />{sessionLabel}{sessionModifiedAt ? ` · ${compactDay(sessionModifiedAt)}` : ""}<span /></div>
+							{messages.length === 0 ? (
+								<div className="flex flex-1 items-center justify-center pt-20 text-sm text-muted-foreground">
+									{emptyHint ?? "开始和 pi manager 对话"}
+								</div>
+							) : (
+								groupForRender(messages).map((item) =>
+									"kind" in item ? (
+										<AssistantGroup key={item.id} roomId={roomId} messages={item.messages} windowType={windowType} onOpenWindow={onOpenWindow} />
+									) : (
+										<Message key={item.id} roomId={roomId} message={item} windowType={windowType} onOpenWindow={onOpenWindow} resolvedTaskIds={resolvedTaskIds} />
+									),
+								)
+							)}
+						</ConversationContent>
+						<ConversationScrollButton
+							portalTarget={scrollButtonHost}
+							className="home-scroll-to-bottom"
+							aria-label="回到底部"
+							title="回到底部"
+						/>
+					</Conversation>
+				</MessageQuickActionProvider>
 				{blocked ? (
 					<div className="border-t border-destructive/20 bg-destructive/5 px-4 py-2 text-center text-xs text-destructive">
 						项目路径已失效，重新绑定或切换项目后才能继续对话与派活。
@@ -273,6 +406,7 @@ function SessionChat({
 					onGoalCommand={openGoalCommand}
 					onOpenWorkspace={onOpenWorkspace}
 					scrollButtonHostRef={setScrollButtonHost}
+					draft={composerDraft}
 				/>
 			</div>
 			{!layoutReady ? (
@@ -547,7 +681,11 @@ export function ChatPane({
 			} else {
 				onOpenWindow?.(result.room.id);
 			}
-			toast.success(mode === "in_place" ? "已切换项目并开始新会话" : result.existed ? "已打开已有单聊" : "已创建新对话");
+			toast.success(
+				mode === "in_place"
+					? result.restored ? "已切换项目并恢复历史会话" : "已切换项目并开始新会话"
+					: result.existed ? "已打开已有对话" : "已创建新对话",
+			);
 		},
 		[roomId, onRoomUpdated, onOpenWindow],
 	);
@@ -933,19 +1071,14 @@ export function ChatPane({
 						<InfoIcon aria-hidden="true" />
 						<p>
 							{type === "solo"
-								? "切换项目会停止当前任务，并开始一个新会话。"
-								: `“${newWindowLabel}”会保留当前对话；“替换当前”会停止当前任务，并开始一个新会话。`}
+								? "切换会停止当前任务并保存本项目会话；再次切回时自动恢复。"
+								: `“${newWindowLabel}”会打开目标项目的已有对话或创建新对话，当前对话会保留。`}
 						</p>
 					</div>
 					<DialogFooter className="workspace-switch-footer">
 						<Button type="button" variant="ghost" onClick={() => setWorkspaceOpen(false)}>取消</Button>
-						{type !== "solo" ? (
-							<Button type="button" variant="outline" disabled={switchingWorkspace || !workspaceTargetReady} onClick={() => void saveWorkspaceSwitch("in_place")}>
-								替换当前
-							</Button>
-						) : null}
 						<Button type="button" disabled={switchingWorkspace || !workspaceTargetReady} onClick={() => void saveWorkspaceSwitch(type === "solo" ? "in_place" : "new_window")}>
-							{switchingWorkspace ? "处理中…" : type === "solo" ? "切换并开始新会话" : newWindowLabel}
+							{switchingWorkspace ? "处理中…" : type === "solo" ? "切换项目" : newWindowLabel}
 						</Button>
 					</DialogFooter>
 				</DialogContent>

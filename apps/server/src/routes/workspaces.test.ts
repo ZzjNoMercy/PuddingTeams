@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { mkdirSync, mkdtempSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import Fastify from "fastify";
@@ -38,7 +38,7 @@ async function makeStack(
 		open: fileOpener,
 		attachmentRoot,
 	});
-	return { app, teams, sessions, delegations, dir };
+	return { app, teams, sessions, delegations, invoker, dir };
 }
 
 test("消息附件从房间 cwd 解析并仅打开允许目录内的文件", async () => {
@@ -266,7 +266,7 @@ test("历史 cwd 失效不阻断启动，且只有可读目录才标记为可用
 });
 
 test("P3-1 API: 项目创建/最近列表与 direct Window 按 (worker, workspaceId) 隔离", async () => {
-	const { app, sessions, dir } = await makeStack();
+	const { app, teams, sessions, dir } = await makeStack();
 	const projectA = mkdtempSync(path.join(tmpdir(), "pt-route-a-"));
 	const projectB = mkdtempSync(path.join(tmpdir(), "pt-route-b-"));
 	const create = async (root: string) => {
@@ -281,7 +281,7 @@ test("P3-1 API: 项目创建/最近列表与 direct Window 按 (worker, workspac
 	const room = async (workspaceId: string) => {
 		const res = await app.inject({ method: "POST", url: "/api/rooms", payload: { type: "direct", members: ["alpha"], workspaceId } });
 		assert.equal(res.statusCode, 200, res.body);
-		return res.json() as { room: { id: string; workspace: { id: string } }; existed: boolean };
+		return res.json() as { room: { id: string; activeSession: string; workspace: { id: string } }; existed: boolean };
 	};
 	const firstA = await room(a.id);
 	const againA = await room(a.id);
@@ -298,6 +298,35 @@ test("P3-1 API: 项目创建/最近列表与 direct Window 按 (worker, workspac
 	assert.equal(switched.statusCode, 200, switched.body);
 	assert.equal(switched.json().room.id, firstB.room.id, "默认切换应打开已有的项目窗口，不污染原窗口");
 	assert.equal(switched.json().existed, true);
+	await sessions.ensureSessionFile(firstA.room.activeSession);
+	const directInPlace = await app.inject({
+		method: "POST",
+		url: `/api/rooms/${firstA.room.id}/switch-workspace`,
+		payload: { workspaceId: b.id, mode: "in_place" },
+	});
+	assert.equal(directInPlace.statusCode, 400, directInPlace.body);
+	assert.equal((await teams.getWindow(firstA.room.id))?.workspaceId, a.id);
+	const directInfo = (await sessions.list()).find((session) => session.id === firstA.room.activeSession);
+	assert.ok(directInfo && existsSync(directInfo.sessionFile), "拒绝 direct 原地切换不得删除原 JSONL");
+
+	await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+	const groupCreated = await app.inject({
+		method: "POST",
+		url: "/api/rooms",
+		payload: { type: "group", members: ["alpha", "beta"], workspaceId: a.id },
+	});
+	assert.equal(groupCreated.statusCode, 200, groupCreated.body);
+	const group = groupCreated.json().room as { id: string; activeSession: string };
+	await sessions.ensureSessionFile(group.activeSession);
+	const groupInPlace = await app.inject({
+		method: "POST",
+		url: `/api/rooms/${group.id}/switch-workspace`,
+		payload: { workspaceId: b.id, mode: "in_place" },
+	});
+	assert.equal(groupInPlace.statusCode, 400, groupInPlace.body);
+	assert.equal((await teams.getWindow(group.id))?.workspaceId, a.id);
+	const groupInfo = (await sessions.list()).find((session) => session.id === group.activeSession);
+	assert.ok(groupInfo && existsSync(groupInfo.sessionFile), "拒绝 group 原地切换不得删除原 JSONL");
 
 	const list = await app.inject({ method: "GET", url: "/api/workspaces" });
 	assert.equal(list.statusCode, 200);
@@ -307,39 +336,254 @@ test("P3-1 API: 项目创建/最近列表与 direct Window 按 (worker, workspac
 	void dir;
 });
 
-test("P3-1 API: 显式原地切换重建 manager Session，并可切回未选项目", async () => {
+test("P3-1 API: solo 切换项目会恢复该项目 Session，并可恢复未选项目", async () => {
 	const { app, teams, sessions, dir } = await makeStack();
 	const a = await teams.workspaces.createManaged("A");
 	const b = await teams.workspaces.createManaged("B");
-	const created = await app.inject({
+	const listed = await app.inject({ method: "GET", url: "/api/rooms" });
+	const solo = listed.json().rooms.find((room: { type: string }) => room.type === "solo") as { id: string; activeSession: string };
+
+	const enteredA = await app.inject({
 		method: "POST",
-		url: "/api/rooms",
-		payload: { type: "direct", members: ["alpha"], workspaceId: a.id },
+		url: `/api/rooms/${solo.id}/switch-workspace`,
+		payload: { workspaceId: a.id, mode: "in_place" },
 	});
-	const old = created.json().room as { id: string; activeSession: string };
-	const switched = await app.inject({
+	assert.equal(enteredA.statusCode, 200, enteredA.body);
+	assert.equal(enteredA.json().restored, false);
+	const sessionA = enteredA.json().room.activeSession as string;
+
+	const enteredB = await app.inject({
 		method: "POST",
-		url: `/api/rooms/${old.id}/switch-workspace`,
+		url: `/api/rooms/${solo.id}/switch-workspace`,
 		payload: { workspaceId: b.id, mode: "in_place" },
 	});
-	assert.equal(switched.statusCode, 200, switched.body);
-	const room = switched.json().room as { id: string; activeSession: string; sessions: unknown[]; workspace: { id: string }; workerBindings: object };
-	assert.equal(room.id, old.id);
-	assert.equal(room.workspace.id, b.id);
-	assert.notEqual(room.activeSession, old.activeSession);
-	assert.equal(room.sessions.length, 1);
-	assert.deepEqual(room.workerBindings, {});
+	assert.equal(enteredB.statusCode, 200, enteredB.body);
+	assert.notEqual(enteredB.json().room.activeSession, sessionA);
+	const persistedA = (await sessions.list()).find((session) => session.id === sessionA);
+	assert.ok(persistedA && existsSync(persistedA.sessionFile), "切走项目不得删除原 Session JSONL");
+	assert.equal((await teams.contextForSession(sessionA))?.active, false, "切走后原 Session 必须进入停驻上下文");
+
+	const restoredA = await app.inject({
+		method: "POST",
+		url: `/api/rooms/${solo.id}/switch-workspace`,
+		payload: { workspaceId: a.id, mode: "in_place" },
+	});
+	assert.equal(restoredA.statusCode, 200, restoredA.body);
+	assert.equal(restoredA.json().restored, true);
+	assert.equal(restoredA.json().room.activeSession, sessionA);
 
 	const detached = await app.inject({
 		method: "POST",
-		url: `/api/rooms/${old.id}/switch-workspace`,
+		url: `/api/rooms/${solo.id}/switch-workspace`,
 		payload: { workspaceId: null, mode: "in_place" },
 	});
 	assert.equal(detached.statusCode, 200, detached.body);
 	const plain = detached.json().room as { workspace: null; cwdSnapshot: string; activeSession: string };
 	assert.equal(plain.workspace, null);
 	assert.equal(plain.cwdSnapshot, realpathSync(dir));
-	assert.notEqual(plain.activeSession, room.activeSession);
+	assert.equal(plain.activeSession, solo.activeSession);
+	await sessions.disposeAll();
+	await app.close();
+});
+
+test("solo 恢复在提交前校验目标 JSONL cwd，损坏时保留当前项目", async () => {
+	const { app, teams, sessions, dir } = await makeStack();
+	const a = await teams.workspaces.createManaged("guard-A");
+	const b = await teams.workspaces.createManaged("guard-B");
+	const listed = await app.inject({ method: "GET", url: "/api/rooms" });
+	const solo = listed.json().rooms.find((room: { type: string }) => room.type === "solo") as { id: string };
+	const enteredA = await app.inject({
+		method: "POST",
+		url: `/api/rooms/${solo.id}/switch-workspace`,
+		payload: { workspaceId: a.id, mode: "in_place" },
+	});
+	const sessionA = enteredA.json().room.activeSession as string;
+	const enteredB = await app.inject({
+		method: "POST",
+		url: `/api/rooms/${solo.id}/switch-workspace`,
+		payload: { workspaceId: b.id, mode: "in_place" },
+	});
+	assert.equal(enteredB.statusCode, 200, enteredB.body);
+	const sessionB = enteredB.json().room.activeSession as string;
+	const infoA = (await sessions.list()).find((session) => session.id === sessionA)!;
+	await sessions.open(sessionA);
+	assert.equal(sessions.isOpen(sessionA), true, "测试必须覆盖驻留缓存不能绕过 JSONL 强校验");
+	const lines = readFileSync(infoA.sessionFile, "utf8").trimEnd().split("\n");
+	const header = JSON.parse(lines[0]!) as { cwd: string };
+	header.cwd = realpathSync(dir);
+	lines[0] = JSON.stringify(header);
+	writeFileSync(infoA.sessionFile, `${lines.join("\n")}\n`, "utf8");
+
+	const rejected = await app.inject({
+		method: "POST",
+		url: `/api/rooms/${solo.id}/switch-workspace`,
+		payload: { workspaceId: a.id, mode: "in_place" },
+	});
+	assert.equal(rejected.statusCode, 400, rejected.body);
+	assert.match(rejected.body, /Session cwd does not match its Window context/);
+	const current = (await teams.getWindow(solo.id))!;
+	assert.equal(current.workspaceId, b.id, "校验失败不得先提交目标上下文");
+	assert.equal(current.activeSession, sessionB);
+	assert.equal((await teams.contextForSession(sessionA))?.active, false);
+	await sessions.disposeAll();
+	await app.close();
+});
+
+test("solo 切换与消息接纳共享生命周期闸，提交后旧 Session 无法再次接纳", async () => {
+	const { app, teams, sessions, invoker } = await makeStack();
+	const workspace = await teams.workspaces.createManaged("barrier-target");
+	const listed = await app.inject({ method: "GET", url: "/api/rooms" });
+	const solo = listed.json().rooms.find((room: { type: string }) => room.type === "solo") as { id: string; activeSession: string };
+	let release!: () => void;
+	const hold = new Promise<void>((resolve) => { release = resolve; });
+	let markEntered!: () => void;
+	const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+	let admitted = false;
+	const admission = invoker.withActiveSessionLifecycle(solo.activeSession, async () => {
+		markEntered();
+		await hold;
+		admitted = true;
+	});
+	await entered;
+	let switched = false;
+	const switching = app.inject({
+		method: "POST",
+		url: `/api/rooms/${solo.id}/switch-workspace`,
+		payload: { workspaceId: workspace.id, mode: "in_place" },
+	}).then((response) => {
+		switched = true;
+		return response;
+	});
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(switched, false, "切换必须等待已进入闸门的消息完成接纳");
+	release();
+	await admission;
+	const response = await switching;
+	assert.equal(response.statusCode, 200, response.body);
+	assert.equal(admitted, true);
+	await assert.rejects(
+		() => invoker.withActiveSessionLifecycle(solo.activeSession, async () => undefined),
+		/所属项目未激活/,
+		"切换提交后旧 Session 不得重新进入消息接纳闸门",
+	);
+	await sessions.disposeAll();
+	await app.close();
+});
+
+test("solo 切换在 parking 准备失败时清理新 Session，并保持源 context active", async () => {
+	const { app, teams, sessions, invoker } = await makeStack();
+	const workspace = await teams.workspaces.createManaged("prepare-failure");
+	const listed = await app.inject({ method: "GET", url: "/api/rooms" });
+	const solo = listed.json().rooms.find((room: { type: string }) => room.type === "solo") as { id: string; activeSession: string };
+	let createdId: string | undefined;
+	let removedId: string | undefined;
+	await assert.rejects(
+		() => invoker.switchWorkspaceInPlace(
+			solo.id,
+			workspace.id,
+			async (source, cwd) => {
+				const created = await sessions.create(undefined, { type: source.type, members: source.members, workspaceId: workspace.id, cwd });
+				createdId = created.id;
+				return created;
+			},
+			async () => { throw new Error("prepare failed"); },
+			(id) => sessions.validateStoredContext(id),
+			(id) => sessions.suspend(id),
+			async (id) => { removedId = id; return sessions.remove(id); },
+		),
+		/prepare failed/,
+	);
+	assert.ok(createdId);
+	assert.equal(removedId, createdId, "create 之后任一提交前失败都必须清理 orphan Session");
+	assert.equal(sessions.isOpen(createdId!), false);
+	const current = (await teams.getWindow(solo.id))!;
+	assert.equal(current.workspaceId, undefined);
+	assert.equal(current.activeSession, solo.activeSession);
+	assert.equal((await teams.contextForSession(solo.activeSession))?.active, true);
+	await sessions.disposeAll();
+	await app.close();
+});
+
+test("内部 triggerTurn 投递输掉切换竞态后只写 parked 审计，不唤醒旧 Session", async () => {
+	const { app, teams, sessions, invoker } = await makeStack();
+	const workspace = await teams.workspaces.createManaged("internal-delivery-race");
+	const listed = await app.inject({ method: "GET", url: "/api/rooms" });
+	const solo = listed.json().rooms.find((room: { type: string }) => room.type === "solo") as { id: string; activeSession: string };
+	let continueCreate!: () => void;
+	let markSwitchInsideGate!: () => void;
+	const createHold = new Promise<void>((resolve) => { continueCreate = resolve; });
+	const switchInsideGate = new Promise<void>((resolve) => { markSwitchInsideGate = resolve; });
+	const switching = invoker.switchWorkspaceInPlace(
+		solo.id,
+		workspace.id,
+		async (source, cwd) => {
+			const created = await sessions.create(undefined, { type: source.type, members: source.members, workspaceId: workspace.id, cwd });
+			markSwitchInsideGate();
+			await createHold;
+			return created;
+		},
+		(id) => sessions.prepareForParking(id),
+		(id) => sessions.validateStoredContext(id),
+		(id) => sessions.suspend(id),
+		(id) => sessions.remove(id),
+	);
+	await switchInsideGate;
+	const delivery = sessions.sendCustomMessage(
+		solo.activeSession,
+		{ customType: "pudding:race_audit", content: "切换后的迟到终态" },
+		{ triggerTurn: true, deliverAs: "followUp" },
+	);
+	continueCreate();
+	const switched = await switching;
+	assert.equal(switched.window.workspaceId, workspace.id);
+	await delivery;
+	assert.equal((await teams.contextForSession(solo.activeSession))?.active, false);
+	assert.equal(sessions.isOpen(solo.activeSession), false, "迟到审计写完必须卸载 parked Session");
+	const oldInfo = (await sessions.list()).find((session) => session.id === solo.activeSession)!;
+	assert.match(readFileSync(oldInfo.sessionFile, "utf8"), /pudding:race_audit/);
+	await sessions.disposeAll();
+	await app.close();
+});
+
+test("durable triggerTurn 输掉切换竞态时不消费真实 eventId，等待项目恢复后重试", async () => {
+	const { app, teams, sessions, invoker } = await makeStack();
+	const workspace = await teams.workspaces.createManaged("durable-delivery-race");
+	const listed = await app.inject({ method: "GET", url: "/api/rooms" });
+	const solo = listed.json().rooms.find((room: { type: string }) => room.type === "solo") as { id: string; activeSession: string };
+	let continueCreate!: () => void;
+	let markSwitchInsideGate!: () => void;
+	const createHold = new Promise<void>((resolve) => { continueCreate = resolve; });
+	const switchInsideGate = new Promise<void>((resolve) => { markSwitchInsideGate = resolve; });
+	const switching = invoker.switchWorkspaceInPlace(
+		solo.id,
+		workspace.id,
+		async (source, cwd) => {
+			const created = await sessions.create(undefined, { type: source.type, members: source.members, workspaceId: workspace.id, cwd });
+			markSwitchInsideGate();
+			await createHold;
+			return created;
+		},
+		(id) => sessions.prepareForParking(id),
+		(id) => sessions.validateStoredContext(id),
+		(id) => sessions.suspend(id),
+		(id) => sessions.remove(id),
+	);
+	await switchInsideGate;
+	const delivery = sessions.appendCustomMessageIfAbsent(
+		solo.activeSession,
+		"durable-race",
+		{ customType: "pudding:goal_recovery", content: "恢复执行" },
+		{ triggerTurn: true, deliverAs: "followUp" },
+	);
+	continueCreate();
+	await switching;
+	assert.equal(await delivery, "deferred");
+	const oldInfo = (await sessions.list()).find((session) => session.id === solo.activeSession)!;
+	const persisted = readFileSync(oldInfo.sessionFile, "utf8");
+	assert.match(persisted, /durable-race:deferred-audit/);
+	assert.doesNotMatch(persisted, /"eventId":"durable-race"/,
+		"审计记录不得占用真实 eventId，否则恢复项目后无法重试唤醒");
+	assert.equal(sessions.isOpen(solo.activeSession), false);
 	await sessions.disposeAll();
 	await app.close();
 });

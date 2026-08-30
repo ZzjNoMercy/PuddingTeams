@@ -462,7 +462,7 @@ export function AgentsPane() {
 				key={agent.name}
 				className="ops-agent-card group relative flex min-h-40 flex-col rounded-2xl p-4 transition-all"
 			>
-				<button type="button" className="flex flex-1 flex-col text-left" onClick={() => openManage(agent)}>
+				<button type="button" className="ops-agent-main flex flex-1 flex-col text-left" onClick={() => openManage(agent)}>
 					<span className="ops-agent-avatar"><WorkerAvatar name={agent.name} size={42} /></span>
 					<div className="mt-3 min-w-0">
 						<div className="flex items-baseline gap-2">
@@ -485,7 +485,12 @@ export function AgentsPane() {
 							<MoreHorizontalIcon className="size-4" />
 						</Button>
 					</DropdownMenuTrigger>
-					<DropdownMenuContent align="end" className="w-40">
+					<DropdownMenuContent
+						align="end"
+						sideOffset={8}
+						className="ops-agent-menu w-44"
+						onCloseAutoFocus={(event) => event.preventDefault()}
+					>
 						<DropdownMenuItem onSelect={() => openManage(agent)}><Settings2Icon />配置</DropdownMenuItem>
 						<DropdownMenuItem disabled={probing === agent.name} onSelect={() => void handleProbe(agent.name)}><RefreshCwIcon />{probing === agent.name ? "探测中…" : "运行探测"}</DropdownMenuItem>
 						<DropdownMenuItem disabled={resolving} onSelect={() => void applyEnabled(agent, !(agent.enabled !== false))}><UserCheckIcon />{agent.enabled !== false ? "停用" : "启用"}</DropdownMenuItem>

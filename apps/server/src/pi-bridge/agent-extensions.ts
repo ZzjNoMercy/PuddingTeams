@@ -1272,10 +1272,9 @@ const DelegateParams = Type.Object(
 type DelegateInput = Static<typeof DelegateParams>;
 
 /**
- * solo 派活的单聊解析（用户拍板「复用并原地切项目」）：同一 worker 优先
- * 只有一个单聊。当前项目有 exact 窗口直接用；否则找该 worker 的任一单聊，
- * 无进行中任务时原地切换到 solo 当前项目（switchWorkspaceInPlace 会取消
- * 窗口内活 Run，所以忙时绝不切换）；忙或切换失败则按项目新建兜底。
+ * solo 派活的单聊解析：Workspace 是 direct Window 身份的一部分。命中同一
+ * worker + Workspace 时恢复既有窗口，否则创建独立窗口；绝不挪用另一个
+ * Workspace 的窗口或删除其 Session 历史。
  */
 async function resolveDirectWindowForDelegation(
 	deps: ManagerExtensionDeps,
@@ -1285,27 +1284,6 @@ async function resolveDirectWindowForDelegation(
 ): Promise<WindowConfig> {
 	const exact = await deps.store.findDirectWindow(agentName, workspaceId, cwd);
 	if (exact) return exact;
-	const candidate = (await deps.store.listWindows()).find((w) => w.type === "direct" && w.members[0] === agentName);
-	if (candidate && (await deps.invoker.activeDelegations(candidate.id)).length === 0) {
-		try {
-			const switched = await deps.invoker.switchWorkspaceInPlace(
-				candidate.id,
-				workspaceId,
-				(fresh, nextCwd) =>
-					deps.sessions.create(undefined, {
-						type: fresh.type,
-						members: fresh.members,
-						prompt: fresh.prompt,
-						workspaceId,
-						cwd: nextCwd,
-					}),
-				(id) => deps.sessions.remove(id),
-			);
-			return switched.window;
-		} catch {
-			// 切换失败（目录失效等）走新建兜底，不阻断派活。
-		}
-	}
 	return deps.store.ensureDirectWindow(
 		agentName,
 		workspaceId,

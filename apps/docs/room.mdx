@@ -29,13 +29,13 @@ Solo 适合“我知道目标，但不想先决定用谁”。如果你已经知
 
 这带来几条明确边界：
 
-- 同一个 Worker 只有一个单聊 Window；重复发起会打开已有窗口；
+- 同一个 Worker 在同一 Workspace 只有一个单聊 Window；重复发起会打开该项目已有窗口；
 - Worker 的 `sessionHandle` 由 Window binding 保存，用于后续 `continue`；
 - 单聊不提供群聊协作提示词；Worker 行为由自己的运行指令或上游配置决定；
 - HITL 交互、结果和执行过程直接回到当前单聊；
 - 单聊也可以设置 Session Goal，但没有 Manager WorkPlan，不伪造一层不存在的 Manager Todo。
 
-如果 Workspace、cwd 快照或 Agent 修订发生变化，旧 binding 不再安全，Runtime 会拒绝直接续接并按新会话语义处理。
+Workspace 是单聊 Window 身份的一部分。切换项目会打开该 Worker 在目标项目的已有窗口或创建新窗口，不会覆盖当前窗口。Workspace、cwd 快照或 Agent 修订不一致时，Runtime 拒绝直接续接旧 binding。
 
 ## 群聊
 
@@ -50,7 +50,8 @@ Manager 可以在执行中邀请新的已启用 Worker。删除成员、删除�
 ```text
 Window：一段长期关系
   ├─ 成员与类型
-  ├─ Workspace 与协作配置
+  ├─ 当前 Workspace 与协作配置
+  ├─ Solo 离开项目的 parked contexts
   ├─ Worker bindings
   └─ 多个 Session
 
@@ -60,7 +61,7 @@ Session：Window 中的一段连贯对话
   └─ 相关 Delegation / Decision / Artifact
 ```
 
-切换 Session 不会创建新的侧栏关系；删除 Session 也不等于删除 Window。每个 Window 至少保留一个 Session，且有一个 active Session。
+切换 Session 不会创建新的侧栏关系；删除 Session 也不等于删除 Window。每个激活的 Window context 至少保留一个 Session，且有一个 active Session。Solo 切项目只切换激活 context：离开的项目历史被停放，切回时恢复；Direct/Group 则打开项目对应 Window。
 
 ## 一次委托怎样流动
 

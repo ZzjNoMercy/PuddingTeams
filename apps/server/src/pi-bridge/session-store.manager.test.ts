@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Type } from "typebox";
@@ -274,6 +274,35 @@ test("产品验收冻结: 共享 sessionDir 可发现并恢复不同 Workspace �
 	);
 	assert.equal((await sessions.open(persisted[0]!.id)).sessionManager.getCwd(), workspaceA.canonicalPath);
 	assert.equal((await sessions.open(persisted[1]!.id)).sessionManager.getCwd(), workspaceB.canonicalPath);
+	await sessions.disposeAll();
+});
+
+test("项目会话恢复时拒绝 JSONL 记录 cwd 与绑定 Workspace 不一致", async () => {
+	const { teams, sessions, dir } = await makeStack();
+	const plain = await sessions.create();
+	const solo = await teams.ensureSoloWindow(async () => ({ id: plain.id }), async () => true);
+	await sessions.ensureSessionFile(plain.id);
+	const workspace = await teams.workspaces.createManaged("cwd-guard");
+	const project = await sessions.create(undefined, {
+		type: "solo",
+		members: [],
+		workspaceId: workspace.id,
+		cwd: workspace.canonicalPath,
+	});
+	await teams.replaceWindowWorkspace(solo.id, workspace.id, project.id, solo);
+	await sessions.ensureSessionFile(project.id);
+	await sessions.dispose(project.id);
+	await teams.replaceWindowWorkspace(solo.id, undefined, undefined, await teams.getWindow(solo.id));
+
+	const info = (await sessions.list()).find((session) => session.id === project.id)!;
+	const lines = readFileSync(info.sessionFile, "utf8").trimEnd().split("\n");
+	const header = JSON.parse(lines[0]!) as { cwd: string };
+	header.cwd = dir;
+	lines[0] = JSON.stringify(header);
+	writeFileSync(info.sessionFile, `${lines.join("\n")}\n`, "utf8");
+
+	await teams.replaceWindowWorkspace(solo.id, workspace.id, undefined, await teams.getWindow(solo.id));
+	await assert.rejects(() => sessions.open(project.id), /Session cwd does not match its Window context/);
 	await sessions.disposeAll();
 });
 

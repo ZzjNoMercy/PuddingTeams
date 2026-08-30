@@ -196,6 +196,19 @@ export class AgentInvoker {
 		return enter(0);
 	}
 
+	/** Serialize admission with workspace switching and re-check active context inside the gate. */
+	async withActiveSessionLifecycle<T>(sessionId: string, action: () => Promise<T>): Promise<T> {
+		const initial = await this.teams.contextForSession(sessionId);
+		if (!initial) return action();
+		return this.withWindowLifecycle(initial.window.id, async () => {
+			const current = await this.teams.contextForSession(sessionId);
+			if (!current || current.window.id !== initial.window.id || !current.active) {
+				throw new Error("该会话所属项目未激活，请先切换回对应项目");
+			}
+			return action();
+		});
+	}
+
 	private async envFor(agent: AgentConfig): Promise<NodeJS.ProcessEnv> {
 		const secrets = this.credentials ? await this.credentials.getSecrets(agent.name) : {};
 		return { ...process.env, ...(agent.env ?? {}), ...secrets };
@@ -203,12 +216,13 @@ export class AgentInvoker {
 
 	/** 解析当前房间 Session 对该 worker 的 handle（continue 用）。 */
 	async sessionHandleFor(windowId: string, managerSessionId: string, agent: AgentConfig): Promise<string | undefined> {
-		const [target, owner] = await Promise.all([
+		const [target, ownerContext] = await Promise.all([
 			this.teams.getWindow(windowId),
-			this.teams.windowForSession(managerSessionId),
+			this.teams.contextForSession(managerSessionId),
 		]);
-		const binding = owner?.workerBindings?.[managerSessionId]?.[agent.name];
-		if (!target || !owner || !binding) return undefined;
+		const owner = ownerContext?.window;
+		const binding = ownerContext?.workerBindings?.[managerSessionId]?.[agent.name];
+		if (!target || !owner || !ownerContext.active || !binding) return undefined;
 		const legalTarget = owner.type === "solo"
 			? target.type === "direct" && target.members.includes(agent.name)
 			: target.id === owner.id;
@@ -275,16 +289,19 @@ export class AgentInvoker {
 	}
 
 	/**
-	 * Stop every Run owned by the window (including solo→direct routed Runs),
-	 * create a manager Session from the latest window state, then commit the
-	 * workspace swap. New delegate/respond/cancel transitions share this gate.
+	 * Validate the target, quiesce and persist the source, then atomically swap
+	 * the solo context. New message/delegate/respond admissions share this gate;
+	 * the old in-memory Session is unloaded only after the commit succeeds.
 	 */
 	async switchWorkspaceInPlace(
 		windowId: string,
 		workspaceId: string | undefined,
 		createSession: (source: WindowConfig, cwd: string) => Promise<{ id: string }>,
+		prepareSessionForParking: (sessionId: string) => Promise<unknown>,
+		validateStoredSession: (sessionId: string) => Promise<unknown>,
+		suspendSession: (sessionId: string) => Promise<unknown>,
 		removeSession: (sessionId: string) => Promise<unknown>,
-	): Promise<{ window: WindowConfig; previousSessionIds: string[]; existed: boolean }> {
+	): Promise<{ window: WindowConfig; restored: boolean; existed: boolean }> {
 		const initial = await this.teams.getWindow(windowId);
 		if (!initial) throw new Error(`window not found: ${windowId}`);
 		const initialRelated = (await this.runtime.listDelegations()).filter(
@@ -295,29 +312,35 @@ export class AgentInvoker {
 			async () => {
 				const source = await this.teams.getWindow(windowId);
 				if (!source) throw new Error(`window not found: ${windowId}`);
+				if (source.type !== "solo") throw new Error("只有全局 Solo 窗口支持原地切换项目；单聊和群聊请打开项目对应窗口");
 				const target = await this.teams.contextForWorkspace(workspaceId);
 				if (source.workspaceId === workspaceId && source.cwdSnapshot === target.cwdSnapshot) {
-					return { window: source, previousSessionIds: [], existed: true };
+					return { window: source, restored: true, existed: true };
 				}
-				const related = (await this.runtime.listDelegations()).filter(
-					(item) =>
-						(item.windowId === source.id || source.sessions.includes(item.managerSessionId)) &&
-						(item.executionState === "waiting_admission" || item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling"),
-				);
-				for (const delegation of related) await this.cancelUnlocked(delegation.id);
-
-				const created = await createSession(source, target.cwdSnapshot);
-				let switched;
+				let created: { id: string } | undefined;
+				let switched: Awaited<ReturnType<TeamsStore["replaceWindowWorkspace"]>>;
 				try {
-					switched = await this.teams.replaceWindowWorkspace(source.id, workspaceId, created.id, source);
+					const parked = await this.teams.parkedWindowContext(source.id, workspaceId);
+					if (parked) {
+						for (const id of parked.sessions) await validateStoredSession(id);
+					} else {
+						created = await createSession(source, target.cwdSnapshot);
+					}
+					const related = (await this.runtime.listDelegations()).filter(
+						(item) =>
+							(item.windowId === source.id || source.sessions.includes(item.managerSessionId)) &&
+							(item.executionState === "waiting_admission" || item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling"),
+					);
+					for (const delegation of related) await this.cancelUnlocked(delegation.id);
+					for (const id of source.sessions) await prepareSessionForParking(id);
+					switched = await this.teams.replaceWindowWorkspace(source.id, workspaceId, created?.id, source);
 				} catch (err) {
-					await removeSession(created.id).catch(() => undefined);
+					if (created) await removeSession(created.id).catch(() => undefined);
 					throw err;
 				}
-				for (const id of switched.previousSessionIds) {
-					await removeSession(id).catch(() => undefined);
-				}
-				return { ...switched, existed: false };
+				for (const id of source.sessions) await Promise.resolve(suspendSession(id)).catch(() => undefined);
+				if (switched.restored && created) await removeSession(created.id).catch(() => undefined);
+				return { ...switched, existed: switched.restored };
 			},
 		);
 	}
@@ -428,6 +451,8 @@ export class AgentInvoker {
 				if (!freshManagerOwner || freshManagerOwner.id !== managerOwner.id) {
 					throw new Error("manager Session 的窗口生命周期已变化，委托被拒绝");
 				}
+				const managerContext = await this.teams.contextForSession(managerSessionId);
+				if (!managerContext?.active) throw new Error("该会话所属项目未激活，请先切换回对应项目");
 				if (params.purpose !== "verification" && window.type !== "solo" && !window.members.includes(freshAgent.name)) {
 					throw new Error(`agent「${freshAgent.name}」不是当前窗口的成员，委托被拒绝`);
 				}
@@ -435,6 +460,9 @@ export class AgentInvoker {
 				if (!driver) throw new Error(`agent「${freshAgent.name}」没有可用的 Driver（未安装对应 Connector）`);
 				this.assertBindingTransport(freshAgent, await driver.capabilities());
 				const cwd = await this.teams.workspaceFor(windowId);
+				if (managerContext.workspaceId !== window.workspaceId || managerContext.cwdSnapshot !== cwd) {
+					throw new Error("manager Session 与当前执行窗口的 Workspace 不一致，委托被拒绝");
+				}
 				const nextSession = mode === "continue" ? await this.sessionHandleFor(windowId, managerSessionId, freshAgent) : undefined;
 				let createdResolve!: () => void;
 				let createdReject!: (reason: unknown) => void;
@@ -652,6 +680,14 @@ export class AgentInvoker {
 	): Promise<AgentInvokeResult> {
 		const delegation = await this.runtime.getDelegationById(interactionId);
 		if (!delegation) throw new Error("interaction or delegation not found");
+		const managerContext = await this.teams.contextForSession(delegation.managerSessionId);
+		if (
+			!managerContext?.active ||
+			managerContext.workspaceId !== delegation.workspaceId ||
+			managerContext.cwdSnapshot !== delegation.cwdSnapshot
+		) {
+			throw new Error("该审批所属项目未激活，请先切换回对应项目");
+		}
 		const interaction = await this.runtime.getInteraction(interactionId);
 		const platformPolicy = interaction?.source === "platform_policy";
 		const replacementResponse = platformPolicy
@@ -661,21 +697,29 @@ export class AgentInvoker {
 			const replacementAgentId = typeof replacementResponse.value === "string" ? replacementResponse.value.trim() : "";
 			return this.replaceAdmissionWorker(interactionId, input, delegation, replacementAgentId, signal);
 		}
-		const managerOwner = await this.teams.windowForSession(delegation.managerSessionId);
+		const managerOwner = managerContext.window;
 		if (!managerOwner) throw new Error("manager Session 已被删除，不能继续审批");
 		const targets = await this.outcomeTargets(delegation);
 		const workerLabel = agentDisplayName((await this.teams.getAgent(delegation.agentId)) ?? { name: delegation.agentId });
 		const prepared = await this.withWindowLifecycles(
 			[delegation.windowId, managerOwner.id],
 			async () => {
-				const [currentOwner, currentTarget] = await Promise.all([
-					this.teams.windowForSession(delegation.managerSessionId),
+				const [currentContext, currentTarget] = await Promise.all([
+					this.teams.contextForSession(delegation.managerSessionId),
 					this.teams.getWindow(delegation.windowId),
 				]);
+				const currentOwner = currentContext?.window;
 				const legalTarget = currentOwner?.type === "solo"
 					? currentTarget?.type === "direct" && currentTarget.members.includes(delegation.agentId)
 					: currentTarget?.id === currentOwner?.id;
-				if (currentOwner?.id !== managerOwner.id || !currentTarget || !legalTarget) {
+				if (
+					currentOwner?.id !== managerOwner.id ||
+					!currentContext?.active ||
+					currentContext.workspaceId !== delegation.workspaceId ||
+					currentContext.cwdSnapshot !== delegation.cwdSnapshot ||
+					!currentTarget ||
+					!legalTarget
+				) {
 					throw new Error("委托所属房间或执行窗口已被删除，不能继续审批");
 				}
 				// continuing=true 表示审批已受理、worker 即将续跑（可能跑很久）；
@@ -753,20 +797,22 @@ export class AgentInvoker {
 			: (await this.replacementCandidates(interactionId)).find((item) => item.agentId === replacementAgentId);
 		if (!replayCandidate && !candidate) throw new Error("所选 Worker 已不可用或不能补足当前只读能力，请刷新后重选");
 		const originalAgent = await this.teams.getAgent(original.agentId);
-		const begun = await this.runtime.beginAdmissionReplacement(
-			interactionId,
-			{
-				requestId: input.requestId,
-				revision: input.revision,
-				responses: input.responses.map((response) => ({
-					requestId: response.requestId,
-					action: response.action as "approve" | "reject" | "answer" | "confirm",
-					scope: response.scope,
-					value: response.value,
-				})),
-			},
-			replacementAgentId,
-			{ cwd: original.cwdSnapshot, env: process.env, signal },
+		const begun = await this.withActiveSessionLifecycle(original.managerSessionId, () =>
+			this.runtime.beginAdmissionReplacement(
+				interactionId,
+				{
+					requestId: input.requestId,
+					revision: input.revision,
+					responses: input.responses.map((response) => ({
+						requestId: response.requestId,
+						action: response.action as "approve" | "reject" | "answer" | "confirm",
+						scope: response.scope,
+						value: response.value,
+					})),
+				},
+				replacementAgentId,
+				{ cwd: original.cwdSnapshot, env: process.env, signal },
+			),
 		);
 		if (begun.replayed) {
 			const application = begun.interaction.application;
@@ -1224,7 +1270,15 @@ export class AgentInvoker {
 	async cancelManagerSession(managerSessionId: string, signal?: AbortSignal): Promise<number> {
 		const candidateCount = (await this.runtime.listDelegations(undefined, managerSessionId))
 			.filter((item) => item.executionState === "waiting_admission" || item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling").length;
-		await this.closeManagerSession(managerSessionId, async () => undefined, async () => undefined, signal);
+		await this.closeManagerSession(
+			managerSessionId,
+			async () => {
+				const context = await this.teams.contextForSession(managerSessionId);
+				if (context && !context.active) throw new Error("该会话所属项目未激活，请先切换回对应项目");
+			},
+			async () => undefined,
+			signal,
+		);
 		return candidateCount;
 	}
 

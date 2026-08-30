@@ -14,7 +14,14 @@ Agent 能读写什么，不应由 Server 从哪个目录启动来决定。Puddin
 - 是否允许发现项目 `AGENTS.md`、`CLAUDE.md`、skills 和 prompts；
 - Worker Session binding 是否仍可安全续接。
 
-Window 创建 Delegation 时冻结 `workspaceId + cwdSnapshot`。后续项目切换或路径变化会使旧 binding 失效，防止 Agent 把另一个项目的 Session 上下文带进当前工作。
+Window 创建 Delegation 时冻结 `workspaceId + cwdSnapshot`。direct/group 按 Workspace 使用独立 Window；solo 切换项目时把当前 Session 列表、active Session 和 Worker bindings 按 `workspaceId + cwdSnapshot` 停放，切回后原样恢复。不同项目之间从不复用 Session binding。
+
+## 切换项目不会删除历史
+
+- Solo 切走当前项目时，在与消息/审批接纳共用的生命周期闸内先持久化 Session，再停止进行中的任务并卸载内存实例；JSONL、会话列表和 Worker bindings 全部保留，再次切回自动恢复原 active Session。
+- Direct 和 Group 不替换当前 Window，而是打开目标项目已有 Window 或创建新 Window，因此原对话始终保留。
+- 首次进入某个项目才创建新 Session。恢复在切换提交前校验 JSONL 存在且记录的 cwd 与 Workspace 快照一致；不一致时保持当前项目不变，避免半切换和跨项目上下文污染。
+- 已停放的 Session 不能接收用户消息、委托、模型修改、审批恢复、Goal 恢复或业务决策回答，必须先切回其项目。迟到终态只记审计，不触发模型；与切换竞态的持久 Goal 唤醒保持待投递，切回后才确认并执行。
 
 ## 无项目不是 Server cwd
 

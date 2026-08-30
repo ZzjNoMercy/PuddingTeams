@@ -350,6 +350,7 @@ const recoverableManagerSessions = new Set(
 let recoveredManagerSessions = 0;
 for (const sessionId of recoverableManagerSessions) {
 	try {
+		if (!(await teams.contextForSession(sessionId))?.active) continue;
 		const recovered = await store.recoverToolCallState(sessionId);
 		if (recovered.recoveredToolResults.length > 0) recoveredManagerSessions++;
 	} catch (error) {
@@ -367,8 +368,8 @@ if (reconciledGoals.projected || reconciledGoals.interrupted) {
 const goalRecoverySettings = (await productSettings.get()).harness.goalRecovery;
 for (const state of await workStates.listActive()) {
 	if (state.execution.status !== "interrupted") continue;
-	const owner = await teams.windowForSession(state.sessionId);
-	if (!owner || owner.type === "direct" || goalRecoverySettings.mode !== "safe_auto") continue;
+	const context = await teams.contextForSession(state.sessionId);
+	if (!context?.active || context.window.type === "direct" || goalRecoverySettings.mode !== "safe_auto") continue;
 	await workStates.resumeGoal(
 		state.sessionId,
 		state.revision,
@@ -381,6 +382,10 @@ let goalOutboxDrain: Promise<void> = Promise.resolve();
 async function drainGoalOutbox(): Promise<void> {
 	for (const event of await workStates.pendingOutbox()) {
 		try {
+			const context = await teams.contextForSession(event.sessionId);
+			// Keep the durable event pending. The periodic drain will deliver it
+			// after the user activates this project context again.
+			if (!context?.active) continue;
 			if (event.kind === "goal_changed") {
 				await store.appendCustomMessageProjectionIfAbsent(event.sessionId, event.id, {
 					customType: "pudding:work_plan_update",
@@ -390,7 +395,7 @@ async function drainGoalOutbox(): Promise<void> {
 				await workStates.markOutboxDelivered(event.id);
 				continue;
 			}
-			const owner = await teams.windowForSession(event.sessionId);
+			const owner = context.window;
 			const current = await workStates.getActive(event.sessionId);
 			const belongsToCurrentGoal = current?.goalId === event.goalId;
 			const triggerTurn = belongsToCurrentGoal && (event.kind === "decision_answered" || (event.kind === "goal_recovery" && owner?.type !== "direct"));
@@ -399,12 +404,16 @@ async function drainGoalOutbox(): Promise<void> {
 				: event.kind === "goal_recovery"
 					? "PuddingTeams 已完成重启对账。请保留已验收 WorkItem，从最近安全点创建新的 Delegation attempt；不要把旧 Run 当作仍在运行。"
 					: "Goal 已暂停；历史 Delegation 保留为审计事实，等待安全恢复。";
-			await store.appendCustomMessageIfAbsent(
+			const disposition = await store.appendCustomMessageIfAbsent(
 				event.sessionId,
 				event.id,
 				{ customType: event.kind === "goal_recovery" ? "pudding:goal_recovery" : event.kind === "goal_interrupted" ? "pudding:goal_interrupted" : "pudding:decision_answered", content, details: { goalId: event.goalId, ...event.payload } },
 				{ triggerTurn, deliverAs: triggerTurn ? "followUp" : undefined },
 			);
+			// The workspace may have switched after the active pre-check. A deferred
+			// wake-up is intentionally not acknowledged; it will be retried after the
+			// owning context is active again.
+			if (disposition === "deferred") continue;
 			// A delivered recovery event advances execution only after the receiver
 			// has durably accepted it. If the process dies before acknowledgement,
 			// receiver-side eventId dedupe makes the retry harmless.

@@ -1,7 +1,7 @@
 "use client";
 
-import { createContext, type ComponentProps, useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ChevronDownIcon, ChevronRightIcon, ExternalLinkIcon, FilePenIcon, FileSearchIcon, FileTextIcon, FolderIcon, ListTreeIcon, SquareIcon, SquareTerminalIcon, UserPlusIcon, UsersIcon, WrenchIcon } from "lucide-react";
+import { createContext, type ComponentProps, type ReactNode, useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { CheckIcon, ChevronDownIcon, ChevronRightIcon, CopyIcon, ExternalLinkIcon, FilePenIcon, FileSearchIcon, FileTextIcon, FolderIcon, ListTreeIcon, RotateCcwIcon, SquareIcon, SquareTerminalIcon, UserPlusIcon, UsersIcon, WrenchIcon } from "lucide-react";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
 	Message as AiMessage,
@@ -17,6 +17,7 @@ import { Task, TaskContent, TaskTrigger } from "@/components/ai-elements/task";
 import { Badge } from "@/components/ui/badge";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { streamdownPlugins } from "@/core/streamdown/plugins";
+import { writeTextToClipboard } from "@/core/clipboard";
 import { delegateWorker, isDelegateCall } from "@/lib/events";
 import { useAgentLabel } from "@/lib/avatars";
 import { formatTokens } from "@/lib/session-stats";
@@ -49,6 +50,81 @@ function toolCallIcon(name: string) {
 }
 
 const RoomFileContext = createContext<string | undefined>(undefined);
+
+type QuickActionDraft = (content: string) => void;
+const QuickActionDraftContext = createContext<QuickActionDraft | undefined>(undefined);
+
+/** Bridges settled-message actions to the session composer without making a
+ * message action execute an agent run immediately. */
+export function MessageQuickActionProvider({ onDraft, children }: { onDraft: QuickActionDraft; children: ReactNode }) {
+	return <QuickActionDraftContext.Provider value={onDraft}>{children}</QuickActionDraftContext.Provider>;
+}
+
+function MessageQuickActions({
+	kind,
+	content,
+	workerLabel,
+	processDetails,
+}: {
+	kind: "manager" | "worker";
+	content: string;
+	workerLabel?: string;
+	processDetails?: unknown;
+}) {
+	const onDraft = useContext(QuickActionDraftContext);
+	const { openWorkerProcess } = useWorkerProcessDrawer();
+	const [copied, setCopied] = useState(false);
+	const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const process = processDetails as { processView?: boolean; delegationId?: string } | undefined;
+	useEffect(() => () => {
+		if (copiedTimer.current) clearTimeout(copiedTimer.current);
+	}, []);
+
+	const copy = async () => {
+		if (!await writeTextToClipboard(content)) {
+			toast.error("复制失败");
+			return;
+		}
+		setCopied(true);
+		if (copiedTimer.current) clearTimeout(copiedTimer.current);
+		copiedTimer.current = setTimeout(() => setCopied(false), 1600);
+	};
+	const delegationRef = process?.delegationId ? `（delegationId: ${process.delegationId}）` : "";
+	const worker = workerLabel ?? "该 Worker";
+
+	return (
+		<div className="home-message-actions" role="group" aria-label={`${kind === "manager" ? "Manager 回复" : "Worker 结果"}操作`}>
+			<button type="button" className="home-message-action" onClick={() => void copy()} title={copied ? "已复制" : "复制正文"} aria-label={copied ? "已复制" : "复制正文"}>
+				{copied ? <CheckIcon /> : <CopyIcon />}
+			</button>
+			{kind === "manager" && onDraft ? (
+				<>
+					<button type="button" className="home-message-action" onClick={() => onDraft("请基于上面的结论继续推进，下一步是：")} title="继续推进" aria-label="继续推进">
+						<ChevronRightIcon />
+					</button>
+					<button type="button" className="home-message-action" onClick={() => onDraft("请基于上面的结论，选择合适的 Worker 执行：")} title="交给 Worker" aria-label="交给 Worker">
+						<UserPlusIcon />
+					</button>
+				</>
+			) : null}
+			{kind === "worker" && onDraft ? (
+				<>
+					<button type="button" className="home-message-action" onClick={() => onDraft(`请让 ${worker} 继续处理上一项委托${delegationRef}：`)} title="继续追问这个 Worker" aria-label="继续追问这个 Worker">
+						<ChevronRightIcon />
+					</button>
+					<button type="button" className="home-message-action" onClick={() => onDraft(`请让 ${worker} 返工上一项委托${delegationRef}，修改要求：`)} title="要求返工" aria-label="要求返工">
+						<RotateCcwIcon />
+					</button>
+				</>
+			) : null}
+			{kind === "worker" && process?.processView && process.delegationId ? (
+				<button type="button" className="home-message-action" onClick={() => openWorkerProcess(process.delegationId!)} title="查看执行过程" aria-label="查看执行过程">
+					<ListTreeIcon />
+				</button>
+			) : null}
+		</div>
+	);
+}
 
 function localPathFromHref(href: string): string | undefined {
 	const value = href.trim();
@@ -378,7 +454,7 @@ function WorkerTaskEntry({
 					    不能在这里按完成/失败二分写死。 */}
 					{badge}
 				</button>
-				<ProcessViewButton details={processDetails} />
+				{!finished ? <ProcessViewButton details={processDetails} /> : null}
 			</div>
 			{actions}
 			{time ? <time className="text-muted-foreground/60 text-[10px] tabular-nums">{time}</time> : null}
@@ -439,6 +515,7 @@ function WorkerTaskEntry({
 								) : null}
 							</div>
 							{usageText ? <p className="mt-1 text-xs text-muted-foreground/70 tabular-nums">{usageText}</p> : null}
+							<MessageQuickActions kind="worker" content={result} workerLabel={workerLabel} processDetails={processDetails} />
 						</>
 					) : (
 						collapsedPreview
@@ -807,7 +884,7 @@ function CustomMessageEntry({
 	// direct 直派（§5.2）：用户发言以普通用户气泡呈现。
 	if (message.customType === "pudding:user_message") {
 		return (
-			<AiMessage from="user" className="home-user-message">
+			<AiMessage from="user" className="home-user-message" data-query-axis-id={message.id}>
 				<MessageContent>
 					<p className="text-sm whitespace-pre-wrap">{message.content}</p>
 				</MessageContent>
@@ -950,7 +1027,7 @@ function MessageBody({
 	const assistantLabel = useAgentLabel(assistantAs ?? "");
 	if (message.role === "user") {
 		return (
-			<AiMessage from="user" className="home-user-message">
+			<AiMessage from="user" className="home-user-message" data-query-axis-id={message.id}>
 				<MessageContent>
 					<p className="whitespace-pre-wrap">{message.content}</p>
 				</MessageContent>
@@ -1020,6 +1097,7 @@ function MessageBody({
 									{message.content}
 								</MessageResponse>
 								<ErrorTechnicalDetails detail={message.errorDetail} />
+								{!message.streaming && message.content ? <MessageQuickActions kind={assistantAs ? "worker" : "manager"} content={message.content} workerLabel={assistantAs ? assistantLabel : undefined} /> : null}
 							</>
 						)}
 					</div>
@@ -1245,6 +1323,9 @@ function AssistantGroupBody({
 										))}
 									</div>
 								))}
+								{!segments.some((segment) => segment.m.streaming) && segments.some((segment) => Boolean(segment.m.content)) ? (
+									<MessageQuickActions kind={assistantAs ? "worker" : "manager"} content={segments.map((segment) => segment.m.content).filter(Boolean).join("\n\n")} workerLabel={assistantAs ? assistantLabel : undefined} />
+								) : null}
 							</div>
 						</div>
 					</div>

@@ -334,7 +334,7 @@ export function registerRoomsRoutes(
 		},
 	);
 
-	/** 切项目默认克隆窗口；显式 in_place 才停止任务并重建全部 manager/worker Session。 */
+	/** direct/group 切项目创建或打开独立窗口；仅 solo 原地停放/恢复 Workspace context。 */
 	app.post<{ Params: { id: string }; Body: { workspaceId?: string | null; mode?: "new_window" | "in_place" } }>(
 		"/api/rooms/:id/switch-workspace",
 		async (req, reply) => {
@@ -355,13 +355,10 @@ export function registerRoomsRoutes(
 				return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
 			}
 			if (workspaceId === source.workspaceId && target.cwdSnapshot === source.cwdSnapshot) {
-				return { room: await buildWindowSummary(sessions, teams, source), existed: true };
+				return { room: await buildWindowSummary(sessions, teams, source), existed: true, restored: true };
 			}
-			if (req.body?.mode === "in_place" && source.type === "direct") {
-				const existing = await teams.findDirectWindow(source.members[0]!, workspaceId, target.cwdSnapshot);
-				if (existing && existing.id !== source.id) {
-					return reply.code(409).send({ error: "该 worker 在目标项目已有单聊；请使用默认切换打开既有窗口" });
-				}
+			if (req.body?.mode === "in_place" && source.type !== "solo") {
+				return reply.code(400).send({ error: "单聊和群聊按项目使用独立窗口，不能替换当前窗口的 Workspace" });
 			}
 			try {
 				if (req.body?.mode !== "in_place") {
@@ -380,7 +377,7 @@ export function registerRoomsRoutes(
 							() => sessions.create(undefined, ctx),
 							{ name: source.name, prompt: source.prompt, cwdSnapshot: target.cwdSnapshot },
 						);
-						return { room: await buildWindowSummary(sessions, teams, next), existed: Boolean(existing) };
+						return { room: await buildWindowSummary(sessions, teams, next), existed: Boolean(existing), restored: Boolean(existing) };
 					}
 					if (source.type === "solo") {
 						return reply.code(400).send({ error: "solo 项目切换必须使用 in_place" });
@@ -395,7 +392,7 @@ export function registerRoomsRoutes(
 						cwdSnapshot: target.cwdSnapshot,
 						sessionId: created.id,
 					});
-					return { room: await buildWindowSummary(sessions, teams, next), existed: false };
+					return { room: await buildWindowSummary(sessions, teams, next), existed: false, restored: false };
 				}
 				if (!invoker) throw new Error("in-place workspace switching is unavailable");
 				const switched = await invoker.switchWorkspaceInPlace(
@@ -409,9 +406,31 @@ export function registerRoomsRoutes(
 							workspaceId,
 							cwd,
 						}),
+					(id) => sessions.prepareForParking(id),
+					(id) => sessions.validateStoredContext(id),
+					(id) => sessions.suspend(id),
 					(id) => sessions.remove(id),
 				);
-				return { room: await buildWindowSummary(sessions, teams, switched.window), existed: switched.existed };
+				await ensureWindowAlive(switched.window).catch((error) => {
+					app.log.warn({ error, windowId: switched.window.id }, "post-switch Session cleanup failed");
+				});
+				const current = (await teams.getWindow(source.id)) ?? switched.window;
+				if (switched.restored && workStates && localFiles?.productSettings) {
+					const state = await workStates.getActive(current.activeSession);
+					const recovery = (await localFiles.productSettings.get()).harness.goalRecovery;
+					if (state?.execution.status === "interrupted" && recovery.mode === "safe_auto") {
+						await invoker.withActiveSessionLifecycle(current.activeSession, () =>
+							workStates.resumeGoal(
+								current.activeSession,
+								state.revision,
+								{ ownerId: "workspace-reactivation", leaseMs: recovery.resumeLeaseMs },
+								`context-reactivated:${state.goalId}:${state.execution.epoch}`,
+								state.goalId,
+							),
+						).catch(() => undefined);
+					}
+				}
+				return { room: await buildWindowSummary(sessions, teams, current), existed: switched.existed, restored: switched.restored };
 			} catch (err) {
 				return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
 			}
