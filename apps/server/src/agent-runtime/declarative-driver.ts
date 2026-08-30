@@ -84,6 +84,9 @@ class DeclarativeDriver implements AgentDriver {
 			// 有 progress mapping 才能流式外送进度，否则只有边界（coarse）。
 			progress: this.rules.some((r) => r.key === "progress") ? "stream" : "coarse",
 			transport: "spawn",
+			cancelConfirmation: "observable",
+			workspace: { honorsInvocationCwd: true, readOnlyEnforcement: "none", mutationObservation: ["git_diff", "filesystem_diff"] },
+			verification: { modalities: ["cli"], freshSession: true, workspaceIsolation: ["mutation_guard", "isolated_copy"], commandExecution: true, guiObservation: false, networkObservation: true },
 		};
 	}
 

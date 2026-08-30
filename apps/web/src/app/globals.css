@@ -1851,6 +1851,27 @@ html[data-reduce-motion="true"] *::after {
 .task-activity-card.is-waiting_input .task-activity-status { color: #d8922b; }
 .task-activity-card.is-completed .task-activity-status { color: #35a56c; }
 .task-activity-card.is-failed .task-activity-status { color: var(--destructive); }
+.task-activity-card.is-observation-lost { border-color: color-mix(in oklab, var(--destructive) 55%, var(--goal-line)); background: color-mix(in oklab, var(--destructive) 7%, transparent); }
+.collaboration-trust { margin-top: 12px; border: 1px solid var(--goal-line); border-radius: 10px; background: color-mix(in oklab, var(--goal-text) 2%, transparent); padding: 9px 10px; }
+.collaboration-trust.is-compact { margin-top: 7px; border: 0; background: transparent; padding: 0; }
+.collaboration-trust-axes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; }
+.collaboration-trust-axis { display: flex; min-width: 0; flex-direction: column; gap: 2px; border-radius: 7px; background: color-mix(in oklab, var(--goal-text) 4%, transparent); padding: 5px 6px; }
+.collaboration-trust-axis b { color: var(--goal-text-3); font-size: 8px; font-weight: 650; letter-spacing: .03em; }
+.collaboration-trust-axis em { overflow: hidden; color: var(--goal-text-2); font-size: 9px; font-style: normal; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.collaboration-trust-axis.is-good em { color: #299664; }
+.collaboration-trust-axis.is-reported em { color: #9a6c1f; }
+.collaboration-trust-axis.is-danger { background: color-mix(in oklab, var(--destructive) 9%, transparent); }
+.collaboration-trust-axis.is-danger em { color: var(--destructive); }
+.collaboration-receipt-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 7px; color: var(--goal-text-3); font-size: 8px; }
+.collaboration-receipt-meta code { max-width: 100%; overflow: hidden; border-radius: 4px; background: color-mix(in oklab, var(--goal-text) 6%, transparent); padding: 2px 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.collaboration-receipt-meta .is-warning { color: #b97916; }
+.collaboration-trust-warning { display: flex; align-items: flex-start; gap: 5px; margin-top: 8px; border-radius: 7px; background: color-mix(in oklab, var(--destructive) 9%, transparent); padding: 6px 7px; color: var(--destructive); font-size: 9px; line-height: 1.45; }
+.collaboration-trust-warning svg { width: 13px; height: 13px; flex: 0 0 auto; margin-top: 1px; }
+.collaboration-trust.is-compact .collaboration-trust-axes { gap: 3px; }
+.collaboration-trust.is-compact .collaboration-trust-axis { background: transparent; padding: 0; }
+.collaboration-trust.is-compact .collaboration-trust-axis b { font-size: 7px; }
+.collaboration-trust.is-compact .collaboration-trust-axis em { font-size: 8px; }
+.collaboration-trust.is-compact .collaboration-trust-warning { margin-top: 5px; font-size: 8px; }
 @keyframes task-live-pulse { 50% { opacity: .45; } }
 .task-activity-empty { display: flex; min-height: 190px; flex-direction: column; align-items: center; justify-content: center; gap: 9px; color: var(--goal-text-3); font-size: 10px; text-align: center; }
 .task-activity-empty > svg { width: 18px; height: 18px; }
@@ -2079,6 +2100,8 @@ html[data-reduce-motion="true"] *::after {
 	border-radius: 16px;
 	background: var(--worker-drawer-detail);
 }
+.worker-process-trust { flex: 0 0 auto; padding: 0 12px 10px; }
+.worker-process-trust .collaboration-trust { margin-top: 0; }
 .worker-process-detail-toolbar {
 	display: flex;
 	min-height: 44px;

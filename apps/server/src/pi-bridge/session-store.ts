@@ -42,6 +42,13 @@ import {
 	type CompletionReviewInput,
 } from "./completion-review.js";
 import type { CompletionReview } from "../store/work-state.js";
+import type { VerificationRecord } from "../store/work-state.js";
+import {
+	buildVerificationPrompt,
+	parseVerificationOutput,
+	VERIFICATION_REVIEWER_SYSTEM_PROMPT,
+	type VerificationReviewInput,
+} from "../agent-runtime/verification-review.js";
 import type { LargeWorkerResultStore } from "../store/large-worker-result.js";
 import type { ProductSettingsStore } from "../store/product-settings.js";
 import {
@@ -1120,6 +1127,30 @@ export class PiSessionStore {
 		}
 	}
 
+	async reviewWorkItemVerification(
+		managerSessionId: string,
+		input: VerificationReviewInput,
+		meta: Omit<VerificationRecord, "criteria" | "evidenceRefs" | "status" | "integrity" | "failureReason" | "reviewerModel" | "reviewerSessionId">,
+		modelRef?: string,
+	): Promise<VerificationRecord> {
+		const manager = this.active.get(managerSessionId) ?? await this.open(managerSessionId);
+		const model = modelRef ? await this.resolveModel(modelRef) : manager.model as PiModel | undefined;
+		if (!model) throw new Error("没有可用于 WorkItem 独立复核的模型");
+		const reviewSession = await this.reviewerSession(model, VERIFICATION_REVIEWER_SYSTEM_PROMPT);
+		try {
+			await reviewSession.prompt(buildVerificationPrompt(input));
+			const output = PiSessionStore.assistantText(reviewSession);
+			if (!output) throw new Error("独立 Verifier 没有返回判定");
+			return parseVerificationOutput(output, input, {
+				...meta,
+				reviewerModel: `${model.provider}/${model.id}`,
+				reviewerSessionId: reviewSession.sessionId,
+			});
+		} finally {
+			reviewSession.dispose();
+		}
+	}
+
 	/** 只投影可复核 ToolResult，不把 manager 的推理或完整聊天历史交给 reviewer。 */
 	private static toolEvidence(session: AgentSession): Array<Record<string, unknown>> {
 		const messages = session.messages as unknown as Array<{
@@ -1254,6 +1285,10 @@ export class PiSessionStore {
 
 	/** Reviewer 使用完全空白的只读上下文；唯一输入由 completion snapshot 提供。 */
 	private completionReviewerSession(model: PiModel): Promise<AgentSession> {
+		return this.reviewerSession(model, COMPLETION_REVIEWER_SYSTEM_PROMPT);
+	}
+
+	private reviewerSession(model: PiModel, systemPrompt: string): Promise<AgentSession> {
 		const agentDir = getAgentDir();
 		return (async () => {
 			const loader = new DefaultResourceLoader({
@@ -1265,7 +1300,7 @@ export class PiSessionStore {
 				noPromptTemplates: true,
 				noThemes: true,
 				noContextFiles: true,
-				systemPromptOverride: () => COMPLETION_REVIEWER_SYSTEM_PROMPT,
+				systemPromptOverride: () => systemPrompt,
 			});
 			await loader.reload();
 			const { session } = await createAgentSession({

@@ -187,9 +187,9 @@ export function SessionWorkCard({
 	const pending = useMemo(() => decisions.filter((item) => item.status === "pending"), [decisions]);
 	const activeGoalSummary = goals.find((item) => item.goalId === activeGoalId);
 	const currentTurnItems = useMemo(() => groupActivitiesByTurn(activityItems, executionTurns).find((group) => group.isCurrent)?.items ?? [], [activityItems, executionTurns]);
-	const activityRunning = currentTurnItems.filter((item) => item.status === "running").length;
-	const activityPending = currentTurnItems.filter((item) => item.status === "waiting_input").length;
-	const activityCompleted = currentTurnItems.filter((item) => item.status === "completed").length;
+	const activityRunning = currentTurnItems.filter((item) => item.executionState === "running" || item.executionState === "reconciling").length;
+	const activityPending = currentTurnItems.filter((item) => item.executionState === "waiting_input").length;
+	const activityCompleted = currentTurnItems.filter((item) => item.executionState === "reported_completed").length;
 	useEffect(() => {
 		onRuntimeSummaryChange?.({
 			hasGoal: goals.length > 0,

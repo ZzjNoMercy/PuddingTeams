@@ -214,7 +214,7 @@ export function registerExtensionsRoutes(app: FastifyInstance, deps: ExtensionRo
 				entry.manifest.kind === "connector" && deps.runtime
 					? (await deps.runtime.listDelegations()).filter(
 							(d) =>
-								(d.status === "running" || d.status === "waiting_input") &&
+									(d.executionState === "admitted" || d.executionState === "running" || d.executionState === "waiting_input" || d.executionState === "cancel_requested" || d.executionState === "reconciling") &&
 								bound.some((a) => a.name === d.agentId),
 						)
 					: [];
@@ -225,7 +225,7 @@ export function registerExtensionsRoutes(app: FastifyInstance, deps: ExtensionRo
 					runs: runs.map((d) => ({
 						delegationId: d.id,
 						agentId: d.agentId,
-						status: d.status,
+						executionState: d.executionState,
 						windowId: d.windowId,
 					})),
 				});

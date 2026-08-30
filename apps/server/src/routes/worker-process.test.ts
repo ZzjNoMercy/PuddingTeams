@@ -32,14 +32,25 @@ async function makeStack() {
 	await workStates.init();
 	const app = Fastify({ logger: false });
 	const cancellations: string[] = [];
+	const reconciliations: string[] = [];
+	const takeovers: Array<{ id: string; rationale: string }> = [];
 	await app.register(websocket);
 	registerWorkerProcessRoutes(app, service, {
 		cancel: async (delegationId) => {
 			cancellations.push(delegationId);
-			await delegations.transitionDelegation(delegationId, ["running", "waiting_input"], { status: "cancelled" });
+			await delegations.transitionDelegation(delegationId, ["running", "waiting_input", "reconciling"], { executionState: "observation_lost" });
+		},
+		reconcile: async (delegationId) => {
+			reconciliations.push(delegationId);
+			const result = await delegations.transitionDelegation(delegationId, ["observation_lost"], { executionState: "running" });
+			return { executionState: result.record?.executionState ?? "observation_lost" };
+		},
+		takeover: async (delegationId, rationale) => {
+			takeovers.push({ id: delegationId, rationale });
+			return { executionState: "cancelled" };
 		},
 	}, workStates);
-	return { app, delegations, timelines, workerSessions, workStates, dir, cancellations };
+	return { app, delegations, timelines, workerSessions, workStates, dir, cancellations, reconciliations, takeovers };
 }
 
 /** 造一个落盘的 worker 会话（user + assistant 两条消息），返回 sessionId。 */
@@ -208,7 +219,7 @@ test("已结束委托：从 JSONL 回放 worker 会话历史，live=false", asyn
 		operation: "run",
 	});
 	await delegations.updateDelegation(d.id, { sessionHandle: handle });
-	await delegations.transitionDelegation(d.id, ["running"], { status: "completed" });
+	await delegations.transitionDelegation(d.id, ["admitted"], { executionState: "observation_lost" });
 
 	const info = await app.inject({ method: "GET", url: `/api/delegations/${d.id}/process` });
 	assert.equal(info.statusCode, 200, info.body);
@@ -216,18 +227,19 @@ test("已结束委托：从 JSONL 回放 worker 会话历史，live=false", asyn
 		delegationId: d.id,
 		managerSessionId: "s1",
 		agentId: "pi-worker",
-		status: "completed",
+		executionState: "observation_lost",
 		sessionHandle: handle,
 		createdAt: d.createdAt,
 		live: false,
 		view: "session",
+		trustProjection: { execution: "observation_lost", verification: "not_required", settlement: "pending" },
 	});
 
 	const res = await app.inject({ method: "GET", url: `/api/delegations/${d.id}/process/messages` });
 	assert.equal(res.statusCode, 200, res.body);
 	const body = res.json();
 	assert.equal(body.live, false);
-	assert.equal(body.status, "completed");
+	assert.equal(body.executionState, "observation_lost");
 	assert.equal(body.messages.length, 2);
 	assert.equal(body.messages[0].role, "user");
 	assert.equal(body.messages[1].role, "assistant");
@@ -244,6 +256,7 @@ test("委托尚无 sessionHandle（worker 未启动）：messages 404", async ()
 		agentRevision: 0,
 		operation: "run",
 	});
+	await delegations.transitionDelegation(d.id, ["admitted"], { executionState: "running" });
 	const res = await app.inject({ method: "GET", url: `/api/delegations/${d.id}/process/messages` });
 	assert.equal(res.statusCode, 404);
 	assert.deepEqual(res.json(), { error: "worker session not started" });
@@ -260,15 +273,45 @@ test("POST delegation cancel：只取消指定的活动 Run，终态拒绝重复
 		agentRevision: 0,
 		operation: "run",
 	});
+	await delegations.transitionDelegation(d.id, ["admitted"], { executionState: "running" });
 	const cancelled = await app.inject({ method: "POST", url: `/api/delegations/${d.id}/cancel` });
 	assert.equal(cancelled.statusCode, 200, cancelled.body);
-	assert.deepEqual(cancelled.json(), { cancelled: true, delegationId: d.id });
+	assert.deepEqual(cancelled.json(), { requested: true, delegationId: d.id, executionState: "observation_lost" });
 	assert.deepEqual(cancellations, [d.id]);
-	assert.equal((await delegations.getDelegation(d.id))?.status, "cancelled");
+	assert.equal((await delegations.getDelegation(d.id))?.executionState, "observation_lost");
 
 	const repeated = await app.inject({ method: "POST", url: `/api/delegations/${d.id}/cancel` });
 	assert.equal(repeated.statusCode, 409);
 	assert.deepEqual(cancellations, [d.id]);
+
+	const reattaching = await delegations.createDelegation({
+		cwdSnapshot: dir, windowId: "w1", managerSessionId: "s1", agentId: "remote",
+		agentRevision: 0, operation: "run", driverTransport: "http",
+	});
+	await delegations.transitionDelegation(reattaching.id, ["admitted"], { executionState: "reconciling", runHandle: "remote-run" });
+	const cancelledReattach = await app.inject({ method: "POST", url: `/api/delegations/${reattaching.id}/cancel` });
+	assert.equal(cancelledReattach.statusCode, 200, cancelledReattach.body);
+	assert.deepEqual(cancellations, [d.id, reattaching.id]);
+	await app.close();
+});
+
+test("observation_lost 提供真实重新对账与显式人工接管动作", async () => {
+	const { app, delegations, dir, reconciliations, takeovers } = await makeStack();
+	const first = await delegations.createDelegation({ cwdSnapshot: dir, windowId: "w1", managerSessionId: "s1", agentId: "remote", agentRevision: 0, operation: "run" });
+	await delegations.transitionDelegation(first.id, ["admitted"], { executionState: "observation_lost" });
+	const reconciled = await app.inject({ method: "POST", url: `/api/delegations/${first.id}/reconcile`, payload: {} });
+	assert.equal(reconciled.statusCode, 200, reconciled.body);
+	assert.equal(reconciled.json().executionState, "running");
+	assert.deepEqual(reconciliations, [first.id]);
+
+	const second = await delegations.createDelegation({ cwdSnapshot: dir, windowId: "w1", managerSessionId: "s1", agentId: "remote", agentRevision: 0, operation: "run" });
+	await delegations.transitionDelegation(second.id, ["admitted"], { executionState: "observation_lost" });
+	const unsafe = await app.inject({ method: "POST", url: `/api/delegations/${second.id}/takeover`, payload: { rationale: "我看过上游" } });
+	assert.equal(unsafe.statusCode, 400);
+	const takeover = await app.inject({ method: "POST", url: `/api/delegations/${second.id}/takeover`, payload: { confirmation: "upstream_stopped", rationale: "已在上游控制台确认进程终止" } });
+	assert.equal(takeover.statusCode, 200, takeover.body);
+	assert.equal(takeover.json().executionState, "cancelled");
+	assert.deepEqual(takeovers, [{ id: second.id, rationale: "已在上游控制台确认进程终止" }]);
 	await app.close();
 });
 
@@ -309,6 +352,6 @@ test("Goal v5：历史 Goal 的 Delegation 只能查看，不能再取消", asyn
 	assert.equal(response.statusCode, 409, response.body);
 	assert.equal(response.json().code, "stale_goal_state");
 	assert.deepEqual(cancellations, []);
-	assert.equal((await delegations.getDelegation(delegation.id))?.status, "running");
+	assert.equal((await delegations.getDelegation(delegation.id))?.executionState, "admitted");
 	await app.close();
 });

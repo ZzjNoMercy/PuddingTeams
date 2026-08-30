@@ -77,6 +77,8 @@ export const PI_CAPABILITIES: DriverCapabilities = {
 	interactionKinds: [],
 	progress: "stream",
 	transport: "sdk",
+	cancelConfirmation: "observable",
+	workspace: { honorsInvocationCwd: true, readOnlyEnforcement: "none", mutationObservation: ["git_diff", "filesystem_diff"] },
 };
 
 /**

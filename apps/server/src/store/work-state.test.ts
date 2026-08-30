@@ -3,7 +3,17 @@ import assert from "node:assert";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { WorkStateConflictError, WorkStateOperationConflictError, WorkStateStore } from "./work-state.js";
+import { WorkStateConflictError, WorkStateOperationConflictError, WorkStateStore, workItemContractHash, type ExecutionReceipt, type SessionWorkState, type WorkItem } from "./work-state.js";
+
+function sealedReceipt(state: SessionWorkState, item: WorkItem, delegationId: string): ExecutionReceipt {
+	return {
+		id: `receipt-${delegationId}`, delegationId, goalId: state.goalId, workPlanId: state.plan?.id, workItemId: item.id,
+		goalRevision: state.goalRevision, workItemRevision: item.revision, goalEpoch: state.execution.epoch,
+		taskContractHash: workItemContractHash(state, state.plan!, item), contractHash: "sha256:runtime-envelope", reportedOutcome: "completed",
+		requirementResults: item.acceptanceCriteria.map((requirement) => ({ requirement, status: "provided" as const, evidenceRefs: [delegationId] })),
+		artifactCapture: [], collectionStatus: "complete", integrity: "clean", issues: [], sealedAt: new Date().toISOString(),
+	};
+}
 
 test("P3-G: Session Goal revision、业务决策与清理闭环", async () => {
 	const store = new WorkStateStore(mkdtempSync(path.join(tmpdir(), "pt-work-state-")));
@@ -13,6 +23,7 @@ test("P3-G: Session Goal revision、业务决策与清理闭环", async () => {
 		goal: "交付可审核版本",
 		completionBoundary: "测试全绿且 Human 审核通过",
 		participantAgentIds: ["codex", "codex"],
+		verificationPolicy: { minimumWorkItemMode: "manager_review", finalGoalMode: "manager_review", trigger: "manager_request", source: "user", reason: "本用例单独验证 Completion Review 状态机" },
 	});
 	assert.equal(created.revision, 0);
 	assert.equal(created.goalRevision, 1);
@@ -121,6 +132,7 @@ test("Goal v5: WorkItem DAG、Submission、验收与幂等闭环", async () => {
 		delegationStatus: "completed",
 		goalEpoch: 1,
 		summary: "资料完成",
+		executionReceipt: sealedReceipt(planned, planned.plan!.items.W1!, "D1"),
 	}, "delegation-boundary:D1:1");
 	assert.equal(submitted.plan?.items.W1?.status, "submitted");
 	assert.equal(submitted.plan?.items.W2?.status, "planned", "submitted 不能解锁下游");
@@ -137,7 +149,7 @@ test("Goal v5: WorkItem DAG、Submission、验收与幂等闭环", async () => {
 	assert.equal(lateWaiting.plan?.items.W1?.status, "accepted", "迟到 waiting_input 不能回退 accepted");
 	await store.reconcileDelegations([{
 		id: "D1", managerSessionId: "plan", goalId: goal.goalId, workItemId: "W1", goalEpoch: 1,
-		status: "completed", revision: 2, updatedAt: new Date().toISOString(),
+		executionState: "reported_completed", revision: 2, updatedAt: new Date().toISOString(),
 	}]);
 	assert.equal((await store.get("plan"))?.plan?.items.W1?.status, "accepted", "启动对账不能把已验收项退回 submitted");
 	const revisedPlan = await store.updatePlan("plan", accepted.revision, {
@@ -151,6 +163,7 @@ test("Goal v5: WorkItem DAG、Submission、验收与幂等闭环", async () => {
 	assert.equal(revisedPlan.plan?.items.W2?.lastChange?.previousRevision, 0);
 	const secondSubmission = await store.noteDelegation("plan", {
 		goalId: goal.goalId, workItemId: "W2", delegationId: "D2", delegationStatus: "completed", goalEpoch: 1,
+		executionReceipt: sealedReceipt(revisedPlan, revisedPlan.plan!.items.W2!, "D2"),
 	}, "delegation-boundary:D2:completed");
 	const blocked = await store.reviewWorkItem("plan", "W2", secondSubmission.revision, {
 		verdict: "blocked", summary: "等待外部资料",
@@ -174,12 +187,37 @@ test("Goal v5: WorkItem DAG、Submission、验收与幂等闭环", async () => {
 	);
 });
 
+test("启动对账: reconciling/running/needs_input 都投影为活跃工作项且不触发 effect_unknown", async () => {
+	const store = new WorkStateStore(mkdtempSync(path.join(tmpdir(), "pt-work-reconcile-active-")));
+	await store.init();
+	const goal = await store.create({ sessionId: "active-reconcile", goal: "恢复远端任务", completionBoundary: "任务有可信边界" });
+	const planned = await store.updatePlan("active-reconcile", goal.revision, {
+		upsertItems: [
+			{ id: "W1", title: "重挂中", dependsOn: [], acceptanceCriteria: ["有终态"] },
+			{ id: "W2", title: "待输入", dependsOn: [], acceptanceCriteria: ["输入后继续"] },
+		],
+		reason: "覆盖恢复态投影",
+	}, "plan-active", 1, goal.goalId);
+	const outcome = await store.reconcileDelegations([
+		{ id: "D-reconciling", managerSessionId: "active-reconcile", goalId: goal.goalId, workItemId: "W1", goalEpoch: 1, executionState: "reconciling", revision: 2, updatedAt: new Date().toISOString() },
+		{ id: "D-input", managerSessionId: "active-reconcile", goalId: goal.goalId, workItemId: "W2", goalEpoch: 1, executionState: "waiting_input", revision: 3, updatedAt: new Date().toISOString() },
+	]);
+	assert.equal(outcome.projected, 2);
+	assert.equal(outcome.interrupted, 0);
+	const current = await store.get("active-reconcile");
+	assert.equal(current?.plan?.items.W1?.status, "in_progress");
+	assert.equal(current?.plan?.items.W2?.status, "waiting_input");
+	assert.equal(current?.execution.interruption, undefined);
+	assert.ok((current?.revision ?? 0) > planned.revision);
+});
+
 test("Goal v5: Manager 工作项必须开始、提交、验收，完成时逐条落 Goal 条件", async () => {
 	const store = new WorkStateStore(mkdtempSync(path.join(tmpdir(), "pt-manager-item-")));
 	await store.init();
 	const goal = await store.create({
 		sessionId: "manager-item", goal: "汇总最终报告", completionBoundary: "报告已汇总\n结论有证据",
 		reviewMode: "manager", operationId: "create",
+		verificationPolicy: { minimumWorkItemMode: "manager_review", finalGoalMode: "manager_review", trigger: "manager_request", source: "user", reason: "本用例验证 Manager Completion" },
 	});
 	const planned = await store.updatePlan("manager-item", goal.revision, {
 		upsertItems: [{
@@ -270,6 +308,7 @@ test("Goal v5: 同一 Session 串行多个 Goal，旧执行事实不能写入新
 	}, "shared-plan-operation", 1, goalA.goalId);
 	const submittedA = await store.noteDelegation("serial", {
 		goalId: goalA.goalId, workItemId: "W1", delegationId: "D-A", delegationStatus: "completed", goalEpoch: 1,
+		executionReceipt: sealedReceipt(planA, planA.plan!.items.W1!, "D-A"),
 	}, "boundary-a");
 	const acceptedA = await store.reviewWorkItem("serial", "W1", submittedA.revision, { verdict: "accepted", summary: "A 已验收" }, "review-a", 1, goalA.goalId);
 	const decisionA = await store.createDecision({
@@ -338,4 +377,58 @@ test("Goal v5: Goal 创建 operationId 不得跨 Session 重复生效", async ()
 		() => store.create({ sessionId: "S2", goal: "目标", completionBoundary: "完成", operationId: "same-create" }),
 		(error: unknown) => error instanceof WorkStateOperationConflictError && error.code === "idempotency_conflict",
 	);
+});
+
+test("Goal v6: sealed Receipt、VerificationRecord 与 isolated worktree 提升门禁", async () => {
+	const store = new WorkStateStore(mkdtempSync(path.join(tmpdir(), "pt-work-plan-v6-")));
+	await store.init();
+	const goal = await store.create({ sessionId: "v6", goal: "交付代码", completionBoundary: "测试通过", operationId: "create-v6", verificationPolicy: { minimumWorkItemMode: "independent_evidence_review", finalGoalMode: "environment_verified", reason: "代码交付需独立证据" } });
+	const planned = await store.updatePlan("v6", goal.revision, {
+		upsertItems: [{ id: "W1", title: "实现并测试", acceptanceCriteria: ["测试通过"], sourceGoalCriteria: ["goal:1:1"], verificationPolicy: { mode: "environment_verified", trigger: "manager_request", source: "manager_derived", reason: "需要环境复验" }, workspaceExecutionPolicy: { mode: "isolated_worktree", source: "harness_default", reason: "代码隔离执行", baselineStrategy: "git_tree", promoteOnAcceptance: true } }], reason: "建立 v6 计划",
+	}, "plan-v6");
+	const item = planned.plan!.items.W1!;
+	const changeSet = { id: "cs-v6", executionScopeId: "scope-v6", delegationIds: ["D-v6"], mode: "isolated_worktree" as const, baselineFingerprint: "base", outputFingerprint: "out", changedPaths: ["src/a.ts"], promotionState: "applied" as const, createdAt: new Date().toISOString(), promotedAt: new Date().toISOString() };
+	const submitted = await store.noteDelegation("v6", { goalId: goal.goalId, workItemId: "W1", delegationId: "D-v6", delegationStatus: "completed", goalEpoch: 1, executionReceipt: sealedReceipt(planned, item, "D-v6"), workspaceChangeSet: changeSet }, "boundary-v6");
+	await assert.rejects(() => store.reviewWorkItem("v6", "W1", submitted.revision, { verdict: "accepted", summary: "先验收" }, "review-before-v6"), /VerificationRecord/);
+	const submission = submitted.plan!.items.W1!.submissions[0]!;
+	const verified = await store.recordVerification("v6", submitted.revision, {
+		id: "verification-v6", goalId: goal.goalId, workPlanId: submitted.plan!.id, workItemId: "W1", submissionId: submission.id,
+		goalRevision: 1, workItemRevision: submission.workItemRevision, goalEpoch: 1, mode: "environment_verified", status: "passed",
+		environmentMode: "isolated_copy", inputFingerprint: submission.inputFingerprint, criteria: [{ criterion: "测试通过", status: "satisfied", evidenceRefs: ["test-v6"], explanation: "测试成功" }], evidenceRefs: ["test-v6"], integrity: "clean", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), completedAt: new Date().toISOString(),
+		}, "verification-v6");
+	await assert.rejects(
+		() => store.reviewWorkItem("v6", "W1", verified.revision, { verdict: "accepted", summary: "跳过两阶段提升" }, "review-without-intent-v6"),
+		/accepted 意图记录/,
+	);
+	const intended = await store.recordAcceptanceIntent("v6", "W1", verified.revision, { summary: "独立证据充分" }, "intent-v6");
+	await assert.rejects(
+		() => store.recordAcceptanceIntent("v6", "W1", intended.revision, { summary: "尝试覆盖意图" }, "intent-v6-overwrite"),
+		/不允许覆盖/,
+	);
+	const accepted = await store.reviewWorkItem("v6", "W1", intended.revision, { verdict: "accepted", summary: "独立证据充分" }, "review-after-v6");
+	assert.equal(accepted.plan?.items.W1?.status, "accepted");
+});
+
+test("Goal v6: Harness trigger 与三类 Workspace 默认值冻结进新 WorkItem", async () => {
+	const store = new WorkStateStore(mkdtempSync(path.join(tmpdir(), "pt-work-plan-v6-defaults-")));
+	await store.init();
+	store.configureVerificationDefaults({
+		trigger: "auto_on_submission",
+		workspaceExecution: { readOnlyMode: "read_only_shared", gitWriteMode: "exclusive_write", nonGitWriteMode: "exclusive_write" },
+	});
+	const goal = await store.create({ sessionId: "defaults", goal: "验证默认值", completionBoundary: "完成", operationId: "create-defaults" });
+	const planned = await store.updatePlan("defaults", goal.revision, {
+		reason: "按执行类别解析 Harness 默认值",
+		upsertItems: [
+			{ id: "R", title: "只读", acceptanceCriteria: ["完成"], sourceGoalCriteria: ["goal:1:1"], workspaceExecutionClass: "read_only" },
+			{ id: "G", title: "Git 写", acceptanceCriteria: ["完成"], sourceGoalCriteria: ["goal:1:1"], workspaceExecutionClass: "git_write" },
+			{ id: "N", title: "非 Git 写", acceptanceCriteria: ["完成"], sourceGoalCriteria: ["goal:1:1"], workspaceExecutionClass: "non_git_write" },
+		],
+	}, "plan-defaults");
+	assert.equal(planned.plan?.items.R?.workspaceExecutionPolicy.mode, "read_only_shared");
+	assert.equal(planned.plan?.items.G?.workspaceExecutionPolicy.mode, "exclusive_write");
+	assert.equal(planned.plan?.items.G?.workspaceExecutionPolicy.baselineStrategy, "git_tree");
+	assert.equal(planned.plan?.items.N?.workspaceExecutionPolicy.mode, "exclusive_write");
+	assert.equal(planned.plan?.items.N?.workspaceExecutionPolicy.baselineStrategy, "filesystem_manifest");
+	assert.ok(Object.values(planned.plan?.items ?? {}).every((item) => item.verificationPolicy.trigger === "auto_on_submission"));
 });

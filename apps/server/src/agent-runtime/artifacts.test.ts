@@ -239,6 +239,9 @@ test("Runtime：Run 完成时把 CompletedResult.artifacts 登记进 ArtifactSto
 	assert.deepEqual(created, [rec.id], "登记触发 artifact.created");
 
 	const persisted = await delegations.getDelegation(outcome.delegation.id);
-	assert.equal(persisted?.status, "completed");
+	assert.equal(persisted?.executionState, "reported_completed");
+	assert.equal(persisted?.receipt?.reportedOutcome, "completed");
+	assert.equal(persisted?.receipt?.collectionStatus, "complete");
+	assert.equal(persisted?.receipt?.artifactCapture[0]?.artifactId, rec.id);
 	assert.equal(persisted?.result?.artifacts?.[0]?.name, "report.md", "DelegationRecord.result 带 artifacts 清单");
 });

@@ -150,7 +150,11 @@ export class CodexDriver implements AgentDriver {
 	}
 
 	private runArgs(ctx: InvocationContext): string[] {
-		const args = ["--json", "--skip-git-repo-check", "-C", ctx.cwd ?? process.cwd(), "-s", this.opts.sandbox ?? "workspace-write"];
+		// Verification profiles are platform-bound and must never inherit a user's
+		// danger-full-access Agent setting. Codex workspace-write is the executable
+		// Connector-side half of the isolated-copy/mutation-guard profile.
+		const sandbox = ctx.verificationProfile ? "workspace-write" : this.opts.sandbox ?? "workspace-write";
+		const args = ["--json", "--skip-git-repo-check", "-C", ctx.cwd ?? process.cwd(), "-s", sandbox];
 		if (this.opts.model) args.push("-m", this.opts.model);
 		return args;
 	}

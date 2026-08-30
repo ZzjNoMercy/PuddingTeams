@@ -508,6 +508,21 @@ export interface DriverCapabilities {
 	interactionKinds: Array<"permission" | "question" | "confirmation">;
 	progress: "none" | "coarse" | "stream";
 	transport: Transport;
+	reconciliation?: "none" | "query_run" | "reattach_stream";
+	cancelConfirmation?: "none" | "acknowledged" | "observable";
+	workspace?: {
+		honorsInvocationCwd: boolean;
+		readOnlyEnforcement: "none" | "sandbox" | "remote_policy";
+		mutationObservation: Array<"event_stream" | "git_diff" | "filesystem_diff">;
+	};
+	verification?: {
+		modalities: Array<"cli" | "gui">;
+		freshSession: boolean;
+		workspaceIsolation: Array<"none" | "mutation_guard" | "isolated_copy">;
+		commandExecution: boolean;
+		guiObservation: boolean;
+		networkObservation: boolean;
+	};
 }
 
 /** Connector 接入 Agent 的 Driver.probe 结构化结果（§10 ProbeResult）。 */
@@ -586,6 +601,78 @@ export type SessionWorkStatus = "active" | "resolved" | "cancelled";
 export type CompletionReviewMode = "manager" | "independent";
 export type GoalExecutionStatus = "idle" | "running" | "waiting_human" | "interrupted" | "recovering" | "reviewing";
 export type WorkItemStatus = "planned" | "ready" | "in_progress" | "waiting_input" | "submitted" | "revision" | "accepted" | "blocked" | "cancelled";
+export type VerificationMode = "manager_review" | "independent_evidence_review" | "environment_verified";
+export type VerificationStatus = "pending" | "running" | "waiting_input" | "passed" | "failed" | "blocked" | "stale";
+export type WorkspaceAccessMode = "read_only_shared" | "exclusive_write" | "isolated_worktree";
+
+export interface VerificationRecord {
+	id: string;
+	goalId: string;
+	workPlanId?: string;
+	workItemId?: string;
+	submissionId?: string;
+	goalRevision: number;
+	workItemRevision?: number;
+	goalEpoch: number;
+	mode: VerificationMode;
+	status: VerificationStatus;
+	verifierAgentId?: string;
+	verifierDelegationId?: string;
+	reviewerModel?: string;
+	reviewerSessionId?: string;
+	environmentProfileId?: string;
+	environmentMode: "none" | "isolated_copy" | "same_target_guarded";
+	inputFingerprint: string;
+	outputFingerprint?: string;
+	criteria: CompletionReviewCriterion[];
+	evidenceRefs: string[];
+	observations?: Array<{ id: string; delegationId: string; kind: "tool" | "file" | "search"; title: string; contentHash: string; itemId?: string }>;
+	integrity: "unknown" | "clean" | "suspect" | "violation";
+	failureReason?: string;
+	createdAt: string;
+	updatedAt: string;
+	completedAt?: string;
+}
+
+export interface WorkspaceChangeSet {
+	id: string;
+	executionScopeId: string;
+	delegationIds: string[];
+	workspaceId?: string;
+	mode: WorkspaceAccessMode;
+	baselineFingerprint: string;
+	outputFingerprint: string;
+	changedPaths: string[];
+	diffArtifactId?: string;
+	diffHash?: string;
+	promotionState: "not_required" | "pending" | "applied" | "conflict" | "failed";
+	createdAt: string;
+	promotedAt?: string;
+}
+
+export interface ExecutionReceipt {
+	id: string;
+	delegationId: string;
+	goalId?: string;
+	workPlanId?: string;
+	workItemId?: string;
+	attempt?: number;
+	goalRevision?: number;
+	workItemRevision?: number;
+	goalEpoch?: number;
+	taskContractHash?: string;
+	contractHash: string;
+	inputFingerprint?: string;
+	reportedOutcome: "completed" | "failed" | "cancelled" | "blocked" | "input_required";
+	requirementResults: Array<{ requirement: string; status: "provided" | "missing" | "unavailable"; evidenceRefs: string[] }>;
+	artifactCapture: Array<{ reportedPath: string; artifactId?: string; contentHash?: string; status: "captured" | "rejected" | "missing" | "failed"; issue?: string }>;
+	collectionStatus: "complete" | "partial" | "failed";
+	integrity: "clean" | "suspect" | "violation";
+	issues: string[];
+	sealedAt: string;
+	workspaceExecutionScopeId?: string;
+	workspaceChangeSetId?: string;
+}
 
 export interface CompletionReviewCriterion {
 	criterion: string;
@@ -624,6 +711,14 @@ export interface SessionWorkState {
 	goalRevision: number;
 	reviewMode: CompletionReviewMode;
 	reviewerModel?: string;
+	verificationPolicy: {
+		minimumWorkItemMode: VerificationMode;
+		finalGoalMode: VerificationMode;
+		trigger: "manager_request" | "auto_on_submission";
+		source: "user" | "harness_default" | "manager_derived";
+		reason: string;
+	};
+	goalVerifications: VerificationRecord[];
 	completionReviews: CompletionReview[];
 	status: SessionWorkStatus;
 	execution: {
@@ -652,6 +747,15 @@ export interface WorkItemSubmission {
 	delegationId?: string;
 	resultRef: { kind: "delegation_result"; delegationId: string } | { kind: "manager_summary"; evidenceRefs: string[] };
 	artifactIds: string[];
+	executionReceiptId?: string;
+	executionReceipt?: ExecutionReceipt;
+	workspaceChangeSetId?: string;
+	workspaceChangeSet?: WorkspaceChangeSet;
+	goalRevision: number;
+	workItemRevision: number;
+	inputFingerprint: string;
+	verifications: VerificationRecord[];
+	acceptanceIntent?: { verdict: "accepted"; summary: string; evidenceRefs: string[]; requestedAt: string };
 	summary?: string;
 	submittedAt: string;
 	review?: {
@@ -671,6 +775,20 @@ export interface WorkItem {
 	acceptanceCriteria: string[];
 	sourceGoalCriteria: string[];
 	status: WorkItemStatus;
+	verificationPolicy: {
+		mode: VerificationMode;
+		trigger: "manager_request" | "auto_on_submission";
+		source: "user" | "goal_default" | "manager_derived";
+		reason: string;
+		frozenAtRevision?: number;
+	};
+	workspaceExecutionPolicy: {
+		mode: WorkspaceAccessMode;
+		source: "harness_default" | "manager_derived" | "user";
+		reason: string;
+		baselineStrategy: "git_tree" | "filesystem_manifest" | "external_snapshot";
+		promoteOnAcceptance: boolean;
+	};
 	delegationIds: string[];
 	activeDelegationId?: string;
 	submissions: WorkItemSubmission[];
@@ -724,7 +842,14 @@ export interface DelegationTrace {
 	expectedOutcome?: string;
 	evidenceRequirements?: string[];
 	completionBoundary?: string;
-	status: string;
+	executionState: "admitted" | "running" | "waiting_input" | "reported_completed" | "reported_failed" | "cancel_requested" | "reconciling" | "cancelled" | "observation_lost";
+	receipt?: {
+		contractHash?: string;
+		collectionStatus?: "complete" | "partial" | "failed";
+		integrity?: "clean" | "suspect" | "violation";
+		issues?: string[];
+		sealedAt?: string;
+	};
 	/** worker 会话句柄（pi 使用；spawn worker 的过程来自 delegation timeline）。 */
 	sessionHandle?: string;
 	/** 该委托提供只读执行过程入口。 */

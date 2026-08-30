@@ -240,7 +240,14 @@ export class PuddingClawDriver implements AgentDriver {
 	constructor(private readonly opts: PuddingClawDriverOptions = {}) {}
 
 	async capabilities(): Promise<DriverCapabilities> {
-		return { ...PUDDINGCLAW_CAPABILITIES, transport: this.transport() };
+		return {
+			...PUDDINGCLAW_CAPABILITIES,
+			transport: this.transport(),
+			cancelConfirmation: "acknowledged",
+			reconciliation: "none",
+			workspace: { honorsInvocationCwd: true, readOnlyEnforcement: "none", mutationObservation: ["event_stream", "git_diff", "filesystem_diff"] },
+			verification: { modalities: ["cli", "gui"], freshSession: true, workspaceIsolation: ["mutation_guard", "isolated_copy"], commandExecution: true, guiObservation: true, networkObservation: true },
+		};
 	}
 
 	private transport(): "spawn" | "http" {
@@ -731,14 +738,14 @@ export class PuddingClawDriver implements AgentDriver {
 
 	async cancel(input: { runHandle: string }, ctx: InvocationContext): Promise<void> {
 		if (this.transport() === "http") {
-			await this.requestHttpJson(`/api/headless/runs/${encodeURIComponent(input.runHandle)}/cancel`, {
+			const response = await this.requestHttpJson(`/api/headless/runs/${encodeURIComponent(input.runHandle)}/cancel`, {
 				method: "POST",
 				timeoutMs: 10_000,
-			}).catch(() => undefined);
+			});
+			if (response.status !== "cancelled" && response.cancelled !== true) throw new Error("上游未确认 Run 已取消");
 			return;
 		}
-		try {
-			await spawnWorker({
+		const cancelled = await spawnWorker({
 				command: this.cmd(),
 				args: ["agent", "cancel", input.runHandle, "--json"],
 				env: ctx.env,
@@ -746,9 +753,7 @@ export class PuddingClawDriver implements AgentDriver {
 				signal: ctx.signal,
 				timeoutMs: 10_000,
 			});
-		} catch {
-			// best-effort: absence of a public cancel degrades to SIGTERM
-		}
+		if (cancelled.exitCode !== 0) throw new Error(`PuddingClaw cancel 未确认（exit ${cancelled.exitCode}）`);
 	}
 
 	async probe(ctx: InvocationContext): Promise<ProbeResult> {

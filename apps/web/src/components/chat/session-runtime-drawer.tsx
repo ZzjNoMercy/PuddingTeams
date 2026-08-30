@@ -7,7 +7,8 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { cancelDelegation, interruptGoal, resumeGoal, reviewWorkItem } from "@/lib/api";
+import { cancelDelegation, interruptGoal, reconcileDelegation, resumeGoal, reviewWorkItem, takeoverDelegation, type CollaborationProjectionSource, type SettlementState, type VerificationProjection } from "@/lib/api";
+import { CollaborationTrustAxes } from "./session-activity-drawer";
 import type { CompletionReview, CompletionReviewCriterion, DecisionRequest, DelegationTrace, SessionGoalSummary, SessionWorkState, WorkItem, WorkItemStatus } from "@/lib/types";
 import { RuntimeViewTabs, type SessionRuntimeView } from "./session-activity-drawer";
 import { useWorkerProcessDrawer } from "./worker-process-context";
@@ -107,6 +108,7 @@ export function SessionRuntimeDrawer({
 	const [selectedId, setSelectedId] = useState<string>();
 	const [selectedDelegationId, setSelectedDelegationId] = useState<string>();
 	const [reviewSummary, setReviewSummary] = useState("");
+	const [takeoverRationale, setTakeoverRationale] = useState("");
 	const [working, setWorking] = useState(false);
 	const [filter, setFilter] = useState<PlanFilter>("all");
 	const { openWorkerProcess } = useWorkerProcessDrawer();
@@ -130,6 +132,18 @@ export function SessionRuntimeDrawer({
 	const workItemActions = items.filter((item) => matchesFilter(item, "action")).length;
 	const running = items.filter((item) => matchesFilter(item, "running", executionLive)).length;
 	const readOnly = workState.goalId !== activeGoalId;
+	const selectedDelegation = effectiveDelegationId ? selectedDelegations.find((item) => item.id === effectiveDelegationId) : undefined;
+	const selectedDelegationProjection = selectedDelegation as (DelegationTrace & CollaborationProjectionSource) | undefined;
+	const latestSubmission = selected?.submissions.at(-1);
+	const workItemSettlement: SettlementState = selected && ["submitted", "accepted", "revision", "blocked", "cancelled"].includes(selected.status)
+		? selected.status as SettlementState
+		: "pending";
+	const selectedTrustSource: CollaborationProjectionSource = {
+		executionState: selectedDelegationProjection?.executionState ?? "admitted",
+		receipt: selectedDelegationProjection?.receipt,
+		verification: latestSubmission?.verifications.at(-1)?.status as VerificationProjection | undefined,
+		settlement: workItemSettlement,
+	};
 	const canInterrupt = !readOnly && workState.status === "active" && ["running", "waiting_human", "reviewing"].includes(workState.execution.status);
 	useEffect(() => {
 		try { localStorage.setItem("puddingteams:goal-selection:" + workState.sessionId + ":" + workState.goalId, JSON.stringify({ workItemId: selected?.id, delegationId: effectiveDelegationId })) } catch { /* private mode */ }
@@ -156,6 +170,16 @@ export function SessionRuntimeDrawer({
 			await cancelDelegation(delegationId, workState.goalId);
 			toast.success("已终止当前 Worker 任务");
 		} catch (error) { toast.error(error instanceof Error ? error.message : "无法终止任务") } finally { setWorking(false) }
+	};
+	const reconcileLostDelegation = async (delegationId: string, takeover = false) => {
+		setWorking(true);
+		try {
+			const result = takeover
+				? await takeoverDelegation(delegationId, takeoverRationale.trim(), workState.goalId)
+				: await reconcileDelegation(delegationId, workState.goalId);
+			if (takeover) setTakeoverRationale("");
+			toast.success(takeover ? "已记录人工确认并解除 fenced scope" : `对账结果：${result.executionState}`);
+		} catch (error) { toast.error(error instanceof Error ? error.message : String(error)) } finally { setWorking(false) }
 	};
 	const openProcess = (id: string) => { onOpenChange(false); setTimeout(() => openWorkerProcess(id), 0) };
 
@@ -185,8 +209,26 @@ export function SessionRuntimeDrawer({
 				{selected ? <section className="runtime-section goal-selected-detail">
 					{selected.description ? <p className="mb-3 text-xs text-muted-foreground">{selected.description}</p> : null}
 					{selected.lastChange ? <p className="mb-3 rounded-lg bg-muted/50 px-2 py-1.5 text-[11px] text-muted-foreground">最近计划变更：{selected.lastChange.reason} · {formatTime(selected.lastChange.changedAt)}</p> : null}
+					<div className="mb-3 grid gap-2 rounded-lg border bg-muted/20 p-2 text-[11px] sm:grid-cols-2">
+						<div><span className="text-muted-foreground">复验策略</span><div className="font-medium">{selected.verificationPolicy.mode} · {selected.verificationPolicy.trigger}</div><p className="text-muted-foreground">{selected.verificationPolicy.reason}{selected.verificationPolicy.frozenAtRevision ? ` · 冻结于 r${selected.verificationPolicy.frozenAtRevision}` : ""}</p></div>
+						<div><span className="text-muted-foreground">Workspace 策略</span><div className="font-medium">{selected.workspaceExecutionPolicy.mode} · {selected.workspaceExecutionPolicy.baselineStrategy}</div><p className="text-muted-foreground">{selected.workspaceExecutionPolicy.reason} · {selected.workspaceExecutionPolicy.promoteOnAcceptance ? "验收后提升" : "不自动提升"}</p></div>
+					</div>
 					<div className="goal-criteria"><div className="runtime-section-head"><h3>本项验收条件</h3><span className="runtime-section-metric">{selected.acceptanceCriteria.length} 项</span></div>{selected.acceptanceCriteria.map((criterion, index) => <div key={criterion} className="goal-criterion"><span>{index + 1}</span><p>{criterion}</p></div>)}</div>
-					{selectedDelegations.length ? <div className="mt-4"><label className="text-[11px] font-medium" htmlFor="goal-attempt">执行记录</label><div className="mt-1.5 flex gap-2"><select id="goal-attempt" className="goal-attempt-select" value={effectiveDelegationId ?? ""} onChange={(event) => setSelectedDelegationId(event.target.value)}>{selectedDelegations.map((item, index) => <option key={item.id} value={item.id}>D{index + 1} · {item.agentId} · {item.status}</option>)}</select><Button size="sm" variant="outline" disabled={!effectiveDelegationId} onClick={() => { if (effectiveDelegationId) openProcess(effectiveDelegationId) }}>执行过程</Button>{!readOnly && effectiveDelegationId && selectedDelegations.find((item) => item.id === effectiveDelegationId && (item.status === "running" || item.status === "waiting_input")) ? <Button size="sm" variant="destructive" disabled={working} onClick={() => void terminateDelegation(effectiveDelegationId)}><SquareIcon className="size-3 fill-current" />终止任务</Button> : null}</div></div> : null}
+					<CollaborationTrustAxes source={selectedTrustSource} />
+					{!readOnly && selectedDelegation?.executionState === "observation_lost" ? <div className="mt-3 rounded-lg border border-destructive/30 bg-destructive/5 p-2 text-[11px]">
+						<div className="font-medium text-destructive">执行效果未知，禁止直接重试</div>
+						<p className="mt-1 text-muted-foreground">“重新对账”只查询/重挂原 Run，不新建任务。仅在你已从上游确认执行终止后，填写依据并人工接管。</p>
+						<div className="mt-2 flex gap-2"><Button size="sm" variant="outline" disabled={working} onClick={() => void reconcileLostDelegation(selectedDelegation.id)}>重新对账</Button><Input value={takeoverRationale} onChange={(event) => setTakeoverRationale(event.target.value)} placeholder="确认上游已终止的依据（至少 8 字）" /><Button size="sm" variant="destructive" disabled={working || takeoverRationale.trim().length < 8} onClick={() => void reconcileLostDelegation(selectedDelegation.id, true)}>确认并接管</Button></div>
+					</div> : null}
+					{latestSubmission ? <details className="mt-3 rounded-lg border p-2 text-[11px]" open={selected.status === "submitted" || selected.status === "blocked"}>
+						<summary className="cursor-pointer font-medium">可信交付详情 · Submission #{latestSubmission.attempt}</summary>
+						<div className="mt-2 space-y-2 text-muted-foreground">
+							{latestSubmission.executionReceipt ? <div><div className="font-medium text-foreground">Execution Receipt · {latestSubmission.executionReceipt.reportedOutcome}</div><p>证据收集 {latestSubmission.executionReceipt.collectionStatus} · integrity {latestSubmission.executionReceipt.integrity} · contract {latestSubmission.executionReceipt.contractHash.slice(0, 16)}…</p><p>要求 {latestSubmission.executionReceipt.requirementResults.length} · artifact {latestSubmission.executionReceipt.artifactCapture.length}{latestSubmission.executionReceipt.issues.length ? ` · ${latestSubmission.executionReceipt.issues.join("；")}` : ""}</p></div> : <p>本次交付没有 Execution Receipt。</p>}
+							{latestSubmission.workspaceChangeSet ? <div><div className="font-medium text-foreground">Workspace Change-set · {latestSubmission.workspaceChangeSet.promotionState}</div><p>{latestSubmission.workspaceChangeSet.mode} · {latestSubmission.workspaceChangeSet.changedPaths.length ? latestSubmission.workspaceChangeSet.changedPaths.join("、") : "无文件变化"}</p></div> : null}
+							{latestSubmission.verifications.length ? latestSubmission.verifications.map((verification) => <div key={verification.id} className="border-t pt-2"><div className="font-medium text-foreground">Verification · {verification.mode} · {verification.status}</div><p>{verification.environmentMode}{verification.verifierAgentId ? ` · ${verification.verifierAgentId}` : ""}{verification.environmentProfileId ? ` · profile ${verification.environmentProfileId.slice(0, 12)}…` : ""}</p><p>平台观测 {verification.observations?.length ?? 0} · evidence refs {verification.evidenceRefs.length} · integrity {verification.integrity}</p>{verification.failureReason ? <p className="text-destructive">{verification.failureReason}</p> : null}<div className="mt-1 space-y-1">{verification.criteria.map((criterion, index) => <p key={criterion.criterion + index}><b className="text-foreground">{criterion.status}</b> · {criterion.criterion} · {criterion.explanation}</p>)}</div></div>) : <p>尚无复验记录。</p>}
+						</div>
+					</details> : null}
+					{selectedDelegations.length ? <div className="mt-4"><label className="text-[11px] font-medium" htmlFor="goal-attempt">执行记录</label><div className="mt-1.5 flex gap-2"><select id="goal-attempt" className="goal-attempt-select" value={effectiveDelegationId ?? ""} onChange={(event) => setSelectedDelegationId(event.target.value)}>{selectedDelegations.map((item, index) => <option key={item.id} value={item.id}>D{index + 1} · {item.agentId} · {item.executionState}</option>)}</select><Button size="sm" variant="outline" disabled={!effectiveDelegationId} onClick={() => { if (effectiveDelegationId) openProcess(effectiveDelegationId) }}>执行过程</Button>{!readOnly && effectiveDelegationId && selectedDelegations.find((item) => item.id === effectiveDelegationId && (item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "reconciling")) ? <Button size="sm" variant="destructive" disabled={working} onClick={() => void terminateDelegation(effectiveDelegationId)}><SquareIcon className="size-3 fill-current" />终止任务</Button> : null}</div></div> : null}
 					{!readOnly && selected.status === "submitted" ? <div className="goal-review-box"><div className="text-xs font-semibold">Submission 待 Manager 验收</div><Textarea value={reviewSummary} onChange={(event) => setReviewSummary(event.target.value)} rows={3} placeholder="填写验收摘要与证据判断（必填）" /><div className="grid grid-cols-3 gap-2"><Button size="sm" disabled={working || !reviewSummary.trim()} onClick={() => void review("accepted")}>接受</Button><Button size="sm" variant="outline" disabled={working || !reviewSummary.trim()} onClick={() => void review("revision")}>要求返修</Button><Button size="sm" variant="destructive" disabled={working || !reviewSummary.trim()} onClick={() => void review("blocked")}>标记阻塞</Button></div></div> : null}
 					{selected.submissions.length ? <div className="mt-3 space-y-2">{[...selected.submissions].reverse().map((submission) => <div key={submission.id} className="rounded-lg border p-2 text-[11px]"><div className="font-medium">第 {submission.attempt} 次交付 · {submission.review ? submissionVerdictText[submission.review.verdict] : "待验收"}</div><p className="mt-1 text-muted-foreground"><span className="font-medium text-foreground">{submission.review ? "Manager 验收结论：" : "交付摘要："}</span>{submission.review?.summary ?? submission.summary ?? "请在执行过程中查看完整结果"}</p></div>)}</div> : null}
 				</section> : null}
@@ -195,7 +237,7 @@ export function SessionRuntimeDrawer({
 					{reviews.length === 1 ? <div className="mt-3 flex items-center justify-between gap-3 border-t pt-3 text-[11px]"><span className="font-medium">{verdictText[reviews[0]!.verdict]}</span><span className="text-muted-foreground">{reviewMethod(reviews[0]!)} · {formatTime(reviews[0]!.reviewedAt)}</span></div> : reviews.length > 1 ? <details className="mt-3 border-t pt-3 text-[11px]"><summary className="flex cursor-pointer list-none items-center justify-between gap-3"><span className="font-medium">最近一次：{verdictText[reviews[0]!.verdict]}</span><span className="text-muted-foreground">共 {reviews.length} 次验收 · 查看历史</span></summary><div className="mt-2 space-y-1.5">{reviews.map((review) => <div key={review.id} className="flex items-center justify-between gap-3 rounded-lg bg-muted/45 px-2.5 py-2"><span>{verdictText[review.verdict]}{review.goalRevision !== workState.goalRevision ? " · 旧版标准" : ""}</span><span className="text-muted-foreground">{reviewMethod(review)} · {formatTime(review.reviewedAt)}</span></div>)}</div></details> : null}
 				</Section>
 				{pendingDecisions.length ? <Section icon={<AlertCircleIcon className="size-4" />} title="人工决策" metric={pendingDecisions.length + " 项待回答"}>{pendingDecisions.map((decision) => <div key={decision.id} className="mb-2 rounded-xl border border-amber-500/30 bg-amber-500/5 p-3 text-xs"><div className="font-medium">{decision.question}</div>{!readOnly ? <><div className="mt-2 flex flex-wrap gap-1.5">{decision.options?.map((option) => <Button key={option.id} size="sm" variant="outline" disabled={submitting} onClick={() => onAnswer(decision, option.id)}>{option.label}</Button>)}</div><div className="mt-2 flex gap-1.5"><Input value={answerById[decision.id] ?? ""} onChange={(event) => onAnswerChange(decision.id, event.target.value)} placeholder="输入决定" /><Button size="sm" disabled={submitting || !(answerById[decision.id] ?? "").trim()} onClick={() => onAnswer(decision, answerById[decision.id] ?? "")}>提交</Button></div></> : null}</div>)}</Section> : null}
-				{unplanned.length ? <Section icon={<Clock3Icon className="size-4" />} title="本 Goal 未绑定 WorkItem 的执行" metric={unplanned.length + " 次"}>{unplanned.map((item) => <button key={item.id} type="button" className="goal-unplanned-row" title="当前 Goal 内未绑定 WorkItem 的委托；不包含本 Session 的历史任务" onClick={() => openProcess(item.id)}><span>{item.agentId} · {item.status}</span><ExternalLinkIcon className="size-3" /></button>)}</Section> : null}
+				{unplanned.length ? <Section icon={<Clock3Icon className="size-4" />} title="本 Goal 未绑定 WorkItem 的执行" metric={unplanned.length + " 次"}>{unplanned.map((item) => <button key={item.id} type="button" className="goal-unplanned-row" title="当前 Goal 内未绑定 WorkItem 的委托；不包含本 Session 的历史任务" onClick={() => openProcess(item.id)}><span>{item.agentId} · {item.executionState}</span><ExternalLinkIcon className="size-3" /></button>)}</Section> : null}
 			</div>
 			</>}
 		</DialogContent>

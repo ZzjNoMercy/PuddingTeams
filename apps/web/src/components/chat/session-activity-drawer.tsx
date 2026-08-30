@@ -5,7 +5,7 @@ import { CircleAlertIcon, ListTreeIcon, RefreshCwIcon, TargetIcon } from "lucide
 import { Loader } from "@/components/ai-elements/loader";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import type { WorkerProcessListItem } from "@/lib/api";
+import { collaborationTrustOf, isObservationLost, type CollaborationProjectionSource, type WorkerProcessListItem } from "@/lib/api";
 import { useAgentLabels } from "@/lib/avatars";
 import { WorkerAvatar } from "./worker-avatar";
 
@@ -35,18 +35,52 @@ interface ActivityTurnGroup {
 	items: WorkerProcessListItem[];
 }
 
-function isActive(status: string): boolean {
-	return status === "running" || status === "waiting_input";
+function isActive(executionState: string): boolean {
+	return executionState === "running" || executionState === "waiting_input" || executionState === "cancel_requested" || executionState === "reconciling";
 }
 
-function statusLabel(status: string): string {
-	return {
-		running: "执行中",
-		waiting_input: "等待输入",
-		completed: "已完成",
-		failed: "失败",
-		cancelled: "已取消",
-	}[status] ?? status;
+const executionLabels: Record<string, string> = {
+	admitted: "已接纳", running: "执行中", waiting_input: "等待输入", reported_completed: "Worker 已报告完成",
+	reported_failed: "Worker 已报告失败", cancel_requested: "取消请求中", reconciling: "正在重挂原 Run", cancelled: "已取消", observation_lost: "失去观测 · effect_unknown",
+};
+const verificationLabels: Record<string, string> = {
+	not_required: "无需复验", unverified: "未复验", pending: "待复验", running: "复验中", waiting_input: "复验等待输入",
+	passed: "已复验", failed: "复验失败", blocked: "复验受阻", stale: "复验已过期",
+};
+const settlementLabels: Record<string, string> = {
+	pending: "待结算", submitted: "已提交", accepted: "已接受", revision: "需返修", blocked: "已阻塞", cancelled: "已取消",
+};
+function axisClass(axis: "execution" | "verification" | "settlement", value: string): string {
+	if (axis === "execution" && ["observation_lost", "reported_failed"].includes(value)) return "is-danger";
+	if (axis === "execution" && value === "reported_completed") return "is-reported";
+	if (axis === "verification" && ["failed", "blocked", "stale"].includes(value)) return "is-danger";
+	if (axis === "verification" && value === "passed") return "is-good";
+	if (axis === "settlement" && value === "accepted") return "is-good";
+	if (axis === "settlement" && ["revision", "blocked"].includes(value)) return "is-danger";
+	return "";
+}
+
+/** Explicit trust projection shared by the activity, goal and process drawers. */
+export function CollaborationTrustAxes({ source, compact = false }: { source: CollaborationProjectionSource; compact?: boolean }) {
+	const trust = collaborationTrustOf(source);
+	const receipt = source.receipt;
+	const unknown = isObservationLost(source);
+	return (
+		<div className={`collaboration-trust ${compact ? "is-compact" : ""}`} aria-label="Execution Verification Settlement 三轴状态">
+			<div className="collaboration-trust-axes">
+				<span className={`collaboration-trust-axis execution ${axisClass("execution", trust.execution)}`}><b>Execution</b><em>{executionLabels[trust.execution] ?? trust.execution}</em></span>
+				<span className={`collaboration-trust-axis verification ${axisClass("verification", trust.verification)}`}><b>Verification</b><em>{verificationLabels[trust.verification] ?? trust.verification}</em></span>
+				<span className={`collaboration-trust-axis settlement ${axisClass("settlement", trust.settlement)}`}><b>Settlement</b><em>{settlementLabels[trust.settlement] ?? trust.settlement}</em></span>
+			</div>
+			{!compact && receipt ? <div className="collaboration-receipt-meta">
+				<span>Receipt {receipt.sealedAt ? "sealed" : "已记录"}</span>
+				{receipt.contractHash ? <code title={receipt.contractHash}>contract {receipt.contractHash.slice(0, 12)}…</code> : null}
+				{receipt.collectionStatus ? <span>证据 {receipt.collectionStatus === "complete" ? "完整" : receipt.collectionStatus === "partial" ? "部分" : "失败"}</span> : null}
+				{receipt.integrity && receipt.integrity !== "clean" ? <span className="is-warning">integrity {receipt.integrity}</span> : null}
+			</div> : null}
+			{unknown ? <div className="collaboration-trust-warning" role="alert"><CircleAlertIcon />执行状态未可观测，真实副作用未知。请重新对账、确认外部状态或人工接管；不要直接重试。</div> : null}
+		</div>
+	);
 }
 
 function taskSummary(item: WorkerProcessListItem): string {
@@ -55,7 +89,7 @@ function taskSummary(item: WorkerProcessListItem): string {
 
 function orderActivities(items: WorkerProcessListItem[]): WorkerProcessListItem[] {
 	return [...items].sort((a, b) => {
-		const activeDelta = Number(isActive(b.status)) - Number(isActive(a.status));
+		const activeDelta = Number(isActive(b.executionState)) - Number(isActive(a.executionState));
 		return activeDelta || b.updatedAt.localeCompare(a.updatedAt);
 	});
 }
@@ -84,7 +118,7 @@ export function groupActivitiesByTurn(items: WorkerProcessListItem[], turns: Ses
 
 function durationLabel(item: WorkerProcessListItem, now: number): string {
 	const start = Date.parse(item.createdAt);
-	const end = isActive(item.status) ? now : Date.parse(item.updatedAt);
+	const end = isActive(item.executionState) ? now : Date.parse(item.updatedAt);
 	if (Number.isNaN(start) || Number.isNaN(end) || end < start) return "";
 	const seconds = Math.max(0, Math.floor((end - start) / 1000));
 	if (seconds < 60) return `${seconds} 秒`;
@@ -144,12 +178,12 @@ export function SessionActivityDrawer({
 	const groups = useMemo(() => groupActivitiesByTurn(items, turns), [items, turns]);
 	const current = groups.find((group) => group.isCurrent) ?? groups[0]!;
 	const selected = (selectedTurnId ? groups.find((group) => group.id === selectedTurnId) : undefined) ?? current;
-	const running = current.items.filter((item) => item.status === "running").length;
-	const pending = current.items.filter((item) => item.status === "waiting_input").length;
-	const completed = current.items.filter((item) => item.status === "completed").length;
-	const selectedRunning = selected.items.filter((item) => item.status === "running").length;
-	const selectedPending = selected.items.filter((item) => item.status === "waiting_input").length;
-	const selectedCompleted = selected.items.filter((item) => item.status === "completed").length;
+	const running = current.items.filter((item) => item.executionState === "running" || item.executionState === "reconciling").length;
+	const pending = current.items.filter((item) => item.executionState === "waiting_input").length;
+	const completed = current.items.filter((item) => item.executionState === "reported_completed").length;
+	const selectedRunning = selected.items.filter((item) => item.executionState === "running" || item.executionState === "reconciling").length;
+	const selectedPending = selected.items.filter((item) => item.executionState === "waiting_input").length;
+	const selectedCompleted = selected.items.filter((item) => item.executionState === "reported_completed").length;
 
 	useEffect(() => {
 		if (!open || running === 0) return;
@@ -162,13 +196,14 @@ export function SessionActivityDrawer({
 		const summary = taskSummary(item);
 		const duration = durationLabel(item, now);
 		return (
-			<button key={item.delegationId} type="button" title="查看执行过程" className={`task-activity-card is-${item.status}`} onClick={() => onOpenProcess(item.delegationId)}>
+			<button key={item.delegationId} type="button" title="查看执行过程" className={`task-activity-card is-${item.executionState} ${isObservationLost(item) ? "is-observation-lost" : ""}`} onClick={() => onOpenProcess(item.delegationId)}>
 				<WorkerAvatar name={item.agentId} size={34} />
 				<span className="task-activity-copy">
 					<span className="task-activity-worker">{labels[item.agentId] ?? item.agentId}</span>
 					<strong>{summary}</strong>
+					<CollaborationTrustAxes source={item} compact />
 				</span>
-				<span className="task-activity-status"><i />{statusLabel(item.status)}{duration ? ` · ${duration}` : ""}</span>
+				<span className="task-activity-status"><i />{executionLabels[collaborationTrustOf(item).execution] ?? item.executionState}{duration ? ` · ${duration}` : ""}</span>
 			</button>
 		);
 	});

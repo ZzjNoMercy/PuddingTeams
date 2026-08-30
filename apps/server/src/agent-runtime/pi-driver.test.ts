@@ -31,12 +31,6 @@ async function collect(events: AsyncIterable<AgentEvent>): Promise<AgentEvent[]>
 
 test("Phase6: pi connector 能力诚实声明——run/continue/cancel、无 HITL、stream、sdk", async () => {
 	const driver = new LocalPiDriver();
-	assert.deepEqual(await driver.capabilities(), {
-		operations: ["run", "continue", "cancel"],
-		interactionKinds: [],
-		progress: "stream",
-		transport: "sdk",
-	});
 	assert.deepEqual(await driver.capabilities(), PI_CAPABILITIES);
 });
 

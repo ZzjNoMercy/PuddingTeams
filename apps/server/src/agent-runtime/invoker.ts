@@ -4,10 +4,11 @@ import { AgentRuntime, SessionConflictError } from "./runtime.js";
 import type { DelegationRecord } from "./delegation-store.js";
 import { DriverRegistry } from "./driver-registry.js";
 import { PuddingClawDriver } from "./puddingclaw-driver.js";
-import type { AgentDriver, DriverCapabilities, InvocationContext } from "./types.js";
+import type { AgentDriver, DriverCapabilities, InvocationContext, NormalizedResult } from "./types.js";
 import { ExtensionCatalog, resolveAgentCapabilityRuntime } from "./extensions.js";
 import type { ProductSettingsStore } from "../store/product-settings.js";
 import { resolveWorkerCodeSearch } from "../pi-bridge/code-search.js";
+import type { WorkspaceExecutionPolicy } from "./workspace-execution.js";
 
 export interface AgentInvokeParams {
 	windowId: string;
@@ -18,6 +19,15 @@ export interface AgentInvokeParams {
 	workItemId?: string;
 	attempt?: number;
 	goalEpoch?: number;
+	goalRevision?: number;
+	workItemRevision?: number;
+	contractHash?: string;
+	workspaceExecutionPolicy?: WorkspaceExecutionPolicy;
+	purpose?: "execution" | "verification";
+	verificationId?: string;
+	verifiesSubmissionId?: string;
+	environmentProfileId?: string;
+	verificationEnvironmentId?: string;
 	parentDelegationId?: string;
 	handoffKind?: "request" | "followup";
 	intent?: string;
@@ -105,7 +115,7 @@ export class AgentInvoker {
 	async runningDelegateToolCallIds(managerSessionId: string): Promise<string[]> {
 		const list = await this.runtime.listDelegations(undefined, managerSessionId);
 		return list
-			.filter((d) => (d.status === "running" || d.status === "waiting_input") && this.runtime.isDelegationActive(d.id))
+			.filter((d) => (d.executionState === "running" || d.executionState === "waiting_input" || d.executionState === "reconciling") && this.runtime.isDelegationActive(d.id))
 			.map((d) => d.managerToolCallId)
 			.filter((id): id is string => Boolean(id));
 	}
@@ -164,7 +174,7 @@ export class AgentInvoker {
 
 	async activeDelegations(windowId: string) {
 		return (await this.runtime.listDelegations(windowId)).filter(
-			(d) => d.status === "running" || d.status === "waiting_input",
+			(d) => d.executionState === "running" || d.executionState === "waiting_input" || d.executionState === "cancel_requested" || d.executionState === "reconciling",
 		);
 	}
 
@@ -179,7 +189,7 @@ export class AgentInvoker {
 		const close = async () => {
 			await preflight();
 			const active = (await this.runtime.listDelegations(undefined, managerSessionId))
-				.filter((item) => item.status === "running" || item.status === "waiting_input");
+				.filter((item) => item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling");
 			for (const item of active) await this.cancelUnlocked(item.id, signal);
 			return transition();
 		};
@@ -200,7 +210,7 @@ export class AgentInvoker {
 			const active = (await this.runtime.listDelegations()).filter(
 				(item) =>
 					(item.windowId === windowId || sessionIds.has(item.managerSessionId))
-					&& (item.status === "running" || item.status === "waiting_input"),
+					&& (item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling"),
 			);
 			for (const item of active) await this.cancelUnlocked(item.id, signal);
 			return transition();
@@ -240,7 +250,7 @@ export class AgentInvoker {
 				const related = (await this.runtime.listDelegations()).filter(
 					(item) =>
 						(item.windowId === source.id || source.sessions.includes(item.managerSessionId)) &&
-						(item.status === "running" || item.status === "waiting_input"),
+						(item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling"),
 				);
 				for (const delegation of related) await this.cancelUnlocked(delegation.id);
 
@@ -332,7 +342,7 @@ export class AgentInvoker {
 				if (!freshManagerOwner || freshManagerOwner.id !== managerOwner.id) {
 					throw new Error("manager Session 的窗口生命周期已变化，委托被拒绝");
 				}
-				if (window.type !== "solo" && !window.members.includes(freshAgent.name)) {
+				if (params.purpose !== "verification" && window.type !== "solo" && !window.members.includes(freshAgent.name)) {
 					throw new Error(`agent「${freshAgent.name}」不是当前窗口的成员，委托被拒绝`);
 				}
 				const driver = this.drivers.get(freshAgent.name) ?? this.resolveDriverFor(freshAgent);
@@ -363,6 +373,15 @@ export class AgentInvoker {
 						workItemId: params.workItemId,
 						attempt: params.attempt,
 						goalEpoch: params.goalEpoch,
+						goalRevision: params.goalRevision,
+						workItemRevision: params.workItemRevision,
+						contractHash: params.contractHash,
+						workspaceExecutionPolicy: params.workspaceExecutionPolicy,
+						purpose: params.purpose,
+						verificationId: params.verificationId,
+						verifiesSubmissionId: params.verifiesSubmissionId,
+						environmentProfileId: params.environmentProfileId,
+						verificationEnvironmentId: params.verificationEnvironmentId,
 						parentDelegationId: params.parentDelegationId,
 						handoffKind: params.handoffKind,
 						intent: params.intent,
@@ -506,6 +525,7 @@ export class AgentInvoker {
 			}
 			case "completed": {
 				const result = delegation.result;
+				const workspaceChangeSet = await this.runtime.getWorkspaceChangeSet(d.workspaceChangeSetId);
 				return {
 					...base,
 					status: "completed",
@@ -514,6 +534,8 @@ export class AgentInvoker {
 						...(result?.meta ?? {}),
 						artifacts: result?.artifacts,
 						usage: result?.usage,
+						executionReceipt: d.receipt,
+						workspaceChangeSet,
 					},
 					waitingInput: false,
 				};
@@ -833,15 +855,59 @@ export class AgentInvoker {
 	/** Delete/session lifecycle boundary: seal every active Run before its owner disappears. */
 	async cancelManagerSession(managerSessionId: string, signal?: AbortSignal): Promise<number> {
 		const candidateCount = (await this.runtime.listDelegations(undefined, managerSessionId))
-			.filter((item) => item.status === "running" || item.status === "waiting_input").length;
+			.filter((item) => item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling").length;
 		await this.closeManagerSession(managerSessionId, async () => undefined, async () => undefined, signal);
 		return candidateCount;
+	}
+
+	getDelegation(delegationId: string): Promise<DelegationRecord | undefined> {
+		return this.runtime.getDelegation(delegationId);
+	}
+
+	reconcileDelegation(delegationId: string, notify?: (delegation: DelegationRecord, result: NormalizedResult) => Promise<void>): Promise<DelegationRecord> {
+		return this.runtime.reconcileDelegation(delegationId, notify);
+	}
+
+	confirmObservationLostStopped(delegationId: string, rationale: string): Promise<DelegationRecord> {
+		return this.runtime.confirmObservationLostStopped(delegationId, rationale);
+	}
+
+	verificationObservations(delegationId: string) {
+		return this.runtime.verificationObservations(delegationId);
+	}
+
+	createVerificationEnvironment(scopeId: string, verificationId: string, mode: "isolated_copy" | "same_target_guarded" = "isolated_copy") {
+		return this.runtime.createVerificationEnvironment(scopeId, verificationId, mode);
+	}
+
+	createGoalVerificationEnvironment(input: { workspacePath: string; workspaceId?: string; verificationId: string; goalId: string; goalEpoch: number }) {
+		return this.runtime.createGoalVerificationEnvironment(input);
+	}
+
+	releaseVerificationEnvironment(copyId: string): Promise<void> {
+		return this.runtime.releaseVerificationEnvironment(copyId);
+	}
+
+	observeVerificationEnvironment(copyId: string) {
+		return this.runtime.observeVerificationEnvironment(copyId);
+	}
+
+	promoteWorkspaceChangeSet(scopeId: string, changeSetId: string) {
+		return this.runtime.promoteWorkspaceChangeSet(scopeId, changeSetId);
+	}
+
+	getWorkspaceChangeSet(changeSetId: string | undefined) {
+		return this.runtime.getWorkspaceChangeSet(changeSetId);
+	}
+
+	releaseWorkspaceExecutionScope(scopeId: string, cleanup = true): Promise<void> {
+		return this.runtime.releaseWorkspaceExecutionScope(scopeId, cleanup);
 	}
 
 	private async cancelUnlocked(delegationId: string, signal?: AbortSignal): Promise<void> {
 		const delegation = await this.runtime.getDelegation(delegationId);
 		if (!delegation) throw new Error("delegation not found");
-		const wasWaitingInput = delegation.status === "waiting_input";
+		const wasWaitingInput = delegation.executionState === "waiting_input";
 		const agent = await this.teams.getAgent(delegation.agentId);
 		await this.runtime.cancel(delegationId, {
 			cwd: delegation.cwdSnapshot,

@@ -8,15 +8,19 @@ import {
 	ConversationScrollButton,
 } from "@/components/ai-elements/conversation";
 import { Loader } from "@/components/ai-elements/loader";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { useWorkerProcess } from "@/hooks/useWorkerProcess";
 import { useDelegationTimeline } from "@/hooks/useDelegationTimeline";
-import { fetchRoomDelegationProcesses, type WorkerProcessInfo, type WorkerProcessListItem } from "@/lib/api";
+import { fetchRoomDelegationProcesses, isObservationLost, reconcileDelegation, takeoverDelegation, type WorkerProcessInfo, type WorkerProcessListItem } from "@/lib/api";
+import { toast } from "sonner";
 import type { DelegationTimelineEvent } from "@/lib/types";
 import { timelineForDisplay, type TimelineDisplayEvent } from "@/lib/delegation-timeline-display";
 import { groupForRender, type RenderItem } from "@/lib/events";
 import { useAgentLabels } from "@/lib/avatars";
 import { AssistantGroup, Message } from "./message";
 import { WorkerAvatar } from "./worker-avatar";
+import { CollaborationTrustAxes } from "./session-activity-drawer";
 
 function WorkerProcessBody({
 	delegationId,
@@ -226,10 +230,12 @@ export function WorkerProcessDrawer({
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState<string | null>(null);
 	const [fullSessionDelegationId, setFullSessionDelegationId] = useState<string | null>(null);
+	const [takeoverRationale, setTakeoverRationale] = useState("");
+	const [reconciling, setReconciling] = useState(false);
 	const labels = useAgentLabels();
 	const orderedItems = useMemo(() => [...items].sort((a, b) => {
-		const activeA = a.status === "running" || a.status === "waiting_input" ? 1 : 0;
-		const activeB = b.status === "running" || b.status === "waiting_input" ? 1 : 0;
+		const activeA = a.executionState === "running" || a.executionState === "waiting_input" || a.executionState === "cancel_requested" || a.executionState === "reconciling" ? 1 : 0;
+		const activeB = b.executionState === "running" || b.executionState === "waiting_input" || b.executionState === "cancel_requested" || b.executionState === "reconciling" ? 1 : 0;
 		return activeB - activeA || b.updatedAt.localeCompare(a.updatedAt);
 	}), [items]);
 	const selected = orderedItems.find((item) => item.delegationId === selectedId) ?? null;
@@ -237,7 +243,7 @@ export function WorkerProcessDrawer({
 		const byAgent = new Map<string, { agentId: string; count: number; active: boolean; latest: WorkerProcessListItem }>();
 		for (const item of orderedItems) {
 			const current = byAgent.get(item.agentId);
-			const active = item.status === "running" || item.status === "waiting_input";
+			const active = item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling";
 			if (current) {
 				current.count += 1;
 				current.active ||= active;
@@ -288,10 +294,23 @@ export function WorkerProcessDrawer({
 		return () => window.removeEventListener("keydown", closeOnEscape);
 	}, [onOpenChange, open]);
 
-	const activeCount = orderedItems.filter((item) => item.status === "running" || item.status === "waiting_input").length;
+	const activeCount = orderedItems.filter((item) => item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling").length;
 	const showFullSession = selected !== null && fullSessionDelegationId === selected.delegationId;
 	const selectItem = (item: WorkerProcessListItem) => {
 		setSelectedId(item.delegationId);
+		setTakeoverRationale("");
+	};
+	const resolveUnknown = async (takeover = false) => {
+		if (!selected) return;
+		setReconciling(true);
+		try {
+			const result = takeover
+				? await takeoverDelegation(selected.delegationId, takeoverRationale.trim(), selected.goalId)
+				: await reconcileDelegation(selected.delegationId, selected.goalId);
+			if (takeover) setTakeoverRationale("");
+			await refresh();
+			toast.success(takeover ? "已确认终止并完成人工接管" : `对账结果：${result.executionState}`);
+		} catch (reason) { toast.error(reason instanceof Error ? reason.message : String(reason)) } finally { setReconciling(false) }
 	};
 
 	return (
@@ -358,6 +377,10 @@ export function WorkerProcessDrawer({
 										) : null}
 									</div>
 								) : null}
+								<div className={`worker-process-trust ${isObservationLost(selected) ? "is-observation-lost" : ""}`}>
+									<CollaborationTrustAxes source={selected} />
+								</div>
+								{isObservationLost(selected) ? <div className="shrink-0 border-b border-destructive/20 bg-destructive/5 p-2 text-[11px]"><div className="flex gap-2"><Button size="sm" variant="outline" disabled={reconciling} onClick={() => void resolveUnknown()}>重新对账原 Run</Button><Input value={takeoverRationale} onChange={(event) => setTakeoverRationale(event.target.value)} placeholder="上游已终止的确认依据（至少 8 字）" /><Button size="sm" variant="destructive" disabled={reconciling || takeoverRationale.trim().length < 8} onClick={() => void resolveUnknown(true)}>确认并接管</Button></div></div> : null}
 								<WorkerProcessRouter key={`${selected.delegationId}:${selected.view}`} info={selected} full={showFullSession} />
 							</>
 						) : (

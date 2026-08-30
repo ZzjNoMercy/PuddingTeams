@@ -20,7 +20,8 @@ export interface WorkerProcessInfo {
 	managerSessionId: string;
 	goalId?: string;
 	agentId: string;
-	status: DelegationRecord["status"];
+	executionState: DelegationRecord["executionState"];
+	receipt?: DelegationRecord["receipt"];
 	sessionHandle?: string;
 	/** 委托创建时间：worker 会话跨任务续接，前端按它切出本次委托的消息片段。 */
 	createdAt: string;
@@ -55,12 +56,13 @@ export class WorkerProcessService {
 			managerSessionId: d.managerSessionId,
 			goalId: d.goalId,
 			agentId: d.agentId,
-			status: d.status,
+			executionState: d.executionState,
+			receipt: d.receipt,
 			sessionHandle: d.sessionHandle,
 			createdAt: d.createdAt,
 			live: view === "session"
 				? Boolean(d.sessionHandle && liveWorkerSession(d.sessionHandle) !== undefined)
-				: d.status === "running" || d.status === "waiting_input",
+				: d.executionState === "running" || d.executionState === "waiting_input" || d.executionState === "cancel_requested" || d.executionState === "reconciling",
 			view,
 		};
 	}

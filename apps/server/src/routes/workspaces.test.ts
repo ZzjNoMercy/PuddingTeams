@@ -362,6 +362,7 @@ test("P3-1 API: solo 原地切换会取消由 solo 路由到 direct 的 Delegati
 		agentRevision: (await teams.getAgent("alpha"))?.extensionRevision ?? 0,
 		operation: "run",
 	});
+	await delegations.transitionDelegation(delegation.id, ["admitted"], { executionState: "running" });
 
 	const switched = await app.inject({
 		method: "POST",
@@ -369,7 +370,7 @@ test("P3-1 API: solo 原地切换会取消由 solo 路由到 direct 的 Delegati
 		payload: { workspaceId: b.id, mode: "in_place" },
 	});
 	assert.equal(switched.statusCode, 200, switched.body);
-	assert.equal((await delegations.getDelegation(delegation.id))?.status, "cancelled");
+	assert.equal((await delegations.getDelegation(delegation.id))?.executionState, "observation_lost");
 	await sessions.disposeAll();
 	await app.close();
 });

@@ -231,4 +231,7 @@ export const CODEX_CAPABILITIES: DriverCapabilities = {
 	interactionKinds: [],
 	progress: "stream",
 	transport: "spawn",
+	cancelConfirmation: "observable",
+	workspace: { honorsInvocationCwd: true, readOnlyEnforcement: "none", mutationObservation: ["git_diff", "filesystem_diff"] },
+	verification: { modalities: ["cli"], freshSession: true, workspaceIsolation: ["mutation_guard", "isolated_copy"], commandExecution: true, guiObservation: false, networkObservation: true },
 };

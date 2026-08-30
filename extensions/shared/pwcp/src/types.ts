@@ -70,12 +70,20 @@ export interface ArtifactRef {
 	origin: "push" | "observe";
 }
 
+/** Worker/Driver 对某一条冻结证据要求的上游报告；平台仍需校验引用存在性和归属。 */
+export interface ReportedEvidence {
+	requirement: string;
+	evidenceRefs: string[];
+}
+
 export interface ResultBase {
 	agentId: string;
 	sessionHandle?: string;
 	runHandle?: string;
 	content?: string;
 	artifacts?: ArtifactRef[];
+	/** 上游报告的证据映射，不代表已经独立验证。 */
+	reportedEvidence?: ReportedEvidence[];
 	usage?: {
 		turns?: number;
 		inputTokens?: number;
@@ -108,6 +116,25 @@ export interface FailedResult extends ResultBase {
 }
 
 export type NormalizedResult = CompletedResult | NeedsInputResult | FailedResult;
+
+/** Connector-neutral immutable payload sealed by the host Runtime after a terminal boundary. */
+export interface ExecutionReceiptPayload {
+	schemaVersion: 1;
+	operationId: string;
+	reportedOutcome: "completed" | "failed" | "blocked" | "cancelled";
+	upstream: {
+		sessionHandle?: string;
+		runHandle?: string;
+	};
+	reportedEvidence: ReportedEvidence[];
+	reportedArtifacts: ArtifactRef[];
+	startedAt: string;
+	observedAt: string;
+	observer: {
+		connectorId: string;
+		transport: DriverTransport;
+	};
+}
 
 /** 事件输出：每次操作必须恰好到达一个边界（input_required/completed/failed）。 */
 export type AgentEvent =
@@ -158,12 +185,48 @@ export interface WorkerActivityUpdateDetails {
 /** Connector execution boundary selected for one concrete Agent binding. */
 export type DriverTransport = "spawn" | "http" | "rpc" | "acp" | "sdk";
 
+export type DriverReconciliation = "none" | "query_run" | "reattach_stream";
+export type DriverCancelConfirmation = "none" | "acknowledged" | "observable";
+
+export interface DriverWorkspaceCapabilities {
+	honorsInvocationCwd: boolean;
+	readOnlyEnforcement: "none" | "sandbox" | "remote_policy";
+	mutationObservation: Array<"event_stream" | "git_diff" | "filesystem_diff">;
+}
+
+export interface DriverVerificationCapabilities {
+	modalities: Array<"cli" | "gui">;
+	freshSession: boolean;
+	workspaceIsolation: Array<"none" | "mutation_guard" | "isolated_copy">;
+	commandExecution: boolean;
+	guiObservation: boolean;
+	networkObservation: boolean;
+}
+
+/** Runtime-resolved, auditable constraints for a verification-purpose Run. */
+export interface VerificationInvocationProfile {
+	profileId: string;
+	environmentId: string;
+	sourceBinding: "goal_workspace";
+	executionRoot: string;
+	workspaceBoundary: "platform_isolated_copy" | "platform_mutation_guard";
+	mutationPolicy: "isolated_changes_only" | "block_on_change";
+	/** First release does not claim network isolation; Connector/account policy remains authoritative. */
+	networkPolicy: "inherit_connector_policy";
+}
+
 export interface DriverCapabilities {
 	operations: Array<"run" | "continue" | "respond" | "cancel">;
 	interactionKinds: Array<"permission" | "question" | "confirmation">;
 	progress: "none" | "coarse" | "stream";
 	/** spawn=子进程 CLI；http/rpc/acp=网络协议；sdk=进程内 SDK（如本地 pi）。 */
 	transport: DriverTransport;
+	/** 缺省按 none 处理；Connector 只能声明上游真实支持的对账能力。 */
+	reconciliation?: DriverReconciliation;
+	/** 缺省按 none 处理；发出 cancel 不等于确认远端已经停止。 */
+	cancelConfirmation?: DriverCancelConfirmation;
+	workspace?: DriverWorkspaceCapabilities;
+	verification?: DriverVerificationCapabilities;
 }
 
 export interface InvocationContext {
@@ -177,6 +240,8 @@ export interface InvocationContext {
 	operationId?: string;
 	/** Alias for upstream HTTP/RPC APIs that use an idempotency-key convention. */
 	idempotencyKey?: string;
+	/** Present only for purpose=verification; resolved by Harness, never accepted from a prompt. */
+	verificationProfile?: VerificationInvocationProfile;
 	/** 已注入凭证的环境变量。 */
 	env: NodeJS.ProcessEnv;
 	signal?: AbortSignal;
@@ -209,6 +274,13 @@ export interface ProbeResult {
 	issues: Array<{ code: string; message: string; fixAction?: string }>;
 }
 
+export type ReconciledRun =
+	| { state: "running"; sessionHandle?: string; runHandle: string }
+	| { state: "needs_input"; result: NeedsInputResult; providerState?: Record<string, unknown> }
+	| { state: "completed"; result: CompletedResult }
+	| { state: "failed" | "cancelled"; result: FailedResult }
+	| { state: "unknown"; reason: string };
+
 /** Driver-owned dynamic choices for one Connector config field. */
 export interface DriverConfigOption {
 	value: string;
@@ -228,6 +300,10 @@ export interface AgentDriver {
 	continue(input: ContinueInput, ctx: InvocationContext): AsyncIterable<AgentEvent>;
 	respond(input: RespondInput, ctx: InvocationContext): AsyncIterable<AgentEvent>;
 	cancel?(input: { runHandle: string }, ctx: InvocationContext): Promise<void>;
+	/** Runtime-only control-plane reconciliation; not a Manager-visible AgentOperation. */
+	reconcileRun?(input: { runHandle: string; lastObservedAt?: string }, ctx: InvocationContext): Promise<ReconciledRun>;
+	/** Reattach to the same upstream Run and continue emitting normalized events. */
+	reattachRun?(input: { runHandle: string; afterCursor?: string }, ctx: InvocationContext): AsyncIterable<AgentEvent>;
 	probe(ctx: InvocationContext): Promise<ProbeResult>;
 	/** Optional provider-native option discovery (for example Codex model/list). */
 	listConfigOptions?(field: string, ctx: InvocationContext): Promise<DriverConfigOption[]>;

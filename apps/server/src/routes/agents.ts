@@ -404,7 +404,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 			const resolve = req.body?.resolve;
 			const active = runtime
 				? (await runtime.listDelegations()).filter(
-						(d) => d.agentId === agent.name && (d.status === "running" || d.status === "waiting_input"),
+						(d) => d.agentId === agent.name && (d.executionState === "running" || d.executionState === "waiting_input" || d.executionState === "cancel_requested" || d.executionState === "reconciling"),
 					)
 				: [];
 			if (active.length > 0 && resolve !== "keep" && resolve !== "cancel") {
@@ -412,7 +412,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 					error: `agent「${agent.name}」有 ${active.length} 个进行中/等待审批的 Run；显式传 resolve: "keep" | "cancel"`,
 					runs: active.map((d) => ({
 						delegationId: d.id,
-						status: d.status,
+					executionState: d.executionState,
 						windowId: d.windowId,
 						managerSessionId: d.managerSessionId,
 					})),

@@ -450,7 +450,7 @@ test("Phase5: 禁用保护——active/waiting Run 时 409，resolve keep/cancel
 		agentRevision: 0,
 		operation: "run",
 	});
-	await delegations.updateDelegation(d.id, { runHandle: "run-1" });
+	await delegations.transitionDelegation(d.id, ["admitted"], { executionState: "running", runHandle: "run-1" });
 
 	// 无 resolve → 409 + Run 清单，Agent 仍启用。
 	const conflict = await app.inject({ method: "PUT", url: "/api/agents/alpha/enabled", payload: { enabled: false } });
@@ -463,7 +463,7 @@ test("Phase5: 禁用保护——active/waiting Run 时 409，resolve keep/cancel
 	const keep = await app.inject({ method: "PUT", url: "/api/agents/alpha/enabled", payload: { enabled: false, resolve: "keep" } });
 	assert.equal(keep.statusCode, 200);
 	assert.equal((await teams.getAgent("alpha"))!.enabled, false);
-	assert.equal((await delegations.getDelegation(d.id))!.status, "running", "keep 必须保留 Run");
+	assert.equal((await delegations.getDelegation(d.id))!.executionState, "running", "keep 必须保留 Run");
 	assert.equal(cancelled, 0);
 
 	// 重新启用后 resolve:"cancel" → Runtime 取消 Run 再禁用。
@@ -471,7 +471,7 @@ test("Phase5: 禁用保护——active/waiting Run 时 409，resolve keep/cancel
 	const cancel = await app.inject({ method: "PUT", url: "/api/agents/alpha/enabled", payload: { enabled: false, resolve: "cancel" } });
 	assert.equal(cancel.statusCode, 200);
 	assert.equal(cancelled, 1, "cancel 必须走 Runtime 取消");
-	assert.equal((await delegations.getDelegation(d.id))!.status, "cancelled");
+	assert.equal((await delegations.getDelegation(d.id))!.executionState, "observation_lost");
 	await app.close();
 });
 

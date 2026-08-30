@@ -166,6 +166,9 @@ test("P2-c: echo capabilities——诚实声明 run/continue/cancel、无 HITL�
 		interactionKinds: [],
 		progress: "stream",
 		transport: "spawn",
+		cancelConfirmation: "observable",
+		workspace: { honorsInvocationCwd: true, readOnlyEnforcement: "none", mutationObservation: ["git_diff", "filesystem_diff"] },
+		verification: { modalities: ["cli"], freshSession: true, workspaceIsolation: ["mutation_guard", "isolated_copy"], commandExecution: true, guiObservation: false, networkObservation: true },
 	});
 });
 

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Type, type Static } from "typebox";
 import type { ExtensionAPI, InlineExtension } from "@earendil-works/pi-coding-agent";
 import { agentDisplayName, type TeamsStore, type AgentConfig, type WindowConfig, type WindowType } from "../store/teams.js";
-import { WorkStateConflictError, WorkStateOperationConflictError, goalCriterionRefs, type WorkStateStore } from "../store/work-state.js";
+import { WorkStateConflictError, WorkStateOperationConflictError, goalCriterionRefs, workItemContractHash, type WorkStateStore } from "../store/work-state.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import {
 	ScopedAgentInvoker,
@@ -16,6 +16,7 @@ import type { PiSessionStore } from "./session-store.js";
 import type { ArtifactStore } from "../agent-runtime/artifact-store.js";
 import type { LargeWorkerResultStore } from "../store/large-worker-result.js";
 import type { ProductSettingsStore } from "../store/product-settings.js";
+import { ENVIRONMENT_OBSERVATION_REF, bindEnvironmentObservations, buildVerificationPrompt, parseVerificationOutput, type VerificationReviewInput } from "../agent-runtime/verification-review.js";
 
 /**
  * Phase 4：manager Session 的 Extension 装配（方案 §3.3）。
@@ -49,12 +50,13 @@ export const CORE_TOOL_CREATE_GOAL = "create_session_goal";
 export const CORE_TOOL_UPDATE_WORK_PLAN = "update_work_plan";
 export const CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM = "advance_manager_work_item";
 export const CORE_TOOL_REVIEW_WORK_ITEM = "review_work_item";
+export const CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION = "request_work_item_verification";
 export const CORE_TOOL_READ_DELEGATION_RESULT = "read_delegation_result";
 /** solo：manager 自建群聊并下达首条任务（房间即群聊 §manager 建房）。 */
 export const CORE_TOOL_CREATE_GROUP = "create_group_window";
 /** group：拉其他已启用 worker 进本群（成员变化走既有撤权/重建链）。 */
 export const CORE_TOOL_INVITE = "invite_to_group";
-const GOAL_ACTIVE_TOOLS = [CORE_TOOL_UPDATE_WORK_STATE, CORE_TOOL_REQUEST_DECISION, CORE_TOOL_UPDATE_WORK_PLAN, CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM, CORE_TOOL_REVIEW_WORK_ITEM] as const;
+const GOAL_ACTIVE_TOOLS = [CORE_TOOL_UPDATE_WORK_STATE, CORE_TOOL_REQUEST_DECISION, CORE_TOOL_UPDATE_WORK_PLAN, CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM, CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION, CORE_TOOL_REVIEW_WORK_ITEM] as const;
 const GOAL_CONTROLLED_TOOLS = [CORE_TOOL_CREATE_GOAL, ...GOAL_ACTIVE_TOOLS] as const;
 
 /** manager Session 的窗口上下文（装配时解析，工具执行期按需重读）。 */
@@ -111,6 +113,7 @@ export async function planManagerTools(
 		CORE_TOOL_CREATE_GOAL,
 		CORE_TOOL_UPDATE_WORK_PLAN,
 		CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM,
+		CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION,
 		CORE_TOOL_REVIEW_WORK_ITEM,
 		CORE_TOOL_READ_DELEGATION_RESULT,
 		CORE_TOOL_CREATE_GROUP,
@@ -232,6 +235,7 @@ const UpdateWorkStateParams = Type.Object({
 			Type.Literal("cancelled"),
 		]),
 	),
+	verifierAgentId: Type.Optional(Type.String({ description: "Goal finalGoalMode=environment_verified 时使用的 Verifier Worker。" })),
 	artifactIds: Type.Optional(Type.Array(Type.String(), { description: "支撑当前结论的稳定 Artifact ID。" })),
 	completionCriteria: Type.Optional(Type.Array(Type.Object({
 		criterion: Type.String({ description: "冻结 Goal 完成条件原文，必须逐条原样对应。" }),
@@ -252,6 +256,13 @@ const CreateGoalParams = Type.Object({
 	activationReason: Type.String({ description: "为何该请求需要持续执行、追踪或多 Worker 协作。" }),
 	criteriaOrigin: Type.Union([Type.Literal("user_input"), Type.Literal("manager_derived")]),
 	sourceMessageIds: Type.Array(Type.String(), { minItems: 1, description: "目标与条件所依据的用户消息 id。" }),
+	verificationPolicy: Type.Optional(Type.Object({
+		minimumWorkItemMode: Type.Union([Type.Literal("manager_review"), Type.Literal("independent_evidence_review"), Type.Literal("environment_verified")]),
+		finalGoalMode: Type.Union([Type.Literal("manager_review"), Type.Literal("independent_evidence_review"), Type.Literal("environment_verified")]),
+		trigger: Type.Union([Type.Literal("manager_request"), Type.Literal("auto_on_submission")]),
+		source: Type.Union([Type.Literal("user"), Type.Literal("manager_derived")]),
+		reason: Type.String({ minLength: 1, description: "为何本 Goal 需要该验证强度；用户明确要求时 source=user。" }),
+	}, { description: "可显式提高 Harness 默认验证等级；Goal 生效后不能静默降低。" })),
 });
 
 const UpdateWorkPlanParams = Type.Object({
@@ -265,6 +276,20 @@ const UpdateWorkPlanParams = Type.Object({
 		assignedAgentId: Type.Optional(Type.String()),
 		dependsOn: Type.Optional(Type.Array(Type.String())),
 		acceptanceCriteria: Type.Array(Type.String(), { minItems: 1 }),
+		workspaceExecutionClass: Type.Optional(Type.Union([Type.Literal("read_only"), Type.Literal("git_write"), Type.Literal("non_git_write")], { description: "使用 Harness 默认策略解析本项：只读 / Git 写 / 非 Git 写。显式 workspaceExecutionPolicy 可覆盖。" })),
+		verificationPolicy: Type.Optional(Type.Object({
+			mode: Type.Union([Type.Literal("manager_review"), Type.Literal("independent_evidence_review"), Type.Literal("environment_verified")]),
+			trigger: Type.Union([Type.Literal("manager_request"), Type.Literal("auto_on_submission")]),
+			source: Type.Union([Type.Literal("user"), Type.Literal("goal_default"), Type.Literal("manager_derived")]),
+			reason: Type.String({ minLength: 1 }),
+		}, { description: "WorkItem 验证策略；不得低于 Goal 下限，首次执行后冻结且只能提高。" })),
+		workspaceExecutionPolicy: Type.Optional(Type.Object({
+			mode: Type.Union([Type.Literal("read_only_shared"), Type.Literal("exclusive_write"), Type.Literal("isolated_worktree")]),
+			source: Type.Union([Type.Literal("harness_default"), Type.Literal("manager_derived"), Type.Literal("user")]),
+			reason: Type.String({ minLength: 1 }),
+			baselineStrategy: Type.Union([Type.Literal("git_tree"), Type.Literal("filesystem_manifest"), Type.Literal("external_snapshot")]),
+			promoteOnAcceptance: Type.Boolean(),
+		}, { description: "工作区所有权策略。代码写入优先 isolated_worktree；非 Git 写入使用 exclusive_write；Manager 自己只能 read_only_shared。" })),
 		sourceGoalCriterionIndexes: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), {
 			uniqueItems: true,
 			description: "本 WorkItem 服务的 Goal 完成条件序号，只填写 context 中的 index（从 1 开始）；内部引用由后端生成。",
@@ -283,6 +308,12 @@ const ReviewWorkItemParams = Type.Object({
 	verdict: Type.Union([Type.Literal("accepted"), Type.Literal("revision"), Type.Literal("blocked")]),
 	summary: Type.String(),
 	evidenceRefs: Type.Optional(Type.Array(Type.String())),
+});
+const RequestWorkItemVerificationParams = Type.Object({
+	goalId: Type.String({ description: "当前 Goal id。" }),
+	workItemId: Type.String(),
+	expectedRevision: Type.Integer({ minimum: 0 }),
+	verifierAgentId: Type.Optional(Type.String({ description: "environment_verified 时指定具备能力的 Worker；独立证据复核不需要。" })),
 });
 const AdvanceManagerWorkItemParams = Type.Object({
 	goalId: Type.String({ description: "系统提示中当前 Goal 的 goalId。" }),
@@ -336,6 +367,136 @@ async function resolveWorkerRef(store: TeamsStore, ref: string): Promise<AgentCo
 	const lower = ref.toLowerCase();
 	const matches = (await store.listAgents()).filter((a) => agentDisplayName(a).toLowerCase() === lower);
 	return matches.length === 1 ? matches[0] : undefined;
+}
+
+async function verifyWorkItemSubmission(
+	deps: ManagerExtensionDeps,
+	toolCallId: string,
+	params: { goalId: string; workItemId: string; expectedRevision: number; verifierAgentId?: string },
+): Promise<{ content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> }> {
+	if (!deps.workStates) throw new Error("Session Work State 未启用");
+	const sessionId = deps.getSessionId();
+	const current = await deps.workStates.getActive(sessionId);
+	if (!current?.plan || current.goalId !== params.goalId) throw new Error("当前 Goal 已变化");
+	if (current.revision !== params.expectedRevision) throw new WorkStateConflictError(current);
+	const item = current.plan.items[params.workItemId];
+	if (!item || item.status !== "submitted") throw new Error("只有 submitted WorkItem 可以复验");
+	const submission = [...item.submissions].reverse().find((entry) => !entry.review);
+	if (!submission) throw new Error("没有待验收 Submission");
+	if (item.verificationPolicy.mode === "manager_review") throw new Error("当前 WorkItem 是 manager_review，不需要独立复验");
+	const settings = await deps.productSettings?.get();
+	const timestamp = new Date().toISOString();
+	const evidenceRefs = new Set<string>([
+		submission.id,
+		...(submission.delegationId ? [submission.delegationId] : []),
+		...(submission.executionReceiptId ? [submission.executionReceiptId] : []),
+		...(submission.workspaceChangeSetId ? [submission.workspaceChangeSetId] : []),
+		...submission.artifactIds,
+		...(submission.executionReceipt?.requirementResults.flatMap((entry) => entry.evidenceRefs) ?? []),
+	]);
+	const verificationId = `verification:${submission.id}:${toolCallId}`;
+	const replayed = submission.verifications.find((record) => record.id === verificationId);
+	if (replayed) {
+		return { content: [{ type: "text", text: `WorkItem ${item.id} 复验已存在（${replayed.status}，revision ${current.revision}）。` }], details: { workState: current, verification: replayed, replayed: true } };
+	}
+	if (item.verificationPolicy.mode === "environment_verified") {
+		const environmentMode = settings?.harness.verification.cliEnvironmentMode ?? "isolated_copy";
+		let verifierAgentId = params.verifierAgentId?.trim() || settings?.harness.verification.reviewers.cliAgentId.trim() || undefined;
+		let environment: Awaited<ReturnType<AgentInvoker["createVerificationEnvironment"]>> | undefined;
+		try {
+			if (!submission.executionReceipt?.workspaceExecutionScopeId) throw new Error("environment_verified 需要 ExecutionReceipt 绑定 Workspace execution scope");
+			const executor = submission.delegationId ? await deps.invoker.getDelegation(submission.delegationId) : undefined;
+			verifierAgentId ||= executor?.agentId;
+			if (!verifierAgentId) throw new Error("无法确定 Verifier Worker；请在 Harness 设置 CLI Verifier Worker");
+			if (settings?.harness.verification.isolation.requireDifferentAgent && verifierAgentId === executor?.agentId) throw new Error("Harness 要求 Verifier 与 Executor 使用不同 Agent");
+			const verifier = await deps.store.getAgent(verifierAgentId);
+			if (!verifier || verifier.pinned || verifier.enabled === false) throw new Error(`Verifier Agent ${verifierAgentId} 不可用`);
+			const capabilities = await deps.invoker.capabilitiesFor(verifierAgentId);
+			const requiredIsolation = environmentMode === "isolated_copy" ? "isolated_copy" : "mutation_guard";
+			if (!capabilities?.verification?.freshSession || !capabilities.verification.modalities.includes("cli") || !capabilities.verification.workspaceIsolation.includes(requiredIsolation) || !capabilities.verification.commandExecution) {
+				throw new Error(`Verifier Agent ${verifierAgentId} 不具备 fresh CLI ${requiredIsolation} 验收能力`);
+			}
+			const owner = await deps.store.windowForSession(sessionId);
+			if (!owner) throw new Error("Manager Session 不属于窗口");
+			if (settings?.harness.verification.reviewers.requireRoomMember && owner.type !== "solo" && !owner.members.includes(verifierAgentId)) throw new Error(`Harness 要求 Verifier ${verifierAgentId} 先加入 Room`);
+			const target = owner.type === "solo"
+				? await deps.store.findDirectWindow(verifierAgentId, owner.workspaceId, await deps.store.workspaceFor(owner.id))
+				: owner;
+			if (!target) throw new Error(`Verifier Agent ${verifierAgentId} 没有绑定当前 Workspace 的执行窗口`);
+			const reviewInput: VerificationReviewInput = {
+				verificationId, mode: "environment_verified", goalId: current.goalId, workPlanId: current.plan.id,
+				workItemId: item.id, submissionId: submission.id, criteria: item.acceptanceCriteria, submission,
+				allowedEvidenceRefs: [...evidenceRefs, ENVIRONMENT_OBSERVATION_REF],
+			};
+			const runningRecord: import("../store/work-state.js").VerificationRecord = {
+				id: verificationId, goalId: current.goalId, workPlanId: current.plan.id, workItemId: item.id, submissionId: submission.id,
+				goalRevision: current.goalRevision, workItemRevision: submission.workItemRevision, goalEpoch: current.execution.epoch,
+				mode: "environment_verified", status: "running", verifierAgentId,
+				environmentProfileId: environmentMode === "isolated_copy" ? "cli-isolated-copy-v1" : "cli-same-target-guarded-v1",
+				environmentMode, inputFingerprint: submission.inputFingerprint,
+				criteria: item.acceptanceCriteria.map((criterion) => ({ criterion, status: "uncertain", evidenceRefs: [], explanation: "Verifier 正在运行" })),
+				evidenceRefs: [], integrity: "unknown", createdAt: timestamp, updatedAt: timestamp,
+			};
+			const runningState = await deps.workStates.recordVerification(sessionId, current.revision, runningRecord, `${toolCallId}:running`, current.execution.epoch, current.goalId);
+			environment = await deps.invoker.createVerificationEnvironment(submission.executionReceipt.workspaceExecutionScopeId, verificationId, environmentMode);
+			const result = await deps.invoker.delegate({
+				windowId: target.id, managerSessionId: sessionId, managerToolCallId: toolCallId,
+				goalId: current.goalId, workPlanId: current.plan.id, workItemId: item.id,
+				goalEpoch: current.execution.epoch, goalRevision: current.goalRevision, workItemRevision: submission.workItemRevision,
+				purpose: "verification", verificationId, verifiesSubmissionId: submission.id,
+				environmentProfileId: runningRecord.environmentProfileId, verificationEnvironmentId: environment.id,
+				agent: verifier, message: buildVerificationPrompt(reviewInput), mode: "run",
+			});
+			const observed = await deps.invoker.observeVerificationEnvironment(environment.id);
+			const finishedAt = new Date().toISOString();
+			let record: import("../store/work-state.js").VerificationRecord;
+			if (result.status === "completed" && result.delegationId) {
+				evidenceRefs.add(result.delegationId);
+				reviewInput.allowedEvidenceRefs = [...evidenceRefs, ENVIRONMENT_OBSERVATION_REF];
+				record = bindEnvironmentObservations(
+					parseVerificationOutput(result.content, reviewInput, { ...runningRecord, verifierDelegationId: result.delegationId, outputFingerprint: observed.outputFingerprint, updatedAt: finishedAt, completedAt: finishedAt }),
+					await deps.invoker.verificationObservations(result.delegationId),
+				);
+			} else {
+				record = { ...runningRecord, status: "failed", verifierDelegationId: result.delegationId, outputFingerprint: observed.outputFingerprint, failureReason: result.content || "Verifier Worker 运行失败", updatedAt: finishedAt, completedAt: finishedAt };
+			}
+			if (environmentMode === "same_target_guarded" && observed.changedPaths.length) {
+				record = { ...record, status: "failed", integrity: "violation", failureReason: `Verifier 修改了受控目标：${observed.changedPaths.join("、")}` };
+			}
+			const state = await deps.workStates.recordVerification(sessionId, runningState.revision, record, `${toolCallId}:final`, current.execution.epoch, current.goalId);
+			return { content: [{ type: "text", text: `WorkItem ${item.id} 环境复验为 ${record.status}（revision ${state.revision}）。` }], details: { workState: state, verification: record } };
+		} catch (error) {
+			const failureReason = error instanceof Error ? error.message : String(error);
+			const latest = await deps.workStates.getActive(sessionId);
+			if (!latest?.plan || latest.goalId !== current.goalId || latest.execution.epoch !== current.execution.epoch) throw error;
+			const latestItem = latest.plan.items[item.id];
+			const latestSubmission = latestItem?.submissions.find((entry) => entry.id === submission.id);
+			if (!latestSubmission || latestSubmission.review) throw error;
+			const finishedAt = new Date().toISOString();
+			const record: import("../store/work-state.js").VerificationRecord = {
+				id: verificationId, goalId: current.goalId, workPlanId: current.plan.id, workItemId: item.id, submissionId: submission.id,
+				goalRevision: current.goalRevision, workItemRevision: submission.workItemRevision, goalEpoch: current.execution.epoch,
+				mode: "environment_verified", status: "blocked", verifierAgentId,
+				environmentProfileId: environmentMode === "isolated_copy" ? "cli-isolated-copy-v1" : "cli-same-target-guarded-v1",
+				environmentMode, inputFingerprint: submission.inputFingerprint,
+				criteria: item.acceptanceCriteria.map((criterion) => ({ criterion, status: "uncertain", evidenceRefs: [], explanation: failureReason })),
+				evidenceRefs: [...evidenceRefs], integrity: "suspect", failureReason,
+				createdAt: timestamp, updatedAt: finishedAt, completedAt: finishedAt,
+			};
+			const state = await deps.workStates.recordVerification(sessionId, latest.revision, record, `${toolCallId}:blocked`, current.execution.epoch, current.goalId);
+			return { content: [{ type: "text", text: `WorkItem ${item.id} 环境复验已阻塞：${failureReason}（revision ${state.revision}）。` }], details: { workState: state, verification: record } };
+		} finally {
+			if (environment) await deps.invoker.releaseVerificationEnvironment(environment.id).catch(() => undefined);
+		}
+	}
+	const record = await deps.sessions.reviewWorkItemVerification(
+		sessionId,
+		{ verificationId, mode: "independent_evidence_review", goalId: current.goalId, workPlanId: current.plan.id, workItemId: item.id, submissionId: submission.id, criteria: item.acceptanceCriteria, submission, allowedEvidenceRefs: [...evidenceRefs] },
+		{ id: verificationId, goalId: current.goalId, workPlanId: current.plan.id, workItemId: item.id, submissionId: submission.id, goalRevision: current.goalRevision, workItemRevision: submission.workItemRevision, goalEpoch: current.execution.epoch, mode: "independent_evidence_review", environmentMode: "none", inputFingerprint: submission.inputFingerprint, createdAt: timestamp, updatedAt: timestamp, completedAt: timestamp },
+		settings?.harness.verification.reviewers.evidenceModel,
+	);
+	const state = await deps.workStates.recordVerification(sessionId, current.revision, record, `${toolCallId}:record`, current.execution.epoch, current.goalId);
+	return { content: [{ type: "text", text: `WorkItem ${item.id} 独立证据复核为 ${record.status}（revision ${state.revision}）。` }], details: { workState: state, verification: record } };
 }
 
 /**
@@ -411,9 +572,8 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 			const workState = deps.workStates ? await deps.workStates.getActive(deps.getSessionId()) : undefined;
 			const latestGoal = workState ?? (deps.workStates ? await deps.workStates.get(deps.getSessionId()) : undefined);
 			const contextWindow = await deps.resolveContext();
-			const goalActivation = contextWindow && deps.productSettings
-				? (await deps.productSettings.get()).harness.goalActivation
-				: undefined;
+			const harness = contextWindow && deps.productSettings ? (await deps.productSettings.get()).harness : undefined;
+			const goalActivation = harness?.goalActivation;
 			const activeWithoutGoalControls = pi.getActiveTools().filter((name) => !(GOAL_CONTROLLED_TOOLS as readonly string[]).includes(name));
 			const controlled = workState
 				? GOAL_ACTIVE_TOOLS
@@ -451,6 +611,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 						`等待：${workState.waitingOn || "无"}`,
 						`下一步：${workState.nextAction || "尚未记录"}`,
 						`冻结 Goal 完成条件（update_work_plan 的 sourceGoalCriterionIndexes 只填写 index）：\n${JSON.stringify(goalCriterionRefs(workState).map((item, index) => ({ index: index + 1, criterion: item.text })))}`,
+						...(harness ? [`Harness 新 WorkItem 默认：verification=${harness.verification.defaultWorkItemMode}/${harness.verification.trigger}；Git 写任务 workspace=${harness.workspaceExecution.gitWriteDefault}；非 Git 写任务 workspace=${harness.workspaceExecution.nonGitWriteDefault}。创建/修改 WorkItem 时必须按任务事实显式填写 verificationPolicy 与 workspaceExecutionPolicy：讨论/拆解可 manager_review+read_only_shared；调研证据至少 independent_evidence_review；代码、构建、页面和真实交付提高到 environment_verified；Git 写入按 Harness 默认 isolated_worktree/exclusive_write，非 Git 写入用 exclusive_write。不得把写任务声明成 Manager 自执行。`] : []),
 						...(workState.plan ? [`Manager WorkPlan（覆盖 Goal r${workState.plan.coveredGoalRevision}${workState.plan.needsReconcile ? "，必须先对账当前 Goal 契约" : ""}）：\n${planLines.join("\n") || "（全部已验收）"}`] : ["Manager WorkPlan：尚未建立。多步骤、依赖或多 Worker 任务先调用 update_work_plan。"]),
 						`Goal 状态写操作必须串行：一次只调用一个 ${CORE_TOOL_UPDATE_WORK_PLAN}/${CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM}/${CORE_TOOL_REVIEW_WORK_ITEM}/${CORE_TOOL_UPDATE_WORK_STATE}，拿到新 revision 后再调用下一个，禁止在同一轮并行提交多个写操作。`,
 						`assignedAgentId=manager 的 WorkItem 开始时调用 ${CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM} 标记 in_progress，完成交付后再标记 submitted，然后调用 ${CORE_TOOL_REVIEW_WORK_ITEM} 验收；不得删除 Manager 工作项绕过提交和验收。worker 委托完成只代表 submitted，同样必须明确验收。`,
@@ -589,6 +750,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 						sourceMessageIds: params.sourceMessageIds,
 						...(params.criteriaOrigin === "manager_derived" ? { authoredByAgentId: "manager" } : {}),
 					},
+					verificationPolicy: params.verificationPolicy,
 					operationId: toolCallId,
 				});
 				const active = pi.getActiveTools().filter((name) => !(GOAL_CONTROLLED_TOOLS as readonly string[]).includes(name));
@@ -603,7 +765,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 		pi.registerTool({
 			name: CORE_TOOL_UPDATE_WORK_PLAN,
 			label: "Update Work Plan",
-			description: "创建或更新当前 Goal 的 WorkItem DAG。验收条件只能从冻结 Goal 条件、步骤产物和下游依赖派生。",
+			description: "创建或更新当前 Goal 的 WorkItem DAG。验收条件只能从冻结 Goal 条件、步骤产物和下游依赖派生；同时显式分类验证强度和工作区所有权。代码写入优先 isolated_worktree，非 Git 写入使用 exclusive_write，Manager 自己不得写工作区。",
 			parameters: UpdateWorkPlanParams,
 			async execute(toolCallId, params: Static<typeof UpdateWorkPlanParams>) {
 				if (!deps.workStates) throw new Error("Session Work State 未启用");
@@ -656,20 +818,59 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 		});
 
 		pi.registerTool({
+			name: CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION,
+			label: "Request Work Item Verification",
+			description: "为最新 Submission 发起与 Executor/Manager 上下文隔离的结构化验收。manager_review 模式不需要调用。",
+			parameters: RequestWorkItemVerificationParams,
+			async execute(toolCallId, params: Static<typeof RequestWorkItemVerificationParams>) {
+				return verifyWorkItemSubmission(deps, toolCallId, params);
+			},
+		});
+
+		pi.registerTool({
 			name: CORE_TOOL_REVIEW_WORK_ITEM,
 			label: "Review Work Item",
 			description: "验收最新 Submission。accepted 才会解锁依赖；revision/blocked 不会完成 Goal。",
 			parameters: ReviewWorkItemParams,
 			async execute(toolCallId, params: Static<typeof ReviewWorkItemParams>) {
 				if (!deps.workStates) throw new Error("Session Work State 未启用");
+				let revision = params.expectedRevision;
+				let effectiveVerdict = params.verdict;
+				let effectiveSummary = params.summary;
+				if (params.verdict === "accepted") {
+					const current = await deps.workStates.getActive(deps.getSessionId());
+					if (!current?.plan || current.goalId !== params.goalId || current.revision !== revision) throw new Error("当前 Goal revision 已变化");
+					const item = current.plan.items[params.workItemId];
+					const submission = item ? [...item.submissions].reverse().find((entry) => !entry.review) : undefined;
+					const isolatedChangeSet = submission?.workspaceChangeSet?.mode === "isolated_worktree";
+					if ((item?.workspaceExecutionPolicy.mode === "isolated_worktree" && item.workspaceExecutionPolicy.promoteOnAcceptance) || isolatedChangeSet) {
+						const intentState = await deps.workStates.recordAcceptanceIntent(
+							deps.getSessionId(), params.workItemId, revision,
+							{ summary: params.summary, evidenceRefs: params.evidenceRefs }, `${toolCallId}:acceptance-intent`, current.execution.epoch, current.goalId,
+						);
+						revision = intentState.revision;
+						const scopeId = submission?.executionReceipt?.workspaceExecutionScopeId;
+						const changeSetId = submission?.workspaceChangeSetId;
+						if (!scopeId || !changeSetId) throw new Error("isolated_worktree Submission 缺少可提升 change-set");
+						const promoted = await deps.invoker.promoteWorkspaceChangeSet(scopeId, changeSetId);
+						const promotedState = await deps.workStates.recordWorkspaceChangeSet(
+							deps.getSessionId(), params.workItemId, revision, promoted, `${toolCallId}:promotion`, current.execution.epoch, current.goalId,
+						);
+						revision = promotedState.revision;
+						if (promoted.promotionState !== "applied") {
+							effectiveVerdict = "blocked";
+							effectiveSummary = `${params.summary}\nWorkspace change-set 提升为 ${promoted.promotionState}；已保留隔离 worktree/diff。`;
+						}
+					}
+				}
 				const state = await deps.workStates.reviewWorkItem(
-					deps.getSessionId(), params.workItemId, params.expectedRevision,
-					{ verdict: params.verdict, summary: params.summary, evidenceRefs: params.evidenceRefs },
-					toolCallId,
+					deps.getSessionId(), params.workItemId, revision,
+					{ verdict: effectiveVerdict, summary: effectiveSummary, evidenceRefs: params.evidenceRefs },
+					`${toolCallId}:review`,
 					undefined,
 					params.goalId,
 				);
-				return { content: [{ type: "text", text: `WorkItem ${params.workItemId} 已标记为 ${params.verdict}（revision ${state.revision}）。` }], details: { workState: state } };
+				return { content: [{ type: "text", text: `WorkItem ${params.workItemId} 已标记为 ${effectiveVerdict}（revision ${state.revision}）。` }], details: { workState: state } };
 			},
 		});
 
@@ -681,7 +882,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 			async execute(toolCallId, params: Static<typeof UpdateWorkStateParams>) {
 				if (!deps.workStates) throw new Error("Session Work State 未启用");
 				try {
-					const { goalId, revision, completionCriteria, ...patch } = params;
+					const { goalId, revision, completionCriteria, verifierAgentId: requestedGoalVerifier, ...patch } = params;
 					if (patch.status === "resolved") {
 						const sessionId = deps.getSessionId();
 						const current = await deps.workStates.getActive(sessionId);
@@ -689,12 +890,108 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 						if (current.goalId !== goalId) throw new Error("当前 Goal 已变化，请重新读取目标状态后再提交。");
 						if (current.revision !== revision) throw new WorkStateConflictError(current);
 						const delegations = (await deps.invoker.delegationsForManagerSession(sessionId)).filter((item) => item.goalId === current.goalId);
-						const active = delegations.filter((item) => item.status === "running" || item.status === "waiting_input");
+						const active = delegations.filter((item) => item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling");
 						if (active.length > 0) throw new Error(`仍有 ${active.length} 个委托正在执行或等待输入，不能完成 Goal`);
 						const pendingDecisions = (await deps.workStates.listDecisions(sessionId, current.goalId)).filter((item) => item.status === "pending");
 						if (pendingDecisions.length > 0) throw new Error(`仍有 ${pendingDecisions.length} 个待回答的人类决策，不能完成 Goal`);
 
-						if (current.reviewMode === "independent") {
+							let completionRevision = revision;
+							if (current.verificationPolicy.finalGoalMode === "environment_verified") {
+								const verificationSettings = (await deps.productSettings?.get())?.harness.verification;
+								const criteria = current.completionBoundary.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean);
+								const verificationId = `goal-verification:${current.goalId}:${toolCallId}`;
+								const blockUnavailable = async (failureReason: string, verifierAgentId?: string) => {
+									const timestamp = new Date().toISOString();
+									const verification: import("../store/work-state.js").VerificationRecord = {
+										id: verificationId, goalId: current.goalId, goalRevision: current.goalRevision, goalEpoch: current.execution.epoch,
+										mode: "environment_verified", status: "blocked", verifierAgentId, environmentProfileId: "goal-cli-isolated-copy-v1", environmentMode: "isolated_copy",
+										inputFingerprint: `goal:${current.goalId}:${current.goalRevision}:${current.execution.epoch}`,
+										criteria: criteria.map((criterion) => ({ criterion, status: "uncertain", evidenceRefs: [], explanation: failureReason })),
+										evidenceRefs: [], integrity: "suspect", failureReason, createdAt: timestamp, updatedAt: timestamp, completedAt: timestamp,
+									};
+									const state = await deps.workStates!.recordVerification(sessionId, current.revision, verification, `${toolCallId}:goal-unavailable`, current.execution.epoch, current.goalId);
+									return { content: [{ type: "text" as const, text: `Goal 环境复验已阻塞：${failureReason}` }], details: { workState: state, verification } as Record<string, unknown> };
+								};
+								const configuredVerifier = verificationSettings?.reviewers.cliAgentId.trim();
+								const candidateIds = [...new Set([requestedGoalVerifier?.trim(), configuredVerifier, ...current.participantAgentIds].filter((id): id is string => Boolean(id)))];
+								const executorIds = new Set(delegations.filter((entry) => entry.purpose !== "verification").map((entry) => entry.agentId));
+								let verifier: AgentConfig | undefined;
+								for (const id of candidateIds) {
+									if (verificationSettings?.isolation.requireDifferentAgent && executorIds.has(id)) continue;
+								const candidate = await deps.store.getAgent(id);
+								const caps = candidate ? await deps.invoker.capabilitiesFor(candidate.name).catch(() => undefined) : undefined;
+								if (candidate && !candidate.pinned && candidate.enabled !== false && caps?.verification?.freshSession && caps.verification.modalities.includes("cli") && caps.verification.workspaceIsolation.includes("isolated_copy") && caps.verification.commandExecution) { verifier = candidate; break; }
+							}
+								if (!verifier) return blockUnavailable("没有具备 fresh CLI isolated_copy 能力的 Goal Verifier Worker");
+								const owner = await deps.store.windowForSession(sessionId);
+								if (!owner) return blockUnavailable("Manager Session 不属于窗口", verifier.name);
+								if (verificationSettings?.reviewers.requireRoomMember && owner.type !== "solo" && !owner.members.includes(verifier.name)) return blockUnavailable(`Harness 要求 Goal Verifier ${verifier.name} 先加入 Room`, verifier.name);
+								const target = owner.type === "solo" ? await deps.store.findDirectWindow(verifier.name, owner.workspaceId, await deps.store.workspaceFor(owner.id)) : owner;
+								if (!target) return blockUnavailable(`Verifier Agent ${verifier.name} 没有绑定当前 Workspace 的执行窗口`, verifier.name);
+							const acceptedSubmissions = Object.values(current.plan?.items ?? {}).flatMap((entry) => entry.submissions.filter((submission) => submission.id === entry.acceptedSubmissionId));
+							const evidenceRefs = new Set<string>([
+								...current.artifactIds,
+								...acceptedSubmissions.flatMap((submission) => [submission.id, ...(submission.delegationId ? [submission.delegationId] : []), ...(submission.executionReceiptId ? [submission.executionReceiptId] : []), ...submission.artifactIds]),
+							]);
+							const reviewInput: VerificationReviewInput = {
+								verificationId, mode: "environment_verified", goalId: current.goalId, workPlanId: current.plan?.id ?? "goal-only", workItemId: "__goal__", submissionId: current.goalId,
+								criteria, submission: { goal: current.goal, currentBrief: patch.currentBrief?.trim() || current.currentBrief, acceptedSubmissions }, allowedEvidenceRefs: [...evidenceRefs, ENVIRONMENT_OBSERVATION_REF],
+							};
+							const timestamp = new Date().toISOString();
+							const runningRecord: import("../store/work-state.js").VerificationRecord = {
+								id: verificationId, goalId: current.goalId, goalRevision: current.goalRevision, goalEpoch: current.execution.epoch,
+								mode: "environment_verified", status: "running", verifierAgentId: verifier.name, environmentProfileId: "goal-cli-isolated-copy-v1", environmentMode: "isolated_copy",
+								inputFingerprint: `goal:${current.goalId}:${current.goalRevision}:${current.execution.epoch}`,
+								criteria: criteria.map((criterion) => ({ criterion, status: "uncertain", evidenceRefs: [], explanation: "Verifier 正在运行" })), evidenceRefs: [], integrity: "unknown", createdAt: timestamp, updatedAt: timestamp,
+							};
+							const runningState = await deps.workStates.recordVerification(sessionId, revision, runningRecord, `${toolCallId}:goal-running`, current.execution.epoch, current.goalId);
+								let verifierScopeId: string | undefined;
+								let verificationEnvironmentId: string | undefined;
+								let verification: import("../store/work-state.js").VerificationRecord;
+								let verifiedState: import("../store/work-state.js").SessionWorkState;
+								try {
+									const preparedEnvironment = await deps.invoker.createGoalVerificationEnvironment({
+										workspacePath: await deps.store.workspaceFor(owner.id), workspaceId: owner.workspaceId,
+										verificationId, goalId: current.goalId, goalEpoch: current.execution.epoch,
+									});
+									verifierScopeId = preparedEnvironment.sourceScopeId;
+									verificationEnvironmentId = preparedEnvironment.environment.id;
+									const result = await deps.invoker.delegate({
+										windowId: target.id, managerSessionId: sessionId, managerToolCallId: toolCallId, goalId: current.goalId, goalEpoch: current.execution.epoch, goalRevision: current.goalRevision,
+										purpose: "verification", verificationId, environmentProfileId: "goal-cli-isolated-copy-v1",
+										verificationEnvironmentId,
+										agent: verifier, message: buildVerificationPrompt(reviewInput), mode: "run",
+									});
+									if (result.delegationId) { evidenceRefs.add(result.delegationId); reviewInput.allowedEvidenceRefs = [...evidenceRefs, ENVIRONMENT_OBSERVATION_REF]; }
+									const observed = await deps.invoker.observeVerificationEnvironment(verificationEnvironmentId);
+									const finishedAt = new Date().toISOString();
+									verification = result.status === "completed" && result.delegationId
+										? bindEnvironmentObservations(
+											parseVerificationOutput(result.content, reviewInput, { ...runningRecord, verifierDelegationId: result.delegationId, outputFingerprint: observed.outputFingerprint, updatedAt: finishedAt, completedAt: finishedAt }),
+											await deps.invoker.verificationObservations(result.delegationId),
+										)
+										: { ...runningRecord, status: "failed", verifierDelegationId: result.delegationId, outputFingerprint: observed.outputFingerprint, failureReason: result.content || "Goal Verifier 运行失败", updatedAt: finishedAt, completedAt: finishedAt };
+									verifiedState = await deps.workStates.recordVerification(sessionId, runningState.revision, verification, `${toolCallId}:goal-final`, current.execution.epoch, current.goalId);
+									completionRevision = verifiedState.revision;
+								} catch (error) {
+									const failureReason = error instanceof Error ? error.message : String(error);
+									const finishedAt = new Date().toISOString();
+									verification = {
+										...runningRecord, status: "blocked", integrity: "suspect", failureReason,
+										criteria: criteria.map((criterion) => ({ criterion, status: "uncertain", evidenceRefs: [], explanation: failureReason })),
+										updatedAt: finishedAt, completedAt: finishedAt,
+									};
+									const latest = await deps.workStates.getActive(sessionId);
+									if (!latest || latest.goalId !== current.goalId || latest.execution.epoch !== current.execution.epoch) throw error;
+									verifiedState = await deps.workStates.recordVerification(sessionId, latest.revision, verification, `${toolCallId}:goal-blocked`, current.execution.epoch, current.goalId);
+									completionRevision = verifiedState.revision;
+								} finally {
+									if (verificationEnvironmentId) await deps.invoker.releaseVerificationEnvironment(verificationEnvironmentId).catch(() => undefined);
+									if (verifierScopeId) await deps.invoker.releaseWorkspaceExecutionScope(verifierScopeId).catch(() => undefined);
+								}
+								if (verification.status !== "passed") return { content: [{ type: "text", text: `Goal 环境复验为 ${verification.status}，Goal 保持 active。` }], details: { workState: verifiedState, verification } as Record<string, unknown> };
+						}
+						if (current.reviewMode === "independent" || current.verificationPolicy.finalGoalMode === "independent_evidence_review") {
 							const currentBrief = patch.currentBrief?.trim() || current.currentBrief;
 							if (!currentBrief) throw new Error("提交独立复核前必须填写最终 currentBrief");
 							const artifactIds = patch.artifactIds ?? current.artifactIds;
@@ -713,7 +1010,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 									delegations: delegations.map((item) => ({
 										id: item.id,
 										agentId: item.agentId,
-										status: item.status,
+										executionState: item.executionState,
 										intent: item.intent,
 										expectedOutcome: item.expectedOutcome,
 										completionBoundary: item.completionBoundary,
@@ -736,20 +1033,50 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 								},
 								current.reviewerModel,
 							);
-							const state = await deps.workStates.applyCompletionReview(sessionId, revision, {
-								currentBrief,
-								artifactIds: patch.artifactIds,
-								review,
-							}, `completion-review:${toolCallId}`, current.execution.epoch, goalId);
+							let reviewedState = current;
+							if (current.verificationPolicy.finalGoalMode === "independent_evidence_review") {
+								const timestamp = new Date().toISOString();
+								const verification: import("../store/work-state.js").VerificationRecord = {
+									id: `goal-verification:${current.goalId}:${toolCallId}`,
+									goalId: current.goalId,
+									goalRevision: current.goalRevision,
+									goalEpoch: current.execution.epoch,
+									mode: "independent_evidence_review",
+									status: review.verdict === "satisfied" ? "passed" : review.verdict === "needs_human" ? "blocked" : "failed",
+									reviewerModel: review.reviewerModel,
+									reviewerSessionId: review.reviewerSessionId,
+									environmentMode: "none",
+									inputFingerprint: `goal:${current.goalId}:${current.goalRevision}:${current.execution.epoch}`,
+									criteria: review.criteria,
+									evidenceRefs: [...new Set(review.criteria.flatMap((entry) => entry.evidenceRefs))],
+									integrity: review.verdict === "satisfied" ? "clean" : "suspect",
+									...(review.gaps.length ? { failureReason: review.gaps.join("；") } : {}),
+									createdAt: timestamp,
+									updatedAt: timestamp,
+									completedAt: timestamp,
+								};
+								reviewedState = await deps.workStates.recordVerification(sessionId, revision, verification, `${toolCallId}:goal-verification`, current.execution.epoch, goalId);
+								completionRevision = reviewedState.revision;
+								if (verification.status !== "passed") {
+									return { content: [{ type: "text", text: `Goal 最终独立复验为 ${verification.status}，Goal 保持 active。` }], details: { workState: reviewedState, verification, completionReview: review } as Record<string, unknown> };
+								}
+							}
+							if (current.reviewMode === "independent") {
+								const state = await deps.workStates.applyCompletionReview(sessionId, completionRevision, {
+									currentBrief,
+									artifactIds: patch.artifactIds,
+									review,
+								}, `completion-review:${toolCallId}`, current.execution.epoch, goalId);
 							const text = review.verdict === "satisfied"
 								? `独立复核通过，Goal 已完成（revision ${state.revision}）。`
 								: review.verdict === "needs_human"
 									? `独立复核需要人类确认，Goal 保持 active。请根据复核结果调用 ${CORE_TOOL_REQUEST_DECISION}。`
 									: `独立复核未通过，Goal 保持 active。缺口：${review.gaps.join("；") || "见逐项复核结果"}`;
 							return { content: [{ type: "text", text }], details: { workState: state, completionReview: review } as Record<string, unknown> };
+							}
 						}
 						if (!completionCriteria) throw new Error("manager 自审完成 Goal 时必须逐条填写 completionCriteria");
-						const state = await deps.workStates.applyManagerCompletion(sessionId, revision, {
+						const state = await deps.workStates.applyManagerCompletion(sessionId, completionRevision, {
 							currentBrief: patch.currentBrief?.trim() || current.currentBrief,
 							artifactIds: patch.artifactIds,
 							criteria: completionCriteria,
@@ -1079,11 +1406,15 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 					workItemId: params.workItemId,
 					attempt: workItem ? workItem.delegationIds.length + 1 : undefined,
 					goalEpoch: goal?.execution.epoch,
+					goalRevision: goal?.goalRevision,
+					workItemRevision: workItem?.revision,
+					contractHash: goal?.plan && workItem ? workItemContractHash(goal, goal.plan, workItem) : undefined,
+					workspaceExecutionPolicy: workItem?.workspaceExecutionPolicy,
 					parentDelegationId: params.parentDelegationId,
 					handoffKind: params.handoffKind ?? (params.parentDelegationId ? "followup" : "request"),
 					intent: params.intent,
 					expectedOutcome: params.expectedOutcome,
-					evidenceRequirements: params.evidenceRequirements,
+					evidenceRequirements: workItem?.acceptanceCriteria ?? params.evidenceRequirements,
 					completionBoundary: params.completionBoundary,
 					mode: params.session === "new" ? "run" : "continue",
 					signal,
@@ -1153,6 +1484,7 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 					goalEpoch: goal?.execution.epoch,
 				};
 				const picked = result.details;
+				let boundaryState: Awaited<ReturnType<WorkStateStore["noteDelegation"]>> | undefined;
 				if (params.workItemId && goal && result.delegationId && deps.workStates) {
 					const boundaryStatus = result.status === "needs_input" || result.status === "conflict"
 						? "waiting_input"
@@ -1160,13 +1492,15 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 							? "completed"
 							: "failed";
 					try {
-						await deps.workStates.noteDelegation(sessionId, {
+						boundaryState = await deps.workStates.noteDelegation(sessionId, {
 							goalId: goal.goalId,
 							workItemId: params.workItemId,
 							delegationId: result.delegationId,
 							delegationStatus: boundaryStatus,
 							goalEpoch: goal.execution.epoch,
 							artifactIds: (picked as { artifacts?: Array<{ id?: string }> }).artifacts?.map((item) => item.id).filter((id): id is string => Boolean(id)) ?? [],
+							executionReceipt: (picked as { executionReceipt?: import("../store/work-state.js").ExecutionReceipt }).executionReceipt,
+							workspaceChangeSet: (picked as { workspaceChangeSet?: import("../store/work-state.js").WorkspaceChangeSet }).workspaceChangeSet,
 							summary: result.status === "completed" ? truncate(result.content).slice(0, 2_000) : undefined,
 						}, `delegation-boundary:${result.delegationId}:${boundaryStatus}`);
 					} catch (error) {
@@ -1175,6 +1509,20 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 						// otherwise valid worker result into a manager tool failure.
 						if (!(error instanceof WorkStateOperationConflictError) || error.code !== "stale_goal_state") throw error;
 						deps.log?.(`ignored stale Goal epoch callback for Delegation ${result.delegationId}`);
+					}
+				}
+				if (boundaryState?.plan && params.workItemId && result.status === "completed") {
+					const submittedItem = boundaryState.plan.items[params.workItemId];
+					if (submittedItem?.verificationPolicy.trigger === "auto_on_submission" && submittedItem.verificationPolicy.mode !== "manager_review") {
+						try {
+							const automated = await verifyWorkItemSubmission(deps, `${toolCallId}:auto-verification`, {
+								goalId: boundaryState.goalId, workItemId: submittedItem.id, expectedRevision: boundaryState.revision,
+							});
+							meta.verification = automated.details.verification;
+						} catch (error) {
+							meta.verificationError = error instanceof Error ? error.message : String(error);
+							deps.log?.(`automatic verification blocked for WorkItem ${submittedItem.id}: ${String(meta.verificationError)}`);
+						}
 					}
 				}
 

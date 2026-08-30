@@ -476,7 +476,7 @@ test("删除房间 Session 在生命周期闸门内先取消 Run；最后一个 
 			assert.equal(removed.removed, true);
 		},
 	);
-	assert.equal((await runtime.getDelegation(first.delegationId!))?.status, "cancelled");
+	assert.equal((await runtime.getDelegation(first.delegationId!))?.executionState, "observation_lost", "未声明取消确认能力时不能伪装成 cancelled");
 	assert.equal((await teams.getWindow(window.id))?.sessions.includes("room-a"), false);
 
 	const last = await invoker.delegate({ windowId: window.id, managerSessionId: "room-b", agent, message: "b", mode: "run" });
@@ -484,7 +484,7 @@ test("删除房间 Session 在生命周期闸门内先取消 Run；最后一个 
 		() => invoker.closeManagerSession("room-b", async () => { throw new Error("窗口至少要保留一个会话"); }, async () => undefined),
 		/窗口至少要保留一个会话/,
 	);
-	assert.equal((await runtime.getDelegation(last.delegationId!))?.status, "waiting_input", "preflight 失败不得误取消最后会话的 Run");
+	assert.equal((await runtime.getDelegation(last.delegationId!))?.executionState, "waiting_input", "preflight 失败不得误取消最后会话的 Run");
 	await invoker.cancel(last.delegationId!);
 });
 

@@ -5,6 +5,7 @@ import semver from "semver";
 import { agentDisplayName, type AgentConfig } from "../store/teams.js";
 import type { AgentInvoker, AgentInvokeResult } from "./invoker.js";
 import type { DriverCapabilities } from "./types.js";
+import type { WorkspaceExecutionPolicy } from "./workspace-execution.js";
 
 /**
  * Phase 4：Extension 拆分（方案 §3.2/§3.3/§10.2，决策 13/14/15）。
@@ -348,6 +349,10 @@ export interface ScopedDelegateInput {
 	workItemId?: string;
 	attempt?: number;
 	goalEpoch?: number;
+	goalRevision?: number;
+	workItemRevision?: number;
+	contractHash?: string;
+	workspaceExecutionPolicy?: WorkspaceExecutionPolicy;
 	parentDelegationId?: string;
 	handoffKind?: "request" | "followup";
 	intent?: string;

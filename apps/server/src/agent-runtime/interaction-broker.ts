@@ -105,19 +105,8 @@ export class InteractionBroker {
 	async advanceDelegation(interaction: InteractionRecord): Promise<DelegationRecord | undefined> {
 		const delegation = await this.store.getDelegation(interaction.delegationId);
 		if (!delegation) return undefined;
-		if (interaction.status === "rejected") {
-			return this.store.updateDelegation(delegation.id, {
-				status: "cancelled",
-				result: {
-					agentId: delegation.agentId,
-					status: "cancelled",
-					errorCode: "rejected",
-					error: "审批被拒绝",
-					recoverable: true,
-				},
-			});
-		}
-		// approved: 等待 respond 完成后由 runtime 更新为 completed/failed。
-		return this.store.updateDelegation(delegation.id, { status: "waiting_input" });
+		// Delegation 的执行轴和 Receipt 只能由 Runtime 在同一个终态事务里推进。
+		// Broker 只拥有 Interaction 聚合，不能自行签发 completed/cancelled 事实。
+		return delegation;
 	}
 }

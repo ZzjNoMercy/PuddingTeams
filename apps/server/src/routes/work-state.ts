@@ -49,7 +49,8 @@ export function registerWorkStateRoutes(
 		expectedOutcome: item.expectedOutcome,
 		evidenceRequirements: item.evidenceRequirements,
 		completionBoundary: item.completionBoundary,
-		status: item.status,
+		executionState: item.executionState,
+		receipt: item.receipt,
 		sessionHandle: item.sessionHandle,
 		processView: true,
 		createdAt: item.createdAt,
@@ -164,7 +165,12 @@ export function registerWorkStateRoutes(
 			expectedRevision: number;
 			expectedEpoch?: number;
 			title?: string;
-			upsertItems: Array<{ id?: string; title: string; description?: string; assignedAgentId?: string; dependsOn?: string[]; acceptanceCriteria: string[]; sourceGoalCriteria?: string[] }>;
+			upsertItems: Array<{
+				id?: string; title: string; description?: string; assignedAgentId?: string; dependsOn?: string[]; acceptanceCriteria: string[]; sourceGoalCriteria?: string[];
+				verificationPolicy?: Partial<import("../store/work-state.js").WorkItemVerificationPolicy>;
+				workspaceExecutionClass?: import("../store/work-state.js").WorkspaceExecutionClass;
+				workspaceExecutionPolicy?: Partial<import("../store/work-state.js").WorkspaceExecutionPolicy>;
+			}>;
 			removeItemIds?: string[];
 			cancelItemIds?: string[];
 			reopenItemIds?: string[];
@@ -230,7 +236,7 @@ export function registerWorkStateRoutes(
 			if (!req.body.expectedGoalId?.trim()) return reply.code(400).send({ error: "暂停 Goal 需要 expectedGoalId" });
 			const current = await workStates.getActive(req.params.id);
 			if (!current) return reply.code(404).send({ error: "当前没有进行中的 Goal" });
-			const active = runtime ? (await runtime.listDelegations(undefined, req.params.id)).filter((item) => item.goalId === current.goalId && (item.status === "running" || item.status === "waiting_input")) : [];
+			const active = runtime ? (await runtime.listDelegations(undefined, req.params.id)).filter((item) => item.goalId === current.goalId && (item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling")) : [];
 			const key = idempotencyKey(req.headers as Record<string, unknown>);
 			const workState = await workStates.interruptGoal(req.params.id, req.body.expectedRevision, {
 				kind: req.body.kind ?? "user",

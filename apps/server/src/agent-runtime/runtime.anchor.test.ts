@@ -170,10 +170,10 @@ test("批准受理后：续跑期间 delegation 立即回到 running，完成后
 		admitted,
 	);
 	assert.equal(await admittedPromise, true);
-	assert.equal((await delegations.getDelegation(first.delegation.id))?.status, "running");
+	assert.equal((await delegations.getDelegation(first.delegation.id))?.executionState, "running");
 	release();
 	assert.equal((await responsePromise).status, "completed");
-	assert.equal((await delegations.getDelegation(first.delegation.id))?.status, "completed");
+	assert.equal((await delegations.getDelegation(first.delegation.id))?.executionState, "reported_completed");
 });
 
 test("respond：delegation 无 runHandle 时不抛错卡死，交给 Driver 判断（clarify-and-retry）", async () => {
@@ -329,7 +329,8 @@ test("安全收口: reject 释放 session 锁并清理 provider state", async ()
 		{ cwd: process.cwd(), env: {} },
 	);
 	assert.equal(outcome.status, "rejected");
-	assert.equal(outcome.delegation.status, "cancelled", "reject 后 delegation 进入 cancelled 终态");
+	assert.equal(outcome.delegation.executionState, "cancelled", "reject 后 delegation 进入 cancelled 终态");
+	assert.ok(outcome.delegation.receipt?.sealedAt, "reject 终态也必须封存 Receipt");
 	assert.equal(await secrets.getProviderState(interactionId), undefined, "reject 后必须清理加密 token");
 
 	// 锁已释放：同一 session 可再次 delegate，不再抛 SessionConflictError。
@@ -595,7 +596,7 @@ test("P3-1: cancel abort 真实 Run，迟到 completed 不能复活 cancelled De
 	const driver: AgentDriver = {
 		id: "slow",
 		async capabilities() {
-			return { operations: ["run", "cancel"], interactionKinds: [], progress: "stream", transport: "spawn" };
+			return { operations: ["run", "cancel"], interactionKinds: [], progress: "stream", transport: "spawn", cancelConfirmation: "observable" };
 		},
 		async *run(_input, ctx) {
 			await new Promise<void>((resolve) => {
@@ -605,10 +606,11 @@ test("P3-1: cancel abort 真实 Run，迟到 completed 不能复活 cancelled De
 					resolve();
 				}, { once: true });
 			});
-			yield { type: "completed", result: { agentId: "slow", status: "completed", content: "late" } };
+			yield { type: "failed", result: { agentId: "slow", status: "cancelled", errorCode: "cancelled", error: "cancelled", recoverable: true } };
 		},
 		async *continue() {},
 		async *respond() {},
+		async cancel() {},
 		async probe() {
 			return { extensionInstalled: true, detected: true, configured: true, authenticated: "unknown", enabled: true, compatibility: "supported", capabilities: await this.capabilities(), issues: [] };
 		},
@@ -627,12 +629,46 @@ test("P3-1: cancel abort 真实 Run，迟到 completed 不能复活 cancelled De
 	await runtime.cancel(delegation.id, { cwd: process.cwd(), env: {} });
 	const outcome = await outcomePromise;
 	assert.equal(observedAbort, true);
-	assert.equal(outcome.delegation.status, "cancelled");
-	assert.equal((await runtime.getDelegation(delegation.id))?.status, "cancelled");
+	assert.equal(outcome.delegation.executionState, "cancelled");
+	assert.equal((await runtime.getDelegation(delegation.id))?.executionState, "cancelled");
 	assert.equal((await runtime.getDelegation(delegation.id))?.result?.status, "cancelled", "取消原因必须持久化供闭环与重放使用");
+	assert.ok((await runtime.getDelegation(delegation.id))?.receipt?.sealedAt);
 });
 
-test("P3-1: terminal CAS 阻止 cancelled 被 completed 覆盖", async () => {
+test("本地 observable Driver 在 abort 后无 boundary 但进程已退出时仍可确认 cancelled", async () => {
+	const dir = freshDir();
+	const store = new DelegationStore(dir);
+	await store.init();
+	const secrets = new InteractionSecretStore(dir);
+	await secrets.init();
+	const driver: AgentDriver = {
+		id: "local-no-boundary",
+		async capabilities() { return { operations: ["run", "cancel"], interactionKinds: [], progress: "stream", transport: "spawn", cancelConfirmation: "observable" }; },
+		async *run(_input, ctx) {
+			await new Promise<void>((resolve) => {
+				if (ctx.signal?.aborted) resolve();
+				else ctx.signal?.addEventListener("abort", () => resolve(), { once: true });
+			});
+			if (false) yield { type: "started" } as AgentEvent;
+		},
+		async *continue() {}, async *respond() {}, async cancel() {}, async probe() { throw new Error("unused"); },
+	};
+	const runtime = new AgentRuntime(store, secrets, () => driver);
+	const outcome = runtime.delegate({ ...PROJECT, windowId: "window-local-stop", managerSessionId: "manager-local-stop", agentId: driver.id, message: "x", mode: "run" }, { cwd: process.cwd(), env: {} });
+	let delegation;
+	for (let i = 0; i < 20 && !delegation; i += 1) {
+		delegation = (await runtime.listDelegations("window-local-stop"))[0];
+		if (!delegation) await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	assert.ok(delegation);
+	await runtime.cancel(delegation.id, { cwd: process.cwd(), env: {} });
+	await outcome;
+	const current = await runtime.getDelegation(delegation.id);
+	assert.equal(current?.executionState, "cancelled");
+	assert.equal(current?.receipt?.reportedOutcome, "cancelled");
+});
+
+test("P3-1: terminal CAS 阻止 reported_completed 被 cancelled 覆盖", async () => {
 	const store = new DelegationStore(freshDir());
 	await store.init();
 	const delegation = await store.createDelegation({
@@ -642,14 +678,19 @@ test("P3-1: terminal CAS 阻止 cancelled 被 completed 覆盖", async () => {
 		agentId: "slow",
 		operation: "run",
 	});
-	const cancelled = await store.transitionDelegation(delegation.id, ["running"], { status: "cancelled" });
-	const completed = await store.transitionDelegation(delegation.id, ["running"], {
-		status: "completed",
-		result: { agentId: "slow", status: "completed", content: "late" },
-	});
-	assert.equal(cancelled.applied, true);
-	assert.equal(completed.applied, false);
-	assert.equal(completed.record?.status, "cancelled");
+	await store.transitionDelegation(delegation.id, ["admitted"], { executionState: "running" });
+	const result = { agentId: "slow", status: "completed" as const, content: "done" };
+	const receipt = {
+		schemaVersion: 1 as const, id: `receipt:${delegation.id}`, delegationId: delegation.id, operationId: delegation.id,
+		contractHash: "sha256:test", reportedOutcome: "completed" as const, upstream: {}, reportedEvidence: [], reportedArtifacts: [],
+		requirementResults: [], artifactCapture: [], collectionStatus: "complete" as const, integrity: "clean" as const, issues: [],
+		startedAt: delegation.createdAt, observedAt: delegation.createdAt, observer: { connectorId: "slow", transport: "spawn" as const }, sealedAt: delegation.createdAt,
+	};
+	const completed = await store.transitionDelegation(delegation.id, ["running"], { executionState: "reported_completed", result, receipt });
+	const cancelled = await store.transitionDelegation(delegation.id, ["running"], { executionState: "cancelled", result: { agentId: "slow", status: "cancelled", errorCode: "cancelled", error: "late", recoverable: true }, receipt });
+	assert.equal(completed.applied, true);
+	assert.equal(cancelled.applied, false);
+	assert.equal(cancelled.record?.executionState, "reported_completed");
 });
 
 test("P3-1: Driver throw 与无边界流都落持久化 failed，不留下 running 幽灵", async () => {
@@ -680,7 +721,7 @@ test("P3-1: Driver throw 与无边界流都落持久化 failed，不留下 runni
 		);
 		if (behavior === "throw") await assert.rejects(() => promise, /driver exploded/);
 		else assert.equal((await promise).status, "failed");
-		assert.equal((await runtime.listDelegations(`window-${behavior}`))[0]?.status, "failed");
+		assert.equal((await runtime.listDelegations(`window-${behavior}`))[0]?.executionState, "reported_failed");
 	}
 });
 
@@ -729,7 +770,7 @@ test("失效会话自动恢复：continue 撞 session-not-found → 丢弃旧 ha
 	assert.ok(updates.some((u) => u.includes("旧会话已失效")), "恢复过程应经 onUpdate 告知");
 
 	const record = (await runtime.listDelegations("win-1"))[0]!;
-	assert.equal(record.status, "completed");
+	assert.equal(record.executionState, "reported_completed");
 	assert.equal(record.sessionHandle, "worker-session-fresh", "delegation 必须记录新 session handle");
 });
 

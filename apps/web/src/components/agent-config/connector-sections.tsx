@@ -165,6 +165,14 @@ function ConnectorProbeView({ probe }: { probe: ConnectorProbeResult }) {
 		...probe.capabilities.operations.map((operation) => OPERATION_LABELS[operation]),
 		...probe.capabilities.interactionKinds.map((kind) => INTERACTION_LABELS[kind]),
 		...(probe.capabilities.progress === "none" ? [] : [PROGRESS_LABELS[probe.capabilities.progress]]),
+		...(probe.capabilities.reconciliation === "query_run" ? ["远端 Run 查询对账"] : probe.capabilities.reconciliation === "reattach_stream" ? ["远端 Run 流重挂"] : []),
+		...(probe.capabilities.cancelConfirmation === "acknowledged" ? ["取消明确确认"] : probe.capabilities.cancelConfirmation === "observable" ? ["取消终态观测"] : []),
+		...(probe.capabilities.workspace?.honorsInvocationCwd ? ["执行目录强绑定"] : []),
+		...(probe.capabilities.workspace?.readOnlyEnforcement !== undefined && probe.capabilities.workspace.readOnlyEnforcement !== "none" ? ["只读边界强制"] : []),
+		...(probe.capabilities.verification?.freshSession ? ["Verifier fresh Session"] : []),
+		...(probe.capabilities.verification?.commandExecution ? ["CLI 命令复验"] : []),
+		...(probe.capabilities.verification?.workspaceIsolation.includes("isolated_copy") ? ["隔离副本复验"] : []),
+		...(probe.capabilities.verification?.workspaceIsolation.includes("mutation_guard") ? ["原目标修改守卫"] : []),
 	];
 	const detailItems = [
 		{ label: "接入方式", value: connectorTransportLabel(transport) },

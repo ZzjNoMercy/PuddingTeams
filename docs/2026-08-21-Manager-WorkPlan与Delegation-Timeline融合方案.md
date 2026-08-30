@@ -1,10 +1,10 @@
 # Session Goal 执行计划与 Delegation Timeline 融合方案
 
-> 状态：2026-08-21 已落地。本文同时是领域模型与实现契约；权威聚合位于 `apps/server/src/store/work-state.ts`（v5），Manager core tools 位于 `apps/server/src/pi-bridge/agent-extensions.ts`，恢复/Outbox 调度位于 `apps/server/src/index.ts`，统一抽屉位于 `apps/web/src/components/chat/session-runtime-drawer.tsx`。Driver SPI 仅增加可选幂等透传，不承载 WorkPlan。
+> 状态：2026-08-30 已升级到 Goal/WorkPlan v6。本文同时是领域模型与实现契约；权威聚合位于 `apps/server/src/store/work-state.ts`（v6），Manager core tools 位于 `apps/server/src/pi-bridge/agent-extensions.ts`，恢复/Outbox 调度位于 `apps/server/src/index.ts`，统一抽屉位于 `apps/web/src/components/chat/session-runtime-drawer.tsx`。Driver SPI 不承载 WorkPlan，只新增宿主无关的 Receipt、环境、取消与对账能力契约。
 >
 > 交互原型：`designs/manager-workplan-timeline/index.html`，包含深色/浅色主题、Goal 任务树、DAG 对照视图以及普通聊天不显示 Goal 入口的状态。Figma v1 参考稿：[03 · Recommended · Fusion · 1440×900](https://www.figma.com/design/Xa6bhuUx31oRrOMK0tJ8p2?node-id=6-2)；2026-08-21 的 Goal 融合与依赖图收口以本地原型为准。
 >
-> 待审增量：ExecutionReceipt、Workspace 写入所有权、远端 Run 对账/未知态、真实环境 Verifier、Submission 验证门禁和 Goal 整合复验尚未实现；合并后的最终开发方案见 `docs/2026-08-26-真实环境复验与可信验收方案.md`。本文下文仍只描述已落地行为。
+> 2026-08-30 增量已实现：ExecutionReceipt、Workspace 写入所有权、远端 Run 对账/未知态、WorkItem/Goal Verifier、Submission 验证门禁和 Goal 整合复验均已接入。十五项产品决策、首期 CLI 范围和故障矩阵见 `docs/2026-08-26-真实环境复验与可信验收方案.md`。
 
 ## 1. 结论
 
@@ -70,7 +70,7 @@ Goal 完成条件的权威来源始终是用户意图，不是 Reviewer 的自�
 - 如果 Manager 需要作出新的产品判断才能写出条件，属于“目标或边界含糊”，必须先询问用户，不能偷偷代填；
 - 用户后续可以显式修改 Goal/完成条件，修改会增加 `goalRevision`，旧版本复核不得应用到新契约。
 
-目标 v5 将来源随 Goal 契约持久化，而不是只留在 toolResult：
+v6 将来源随 Goal 契约持久化，而不是只留在 toolResult：
 
 ```ts
 interface GoalContractProvenance {
@@ -146,6 +146,8 @@ interface WorkItem {
   acceptanceCriteria: string[];
   /** 指向本项服务的冻结 Goal 条件序号或稳定 ID。 */
   sourceGoalCriteria: string[];
+  verificationPolicy: WorkItemVerificationPolicy;
+  workspaceExecutionPolicy: WorkspaceExecutionPolicy;
   status:
     | "planned"       // 仍被依赖阻塞
     | "ready"         // 所有依赖均 accepted，可开始
@@ -160,6 +162,7 @@ interface WorkItem {
   activeDelegationId?: string;
   submissions: WorkItemSubmission[];
   acceptedSubmissionId?: string;
+  lastChange?: { reason: string; changedAt: string; previousRevision: number };
   revision: number;
   createdAt: string;
   updatedAt: string;
@@ -175,6 +178,21 @@ interface WorkItemSubmission {
     | { kind: "delegation_result"; delegationId: string }
     | { kind: "manager_summary"; evidenceRefs: string[] };
   artifactIds: string[];
+  executionReceiptId?: string;
+  executionReceipt?: ExecutionReceipt;
+  workspaceChangeSetId?: string;
+  workspaceChangeSet?: WorkspaceChangeSet;
+  goalRevision: number;
+  workItemRevision: number;
+  inputFingerprint: string;
+  verifications: VerificationRecord[];
+  /** isolated_worktree 两阶段结算的不可覆盖 Manager 意图。 */
+  acceptanceIntent?: {
+    verdict: "accepted";
+    summary: string;
+    evidenceRefs: string[];
+    requestedAt: string;
+  };
   summary?: string;
   submittedAt: string;
   review?: {
@@ -212,9 +230,10 @@ ready --创建绑定 Delegation--> in_progress
 ready/revision --Manager 开始自己的 WorkItem--> in_progress
 in_progress --Interaction pending--> waiting_input
 waiting_input --respond/approve--> in_progress
-in_progress --Delegation completed--> submitted
+in_progress --execution Delegation reported_completed + sealed Receipt--> submitted
 in_progress --Manager 提交内联结果与证据--> submitted
-submitted --Manager accept--> accepted
+submitted --验证门禁通过--> Manager acceptanceIntent
+acceptanceIntent --change-set 提升 applied--> accepted
 submitted --Manager request revision--> revision
 revision --创建新 Delegation--> in_progress
 submitted --确认无法继续--> blocked
@@ -222,8 +241,10 @@ submitted --确认无法继续--> blocked
 
 失败和取消保持分层：
 
-- `Delegation.failed/cancelled` 只结束这一次尝试；Manager 可把 WorkItem 置为 `revision` 后换 Worker 重试，也可明确置为 `blocked/cancelled`；
-- `Delegation.completed` 自动生成 `WorkItemSubmission` 并把 WorkItem 推进到 `submitted`，**不会**自动 `accepted`；
+- `Delegation.reported_failed/cancelled/observation_lost` 只结束或中止这一次尝试；Manager 可在效果已知后把 WorkItem 置为 `revision`，也可明确置为 `blocked/cancelled`；`effect_unknown` 的写任务不得自动重试；
+- execution Delegation 的 `reported_completed` 只有在 sealed Receipt 与 WorkItem contract hash/revision/epoch 匹配时才自动生成 `WorkItemSubmission` 并推进到 `submitted`，**不会**自动 `accepted`；verification Delegation 不生成 Submission；
+- 高于 `manager_review` 的 WorkItem 必须有绑定当前 Submission/revision/epoch/inputFingerprint 的 `passed + clean` VerificationRecord，逐项满足全部 acceptance criteria 且引用白名单证据；
+- `isolated_worktree` 必须先原子冻结 `acceptanceIntent`，再精确提升 change-set；目标 baseline 漂移时改为 `blocked` 并保留 worktree/diff，不能覆盖用户或其他 Worker 修改；
 - `assignedAgentId=manager` 的工作项必须通过 `advance_manager_work_item` 明确记录 `in_progress → submitted`，再走同一个 `review_work_item` 验收门；WorkItem 一旦开始或产生 Submission 就禁止物理删除，只能取消并保留审计事实；
 - 只有 `accepted` 才满足下游 `dependsOn`；`submitted`、`completed`、`revision` 都不能解锁后继；
 - WorkPlan 全部非取消项 `accepted` 后只代表计划完成，Goal 仍需沿用现有 completion review 门禁才能 `resolved`。
@@ -326,13 +347,13 @@ Manager 显性规划
 <PUDDINGTEAMS_HOME>/state/work-states.json
 ```
 
-`WorkStateStore` 以原子改写方式保存多个 `SessionWorkState + DecisionRequest`。`plan` 是单个 Goal 聚合的可选子结构；v5 以 `goalId` 为 `states` 主键，同一 `sessionId` 可以有多个终态 Goal，但最多一个 active Goal。项目未上线，不保留双写或历史兼容层。这既避免 Goal 与 WorkPlan 两个快照之间出现崩溃窗口，也隔离同一 Session 的连续目标。
+`WorkStateStore` 以原子改写方式保存多个 `SessionWorkState + DecisionRequest`。`plan` 是单个 Goal 聚合的可选子结构；当前 v6 以 `goalId` 为 `states` 主键，在 v5 基础上增加 Goal/WorkItem VerificationPolicy、VerificationRecord、ExecutionReceipt、WorkspaceChangeSet 与两阶段 acceptanceIntent。同一 `sessionId` 可以有多个终态 Goal，但最多一个 active Goal。项目未上线，v6 直接拒绝旧结构，不保留双写、迁移或历史兼容层。
 
 文件仍是当前状态快照，不是 JSONL。结构示意：
 
 ```json
 {
-  "version": 5,
+  "version": 6,
   "states": {
     "goal-01": {
       "goalId": "goal-01",
@@ -515,7 +536,7 @@ Goal 是持久控制面，不是一个长时间内存进程。服务重启、Man
 
 1. 保留同一 `sessionId`、Goal 契约、Goal revision、已验收 WorkItem、Decision、Artifact 与历史 Delegation；
 2. 崩溃前没有提交的 token/推理不是恢复点；最近一个成功的原子 Goal 操作、toolResult 或 Delegation 边界才是安全点；
-3. 现有 `reapOrphanedRuns()` 继续把孤儿 Delegation 转成不可变的 `failed(server_restart)`，不把原 D 改回 running；
+3. 启动 `reconcileOrphanedRuns()` 按执行所有权恢复：本地生命周期绑定 Run 确认进程消失后封存 `failed(server_restart)` Receipt；远端 Run 按 Driver 的 `query_run/reattach_stream` 查询或重挂；无法确认真实效果时进入 `observation_lost/effect_unknown` 并 fence 写 scope，不伪造 failed/cancelled；
 4. 每个新的中断边界只增加一次 `execution.epoch`；恢复操作沿用该新 epoch，在同一 WorkItem 下创建新 Delegation 尝试，并用 `resumeOfDelegationId` 或现有 `parentDelegationId + handoffKind:"followup"` 指向旧 D；
 5. 旧 epoch 晚到的 Manager tool、Worker 回调或 reviewer 结果只记审计，不得改写当前 Goal。
 
@@ -573,7 +594,7 @@ server 启动顺序固定为：
 
 ```text
 init stores
-  → reapOrphanedRuns()
+  → reconcileOrphanedRuns()
   → GoalRecoveryCoordinator.reconcile()
   → drain Goal outbox
   → 开放 HTTP/WS
@@ -641,7 +662,7 @@ PuddingTeams 可以保证“本地 Goal 状态只应用一次”，但无法在�
 
 ## 11. 分阶段落地
 
-1. **GoalStore v5**：把 plan 并入按 `goalId` 存储的 `SessionWorkState`，允许同一 Session 串行多个 Goal，拆分业务/执行状态，增加 epoch、operation ledger、outbox 与原子命令网关；
+1. **GoalStore v6**：把 plan 并入按 `goalId` 存储的 `SessionWorkState`，允许同一 Session 串行多个 Goal，拆分业务/执行/复验/结算状态，增加 epoch、operation ledger、outbox、Receipt/change-set 引用与原子命令网关；
 2. **幂等改造**：HTTP `Idempotency-Key`、core toolCallId、Decision 回答、Delegation boundary、Submission/review 去重和 Session JSONL `eventId` 去重；
 3. **Recovery Coordinator**：启动扫描、孤儿收割后对账、resume lease、Manager safe-auto 唤醒与 direct 人工恢复；
 4. **Manager Harness + WorkItem**：core tools、Goal/WorkPlan context、DAG、Submission/验收和 completion review 幂等化；

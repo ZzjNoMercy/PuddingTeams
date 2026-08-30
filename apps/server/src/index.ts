@@ -37,6 +37,7 @@ import { registerWorkStateRoutes } from "./routes/work-state.js";
 import { registerWorkerProcessRoutes } from "./routes/worker-process.js";
 import { WorkerProcessService } from "./agent-runtime/worker-process.js";
 import { DelegationTimelineStore } from "./agent-runtime/delegation-timeline-store.js";
+import { WorkspaceExecutionCoordinator } from "./agent-runtime/workspace-execution.js";
 import { UploadStore } from "./store/uploads.js";
 import { configureSharedModelRuntime } from "./pi-bridge/model-runtime.js";
 import { registerWebStatic } from "./web-static.js";
@@ -114,6 +115,21 @@ const productSettings = new ProductSettingsStore(paths.config);
 const largeWorkerResults = new LargeWorkerResultStore(paths.state);
 const initialProductSettings = await productSettings.get();
 workStates.configureOperationLedger(initialProductSettings.harness.goalRecovery);
+workStates.configureVerificationDefaults({
+	minimumWorkItemMode: initialProductSettings.harness.verification.defaultWorkItemMode,
+	finalGoalMode: initialProductSettings.harness.verification.defaultFinalGoalMode,
+	trigger: initialProductSettings.harness.verification.trigger,
+	workspaceExecution: {
+		readOnlyMode: initialProductSettings.harness.workspaceExecution.readOnlyDefault,
+		gitWriteMode: initialProductSettings.harness.workspaceExecution.gitWriteDefault,
+		nonGitWriteMode: initialProductSettings.harness.workspaceExecution.nonGitWriteDefault,
+	},
+});
+const workspaceExecution = new WorkspaceExecutionCoordinator(paths.state, {
+	worktreeRoot: path.join(paths.runtime, "worktrees"),
+	leaseTimeoutMs: initialProductSettings.harness.workspaceExecution.leaseTimeoutMs,
+});
+await workspaceExecution.init();
 const extensionRegistry = new ExtensionRegistry(paths.extensions, catalog, drivers);
 extensionRegistry.registerBuiltin(puddingClawConnectorManifest, puddingClawExtensionHooks(), {
 	// PuddingClaw 默认头像（布丁狗）随 server 包发布。
@@ -143,6 +159,7 @@ const runtime: AgentRuntime = new AgentRuntime(
 	{ ttlMs: 24 * 60 * 60 * 1000 },
 	artifacts,
 	delegationTimelines,
+	workspaceExecution,
 );
 const invoker = new AgentInvoker(
 	teams,
@@ -172,20 +189,25 @@ const store = new PiSessionStore(
 invoker.setManagerSender((managerSessionId, message, options) =>
 	store.sendCustomMessage(managerSessionId, message, options),
 );
-// 启动收割（server_restart）：上次进程退出留下的 running/waiting_input 孤儿
-// 委托统一转 failed，并补写 manager 会话——有真实工具调用的补合成 toolResult
+// 启动对账：本地生命周期绑定进程按已确认消失结算；远端 Run 按 Driver 能力
+// 查询/重挂，无法确认的副作用进入 observation_lost/effect_unknown。
+// 已确认的本地中断补写 manager 会话——有真实工具调用的补合成 toolResult
 // （manager 下次运行能看到失败原因并重新决策）；direct 直派链路（
 // managerToolCallId 是 taskId、会话里没有 toolCall）改补一张失败结果卡。
-const reapedOrphans = await runtime.reapOrphanedRuns(async (orphan) => {
+const reconciledOrphans = await runtime.reconcileOrphanedRuns(async (orphan, result) => {
+	await workStates.reconcileDelegations(await runtime.listDelegations());
 	if (!orphan.managerToolCallId) return;
-	const text =
-		`PuddingTeams 服务重启，该任务运行中断（server_restart）。worker「${orphan.agentId}」的执行已终止；` +
-		`交接目录 ${orphan.cwdSnapshot}/.pudding/handoff/${orphan.id} 中可能保留了部分进展。如需继续，请重新委派并说明可复用的进展。`;
+	const errorCode = result.status === "failed" ? result.errorCode : undefined;
+	const text = result.status === "completed"
+		? `PuddingTeams 启动对账确认 worker「${orphan.agentId}」的远端 Run 已完成，已按原 Delegation 封存 Receipt。`
+		: errorCode === "observation_lost"
+			? `PuddingTeams 无法继续观察 worker「${orphan.agentId}」的远端 Run；执行效果未知，相关写 scope 已 fence。请先人工对账，禁止直接重试副作用任务。`
+			: `PuddingTeams 服务重启，该任务运行中断（${errorCode ?? "server_restart"}）。worker「${orphan.agentId}」的本地执行已终止；交接目录 ${orphan.cwdSnapshot}/.pudding/handoff/${orphan.id} 中可能保留了部分进展。`;
 	const wrote = await store.appendToolResultIfPending(orphan.managerSessionId, {
 		toolCallId: orphan.managerToolCallId,
 		toolName: `agent_${orphan.agentId}__delegate`,
 		text,
-		details: { status: "failed", errorCode: "server_restart", delegationId: orphan.id },
+		details: { status: result.status, ...(errorCode ? { errorCode } : {}), delegationId: orphan.id, executionState: orphan.executionState },
 	});
 	if (!wrote) {
 		await store.sendCustomMessage(
@@ -193,14 +215,14 @@ const reapedOrphans = await runtime.reapOrphanedRuns(async (orphan) => {
 			{
 				customType: "pudding:task_result",
 				content: text,
-				details: { taskId: orphan.managerToolCallId, worker: orphan.agentId, windowId: orphan.windowId, status: "failed" },
+				details: { taskId: orphan.managerToolCallId, worker: orphan.agentId, windowId: orphan.windowId, status: result.status, executionState: orphan.executionState },
 			},
 			{ triggerTurn: false },
 		);
 	}
 });
-if (reapedOrphans > 0) app.log.info({ reaped: reapedOrphans }, "reaped orphaned delegations from previous process");
-// Goal v4 recovery runs after Runtime has sealed orphaned Runs and before HTTP
+if (reconciledOrphans > 0) app.log.info({ reconciled: reconciledOrphans }, "reconciled orphaned delegations from previous process");
+// Goal recovery runs after Runtime has reconciled/sealed Runs and before HTTP
 // opens. Terminal Delegations are projected into WorkItem submissions exactly
 // once; restart orphans advance one Goal epoch and never resurrect the old Run.
 const reconciledGoals = await workStates.reconcileDelegations(await runtime.listDelegations());
@@ -293,7 +315,10 @@ await registerChatRoutes(app, store, teams, workStates, uploads, invoker, {
 	dataHomeId: puddingTeamsHomeId(paths.home),
 });
 registerIdentityRoutes(app);
-await registerSettingsRoutes(app, defaultCwd, productSettings, workStates, () => store.markAllDirty());
+await registerSettingsRoutes(app, defaultCwd, productSettings, workStates, (settings) => {
+	store.markAllDirty();
+	workspaceExecution.configure({ leaseTimeoutMs: settings.harness.workspaceExecution.leaseTimeoutMs });
+});
 await registerProvidersRoutes(app, store);
 await registerAgentsRoutes(app, teams, {
 	credentials,
@@ -322,6 +347,18 @@ registerArtifactsRoutes(app, artifacts);
 registerWorkStateRoutes(app, workStates, teams, store, runtime, productSettings);
 registerWorkerProcessRoutes(app, new WorkerProcessService(delegations, teams, paths.workerSessions, delegationTimelines), {
 	cancel: (delegationId, signal) => invoker.cancel(delegationId, signal),
+	reconcile: async (delegationId) => {
+		const record = await invoker.reconcileDelegation(delegationId, async () => {
+			await workStates.reconcileDelegations(await runtime.listDelegations());
+		});
+		await workStates.reconcileDelegations(await runtime.listDelegations());
+		return record;
+	},
+	takeover: async (delegationId, rationale) => {
+		const record = await invoker.confirmObservationLostStopped(delegationId, rationale);
+		await workStates.reconcileDelegations(await runtime.listDelegations());
+		return record;
+	},
 }, workStates);
 
 // §15.6 artifact.created 事件：与现有审批/任务结果同一通道——manager session

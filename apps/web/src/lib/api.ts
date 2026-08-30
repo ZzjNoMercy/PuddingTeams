@@ -242,6 +242,25 @@ export async function cancelDelegation(delegationId: string, expectedGoalId?: st
 	}
 }
 
+export async function reconcileDelegation(delegationId: string, expectedGoalId?: string): Promise<{ executionState: string }> {
+	const res = await fetch(`${SERVER_URL}/api/delegations/${encodeURIComponent(delegationId)}/reconcile`, {
+		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ expectedGoalId }),
+	});
+	const body = (await res.json().catch(() => null)) as { executionState?: string; error?: string } | null;
+	if (!res.ok) throw new Error(body?.error ?? `reconcile delegation failed: ${res.status}`);
+	return { executionState: body?.executionState ?? "observation_lost" };
+}
+
+export async function takeoverDelegation(delegationId: string, rationale: string, expectedGoalId?: string): Promise<{ executionState: string }> {
+	const res = await fetch(`${SERVER_URL}/api/delegations/${encodeURIComponent(delegationId)}/takeover`, {
+		method: "POST", headers: { "content-type": "application/json" },
+		body: JSON.stringify({ expectedGoalId, confirmation: "upstream_stopped", rationale }),
+	});
+	const body = (await res.json().catch(() => null)) as { executionState?: string; error?: string } | null;
+	if (!res.ok) throw new Error(body?.error ?? `take over delegation failed: ${res.status}`);
+	return { executionState: body?.executionState ?? "cancelled" };
+}
+
 export function sessionWsUrl(sessionId: string): string {
 	return `${SERVER_URL.replace(/^http/, "ws")}/api/sessions/${sessionId}/ws`;
 }
@@ -253,7 +272,10 @@ export interface WorkerProcessInfo {
 	managerSessionId: string;
 	goalId?: string;
 	agentId: string;
-	status: string;
+	executionState: ExecutionState;
+	/** 后端根据 Delegation 与 WorkState 生成的权威三轴投影。 */
+	trustProjection: CollaborationTrustProjection;
+	receipt?: ExecutionReceiptView;
 	sessionHandle?: string;
 	/** 委托创建时间（ISO）：worker 会话跨任务续接，用它切出本次委托的消息。 */
 	createdAt: string;
@@ -266,6 +288,49 @@ export interface WorkerProcessListItem extends WorkerProcessInfo {
 	task?: string;
 	intent?: string;
 	expectedOutcome?: string;
+}
+
+/** Execution / Verification / Settlement are intentionally independent axes. */
+export type ExecutionState =
+	| "admitted" | "running" | "waiting_input" | "reported_completed" | "reported_failed"
+	| "cancel_requested" | "reconciling" | "cancelled" | "observation_lost";
+export type VerificationProjection =
+	| "not_required" | "unverified" | "pending" | "running" | "waiting_input"
+	| "passed" | "failed" | "blocked" | "stale";
+export type SettlementState = "pending" | "submitted" | "accepted" | "revision" | "blocked" | "cancelled";
+export interface CollaborationTrustProjection {
+	execution: ExecutionState;
+	verification: VerificationProjection;
+	settlement: SettlementState;
+}
+export interface ExecutionReceiptView {
+	contractHash?: string;
+	collectionStatus?: "complete" | "partial" | "failed";
+	integrity?: "unknown" | "clean" | "suspect" | "violation";
+	issues?: string[];
+	sealedAt?: string;
+	artifactCapture?: Array<{ artifactId?: string; status?: string; issue?: string }>;
+}
+
+/** Exact trust fields emitted by the server, or locally projected from WorkState. */
+export interface CollaborationProjectionSource {
+	executionState: ExecutionState;
+	trustProjection?: CollaborationTrustProjection;
+	verification?: VerificationProjection;
+	settlement?: SettlementState;
+	receipt?: ExecutionReceiptView;
+}
+
+export function collaborationTrustOf(source: CollaborationProjectionSource): CollaborationTrustProjection {
+	return source.trustProjection ?? {
+		execution: source.executionState,
+		verification: source.verification ?? "unverified",
+		settlement: source.settlement ?? "pending",
+	};
+}
+
+export function isObservationLost(source: CollaborationProjectionSource): boolean {
+	return collaborationTrustOf(source).execution === "observation_lost";
 }
 
 export async function fetchRoomDelegationProcesses(
@@ -367,6 +432,28 @@ export interface HarnessSettings {
 		resumeLeaseMs: number;
 		operationRetentionDays: number;
 		maxOperationsPerSession: number;
+	};
+	verification: {
+		enabled: boolean;
+		defaultWorkItemMode: "manager_review" | "independent_evidence_review";
+		defaultFinalGoalMode: "manager_review" | "independent_evidence_review" | "environment_verified";
+		trigger: "manager_request" | "auto_on_submission";
+		reviewers: { evidenceModel: string; cliAgentId: string; requireRoomMember: boolean };
+		cliEnvironmentMode: "isolated_copy" | "same_target_guarded";
+		isolation: { requireFreshSession: boolean; forbidExecutorContinuation: boolean; requireDifferentAgent: boolean };
+		firstReleaseScope: "cli_code_first";
+		unavailableAction: "block";
+		artifactCaptureFailure: "partial_receipt_block";
+		remoteRunUnknown: "observation_lost_effect_unknown";
+		cancelUnconfirmed: "cancel_requested_observation_lost";
+	};
+	workspaceExecution: {
+		readOnlyDefault: "read_only_shared";
+		gitWriteDefault: "isolated_worktree" | "exclusive_write";
+		nonGitWriteDefault: "exclusive_write";
+		leaseTimeoutMs: number;
+		promotion: { autoApplyAfterAcceptance: boolean; autoCommit: boolean; autoPush: boolean; conflictAction: "block_preserve_changes" };
+		managerWritePolicy: "delegation_required";
 	};
 }
 export async function getHarnessSettings(): Promise<HarnessSettings> {

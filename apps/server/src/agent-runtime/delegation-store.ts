@@ -1,10 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { InteractionRequest, NormalizedResult } from "./types.js";
+import type { ExecutionReceipt, ExecutionState } from "./execution-receipt.js";
+import type { DriverTransport, InteractionRequest, NormalizedResult } from "./types.js";
+import type { WorkspaceExecutionPolicy } from "./workspace-execution.js";
 
 export interface DelegationRecord {
 	id: string;
+	/** Stable Runtime operation identity, also propagated as upstream idempotency key. */
+	operationId?: string;
+	contractHash?: string;
 	windowId: string;
 	/** 缺省表示该 Run 使用平台默认 cwd，而非显式项目。 */
 	workspaceId?: string;
@@ -12,12 +17,19 @@ export interface DelegationRecord {
 	cwdSnapshot: string;
 	managerSessionId: string;
 	managerToolCallId?: string;
+	purpose: "execution" | "verification";
+	verificationId?: string;
+	verifiesSubmissionId?: string;
+	environmentProfileId?: string;
+	verificationEnvironmentId?: string;
 	goalId?: string;
 	workPlanId?: string;
 	workItemId?: string;
 	attempt?: number;
 	/** Goal execution epoch captured when this immutable Run is created. */
 	goalEpoch?: number;
+	goalRevision?: number;
+	workItemRevision?: number;
 	/** Optional causal edge to an earlier delegation in the same manager Session. */
 	parentDelegationId?: string;
 	handoffKind?: "request" | "followup";
@@ -31,10 +43,24 @@ export interface DelegationRecord {
 	agentId: string;
 	/** Agent/Connector configuration generation captured when the Run starts. */
 	agentRevision: number;
+	driverId?: string;
+	driverTransport?: DriverTransport;
 	operation: "run" | "continue";
 	sessionHandle?: string;
 	runHandle?: string;
-	status: "running" | "waiting_input" | "completed" | "failed" | "cancelled";
+	executionState: ExecutionState;
+	/** Durable boundary journal: written before cross-store evidence collection so restart seals the same result without rerunning the Worker. */
+	pendingTerminal?: {
+		executionState: "reported_completed" | "reported_failed" | "cancelled";
+		result: Exclude<NormalizedResult, { status: "needs_input" }>;
+		startedAt: string;
+	};
+	receipt?: ExecutionReceipt;
+	workspaceExecutionPolicy?: WorkspaceExecutionPolicy;
+	workspaceExecutionScopeId?: string;
+	workspaceChangeSetId?: string;
+	/** Actual cwd bound to the Driver; target cwdSnapshot remains immutable. */
+	executionCwd?: string;
 	revision: number;
 	createdAt: string;
 	updatedAt: string;
@@ -60,12 +86,12 @@ export interface InteractionRecord {
 }
 
 interface DelegationsFile {
-	version: number;
+	version: 2;
 	delegations: Record<string, DelegationRecord>;
 }
 
 interface InteractionsFile {
-	version: number;
+	version: 2;
 	interactions: Record<string, InteractionRecord>;
 }
 
@@ -98,10 +124,13 @@ export class DelegationStore {
 		return run;
 	}
 
-	private async readFile(file: string, version = 1): Promise<Record<string, unknown>> {
+	private async readFile(file: string): Promise<Record<string, unknown>> {
 		try {
 			const raw = await readFile(file, "utf-8");
 			const parsed = JSON.parse(raw) as { [k: string]: unknown };
+			if (parsed.version !== 2) {
+				throw new Error(`${path.basename(file)} 必须使用 v2；项目未上线，不读取旧结构，请移走旧文件后重启`);
+			}
 			return parsed ?? {};
 		} catch (err: unknown) {
 			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
@@ -128,12 +157,16 @@ export class DelegationStore {
 
 	// ---- delegations ----
 
-	async createDelegation(input: Omit<DelegationRecord, "id" | "status" | "revision" | "createdAt" | "updatedAt">): Promise<DelegationRecord> {
+	async createDelegation(
+		input: Omit<DelegationRecord, "id" | "purpose" | "executionState" | "revision" | "createdAt" | "updatedAt">
+			& { purpose?: DelegationRecord["purpose"] },
+	): Promise<DelegationRecord> {
 		const now = new Date().toISOString();
 		const record: DelegationRecord = {
 			...input,
+			purpose: input.purpose ?? "execution",
 			id: randomUUID(),
-			status: "running",
+			executionState: "admitted",
 			revision: 0,
 			createdAt: now,
 			updatedAt: now,
@@ -141,7 +174,7 @@ export class DelegationStore {
 		await this.serialize(async () => {
 			const all = await this.loadDelegations();
 			all[record.id] = record;
-			await this.writeFile(this.delegationsFile, { version: 1, delegations: all });
+			await this.writeFile(this.delegationsFile, { version: 2, delegations: all } satisfies DelegationsFile);
 		});
 		return record;
 	}
@@ -156,35 +189,9 @@ export class DelegationStore {
 			const all = await this.loadDelegations();
 			const rec = all[id];
 			if (!rec) return;
-			const next: DelegationRecord = {
-				...rec,
-				...patch,
-				id: rec.id,
-				createdAt: rec.createdAt,
-				revision: patch.revision ?? rec.revision,
-				updatedAt: new Date().toISOString(),
-			};
-			all[id] = next;
-			updated = next;
-			await this.writeFile(this.delegationsFile, { version: 1, delegations: all });
-		});
-		return updated;
-	}
-
-	/** Atomic status compare-and-set used by Runtime terminal transitions. */
-	async transitionDelegation(
-		id: string,
-		allowed: readonly DelegationRecord["status"][],
-		patch: Partial<Omit<DelegationRecord, "id" | "createdAt" | "status">> & { status: DelegationRecord["status"] },
-	): Promise<{ applied: boolean; record?: DelegationRecord }> {
-		let result: { applied: boolean; record?: DelegationRecord } = { applied: false };
-		await this.serialize(async () => {
-			const all = await this.loadDelegations();
-			const rec = all[id];
-			if (!rec) return;
-			if (!allowed.includes(rec.status)) {
-				result = { applied: false, record: rec };
-				return;
+			this.assertReceiptImmutable(rec, patch);
+			if (patch.executionState && ["reported_completed", "reported_failed", "cancelled"].includes(patch.executionState) && !patch.receipt && !rec.receipt) {
+				throw new Error(`Delegation ${id} 的终态 ${patch.executionState} 必须与 ExecutionReceipt 原子封存`);
 			}
 			const next: DelegationRecord = {
 				...rec,
@@ -195,7 +202,64 @@ export class DelegationStore {
 				updatedAt: new Date().toISOString(),
 			};
 			all[id] = next;
-			await this.writeFile(this.delegationsFile, { version: 1, delegations: all });
+			updated = next;
+			await this.writeFile(this.delegationsFile, { version: 2, delegations: all } satisfies DelegationsFile);
+		});
+		return updated;
+	}
+
+	private assertReceiptImmutable(
+		record: DelegationRecord,
+		patch: Partial<Omit<DelegationRecord, "id" | "createdAt">>,
+	): void {
+		if (!record.receipt) return;
+		const immutableKeys: Array<keyof DelegationRecord> = [
+			"operationId", "contractHash", "goalId", "workPlanId", "workItemId", "attempt", "goalEpoch",
+			"goalRevision", "workItemRevision", "task", "intent", "expectedOutcome",
+			"evidenceRequirements", "completionBoundary", "agentId", "agentRevision", "driverId",
+			"driverTransport", "operation", "sessionHandle", "runHandle", "executionState", "result",
+			"receipt", "workspaceExecutionScopeId", "workspaceChangeSetId", "purpose",
+			"workspaceExecutionPolicy", "executionCwd",
+			"verificationId", "verifiesSubmissionId", "environmentProfileId", "verificationEnvironmentId",
+		];
+		for (const key of immutableKeys) {
+			if (!(key in patch)) continue;
+			const patchRecord = patch as Partial<DelegationRecord>;
+			if (JSON.stringify(patchRecord[key]) !== JSON.stringify(record[key])) {
+				throw new Error(`Delegation ${record.id} 的 ExecutionReceipt 已封存，禁止修改 ${String(key)}`);
+			}
+		}
+	}
+
+	/** Atomic execution-state compare-and-set used by Runtime lifecycle transitions. */
+	async transitionDelegation(
+		id: string,
+		allowed: readonly ExecutionState[],
+		patch: Partial<Omit<DelegationRecord, "id" | "createdAt" | "executionState">> & { executionState: ExecutionState },
+	): Promise<{ applied: boolean; record?: DelegationRecord }> {
+		let result: { applied: boolean; record?: DelegationRecord } = { applied: false };
+		await this.serialize(async () => {
+			const all = await this.loadDelegations();
+			const rec = all[id];
+			if (!rec) return;
+			if (!allowed.includes(rec.executionState)) {
+				result = { applied: false, record: rec };
+				return;
+			}
+			this.assertReceiptImmutable(rec, patch);
+			if (["reported_completed", "reported_failed", "cancelled"].includes(patch.executionState) && !patch.receipt && !rec.receipt) {
+				throw new Error(`Delegation ${id} 的终态 ${patch.executionState} 必须与 ExecutionReceipt 原子封存`);
+			}
+			const next: DelegationRecord = {
+				...rec,
+				...patch,
+				id: rec.id,
+				createdAt: rec.createdAt,
+				revision: patch.revision ?? rec.revision,
+				updatedAt: new Date().toISOString(),
+			};
+			all[id] = next;
+			await this.writeFile(this.delegationsFile, { version: 2, delegations: all } satisfies DelegationsFile);
 			result = { applied: true, record: next };
 		});
 		return result;
@@ -223,7 +287,7 @@ export class DelegationStore {
 		await this.serialize(async () => {
 			const all = await this.loadInteractions();
 			all[record.id] = record;
-			await this.writeFile(this.interactionsFile, { version: 1, interactions: all });
+			await this.writeFile(this.interactionsFile, { version: 2, interactions: all } satisfies InteractionsFile);
 		});
 		return record;
 	}
@@ -248,7 +312,7 @@ export class DelegationStore {
 			};
 			all[id] = next;
 			updated = next;
-			await this.writeFile(this.interactionsFile, { version: 1, interactions: all });
+			await this.writeFile(this.interactionsFile, { version: 2, interactions: all } satisfies InteractionsFile);
 		});
 		return updated;
 	}
