@@ -97,6 +97,10 @@ puddingteams start --port 8940
 
 检查 Workspace、cwdSnapshot、Agent revision 和 Connector 是否变化。PuddingTeams 会拒绝把旧 handle 带进新的执行边界；这是数据隔离，不是记忆随机丢失。
 
+如果是 Solo 切换项目，切回原项目应恢复原 active Session；如果没有恢复，检查 `windows.json.parkedContexts` 是否仍包含该 `workspaceId + cwdSnapshot`、对应 JSONL 是否存在，以及 JSONL 首行 cwd 是否仍与 canonical Workspace 一致。项目切换本身不得删除 JSONL。
+
+首次启动支持 Workspace 历史的新版本时，旧版 `windows.json` 会先在内存升级并完成全量校验，再原子提交：保留全部 Window、Session、active Session 和 Worker handle，把旧 Window 级 binding 归入当时的 active Session，并补齐 `parkedContexts`。升级前原文件以原子方式保存在同目录的 `windows.json.v1.bak`；若该名称已有不同内容，则另存为带源内容哈希的 `windows.json.v1.<hash>.bak`，不会覆盖或误用旧备份。不需要也不应通过删除 `windows.json` 解决版本变化。
+
 ### Delegation 一直等待
 
 查看 Interaction 列表和执行 Inspector。`waiting_input` 不是失败，必须回答或取消原 Interaction；再发一条普通消息不会替代 `Driver.respond`。

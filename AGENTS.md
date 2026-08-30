@@ -27,3 +27,11 @@ Connector/Capability Extension 的本质是**给 pi 扩充连接其他 Agent 的
 - 发行打包：`pnpm build:runtime`（esbuild 单文件 bundle server/CLI + web 静态产物 + 第一方 extensions 预编译，组装到 `packages/puddingteams-cli/runtime/`）；`pnpm pack:cli` 额外产出 tgz。安装链路：`npm install -g <tgz>` → `puddingteams init` → `puddingteams start` → `puddingteams open`。发行态 server 同源托管 web 静态产物，单进程单端口。
 - 不做任何 git 提交/变更，除非用户明确要求。
 - 未上线项目，不做历史数据兼容：结构变化直接替换，不留兼容适配层。
+
+<!-- pudding:handoff-begin -->
+## PuddingTeams 交付约定（平台托管块，请勿手工编辑）
+
+- 报告、导出数据等交付物写入本工作区的 `.pudding/handoff/` 目录；
+- 最终回复中列出交付物清单（名称 + 路径），供接力任务按路径引用（传路径不传内容）；
+- 中间过程产物（scratch、临时文件）自理，不要放进 handoff 目录。
+<!-- pudding:handoff-end -->
