@@ -30,6 +30,7 @@ import type {
 	NormalizedResult,
 	WorkerActivity,
 } from "./types.js";
+import { redactText, redactValue } from "./redaction.js";
 
 export interface DelegateInput {
 	windowId: string;
@@ -195,15 +196,17 @@ export class AgentRuntime {
 		return {
 			...ctx,
 			onUpdate: (content, details) => {
+				const publicContent = redactText(content);
+				const safeDetails = redactValue(details);
 				if (this.timeline) {
 					void this.timeline
-						.append(delegation.id, this.activityFromUpdate(delegation.agentId, content, details))
+						.append(delegation.id, this.activityFromUpdate(delegation.agentId, publicContent, safeDetails))
 						.catch(() => undefined);
 				}
-				const publicDetails = details && typeof details === "object"
-					? { ...(details as Record<string, unknown>), delegationId: delegation.id }
+				const publicDetails = safeDetails && typeof safeDetails === "object"
+					? { ...(safeDetails as Record<string, unknown>), delegationId: delegation.id }
 					: { delegationId: delegation.id };
-				ctx.onUpdate?.(content, publicDetails);
+				ctx.onUpdate?.(publicContent, publicDetails);
 			},
 		};
 	}
@@ -494,6 +497,23 @@ export class AgentRuntime {
 					// This does not grant or change Worker permissions.
 					mode = "exclusive_write";
 				}
+				if (mode === "exclusive_write") {
+					const blocking = await this.workspaceExecution.getBlockingScope(input.workspaceId, input.cwdSnapshot);
+					if (blocking) {
+						const owners = await Promise.all(blocking.delegationIds.map((id) => this.delegations.getDelegation(id)));
+						const terminal = owners.length > 0 && owners.every((owner) => owner !== undefined && ["reported_completed", "reported_failed", "cancelled"].includes(owner.executionState));
+						if (terminal) {
+							// Safe lazy migration for leases retained by older runtimes: every
+							// owning Driver already has a durable terminal observation, so no
+							// upstream writer can still be active.
+							await this.workspaceExecution.release(blocking.id, {
+								ownerToken: blocking.ownerToken,
+								allowFenced: true,
+								cleanup: false,
+							});
+						}
+					}
+				}
 				if (mode === "isolated_worktree" && driverCapabilities.workspace?.honorsInvocationCwd !== true) throw new Error("Connector 不保证使用平台注入 cwd，不能进入隔离 worktree");
 				const scope = await this.workspaceExecution.begin({
 					workspacePath: input.cwdSnapshot,
@@ -561,6 +581,9 @@ export class AgentRuntime {
 		const runCtx = this.timelineContext({
 			...ctx,
 			cwd: delegation.executionCwd ?? delegation.cwdSnapshot,
+			workspaceBoundary: delegation.workspaceExecutionPolicy?.mode === "isolated_worktree"
+				? "platform_isolated_checkout"
+				: "workspace",
 			delegationId: delegation.id,
 			operationId: requestId,
 			idempotencyKey: requestId,
@@ -790,10 +813,11 @@ export class AgentRuntime {
 				return { terminal: false, outcome: undefined as unknown as RuntimeOutcome };
 			}
 			case "progress": {
-				ctx.onUpdate?.(event.message, { running: true });
+				ctx.onUpdate?.(redactText(event.message), { running: true });
 				return { terminal: false, outcome: undefined as unknown as RuntimeOutcome };
 			}
 			case "input_required": {
+				const publicResult = redactValue(event.result);
 				// C1/H1：runHandle/sessionHandle 只可能出现在 boundary result 里
 				// （真实 driver 的 started 事件不带这些），必须从这里落盘，否则
 				// respond 无 runHandle、续接无 sessionHandle。
@@ -811,20 +835,21 @@ export class AgentRuntime {
 					const result = this.conflictResult(record);
 					return { terminal: true, outcome: { status: "failed", result, delegation: record } };
 				}
-				const interaction = await this.persistInteraction(delegation, event.result, event.providerState);
+				const interaction = await this.persistInteraction(delegation, publicResult, event.providerState);
 				if (effectiveSession) this.activeRuns.set(effectiveSession, delegation.id);
-				await this.recordBoundary(delegation, event);
+				await this.recordBoundary(delegation, { ...event, result: publicResult });
 				return {
 					terminal: true,
 					outcome: {
 						status: "needs_input",
-						result: event.result,
+						result: publicResult,
 						delegation: transitioned.record!,
 						interaction,
 					},
 				};
 			}
 			case "completed": {
+				const publicResult = redactValue(event.result);
 				// H1：优先采用 boundary result 的 sessionHandle（run 模式 started
 				// 不带 session），否则续接会丢失 worker session。
 				const effectiveSession = event.result.sessionHandle ?? sessionHandle ?? current?.sessionHandle ?? delegation.sessionHandle;
@@ -835,7 +860,7 @@ export class AgentRuntime {
 						terminalBase,
 						["running", "cancel_requested", "reconciling"],
 						"reported_completed",
-						event.result,
+						publicResult,
 						ctx,
 						{ sessionHandle: effectiveSession, runHandle: event.result.runHandle ?? current?.runHandle ?? delegation.runHandle },
 					);
@@ -845,18 +870,19 @@ export class AgentRuntime {
 					return { terminal: true, outcome: { status: "failed", result, delegation: record } };
 				}
 				if (effectiveSession) this.releaseSession(effectiveSession, delegation.id);
-					await this.recordBoundary(delegation, event);
-					return { terminal: true, outcome: { status: "completed", result: event.result, delegation: transitioned.record! } };
+					await this.recordBoundary(delegation, { ...event, result: publicResult });
+					return { terminal: true, outcome: { status: "completed", result: publicResult, delegation: transitioned.record! } };
 			}
 			case "failed": {
+				const publicResult = redactValue(event.result);
 				// H1：采用 boundary result 的 sessionHandle，避免 run 模式丢 session。
 				const effectiveSession = event.result.sessionHandle ?? sessionHandle ?? current?.sessionHandle ?? delegation.sessionHandle;
 					const terminalBase = current ?? delegation;
 					const transitioned = await this.sealTerminal(
 						terminalBase,
 						["running", "cancel_requested", "reconciling"],
-						event.result.status === "cancelled" ? "cancelled" : "reported_failed",
-						event.result,
+						publicResult.status === "cancelled" ? "cancelled" : "reported_failed",
+						publicResult,
 						ctx,
 						{ sessionHandle: effectiveSession, runHandle: event.result.runHandle ?? current?.runHandle ?? delegation.runHandle },
 					);
@@ -866,10 +892,10 @@ export class AgentRuntime {
 					return { terminal: true, outcome: { status: "failed", result, delegation: record } };
 				}
 					if (effectiveSession) this.releaseSession(effectiveSession, delegation.id);
-					await this.recordBoundary(delegation, event);
+					await this.recordBoundary(delegation, { ...event, result: publicResult });
 				return {
 					terminal: true,
-						outcome: { status: "failed", result: event.result, delegation: transitioned.record! },
+						outcome: { status: "failed", result: publicResult, delegation: transitioned.record! },
 				};
 			}
 		}
@@ -916,10 +942,14 @@ export class AgentRuntime {
 			}));
 		}
 		const captures: ArtifactCaptureResult[] = [];
+		// Artifact paths are reported by the Worker relative to the cwd it
+		// actually executed in. For isolated scopes that directory intentionally
+		// differs from the target checkout until acceptance/promotion.
+		const executionRoot = delegation.executionCwd ?? delegation.cwdSnapshot;
 		for (const artifact of result.artifacts) {
 			const absolute = path.isAbsolute(artifact.path)
 				? artifact.path
-				: path.resolve(delegation.cwdSnapshot, artifact.path);
+				: path.resolve(executionRoot, artifact.path);
 			try {
 				const record = await this.artifacts.register({
 					name: artifact.name,
@@ -931,7 +961,7 @@ export class AgentRuntime {
 					delegationId: delegation.id,
 					windowId: delegation.windowId,
 					workspaceId: delegation.workspaceId,
-					cwdSnapshot: delegation.executionCwd ?? delegation.cwdSnapshot,
+					cwdSnapshot: executionRoot,
 				});
 				captures.push({ reportedPath: artifact.path, artifactId: record.id, contentHash: record.contentHash, status: "captured" });
 			} catch (error) {
@@ -1031,7 +1061,7 @@ export class AgentRuntime {
 			if (receipt.integrity === "clean") receipt.integrity = "suspect";
 			if (receipt.collectionStatus === "complete") receipt.collectionStatus = "partial";
 		}
-		return this.delegations.transitionDelegation(working.id, [working.executionState], {
+		const terminal = await this.delegations.transitionDelegation(working.id, [working.executionState], {
 			...patch,
 			...(workspaceChangeSet ? { workspaceChangeSetId: workspaceChangeSet.id } : {}),
 			executionState,
@@ -1040,6 +1070,27 @@ export class AgentRuntime {
 			receipt,
 			revision: working.revision + 1,
 		});
+		// read_only_shared never has a promotable execution result. When its
+		// boundary was not enforceable, admission conservatively upgraded the
+		// coordination scope to exclusive_write; retaining that lease after a
+		// Driver-observed terminal result fences every later read-only query on the
+		// Workspace. Capture the change-set first, commit the terminal fact, then
+		// release the coordination scope. A fenced lease is safe to release here
+		// because this path itself is the terminal Driver observation.
+		if (terminal.applied
+			&& this.workspaceExecution
+			&& working.workspaceExecutionScopeId
+			&& working.workspaceExecutionPolicy?.mode === "read_only_shared") {
+			const scope = await this.workspaceExecution.get(working.workspaceExecutionScopeId);
+			if (scope) {
+				await this.workspaceExecution.release(scope.id, {
+					ownerToken: scope.ownerToken,
+					allowFenced: true,
+					cleanup: false,
+				});
+			}
+		}
+		return terminal;
 	}
 
 	/** 恢复 provider state（仅 Runtime 内部使用，token 永不出 Runtime）。 */
@@ -1501,14 +1552,15 @@ export class AgentRuntime {
 		}
 		switch (event.type) {
 			case "progress":
-				ctx.onUpdate?.(event.message, { running: true });
+				ctx.onUpdate?.(redactText(event.message), { running: true });
 				return { terminal: false, outcome: undefined as unknown as RespondOutcome };
 			case "completed": {
+				const publicResult = redactValue(event.result);
 				const transitioned = await this.sealTerminal(
 					current ?? delegation,
 					["running", "waiting_input", "cancel_requested"],
 					"reported_completed",
-					event.result,
+					publicResult,
 					ctx,
 					{ sessionHandle },
 				);
@@ -1520,18 +1572,19 @@ export class AgentRuntime {
 				await this.secrets.removeProviderState(interaction.id);
 				await this.delegations.updateInteraction(interaction.id, { status: "approved" });
 				if (sessionHandle) this.releaseSession(sessionHandle, delegation.id);
-				await this.recordBoundary(delegation, event);
+				await this.recordBoundary(delegation, { ...event, result: publicResult });
 				return {
 					terminal: true,
-					outcome: { status: "completed", result: event.result, delegation: transitioned.record!, interaction },
+					outcome: { status: "completed", result: publicResult, delegation: transitioned.record!, interaction },
 				};
 			}
 			case "failed": {
+				const publicResult = redactValue(event.result);
 				const transitioned = await this.sealTerminal(
 					current ?? delegation,
 					["running", "waiting_input", "cancel_requested"],
-					event.result.status === "cancelled" ? "cancelled" : "reported_failed",
-					event.result,
+					publicResult.status === "cancelled" ? "cancelled" : "reported_failed",
+					publicResult,
 					ctx,
 				);
 				if (!transitioned.applied) {
@@ -1542,13 +1595,14 @@ export class AgentRuntime {
 				await this.secrets.removeProviderState(interaction.id);
 				await this.delegations.updateInteraction(interaction.id, { status: "failed" });
 				if (sessionHandle) this.releaseSession(sessionHandle, delegation.id);
-				await this.recordBoundary(delegation, event);
+				await this.recordBoundary(delegation, { ...event, result: publicResult });
 				return {
 					terminal: true,
-					outcome: { status: "failed", result: event.result, delegation: transitioned.record!, interaction },
+					outcome: { status: "failed", result: publicResult, delegation: transitioned.record!, interaction },
 				};
 			}
 			case "input_required": {
+				const publicResult = redactValue(event.result);
 				const transitioned = await this.delegations.transitionDelegation(delegation.id, ["running", "waiting_input"], {
 					executionState: "waiting_input",
 					revision: (current?.revision ?? delegation.revision ?? 0) + 1,
@@ -1563,7 +1617,7 @@ export class AgentRuntime {
 				const updated = await this.delegations.updateInteraction(interaction.id, {
 					status: "pending",
 					revision: interaction.revision + 1,
-					requests: event.result.interaction.requests,
+					requests: publicResult.interaction.requests,
 					// L1：回到 pending 必须清掉 consumedRequestId，否则第二轮提交
 					// 复用同一 requestId 会被误判为幂等重放。
 					consumedRequestId: undefined,
@@ -1578,12 +1632,12 @@ export class AgentRuntime {
 						...event.providerState,
 					});
 				}
-				await this.recordBoundary(delegation, event);
+				await this.recordBoundary(delegation, { ...event, result: publicResult });
 				return {
 					terminal: true,
 					outcome: {
 						status: "needs_input",
-						result: event.result,
+						result: publicResult,
 						delegation: transitioned.record ?? delegation,
 						interaction: updated ?? interaction,
 					},
@@ -1749,20 +1803,23 @@ export class AgentRuntime {
 				const observed = await driver.reconcileRun({ runHandle: orphan.runHandle, lastObservedAt: orphan.updatedAt }, ctx)
 					.catch((error: unknown) => ({ state: "unknown" as const, reason: error instanceof Error ? error.message : String(error) }));
 				if (observed.state === "completed") {
-					const transition = await this.withDelegationTransition(orphan.id, () => this.sealTerminal(orphan, [orphan.executionState], "reported_completed", observed.result, ctx));
-					if (transition.applied && notify) await notify(transition.record ?? orphan, observed.result).catch(() => undefined);
+					const publicResult = redactValue(observed.result);
+					const transition = await this.withDelegationTransition(orphan.id, () => this.sealTerminal(orphan, [orphan.executionState], "reported_completed", publicResult, ctx));
+					if (transition.applied && notify) await notify(transition.record ?? orphan, publicResult).catch(() => undefined);
 				} else if (observed.state === "failed" || observed.state === "cancelled") {
-					const transition = await this.withDelegationTransition(orphan.id, () => this.sealTerminal(orphan, [orphan.executionState], observed.state === "cancelled" ? "cancelled" : "reported_failed", observed.result, ctx));
-					if (transition.applied && notify) await notify(transition.record ?? orphan, observed.result).catch(() => undefined);
+					const publicResult = redactValue(observed.result);
+					const transition = await this.withDelegationTransition(orphan.id, () => this.sealTerminal(orphan, [orphan.executionState], observed.state === "cancelled" ? "cancelled" : "reported_failed", publicResult, ctx));
+					if (transition.applied && notify) await notify(transition.record ?? orphan, publicResult).catch(() => undefined);
 				} else if (observed.state === "running") {
 					await this.delegations.transitionDelegation(orphan.id, [orphan.executionState], { executionState: "running", runHandle: observed.runHandle, sessionHandle: observed.sessionHandle, revision: orphan.revision + 1 });
 					this.activeDelegations.add(orphan.id);
 					if (observed.sessionHandle) this.activeRuns.set(observed.sessionHandle, orphan.id);
 				} else if (observed.state === "needs_input") {
+					const publicResult = redactValue(observed.result);
 					const effectiveRun = observed.result.runHandle ?? orphan.runHandle;
 					const effectiveSession = observed.result.sessionHandle ?? orphan.sessionHandle;
 					await this.delegations.transitionDelegation(orphan.id, [orphan.executionState], { executionState: "waiting_input", runHandle: effectiveRun, sessionHandle: effectiveSession, result: undefined, revision: orphan.revision + 1 });
-					await this.persistInteraction({ ...orphan, runHandle: effectiveRun, sessionHandle: effectiveSession }, observed.result, observed.providerState);
+					await this.persistInteraction({ ...orphan, runHandle: effectiveRun, sessionHandle: effectiveSession }, publicResult, observed.providerState);
 					this.activeDelegations.add(orphan.id);
 					if (effectiveSession) this.activeRuns.set(effectiveSession, orphan.id);
 				} else {
@@ -1771,7 +1828,7 @@ export class AgentRuntime {
 						const scope = await this.workspaceExecution.get(orphan.workspaceExecutionScopeId);
 						await this.workspaceExecution.fence(orphan.workspaceExecutionScopeId, scope?.ownerToken).catch(() => undefined);
 					}
-					const reason = "reason" in observed ? observed.reason : "remote_run_state_unknown";
+					const reason = redactText("reason" in observed ? observed.reason : "remote_run_state_unknown");
 					if (lost.applied && notify) await notify(lost.record ?? orphan, { agentId: orphan.agentId, status: "failed", errorCode: "observation_lost", error: reason, recoverable: true }).catch(() => undefined);
 				}
 				reconciled++;

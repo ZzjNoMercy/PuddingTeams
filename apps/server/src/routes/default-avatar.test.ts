@@ -115,6 +115,25 @@ test("§11: avatar GET 回退链——包内默认 → 上传优先 → 删除�
 	assert.equal(back.headers["content-type"], "image/svg+xml");
 });
 
+test("§11: 复制有上传头像的 Worker 时，副本响应立即标记 Connector 默认头像", async () => {
+	const { app } = await makeStack();
+	const up = await app.inject({
+		method: "POST",
+		url: "/api/agents/ava-worker/avatar",
+		payload: { data: PNG_B64, mediaType: "image/png" },
+	});
+	assert.equal(up.statusCode, 200);
+
+	const duplicate = await app.inject({ method: "POST", url: "/api/agents/ava-worker/duplicate" });
+	assert.equal(duplicate.statusCode, 200);
+	assert.equal(duplicate.json().agent.avatar, undefined, "上传头像属于源身份，不得复制");
+	assert.equal(duplicate.json().agent.hasDefaultAvatar, true, "响应必须足以让当前前端生命周期登记默认头像");
+
+	const avatar = await app.inject({ method: "GET", url: `/api/agents/${duplicate.json().agent.name}/avatar` });
+	assert.equal(avatar.statusCode, 200);
+	assert.equal(avatar.headers["content-type"], "image/svg+xml");
+});
+
 test("§11: 无 connector 默认头像的 agent 仍是 404（前端展示程序化默认）", async () => {
 	const { app, teams } = await makeStack();
 	await teams.upsertAgent({

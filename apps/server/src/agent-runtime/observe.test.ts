@@ -47,6 +47,25 @@ test("observe: 基线里已存在的脏文件不误报（平台自身开发改�
 	assert.deepEqual(artifacts.map((a) => a.path), ["new.ts"]);
 });
 
+test("observe: Worker 提交后工作树 clean，仍按任务前 HEAD 收集已提交 Artifact", async () => {
+	const dir = freshDir("pt-observe-commit-");
+	execFileSync("git", ["init", "-q"], { cwd: dir });
+	execFileSync("git", ["config", "user.email", "e2e@example.invalid"], { cwd: dir });
+	execFileSync("git", ["config", "user.name", "E2E"], { cwd: dir });
+	writeFileSync(path.join(dir, "base.txt"), "base\n");
+	execFileSync("git", ["add", "base.txt"], { cwd: dir });
+	execFileSync("git", ["commit", "-qm", "base"], { cwd: dir });
+	const baseline = await gitBaseline(dir, process.env);
+
+	writeFileSync(path.join(dir, "committed.txt"), "result\n");
+	execFileSync("git", ["add", "committed.txt"], { cwd: dir });
+	execFileSync("git", ["commit", "-qm", "result"], { cwd: dir });
+	assert.equal(execFileSync("git", ["status", "--porcelain"], { cwd: dir, encoding: "utf8" }), "");
+
+	const artifacts = await observeGitArtifacts(dir, process.env, baseline);
+	assert.deepEqual(artifacts.map((a) => a.path), ["committed.txt"]);
+});
+
 test("observe: .pudding/handoff/ 导出目录不属于 observe 范围", async () => {
 	const dir = freshDir("pt-observe-handoff-");
 	execFileSync("git", ["init", "-q"], { cwd: dir });

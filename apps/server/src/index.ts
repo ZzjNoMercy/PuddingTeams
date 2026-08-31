@@ -40,6 +40,7 @@ import { DelegationTimelineStore } from "./agent-runtime/delegation-timeline-sto
 import { WorkspaceExecutionCoordinator } from "./agent-runtime/workspace-execution.js";
 import { UploadStore } from "./store/uploads.js";
 import { configureSharedModelRuntime } from "./pi-bridge/model-runtime.js";
+import { verifyWorkItemSubmission } from "./pi-bridge/agent-extensions.js";
 import { registerWebStatic } from "./web-static.js";
 
 // Electron 只需要该变量让自身二进制以 Node 模式启动 server。进入 server 后
@@ -192,9 +193,65 @@ invoker.setManagerSender((managerSessionId, message, options) =>
 invoker.setDurableManagerSender((managerSessionId, eventId, message, options) =>
 	store.appendCustomMessageIfAbsent(managerSessionId, eventId, message, options).then(() => undefined),
 );
-invoker.setDelegationStateObserver(async () => {
+let automaticVerificationQueue: Promise<void> = Promise.resolve();
+async function reconcileWorkAndScheduleVerification(): Promise<void> {
 	await workStates.reconcileDelegations(await runtime.listDelegations());
-});
+	const run = automaticVerificationQueue.then(async () => {
+		for (const snapshot of await workStates.listActive()) {
+			for (const snapshotItem of Object.values(snapshot.plan?.items ?? {})) {
+				if (snapshotItem.status !== "submitted"
+					|| snapshotItem.verificationPolicy.trigger !== "auto_on_submission"
+					|| snapshotItem.verificationPolicy.mode === "manager_review") continue;
+				const snapshotSubmission = [...snapshotItem.submissions].reverse().find((entry) => !entry.review);
+				if (!snapshotSubmission || snapshotSubmission.verifications.length > 0) continue;
+				// Re-read immediately before the state-changing call because another
+				// completed Delegation may have advanced the same Goal revision.
+				const current = await workStates.getActive(snapshot.sessionId);
+				const item = current?.plan?.items[snapshotItem.id];
+				const submission = item ? [...item.submissions].reverse().find((entry) => !entry.review) : undefined;
+				if (!current || !item || item.status !== "submitted" || !submission || submission.verifications.length > 0) continue;
+				try {
+					const verificationResult = await verifyWorkItemSubmission({
+						store: teams,
+						sessions: store,
+						invoker,
+						catalog,
+						workStates,
+						artifacts,
+						largeResults: largeWorkerResults,
+						productSettings,
+						getSessionId: () => current.sessionId,
+						ctx: undefined,
+						resolveContext: async () => undefined,
+						log: (message) => app.log.warn(message),
+					}, `auto-verification:${submission.id}`, {
+						goalId: current.goalId,
+						workItemId: item.id,
+						expectedRevision: current.revision,
+					}, { trigger: "auto_on_submission" });
+					const verification = verificationResult.details.verification as { id?: string; status?: string } | undefined;
+					if (verification?.id && verification.status && verification.status !== "running") {
+						await store.appendCustomMessageIfAbsent(
+							current.sessionId,
+							`auto-verification-ready:${verification.id}`,
+							{
+								customType: "pudding:work_plan_update",
+								content: `平台自动复验已完成（${verification.status}）。请读取最新 WorkState，按 VerificationRecord 验收并汇总三轴状态；不要再调用手工复验工具。`,
+								details: { goalId: current.goalId, workItemId: item.id, verificationId: verification.id, status: verification.status, trigger: "auto_on_submission" },
+							},
+							{ triggerTurn: true, deliverAs: "followUp" },
+						);
+					}
+				} catch (error) {
+					app.log.warn({ error, sessionId: current.sessionId, workItemId: item.id }, "automatic WorkItem verification could not start");
+				}
+			}
+		}
+	});
+	automaticVerificationQueue = run.catch(() => undefined);
+	await run;
+}
+invoker.setDelegationStateObserver(reconcileWorkAndScheduleVerification);
 invoker.setReplacementWindowResolver(async (delegation, agent) => {
 	const window = await teams.ensureDirectWindow(
 		agent.name,
@@ -242,7 +299,7 @@ invoker.setReplacementStateGuard(async (original, replacement, agent, replacemen
 // （manager 下次运行能看到失败原因并重新决策）；direct 直派链路（
 // managerToolCallId 是 taskId、会话里没有 toolCall）改补一张失败结果卡。
 const reconciledOrphans = await runtime.reconcileOrphanedRuns(async (orphan, result) => {
-	await workStates.reconcileDelegations(await runtime.listDelegations());
+	await reconcileWorkAndScheduleVerification();
 	if (!orphan.managerToolCallId) return;
 	const errorCode = result.status === "failed" ? result.errorCode : undefined;
 	const text = result.status === "completed"
@@ -267,6 +324,23 @@ const reconciledOrphans = await runtime.reconcileOrphanedRuns(async (orphan, res
 			{ triggerTurn: false },
 		);
 	}
+	// A Solo delegation is also visible in the Worker direct window. Startup
+	// reconciliation must close that mirror as well; otherwise its durable
+	// running card keeps the composer disabled even though the Delegation is
+	// already terminal.
+	const executionWindow = await teams.getWindow(orphan.windowId);
+	if (executionWindow?.activeSession && executionWindow.activeSession !== orphan.managerSessionId) {
+		await store.appendCustomMessageIfAbsent(
+			executionWindow.activeSession,
+			`startup-worker-result:${orphan.id}:${orphan.revision}`,
+			{
+				customType: "pudding:task_result",
+				content: text,
+				details: { taskId: orphan.managerToolCallId, delegationId: orphan.id, worker: orphan.agentId, windowId: orphan.windowId, status: result.status, executionState: orphan.executionState },
+			},
+			{ triggerTurn: false },
+		);
+	}
 });
 if (reconciledOrphans > 0) app.log.info({ reconciled: reconciledOrphans }, "reconciled orphaned delegations from previous process");
 async function sweepExpiredAdmissions(): Promise<number> {
@@ -276,7 +350,7 @@ async function sweepExpiredAdmissions(): Promise<number> {
 	const expired = await runtime.expireAdmissionRequests();
 	if (expired === 0) return 0;
 	const delegations = await runtime.listDelegations();
-	await workStates.reconcileDelegations(delegations);
+	await reconcileWorkAndScheduleVerification();
 	for (const delegation of delegations) {
 		if (!before.includes(delegation.id) || delegation.executionState !== "cancelled") continue;
 		if (!delegation.result || !("errorCode" in delegation.result) || delegation.result.errorCode !== "admission_expired") continue;
@@ -365,6 +439,7 @@ const reconciledGoals = await workStates.reconcileDelegations(await runtime.list
 if (reconciledGoals.projected || reconciledGoals.interrupted) {
 	app.log.info(reconciledGoals, "reconciled Goal checkpoints");
 }
+await reconcileWorkAndScheduleVerification();
 const goalRecoverySettings = (await productSettings.get()).harness.goalRecovery;
 for (const state of await workStates.listActive()) {
 	if (state.execution.status !== "interrupted") continue;
@@ -440,7 +515,11 @@ function scheduleGoalOutboxDrain(): Promise<void> {
 	goalOutboxDrain = run.catch(() => undefined);
 	return run;
 }
-await scheduleGoalOutboxDrain();
+// Start draining immediately, but never hold server startup behind a recovery
+// turn. A pending follow-up may legitimately wait for an AgentSession event;
+// awaiting it before app.listen leaves Node with an unsettled top-level await
+// and no live server handle, so the process can exit before health/routes exist.
+void scheduleGoalOutboxDrain().catch((error) => app.log.warn({ error }, "initial Goal outbox delivery failed; will retry"));
 const goalOutboxTimer = setInterval(() => void scheduleGoalOutboxDrain(), 2_500);
 goalOutboxTimer.unref();
 const admissionExpiryTimer = setInterval(() => {
@@ -501,14 +580,14 @@ registerWorkerProcessRoutes(app, new WorkerProcessService(delegations, teams, pa
 	cancel: (delegationId, signal) => invoker.cancel(delegationId, signal),
 	reconcile: async (delegationId) => {
 		const record = await invoker.reconcileDelegation(delegationId, async () => {
-			await workStates.reconcileDelegations(await runtime.listDelegations());
+			await reconcileWorkAndScheduleVerification();
 		});
-		await workStates.reconcileDelegations(await runtime.listDelegations());
+		await reconcileWorkAndScheduleVerification();
 		return record;
 	},
 	takeover: async (delegationId, rationale) => {
 		const record = await invoker.confirmObservationLostStopped(delegationId, rationale);
-		await workStates.reconcileDelegations(await runtime.listDelegations());
+		await reconcileWorkAndScheduleVerification();
 		return record;
 	},
 }, workStates);

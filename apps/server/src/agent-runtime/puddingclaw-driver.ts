@@ -116,6 +116,10 @@ export function projectPuddingClawActivity(line: unknown): { label: string; acti
 			return common("approval", "waiting", "等待人工审批", content || safeActivityStringify(data.requests), simpleFacts(data, ["run_id", "request_id"]));
 		case "permission_resolved":
 			return common("approval", "resolved", "人工审批已处理", content, simpleFacts(data, ["request_id", "decision", "scope"]));
+		case "user_input_required":
+			return common("approval", "waiting", "等待业务选择", content || safeActivityStringify(data.questions), simpleFacts(data, ["run_id", "request_id"]));
+		case "user_input_resolved":
+			return common("approval", "resolved", "业务选择已提交", content || safeActivityStringify(data.answers), simpleFacts(data, ["request_id", "action"]));
 		case "final_response":
 			return common("assistant", "completed", "PuddingClaw 最终回复", content);
 		case "done":
@@ -622,7 +626,7 @@ export class PuddingClawDriver implements AgentDriver {
 			...options,
 			message: input.message,
 			request_id: input.requestId,
-			...(this.transport() === "http" ? { workspace_path: this.ctxCwd(ctx) } : {}),
+			workspace_path: this.ctxCwd(ctx),
 			metadata: { ...metadata, caller_id: "puddingteams", caller_name: "PuddingTeams" },
 		};
 		yield this.withResumeState(
@@ -650,7 +654,7 @@ export class PuddingClawDriver implements AgentDriver {
 			message: input.message,
 			session_id: input.sessionHandle,
 			request_id: input.requestId,
-			...(this.transport() === "http" ? { workspace_path: this.ctxCwd(ctx) } : {}),
+			workspace_path: this.ctxCwd(ctx),
 			metadata: { ...metadata, caller_id: "puddingteams", caller_name: "PuddingTeams" },
 		};
 		yield this.withResumeState(
@@ -701,7 +705,7 @@ export class PuddingClawDriver implements AgentDriver {
 			const payload = {
 				message: `${task}\n\n（用户已明确：使用「${chosen}」执行本任务。）`,
 				request_id: input.requestId,
-				...(this.transport() === "http" ? { workspace_path: this.ctxCwd(ctx) } : {}),
+				workspace_path: this.ctxCwd(ctx),
 				metadata: { caller_id: "puddingteams", caller_name: "PuddingTeams" },
 			};
 			yield this.transport() === "http"
@@ -716,15 +720,36 @@ export class PuddingClawDriver implements AgentDriver {
 		}
 		ctx.onUpdate?.("正在提交审批…", { running: true });
 		yield { type: "started", runHandle: input.runHandle };
-		const payload = {
-			continuation_token: token,
-			request_id: input.requestId,
-			decisions: input.responses.map((r) => ({
+		const businessQuestions = state.interaction_type === "user_input" && Array.isArray(state.questions)
+			? state.questions as Array<{ requestId?: unknown; questionId?: unknown; optionIds?: unknown; type?: unknown }>
+			: [];
+		const businessRequestId = typeof state.upstream_request_id === "string" ? state.upstream_request_id : "";
+		const decisions = businessQuestions.length && businessRequestId
+			? [{
+				request_id: businessRequestId,
+				action: input.responses.some((response) => response.action === "reject") ? "cancel" : "submit",
+				answers: input.responses.map((response) => {
+					const spec = businessQuestions.find((question) => question.requestId === response.requestId);
+					const value = typeof response.value === "string" ? response.value : typeof response.scope === "string" ? response.scope : "";
+					const optionIds = Array.isArray(spec?.optionIds) ? spec.optionIds.filter((item): item is string => typeof item === "string") : [];
+					return {
+						question_id: typeof spec?.questionId === "string" ? spec.questionId : response.requestId,
+						option_ids: value && optionIds.includes(value) ? [value] : [],
+						text: value && !optionIds.includes(value) ? value : "",
+					};
+				}),
+			}]
+			: input.responses.map((r) => ({
 				request_id: r.requestId,
 				decision: r.action,
 				...(r.scope ? { scope: r.scope } : {}),
 				...(r.value !== undefined ? { value: r.value } : {}),
-			})),
+			}));
+		const payload = {
+			continuation_token: token,
+			request_id: input.requestId,
+			workspace_path: this.ctxCwd(ctx),
+			decisions,
 		};
 		yield this.transport() === "http"
 			? await this.runHttp(`/api/headless/runs/${encodeURIComponent(input.runHandle)}/resume?stream=true`, payload, ctx)

@@ -28,6 +28,16 @@ export function normalizePuddingClawJson(raw: unknown): AgentEvent {
 		}
 		if (typeof payload.run_id === "string") providerState.run_id = payload.run_id;
 		if (typeof payload.session_id === "string") providerState.session_id = payload.session_id;
+		if (needs?.type === "user_input") {
+			providerState.interaction_type = "user_input";
+			providerState.upstream_request_id = requestIdOf(payload, needs);
+			providerState.questions = userInputQuestions(needs).map((question) => ({
+				requestId: question.requestId,
+				questionId: question.questionId,
+				optionIds: question.optionIds,
+				type: question.type,
+			}));
+		}
 		return {
 			type: "input_required",
 			result: needsInputResult(payload, needs),
@@ -117,13 +127,11 @@ function pickMeta(payload: Record<string, unknown>): Record<string, unknown> {
 function needsInputResult(payload: Record<string, unknown>, needs?: Record<string, unknown> | null): NeedsInputResult {
 	// H4：每次只构造一个 request，needs.options 是答案选项（choices），不是并行
 	// 请求。真实 request_id 优先取 needs.request_id，否则取顶层 request_id。
-	const requestId =
-		(typeof needs?.request_id === "string" && (needs.request_id as string)) ||
-		(typeof payload.request_id === "string" ? (payload.request_id as string) : "") ||
-		"req-1";
+	const requestId = requestIdOf(payload, needs);
 	const prompt = needs && typeof needs.prompt === "string" ? needs.prompt : "需要更多输入才能执行";
 
-	// permission / 业务确认类：选项是授权范围；question 类：选项是答案。
+	// Only permission options are authorization scopes. Questions and business
+	// confirmations keep their exact choices so the user can answer the Worker.
 	const options = Array.isArray(needs?.options)
 		? (needs.options as Array<{ id?: string; name?: string }>)
 				.map((o) => (typeof o.id === "string" ? o.id : typeof o.name === "string" ? o.name : ""))
@@ -140,19 +148,25 @@ function needsInputResult(payload: Record<string, unknown>, needs?: Record<strin
 			? "confirmation"
 			: "question";
 
+	const structuredQuestions = needsType === "user_input" ? userInputQuestions(needs ?? {}) : [];
 	return {
 		...resultBase(payload),
 		status: "needs_input",
 		interaction: {
 			id: "",
 			kind,
-			requests: [
+			requests: structuredQuestions.length ? structuredQuestions.map((question) => ({
+				requestId: question.requestId,
+				prompt: question.prompt,
+				...(question.optionIds.length ? { options: question.optionIds } : {}),
+				...(typeof needs?.reason === "string" ? { reason: needs.reason } : {}),
+			})) : [
 				{
 					requestId,
 					prompt,
 					...(typeof needs?.command === "string" ? { command: needs.command } : {}),
 					...(typeof needs?.path === "string" ? { path: needs.path } : {}),
-					...(kind === "permission" || kind === "confirmation"
+					...(kind === "permission"
 						// PuddingClaw 的权限层会把精确授权目标编码进 option，例如
 						// exact_directory_run / exact_directory_session。它们是授权
 						// 目标，不是 Platform 对外协议的 scope；必须归一化为 CLI
@@ -167,6 +181,53 @@ function needsInputResult(payload: Record<string, unknown>, needs?: Record<strin
 			],
 		},
 	};
+}
+
+function requestIdOf(payload: Record<string, unknown>, needs?: Record<string, unknown> | null): string {
+	return (typeof needs?.request_id === "string" && needs.request_id)
+		|| (typeof payload.request_id === "string" ? payload.request_id : "")
+		|| "req-1";
+}
+
+interface NormalizedUserInputQuestion {
+	requestId: string;
+	questionId: string;
+	prompt: string;
+	type: string;
+	optionIds: string[];
+}
+
+/**
+ * PuddingClaw 的业务 HITL 是一个上游 request，内部包含 1–3 个 question。
+ * PWCP 把每个 question 投影成必须逐项回答的 InteractionRequest；私有
+ * providerState 保留 request/question 映射，respond 时再组装回同一 Run。
+ */
+function userInputQuestions(needs: Record<string, unknown>): NormalizedUserInputQuestion[] {
+	const questions = Array.isArray(needs.questions) ? needs.questions : [];
+	return questions.flatMap((raw, index) => {
+		if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+		const question = raw as Record<string, unknown>;
+		const questionId = typeof question.id === "string" && question.id ? question.id : `question-${index + 1}`;
+		const prompt = typeof question.prompt === "string" && question.prompt ? question.prompt : "需要你的选择";
+		const options = Array.isArray(question.options) ? question.options : [];
+		const optionIds = options.map((option) => {
+			if (typeof option === "string") return option;
+			if (!option || typeof option !== "object" || Array.isArray(option)) return "";
+			const item = option as Record<string, unknown>;
+			return typeof item.id === "string" && item.id
+				? item.id
+				: typeof item.name === "string" && item.name
+					? item.name
+					: typeof item.label === "string" ? item.label : "";
+		}).filter(Boolean);
+		return [{
+			requestId: questionId,
+			questionId,
+			prompt,
+			type: typeof question.type === "string" ? question.type : "text",
+			optionIds,
+		}];
+	});
 }
 
 /**
@@ -208,10 +269,7 @@ function failedEvent(errorCode: string, error: string): AgentEvent {
 
 export const PUDDINGCLAW_CAPABILITIES: DriverCapabilities = {
 	operations: ["run", "continue", "respond", "cancel"],
-	// PuddingClaw Headless resume currently rejects every external interrupt
-	// except permission_request. Keep the advertised contract narrower than the
-	// generic normalizer's defensive understanding of other needs_input shapes.
-	interactionKinds: ["permission"],
+	interactionKinds: ["permission", "question", "confirmation"],
 	// All public Headless JSONL events are projected into the Runtime timeline;
 	// terminal content remains the separately normalized final response.
 	progress: "stream",

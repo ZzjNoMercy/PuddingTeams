@@ -245,7 +245,7 @@ function SessionChat({
 	onRuntimeViewChange: (view: SessionRuntimeView) => void;
 	onRuntimeSummaryChange: (summary: SessionRuntimeSummary) => void;
 }) {
-	const { messages, historyLoading, status, running, stopping, send, stop } = useChat(sessionId);
+	const { messages, historyLoading, status, running, stopping, error, send, stop } = useChat(sessionId);
 	const handleStop = useCallback(async () => {
 		try {
 			const result = await stop();
@@ -412,6 +412,11 @@ function SessionChat({
 			{!layoutReady ? (
 				<div className="absolute inset-0 flex items-center justify-center" role="status">
 					<div className="flex items-center gap-2 text-xs text-muted-foreground"><Loader size={14} />正在加载对话…</div>
+				</div>
+			) : null}
+			{error ? (
+				<div className="absolute bottom-24 left-1/2 z-20 max-w-[min(90%,36rem)] -translate-x-1/2 rounded-md border border-destructive/30 bg-background px-3 py-2 text-xs text-destructive shadow-md" role="alert">
+					{error}
 				</div>
 			) : null}
 		</div>

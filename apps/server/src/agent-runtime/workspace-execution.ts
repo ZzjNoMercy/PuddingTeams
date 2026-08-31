@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { access, chmod, copyFile, lstat, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
@@ -101,6 +101,9 @@ interface ScopeRecord extends WorkspaceExecutionScope {
 	executionRoot: string;
 	baselineSnapshotPath: string;
 	baselineEntries: SnapshotEntry[];
+	/** Target HEAD frozen at admission; Worker-local commits are execution detail,
+	 * not part of the promoted target fingerprint. */
+	baselineGitHead?: string;
 	leaseKey?: string;
 	ownerToken?: string;
 	latestChangeSetId?: string;
@@ -294,10 +297,17 @@ async function assertNoNestedGit(root: string, current = root): Promise<void> {
 	for (const entry of await readdir(current, { withFileTypes: true })) {
 		if (entry.name === ".git") continue;
 		const absolute = path.join(current, entry.name);
-		if (entry.isSymbolicLink()) throw new WorkspaceExecutionError("unsupported_layout", `symbolic links are not supported: ${path.relative(root, absolute)}`);
+		const relative = safeRelative(path.relative(root, absolute));
+		// Ignored content is not part of the baseline, is not copied into the
+		// execution worktree, and therefore cannot affect scope integrity. Package
+		// managers routinely place symlinks under ignored node_modules; walking
+		// those paths made an otherwise ordinary repository impossible to use.
+		const ignored = await command("git", ["-C", root, "check-ignore", "-q", "--", relative], { allowCodes: [1] });
+		if (ignored.code === 0) continue;
+		if (entry.isSymbolicLink()) throw new WorkspaceExecutionError("unsupported_layout", `symbolic links are not supported: ${relative}`);
 		if (entry.isDirectory()) {
 			const marker = await lstat(path.join(absolute, ".git")).catch(() => undefined);
-			if (marker) throw new WorkspaceExecutionError("unsupported_layout", `nested repositories cannot be materialized: ${path.relative(root, absolute)}`);
+			if (marker) throw new WorkspaceExecutionError("unsupported_layout", `nested repositories cannot be materialized: ${relative}`);
 			await assertNoNestedGit(root, absolute);
 		}
 	}
@@ -328,6 +338,25 @@ async function applyTrackedDirtyState(sourceRoot: string, executionRoot: string)
 		await mkdir(path.dirname(target), { recursive: true });
 		await copyFile(source, target);
 		await chmod(target, info.mode & 0o777);
+	}
+}
+
+/**
+ * Materialize an independent local Git checkout. Unlike `git worktree`, its
+ * index, HEAD, refs and newly-created objects all live under executionRoot, so
+ * a sandboxed Worker never needs write access to the target repository's
+ * shared `.git/worktrees/*` metadata. `--shared` only adds a read-only object
+ * alternate; new commits are written to the clone's own object database.
+ */
+async function materializeGitCheckout(sourceRoot: string, executionRoot: string): Promise<void> {
+	const head = await gitHead(sourceRoot);
+	await command("git", ["clone", "--shared", "--no-checkout", "--", sourceRoot, executionRoot]);
+	try {
+		await command("git", ["-C", executionRoot, "checkout", "--detach", head]);
+		await applyTrackedDirtyState(sourceRoot, executionRoot);
+	} catch (error) {
+		await rm(executionRoot, { recursive: true, force: true }).catch(() => undefined);
+		throw error;
 	}
 }
 
@@ -461,7 +490,9 @@ export class WorkspaceExecutionCoordinator {
 		const git = scope.mode === "isolated_worktree";
 		const root = git ? scope.executionRoot : scope.executionCwd;
 		const entries = await entriesFor(root, git);
-		const head = git ? await gitHead(root) : undefined;
+		// Commits made inside the isolated checkout must not change the content
+		// change-set identity or require promotion to rewrite the target branch.
+		const head = git ? scope.baselineGitHead : undefined;
 		return { entries, fingerprint: fingerprint(scope.canonicalRoot, entries, head) };
 	}
 
@@ -523,22 +554,19 @@ export class WorkspaceExecutionCoordinator {
 				}
 			}
 			const baselineEntries = await entriesFor(canonicalRoot, git);
-			const baselineFingerprint = fingerprint(canonicalRoot, baselineEntries, git ? await gitHead(canonicalRoot) : undefined);
+			const baselineGitHead = git ? await gitHead(canonicalRoot) : undefined;
+			const baselineFingerprint = fingerprint(canonicalRoot, baselineEntries, baselineGitHead);
 			const id = randomUUID();
 			const baselineSnapshotPath = path.join(this.stateDir, "baselines", id);
 			await snapshot(canonicalRoot, baselineSnapshotPath, baselineEntries);
 			let executionCwd = canonicalRoot;
+			let executionRoot = canonicalRoot;
 			if (input.mode === "isolated_worktree") {
-				executionCwd = path.join(this.worktreeRoot, id);
-				await command("git", ["-C", canonicalRoot, "worktree", "add", "--detach", executionCwd, "HEAD"]);
-				try {
-					await applyTrackedDirtyState(canonicalRoot, executionCwd);
-					// Worktree cwd may be a subdirectory of the repository.
-					executionCwd = workspaceRelative ? absoluteInside(executionCwd, workspaceRelative) : executionCwd;
-				} catch (error) {
-					await command("git", ["-C", canonicalRoot, "worktree", "remove", "--force", path.join(this.worktreeRoot, id)], { allowCodes: [1] }).catch(() => undefined);
-					throw error;
-				}
+				const requestedRoot = path.join(this.worktreeRoot, id);
+				await materializeGitCheckout(canonicalRoot, requestedRoot);
+				executionRoot = await realpath(requestedRoot);
+				// Worker cwd may be a subdirectory of the repository.
+				executionCwd = workspaceRelative ? absoluteInside(executionRoot, workspaceRelative) : executionRoot;
 			}
 			const timestamp = now();
 			const scope: ScopeRecord = {
@@ -546,13 +574,14 @@ export class WorkspaceExecutionCoordinator {
 				...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
 				canonicalRoot,
 				workspaceRoot: workspacePath,
-				executionRoot: input.mode === "isolated_worktree" ? path.join(this.worktreeRoot, id) : canonicalRoot,
+				executionRoot,
 				executionCwd,
 				mode: input.mode,
 				delegationIds: [input.delegationId],
 				...(input.goalId ? { goalId: input.goalId } : {}),
 				...(input.goalEpoch === undefined ? {} : { goalEpoch: input.goalEpoch }),
 				baselineFingerprint,
+				...(baselineGitHead ? { baselineGitHead } : {}),
 				state: "active",
 				createdAt: timestamp,
 				updatedAt: timestamp,
@@ -592,6 +621,17 @@ export class WorkspaceExecutionCoordinator {
 		return scope ? structuredClone(scope) : undefined;
 	}
 
+	async getBlockingScope(workspaceId: string | undefined, workspacePath: string): Promise<WorkspaceExecutionScope | undefined> {
+		const canonicalRoot = await canonicalDirectory(workspacePath);
+		const key = this.leaseKey(workspaceId, canonicalRoot);
+		const state = await this.load();
+		const lease = Object.values(state.leases).find((candidate) =>
+			candidate.state !== "released" && (candidate.key === key || candidate.canonicalRoot === canonicalRoot)
+		);
+		const scope = lease ? state.scopes[lease.executionScopeId] : undefined;
+		return scope ? structuredClone(scope) : undefined;
+	}
+
 	async getChangeSet(changeSetId: string): Promise<WorkspaceChangeSet | undefined> {
 		const changeSet = (await this.load()).changeSets[changeSetId];
 		return changeSet ? structuredClone(changeSet) : undefined;
@@ -613,15 +653,9 @@ export class WorkspaceExecutionCoordinator {
 			let kind: VerificationEnvironmentCopy["kind"] = "filesystem_copy";
 			if (scope.mode === "isolated_worktree") {
 				kind = "git_worktree";
-				await command("git", ["-C", scope.canonicalRoot, "worktree", "add", "--detach", root, "HEAD"]);
-				try {
-					await applyTrackedDirtyState(scope.executionRoot, root);
-					const relative = path.relative(scope.executionRoot, scope.executionCwd);
-					executionCwd = relative ? absoluteInside(root, relative) : root;
-				} catch (error) {
-					await command("git", ["-C", scope.canonicalRoot, "worktree", "remove", "--force", root], { allowCodes: [1] }).catch(() => undefined);
-					throw error;
-				}
+				await materializeGitCheckout(scope.executionRoot, root);
+				const relative = path.relative(scope.executionRoot, scope.executionCwd);
+				executionCwd = relative ? absoluteInside(root, relative) : root;
 			} else {
 				await snapshot(scope.executionCwd, root, await entriesFor(scope.executionCwd, false));
 			}
@@ -699,7 +733,7 @@ export class WorkspaceExecutionCoordinator {
 			const copy = state.verificationCopies[copyId];
 			if (!copy || copy.state === "released") return;
 			const scope = state.scopes[copy.executionScopeId];
-			if (copy.kind === "git_worktree" && scope) await command("git", ["-C", scope.canonicalRoot, "worktree", "remove", "--force", copy.root], { allowCodes: [1] }).catch(() => undefined);
+			if (copy.kind === "git_worktree" && scope) await rm(copy.root, { recursive: true, force: true });
 			else if (copy.kind === "filesystem_copy") await rm(copy.root, { recursive: true, force: true });
 			copy.state = "released";
 			await this.write(state);
@@ -882,7 +916,7 @@ export class WorkspaceExecutionCoordinator {
 			scope.state = "released";
 			scope.updatedAt = now();
 			if (options.cleanup !== false && scope.mode === "isolated_worktree") {
-				await command("git", ["-C", scope.canonicalRoot, "worktree", "remove", "--force", path.join(this.worktreeRoot, scope.id)], { allowCodes: [1] }).catch(() => undefined);
+				await rm(path.join(this.worktreeRoot, scope.id), { recursive: true, force: true });
 			}
 			await this.write(state);
 			return structuredClone(scope);

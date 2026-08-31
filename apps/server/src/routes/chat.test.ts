@@ -15,6 +15,7 @@ import { PiSessionStore } from "../pi-bridge/session-store.js";
 import { registerChatRoutes } from "./chat.js";
 import { UploadStore } from "../store/uploads.js";
 import type { AgentDriver } from "../agent-runtime/types.js";
+import { WorkStateStore } from "../store/work-state.js";
 
 async function makeStack() {
 	const dir = mkdtempSync(path.join(tmpdir(), "pt-chat-routes-"));
@@ -32,10 +33,12 @@ async function makeStack() {
 	const runtime = new AgentRuntime(delegations, secrets, (id) => drivers.get(id), { ttlMs: 60_000 });
 	const invoker = new AgentInvoker(teams, runtime, drivers, undefined, dir);
 	const sessions = new PiSessionStore(dir, path.join(dir, "sessions"), teams, invoker);
+	const workStates = new WorkStateStore(path.join(dir, "work-state"));
+	await workStates.init();
 	const app = Fastify({ logger: false });
 	await app.register(websocket);
-	await registerChatRoutes(app, sessions, teams, undefined, undefined, invoker);
-	return { app, dir, sessions, teams, delegations, drivers, runtime, invoker };
+	await registerChatRoutes(app, sessions, teams, workStates, undefined, invoker);
+	return { app, dir, sessions, teams, delegations, drivers, runtime, invoker, workStates };
 }
 
 function writeSkill(agentDir: string, name: string, description: string): void {
@@ -152,6 +155,32 @@ test("POST /abort 在服务端未确认运行时返回可见失败而非假成�
 	const res = await app.inject({ method: "POST", url: `/api/sessions/${summary.id}/abort` });
 	assert.equal(res.statusCode, 409, res.body);
 	assert.deepEqual(res.json(), { aborted: false, reconciledToolResults: 0, error: "当前会话没有正在运行的任务" });
+	await app.close();
+});
+
+test("Manager Stop 先推进 Goal epoch，迟到工具结果不能继续写 durable state", async () => {
+	const { app, sessions, workStates } = await makeStack();
+	const summary = await sessions.create();
+	const goal = await workStates.create({
+		sessionId: summary.id,
+		goal: "stop fence",
+		completionBoundary: "no late writes",
+		operationId: "goal-before-stop",
+	});
+	const session = await sessions.open(summary.id);
+	Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
+	Object.defineProperty(session, "isIdle", { configurable: true, get: () => false });
+	Object.defineProperty(session, "abort", { configurable: true, value: async () => undefined });
+
+	const stopped = await app.inject({ method: "POST", url: `/api/sessions/${summary.id}/abort` });
+	assert.equal(stopped.statusCode, 200, stopped.body);
+	const interrupted = await workStates.getActive(summary.id);
+	assert.equal(interrupted?.execution.status, "interrupted");
+	assert.equal(interrupted?.execution.epoch, goal.execution.epoch + 1);
+	await assert.rejects(
+		() => workStates.update(summary.id, interrupted!.revision, { currentBrief: "late mutation" }, "late-tool", goal.execution.epoch, goal.goalId),
+		/epoch 已变化/,
+	);
 	await app.close();
 });
 

@@ -6,7 +6,7 @@ import path from "node:path";
 import { parseExtensionManifest, ExtensionCatalog } from "./extensions.js";
 import { DriverRegistry } from "./driver-registry.js";
 import { ExtensionRegistry } from "./extension-registry.js";
-import { CodexDriver, createDriver } from "@puddingteams/connector-codex/driver";
+import { CodexDriver, codexExecutionPolicyArgs, createDriver } from "@puddingteams/connector-codex/driver";
 import { CodexEventReducer, CODEX_CAPABILITIES } from "@puddingteams/connector-codex/core/codex-normalize";
 import type { AgentEvent, InvocationContext } from "./types.js";
 
@@ -83,6 +83,24 @@ test("P1: codex driverFactory 多实例——同一 Connector 按 config 构造�
 	// 非法 sandbox 值必须被丢弃（走默认），不能透传给 CLI。
 	const c = createDriver({ sandbox: "yolo-mode" });
 	assert.ok(c instanceof CodexDriver);
+});
+
+test("isolated checkout 保持 workspace-write 并为受保护的 .git 写入启用命令级自动审核", () => {
+	assert.deepEqual(codexExecutionPolicyArgs(undefined, { workspaceBoundary: "platform_isolated_checkout" }), ["--approve-for-me"]);
+	assert.deepEqual(codexExecutionPolicyArgs("workspace-write", { workspaceBoundary: "workspace" }), ["-s", "workspace-write"]);
+	assert.deepEqual(codexExecutionPolicyArgs("danger-full-access", { workspaceBoundary: "platform_isolated_checkout" }), ["-s", "danger-full-access"]);
+	assert.deepEqual(codexExecutionPolicyArgs("danger-full-access", {
+		workspaceBoundary: "platform_isolated_checkout",
+		verificationProfile: {
+			profileId: "verify",
+			environmentId: "env",
+			sourceBinding: "goal_workspace",
+			executionRoot: "/tmp/verify",
+			workspaceBoundary: "platform_isolated_copy",
+			mutationPolicy: "isolated_changes_only",
+			networkPolicy: "inherit_connector_policy",
+		},
+	}), ["--approve-for-me"]);
 });
 
 test("P2: 从包目录安装（折叠 manifest + entry 模块）后 DriverRegistry 可创建 codex Driver", async () => {

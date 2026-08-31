@@ -234,6 +234,12 @@ export interface DriverCapabilities {
 export interface InvocationContext {
 	/** Agent 工作目录（workspace root 或平台默认）。 */
 	cwd: string;
+	/**
+	 * Runtime 已建立的文件系统边界。platform_isolated_checkout 表示 cwd 是
+	 * 平台物化、可丢弃且与目标 checkout 分离的完整 Git checkout；Connector
+	 * 可据此启用仍受命令级审核的 Git 元数据写入，不能由提示词自行声明。
+	 */
+	workspaceBoundary?: "workspace" | "platform_isolated_checkout";
 	/** 本次委托的 delegation id（Runtime 注入）：Driver 据此生成 handoff 导出目录（§15.3）。 */
 	delegationId?: string;
 	/** 窗口的显式 workspaceId（Runtime 注入）：进程内 Driver 的信任门资源判定用（迁移方案 §7.2）。 */

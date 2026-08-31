@@ -24,6 +24,7 @@ function freshDir(prefix: string): string {
 type Sent = {
 	sessionId: string;
 	customType: string;
+	content: string;
 	status?: unknown;
 	revision?: unknown;
 	options: { triggerTurn: boolean; deliverAs?: string };
@@ -120,6 +121,7 @@ async function makeStack(variant: "completed" | "failed" | "needs_input", manage
 		sent.push({
 			sessionId,
 			customType: message.customType,
+			content: message.content,
 			status: message.details?.status,
 			revision: message.details?.revision,
 			options,
@@ -166,7 +168,7 @@ async function waitForSent(sent: Sent[], count: number): Promise<void> {
 }
 
 test("两边同步: 受理即返回 approved，completed 扇出 manager（唤醒汇总）+ 单聊（仅展示）", async () => {
-	const { invoker, interactionId, sent } = await makeStack("completed");
+	const { invoker, interactionId, delegationId, sent } = await makeStack("completed");
 	const outcome = await invoker.respond(interactionId, approve);
 	assert.equal(outcome.status, "approved", "approve 受理后立即返回，不等 worker 续跑落定");
 	assert.equal(outcome.details.admitted, true);
@@ -181,6 +183,7 @@ test("两边同步: 受理即返回 approved，completed 扇出 manager（唤醒
 	assert.equal(manager[0]!.status, "approved");
 	assert.equal(manager[0]!.options.triggerTurn, false);
 	assert.equal(manager[1]!.status, "completed");
+	assert.match(manager[1]!.content, new RegExp(`delegationId：${delegationId}`), "审批续跑的终态正文必须暴露 delegationId，供同 Run followup 使用");
 	assert.equal(manager[1]!.options.triggerTurn, true, "manager 需要被唤醒做汇总");
 	assert.equal(manager[1]!.options.deliverAs, "followUp");
 	assert.deepEqual(

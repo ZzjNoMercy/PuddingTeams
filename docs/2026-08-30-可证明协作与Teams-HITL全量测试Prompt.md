@@ -20,6 +20,12 @@
 
 ## 2. 测试前准备
 
+### 2.0 模型基线
+
+- Manager 默认模型统一选择 `DeepSeek V4 Flash`（模型 ID：`deepseek/deepseek-v4-flash`）；每个新 Session 发送首条 Prompt 前都核对 composer 模型按钮，禁止沿用历史 Session 的 V4 Pro 记录。
+- Harness 的独立证据 Reviewer 模型同样设为 `deepseek/deepseek-v4-flash`；CLI/environment Verifier 仍按场景指定具体 Worker，不用模型名称替代 Worker 身份。
+- 报告必须分别记录 Manager Session 的实际模型和 VerificationRecord 的 `reviewerModel`，不能只依据全局配置推断。
+
 ### 2.1 Worker 建议
 
 至少准备以下 Worker：
@@ -529,7 +535,110 @@
 | Manager/Worker 消息快捷操作 | T26、T27 |
 | crash/CAS/TTL/乱序内部窗口 | 第 8 节 |
 
-## 10. 清理 Prompt
+## 10. 修复后缺陷回归增补（D01–D18）
+
+本节用于修复后定向回归；它不替代 T01–T27，而是把修复前 18 个缺陷映射为最短可复现路径。每组使用新 Session，除明确要求外不要复用旧 Goal。所有“成功”都必须以 UI 状态、持久化状态或命令 observation 为证据，不能仅接受 Manager 的自然语言声明。
+
+### R01：默认 Worker、动态工具同步、Goal 工具连续性与 Manager 写门禁（D01、D05、D07、D08、D11、D12）
+
+先在已有 Manager Session 中新建一个 `{{临时 Worker}}`，保存后不要新建 Manager Session，直接发送：
+
+```text
+请立即创建正式 Goal，并在 create_session_goal 成功后的同一条工具链中紧接着创建 WorkPlan，不要停下来重复解释调用顺序。
+
+W1：把“只读查询当前分支与 HEAD”委派给刚创建的 {{临时 Worker}}，策略 read_only_shared，验收方式 manager_review。
+W2：创建 docs/e2e-regression-manager-write.md，必须由可写 Worker 在 isolated_worktree 完成；Manager 自己不得调用 bash、edit、write 或任何等价写工具。
+
+没有 WorkItem ID 时禁止发起任何正式 Goal Delegation。若工具不可用或门禁拒绝，原样报告错误，不得用普通写工具绕过。
+```
+
+预期：新 Worker 在当前 Manager Session 立即可调用；Goal 后同一 tool chain 可调用 `update_work_plan`；Manager 实际工具面无 `bash/edit/write`；所有正式 Delegation 都有 `goalId/workItemId`；不能产生孤儿写入。
+
+### R02：ignored 依赖、独立 Git checkout、Receipt/Artifact 与受控提升（D02、D06、D10）
+
+测试 Workspace 应为 pnpm 仓库并保留 Git ignored 的 `node_modules` 符号链接。发送：
+
+```text
+请创建正式 Goal 和一个 git_write WorkItem，在 isolated_worktree 中创建 docs/e2e-regression-isolated.md，内容精确为 isolated-regression，然后执行 git add 和 git commit。
+
+交付必须包含：独立执行目录、该目录自己的可写 .git、commit hash、完整 diff、文件 Artifact 及 hash、sealed ExecutionReceipt。Worker 返回后先复验，再接受并通过受控入口提升到目标 Workspace；不得让 Worker 直接写目标 checkout。
+```
+
+预期：ignored `node_modules` 不触发 unsupported_layout；commit 不再因主仓库 `.git/worktrees/*/index.lock` 失败；Artifact 从 `executionCwd` 采集；Receipt clean；接受后只提升目标文件。
+
+### R03：Submission 自动复验（D09）
+
+先把 Harness trigger 设为 `auto_on_submission`，再发送：
+
+```text
+请创建正式 Goal，把“只读查询当前分支与 HEAD”作为一个 independent_evidence_review WorkItem 委派给只读 Worker。Worker 提交后不要手工调用 request_work_item_verification；等待平台自动创建唯一 Verification Run，并在结果出现后汇总 Submission、VerificationRecord 和 Settlement 三轴状态。
+```
+
+预期：Submission 创建后自动出现一次且仅一次 Verification；刷新/重复 observer 不创建第二个 Run；稳定 operationId 可重放；复验结果绑定同一 Goal epoch、WorkItem revision 与 Submission ID。
+
+### R04：Teams 准入三动作与重启恢复（D13、D14）
+
+使用不具备强制只读能力的 Worker，分别在三个新 Goal 中执行 T15 Prompt：
+
+1. 卡出现后取消；
+2. 卡出现后继续；
+3. 卡出现后换成只读 Worker。
+
+每次都先刷新页面；第三次在决定前重启服务。预期：历史/镜像卡即使初始消息没有 `goalId`，也从权威 Delegation 补回并携带 `expectedGoalId`；取消不启动 Worker；继续记录 `unverified_user_accepted`；改派创建唯一 replacement Delegation；重启不把 Verification Delegation 重放成执行 Submission，也不因旧 Receipt 崩溃。
+
+### R05：Worker 原生业务问答（D18）
+
+```text
+请创建正式 Goal，并委派给支持原生 input_required/respond 的 {{PuddingClaw Worker}}。在任何写入前必须询问业务选择，选项原值为 A 和 B；我选择后续接同一 Delegation 和同一 Run，把所选值写入 docs/e2e-regression-hitl.md。不得把 A/B 当 permission scope，也不得创建替代 Run。
+```
+
+预期：question/confirmation 的业务选项显示为 A/B 按钮并以 `answer/confirm.value` 原样回传；permission 才显示 once/run/session scope。若 Worker 发出无 options 的 question，卡片显示自由回答输入框；无 options confirmation 显示“确认”。Teams 平台准入始终独立显示“继续使用/换 Worker/取消任务”。
+
+### R06：Stop epoch fence（D15）
+
+```text
+请创建正式 Goal 和两个有依赖关系的 WorkItem。第一项委派一个持续 60 秒的只读 Worker；运行期间保持 Manager 工具链可继续推进，等待我点击停止。
+```
+
+运行中点击停止。预期：Goal 先持久化为 interrupted 且 epoch +1；旧 epoch 的 `update_work_plan`、验收、状态更新、业务决定全部被拒绝；Worker/Manager 最终收敛，不在停止后创建下一 Goal 或继续旧工具链。
+
+### R07：外部目录错误与草稿保留（D16）
+
+在任一可发送的会话 composer 输入但不要另存副本：
+
+```text
+读取目录 `{{当前 Workspace 之外的绝对目录}}`
+```
+
+发送。预期：安全规则仍拒绝；页面出现可见错误，说明目录不属于当前 Workspace；原草稿原样保留在 composer，可修改后重试。
+
+### R08：Worker 快捷操作草稿追加（D17）
+
+等待任一 Worker 最终结果，在 composer 先输入 `已有草稿`，再点“要求返工”。预期：不自动发送，内容变为 `已有草稿`、换行、返工模板；模板包含 Worker 名和原 `delegationId`；焦点在输入框末尾。
+
+### R09：持久化脱敏（D04）
+
+让测试 Worker 的工具输出包含专用假 secret（只能使用测试值，例如 `sk-test-redaction-only`、`Authorization: Bearer test-token`），等待完成后检查原始 Delegation timeline JSONL。预期：UI/持久化内容都不出现原值；嵌套对象、数组、JSON 字符串和普通文本中的敏感模式都被替换；不得使用真实凭证执行本测试。
+
+### 自动门禁
+
+完成 R01–R09 后执行：
+
+```bash
+pnpm --dir apps/server test
+pnpm --dir apps/server typecheck
+pnpm --dir apps/web build
+pnpm --dir apps/web typecheck
+pnpm --dir apps/web lint
+pnpm docs:typecheck
+pnpm --filter @puddingteams/docs run lint
+pnpm docs:build
+git diff --check
+```
+
+缺陷覆盖映射：R01→D01/D05/D07/D08/D11/D12，R02→D02/D06/D10，R03→D09，R04→D13/D14，R05→D18，R06→D15，R07→D16，R08→D17，R09→D04；D03 是测试机解锁前置，不是产品代码场景。
+
+## 11. 清理 Prompt
 
 确认没有需要保留的冲突 worktree/diff 后，新建 Session 执行：
 

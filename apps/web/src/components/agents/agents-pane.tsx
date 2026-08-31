@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { LoaderIcon, MoreHorizontalIcon, PlusIcon, RefreshCwIcon, Settings2Icon, TrashIcon, UserCheckIcon } from "lucide-react";
+import { CopyIcon, LoaderIcon, MoreHorizontalIcon, PlusIcon, RefreshCwIcon, Settings2Icon, TrashIcon, UserCheckIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -14,13 +14,14 @@ import {
 	ApiConflictError,
 	createAgent,
 	deleteAgent,
+	duplicateAgent,
 	listAgents,
 	listExtensionCatalog,
 	probeAgent,
 	putAgentConnector,
 	setAgentEnabled,
 } from "@/lib/api";
-import { agentRemoved, agentRenamed } from "@/lib/avatars";
+import { agentRegistered, agentRemoved, agentRenamed } from "@/lib/avatars";
 import type { AgentConfig, AgentConnectorBinding, AgentProbeResult, CatalogEntry, ConflictRun } from "@/lib/types";
 import { agentDisplayName, isConnectorProbe } from "@/lib/types";
 import { ManagerAvatar, WorkerAvatar } from "@/components/chat/worker-avatar";
@@ -370,6 +371,7 @@ export function AgentsPane() {
 	const [loading, setLoading] = useState(true);
 	const [createOpen, setCreateOpen] = useState(false);
 	const [pendingDelete, setPendingDelete] = useState<AgentConfig | null>(null);
+	const [duplicating, setDuplicating] = useState<string | null>(null);
 	const [probing, setProbing] = useState<string | null>(null);
 	const [probes, setProbes] = useState<Record<string, AgentProbeResult>>({});
 	const [enableConflict, setEnableConflict] = useState<{ agent: AgentConfig; message: string; runs: ConflictRun[] } | null>(null);
@@ -445,6 +447,20 @@ export function AgentsPane() {
 		setPendingDelete(null);
 	}, [pendingDelete, refresh]);
 
+	const handleDuplicate = useCallback(async (agent: AgentConfig) => {
+		setDuplicating(agent.name);
+		try {
+			const created = await duplicateAgent(agent.name);
+			agentRegistered(created);
+			toast.success(`已复制为「${agentDisplayName(created)}」（已停用）；请确认凭证后再启用`);
+			router.push(`/agents/config?name=${encodeURIComponent(created.name)}`);
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		} finally {
+			setDuplicating(null);
+		}
+	}, [router]);
+
 	/** 所有 Agent 统一进独立配置页（§10.5）。 */
 	const openManage = (agent: AgentConfig) => {
 		router.push(`/agents/config?name=${encodeURIComponent(agent.name)}`);
@@ -492,6 +508,9 @@ export function AgentsPane() {
 						onCloseAutoFocus={(event) => event.preventDefault()}
 					>
 						<DropdownMenuItem onSelect={() => openManage(agent)}><Settings2Icon />配置</DropdownMenuItem>
+						{agent.connector && agent.invoke?.type !== "command" ? (
+							<DropdownMenuItem disabled={duplicating !== null} onSelect={() => void handleDuplicate(agent)}><CopyIcon />{duplicating === agent.name ? "复制中…" : "复制 Worker"}</DropdownMenuItem>
+						) : null}
 						<DropdownMenuItem disabled={probing === agent.name} onSelect={() => void handleProbe(agent.name)}><RefreshCwIcon />{probing === agent.name ? "探测中…" : "运行探测"}</DropdownMenuItem>
 						<DropdownMenuItem disabled={resolving} onSelect={() => void applyEnabled(agent, !(agent.enabled !== false))}><UserCheckIcon />{agent.enabled !== false ? "停用" : "启用"}</DropdownMenuItem>
 						<DropdownMenuSeparator />

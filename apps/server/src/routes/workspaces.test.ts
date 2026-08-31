@@ -588,6 +588,42 @@ test("durable triggerTurn 输掉切换竞态时不消费真实 eventId，等待�
 	await app.close();
 });
 
+test("durable triggerTurn 只在入队边界持有 Window 生命周期锁", async () => {
+	const { app, teams, sessions, invoker } = await makeStack();
+	const listed = await app.inject({ method: "GET", url: "/api/rooms" });
+	const solo = listed.json().rooms.find((room: { type: string }) => room.type === "solo") as { activeSession: string };
+	const session = await sessions.open(solo.activeSession);
+	let markStarted!: () => void;
+	let finishTurn!: () => void;
+	const started = new Promise<void>((resolve) => { markStarted = resolve; });
+	const heldTurn = new Promise<void>((resolve) => { finishTurn = resolve; });
+	const originalSend = session.sendCustomMessage.bind(session);
+	session.sendCustomMessage = async () => {
+		markStarted();
+		await heldTurn;
+	};
+
+	const delivery = sessions.appendCustomMessageIfAbsent(
+		solo.activeSession,
+		"durable-long-turn",
+		{ customType: "pudding:goal_recovery", content: "恢复执行" },
+		{ triggerTurn: true, deliverAs: "followUp" },
+	);
+	await started;
+	const lifecycleProbe = invoker.withActiveSessionLifecycle(solo.activeSession, async () => "available");
+	const probeResult = await Promise.race([
+		lifecycleProbe,
+		new Promise<string>((resolve) => setTimeout(() => resolve("blocked"), 100)),
+	]);
+	assert.equal(probeResult, "available", "模型回合运行期间读取/切换所需的 Window 生命周期锁必须已经释放");
+
+	finishTurn();
+	assert.equal(await delivery, "delivered");
+	session.sendCustomMessage = originalSend;
+	await sessions.disposeAll();
+	await app.close();
+});
+
 test("P3-1 API: solo 原地切换会取消由 solo 路由到 direct 的 Delegation", async () => {
 	const { app, teams, sessions, delegations } = await makeStack();
 	const b = await teams.workspaces.createManaged("B");

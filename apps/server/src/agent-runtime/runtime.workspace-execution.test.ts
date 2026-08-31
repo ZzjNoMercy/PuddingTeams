@@ -7,6 +7,7 @@ import path from "node:path";
 import { AgentRuntime } from "./runtime.js";
 import { DelegationStore } from "./delegation-store.js";
 import { InteractionSecretStore } from "./interaction-secret-store.js";
+import { ArtifactStore } from "./artifact-store.js";
 import { WorkspaceExecutionCoordinator } from "./workspace-execution.js";
 import { WorkStateStore, workItemContractHash } from "../store/work-state.js";
 import type { AgentDriver } from "./types.js";
@@ -22,6 +23,7 @@ test("Runtime 在 Driver 启动前把无只读强制能力的 Git 任务路由�
 	const state = temp("pt-runtime-workspace-state-");
 	const delegations = new DelegationStore(state); await delegations.init();
 	const secrets = new InteractionSecretStore(state); await secrets.init();
+	const artifacts = new ArtifactStore(state, path.join(state, "artifact-blobs")); await artifacts.init();
 	const coordinator = new WorkspaceExecutionCoordinator(state, { worktreeRoot: temp("pt-runtime-worktrees-") }); await coordinator.init();
 	const workStates = new WorkStateStore(temp("pt-runtime-work-state-")); await workStates.init();
 	const goal = await workStates.create({ sessionId: "s", goal: "write result", completionBoundary: "result exists", operationId: "create-goal" });
@@ -37,25 +39,27 @@ test("Runtime 在 Driver 启动前把无只读强制能力的 Git 任务路由�
 			observedCwd = ctx.cwd;
 			assert.equal(readFileSync(path.join(ctx.cwd, "input.txt"), "utf8"), "dirty-visible\n");
 			writeFileSync(path.join(ctx.cwd, "result.txt"), "result\n");
-			yield { type: "completed", result: { agentId: "worker", status: "completed", reportedEvidence: [{ requirement: "result exists", evidenceRefs: ["result.txt"] }] } };
+			yield { type: "completed", result: { agentId: "worker", status: "completed", reportedEvidence: [{ requirement: "result exists", evidenceRefs: ["result.txt"] }], artifacts: [{ name: "result.txt", path: "result.txt", origin: "observe" }] } };
 		},
 		async *continue() {}, async *respond() {},
 		async probe() { return { extensionInstalled: true, detected: true, configured: true, authenticated: true, enabled: true, compatibility: "supported", capabilities: await this.capabilities(), issues: [] }; },
 	};
-	const runtime = new AgentRuntime(delegations, secrets, () => driver, { ttlMs: 60_000 }, undefined, undefined, coordinator);
+	const runtime = new AgentRuntime(delegations, secrets, () => driver, { ttlMs: 60_000 }, artifacts, undefined, coordinator);
 	const outcome = await runtime.delegate({
 		windowId: "w", workspaceId: "workspace", cwdSnapshot: root, managerSessionId: "s", agentId: "worker", agentRevision: 1,
 		message: "write result", mode: "run", evidenceRequirements: ["result exists"], goalId: goal.goalId, workPlanId: planned.plan!.id,
 		workItemId: item.id, goalEpoch: goal.execution.epoch, goalRevision: goal.goalRevision, workItemRevision: item.revision, contractHash: frozenContractHash,
 		workspaceExecutionPolicy: policy,
 	}, { cwd: root, env: {} });
-	assert.equal(outcome.status, "completed");
+	assert.equal(outcome.status, "completed", JSON.stringify(outcome.result));
 	assert.notEqual(observedCwd, root);
 	assert.equal(existsSync(path.join(root, "result.txt")), false, "验收前不得写入目标 Workspace");
 	assert.equal(outcome.delegation.workspaceExecutionPolicy?.mode, "isolated_worktree");
 	assert.ok(outcome.delegation.workspaceExecutionScopeId);
 	assert.ok(outcome.delegation.workspaceChangeSetId);
 	assert.equal(outcome.delegation.receipt?.integrity, "clean");
+	assert.equal(outcome.delegation.receipt?.collectionStatus, "complete");
+	assert.equal(outcome.delegation.receipt?.artifactCapture[0]?.status, "captured", "Artifact 必须从隔离执行 cwd 捕获，而不是提前读取目标 checkout");
 	assert.equal(outcome.delegation.receipt?.taskContractHash, frozenContractHash);
 	assert.notEqual(outcome.delegation.receipt?.contractHash, frozenContractHash, "Runtime envelope 还必须绑定 Agent/执行身份");
 	const changeSet = await runtime.getWorkspaceChangeSet(outcome.delegation.workspaceChangeSetId);

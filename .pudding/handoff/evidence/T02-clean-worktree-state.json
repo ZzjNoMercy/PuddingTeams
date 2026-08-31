@@ -1,0 +1,31 @@
+{
+  "sessionId": "01a0539d-f425-749b-abcf-8c010fae88b5",
+  "goalId": "8cc7e228-0993-4116-b101-2b1f866107c7",
+  "delegationId": "517ff475-20fd-4355-aaa5-86df49f99b30",
+  "worker": "codex-writer",
+  "workerStarted": true,
+  "executionStateAtCapture": "reported_completed",
+  "workspaceMode": "isolated_worktree",
+  "executionScopeId": "f647843e-59db-4040-b165-f6a47955cc66",
+  "canonicalWorkspace": "/private/tmp/puddingteams-pcp-target",
+  "changedPathsAtCapture": [
+    "docs/e2e-pcp-happy-path.md"
+  ],
+  "changeSetId": "0b42d82b-7a6e-44a3-9c52-08a609377822",
+  "changeSetPromotionState": "pending",
+  "changeSetIntegrity": "clean",
+  "receipt": {
+    "reportedOutcome": "completed",
+    "collectionStatus": "failed",
+    "integrity": "suspect",
+    "sealed": true,
+    "artifactIssue": "target Workspace path did not exist before promotion"
+  },
+  "submissionCreatedAutomatically": true,
+  "workItemStatus": "submitted",
+  "verificationStatus": "blocked",
+  "verificationBlockReason": "codex-verifier has no execution window bound to the temporary Workspace",
+  "fileFirstLine": "# Provable Collaboration E2E",
+  "fileBranchEvidence": "HEAD (inner platform worktree is detached)",
+  "sensitiveTimelineContentOmitted": true
+}

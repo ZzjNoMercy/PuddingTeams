@@ -89,6 +89,17 @@ export function agentIdFromDisplayName(displayName: string): string {
 	return `worker-${randomBytes(3).toString("hex")}`;
 }
 
+/** 在给定身份全集内生成 ≤32 字符的可读 id；调用方必须持有注册表写锁。 */
+function nextAvailableAgentId(baseInput: string, taken: ReadonlySet<string>): string {
+	const base = baseInput.slice(0, 32).replace(/[-_]+$/g, "") || "worker";
+	for (let index = 1; ; index += 1) {
+		const suffix = index === 1 ? "" : `-${index}`;
+		const stem = base.slice(0, Math.max(1, 32 - suffix.length)).replace(/[-_]+$/g, "") || "worker";
+		const candidate = `${stem}${suffix}`;
+		if (!taken.has(candidate)) return candidate;
+	}
+}
+
 export interface AgentResponsibilityProfile {
 	identity?: string;
 	domain: string;
@@ -210,8 +221,10 @@ export interface WindowConfig {
 }
 
 interface TeamsFile {
-	version: number;
+	version: 2;
 	agents: AgentConfig[];
+	/** 永不复用的历史 Agent id；保留 Window/Session/Run 审计时的身份隔离栅栏。 */
+	retiredAgentIds: string[];
 }
 
 function windowContextKey(workspaceId: string | undefined, cwdSnapshot: string): string {
@@ -370,6 +383,7 @@ export const DEFAULT_TEAMS: AgentConfig[] = [
 		invoke: { type: "pi" },
 		pinned: true,
 		enabled: true,
+		extensionRevision: 1,
 		capabilities: [],
 		manager: {},
 	},
@@ -386,6 +400,7 @@ export const DEFAULT_TEAMS: AgentConfig[] = [
 			config: {},
 		},
 		enabled: true,
+		extensionRevision: 1,
 	},
 	{
 		// 第一方双宿主 Connector 随发行物预置；这里只创建可见 Worker 实例，
@@ -399,6 +414,7 @@ export const DEFAULT_TEAMS: AgentConfig[] = [
 			config: {},
 		},
 		enabled: true,
+		extensionRevision: 1,
 	},
 	{
 		name: "codex",
@@ -410,6 +426,7 @@ export const DEFAULT_TEAMS: AgentConfig[] = [
 			config: {},
 		},
 		enabled: true,
+		extensionRevision: 1,
 	},
 	{
 		// 决策 20：旧结构直接替换——PuddingClaw 以第一方 Connector binding 接入。
@@ -424,6 +441,7 @@ export const DEFAULT_TEAMS: AgentConfig[] = [
 			config: { command: "puddingclaw" },
 		},
 		enabled: true,
+		extensionRevision: 1,
 	},
 	{
 		// 双传输打样：默认展示一个直连 Headless NDJSON 的 HTTP Worker，便于
@@ -439,6 +457,7 @@ export const DEFAULT_TEAMS: AgentConfig[] = [
 			config: { endpoint: "http://127.0.0.1:8888" },
 		},
 		enabled: false,
+		extensionRevision: 1,
 	},
 ];
 
@@ -498,6 +517,7 @@ export interface TeamsStoreDirs {
 
 export class TeamsStore {
 	private agentsPromise: Promise<AgentConfig[]> | null = null;
+	private retiredAgentIds = new Set<string>();
 	private windowsPromise: Promise<WindowsFile> | null = null;
 	private readonly agentsFile: string;
 	private readonly windowsFile: string;
@@ -552,7 +572,7 @@ export class TeamsStore {
 				const designer = defaults.find((agent) => agent.name === "pi-b");
 				if (designer) designer.avatar = fileName;
 			}
-			await this.writeAgents(defaults);
+			await this.writeAgents(defaults, []);
 		}
 		const agents = await this.loadAgentsFile();
 		const manager = agents.find((agent) => agent.name === MANAGER_AGENT_NAME);
@@ -692,7 +712,24 @@ export class TeamsStore {
 		try {
 			const raw = await readFile(this.agentsFile, "utf-8");
 			const parsed = JSON.parse(raw) as Partial<TeamsFile>;
-			return Array.isArray(parsed.agents) ? parsed.agents : [];
+			if (parsed.version !== 2 || !Array.isArray(parsed.agents) || !Array.isArray(parsed.retiredAgentIds)) {
+				throw new Error("agents.json uses a retired schema; clear development data");
+			}
+			if (parsed.retiredAgentIds.some((id) => typeof id !== "string" || !SAFE_AGENT_NAME.test(id))) {
+				throw new Error("agents.json has invalid retiredAgentIds");
+			}
+			if (parsed.agents.some((agent) => !agent || typeof agent.name !== "string" || !SAFE_AGENT_NAME.test(agent.name))) {
+				throw new Error("agents.json has an invalid Agent id");
+			}
+			if (new Set(parsed.agents.map((agent) => agent.name)).size !== parsed.agents.length) {
+				throw new Error("agents.json has duplicate Agent ids");
+			}
+			const retired = new Set(parsed.retiredAgentIds);
+			if (parsed.agents.some((agent) => retired.has(agent.name))) {
+				throw new Error("agents.json reuses a retired Agent id");
+			}
+			this.retiredAgentIds = retired;
+			return parsed.agents;
 		} catch (err: unknown) {
 			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
 			return [];
@@ -709,8 +746,17 @@ export class TeamsStore {
 		return this.agentsPromise;
 	}
 
-	private async writeAgents(agents: AgentConfig[]): Promise<void> {
-		await this.writeJsonFile(this.agentsFile, { version: 1, agents });
+	private async writeAgents(agents: AgentConfig[], retiredAgentIds: Iterable<string> = this.retiredAgentIds): Promise<void> {
+		const retired = [...new Set(retiredAgentIds)].sort();
+		const activeIds = agents.map((agent) => agent.name);
+		if (activeIds.some((id) => !SAFE_AGENT_NAME.test(id)) || retired.some((id) => !SAFE_AGENT_NAME.test(id))) {
+			throw new Error("refusing to persist an unsafe Agent id");
+		}
+		if (new Set(activeIds).size !== activeIds.length) throw new Error("refusing to persist duplicate Agent ids");
+		const retiredSet = new Set(retired);
+		if (activeIds.some((id) => retiredSet.has(id))) throw new Error("refusing to reuse a retired Agent id");
+		await this.writeJsonFile(this.agentsFile, { version: 2, agents, retiredAgentIds: retired } satisfies TeamsFile);
+		this.retiredAgentIds = new Set(retired);
 		this.agentsPromise = Promise.resolve(agents);
 	}
 
@@ -721,6 +767,12 @@ export class TeamsStore {
 
 	async getAgent(name: string): Promise<AgentConfig | undefined> {
 		return (await this.agents()).find((a) => a.name === name);
+	}
+
+	/** 当前或历史使用过的 Agent id；创建路径据此避免身份复用。 */
+	async reservedAgentIds(): Promise<string[]> {
+		const agents = await this.agents();
+		return [...new Set([...agents.map((agent) => agent.name), ...this.retiredAgentIds])];
 	}
 
 	private normalizeResponsibility(input: AgentResponsibilityProfile | undefined): AgentResponsibilityProfile | undefined {
@@ -780,13 +832,19 @@ export class TeamsStore {
 		return Object.keys(result).length ? result : undefined;
 	}
 
-	async upsertAgent(input: AgentConfig): Promise<AgentConfig> {
+	async upsertAgent(
+		input: AgentConfig,
+		options: { createOnly?: boolean; generateUniqueName?: boolean } = {},
+	): Promise<AgentConfig> {
 		const agent: AgentConfig = {
 			enabled: true,
 			...input,
 			name: input.name.trim(),
 		};
 		if (!agent.name) throw new Error("agent name is required");
+		if (!SAFE_AGENT_NAME.test(agent.name)) {
+			throw new Error("agent name 只能包含字母、数字、连字符或下划线，且以字母或数字开头");
+		}
 		const displayName = normalizeDisplayName(agent.displayName, agent.name);
 		if (displayName) agent.displayName = displayName;
 		else delete agent.displayName;
@@ -867,7 +925,19 @@ export class TeamsStore {
 
 		await this.serialize(async () => {
 			const agents = await this.loadAgentsFile();
+			if (options.generateUniqueName) {
+				agent.name = nextAvailableAgentId(
+					agent.name,
+					new Set([...agents.map((current) => current.name), ...this.retiredAgentIds]),
+				);
+			}
 			const idx = agents.findIndex((a) => a.name === agent.name);
+			if (idx < 0 && this.retiredAgentIds.has(agent.name)) {
+				throw new Error(`agent id「${agent.name}」已退役，不可复用`);
+			}
+			if (options.createOnly && idx >= 0) {
+				throw new Error(`agent already exists: ${agent.name}`);
+			}
 			// Extension 配置版本递增（§3.3.5）：旧配置保留的 extensionRevision
 			// 在基础上 +1，manager Session 据此发现装配陈旧。
 			const prev = idx >= 0 ? agents[idx] : undefined;
@@ -880,6 +950,75 @@ export class TeamsStore {
 		return agent;
 	}
 
+	/**
+	 * 复制一个 Worker 的可复用配置，但创建全新的运行身份。
+	 *
+	 * name、Capability binding id 与 extensionRevision 都重新生成；凭证引用、
+	 * 明文 env、上传头像和任何 Session/Window 关系都不继承。副本默认停用，
+	 * 让用户先检查接入与凭证，再显式加入 manager roster。
+	 */
+	async duplicateAgent(sourceName: string): Promise<AgentConfig> {
+		let duplicated: AgentConfig | undefined;
+		await this.serialize(async () => {
+			const agents = await this.loadAgentsFile();
+			const source = agents.find((agent) => agent.name === sourceName);
+			if (!source) throw new Error(`agent not found: ${sourceName}`);
+			if (source.pinned) throw new Error(`agent「${sourceName}」是 pinned 内置 Agent，不可复制`);
+			if (!source.connector || source.invoke?.type === "command") {
+				throw new Error(`agent「${sourceName}」是 legacy command Worker，不支持复制；请改用 Connector 接入`);
+			}
+
+			const copyBase = `${source.name.slice(0, 27).replace(/[-_]+$/g, "") || "worker"}-copy`;
+			const nextName = nextAvailableAgentId(
+				copyBase,
+				new Set([...agents.map((agent) => agent.name), ...this.retiredAgentIds]),
+			);
+
+			const takenDisplayNames = new Set(agents.map((agent) => agentDisplayName(agent)));
+			const sourceDisplayName = agentDisplayName(source);
+			let displayIndex = 1;
+			let nextDisplayName = "";
+			while (!nextDisplayName || takenDisplayNames.has(nextDisplayName)) {
+				const suffix = displayIndex === 1 ? " 副本" : ` 副本 ${displayIndex}`;
+				const maxBaseLength = Math.max(1, 40 - [...suffix].length);
+				nextDisplayName = `${[...sourceDisplayName].slice(0, maxBaseLength).join("")}${suffix}`;
+				displayIndex += 1;
+			}
+
+			const copy = structuredClone(source);
+			copy.name = nextName;
+			copy.displayName = nextDisplayName;
+			copy.enabled = false;
+			copy.extensionRevision = 1;
+			delete copy.pinned;
+			delete copy.manager;
+			delete copy.avatar;
+			// env 是任意进程环境变量，可能含未迁入 CredentialsStore 的旧凭证。
+			delete copy.env;
+			if (copy.connector) {
+				copy.connector = structuredClone(copy.connector);
+				delete copy.connector.secretRefs;
+			}
+			if (copy.capabilityExtensions) {
+				const takenBindingIds = new Set(copy.capabilityExtensions.map((binding) => binding.id));
+				copy.capabilityExtensions = copy.capabilityExtensions.map((binding) => {
+					const next = structuredClone(binding);
+					do next.id = randomUUID().slice(0, 8);
+					while (takenBindingIds.has(next.id));
+					takenBindingIds.add(next.id);
+					delete next.secretRefs;
+					return next;
+				});
+			}
+
+			agents.push(copy);
+			await this.writeAgents(agents);
+			duplicated = copy;
+		});
+		this.emitChange();
+		return duplicated!;
+	}
+
 	async removeAgent(name: string): Promise<boolean> {
 		const existing = await this.getAgent(name);
 		if (existing?.pinned) throw new Error(`agent「${name}」是 pinned 内置 Agent，不可删除`);
@@ -888,7 +1027,7 @@ export class TeamsStore {
 			const agents = await this.loadAgentsFile();
 			const next = agents.filter((a) => a.name !== name);
 			removed = next.length !== agents.length;
-			if (removed) await this.writeAgents(next);
+			if (removed) await this.writeAgents(next, new Set([...this.retiredAgentIds, name]));
 		});
 		// Best-effort cleanup of the avatar file so it doesn't orphan on disk.
 		if (removed && SAFE_AGENT_NAME.test(name)) await this.removeAvatarFiles(name);

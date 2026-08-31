@@ -534,6 +534,16 @@ export async function createAgent(agent: AgentConfig): Promise<AgentConfig> {
 	return ((await res.json()) as { agent: AgentConfig }).agent;
 }
 
+/** 复制 Worker 的非敏感配置；服务端生成新身份并让副本保持停用。 */
+export async function duplicateAgent(name: string): Promise<AgentConfig> {
+	const data = await postJson<MutationResponse>(
+		`/api/agents/${encodeURIComponent(name)}/duplicate`,
+		{},
+		"duplicate agent failed",
+	);
+	return data.agent;
+}
+
 export async function updateAgent(name: string, agent: AgentConfig): Promise<AgentConfig> {
 	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}`, {
 		method: "PUT",

@@ -23,6 +23,7 @@ test("P3-G: Session Goal revision、业务决策与清理闭环", async () => {
 		goal: "交付可审核版本",
 		completionBoundary: "测试全绿且 Human 审核通过",
 		participantAgentIds: ["codex", "codex"],
+		reviewMode: "independent",
 		verificationPolicy: { minimumWorkItemMode: "manager_review", finalGoalMode: "manager_review", trigger: "manager_request", source: "user", reason: "本用例单独验证 Completion Review 状态机" },
 	});
 	assert.equal(created.revision, 0);
@@ -98,6 +99,21 @@ test("P3-G: Session Goal revision、业务决策与清理闭环", async () => {
 	await store.removeSession("s1");
 	assert.equal(await store.get("s1"), undefined);
 	assert.deepEqual(await store.listDecisions("s1"), []);
+});
+
+test("Goal 验收模式：省略旧 reviewMode 时跟随 verificationPolicy.finalGoalMode", async () => {
+	const store = new WorkStateStore(mkdtempSync(path.join(tmpdir(), "pt-goal-review-mode-")));
+	await store.init();
+	const manager = await store.create({
+		sessionId: "manager-review", goal: "Manager 验收", completionBoundary: "完成",
+		verificationPolicy: { minimumWorkItemMode: "manager_review", finalGoalMode: "manager_review", trigger: "manager_request", source: "user", reason: "不启动独立 reviewer" },
+	});
+	assert.equal(manager.reviewMode, "manager");
+	const independent = await store.create({
+		sessionId: "independent-review", goal: "独立验收", completionBoundary: "完成",
+		verificationPolicy: { minimumWorkItemMode: "manager_review", finalGoalMode: "independent_evidence_review", trigger: "manager_request", source: "user", reason: "需要独立 reviewer" },
+	});
+	assert.equal(independent.reviewMode, "independent");
 });
 
 test("Goal v5: WorkItem DAG、Submission、验收与幂等闭环", async () => {
@@ -213,6 +229,37 @@ test("启动对账: reconciling/waiting_input/waiting_admission 都投影为活�
 	assert.equal(current?.execution.status, "waiting_human");
 	assert.equal(current?.execution.interruption, undefined);
 	assert.ok((current?.revision ?? 0) > planned.revision);
+});
+
+test("启动对账: verification Delegation 只提供证据，不得被重放为执行 Submission", async () => {
+	const store = new WorkStateStore(mkdtempSync(path.join(tmpdir(), "pt-work-reconcile-verification-")));
+	await store.init();
+	const goal = await store.create({ sessionId: "verify-reconcile", goal: "验证交付", completionBoundary: "独立复验通过" });
+	const planned = await store.updatePlan("verify-reconcile", goal.revision, {
+		upsertItems: [{ id: "W1", title: "实现", dependsOn: [], acceptanceCriteria: ["文件存在"] }],
+		reason: "plan",
+	}, "plan-verification", goal.execution.epoch, goal.goalId);
+	const item = planned.plan!.items.W1!;
+	const verifierReceipt = sealedReceipt(planned, item, "D-verifier");
+	verifierReceipt.taskContractHash = undefined;
+
+	const outcome = await store.reconcileDelegations([{
+		id: "D-verifier",
+		managerSessionId: "verify-reconcile",
+		purpose: "verification",
+		goalId: goal.goalId,
+		workItemId: "W1",
+		goalEpoch: goal.execution.epoch,
+		executionState: "reported_completed",
+		revision: 4,
+		updatedAt: new Date().toISOString(),
+		receipt: verifierReceipt,
+	}]);
+
+	assert.deepEqual(outcome, { projected: 0, interrupted: 0 });
+	const current = await store.get("verify-reconcile");
+	assert.equal(current?.plan?.items.W1?.submissions.length, 0);
+	assert.equal(current?.plan?.items.W1?.status, "ready");
 });
 
 test("改派 reservation 原子切换 active Delegation，旧终态不得清除或回退新任务", async () => {
@@ -366,7 +413,7 @@ test("Goal v5: 同一 Session 串行多个 Goal，旧执行事实不能写入新
 		goalId: goalA.goalId, workItemId: "W1", delegationId: "D-A", delegationStatus: "completed", goalEpoch: 1,
 		executionReceipt: sealedReceipt(planA, planA.plan!.items.W1!, "D-A"),
 	}, "boundary-a");
-	const acceptedA = await store.reviewWorkItem("serial", "W1", submittedA.revision, { verdict: "accepted", summary: "A 已验收" }, "review-a", 1, goalA.goalId);
+	const acceptedA = await store.reviewWorkItem("serial", "W1", submittedA.revision, { verdict: "accepted", summary: "A 已验收", evidenceRefs: ["delegation:D-A"] }, "review-a", 1, goalA.goalId);
 	const decisionA = await store.createDecision({
 		sessionId: "serial", requestedBy: "manager", question: "是否归档 A？", context: "", blockedAction: "完成 A", resumeHint: "按决定继续",
 	}, "decision-a", acceptedA.revision, goalA.goalId);
@@ -462,6 +509,47 @@ test("Goal v6: sealed Receipt、VerificationRecord 与 isolated worktree 提升�
 		/不允许覆盖/,
 	);
 	const accepted = await store.reviewWorkItem("v6", "W1", intended.revision, { verdict: "accepted", summary: "独立证据充分" }, "review-after-v6");
+	assert.equal(accepted.plan?.items.W1?.status, "accepted");
+});
+
+test("manager_review 可验收普通 Connector 的 partial Receipt，但必须记录 Manager 证据引用", async () => {
+	const store = new WorkStateStore(mkdtempSync(path.join(tmpdir(), "pt-manager-review-partial-")));
+	await store.init();
+	const goal = await store.create({ sessionId: "manager-review", goal: "检查 Worker 输出", completionBoundary: "结果已由 Manager 验收" });
+	const planned = await store.updatePlan("manager-review", goal.revision, {
+		upsertItems: [{
+			id: "W1",
+			title: "普通 CLI Worker 输出",
+			acceptanceCriteria: ["返回分支和 HEAD"],
+			sourceGoalCriteria: ["goal:1:1"],
+			verificationPolicy: { mode: "manager_review", trigger: "manager_request", source: "user", reason: "由 Manager 读回结果" },
+		}],
+		reason: "验证 manager_review 信任边界",
+	}, "plan-manager-review");
+	const item = planned.plan!.items.W1!;
+	const receipt = sealedReceipt(planned, item, "D-plain");
+	receipt.requirementResults = [{ requirement: "返回分支和 HEAD", status: "missing", evidenceRefs: [] }];
+	receipt.collectionStatus = "partial";
+	receipt.integrity = "suspect";
+	receipt.issues = ["普通 Connector 未输出结构化 reportedEvidence"];
+	const submitted = await store.noteDelegation("manager-review", {
+		goalId: goal.goalId,
+		workItemId: "W1",
+		delegationId: "D-plain",
+		delegationStatus: "completed",
+		goalEpoch: 1,
+		summary: "分支 main，HEAD abc123",
+		executionReceipt: receipt,
+	}, "boundary-manager-review");
+	await assert.rejects(
+		() => store.reviewWorkItem("manager-review", "W1", submitted.revision, { verdict: "accepted", summary: "已读回结果" }, "review-without-evidence"),
+		/必须引用至少一条/,
+	);
+	const accepted = await store.reviewWorkItem("manager-review", "W1", submitted.revision, {
+		verdict: "accepted",
+		summary: "已读回 Worker 结果，分支与 HEAD 完整",
+		evidenceRefs: ["delegation:D-plain"],
+	}, "review-with-manager-evidence");
 	assert.equal(accepted.plan?.items.W1?.status, "accepted");
 });
 

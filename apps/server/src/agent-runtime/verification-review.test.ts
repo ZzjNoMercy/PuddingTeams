@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { ENVIRONMENT_OBSERVATION_REF, bindEnvironmentObservations, parseVerificationOutput, type VerificationReviewInput } from "./verification-review.js";
+import { ENVIRONMENT_OBSERVATION_REF, VERIFICATION_REVIEWER_SYSTEM_PROMPT, bindEnvironmentObservations, buildVerificationPrompt, parseVerificationOutput, type VerificationReviewInput } from "./verification-review.js";
 
 const input: VerificationReviewInput = {
 	verificationId: "V1", mode: "environment_verified", goalId: "G", workPlanId: "P", workItemId: "W", submissionId: "S",
@@ -59,4 +59,25 @@ test("Verifier 不能引用未知证据，也不能把 uncertain 伪装为 passe
 			{ criterion: "artifact exists", status: "uncertain", evidenceRefs: [], explanation: "x" },
 		], evidenceRefs: [],
 	}), input, meta), /未知证据|passed/);
+});
+
+test("独立复核输入可携带平台侧执行快照、观测、变更集与自动调度证明", () => {
+	const enriched: VerificationReviewInput = {
+		...input,
+		mode: "independent_evidence_review",
+		submission: {
+			id: "S",
+			executionReceipt: { reportedEvidence: [] },
+			executorSnapshot: { delegationId: "D-executor", executionState: "completed", result: { content: "checked" } },
+			executorObservations: [{ id: "observation:D-executor:1", title: "read file" }],
+			workspaceChangeSet: { id: "change-set:S", changedPaths: [] },
+			verificationInvocation: { trigger: "auto_on_submission", evidenceRef: "platform:auto_on_submission:S" },
+		},
+		allowedEvidenceRefs: ["S", "D-executor", "observation:D-executor:1", "change-set:S", "platform:auto_on_submission:S"],
+	};
+	const prompt = buildVerificationPrompt(enriched);
+	assert.match(prompt, /executorSnapshot/);
+	assert.match(prompt, /observation:D-executor:1/);
+	assert.match(prompt, /platform:auto_on_submission:S/);
+	assert.match(VERIFICATION_REVIEWER_SYSTEM_PROMPT, /reportedEvidence.*为空不能否定/);
 });

@@ -264,6 +264,15 @@ export function renderHistory(msgs: PiMessage[]): ChatMessage[] {
 		if (m.role === "custom") {
 			const next = renderCustom(m);
 			if (m.display === false) {
+				// Approval projections created while the manager is inside a delegate
+				// tool stay hidden in the pi/model transcript to preserve tool ordering,
+				// but are still first-class product UI and must survive reload.
+				if (m.customType === "pudding:interaction_required") {
+					const replaced = upsertCustomMessage(out, next);
+					out.length = 0;
+					out.push(...replaced);
+					continue;
+				}
 				// Hidden group running projections are audit/recovery state, not a
 				// second chat card. Fold them into the original delegate tool call.
 				if (m.customType === "pudding:task_assign") {
@@ -499,6 +508,9 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 			if (m.role === "custom") {
 				const next = renderCustom(m);
 				if (m.display === false) {
+					if (m.customType === "pudding:interaction_required") {
+						return upsertCustomMessage(messages, next);
+					}
 					// Hidden manager projections are not cards, but they carry the
 					// delegation/process metadata needed by the original delegate row.
 					return m.customType === "pudding:task_assign"

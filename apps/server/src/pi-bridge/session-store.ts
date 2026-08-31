@@ -1,6 +1,9 @@
 import {
 	createAgentSession,
-	createBashToolDefinition,
+	createFindToolDefinition,
+	createGrepToolDefinition,
+	createLsToolDefinition,
+	createReadToolDefinition,
 	DefaultResourceLoader,
 	getAgentDir,
 	ModelRuntime,
@@ -127,7 +130,6 @@ interface CapturedToolExecution {
 type PiModel = NonNullable<CreateAgentSessionOptions["model"]>;
 
 /** 纯展示 custom message 等待 run 落定的上限（超时降级 nextTurn）。 */
-const CUSTOM_MESSAGE_IDLE_WAIT_MS = 15_000;
 
 function stringifyUnknown(value: unknown): string {
 	if (value instanceof Error) return value.message;
@@ -456,7 +458,7 @@ export class PiSessionStore {
 		cwd: string;
 		getSessionId: () => string;
 		/** open() 重开已有会话：模型以 JSONL 最后一条 model_change 为准，
-		 *  不用 manager 默认模型覆盖用户的选择（SDK 只在未传 model 时才恢复记录）。 */
+		 *  不用 manager 默认模型覆盖用户的选择。 */
 		preferRecordedModel?: boolean;
 	}): Promise<AgentSession> {
 		const settings = await this.managerSettings();
@@ -468,15 +470,23 @@ export class PiSessionStore {
 			settings,
 			resources,
 		);
-		const guidance = PiSessionStore.resolveGuidance(opts.ctx);
-		// 单聊/群聊 relay：manager 只保留委托工具，不能自己动手。solo 的
-		// manager prompt 只是人格/规则，不影响内置工具；§10.5 的
-		// builtinTools:false 则在任何窗口都关闭内置工具。
+		// Manager is an orchestrator, never a Workspace writer. Pi's builtin set
+		// couples read with bash/edit/write, so remove it in every window and add
+		// back only bounded read-only tools for solo inspection. This is an
+		// execution boundary, not a prompt convention: Goal and non-Goal turns
+		// receive the same no-mutation surface.
 		const isRelay = opts.ctx !== undefined && opts.ctx.type !== "solo";
-		const stripBuiltin = (isRelay && guidance !== undefined) || settings?.builtinTools === false;
+		const readOnlyManagerTools = !isRelay && settings?.builtinTools !== false
+			? [
+					createReadToolDefinition(opts.cwd),
+					createLsToolDefinition(opts.cwd),
+					...(codeSearch === "builtin" ? [createGrepToolDefinition(opts.cwd), createFindToolDefinition(opts.cwd)] : []),
+				]
+			: [];
 		// §10.5 默认模型：显式选择的模型优先，否则用 manager 配置的默认模型
-		// （解析失败不阻断建会话，回退 SDK 默认）。重开会话（preferRecordedModel）
-		// 不解析默认值，让 SDK 从 JSONL 的 model_change 恢复用户选过的模型。
+		// （解析失败不阻断建会话，回退 SDK 默认）。重开会话会把 JSONL 中
+		// 最后一条 model_change 显式解析后传入；preferRecordedModel 仅禁止
+		// manager 默认值在该解析失败时覆盖用户记录。
 		let model = opts.model;
 		if (!model && !opts.preferRecordedModel && settings?.model) {
 			model = await this.resolveModel(settings.model).catch((err: unknown) => {
@@ -491,19 +501,11 @@ export class PiSessionStore {
 			modelRuntime: await this.runtime(),
 			...(settings?.thinkingLevel ? { thinkingLevel: settings.thinkingLevel } : {}),
 			resourceLoader: loader,
-			...(stripBuiltin ? { noTools: "builtin" as const } : {}),
-			...(!stripBuiltin && capabilityRuntime && capabilityRuntime.activeBindings > 0
-				? {
-						customTools: [
-							createBashToolDefinition(opts.cwd, {
-								spawnHook: (spawnCtx) => ({
-									...spawnCtx,
-									env: { ...spawnCtx.env, ...capabilityRuntime.env },
-								}),
-							}) as NonNullable<CreateAgentSessionOptions["customTools"]>[number],
-						],
-					}
-					: {}),
+			noTools: "builtin" as const,
+			excludeTools: ["bash", "edit", "write"],
+			...(readOnlyManagerTools.length
+				? { customTools: readOnlyManagerTools as NonNullable<CreateAgentSessionOptions["customTools"]> }
+				: {}),
 		});
 		// createAgentSession() only constructs registered extensions. Embedded
 		// hosts must bind them explicitly so session_start receives this Session's
@@ -529,7 +531,6 @@ export class PiSessionStore {
 		}
 		const current = session.getActiveToolNames();
 		const next = current.filter((n) => !plan.managed.has(n) || plan.active.has(n) || replayed.has(n));
-		if (codeSearch === "builtin" && !stripBuiltin) next.push("grep", "find");
 		session.setActiveToolsByName([...new Set(next)]);
 		this.assembledManaged.set(session.sessionId, plan.managed);
 		this.attachForwarder(session);
@@ -863,7 +864,14 @@ export class PiSessionStore {
 			getSessionId: () => binding.sessionId,
 		});
 		binding.sessionId = session.sessionId;
-		return this.summarize(session);
+		const summary = await this.summarize(session);
+		// A newly created Session is already a durable product identity even before
+		// its first assistant message. Materialize the header immediately so an
+		// Agent/Extension mutation can rebuild this idle Session before its first
+		// user turn. Otherwise runtimeDirty remains stuck on a fileless instance and
+		// newly added Worker tools are absent from that first provider schema.
+		await this.ensureSessionFile(summary.id);
+		return { ...summary, sessionFile: session.sessionFile ?? summary.sessionFile };
 	}
 
 	async list(): Promise<SessionSummary[]> {
@@ -971,8 +979,16 @@ export class PiSessionStore {
 		if (recordedCwd !== expectedCwd) {
 			throw new Error(`Session cwd does not match its Window context: ${id}`);
 		}
+		const recordedModelRef = await PiSessionStore.modelRefOfFile(info.path);
+		const recordedModel = recordedModelRef
+			? await this.resolveModel(recordedModelRef).catch((err: unknown) => {
+					this.debugLog?.(`会话 ${id} 的记录模型解析失败：${err instanceof Error ? err.message : String(err)}`);
+					return undefined;
+				})
+			: undefined;
 		const session = await this.assembleSession({
 			sessionManager,
+			model: recordedModel,
 			ctx,
 			cwd,
 			getSessionId: () => id,
@@ -1132,6 +1148,11 @@ export class PiSessionStore {
 	 * section. AgentSession/Driver cancellation is bounded: an uncooperative tool
 	 * must not monopolize the repair queue and make refresh hang behind Stop.
 	 */
+	isRunning(id: string): boolean {
+		const session = this.active.get(id);
+		return Boolean(session && (session.isStreaming || !session.isIdle));
+	}
+
 	async abort(id: string): Promise<AbortSessionResult> {
 		const session = this.active.get(id);
 		const wasRunning = Boolean(session && (session.isStreaming || !session.isIdle));
@@ -1321,9 +1342,15 @@ export class PiSessionStore {
 			return this.deliverCustomMessageUnlocked(id, message, options);
 		}
 		try {
-			return await this.invoker.withActiveSessionLifecycle(id, () =>
-				this.deliverCustomMessageUnlocked(id, message, options),
-			);
+			// The lifecycle gate protects only the active-context check plus the
+			// synchronous prompt admission boundary. AgentSession.sendCustomMessage
+			// resolves after the whole model turn; awaiting that promise inside the
+			// gate blocks message history, new-session initialization, and workspace
+			// switching for the entire run (notably during startup Goal recovery).
+			const started = await this.invoker.withActiveSessionLifecycle(id, async () => ({
+				completion: this.deliverCustomMessageUnlocked(id, message, options),
+			}));
+			return await started.completion;
 		} catch (err) {
 			if (!(err instanceof Error) || !err.message.includes("所属项目未激活")) throw err;
 			// The switch won the lifecycle race. Keep the terminal fact as audit,
@@ -1347,10 +1374,26 @@ export class PiSessionStore {
 		const session = await this.open(id);
 		try {
 			if (!effectiveOptions.triggerTurn && !session.isIdle) {
-				await Promise.race([
-					session.waitForIdle(),
-					new Promise<void>((resolve) => setTimeout(resolve, CUSTOM_MESSAGE_IDLE_WAIT_MS)),
-				]).catch(() => undefined);
+				// Display-only projections must be durable while the manager is still
+				// inside the delegate tool call. Enqueuing one as an SDK nextTurn can
+				// leave an approval card memory-only forever, while inserting a visible
+				// custom entry into the unfinished assistant/tool sequence corrupts model
+				// ordering. Persist a hidden audit projection; the web reducer promotes
+				// interaction_required to a visible card without feeding it to the model.
+				const timestamp = this.appendProjectionToSession(session, message);
+				await this.ensureSessionFile(id);
+				this.forwardEvent(id, {
+					type: "message_start",
+					message: {
+						role: "custom",
+						customType: message.customType,
+						content: message.content,
+						display: false,
+						details: message.details,
+						timestamp,
+					},
+				} as AgentSessionEvent);
+				return;
 			}
 			const deliverAs = effectiveOptions.triggerTurn
 				? (effectiveOptions.deliverAs ?? "followUp")
@@ -1401,11 +1444,12 @@ export class PiSessionStore {
 	private appendProjectionToSession(
 		session: AgentSession,
 		message: { customType: string; content: string; details?: Record<string, unknown> },
+		display = false,
 	): number {
 		const entryId = session.sessionManager.appendCustomMessageEntry(
 			message.customType,
 			message.content,
-			false,
+			display,
 			message.details,
 		);
 		const entry = session.sessionManager.getEntry(entryId);
@@ -1421,7 +1465,7 @@ export class PiSessionStore {
 			role: "custom",
 			customType: message.customType,
 			content: message.content,
-			display: false,
+			display,
 			details: message.details,
 			timestamp,
 		});
@@ -1479,7 +1523,12 @@ export class PiSessionStore {
 			};
 			if (!options.triggerTurn) return deliver();
 			try {
-				return await this.withActiveContextLifecycle(id, deliver);
+				// As above, admit the durable wake-up while the active Window is
+				// serialized, then release that short lock before awaiting the model
+				// turn. The outer custom-event serializer still preserves eventId
+				// dedupe until delivery is durably acknowledged.
+				const started = await this.withActiveContextLifecycle(id, async () => ({ completion: deliver() }));
+				return await started.completion;
 			} catch (err) {
 				if (!(err instanceof Error) || !err.message.includes("所属项目未激活")) throw err;
 				// A durable wake-up that loses the workspace-switch race remains pending.
@@ -1619,7 +1668,7 @@ export class PiSessionStore {
 		if (!model) throw new Error("没有可用于独立复核的模型");
 		const reviewInput: CompletionReviewInput = {
 			...input,
-			managerEvidence: PiSessionStore.toolEvidence(manager),
+			managerEvidence: [...input.managerEvidence, ...PiSessionStore.toolEvidence(manager)],
 		};
 		const reviewSession = await this.completionReviewerSession(model);
 		try {

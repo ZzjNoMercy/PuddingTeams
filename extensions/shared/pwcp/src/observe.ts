@@ -16,6 +16,22 @@ async function gitStatus(cwd: string, env: NodeJS.ProcessEnv): Promise<string | 
 	return res.exitCode === 0 ? res.stdout : undefined;
 }
 
+async function gitOutput(cwd: string, env: NodeJS.ProcessEnv, args: string[]): Promise<string | undefined> {
+	const res = await spawnWorker({
+		command: "git",
+		args: ["-C", cwd, ...args],
+		env,
+		timeoutMs: 10_000,
+		startupMs: 5_000,
+	});
+	return res.exitCode === 0 ? res.stdout : undefined;
+}
+
+export interface GitObservationBaseline {
+	dirtyPaths: Set<string>;
+	head?: string;
+}
+
 function parsePaths(stdout: string): string[] {
 	const out: string[] = [];
 	for (const line of stdout.split("\n")) {
@@ -35,10 +51,11 @@ function parsePaths(stdout: string): string[] {
 /**
  * §15.4 observe 轨的任务前基线：非 git 工作区返回 null（完成后不收集）。
  */
-export async function gitBaseline(cwd: string, env: NodeJS.ProcessEnv): Promise<Set<string> | null> {
+export async function gitBaseline(cwd: string, env: NodeJS.ProcessEnv): Promise<GitObservationBaseline | null> {
 	const stdout = await gitStatus(cwd, env);
 	if (stdout === undefined) return null;
-	return new Set(parsePaths(stdout));
+	const head = (await gitOutput(cwd, env, ["rev-parse", "--verify", "HEAD"]))?.trim() || undefined;
+	return { dirtyPaths: new Set(parsePaths(stdout)), head };
 }
 
 /**
@@ -50,15 +67,29 @@ export async function gitBaseline(cwd: string, env: NodeJS.ProcessEnv): Promise<
 export async function observeGitArtifacts(
 	cwd: string,
 	env: NodeJS.ProcessEnv,
-	baseline: Set<string> | null,
+	baseline: GitObservationBaseline | null,
 ): Promise<ArtifactRef[]> {
 	if (baseline === null) return [];
 	const stdout = await gitStatus(cwd, env);
 	if (stdout === undefined) return [];
 
-	const out: ArtifactRef[] = [];
+	const changed = new Set<string>();
 	for (const p of parsePaths(stdout)) {
-		if (baseline.has(p)) continue;
+		if (baseline.dirtyPaths.has(p)) continue;
+		changed.add(p);
+	}
+	// A successful Worker may commit every change, leaving porcelain empty. The
+	// immutable task-start HEAD is therefore part of the baseline: collect paths
+	// introduced by commits made during the task as well as remaining dirty paths.
+	if (baseline.head) {
+		const committed = await gitOutput(cwd, env, ["diff", "--name-only", "--diff-filter=ACMRTUXB", "-z", `${baseline.head}..HEAD`, "--"]);
+		for (const p of committed?.split("\0") ?? []) {
+			if (p && !p.startsWith(".pudding/")) changed.add(p);
+		}
+	}
+
+	const out: ArtifactRef[] = [];
+	for (const p of changed) {
 		out.push({
 			name: p.split(/[\\/]+/).filter(Boolean).pop() ?? p,
 			path: p,

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Type } from "typebox";
@@ -102,6 +102,17 @@ test("Manager 代码搜索默认关闭，Solo 显式 builtin 才激活 grep/find
 	await sessions.disposeAll();
 });
 
+test("Manager 在所有窗口都没有 bash/write/edit 写入通道，Solo 只恢复只读工具", async () => {
+	const { sessions, dir } = await makeStack();
+	const summary = await sessions.create(undefined, { type: "solo", members: [], cwd: dir });
+	const tools = (await sessions.open(summary.id)).getAllTools().map((tool) => tool.name);
+	assert.ok(tools.includes("read") && tools.includes("ls"));
+	assert.ok(!tools.includes("bash"));
+	assert.ok(!tools.includes("write"));
+	assert.ok(!tools.includes("edit"));
+	await sessions.disposeAll();
+});
+
 test("Solo Manager 的 FFF 只在 trusted Workspace 装配 override 工具", async () => {
 	const { teams, sessions } = await makeStack();
 	const workspace = await teams.workspaces.createManaged("fff-project");
@@ -146,6 +157,76 @@ test("Phase5: 受影响 manager Session 统计（active_now / reload_pending）"
 	// 无关 Agent 的统计为零。
 	assert.equal(sessions.agentSessionStats("nonexistent").affectedSessions, 0);
 	await sessions.disposeAll();
+});
+
+test("fresh Session 首条消息前配置新增 Worker，下一次 open 重建并暴露委托工具", async () => {
+	const { teams, sessions } = await makeStack();
+	const summary = await sessions.create();
+	await teams.ensureSoloWindow(async () => ({ id: summary.id }), async () => true);
+	const before = await sessions.open(summary.id);
+	assert.ok(summary.sessionFile && existsSync(summary.sessionFile), "新 Session 必须立即落盘，不能等首条 assistant 消息");
+	assert.ok(!before.getAllTools().some((tool) => tool.name === delegateToolName("late-worker")));
+
+	await teams.upsertAgent({
+		name: "late-worker",
+		displayName: "Late Worker",
+		description: "created after manager Session",
+		invoke: { type: "command", command: "late-worker", runArgs: [] },
+	});
+	await sessions.syncAgentConfigChange();
+	const rebuilt = await sessions.open(summary.id);
+	assert.notEqual(rebuilt, before, "配置变更后的空闲 Session 必须在下一次 open 重建");
+	assert.ok(rebuilt.getActiveToolNames().includes(delegateToolName("late-worker")), "首条 provider 请求前必须含新 Worker 委托工具");
+	await sessions.disposeAll();
+});
+
+test("busy Manager 的审批投影以隐藏审计消息立即持久化并广播，不进入 nextTurn", async () => {
+	const { sessions } = await makeStack();
+	const persisted: Array<{ customType: string; content: string; display: boolean; details?: unknown }> = [];
+	const mirrored: Array<{ role: string; customType: string; content: string; display: boolean; details?: unknown }> = [];
+	const events: unknown[] = [];
+	let sdkSends = 0;
+	const fakeSession = {
+		isIdle: false,
+		sessionManager: {
+			appendCustomMessageEntry(customType: string, content: string, display: boolean, details?: unknown) {
+				persisted.push({ customType, content, display, details });
+				return "entry-1";
+			},
+			getEntry() { return { timestamp: "2026-08-31T00:00:00.000Z" }; },
+		},
+		state: { messages: mirrored },
+		async sendCustomMessage() { sdkSends += 1; },
+	};
+	const internals = sessions as unknown as {
+		open(id: string): Promise<typeof fakeSession>;
+		ensureSessionFile(id: string): Promise<void>;
+		forwardEvent(id: string, event: unknown): void;
+		deliverCustomMessageUnlocked(
+			id: string,
+			message: { customType: string; content: string; details?: Record<string, unknown> },
+			options: { triggerTurn: boolean },
+		): Promise<void>;
+	};
+	internals.open = async () => fakeSession;
+	internals.ensureSessionFile = async () => undefined;
+	internals.forwardEvent = (_id, event) => events.push(event);
+
+	await internals.deliverCustomMessageUnlocked(
+		"manager-session",
+		{ customType: "pudding:interaction_required", content: "approval", details: { interactionId: "i-1" } },
+		{ triggerTurn: false },
+	);
+
+	assert.equal(sdkSends, 0, "busy session must not queue approval UI as SDK nextTurn");
+	assert.deepEqual(persisted, [{
+		customType: "pudding:interaction_required",
+		content: "approval",
+		display: false,
+		details: { interactionId: "i-1" },
+	}]);
+	assert.equal(mirrored[0]?.display, false);
+	assert.equal(events.length, 1, "open UI must receive the audit projection immediately");
 });
 
 test("Phase5: pinned manager 不能被委托（Invoker 入口拒绝）", async () => {

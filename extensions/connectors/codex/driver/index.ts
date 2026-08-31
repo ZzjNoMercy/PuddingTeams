@@ -27,6 +27,15 @@ export interface CodexDriverOptions {
 	timeoutMs?: number;
 }
 
+export function codexExecutionPolicyArgs(
+	configuredSandbox: CodexDriverOptions["sandbox"],
+	ctx: Pick<InvocationContext, "verificationProfile" | "workspaceBoundary">,
+): string[] {
+	const sandbox = ctx.verificationProfile ? "workspace-write" : configuredSandbox ?? "workspace-write";
+	if (ctx.workspaceBoundary === "platform_isolated_checkout" && sandbox === "workspace-write") return ["--approve-for-me"];
+	return ["-s", sandbox];
+}
+
 /** 有界的 stderr 诊断摘要（截断 + 脱敏）。 */
 function stderrSummary(stderr: string): string {
 	if (!stderr.trim()) return "";
@@ -155,12 +164,20 @@ export class CodexDriver implements AgentDriver {
 		});
 	}
 
-	private runArgs(ctx: InvocationContext): string[] {
+	private executionPolicyArgs(ctx: InvocationContext): string[] {
 		// Verification profiles are platform-bound and must never inherit a user's
 		// danger-full-access Agent setting. Codex workspace-write is the executable
 		// Connector-side half of the isolated-copy/mutation-guard profile.
-		const sandbox = ctx.verificationProfile ? "workspace-write" : this.opts.sandbox ?? "workspace-write";
-		const args = ["--json", "--skip-git-repo-check", "-C", ctx.cwd ?? process.cwd(), "-s", sandbox];
+		// Codex workspace-write deliberately protects .git. A platform-created
+		// isolated checkout is the one boundary where git metadata must be writable;
+		// --approve-for-me keeps workspace-write and routes that protected command
+		// through Codex's command-level automatic reviewer. Never use this signal for
+		// the user's target checkout and never fall back to danger-full-access.
+		return codexExecutionPolicyArgs(this.opts.sandbox, ctx);
+	}
+
+	private runArgs(ctx: InvocationContext): string[] {
+		const args = ["--json", "--skip-git-repo-check", "-C", ctx.cwd ?? process.cwd(), ...this.executionPolicyArgs(ctx)];
 		if (this.opts.model) args.push("-m", this.opts.model);
 		return args;
 	}
@@ -170,7 +187,7 @@ export class CodexDriver implements AgentDriver {
 	 * 保证；沙箱经 -c 配置覆盖传同一值，避免 resume 掉回默认 read-only）。
 	 */
 	private resumeArgs(): string[] {
-		const args = ["--json", "--skip-git-repo-check", "-c", `sandbox_mode="${this.opts.sandbox ?? "workspace-write"}"`];
+		const args = ["--json", "--skip-git-repo-check"];
 		if (this.opts.model) args.push("-m", this.opts.model);
 		return args;
 	}
@@ -287,7 +304,7 @@ export class CodexDriver implements AgentDriver {
 	async *continue(input: ContinueInput, ctx: InvocationContext): AsyncIterable<AgentEvent> {
 		ctx.onUpdate?.("worker 正在续接会话…", { running: true });
 		yield { type: "started", sessionHandle: input.sessionHandle };
-		yield await this.runCli(["exec", "resume", ...this.resumeArgs(), input.sessionHandle, input.message], ctx);
+		yield await this.runCli(["exec", ...this.executionPolicyArgs(ctx), "resume", ...this.resumeArgs(), input.sessionHandle, input.message], ctx);
 	}
 
 	async *respond(input: RespondInput, _ctx: InvocationContext): AsyncIterable<AgentEvent> {

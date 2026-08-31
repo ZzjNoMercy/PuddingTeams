@@ -530,6 +530,13 @@ export class WorkStateStore {
 			};
 			if (!["user", "harness_default", "manager_derived"].includes(verificationPolicy.source)) throw new Error("verificationPolicy.source 无效");
 			verificationPolicy.finalGoalMode = stricterMode(verificationPolicy.finalGoalMode, verificationPolicy.minimumWorkItemMode);
+			// `verificationPolicy.finalGoalMode` is the current Harness contract.
+			// Keep the legacy CompletionReviewMode projection aligned when callers
+			// omit it; otherwise `finalGoalMode=manager_review` could still launch an
+			// independent Goal reviewer and leave an already accepted Goal active.
+			const inferredReviewMode: CompletionReviewMode = verificationPolicy.finalGoalMode === "manager_review"
+				? "manager"
+				: "independent";
 			const state: SessionWorkState = {
 				goalId, sessionId: input.sessionId, goal,
 				contractProvenance: {
@@ -538,7 +545,7 @@ export class WorkStateStore {
 					...(provenance.criteriaOrigin === "manager_derived" ? { authoredByAgentId: "manager" as const } : {}),
 				},
 				responsibleAgentId: "manager", participantAgentIds: [...new Set(input.participantAgentIds ?? [])],
-				currentBrief: "", completionBoundary, goalRevision: 1, reviewMode: input.reviewMode ?? "independent",
+				currentBrief: "", completionBoundary, goalRevision: 1, reviewMode: input.reviewMode ?? inferredReviewMode,
 				verificationPolicy, goalVerifications: [],
 				...(optionalText(input.reviewerModel, "reviewerModel") ? { reviewerModel: input.reviewerModel!.trim() } : {}),
 				completionReviews: [], status: "active", execution: { epoch: 1, status: "idle" },
@@ -927,22 +934,35 @@ export class WorkStateStore {
 			return copy(next);
 		});
 	}
-	private assertSubmissionCanAccept(state: SessionWorkState, plan: GoalWorkPlan, item: WorkItem, submission: WorkItemSubmission, ignorePromotion = false): void {
+	private assertSubmissionCanAccept(
+		state: SessionWorkState,
+		plan: GoalWorkPlan,
+		item: WorkItem,
+		submission: WorkItemSubmission,
+		managerEvidenceRefs: string[] = [],
+		ignorePromotion = false,
+	): void {
 		if (submission.goalRevision !== state.goalRevision || submission.workItemRevision > item.revision) throw new Error("Submission revision 已过期，不能验收");
+		const mode = item.verificationPolicy.mode;
 		if (submission.source === "delegation") {
 			const receipt = submission.executionReceipt;
 			if (!receipt || !submission.executionReceiptId || receipt.id !== submission.executionReceiptId || !receipt.sealedAt) throw new Error("Submission 缺少 sealed ExecutionReceipt");
 			if (receipt.delegationId !== submission.delegationId || receipt.goalId !== state.goalId || receipt.workItemId !== item.id || receipt.goalRevision !== undefined && receipt.goalRevision !== state.goalRevision || receipt.workItemRevision !== undefined && receipt.workItemRevision !== submission.workItemRevision || receipt.reportedOutcome !== "completed") throw new Error("ExecutionReceipt 与当前 Submission/契约不匹配");
 			if (!receipt.taskContractHash || receipt.taskContractHash !== workItemContractHash(state, plan, { ...item, revision: submission.workItemRevision })) throw new Error("ExecutionReceipt taskContractHash 不匹配当前 WorkItem 契约");
 			if (receipt.integrity === "violation") throw new Error("ExecutionReceipt integrity violation，不能验收");
-			for (const criterion of item.acceptanceCriteria) {
-				const result = receipt.requirementResults.find((entry) => entry.requirement === criterion);
-				if (!result || result.status !== "provided" || !result.evidenceRefs.length) throw new Error(`缺少验收条件证据：${criterion}`);
+			// manager_review is deliberately the trust boundary where the Manager may
+			// inspect a plain Worker result, an Artifact, or a read-only observation and
+			// record its own evidence references. Requiring the Worker to have emitted
+			// structured reportedEvidence makes ordinary CLI/legacy Connectors
+			// impossible to accept and turns review into a circular self-proof. Stronger
+			// modes are still gated by a clean, criterion-complete VerificationRecord
+			// below; every mode still requires a sealed, matching, non-violation receipt.
+			if (mode === "manager_review" && strings(managerEvidenceRefs, "evidenceRefs").length === 0) {
+				throw new Error("manager_review accepted 必须引用至少一条 Delegation、Artifact、消息或只读观察证据");
 			}
 		} else if (item.workspaceExecutionPolicy.mode !== "read_only_shared") {
 			throw new Error("Manager Submission 只能来自 read_only_shared WorkItem");
 		}
-		const mode = item.verificationPolicy.mode;
 		if (verificationRank[mode] > verificationRank.manager_review) {
 			const verification = [...submission.verifications].reverse().find((entry) => entry.status === "passed");
 			if (!verification || verification.mode !== mode || verification.integrity !== "clean" || verification.goalId !== state.goalId || verification.goalRevision !== state.goalRevision || verification.workItemId !== item.id || verification.workItemRevision !== submission.workItemRevision || verification.goalEpoch !== state.execution.epoch || verification.inputFingerprint !== submission.inputFingerprint) throw new Error(`当前 WorkItem 需要匹配的 ${mode} VerificationRecord`);
@@ -977,7 +997,7 @@ export class WorkStateStore {
 			if (!item || item.status !== "submitted") throw new Error("只有 submitted WorkItem 可以请求 accepted");
 			const submission = [...item.submissions].reverse().find((entry) => !entry.review);
 			if (!submission) throw new Error("没有待验收 Submission");
-			this.assertSubmissionCanAccept(state, state.plan, state.plan.items[workItemId]!, submission, true);
+			this.assertSubmissionCanAccept(state, state.plan, state.plan.items[workItemId]!, submission, input.evidenceRefs ?? [], true);
 			if (submission.acceptanceIntent) throw new Error("当前 Submission 已冻结 Manager accepted 意图，不允许覆盖");
 			const timestamp = now();
 			submission.acceptanceIntent = { verdict: "accepted", summary: requiredText(input.summary, "summary"), evidenceRefs: strings(input.evidenceRefs ?? [], "evidenceRefs"), requestedAt: timestamp };
@@ -1089,7 +1109,7 @@ export class WorkStateStore {
 			if (!item || item.status !== "submitted") throw new Error("只有 submitted WorkItem 可以验收");
 			const submission = [...item.submissions].reverse().find((entry) => !entry.review);
 			if (!submission) throw new Error("没有待验收 Submission");
-			if (input.verdict === "accepted") this.assertSubmissionCanAccept(state, plan, item, submission);
+			if (input.verdict === "accepted") this.assertSubmissionCanAccept(state, plan, item, submission, input.evidenceRefs ?? []);
 			const timestamp = now();
 			submission.review = { verdict: input.verdict, summary: requiredText(input.summary, "summary"), evidenceRefs: strings(input.evidenceRefs ?? [], "evidenceRefs"), reviewedAt: timestamp };
 			item.status = input.verdict;
@@ -1239,12 +1259,18 @@ export class WorkStateStore {
 	}
 	async reconcileDelegations(delegations: Array<{
 		id: string; managerSessionId: string; goalId?: string; workItemId?: string; goalEpoch?: number;
+		purpose?: "execution" | "verification";
 		executionState: "admitted" | "waiting_admission" | "running" | "waiting_input" | "reported_completed" | "reported_failed" | "cancel_requested" | "reconciling" | "cancelled" | "observation_lost"; revision: number; updatedAt: string;
 		receipt?: ExecutionReceipt;
 		result?: unknown;
 	}>): Promise<{ projected: number; interrupted: number }> {
+		const executionDelegations = delegations.filter((item) => item.purpose !== "verification");
 		let projected = 0;
-		for (const item of delegations) {
+		for (const item of executionDelegations) {
+			// Verification Delegations are evidence producers for an existing
+			// Submission, never a new execution attempt. Replaying them through
+			// noteDelegation would compare a verifier Receipt with the WorkItem's
+			// execution contract and can both crash startup and invent a Submission.
 			if (item.goalId && item.workItemId && item.goalEpoch !== undefined && (item.executionState === "waiting_admission" || item.executionState === "waiting_input" || item.executionState === "running" || item.executionState === "reconciling")) {
 				const state = await this.getGoal(item.managerSessionId, item.goalId);
 				if (state?.plan?.items[item.workItemId] && state.execution.epoch === item.goalEpoch) {
@@ -1268,7 +1294,7 @@ export class WorkStateStore {
 		}
 		let interrupted = 0;
 		const sessions = new Map<string, typeof delegations>();
-		for (const item of delegations) {
+		for (const item of executionDelegations) {
 			if (!item.result || typeof item.result !== "object" || (item.result as { errorCode?: unknown }).errorCode !== "server_restart" || item.goalEpoch === undefined) continue;
 			const list = sessions.get(item.managerSessionId) ?? [];
 			list.push(item); sessions.set(item.managerSessionId, list);
@@ -1282,7 +1308,7 @@ export class WorkStateStore {
 			await this.interruptGoal(sessionId, state.revision, { kind: "server_restart", fingerprint, delegationIds: ids }, `reconcile:${fingerprint}`, state.goalId);
 			interrupted++;
 		}
-		for (const item of delegations) {
+		for (const item of executionDelegations) {
 			if (item.executionState !== "observation_lost" || item.goalEpoch === undefined) continue;
 			const state = await this.getActive(item.managerSessionId);
 			if (!state || item.goalId !== state.goalId || state.execution.epoch !== item.goalEpoch || state.execution.status === "interrupted") continue;
@@ -1307,8 +1333,8 @@ export class WorkStateStore {
 			await this.write(data);
 		});
 	}
-	async createDecision(input: Omit<DecisionRequest, "id" | "goalId" | "status" | "createdAt" | "updatedAt">, operationId: string = randomUUID(), expectedRevision?: number, expectedGoalId?: string): Promise<DecisionRequest> {
-		const payload = { input, expectedRevision, expectedGoalId };
+	async createDecision(input: Omit<DecisionRequest, "id" | "goalId" | "status" | "createdAt" | "updatedAt">, operationId: string = randomUUID(), expectedRevision?: number, expectedGoalId?: string, expectedEpoch?: number): Promise<DecisionRequest> {
+		const payload = { input, expectedRevision, expectedGoalId, expectedEpoch };
 		return this.serialize(async () => {
 			const data = await this.load();
 			const state = this.active(data, input.sessionId);
@@ -1316,7 +1342,7 @@ export class WorkStateStore {
 			const goalId = expectedGoalId ?? state.goalId;
 			const replay = this.replay<DecisionRequest>(data, input.sessionId, operationId, "create_decision", payload, goalId);
 			if (replay) return replay;
-			if (expectedRevision !== undefined) this.current(state, expectedRevision, undefined, goalId);
+			if (expectedRevision !== undefined) this.current(state, expectedRevision, expectedEpoch, goalId);
 			else if (state.goalId !== goalId) throw new WorkStateOperationConflictError("当前 Goal 已变化，请重新读取目标状态", "stale_goal_state");
 			const timestamp = now();
 			const decision: DecisionRequest = {

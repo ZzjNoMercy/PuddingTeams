@@ -1,6 +1,7 @@
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import type { WorkerActivity } from "./types.js";
+import { redactValue } from "./redaction.js";
 
 export interface DelegationTimelineEvent extends WorkerActivity {
 	id: string;
@@ -10,6 +11,10 @@ export interface DelegationTimelineEvent extends WorkerActivity {
 }
 
 type TimelineListener = (event: DelegationTimelineEvent) => void;
+
+function redactActivity(activity: WorkerActivity): WorkerActivity {
+	return redactValue(activity);
+}
 
 /**
  * Append-only, delegation-scoped worker activity log.
@@ -79,7 +84,7 @@ export class DelegationTimelineStore {
 			seq += 1;
 			this.nextSeq.set(delegationId, seq);
 			const event: DelegationTimelineEvent = {
-				...activity,
+				...redactActivity(activity),
 				id: `${delegationId}:${seq}`,
 				delegationId,
 				seq,

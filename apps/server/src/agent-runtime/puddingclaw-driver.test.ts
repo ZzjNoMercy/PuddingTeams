@@ -288,6 +288,74 @@ test("PuddingClawDriver：input_required 时原任务文本进 providerState 私
 	assert.ok(needs && needs.type === "input_required");
 	assert.equal(needs.providerState?.task, "分析一下上月的配置数据", "clarify-and-retry 需要原任务文本");
 	assert.equal(needs.providerState?.continuation_token, undefined, "该形发问本来就没有 token");
+	const stdin = JSON.parse(readFileSync(path.join(dir, "stdin.txt"), "utf-8")) as { workspace_path?: string };
+	assert.equal(stdin.workspace_path, ws, "spawn transport 也必须把目标 Workspace 传给 PuddingClaw");
+});
+
+test("PuddingClaw 业务问答：逐题映射为 PWCP question 并保留同 Run 续跑状态", () => {
+	const event = normalizePuddingClawJson({
+		status: "needs_input",
+		run_id: "run-hitl",
+		continuation_token: "token-hitl",
+		needs_input: {
+			type: "user_input",
+			request_id: "upstream-request",
+			questions: [{
+				id: "choice",
+				prompt: "请选择 A 或 B",
+				type: "single_choice",
+				options: [{ id: "A", label: "方案 A" }, { id: "B", label: "方案 B" }],
+			}],
+		},
+	});
+	assert.equal(event.type, "input_required");
+	if (event.type !== "input_required") return;
+	assert.equal(event.result.interaction.kind, "question");
+	assert.deepEqual(event.result.interaction.requests, [{ requestId: "choice", prompt: "请选择 A 或 B", options: ["A", "B"] }]);
+	assert.equal(event.providerState?.interaction_type, "user_input");
+	assert.equal(event.providerState?.upstream_request_id, "upstream-request");
+	assert.deepEqual(event.providerState?.questions, [{ requestId: "choice", questionId: "choice", optionIds: ["A", "B"], type: "single_choice" }]);
+});
+
+test("PuddingClawDriver：业务问答答案组装为同一上游 request 的 respond payload", async () => {
+	const dir = freshDir();
+	const ws = path.join(dir, "target-workspace");
+	mkdirSync(ws, { recursive: true });
+	const cli = path.join(dir, "fake-user-input-resume.sh");
+	const stdinCapture = path.join(dir, "stdin.json");
+	writeFileSync(cli, [
+		"#!/bin/sh",
+		'printf "%s\\n" "$@" > "$ARGV_CAPTURE"',
+		'cat > "$STDIN_CAPTURE"',
+		'printf "%s\\n" \'{"status":"completed","final_response":"resumed","run_id":"run-hitl","session_id":"session-hitl"}\'',
+		"",
+	].join("\n"));
+	chmodSync(cli, 0o755);
+	const driver = new PuddingClawDriver({ command: cli });
+	const events = await collect(driver.respond({
+		runHandle: "run-hitl",
+		interactionHandle: "interaction-hitl",
+		requestId: "platform-request",
+		responses: [{ requestId: "choice", action: "answer", value: "B" }],
+	}, {
+		cwd: ws,
+		env: { ...process.env, ARGV_CAPTURE: path.join(dir, "argv.txt"), STDIN_CAPTURE: stdinCapture },
+		providerState: {
+			continuation_token: "token-hitl",
+			interaction_type: "user_input",
+			upstream_request_id: "upstream-request",
+			questions: [{ requestId: "choice", questionId: "choice", optionIds: ["A", "B"], type: "single_choice" }],
+		},
+	}));
+	assert.equal(events.at(-1)?.type, "completed");
+	assert.deepEqual(readFileSync(path.join(dir, "argv.txt"), "utf-8").trim().split("\n").slice(0, 2), ["agent", "respond"]);
+	const payload = JSON.parse(readFileSync(stdinCapture, "utf-8")) as Record<string, unknown>;
+	assert.equal(payload.workspace_path, ws);
+	assert.deepEqual(payload.decisions, [{
+		request_id: "upstream-request",
+		action: "submit",
+		answers: [{ question_id: "choice", option_ids: ["B"], text: "" }],
+	}]);
 });
 
 test("PuddingClawDriver：respond 无 token 时按用户选择并入原任务重跑", async () => {
@@ -303,7 +371,7 @@ test("PuddingClawDriver：respond 无 token 时按用户选择并入原任务重
 	};
 	const events = await collect(
 		driver.respond(
-			{ runHandle: "", interactionHandle: "h", requestId: "req-2", responses: [{ requestId: "req-1", action: "approve", scope: "产品配置分析" }] },
+			{ runHandle: "", interactionHandle: "h", requestId: "req-2", responses: [{ requestId: "req-1", action: "answer", value: "产品配置分析" }] },
 			ctx,
 		),
 	);
@@ -408,12 +476,13 @@ test("PuddingClawDriver：长连接丢失后用同一 request_id 恢复幂等终
 	assert.ok(updates.some((text) => text.includes("仍在执行")));
 });
 
-test("PuddingClaw 时间线：17 类公共事件均有结构化投影，工具负载脱敏", () => {
+test("PuddingClaw 时间线：19 类公共事件均有结构化投影，工具负载脱敏", () => {
 	const names = [
 		"run_starting", "task_preflight_started", "task_preflight_completed", "run_started",
 		"run_outcome", "goal_run_continued", "new_response", "token", "segment_break",
 		"segment_content_replaced", "tool_start", "tool_end", "permission_required",
-		"permission_resolved", "final_response", "done", "error",
+		"permission_resolved", "user_input_required", "user_input_resolved",
+		"final_response", "done", "error",
 	];
 	const projected = names.map((event, index) => projectPuddingClawActivity({
 		event,
@@ -432,6 +501,8 @@ test("PuddingClaw 时间线：17 类公共事件均有结构化投影，工具�
 	assert.equal(projected[10]!.activity.kind, "tool");
 	assert.match(projected[10]!.activity.content ?? "", /\[redacted\]/);
 	assert.ok(!(projected[10]!.activity.content ?? "").includes("must-not-leak"));
+	assert.equal(projected[14]!.activity.title, "等待业务选择");
+	assert.equal(projected[15]!.activity.title, "业务选择已提交");
 });
 
 test("PuddingClaw 时间线：连续 token 在落盘前合并，非 token 事件结束分组", () => {

@@ -63,3 +63,23 @@ test("P3-G: reviewer prompt 只包含冻结输入与结构化输出契约", () =
 	assert.match(prompt, /needs_human/);
 	assert.doesNotMatch(prompt, /chain.of.thought/i);
 });
+
+test("P3-G: 待发送最终报告可作为汇报类完成条件的冻结证据", () => {
+	const evidenceId = "prepared-final-report:goal-1:2";
+	const input = {
+		goal: "完成并汇报三轴状态",
+		completionBoundary: "汇总 Submission、VerificationRecord、Settlement 三轴状态并汇报",
+		goalRevision: 2,
+		currentBrief: "Submission=submitted；VerificationRecord=passed；Settlement=accepted。",
+		delegations: [], artifactIds: [], artifacts: [], humanDecisions: [],
+		managerEvidence: [{ id: evidenceId, kind: "prepared_final_report", content: "Submission=submitted；VerificationRecord=passed；Settlement=accepted。" }],
+	};
+	const prompt = buildCompletionReviewPrompt(input);
+	assert.match(prompt, /prepared_final_report/);
+	const review = parseCompletionReview(
+		JSON.stringify({ verdict: "satisfied", criteria: [{ criterion: input.completionBoundary, status: "satisfied", evidenceRefs: [evidenceId], explanation: "冻结报告覆盖三轴状态" }], gaps: [] }),
+		input,
+		meta,
+	);
+	assert.equal(review.verdict, "satisfied");
+});

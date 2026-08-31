@@ -35,6 +35,25 @@ test("历史回放保留 running 投影里的 Delegation 与执行过程入口",
 	});
 });
 
+test("隐藏的 interaction_required 审计投影仍渲染审批卡，历史与实时一致", () => {
+	const interaction = {
+		role: "custom",
+		customType: "pudding:interaction_required",
+		content: "等待准入",
+		display: false,
+		details: { interactionId: "I1", delegationId: "D1", worker: "codex", status: "pending" },
+		timestamp: 2,
+	} as unknown as PiMessage;
+	const history = renderHistory([interaction]);
+	assert.equal(history.length, 1);
+	assert.equal(history[0]?.customType, "pudding:interaction_required");
+	assert.equal((history[0]?.details as { interactionId?: string })?.interactionId, "I1");
+
+	const live = reducePiEvent([], { type: "message_start", message: interaction });
+	assert.equal(live.length, 1);
+	assert.equal(live[0]?.customType, "pudding:interaction_required");
+});
+
 test("延迟 toolResult 按 toolCallId 回填原 assistant，不误绑到最新一轮", () => {
 	const rendered = renderHistory([
 		{

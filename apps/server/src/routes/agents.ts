@@ -76,6 +76,14 @@ function connectorSecurityWarnings(agent: AgentConfig): string[] {
 export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, deps: AgentsRouteDeps = {}): void {
 	const { credentials, runtime, invoker, extensions, sessions, capabilityStateRoot } = deps;
 
+	/** 给 API 的 Agent 视图补充包内默认头像事实；不写回 agents.json。 */
+	function presentAgent(agent: AgentConfig): AgentConfig & { hasDefaultAvatar?: true } {
+		const connectorId = avatarConnectorId(agent);
+		return !agent.avatar && connectorId && extensions?.hasConnectorAvatar(connectorId)
+			? { ...agent, hasDefaultAvatar: true }
+			: agent;
+	}
+
 	function connectorBindingIssue(binding: unknown): string | undefined {
 		if (!binding || typeof binding !== "object" || Array.isArray(binding)) return undefined;
 		const value = binding as Record<string, unknown>;
@@ -103,7 +111,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		const affectedSessions = sessions
 			? sessions.agentSessionStats(agent.name)
 			: { affectedSessions: 0, activeNow: 0, reloadPending: 0 };
-		return { agent, revision: agent.extensionRevision ?? 0, affectedSessions, securityWarnings: connectorSecurityWarnings(agent) };
+		return { agent: presentAgent(agent), revision: agent.extensionRevision ?? 0, affectedSessions, securityWarnings: connectorSecurityWarnings(agent) };
 	}
 
 	function notFoundOr400(reply: { code: (n: number) => { send: (b: unknown) => unknown } }, err: unknown): unknown {
@@ -143,14 +151,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		// §11：未上传头像但 connector 声明了包内默认头像时，标记 hasDefaultAvatar，
 		// 前端据此走 avatar URL（GET avatar 路由会回退到包内资源）。
 		if (!extensions) return { agents };
-		return {
-			agents: agents.map((a) => {
-				const connectorId = avatarConnectorId(a);
-				return !a.avatar && connectorId && extensions.hasConnectorAvatar(connectorId)
-					? { ...a, hasDefaultAvatar: true }
-					: a;
-			}),
-		};
+		return { agents: agents.map(presentAgent) };
 	});
 
 	app.get<{ Params: { name: string } }>("/api/agents/:name/execution-capabilities", async (req, reply) => {
@@ -182,25 +183,35 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 	app.post<{ Body: Partial<Record<string, unknown>> }>("/api/agents", async (req, reply) => {
 		try {
 			const body = { ...(req.body ?? {}) } as Record<string, unknown>;
+			let generateUniqueName = false;
 			const connectorIssue = connectorBindingIssue(body.connector);
 			if (connectorIssue) return reply.code(400).send({ error: connectorIssue });
 			// name/id 解耦：未显式给内部 id（name）时，从显示名派生并保证唯一。
 			if (typeof body.name !== "string" || !body.name.trim()) {
 				const displayName = typeof body.displayName === "string" ? body.displayName.trim() : "";
 				if (!displayName) return reply.code(400).send({ error: "displayName 必填（name 缺省时据此生成内部 id）" });
-				const taken = new Set((await teams.listAgents()).map((a) => a.name));
-				const base = agentIdFromDisplayName(displayName);
-				let generated = base;
-				for (let i = 2; taken.has(generated); i += 1) generated = `${base}-${i}`;
-				body.name = generated;
+				body.name = agentIdFromDisplayName(displayName);
+				generateUniqueName = true;
 			} else if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(body.name.trim())) {
 				// 显式 id 必须是文件名/工具名安全字符（生成路径已保证）。
 				return reply.code(400).send({ error: "name（内部 id）只能包含字母、数字、连字符或下划线，且以字母或数字开头" });
 			}
-			const agent = await teams.upsertAgent(body as unknown as AgentConfig);
-			return { agent };
+			const agent = await teams.upsertAgent(body as unknown as AgentConfig, { createOnly: true, generateUniqueName });
+			return mutationReply(agent);
 		} catch (err) {
 			return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+		}
+	});
+
+	/**
+	 * 复制 Worker 配置并创建独立、默认停用的新身份。凭证、env、头像、
+	 * Session/Window 关系不复制；Capability binding id 由存储层重新生成。
+	 */
+	app.post<{ Params: { name: string } }>("/api/agents/:name/duplicate", async (req, reply) => {
+		try {
+			return mutationReply(await teams.duplicateAgent(req.params.name));
+		} catch (err) {
+			return notFoundOr400(reply, err);
 		}
 	});
 
@@ -227,11 +238,15 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 					});
 					return mutationReply(agent);
 				}
+				const existing = await teams.getAgent(req.params.name);
+				if (!existing) return reply.code(404).send({ error: "agent not found" });
+				const connectorIssue = connectorBindingIssue(req.body?.connector);
+				if (connectorIssue) return reply.code(400).send({ error: connectorIssue });
 				const agent = await teams.upsertAgent({
 					...(req.body as unknown as AgentConfig),
 					name: req.params.name,
 				});
-				return { agent };
+				return mutationReply(agent);
 			} catch (err) {
 				return notFoundOr400(reply, err);
 			}

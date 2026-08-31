@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { mkdirSync, mkdtempSync, realpathSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { AgentRuntime, SessionConflictError } from "../agent-runtime/runtime.js";
@@ -432,6 +432,8 @@ test("Phase1 回归: needs_input 归一化只产生一个 request，选项不破
 	const req = event.result.interaction.requests[0]!;
 	assert.equal(req.requestId, "model-select-1", "必须保留真实 request_id");
 	assert.equal(req.prompt, "请选择分析模型");
+	assert.equal(event.result.interaction.kind, "question");
+	assert.deepEqual(req.options, ["m1", "m2"], "业务选项必须原样保留，不能转换成授权 scope");
 	assert.equal(event.result.sessionHandle, "s1", "sessionHandle 进入 result 供持久化");
 	assert.equal(event.result.runHandle, "r1", "runHandle 进入 result 供持久化");
 	const ps = (event as { providerState?: Record<string, unknown> }).providerState;
@@ -789,6 +791,45 @@ test("P3-1: Driver throw 与无边界流都落持久化 failed，不留下 runni
 		else assert.equal((await promise).status, "failed");
 		assert.equal((await runtime.listDelegations(`window-${behavior}`))[0]?.executionState, "reported_failed");
 	}
+});
+
+test("Runtime：Worker 更新、终态结果与 Delegation 状态共享同一递归脱敏边界", async () => {
+	const { delegations, secrets, dir } = await makeRuntime();
+	const updates: Array<{ content: string; details?: unknown }> = [];
+	const driver: AgentDriver = {
+		id: "redaction-worker",
+		async capabilities() {
+			return { operations: ["run"], interactionKinds: [], progress: "stream", transport: "spawn" };
+		},
+		async *run(_input, ctx): AsyncIterable<AgentEvent> {
+			ctx.onUpdate?.("Authorization: Bearer progress-token", {
+				activity: {
+					source: "test", sourceEvent: "assistant", kind: "assistant", status: "completed",
+					title: "sk-progress-secret", content: '{"api_key":"nested-progress-secret"}',
+				},
+			});
+			yield { type: "completed", result: {
+				agentId: "redaction-worker", status: "completed",
+				content: "plain sk-test-redaction-only and Authorization: Bearer test-token",
+				meta: { nested: [{ access_token: "nested-secret" }], json: '{"secret":"json-secret"}' },
+			} };
+		},
+		async *continue() {}, async *respond() {},
+		async probe() { throw new Error("unused"); },
+	};
+	const runtime = new AgentRuntime(delegations, secrets, () => driver);
+	const outcome = await runtime.delegate(
+		{ ...PROJECT, windowId: "window-redaction", managerSessionId: "manager", agentId: driver.id, message: "safe", mode: "run" },
+		{ cwd: process.cwd(), env: {}, onUpdate: (content, details) => updates.push({ content, details }) },
+	);
+	const publicSurface = JSON.stringify({ outcome, updates });
+	const persisted = readFileSync(path.join(dir, "delegations.json"), "utf8");
+	for (const secret of ["progress-token", "sk-progress-secret", "nested-progress-secret", "sk-test-redaction-only", "test-token", "nested-secret", "json-secret"]) {
+		assert.ok(!publicSurface.includes(secret), `Runtime 公共输出不得包含 ${secret}`);
+		assert.ok(!persisted.includes(secret), `Delegation 状态不得包含 ${secret}`);
+	}
+	assert.match(publicSurface, /\[redacted\]/);
+	assert.match(persisted, /\[redacted\]/);
 });
 
 

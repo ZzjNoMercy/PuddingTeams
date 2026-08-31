@@ -52,6 +52,8 @@ test("isolated_worktree materializes clean, staged, unstaged, and non-ignored un
 		assert.equal(await readFile(path.join(scope.executionCwd, "new.txt"), "utf8"), "untracked\n");
 		await writeFile(path.join(scope.executionCwd, "tracked.txt"), "worker\n");
 		await writeFile(path.join(scope.executionCwd, "worker.txt"), "created\n");
+		await git(scope.executionCwd, ["add", "tracked.txt", "worker.txt"]);
+		await git(scope.executionCwd, ["-c", "user.email=worker@example.com", "-c", "user.name=Worker", "commit", "-m", "worker commit"]);
 		const changeSet = await coordinator.capture(scope.id, scope.ownerToken);
 		assert.deepEqual(changeSet.changedPaths, ["tracked.txt", "worker.txt"]);
 		assert.equal(changeSet.promotionState, "pending");
@@ -84,6 +86,29 @@ test("isolated_worktree rejects non-Git projects and nested repositories", async
 			(error: unknown) => error instanceof WorkspaceExecutionError && error.code === "unsupported_layout",
 		);
 		await rm(repo, { recursive: true, force: true });
+	} finally {
+		await rm(root, { recursive: true, force: true });
+		await rm(state, { recursive: true, force: true });
+	}
+});
+
+test("isolated_worktree ignores package-manager symlinks under ignored directories", async () => {
+	const root = await gitRepo();
+	const state = await temp("pt-execution-state-");
+	try {
+		await writeFile(path.join(root, ".gitignore"), "node_modules/\n");
+		await git(root, ["add", ".gitignore"]);
+		await git(root, ["commit", "-m", "ignore dependencies"]);
+		await mkdir(path.join(root, "node_modules", ".pnpm"), { recursive: true });
+		await import("node:fs/promises").then(({ symlink }) =>
+			symlink(path.join(root, "tracked.txt"), path.join(root, "node_modules", "linked-package")),
+		);
+		const coordinator = new WorkspaceExecutionCoordinator(state);
+		await coordinator.init();
+		const scope = await coordinator.begin({ workspacePath: root, mode: "isolated_worktree", delegationId: "d-pnpm" });
+		assert.notEqual(scope.executionCwd, root);
+		assert.equal(await readFile(path.join(scope.executionCwd, "tracked.txt"), "utf8"), "base\n");
+		await assert.rejects(() => readFile(path.join(scope.executionCwd, "node_modules", "linked-package")));
 	} finally {
 		await rm(root, { recursive: true, force: true });
 		await rm(state, { recursive: true, force: true });

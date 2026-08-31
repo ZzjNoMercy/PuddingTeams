@@ -72,6 +72,21 @@ export interface AgentInvokeResult {
 }
 
 /**
+ * The Workspace coordinator, not the Worker, owns checkout materialization.
+ * Make that boundary explicit in the actual Driver input so a generic coding
+ * agent does not interpret "in isolated_worktree" as an instruction to create
+ * a second nested repository that cannot be captured or promoted safely.
+ */
+export function messageForWorkspaceExecution(message: string, policy?: WorkspaceExecutionPolicy): string {
+	if (policy?.mode !== "isolated_worktree") return message;
+	return `${message}\n\n[PuddingTeams execution boundary]\n`
+		+ "- The current working directory is already the platform-created isolated checkout for this Run.\n"
+		+ "- Work directly in the current working directory and use its existing writable .git.\n"
+		+ "- Do not run git clone, git worktree add, or create any nested repository/worktree.\n"
+		+ "- Do not write the target checkout; PuddingTeams captures and promotes the current checkout after acceptance.";
+}
+
+/**
  * AgentInvoker：pi 工具（per-agent delegation Extension）与 AgentRuntime 之间
  * 的唯一业务通道。
  *
@@ -504,7 +519,7 @@ export class AgentInvoker {
 						completionBoundary: params.completionBoundary,
 						agentId: freshAgent.name,
 						agentRevision: freshAgent.extensionRevision ?? 0,
-						message,
+						message: messageForWorkspaceExecution(message, params.workspaceExecutionPolicy),
 						mode,
 						sessionHandle: nextSession,
 						requestId: params.operationId,
@@ -537,6 +552,10 @@ export class AgentInvoker {
 			agent = prepared.agent;
 			sessionHandle = prepared.sessionHandle;
 			delegation = await prepared.runPromise;
+			// A normal delegate completion is the primary Submission boundary. Notify
+			// the WorkState observer here as well as on respond/cancel paths so
+			// auto_on_submission verification is scheduled deterministically.
+			this.observeDelegationState();
 		} catch (err) {
 			if (err instanceof SessionConflictError) {
 				// M5：冲突时把该 session 已有的 pending interaction 一起带出，
@@ -589,6 +608,7 @@ export class AgentInvoker {
 								: `worker「${agentDisplayName(agent)}」需要人工审批才能继续。`,
 							details: {
 								interactionId: interaction.id,
+								kind: interaction.kind,
 								source: interaction.source,
 								workerStarted: d.workerStarted,
 								delegationId: d.id,
@@ -1132,9 +1152,15 @@ export class AgentInvoker {
 				// direct 窗口无 manager 回合，taskResultOptions 降级为仅展示），并把
 				// worker 的真实结果带给 manager，否则汇总轮无内容可转述。
 				const details = { ...(outcome.result.meta ?? {}), artifacts: outcome.result.artifacts, usage: outcome.result.usage };
+				// The manager model consumes the custom message body, not its structured
+				// details.  A run that crossed an Interaction boundary no longer returns
+				// through the original delegate tool, so this resumed terminal projection
+				// must carry the Delegation id in-band as well.  Otherwise a required
+				// followup cannot fill parentDelegationId and cannot resume the same Run.
+				const delegationNote = `\n\n（delegationId：${d.id}——需要该 worker 接力/追问时，用 handoffKind="followup" 并把它填进 parentDelegationId）`;
 				const taskResult = {
 					customType: "pudding:task_result",
-					content: outcome.result.content ?? "",
+					content: `${outcome.result.content ?? ""}${delegationNote}`,
 					details: { interactionId, delegationId: d.id, worker: d.agentId, status: "completed", ...details },
 				};
 				if (targets.manager) {
@@ -1216,10 +1242,12 @@ export class AgentInvoker {
 						content: `worker「${workerLabel}」需要更多审批才能继续。`,
 							details: {
 								interactionId: outcome.interaction.id,
+								kind: outcome.interaction.kind,
 								source: outcome.interaction.source,
 								workerStarted: d.workerStarted,
-							delegationId: d.id,
-							worker: d.agentId,
+								delegationId: d.id,
+								...(d.goalId ? { goalId: d.goalId } : {}),
+								worker: d.agentId,
 							status: "pending",
 							revision: outcome.interaction.revision,
 							requests: outcome.interaction.requests.map((r) => ({

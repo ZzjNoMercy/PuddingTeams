@@ -592,6 +592,7 @@ function DelegateCard({ call, onOpenWindow, timestamp }: { call: ToolCallView; o
 				goalId?: string;
 				processView?: boolean;
 				revision?: number;
+				kind?: "permission" | "question" | "confirmation";
 				source?: "worker" | "platform_policy";
 				workerStarted?: boolean;
 				requests?: Array<{ requestId: string; prompt: string; command?: string; path?: string; risk?: string; options?: string[] }>;
@@ -632,6 +633,7 @@ function DelegateCard({ call, onOpenWindow, timestamp }: { call: ToolCallView; o
 					interactionId={details.interactionId}
 					worker={worker ?? "worker"}
 					goalId={details.goalId}
+					kind={details.kind}
 					requests={details.requests}
 					revision={details.revision}
 					windowId={details.windowId}
@@ -874,6 +876,7 @@ function CustomMessageEntry({
 				sessionHandle?: string;
 				processView?: boolean;
 				revision?: number;
+				kind?: "permission" | "question" | "confirmation";
 				source?: "worker" | "platform_policy";
 				workerStarted?: boolean;
 				usage?: TaskUsage;
@@ -978,6 +981,7 @@ function CustomMessageEntry({
 					interactionId={details?.interactionId}
 					worker={details?.worker ?? "worker"}
 					goalId={details?.goalId}
+					kind={details?.kind}
 				requests={details?.requests}
 					revision={details?.revision}
 				windowId={details?.windowId}

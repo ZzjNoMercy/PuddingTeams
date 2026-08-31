@@ -223,10 +223,13 @@ export function useChat(sessionId: string) {
 		async (text: string, attachments: MessageAttachmentInput[] = []) => {
 			const content = text.trim();
 			if ((!content && attachments.length === 0) || running) return;
+			setError(null);
 			try {
 				await sendMessage(sessionId, content, attachments);
 			} catch (err) {
-				setError(err instanceof Error ? err.message : String(err));
+				const message = err instanceof Error ? err.message : String(err);
+				setError(message);
+				throw err;
 			}
 		},
 		[sessionId, running],

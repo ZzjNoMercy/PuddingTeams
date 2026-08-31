@@ -30,6 +30,8 @@ import {
 	CORE_TOOL_REQUEST_DECISION,
 	CORE_TOOL_CREATE_GOAL,
 	CORE_TOOL_UPDATE_WORK_PLAN,
+	CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM,
+	CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION,
 	CORE_TOOL_REVIEW_WORK_ITEM,
 	CORE_TOOL_READ_DELEGATION_RESULT,
 	CORE_TOOL_CREATE_GROUP,
@@ -186,8 +188,17 @@ test("Phase4: 窗口内只有成员的工具可见（direct 非成员 Agent 不�
 	assert.ok(plan.active.has(delegateToolName("alpha")), "direct 默认激活该 Agent 的基础委托工具");
 	assert.deepEqual(
 		[...plan.active].filter((n) => !n.startsWith("agent_")),
-		[CORE_TOOL_SEARCH, CORE_TOOL_READ_DELEGATION_RESULT],
-		"direct 无 Manager Goal 激活工具，Goal 专用工具仅注册不激活",
+		[
+			CORE_TOOL_SEARCH,
+			CORE_TOOL_READ_DELEGATION_RESULT,
+			CORE_TOOL_UPDATE_WORK_STATE,
+			CORE_TOOL_REQUEST_DECISION,
+			CORE_TOOL_UPDATE_WORK_PLAN,
+			CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM,
+			CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION,
+			CORE_TOOL_REVIEW_WORK_ITEM,
+		],
+		"Goal 状态机工具必须在 provider 请求前常驻，执行期再校验 durable Goal",
 	);
 
 	// factories 实际注册的工具名与 plan 一致。
@@ -209,7 +220,17 @@ test("Phase4: 激活策略——委托工具全窗口默认激活，capability �
 
 	const group = await planManagerTools(teams, catalog, { type: "group", members: ["alpha", "beta"] });
 	assert.ok(group.managed.has(delegateToolName("alpha")) && group.managed.has(delegateToolName("beta")));
-	const core = [CORE_TOOL_SEARCH, CORE_TOOL_READ_DELEGATION_RESULT, CORE_TOOL_CREATE_GOAL];
+	const core = [
+		CORE_TOOL_SEARCH,
+		CORE_TOOL_READ_DELEGATION_RESULT,
+		CORE_TOOL_UPDATE_WORK_STATE,
+		CORE_TOOL_REQUEST_DECISION,
+		CORE_TOOL_UPDATE_WORK_PLAN,
+		CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM,
+		CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION,
+		CORE_TOOL_REVIEW_WORK_ITEM,
+		CORE_TOOL_CREATE_GOAL,
+	];
 	assert.deepEqual(
 		[...group.active],
 		[...core, CORE_TOOL_INVITE, delegateToolName("alpha"), delegateToolName("beta")],
@@ -384,6 +405,36 @@ test("委托结果正文携带 delegationId，followup 凭它接力成功", asyn
 	);
 	const secondText = (second.content[0] as { text?: string }).text ?? "";
 	assert.ok(secondText.includes("done"), `followup 必须被接受并完成：${secondText}`);
+});
+
+test("正式 Goal 未建立 WorkPlan 时拒绝无 workItemId 委托，且 Worker 不得启动", async () => {
+	const teams = await makeTeams([agentConfig("alpha")]);
+	const invoker = await makeInvoker(teams, "alpha");
+	const catalog = new ExtensionCatalog();
+	const ctx: ManagerWindowContext = { type: "direct", members: ["alpha"] };
+	await teams.createWindow({ type: "direct", members: ["alpha"], sessionId: "sess-test" });
+	const workStates = new WorkStateStore(freshDir("pt-goal-delegation-gate-"));
+	await workStates.init();
+	await workStates.create({ sessionId: "sess-test", goal: "修改 Workspace", completionBoundary: "变更经过验收" });
+	const deps = { ...makeDeps(teams, invoker, catalog, ctx), workStates };
+	const plan = await planManagerTools(teams, catalog, ctx);
+	const { pi, tools } = mockPi();
+	for (const ext of buildManagerExtensionFactories(plan, deps)) {
+		const factory = typeof ext === "function" ? ext : ext.factory;
+		await factory(pi);
+	}
+
+	await assert.rejects(
+		() => tools.get(delegateToolName("alpha"))!.execute(
+			"call-orphan",
+			{ task: "直接写文件", intent: "实现 Goal", expectedOutcome: "文件存在", completionBoundary: "文件可验收" },
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		),
+		/必须先建立 WorkPlan 并绑定 workItemId/,
+	);
+	assert.equal((await invoker.delegationsForManagerSession("sess-test")).length, 0);
 });
 
 test("solo 委托的启动前失败先结束 manager 工具，不被单聊镜像阻塞", async () => {
@@ -650,6 +701,9 @@ test("Phase4: roster 由 before_agent_start 注入 system prompt 且每轮刷新
 	assert.ok(first.startsWith("base\n\n"), "roster 段落追加在原 system prompt 之后");
 	assert.ok(first.includes("alpha") && first.includes("beta"), "成员必须出现在 prompt 中");
 	assert.ok(first.includes(delegateToolName("alpha")), "prompt 必须给出委托工具名");
+	assert.match(first, /input_required\/respond/);
+	assert.match(first, /不得拆成询问前\/后两个 WorkItem/);
+	assert.match(first, /不得再发 followup、验证委托或替代委托/);
 
 	// 禁用 beta 后下一轮 prompt 即不再包含它（无需等会话重建）。
 	await teams.setEnabled("beta", false);
@@ -688,7 +742,7 @@ test("产品验收冻结: Goal 上下文在 custom-message turn 前按最新状�
 	};
 	assert.match(await textOf(), /尚未设置 Goal/);
 	assert.ok(getActive().includes(CORE_TOOL_CREATE_GOAL));
-	assert.ok(!getActive().includes(CORE_TOOL_UPDATE_WORK_PLAN));
+	assert.ok(getActive().includes(CORE_TOOL_UPDATE_WORK_PLAN), "同一 provider turn 创建 Goal 后必须仍可建立 WorkPlan");
 	await workStates.create({
 		sessionId: "sess-test",
 		goal: "冻结验收",
@@ -813,9 +867,11 @@ test("P3-G: independent Goal 的 resolved 提交先走隔离 reviewer 再原子�
 	await states.init();
 	const goal = await states.create({ sessionId: "sess-test", goal: "交付页面", completionBoundary: "页面验证通过" });
 	let reviewCalls = 0;
+	let reviewInput: import("./completion-review.js").CompletionReviewInput | undefined;
 	const sessions = {
-		async reviewGoalCompletion() {
+		async reviewGoalCompletion(_sessionId: string, input: import("./completion-review.js").CompletionReviewInput) {
 			reviewCalls++;
+			reviewInput = input;
 			return {
 				id: "review-1",
 				goalRevision: 1,
@@ -846,6 +902,12 @@ test("P3-G: independent Goal 的 resolved 提交先走隔离 reviewer 再原子�
 		{} as ExtensionContext,
 	);
 	assert.equal(reviewCalls, 1);
+	assert.deepEqual(reviewInput?.managerEvidence, [{
+		id: `prepared-final-report:${goal.goalId}:1`,
+		kind: "prepared_final_report",
+		content: "页面已生成并验证",
+		deliveryCondition: "Goal 完成后立即作为 manager 最终报告发送给用户",
+	}]);
 	assert.equal((result.details as { workState: { status: string } }).workState.status, "resolved");
 	assert.equal((await states.get("sess-test"))?.completionReviews.at(-1)?.id, "review-1");
 });

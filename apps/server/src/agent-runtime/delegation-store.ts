@@ -4,6 +4,7 @@ import path from "node:path";
 import type { ExecutionReceipt, ExecutionState } from "./execution-receipt.js";
 import type { DriverTransport, DriverWorkspaceCapabilities, InteractionRequest, NormalizedResult } from "./types.js";
 import type { WorkspaceExecutionPolicy } from "./workspace-execution.js";
+import { redactValue } from "./redaction.js";
 
 export interface DelegationRecord {
 	id: string;
@@ -177,30 +178,30 @@ export class DelegationStore {
 	private async writeFile(file: string, data: unknown): Promise<void> {
 		await mkdir(this.stateDir, { recursive: true });
 		const tmp = `${file}.${randomUUID().slice(0, 8)}.tmp`;
-		await writeFile(tmp, JSON.stringify(data, null, 2) + "\n", "utf-8");
+		await writeFile(tmp, JSON.stringify(redactValue(data), null, 2) + "\n", "utf-8");
 		await rename(tmp, file);
 	}
 
 	private async loadDelegations(): Promise<Record<string, DelegationRecord>> {
 		const raw = await this.readFile(this.delegationsFile);
 		const records = (raw.delegations ?? {}) as Record<string, DelegationRecord>;
-		return Object.fromEntries(Object.entries(records).map(([id, record]) => [id, {
+		return Object.fromEntries(Object.entries(records).map(([id, record]) => [id, redactValue({
 			...record,
 			// v2 gained this additive boundary flag; records written before the
 			// boundary existed are necessarily pre-observation and therefore false.
 			workerStarted: record.workerStarted === true,
-		}])) as Record<string, DelegationRecord>;
+		})])) as Record<string, DelegationRecord>;
 	}
 
 	private async loadInteractions(): Promise<Record<string, InteractionRecord>> {
 		const raw = await this.readFile(this.interactionsFile);
 		const records = (raw.interactions ?? {}) as Record<string, InteractionRecord>;
-		return Object.fromEntries(Object.entries(records).map(([id, record]) => [id, {
+		return Object.fromEntries(Object.entries(records).map(([id, record]) => [id, redactValue({
 			...record,
 			// Existing v2 interactions predate Teams platform-policy admission and
 			// are therefore Worker-originated.
 			source: record.source ?? "worker",
-		}])) as Record<string, InteractionRecord>;
+		})])) as Record<string, InteractionRecord>;
 	}
 
 	// ---- delegations ----
@@ -210,7 +211,7 @@ export class DelegationStore {
 			& { purpose?: DelegationRecord["purpose"] },
 	): Promise<DelegationRecord> {
 		const now = new Date().toISOString();
-		const record: DelegationRecord = {
+		const record: DelegationRecord = redactValue({
 			...input,
 			purpose: input.purpose ?? "execution",
 			id: randomUUID(),
@@ -219,7 +220,7 @@ export class DelegationStore {
 			revision: 0,
 			createdAt: now,
 			updatedAt: now,
-		};
+		});
 		await this.serialize(async () => {
 			const all = await this.loadDelegations();
 			if (record.operationId && Object.values(all).some((item) => item.operationId === record.operationId)) {
@@ -245,14 +246,14 @@ export class DelegationStore {
 			if (patch.executionState && ["reported_completed", "reported_failed", "cancelled"].includes(patch.executionState) && !patch.receipt && !rec.receipt) {
 				throw new Error(`Delegation ${id} 的终态 ${patch.executionState} 必须与 ExecutionReceipt 原子封存`);
 			}
-			const next: DelegationRecord = {
+			const next: DelegationRecord = redactValue({
 				...rec,
 				...patch,
 				id: rec.id,
 				createdAt: rec.createdAt,
 				revision: patch.revision ?? rec.revision,
 				updatedAt: new Date().toISOString(),
-			};
+			});
 			all[id] = next;
 			updated = next;
 			await this.writeFile(this.delegationsFile, { version: 2, delegations: all } satisfies DelegationsFile);
@@ -304,14 +305,14 @@ export class DelegationStore {
 			if (["reported_completed", "reported_failed", "cancelled"].includes(patch.executionState) && !patch.receipt && !rec.receipt) {
 				throw new Error(`Delegation ${id} 的终态 ${patch.executionState} 必须与 ExecutionReceipt 原子封存`);
 			}
-			const next: DelegationRecord = {
+			const next: DelegationRecord = redactValue({
 				...rec,
 				...patch,
 				id: rec.id,
 				createdAt: rec.createdAt,
 				revision: patch.revision ?? rec.revision,
 				updatedAt: new Date().toISOString(),
-			};
+			});
 			all[id] = next;
 			await this.writeFile(this.delegationsFile, { version: 2, delegations: all } satisfies DelegationsFile);
 			result = { applied: true, record: next };
@@ -332,7 +333,7 @@ export class DelegationStore {
 		input: Omit<InteractionRecord, "id" | "source" | "status" | "revision" | "createdAt" | "updatedAt"> & { source?: InteractionRecord["source"] },
 	): Promise<InteractionRecord> {
 		const now = new Date().toISOString();
-		const record: InteractionRecord = {
+		const record: InteractionRecord = redactValue({
 			...input,
 			source: input.source ?? "worker",
 			id: randomUUID(),
@@ -340,7 +341,7 @@ export class DelegationStore {
 			revision: 0,
 			createdAt: now,
 			updatedAt: now,
-		};
+		});
 		await this.serialize(async () => {
 			const all = await this.loadInteractions();
 			all[record.id] = record;
@@ -359,14 +360,14 @@ export class DelegationStore {
 			const all = await this.loadInteractions();
 			const rec = all[id];
 			if (!rec) return;
-			const next: InteractionRecord = {
+			const next: InteractionRecord = redactValue({
 				...rec,
 				...patch,
 				id: rec.id,
 				createdAt: rec.createdAt,
 				revision: patch.revision ?? rec.revision,
 				updatedAt: new Date().toISOString(),
-			};
+			});
 			all[id] = next;
 			updated = next;
 			await this.writeFile(this.interactionsFile, { version: 2, interactions: all } satisfies InteractionsFile);
@@ -390,14 +391,14 @@ export class DelegationStore {
 				result = { applied: false, record: rec };
 				return;
 			}
-			const next: InteractionRecord = {
+			const next: InteractionRecord = redactValue({
 				...rec,
 				...patch,
 				id: rec.id,
 				createdAt: rec.createdAt,
 				revision: patch.revision ?? rec.revision,
 				updatedAt: new Date().toISOString(),
-			};
+			});
 			all[id] = next;
 			await this.writeFile(this.interactionsFile, { version: 2, interactions: all } satisfies InteractionsFile);
 			result = { applied: true, record: next };
@@ -420,11 +421,11 @@ export class DelegationStore {
 				result = { applied: false, record: rec };
 				return;
 			}
-			const next: InteractionRecord = {
+			const next: InteractionRecord = redactValue({
 				...rec,
 				application: { ...rec.application, ...patch, updatedAt: new Date().toISOString() },
 				updatedAt: new Date().toISOString(),
-			};
+			});
 			all[id] = next;
 			await this.writeFile(this.interactionsFile, { version: 2, interactions: all } satisfies InteractionsFile);
 			result = { applied: true, record: next };

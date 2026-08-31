@@ -191,6 +191,7 @@ test("Phase5: DEFAULT_TEAMS 新结构——pinned manager + 三个发行内置 W
 		description: "负责UI/UX设计和PPT制作",
 		connector: { extensionId: "pi", connectorId: "pi", transport: "sdk", config: {} },
 		enabled: true,
+		extensionRevision: 1,
 	});
 	const claude = agents.find((a) => a.name === "claude-code");
 	assert.deepEqual(claude, {
@@ -198,6 +199,7 @@ test("Phase5: DEFAULT_TEAMS 新结构——pinned manager + 三个发行内置 W
 		description: "Anthropic Claude Code CLI worker（spawn + stream-json 流式）",
 		connector: { extensionId: "claude-code", connectorId: "claude-code", transport: "spawn", config: {} },
 		enabled: true,
+		extensionRevision: 1,
 	});
 	const codex = agents.find((a) => a.name === "codex");
 	assert.deepEqual(codex, {
@@ -205,6 +207,7 @@ test("Phase5: DEFAULT_TEAMS 新结构——pinned manager + 三个发行内置 W
 		description: "OpenAI Codex CLI worker（spawn + JSONL 流式）",
 		connector: { extensionId: "codex", connectorId: "codex", transport: "spawn", config: {} },
 		enabled: true,
+		extensionRevision: 1,
 	});
 	const claw = agents.find((a) => a.name === "puddingclaw");
 	assert.ok(claw);

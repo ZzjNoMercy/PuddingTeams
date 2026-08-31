@@ -336,6 +336,31 @@ export async function registerChatRoutes(
 	app.post<{ Params: { id: string } }>("/api/sessions/:id/abort", async (req, reply) => {
 		try {
 			await requireActiveSessionContext(req.params.id);
+			// Stop is a durable execution boundary, not only an SDK cancellation.
+			// Fence every already-issued manager/worker callback by advancing the
+			// Goal epoch before aborting external execution.
+			const activeDelegations = invoker
+				? (await invoker.delegationsForManagerSession(req.params.id)).filter((item) =>
+					["waiting_admission", "running", "waiting_input", "cancel_requested", "reconciling"].includes(item.executionState),
+				)
+				: [];
+			const shouldFenceGoal = store.isRunning(req.params.id) || activeDelegations.length > 0;
+			if (shouldFenceGoal && workStates) {
+				const goal = await workStates.getActive(req.params.id);
+				if (goal && goal.execution.status !== "interrupted") {
+					await workStates.interruptGoal(
+						req.params.id,
+						goal.revision,
+						{
+							kind: "manager_interrupted",
+							fingerprint: `manager_abort:${goal.goalId}:${goal.execution.epoch}`,
+							delegationIds: activeDelegations.filter((item) => item.goalId === goal.goalId).map((item) => item.id).sort(),
+						},
+						`manager-abort:${goal.goalId}:${goal.execution.epoch}`,
+						goal.goalId,
+					);
+				}
+			}
 			const result = await store.abort(req.params.id);
 			if (!result.aborted) {
 				return reply.code(409).send({ ...result, error: "当前会话没有正在运行的任务" });

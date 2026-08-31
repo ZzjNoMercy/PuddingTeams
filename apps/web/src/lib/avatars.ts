@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { agentAvatarUrl, listAgents } from "./api";
+import type { AgentConfig } from "./types";
 
 /**
  * Module-level registry of which agents have an uploaded avatar (§11). The
@@ -53,6 +54,19 @@ export function agentAvatarChanged(name: string, uploaded: boolean): void {
 	const current = avatarKinds.get(name);
 	avatarKinds.set(name, { uploaded, bundled: current?.bundled ?? false });
 	versions.set(name, (versions.get(name) ?? 0) + 1);
+	emit();
+}
+
+/** 注册刚创建的 Agent，避免一次性列表缓存要到整页刷新后才认识其头像来源。 */
+export function agentRegistered(
+	agent: Pick<AgentConfig, "name" | "displayName" | "avatar" | "hasDefaultAvatar">,
+): void {
+	avatarKinds.set(agent.name, {
+		uploaded: Boolean(agent.avatar),
+		bundled: Boolean(agent.hasDefaultAvatar),
+	});
+	displayNames.set(agent.name, agent.displayName?.trim() || agent.name);
+	if (!versions.has(agent.name)) versions.set(agent.name, 0);
 	emit();
 }
 
