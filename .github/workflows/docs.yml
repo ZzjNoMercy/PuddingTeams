@@ -20,6 +20,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      NEXT_PUBLIC_SITE_BASE_PATH: /PuddingTeams
+      NEXT_PUBLIC_SITE_ORIGIN: https://zzjnomercy.github.io/PuddingTeams
     steps:
       - uses: actions/checkout@v6
       - uses: pnpm/action-setup@v4

@@ -120,13 +120,13 @@ Fastify Server
 
 ## 文档
 
-- [产品与概念](https://teams.puddingai.com/docs/)
-- [部署方式](https://teams.puddingai.com/docs/deployment/)
-- [协作模式](https://teams.puddingai.com/docs/room/)
-- [Harness 与长结果](https://teams.puddingai.com/docs/harness/)
-- [Extension 机制](https://teams.puddingai.com/docs/connectors/)
-- [Connector 开发参考](https://teams.puddingai.com/docs/connector-development/)
-- [运行与排错](https://teams.puddingai.com/docs/operations/)
+- [产品与概念](https://zzjnomercy.github.io/PuddingTeams/docs/)
+- [部署方式](https://zzjnomercy.github.io/PuddingTeams/docs/deployment/)
+- [协作模式](https://zzjnomercy.github.io/PuddingTeams/docs/room/)
+- [Harness 与长结果](https://zzjnomercy.github.io/PuddingTeams/docs/harness/)
+- [Extension 机制](https://zzjnomercy.github.io/PuddingTeams/docs/connectors/)
+- [Connector 开发参考](https://zzjnomercy.github.io/PuddingTeams/docs/connector-development/)
+- [运行与排错](https://zzjnomercy.github.io/PuddingTeams/docs/operations/)
 
 文档源码位于 [`apps/docs`](apps/docs)，本地用 `pnpm docs:dev` 启动，默认地址为 `http://127.0.0.1:8936/docs/`。
 

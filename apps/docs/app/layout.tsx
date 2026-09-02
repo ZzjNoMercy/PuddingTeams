@@ -2,8 +2,10 @@ import type { Metadata } from "next";
 import { RootProvider } from "fumadocs-ui/provider/next";
 import "./globals.css";
 
+const siteOrigin = process.env.NEXT_PUBLIC_SITE_ORIGIN ?? "https://teams.puddingai.com";
+
 export const metadata: Metadata = {
-  metadataBase: new URL("https://teams.puddingai.com"),
+  metadataBase: new URL(siteOrigin),
   title: {
     default: "PuddingTeams Documents",
     template: "%s | PuddingTeams"
