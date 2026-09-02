@@ -199,15 +199,19 @@ test("Teams 准入卡只列出能补足只读缺口的 Worker，并以新 Delega
 	});
 	assert.equal(replaced.status, "replaced");
 	assert.equal(unsafeStarted, false);
-	for (let index = 0; index < 20; index++) {
-		const child = (await runtime.listDelegations(window.id, "manager-session")).find((item) => item.agentId === "safe");
-		if (child?.executionState === "reported_completed") break;
-		await new Promise((resolve) => setTimeout(resolve, 5));
+	assert.ok(replaced.delegationId, "改派响应必须返回 replacement Delegation id");
+	const terminalDeadline = Date.now() + 5_000;
+	let completedReplacement = await runtime.getDelegation(replaced.delegationId);
+	while (completedReplacement?.executionState !== "reported_completed" && Date.now() < terminalDeadline) {
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		completedReplacement = await runtime.getDelegation(replaced.delegationId);
 	}
+	assert.equal(completedReplacement?.executionState, "reported_completed", "replacement 必须在超时前进入 reported_completed");
+	assert.ok(completedReplacement.receipt, "replacement 终态必须原子封存 ExecutionReceipt");
 	assert.equal(safeStarted, true);
 	const all = await runtime.listDelegations(window.id, "manager-session");
 	const original = all.find((item) => item.agentId === "unsafe")!;
-	const replacement = all.find((item) => item.agentId === "safe")!;
+	const replacement = all.find((item) => item.id === replaced.delegationId)!;
 	assert.equal(original.executionState, "cancelled");
 	assert.equal(original.workerStarted, false);
 	assert.equal(original.result && "errorCode" in original.result ? original.result.errorCode : undefined, "admission_replaced");
