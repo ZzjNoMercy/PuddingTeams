@@ -117,9 +117,14 @@ test("doctor：worker 缺失不影响退出码，但给 npm 修复建议", async
 	assert.match(out, /✓ codex — codex 0\.40\.0/);
 });
 
-test("doctor：Node <20 是核心故障，退出码 1", async () => {
-	const { deps } = makeFake({ nodeVersion: "18.19.0", commands: ALL_WORKERS_PRESENT });
+test("doctor：Node <22.19.0 是核心故障，退出码 1", async () => {
+	const { deps } = makeFake({ nodeVersion: "22.18.0", commands: ALL_WORKERS_PRESENT });
 	assert.equal(await runDoctorCli([], deps), 1);
+});
+
+test("doctor：Node 22.19.0 通过核心检查", async () => {
+	const { deps } = makeFake({ nodeVersion: "22.19.0", commands: ALL_WORKERS_PRESENT });
+	assert.equal(await runDoctorCli([], deps), 0);
 });
 
 // ---- init：阶段 2.5 安装引导 ----
@@ -178,7 +183,7 @@ test("init：安装 spec 可被环境变量覆盖（puddingclaw 发布前的本�
 });
 
 test("init：核心探测失败直接退出 1，不进入 worker 询问", async () => {
-	const { deps, asked } = makeFake({ isTTY: true, nodeVersion: "18.19.0" });
+	const { deps, asked } = makeFake({ isTTY: true, nodeVersion: "22.18.0" });
 	assert.equal(await runInitCli([], deps), 1);
 	assert.equal(asked.length, 0);
 });

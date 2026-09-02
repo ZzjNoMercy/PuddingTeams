@@ -18,6 +18,7 @@ import {
 	PlugIcon,
 	RefreshCwIcon,
 	SaveIcon,
+	ServerIcon,
 	SlidersHorizontalIcon,
 	SparklesIcon,
 	UploadIcon,
@@ -63,14 +64,15 @@ import { McpSelectionSection } from "@/components/agent-config/mcp-selection-sec
 
 /**
  * Agent 独立配置页（§10.5）：所有角色统一入口。
- * - pinned manager 与 pi worker：概览 / 模型与运行 / 提示词 / 模板四个分区编辑
- *   同一份页面级草稿，一个「保存」调 PUT /api/agents/:name/config 一次提交；
+ * - pinned manager 与 pi worker：概览 / 模型与运行 / 提示词 / 技能 / 模板 / MCP /
+ *   插件分区；普通配置使用同一份页面级草稿，一个「保存」调
+ *   PUT /api/agents/:name/config 一次提交，MCP 与插件绑定独立保存；
  * - 其余 connector / legacy worker：概览（描述 + 责任边界，随页面「保存」走
  *   全量 upsert）+ 基础接入 / Extensions / 运行状态三个分区（各自独立保存，
  *   见 connector-sections.tsx）。
  */
 
-type SectionKey = "overview" | "model" | "prompt" | "skills" | "templates" | "connector" | "extensions" | "status";
+type SectionKey = "overview" | "model" | "prompt" | "skills" | "templates" | "connector" | "mcp" | "extensions" | "status";
 
 type SectionDef = { key: SectionKey; label: string; description: string; icon: typeof InfoIcon };
 
@@ -87,6 +89,7 @@ const PI_SECTIONS: SectionDef[] = [
 	{ key: "prompt", label: "提示词", description: "运行指令、项目上下文与提示词预览。", icon: MessageSquareTextIcon },
 	{ key: "skills", label: "技能", description: "管理技能库，勾选本 Agent 的选用范围。", icon: SparklesIcon },
 	{ key: "templates", label: "模板", description: "管理可复用提示模板，让常用协作方式保持一致。", icon: BoxIcon },
+	{ key: "mcp", label: "MCP", description: "选择当前 Pi Agent 可以使用的 MCP Server。", icon: ServerIcon },
 	{ key: "extensions", label: "插件", description: "为当前 Pi 会话绑定能力插件，扩充可使用的业务能力。", icon: BoxesIcon },
 ];
 
@@ -522,12 +525,8 @@ export function AgentConfigPage({ name }: { name: string }) {
 								<ConnectorSection agent={agent} onMutation={handleMutation} />
 							)
 						) : null}
-						{section === "extensions" ? (
-							<div className="flex flex-col gap-5">
-								<McpSelectionSection agent={agent} onMutation={handleMutation} />
-								<BindingsSection agent={agent} onMutation={handleMutation} />
-							</div>
-						) : null}
+						{piMode && section === "mcp" ? <McpSelectionSection agent={agent} onMutation={handleMutation} /> : null}
+						{section === "extensions" ? <BindingsSection agent={agent} onMutation={handleMutation} /> : null}
 						{!piMode && section === "status" ? <StatusSection agent={agent} lastMutation={lastMutation} onToggleEnabled={handleToggleEnabled} toggling={toggling} /> : null}
 					</div>
 				</main>

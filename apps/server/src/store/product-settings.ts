@@ -62,7 +62,7 @@ export const DEFAULT_VERIFICATION_SETTINGS: VerificationSettings = {
 	defaultWorkItemMode: "manager_review",
 	defaultFinalGoalMode: "independent_evidence_review",
 	trigger: "manager_request",
-	reviewers: { evidenceModel: "provider/model", cliAgentId: "", requireRoomMember: false },
+	reviewers: { evidenceModel: "", cliAgentId: "", requireRoomMember: false },
 	cliEnvironmentMode: "isolated_copy",
 	isolation: { requireFreshSession: true, forbidExecutorContinuation: true, requireDifferentAgent: false },
 	firstReleaseScope: "cli_code_first",
@@ -121,7 +121,7 @@ export class ProductSettingsStore {
 						defaultFinalGoalMode: enumOr(verification?.defaultFinalGoalMode, ["manager_review", "independent_evidence_review", "environment_verified"], DEFAULT_VERIFICATION_SETTINGS.defaultFinalGoalMode),
 						trigger: enumOr(verification?.trigger, ["manager_request", "auto_on_submission"], DEFAULT_VERIFICATION_SETTINGS.trigger),
 						reviewers: {
-							evidenceModel: typeof verification?.reviewers?.evidenceModel === "string" && verification.reviewers.evidenceModel.trim() ? verification.reviewers.evidenceModel : DEFAULT_VERIFICATION_SETTINGS.reviewers.evidenceModel,
+							evidenceModel: typeof verification?.reviewers?.evidenceModel === "string" ? verification.reviewers.evidenceModel.trim() : DEFAULT_VERIFICATION_SETTINGS.reviewers.evidenceModel,
 							cliAgentId: typeof verification?.reviewers?.cliAgentId === "string" ? verification.reviewers.cliAgentId.trim() : DEFAULT_VERIFICATION_SETTINGS.reviewers.cliAgentId,
 							requireRoomMember: verification?.reviewers?.requireRoomMember === true,
 						},
@@ -218,7 +218,8 @@ export class ProductSettingsStore {
 			if (!["manager_review", "independent_evidence_review"].includes(verification.defaultWorkItemMode)) throw new Error("verification.defaultWorkItemMode 无效");
 			if (!["manager_review", "independent_evidence_review", "environment_verified"].includes(verification.defaultFinalGoalMode)) throw new Error("verification.defaultFinalGoalMode 无效");
 			if (!["manager_request", "auto_on_submission"].includes(verification.trigger)) throw new Error("verification.trigger 无效");
-			if (typeof verification.reviewers.evidenceModel !== "string" || verification.reviewers.evidenceModel.trim().length === 0 || verification.reviewers.evidenceModel.length > 200) throw new Error("verification.reviewers.evidenceModel 必须是非空短字符串");
+			if (typeof verification.reviewers.evidenceModel !== "string" || verification.reviewers.evidenceModel.length > 200) throw new Error("verification.reviewers.evidenceModel 必须是短字符串");
+			verification.reviewers.evidenceModel = verification.reviewers.evidenceModel.trim();
 			if (typeof verification.reviewers.cliAgentId !== "string" || verification.reviewers.cliAgentId.length > 200) throw new Error("verification.reviewers.cliAgentId 必须是短字符串");
 			if (typeof verification.reviewers.requireRoomMember !== "boolean") throw new Error("verification.reviewers.requireRoomMember 必须是布尔值");
 			if (!["isolated_copy", "same_target_guarded"].includes(verification.cliEnvironmentMode)) throw new Error("verification.cliEnvironmentMode 无效");

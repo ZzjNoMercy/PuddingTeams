@@ -17,7 +17,7 @@ export const puddingClawConnectorManifest: ConnectorExtensionManifest = {
 	version: "1.1.0",
 	source: "builtin",
 	kind: "connector",
-	engines: { puddingteams: ">=0.1 <1" },
+	engines: { puddingteams: ">=1 <2" },
 	permissions: ["spawn", "network"],
 	connector: {
 		id: PUDDINGCLAW_CONNECTOR_ID,

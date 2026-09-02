@@ -61,7 +61,7 @@ pi resource-loader 按此字段找入口，`pi install <source>` 后加载 `pi/i
 | `id` / `publisher` / `displayName` / `version` | 包身份；`id` 与目录名一致 |
 | `source` | `"builtin" | "trusted" | "external"`；第一方包用 `trusted`，第三方模板默认 `external` |
 | `kind` | `"connector"`；与 `extensions/connectors/` 目录一致 |
-| `engines.puddingteams` | 宿主版本的合法 semver range，如 `>=0.1 <1`；validate 检查语法，安装与每次启用强制匹配当前宿主版本 |
+| `engines.puddingteams` | 宿主版本的合法 semver range，1.x Extension 例如 `>=1 <2`；validate 检查语法，安装与每次启用强制匹配当前宿主版本 |
 | `permissions` | 安装时向用户展示的能力申请：`spawn` / `network` / `workspace` / `secrets` |
 | `entry` | Driver 入口（包内相对路径，指向 `driver/index.ts`）；与 `connector.declarative` 互斥 |
 | `connector.id` / `displayName` / `apiVersion` | Connector contribution 身份；`apiVersion` 只支持 `"1"` |

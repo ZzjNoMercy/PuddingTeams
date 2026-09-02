@@ -1,13 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { LoaderIcon, PlusIcon, Trash2Icon } from "lucide-react";
+import { LoaderIcon, PencilIcon, PlusIcon, ServerIcon, Trash2Icon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { createMcpServer, deleteMcpServer, listMcpServers } from "@/lib/api";
+import { createMcpServer, deleteMcpServer, listMcpServers, updateMcpServer } from "@/lib/api";
 import type { McpCatalogResponse, McpServerDefinition, McpServerRecord } from "@/lib/types";
 
 function parseSecrets(raw: string): Record<string, string> | undefined {
@@ -32,7 +32,8 @@ function endpointOf(server: McpServerRecord): string {
 export function McpServersView({ onCountChange }: { onCountChange: (count: number) => void }) {
 	const [catalog, setCatalog] = useState<McpCatalogResponse | null>(null);
 	const [loading, setLoading] = useState(true);
-	const [createOpen, setCreateOpen] = useState(false);
+	const [editorOpen, setEditorOpen] = useState(false);
+	const [editing, setEditing] = useState<McpServerRecord | null>(null);
 	const [saving, setSaving] = useState(false);
 	const [deleting, setDeleting] = useState<McpServerRecord | null>(null);
 	const [deleteBusy, setDeleteBusy] = useState(false);
@@ -69,21 +70,48 @@ export function McpServersView({ onCountChange }: { onCountChange: (count: numbe
 		setSecrets("");
 	};
 
-	const create = async () => {
+	const openCreate = () => {
+		setEditing(null);
+		resetDraft();
+		setEditorOpen(true);
+	};
+
+	const openEdit = (server: McpServerRecord) => {
+		setEditing(server);
+		setId(server.id);
+		setDisplayName(server.displayName);
+		setDescription(server.description ?? "");
+		setDefinition(JSON.stringify(server.definition, null, 2));
+		setSecrets("");
+		setEditorOpen(true);
+	};
+
+	const save = async () => {
 		if (!canSave) return;
 		setSaving(true);
 		try {
 			const parsed = JSON.parse(definition) as McpServerDefinition;
 			const parsedSecrets = parseSecrets(secrets);
-			await createMcpServer({
-				id: id.trim(),
-				displayName: displayName.trim(),
-				...(description.trim() ? { description: description.trim() } : {}),
-				definition: parsed,
-				...(parsedSecrets ? { secrets: parsedSecrets } : {}),
-			});
-			toast.success(`MCP Server「${displayName.trim()}」已添加`);
-			setCreateOpen(false);
+			if (editing) {
+				await updateMcpServer(editing.id, {
+					displayName: displayName.trim(),
+					description: description.trim(),
+					definition: parsed,
+					...(parsedSecrets ? { secrets: parsedSecrets } : {}),
+				});
+				toast.success(`MCP Server「${displayName.trim()}」已更新`);
+			} else {
+				await createMcpServer({
+					id: id.trim(),
+					displayName: displayName.trim(),
+					...(description.trim() ? { description: description.trim() } : {}),
+					definition: parsed,
+					...(parsedSecrets ? { secrets: parsedSecrets } : {}),
+				});
+				toast.success(`MCP Server「${displayName.trim()}」已添加`);
+			}
+			setEditorOpen(false);
+			setEditing(null);
 			resetDraft();
 			await refresh();
 		} catch (err) {
@@ -116,22 +144,26 @@ export function McpServersView({ onCountChange }: { onCountChange: (count: numbe
 				<>
 					<div className="mb-6 flex items-center justify-between gap-4">
 						<h2 className="text-base font-semibold tracking-tight">MCP Servers</h2>
-						<Button type="button" size="sm" onClick={() => setCreateOpen(true)}><PlusIcon className="size-4" />添加 Server</Button>
+						<Button type="button" size="sm" onClick={openCreate}><PlusIcon className="size-4" />添加 Server</Button>
 					</div>
-					<div className="grid gap-3">{catalog.servers.map((server) => (
-						<article key={server.id} className="rounded-xl border bg-card p-4">
-							<div className="flex items-start justify-between gap-4">
-								<div className="min-w-0">
-									<div className="flex flex-wrap items-center gap-2"><h3 className="text-sm font-semibold">{server.displayName}</h3><code className="rounded bg-muted px-1.5 py-0.5 text-[11px]">{server.id}</code></div>
-									{server.description ? <p className="mt-1 text-xs text-muted-foreground">{server.description}</p> : null}
-									<p className="mt-3 truncate font-mono text-xs text-muted-foreground" title={endpointOf(server)}>{endpointOf(server)}</p>
+					<div className="ops-mcp-grid">{catalog.servers.map((server) => (
+						<article key={server.id} className="ops-mcp-card">
+							<div className="ops-mcp-card-head">
+								<div className="ops-mcp-card-icon"><ServerIcon className="size-4" /></div>
+								<div className="min-w-0 flex-1">
+									<div className="flex min-w-0 items-center gap-2"><h3 className="truncate text-sm font-semibold">{server.displayName}</h3><code className="ops-mcp-id">{server.id}</code></div>
+									<p className="ops-mcp-endpoint" title={endpointOf(server)}>{endpointOf(server)}</p>
 								</div>
-								<Button type="button" variant="ghost" size="icon" aria-label={`删除 ${server.displayName}`} onClick={() => setDeleting(server)}><Trash2Icon className="size-4" /></Button>
+								<div className="flex items-center gap-0.5">
+									<Button type="button" variant="ghost" size="icon" title="编辑" aria-label={`编辑 ${server.displayName}`} onClick={() => openEdit(server)}><PencilIcon className="size-3.5" /></Button>
+									<Button type="button" variant="ghost" size="icon" title="删除" aria-label={`删除 ${server.displayName}`} onClick={() => setDeleting(server)}><Trash2Icon className="size-3.5" /></Button>
+								</div>
 							</div>
-							<div className="mt-4 flex flex-wrap gap-x-5 gap-y-1 border-t pt-3 text-[11px] text-muted-foreground">
+							{server.description ? <p className="ops-mcp-description">{server.description}</p> : null}
+							<div className="ops-mcp-meta">
 								<span>{server.definition.url ? "Remote HTTP" : "Local stdio"}</span>
-								<span>密钥：{server.secretKeys.length ? server.secretKeys.join(", ") : "无"}</span>
-								<span>已启用：{server.usedBy.length ? server.usedBy.map((agent) => agent.displayName).join("、") : "无 Agent"}</span>
+								<span>{server.secretKeys.length ? `${server.secretKeys.length} 个密钥` : "无密钥"}</span>
+								<span title={server.usedBy.map((agent) => agent.displayName).join("、")}>{server.usedBy.length ? `${server.usedBy.length} 个 Agent` : "未启用"}</span>
 							</div>
 						</article>
 					))}</div>
@@ -139,21 +171,21 @@ export function McpServersView({ onCountChange }: { onCountChange: (count: numbe
 			) : (
 				<div className="ops-empty-state flex min-h-64 flex-col items-center justify-center">
 					<div className="text-sm font-medium">还没有 MCP Server</div>
-					<Button type="button" size="sm" className="mt-4" onClick={() => setCreateOpen(true)}><PlusIcon className="size-4" />添加 Server</Button>
+					<Button type="button" size="sm" className="mt-4" onClick={openCreate}><PlusIcon className="size-4" />添加 Server</Button>
 				</div>
 			)}
 
-			<Dialog open={createOpen} onOpenChange={(open) => { setCreateOpen(open); if (!open && !saving) resetDraft(); }}>
+			<Dialog open={editorOpen} onOpenChange={(open) => { setEditorOpen(open); if (!open && !saving) { setEditing(null); resetDraft(); } }}>
 				<DialogContent className="sm:max-w-2xl">
-					<DialogHeader><DialogTitle>添加 MCP Server</DialogTitle><DialogDescription>command 与 url 请选择一种。</DialogDescription></DialogHeader>
+					<DialogHeader><DialogTitle>{editing ? "编辑 MCP Server" : "添加 MCP Server"}</DialogTitle><DialogDescription>{editing ? "Server ID 不可修改；密钥留空会保留已有值。" : "command 与 url 请选择一种。"}</DialogDescription></DialogHeader>
 					<div className="grid gap-4 sm:grid-cols-2">
-						<label className="flex flex-col gap-1 text-sm"><span className="text-muted-foreground">Server ID</span><Input value={id} onChange={(event) => setId(event.target.value)} placeholder="context7" className="font-mono text-xs" /></label>
+						<label className="flex flex-col gap-1 text-sm"><span className="text-muted-foreground">Server ID</span><Input value={id} disabled={editing !== null} onChange={(event) => setId(event.target.value)} placeholder="context7" className="font-mono text-xs" /></label>
 						<label className="flex flex-col gap-1 text-sm"><span className="text-muted-foreground">显示名称</span><Input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="Context7" /></label>
 						<label className="flex flex-col gap-1 text-sm sm:col-span-2"><span className="text-muted-foreground">说明（可选）</span><Input value={description} onChange={(event) => setDescription(event.target.value)} /></label>
 						<label className="flex flex-col gap-1 text-sm sm:col-span-2"><span className="text-muted-foreground">Server definition（JSON）</span><Textarea value={definition} onChange={(event) => setDefinition(event.target.value)} rows={9} className="font-mono text-xs" /></label>
-						<label className="flex flex-col gap-1 text-sm sm:col-span-2"><span className="text-muted-foreground">密钥环境变量（可选，每行 KEY=VALUE；保存后不回显）</span><Textarea value={secrets} onChange={(event) => setSecrets(event.target.value)} rows={3} className="font-mono text-xs" placeholder="API_TOKEN=…" /></label>
+						<label className="flex flex-col gap-1 text-sm sm:col-span-2"><span className="text-muted-foreground">密钥环境变量（可选，每行 KEY=VALUE；保存后不回显）{editing?.secretKeys.length ? ` · 已配置 ${editing.secretKeys.join("、")}` : ""}</span><Textarea value={secrets} onChange={(event) => setSecrets(event.target.value)} rows={3} className="font-mono text-xs" placeholder={editing ? "留空保留；KEY=新值 更新；KEY= 删除" : "API_TOKEN=…"} /></label>
 					</div>
-					<DialogFooter><Button type="button" variant="ghost" disabled={saving} onClick={() => setCreateOpen(false)}>取消</Button><Button type="button" disabled={saving || !canSave} onClick={() => void create()}>{saving ? <LoaderIcon className="size-4 animate-spin" /> : null}添加</Button></DialogFooter>
+					<DialogFooter><Button type="button" variant="ghost" disabled={saving} onClick={() => setEditorOpen(false)}>取消</Button><Button type="button" disabled={saving || !canSave} onClick={() => void save()}>{saving ? <LoaderIcon className="size-4 animate-spin" /> : null}{editing ? "保存" : "添加"}</Button></DialogFooter>
 				</DialogContent>
 			</Dialog>
 

@@ -78,7 +78,14 @@ if (connector === "echo") {
 	assert.equal(second.result.sessionHandle, first.result.sessionHandle);
 	const persisted = await delegations.listDelegations("smoke-window", "smoke-manager-session");
 	assert.equal(persisted.length, 2);
-	assert.ok(persisted.every((item) => item.status === "completed" && item.cwdSnapshot === cwdSnapshot));
+	assert.ok(
+		persisted.every(
+			(item) =>
+				item.executionState === "reported_completed" &&
+				item.receipt?.reportedOutcome === "completed" &&
+				item.cwdSnapshot === cwdSnapshot,
+		),
+	);
 }
 
 console.log(`✓ ${connector} smoke passed: install → probe → run${connector === "echo" ? " → continue → persistence" : ""}`);

@@ -368,14 +368,10 @@ interface TaskUsage {
 	cost?: number;
 }
 
-/** 「消耗 输入 12.3K · 输出 1.2K · $0.0034」；无数据不显示。 */
+/** 「输入 12.3K · 输出 1.2K」；成本不在会话 UI 中展示。 */
 function usageMetaText(usage: TaskUsage | undefined): string | undefined {
 	if (!usage || (usage.inputTokens === undefined && usage.outputTokens === undefined)) return undefined;
-	let text = `消耗 输入 ${formatTokens(usage.inputTokens ?? 0)} · 输出 ${formatTokens(usage.outputTokens ?? 0)}`;
-	if (typeof usage.cost === "number") {
-		text += ` · $${usage.cost < 0.01 ? usage.cost.toFixed(4) : usage.cost.toFixed(2)}`;
-	}
-	return text;
+	return `输入 ${formatTokens(usage.inputTokens ?? 0)} · 输出 ${formatTokens(usage.outputTokens ?? 0)}`;
 }
 
 function WorkerTaskEntry({
@@ -503,18 +499,22 @@ function WorkerTaskEntry({
 								<div className={`home-worker-result ${!resultOpen && expandableResult ? "is-clamped" : ""} ${isError ? "text-destructive" : ""}`}>
 									<MessageResponse {...chatStreamdownProps}>{result}</MessageResponse>
 								</div>
-								{expandableResult ? (
-									<button
-										type="button"
-										className="home-worker-result-toggle"
-										onClick={() => toggleKeepingAnchor(setResultOpen)}
-									>
-										{resultOpen ? "收起结果" : "展开结果"}
-										<ChevronDownIcon className={resultOpen ? "rotate-180" : ""} />
-									</button>
+								{expandableResult || usageText ? (
+									<div className="home-worker-result-footer">
+										{expandableResult ? (
+											<button
+												type="button"
+												className="home-worker-result-toggle"
+												onClick={() => toggleKeepingAnchor(setResultOpen)}
+											>
+												{resultOpen ? "收起结果" : "展开结果"}
+												<ChevronDownIcon className={resultOpen ? "rotate-180" : ""} />
+											</button>
+										) : null}
+										{usageText ? <p className="home-worker-result-usage">{usageText}</p> : null}
+									</div>
 								) : null}
 							</div>
-							{usageText ? <p className="mt-1 text-xs text-muted-foreground/70 tabular-nums">{usageText}</p> : null}
 							<MessageQuickActions kind="worker" content={result} workerLabel={workerLabel} processDetails={processDetails} />
 						</>
 					) : (

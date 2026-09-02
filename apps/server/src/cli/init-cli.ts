@@ -14,7 +14,7 @@ import { TeamsStore } from "../store/teams.js";
  * `puddingteams doctor` / `puddingteams init`：环境体检与首次初始化向导。
  *
  * 向导分阶段（对标 openclaw / PuddingClaw deploy CLI）：
- * - 阶段 0  环境检查：Node ≥20、数据目录可写（探测只读，不主动创建目录）；
+ * - 阶段 0  环境检查：Node ≥22.19.0、数据目录可写（探测只读，不主动创建目录）；
  * - 阶段 1  模型 Provider：选 provider → API Key（隐藏输入）→ 连通性探测 →
  *           写平台自有 secrets/auth.json（与 pi CLI 解耦 §10.6）→ 选默认模型；
  * - 阶段 2  第一方 Connector 状态：pi/puddingclaw 内置恒 ✓；codex/claude-code
@@ -276,11 +276,19 @@ function installSpecFor(worker: WorkerEntry, env: NodeJS.ProcessEnv): string {
 
 async function probeCore(deps: CliDeps): Promise<ProbeItem[]> {
 	const items: ProbeItem[] = [];
-	const major = Number.parseInt(deps.nodeVersion.split(".")[0] ?? "0", 10);
+	const [major = 0, minor = 0, patch = 0] = deps.nodeVersion
+		.split(".", 3)
+		.map((part) => Number.parseInt(part, 10) || 0);
+	const nodeSupported = major > 22 || (major === 22 && (minor > 19 || (minor === 19 && patch >= 0)));
 	items.push(
-		major >= 20
-			? { id: "node", ok: true, detail: `v${deps.nodeVersion}（>=20）` }
-			: { id: "node", ok: false, detail: `v${deps.nodeVersion}`, remediation: "PuddingTeams 需要 Node.js >= 20，请升级后重试" },
+		nodeSupported
+			? { id: "node", ok: true, detail: `v${deps.nodeVersion}（>=22.19.0）` }
+			: {
+					id: "node",
+					ok: false,
+					detail: `v${deps.nodeVersion}`,
+					remediation: "PuddingTeams 源码部署需要 Node.js >= 22.19.0，请升级后重试",
+				},
 	);
 	let home = "";
 	try {

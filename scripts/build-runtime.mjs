@@ -41,7 +41,7 @@ async function bundle(entry, outfile) {
 		bundle: true,
 		platform: "node",
 		format: "esm",
-		target: "node20",
+		target: "node22",
 		banner: { js: BANNER },
 		define: { PUDDINGTEAMS_HOST_VERSION_DEFINE: JSON.stringify(serverVersion) },
 		outfile,

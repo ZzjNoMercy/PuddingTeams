@@ -5,6 +5,7 @@ import { CircleAlertIcon, ListTreeIcon, RefreshCwIcon, TargetIcon } from "lucide
 import { Loader } from "@/components/ai-elements/loader";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { collaborationTrustOf, isObservationLost, type CollaborationProjectionSource, type WorkerProcessListItem } from "@/lib/api";
 import { useAgentLabels } from "@/lib/avatars";
 import { WorkerAvatar } from "./worker-avatar";
@@ -222,12 +223,18 @@ export function SessionActivityDrawer({
 				<RuntimeViewTabs view="activity" hasGoal={hasGoal} onViewChange={onViewChange} />
 				<div className="task-activity-scroll">
 					<div className="task-activity-section-head">
-						<label className="task-turn-select">
-							<span className="sr-only">选择执行轮次</span>
-							<select aria-label="选择执行轮次" value={selected.id} onChange={(event) => setSelectedTurnId(event.target.value === current.id ? null : event.target.value)}>
-								{groups.map((group) => <option key={group.id} value={group.id}>{group.isCurrent ? "本轮" : group.index ? `第 ${group.index} 轮` : "会话早期"} · {group.items.length} 个任务</option>)}
-							</select>
-						</label>
+						<Select value={selected.id} onValueChange={(value) => setSelectedTurnId(value === current.id ? null : value)}>
+							<SelectTrigger size="sm" className="task-turn-select" aria-label="选择执行轮次">
+								<SelectValue />
+							</SelectTrigger>
+							<SelectContent position="popper" align="start" className="task-turn-select-content">
+								{groups.map((group) => (
+									<SelectItem key={group.id} value={group.id} className="task-turn-select-item">
+										{group.isCurrent ? "本轮" : group.index ? `第 ${group.index} 轮` : "会话早期"} · {group.items.length} 个任务
+									</SelectItem>
+								))}
+							</SelectContent>
+						</Select>
 						{selected.id !== current.id ? <span>{selectedPending > 0 ? `${selectedPending} 待处理` : selectedRunning > 0 ? `${selectedRunning} 运行中` : selected.items.length > 0 ? `${selectedCompleted}/${selected.items.length} 完成` : "无任务"}</span> : null}
 					</div>
 					{loading && items.length === 0 ? (

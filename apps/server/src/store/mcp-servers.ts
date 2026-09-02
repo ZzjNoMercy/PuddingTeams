@@ -45,6 +45,39 @@ function stringRecord(value: unknown, label: string): Record<string, string> | u
 	return result;
 }
 
+function normalizeRequestHeadersCommand(value: unknown): ServerEntry["requestHeadersCommand"] | undefined {
+	if (value === undefined) return undefined;
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error("definition.requestHeadersCommand 必须是对象");
+	}
+	const raw = value as Record<string, unknown>;
+	const command = typeof raw.command === "string" ? raw.command.trim() : "";
+	if (!command) throw new Error("definition.requestHeadersCommand.command 必须是非空字符串");
+	if (raw.args !== undefined && (!Array.isArray(raw.args) || raw.args.some((item) => typeof item !== "string"))) {
+		throw new Error("definition.requestHeadersCommand.args 必须是字符串数组");
+	}
+	const env = stringRecord(raw.env, "definition.requestHeadersCommand.env");
+	for (const [key, envValue] of Object.entries(env ?? {})) {
+		if (SENSITIVE_ENV_KEY.test(key) && envValue && !SECRET_REFERENCE.test(envValue)) {
+			throw new Error(`definition.requestHeadersCommand.env.${key} 疑似包含凭据；请改用 \${${key}} 引用并在 secrets 中保存`);
+		}
+	}
+	if (raw.timeoutMs !== undefined && (
+		typeof raw.timeoutMs !== "number"
+		|| !Number.isInteger(raw.timeoutMs)
+		|| raw.timeoutMs <= 0
+		|| raw.timeoutMs > 60_000
+	)) {
+		throw new Error("definition.requestHeadersCommand.timeoutMs 必须是 1 到 60000 的整数");
+	}
+	return {
+		command,
+		...(raw.args !== undefined ? { args: [...raw.args as string[]] } : {}),
+		...(env ? { env } : {}),
+		...(typeof raw.timeoutMs === "number" ? { timeoutMs: raw.timeoutMs } : {}),
+	};
+}
+
 /**
  * 平台托管的 MCP Server definition。只接受 adapter 的安全常用子集；明文
  * bearerToken / OAuth clientSecret 必须走 secrets + 环境变量引用，不能进入
@@ -78,6 +111,7 @@ export function normalizeMcpServerDefinition(input: unknown): ServerEntry {
 	}
 	const env = stringRecord(raw.env, "definition.env");
 	const headers = stringRecord(raw.headers, "definition.headers");
+	const requestHeadersCommand = normalizeRequestHeadersCommand(raw.requestHeadersCommand);
 	for (const [key, value] of Object.entries(headers ?? {})) {
 		if (SENSITIVE_HEADER.test(key) && !SECRET_REFERENCE.test(value)) {
 			throw new Error(`definition.headers.${key} 疑似包含凭据；请改用 \${KEY} 引用并在 secrets 中保存`);
@@ -94,6 +128,7 @@ export function normalizeMcpServerDefinition(input: unknown): ServerEntry {
 		...(typeof raw.cwd === "string" ? { cwd: raw.cwd.trim() } : {}),
 		...(env ? { env } : {}),
 		...(headers ? { headers } : {}),
+		...(requestHeadersCommand ? { requestHeadersCommand } : {}),
 		...(raw.auth === "oauth" || raw.auth === "bearer" || raw.auth === false ? { auth: raw.auth } : {}),
 		...(typeof raw.bearerTokenEnv === "string" ? { bearerTokenEnv: raw.bearerTokenEnv } : {}),
 		...(raw.oauth === false || (raw.oauth && typeof raw.oauth === "object" && !Array.isArray(raw.oauth))
@@ -266,6 +301,17 @@ export class McpServerStore {
 			if (definition.url) definition.url = interpolateSecrets(definition.url, secrets);
 			if (definition.args) definition.args = definition.args.map((value) => interpolateSecrets(value, secrets));
 			if (definition.cwd) definition.cwd = interpolateSecrets(definition.cwd, secrets);
+			if (definition.requestHeadersCommand) {
+				definition.requestHeadersCommand.command = interpolateSecrets(definition.requestHeadersCommand.command, secrets);
+				if (definition.requestHeadersCommand.args) {
+					definition.requestHeadersCommand.args = definition.requestHeadersCommand.args.map((value) => interpolateSecrets(value, secrets));
+				}
+				if (definition.requestHeadersCommand.env) {
+					definition.requestHeadersCommand.env = Object.fromEntries(
+						Object.entries(definition.requestHeadersCommand.env).map(([key, value]) => [key, interpolateSecrets(value, secrets)]),
+					);
+				}
+			}
 			if (definition.bearerTokenEnv && secrets[definition.bearerTokenEnv]) {
 				definition.bearerToken = secrets[definition.bearerTokenEnv];
 				delete definition.bearerTokenEnv;

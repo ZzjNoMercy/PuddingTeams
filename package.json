@@ -1,11 +1,15 @@
 {
   "name": "puddingteams",
   "private": true,
+  "version": "1.0.0",
   "packageManager": "pnpm@10.32.1",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19.0"
   },
   "pnpm": {
+    "patchedDependencies": {
+      "@modelcontextprotocol/client@2.0.0": "patches/@modelcontextprotocol__client@2.0.0.patch"
+    },
     "onlyBuiltDependencies": [
       "@larksuite/cli",
       "electron",
@@ -27,13 +31,16 @@
     "dev:electron": "pnpm --filter @puddingteams/electron dev:desktop",
     "build:electron": "pnpm build:runtime && pnpm --filter @puddingteams/electron pack:mac",
     "build:electron:arm64": "pnpm build:runtime && pnpm --filter @puddingteams/electron pack:mac:arm64",
+    "build:electron:x64": "pnpm build:runtime && pnpm --filter @puddingteams/electron pack:mac:x64",
     "build:electron:win:x64": "pnpm build:runtime && pnpm --filter @puddingteams/electron pack:win:x64",
     "typecheck": "pnpm -r run typecheck",
     "docs:typecheck": "pnpm --filter @puddingteams/docs run typecheck",
     "smoke:golden": "pnpm --filter @puddingteams/server exec tsx scripts/connector-smoke.ts echo",
     "smoke:real:codex": "pnpm --filter @puddingteams/server exec tsx scripts/connector-smoke.ts codex",
     "smoke:real:claude": "pnpm --filter @puddingteams/server exec tsx scripts/connector-smoke.ts claude-code",
-    "verify:baseline": "pnpm --filter @puddingteams/server test && pnpm --filter @puddingteams/server typecheck && pnpm --filter @puddingteams/web typecheck && pnpm --filter @puddingteams/web lint && pnpm run smoke:golden && pnpm --filter @puddingteams/web build"
+    "verify:baseline": "pnpm --filter @puddingteams/server test && pnpm --filter @puddingteams/server typecheck && pnpm --filter @puddingteams/web typecheck && pnpm --filter @puddingteams/web lint && pnpm run smoke:golden && pnpm --filter @puddingteams/web build",
+    "verify:release": "node scripts/verify-release.mjs && pnpm verify:baseline && pnpm docs:typecheck && pnpm --filter @puddingteams/docs run lint && pnpm docs:build && pnpm --filter @puddingteams/electron test && pnpm --filter @puddingteams/electron typecheck && pnpm build:runtime",
+    "release:checksums": "node scripts/write-release-checksums.mjs"
   },
   "devDependencies": {
     "esbuild": "0.28.1"

@@ -18,7 +18,7 @@ export const piConnectorManifest: ConnectorExtensionManifest = {
 	version: "1.0.0",
 	source: "builtin",
 	kind: "connector",
-	engines: { puddingteams: ">=0.1 <1" },
+	engines: { puddingteams: ">=1 <2" },
 	// 进程内 SDK：不 spawn；会访问网络（LLM API）与 workspace（内置工具读写 cwd）。
 	permissions: ["network", "workspace"],
 	connector: {

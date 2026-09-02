@@ -3,7 +3,7 @@ title: 技术架构
 description: pi、Agent Runtime、Transport、Extension 与 Web/桌面宿主怎样组成 PuddingTeams。
 ---
 
-<Status tone="preview">PREVIEW</Status>
+<Status>1.0 STABLE</Status>
 
 PuddingTeams 的核心不是某个 UI 框架，而是一条稳定的控制链：**协作状态属于平台，执行协议属于 Connector，具体 Agent 可以替换。**
 
@@ -26,8 +26,8 @@ Fastify Server
 
 | 层 | 当前实现 | 作用 |
 | --- | --- | --- |
-| Manager Harness | `@earendil-works/pi-coding-agent` 0.83 | Manager 会话、工具、资源装配和本地 pi Worker |
-| Server | Node.js 20+、TypeScript、Fastify 5 | API、WebSocket、状态存储与 Agent Runtime |
+| Manager Harness | `@earendil-works/pi-coding-agent` 0.84 | Manager 会话、工具、资源装配和本地 pi Worker |
+| Server | Node.js 22.19+、TypeScript、Fastify 5 | API、WebSocket、状态存储与 Agent Runtime |
 | Web | Next.js 16、React 19、Tailwind CSS 4 | 聊天、配置、执行 Inspector；生产态静态导出 |
 | Desktop | Electron 43、electron-builder | 启动同一 Server bundle，并加载同源 Web |
 | Build | pnpm 10、esbuild、TypeScript | monorepo、发行 runtime 与 CLI bundle |

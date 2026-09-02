@@ -677,6 +677,20 @@ export function createMcpServer(input: {
 		.then((result) => result.server);
 }
 
+export function updateMcpServer(id: string, input: {
+	displayName: string;
+	description?: string;
+	definition: McpServerDefinition;
+	secrets?: Record<string, string>;
+}): Promise<McpServerRecord> {
+	return postJson<{ server: McpServerRecord }>(
+		`/api/extensions/mcp/servers/${encodeURIComponent(id)}`,
+		input,
+		"update MCP server failed",
+		"PUT",
+	).then((result) => result.server);
+}
+
 export async function deleteMcpServer(id: string): Promise<void> {
 	const res = await fetch(`${SERVER_URL}/api/extensions/mcp/servers/${encodeURIComponent(id)}`, { method: "DELETE" });
 	await ensureOk(res, "delete MCP server failed");

@@ -127,7 +127,7 @@ function writeCapabilityPackage(dir: string): string {
 			version: "1.0.0",
 			source: "external",
 			kind: "capability",
-			engines: { puddingteams: ">=0.1 <1" },
+			engines: { puddingteams: ">=1 <2" },
 			entry: "index.mjs",
 			capability: {
 				id: "cap-ext",
@@ -657,7 +657,7 @@ test("P4 API: install mode=copy 安装 user 包；三态冲突 409；bundled 不
 		path.join(userDir, EXTENSION_MANIFEST_FILE),
 		JSON.stringify({
 			id: "user-cap", publisher: "test", displayName: "用户 Capability", version: "1.0.0", source: "external",
-			kind: "capability", engines: { puddingteams: ">=0.1 <1" }, entry: "index.mjs",
+			kind: "capability", engines: { puddingteams: ">=1 <2" }, entry: "index.mjs",
 			capability: { id: "user-cap", displayName: "用户 Capability", apiVersion: "1", tools: [{ name: "do_thing", activation: "always" }] },
 		}),
 	);

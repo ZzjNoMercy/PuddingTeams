@@ -49,6 +49,12 @@ arm64 + x64：
 APPLE_KEYCHAIN_PROFILE=puddingclaw-notary pnpm build:electron
 ```
 
+只构建 Intel x64：
+
+```bash
+APPLE_KEYCHAIN_PROFILE=puddingclaw-notary pnpm build:electron:x64
+```
+
 构建配置要求登录 Keychain 中存在有效的 `Developer ID Application` 证书，
 并启用 Hardened Runtime。`electron-builder` 使用
 `APPLE_KEYCHAIN_PROFILE` 指定的 `notarytool` Keychain profile 公证应用；仓库
@@ -73,5 +79,11 @@ pnpm build:electron:win:x64
 同样直接使用用户目录下的 `.puddingteams` 与 `.pi/agent`，卸载客户端不会删除
 这些业务数据。
 
-默认 Windows 构建不强制代码签名。正式对外发布前应配置受信任的 Windows
-代码签名证书，否则 SmartScreen 可能显示“未知发布者”。
+本地 Windows 结构验证构建不强制代码签名。稳定版 GitHub Release 工作流要求
+配置 `WIN_CSC_LINK` 与 `WIN_CSC_KEY_PASSWORD`，并在上传前用
+`Get-AuthenticodeSignature` 验证为 `Valid`；缺少证书时工作流会直接失败。macOS
+上的交叉构建不能替代干净 Windows 10/11 环境中的安装、首次启动、升级和卸载
+验收。
+
+三份 1.0 安装包齐备后运行 `pnpm release:checksums`，生成随 Release 一起上传的
+`electron/release/SHA256SUMS.txt`。完整清单见仓库根目录 `RELEASING.md`。

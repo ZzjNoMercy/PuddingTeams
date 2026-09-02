@@ -1,0 +1,32 @@
+diff --git a/dist/index.cjs b/dist/index.cjs
+index 1de82ce..0d57be2 100644
+--- a/dist/index.cjs
++++ b/dist/index.cjs
+@@ -5390,7 +5390,10 @@ var StreamableHTTPClientTransport = class {
+ 			}
+ 			if (response.status === 202) {
+ 				await response.text?.().catch(() => {});
+-				if (require_src.isInitializedNotification(message)) this._startOrAuthSse({ resumptionToken: void 0 }).catch((error) => this.onerror?.(error));
++				// A sessionless Streamable HTTP server has no routing key for an
++				// independent server-to-client GET stream. Keep it POST-only; otherwise
++				// servers such as DeepWiki accept the GET and stall later POST requests.
++				if (require_src.isInitializedNotification(message) && this._sessionId !== void 0) this._startOrAuthSse({ resumptionToken: void 0 }).catch((error) => this.onerror?.(error));
+ 				return;
+ 			}
+ 			const hasRequests = (Array.isArray(message) ? message : [message]).some((msg) => "method" in msg && "id" in msg && msg.id !== void 0);
+diff --git a/dist/index.mjs b/dist/index.mjs
+index 122a42c..97d6530 100644
+--- a/dist/index.mjs
++++ b/dist/index.mjs
+@@ -5387,7 +5387,10 @@ var StreamableHTTPClientTransport = class {
+ 			}
+ 			if (response.status === 202) {
+ 				await response.text?.().catch(() => {});
+-				if (isInitializedNotification(message)) this._startOrAuthSse({ resumptionToken: void 0 }).catch((error) => this.onerror?.(error));
++				// A sessionless Streamable HTTP server has no routing key for an
++				// independent server-to-client GET stream. Keep it POST-only; otherwise
++				// servers such as DeepWiki accept the GET and stall later POST requests.
++				if (isInitializedNotification(message) && this._sessionId !== void 0) this._startOrAuthSse({ resumptionToken: void 0 }).catch((error) => this.onerror?.(error));
+ 				return;
+ 			}
+ 			const hasRequests = (Array.isArray(message) ? message : [message]).some((msg) => "method" in msg && "id" in msg && msg.id !== void 0);

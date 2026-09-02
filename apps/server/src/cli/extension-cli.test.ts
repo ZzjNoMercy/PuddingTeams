@@ -99,7 +99,7 @@ test("validate manifest kind 非法 → 1", async () => {
 			version: "1.0.0",
 			source: "external",
 			kind: "widget",
-			engines: { puddingteams: ">=0.1 <1" },
+			engines: { puddingteams: ">=1 <2" },
 		},
 	});
 	assert.strictEqual((await runBin(["extension", "validate", dir])).code, 1);
@@ -117,7 +117,7 @@ test("validate declarative + entry 混排 → 1", async () => {
 			version: "1.0.0",
 			source: "external",
 			kind: "connector",
-			engines: { puddingteams: ">=0.1 <1" },
+			engines: { puddingteams: ">=1 <2" },
 			permissions: ["spawn"],
 			entry: "driver/index.ts",
 			connector: {
@@ -152,7 +152,7 @@ test("validate entry 声明但文件缺失 → 1", async () => {
 			version: "1.0.0",
 			source: "external",
 			kind: "connector",
-			engines: { puddingteams: ">=0.1 <1" },
+			engines: { puddingteams: ">=1 <2" },
 			permissions: ["spawn"],
 			entry: "driver/index.ts",
 			connector: {

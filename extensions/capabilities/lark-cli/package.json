@@ -38,7 +38,7 @@
 		"source": "trusted",
 		"kind": "capability",
 		"engines": {
-			"puddingteams": ">=0.1 <1"
+			"puddingteams": ">=1 <2"
 		},
 		"permissions": [
 			"spawn",

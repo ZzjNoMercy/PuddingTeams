@@ -157,7 +157,7 @@ export class CodexDriver implements AgentDriver {
 				method: "initialize",
 				id: 1,
 				params: {
-					clientInfo: { name: "puddingteams", title: "PuddingTeams", version: "0.1.0" },
+					clientInfo: { name: "puddingteams", title: "PuddingTeams", version: "1.0.0" },
 					capabilities: { experimentalApi: false, requestAttestation: false },
 				},
 			});

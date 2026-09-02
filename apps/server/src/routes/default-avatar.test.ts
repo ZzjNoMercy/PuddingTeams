@@ -35,7 +35,7 @@ function avatarConnectorManifest(): ConnectorExtensionManifest {
 		version: "1.0.0",
 		source: "builtin",
 		kind: "connector",
-		engines: { puddingteams: ">=0.1 <1" },
+		engines: { puddingteams: ">=1 <2" },
 		permissions: ["spawn"],
 		connector: {
 			id: "ava-conn",

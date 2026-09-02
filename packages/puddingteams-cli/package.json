@@ -1,6 +1,6 @@
 {
 	"name": "@puddingteams/cli",
-	"version": "0.1.0",
+	"version": "1.0.0",
 	"description": "PuddingTeams CLI：init 初始化向导 / doctor 体检 / 本地运行（start/stop/open）/ Extension 脚手架",
 	"license": "MIT",
 	"private": true,
@@ -13,7 +13,7 @@
 		"runtime"
 	],
 	"engines": {
-		"node": ">=20"
+		"node": ">=22.19.0"
 	},
 	"dependencies": {
 		"@ff-labs/fff-node": "0.10.5",

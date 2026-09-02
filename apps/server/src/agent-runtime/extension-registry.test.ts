@@ -26,7 +26,7 @@ function capabilityManifest(version = "1.0.0"): Record<string, unknown> {
 		version,
 		source: "external",
 		kind: "capability",
-		engines: { puddingteams: ">=0.1 <1" },
+		engines: { puddingteams: ">=1 <2" },
 		permissions: ["workspace"],
 		entry: "index.mjs",
 		capability: {
@@ -52,7 +52,7 @@ function connectorManifest(version = "1.0.0"): Record<string, unknown> {
 		version,
 		source: "external",
 		kind: "connector",
-		engines: { puddingteams: ">=0.1 <1" },
+		engines: { puddingteams: ">=1 <2" },
 		permissions: ["spawn", "secrets"],
 		entry: "index.mjs",
 		connector: {
@@ -541,7 +541,7 @@ test("P4: user 安装——复制到 packages/<id>/<version>/、记录 digest，
 
 test("P4: user 安装失败——校验/激活失败不留包目录与记录残留", async () => {
 	const dir = freshDir("pt-user-fail-");
-	const registry = new ExtensionRegistry(dir, new ExtensionCatalog(), new DriverRegistry(), "0.1.0");
+	const registry = new ExtensionRegistry(dir, new ExtensionCatalog(), new DriverRegistry(), "1.0.0");
 	await registry.init();
 
 	// engines 校验失败：发生在 staging 之前，packages 目录都不应出现。

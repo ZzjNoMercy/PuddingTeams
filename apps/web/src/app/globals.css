@@ -341,7 +341,76 @@ html[data-reduce-motion="true"] *::after {
 .harness-settings-tabs button:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 .harness-settings-card { min-height: 359px; }
 .harness-settings-pane { display: flex; flex-direction: column; gap: 16px; }
+.harness-choice-grid {
+	display: grid;
+	grid-template-columns: repeat(3, minmax(0, 1fr));
+	gap: 9px;
+}
+.harness-choice-grid-two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.harness-choice {
+	display: flex;
+	min-height: 92px;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 7px;
+	border: 1px solid var(--settings-line);
+	border-radius: 12px;
+	background: color-mix(in oklab, var(--settings-surface) 94%, var(--settings-sidebar));
+	padding: 13px 14px;
+	text-align: left;
+	transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
+}
+.harness-choice:hover { border-color: color-mix(in oklab, var(--foreground) 24%, var(--settings-line)); }
+.harness-choice[data-active="true"] {
+	border-color: color-mix(in oklab, var(--primary) 68%, var(--settings-line));
+	background: color-mix(in oklab, var(--primary) 8%, var(--settings-surface));
+	box-shadow: 0 0 0 1px color-mix(in oklab, var(--primary) 20%, transparent);
+}
+.harness-choice:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.harness-choice strong { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 680; }
+.harness-choice strong span {
+	border-radius: 999px;
+	background: color-mix(in oklab, var(--primary) 12%, transparent);
+	padding: 2px 6px;
+	color: color-mix(in oklab, var(--primary) 82%, var(--foreground));
+	font-size: 9px;
+	font-weight: 680;
+}
+.harness-choice small { color: var(--muted-foreground); font-size: 10px; line-height: 1.5; }
+.harness-inline-status { margin-top: -8px; color: var(--muted-foreground); font-size: 10px; }
+.harness-advanced {
+	border: 1px solid var(--settings-line);
+	border-radius: 12px;
+	background: color-mix(in oklab, var(--settings-sidebar) 52%, transparent);
+	padding: 0 14px;
+}
+.harness-advanced summary {
+	cursor: pointer;
+	padding: 11px 0;
+	color: var(--muted-foreground);
+	font-size: 11px;
+	font-weight: 650;
+	user-select: none;
+}
+.harness-advanced[open] { padding-bottom: 14px; }
+.harness-advanced[open] summary { border-bottom: 1px solid var(--settings-line); color: var(--foreground); }
+.harness-advanced summary:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; }
+.harness-check-row { display: flex; align-items: flex-start; gap: 9px; font-size: 11px; }
+.harness-check-row input { margin-top: 2px; }
+.harness-check-row span { display: flex; flex-direction: column; gap: 3px; }
+.harness-check-row strong { font-weight: 620; }
+.harness-check-row small { color: var(--muted-foreground); font-size: 10px; line-height: 1.45; }
+.harness-safety-note {
+	border-radius: 11px;
+	background: color-mix(in oklab, var(--foreground) 4%, transparent);
+	padding: 11px 13px;
+}
+.harness-safety-note strong { display: block; margin-bottom: 3px; font-size: 10px; font-weight: 680; }
+.harness-safety-note p { color: var(--muted-foreground); font-size: 10px; line-height: 1.55; }
 .harness-settings-footer { display: flex; justify-content: flex-end; margin-top: 20px; border-top: 1px solid var(--settings-line); padding-top: 16px; }
+@media (max-width: 680px) {
+	.harness-choice-grid { grid-template-columns: 1fr; }
+}
 .appearance-settings { display: flex; flex-direction: column; }
 .preference-row {
 	display: flex;
@@ -1026,6 +1095,50 @@ html[data-reduce-motion="true"] *::after {
 	background: var(--ops-surface);
 }
 
+.ops-mcp-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(min(100%, 22rem), 1fr));
+	gap: 0.75rem;
+}
+.ops-mcp-card {
+	display: flex;
+	min-width: 0;
+	flex-direction: column;
+	gap: 0.65rem;
+	border-radius: 0.85rem;
+	background: #fff;
+	padding: 0.8rem;
+	box-shadow: 0 8px 20px color-mix(in oklab, black 5%, transparent);
+	transition: box-shadow 170ms ease, transform 180ms cubic-bezier(.2,.8,.2,1);
+}
+.ops-mcp-card:hover { box-shadow: 0 12px 26px color-mix(in oklab, black 8%, transparent); transform: translateY(-1px); }
+.dark .ops-mcp-card { background: color-mix(in oklab, var(--ops-surface) 72%, transparent); box-shadow: none; }
+.dark .ops-mcp-card:hover { background: var(--ops-surface-strong); box-shadow: none; }
+.ops-mcp-card-head { display: flex; min-width: 0; align-items: center; gap: 0.65rem; }
+.ops-mcp-card-icon {
+	display: grid;
+	width: 2.1rem;
+	height: 2.1rem;
+	flex: 0 0 2.1rem;
+	place-items: center;
+	border-radius: 0.65rem;
+	background: color-mix(in oklab, var(--primary) 10%, transparent);
+	color: var(--ops-accent);
+}
+.ops-mcp-id {
+	max-width: 9rem;
+	overflow: hidden;
+	border-radius: 0.35rem;
+	background: var(--ops-surface);
+	padding: 0.12rem 0.4rem;
+	color: var(--muted-foreground);
+	font-size: 0.65rem;
+	text-overflow: ellipsis;
+}
+.ops-mcp-endpoint { margin-top: 0.2rem; overflow: hidden; color: var(--muted-foreground); font-family: var(--font-mono), ui-monospace, monospace; font-size: 0.65rem; text-overflow: ellipsis; white-space: nowrap; }
+.ops-mcp-description { display: -webkit-box; overflow: hidden; color: var(--muted-foreground); font-size: 0.7rem; line-height: 1.45; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.ops-mcp-meta { display: flex; min-width: 0; flex-wrap: wrap; gap: 0.3rem 0.8rem; margin-top: auto; border-top: 1px solid color-mix(in oklab, var(--foreground) 8%, transparent); padding-top: 0.55rem; color: var(--muted-foreground); font-size: 0.65rem; }
+
 .skills-library-list {
 	display: grid;
 	grid-template-columns: minmax(0, 1fr);
@@ -1421,16 +1534,16 @@ html[data-reduce-motion="true"] *::after {
 .agent-config-list > div { border-radius: 10px; padding-block: 9px; transition: background 150ms ease; }
 .agent-config-list > div:hover { background: color-mix(in oklab, var(--foreground) 4%, transparent); }
 
-/* Agent 插件分区：用状态卡、色彩和独立操作区替代平铺说明。 */
+/* Agent 的 MCP / 插件分区共享同一套摘要卡与条目卡。 */
 .agent-plugin-section .agent-config-card + .agent-config-card { margin-top: 0; }
 .agent-plugin-overview {
 	display: grid;
 	grid-template-columns: 46px minmax(0, 1fr) auto;
 	gap: 14px;
 	align-items: center;
-	border: 1px solid color-mix(in oklab, var(--primary) 22%, var(--config-line));
+	border: 1px solid var(--config-line);
 	border-radius: 16px;
-	background: color-mix(in oklab, var(--primary) 6%, var(--config-surface));
+	background: var(--config-surface);
 	box-shadow: 0 12px 30px color-mix(in oklab, black 5%, transparent);
 	padding: 17px 18px;
 }
@@ -1487,9 +1600,9 @@ html[data-reduce-motion="true"] *::after {
 	padding: 14px 16px;
 }
 .agent-plugin-binding-card {
-	border-color: color-mix(in oklab, var(--foreground) 12%, transparent);
+	border-color: var(--config-line);
 	background: var(--config-surface);
-	box-shadow: 0 10px 26px color-mix(in oklab, black 5%, transparent);
+	box-shadow: 0 12px 30px color-mix(in oklab, black 5%, transparent);
 }
 .agent-plugin-binding-head {
 	display: grid;
@@ -1543,7 +1656,7 @@ html[data-reduce-motion="true"] *::after {
 	padding-top: 12px;
 }
 .agent-plugin-add-card {
-	border-color: color-mix(in oklab, var(--primary) 24%, var(--config-line));
+	border-color: var(--config-line);
 	background: var(--config-surface);
 }
 .agent-plugin-add-head {
@@ -1564,6 +1677,69 @@ html[data-reduce-motion="true"] *::after {
 }
 .agent-plugin-unavailable strong { color: color-mix(in oklab, #d97706 72%, var(--foreground)); font-size: 12px; }
 .agent-plugin-unavailable p { margin-top: 3px; color: var(--muted-foreground); font-size: 10px; line-height: 1.65; }
+.agent-integration-empty {
+	border: 1px solid var(--config-line);
+	border-radius: 16px;
+	background: var(--config-surface);
+	padding: 22px;
+	color: var(--muted-foreground);
+	font-size: 11px;
+	text-align: center;
+}
+.agent-mcp-toolbar {
+	display: flex;
+	min-height: 36px;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+}
+.agent-mcp-toolbar > span { color: var(--muted-foreground); font-size: 10px; }
+.agent-mcp-server-card {
+	display: flex;
+	cursor: pointer;
+	align-items: center;
+	gap: 11px;
+	transition: border-color 150ms ease, background 150ms ease, box-shadow 150ms ease;
+}
+.agent-mcp-server-card:hover {
+	border-color: color-mix(in oklab, var(--primary) 28%, var(--config-line));
+	background: color-mix(in oklab, var(--primary) 2%, var(--config-surface));
+}
+.agent-mcp-server-card.selected {
+	border-color: color-mix(in oklab, var(--primary) 38%, var(--config-line));
+	box-shadow: 0 12px 30px color-mix(in oklab, var(--primary) 7%, transparent);
+}
+.agent-mcp-server-card:has(input:focus-visible) { outline: 2px solid var(--ring); outline-offset: 2px; }
+.agent-mcp-server-id {
+	border-radius: 6px;
+	background: var(--config-field);
+	padding: 2px 6px;
+	color: var(--muted-foreground);
+	font-family: var(--font-mono), ui-monospace, monospace;
+	font-size: 10px;
+	font-weight: 500;
+}
+.agent-mcp-server-description {
+	display: block;
+	margin-top: 5px;
+	overflow: hidden;
+	color: var(--muted-foreground);
+	font-size: 10px;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.agent-mcp-check {
+	display: grid;
+	width: 20px;
+	height: 20px;
+	flex: 0 0 20px;
+	place-items: center;
+	border: 1px solid color-mix(in oklab, var(--foreground) 20%, transparent);
+	border-radius: 6px;
+	background: var(--config-surface);
+	color: white;
+}
+.agent-mcp-check.selected { border-color: var(--primary); background: var(--primary); }
 
 @media (max-width: 640px) {
 	.agent-plugin-overview { grid-template-columns: 42px minmax(0, 1fr); padding: 15px; }
@@ -1938,9 +2114,41 @@ html[data-reduce-motion="true"] *::after {
 .task-activity-scroll { min-height: 0; overflow-y: auto; padding: 14px; scrollbar-width: thin; }
 .task-activity-section-head { display: flex; min-height: 36px; align-items: center; justify-content: space-between; gap: 12px; padding: 0 3px 10px; }
 .task-activity-section-head > span { flex: 0 0 auto; color: var(--goal-text-3); font-size: 8px; font-variant-numeric: tabular-nums; }
-.task-turn-select { position: relative; min-width: 0; }
-.task-turn-select select { width: auto; max-width: 190px; height: 30px; border: 0; border-radius: 9px; background: color-mix(in oklab, var(--goal-text) 5%, transparent); padding: 0 26px 0 9px; color: var(--goal-text-2); font-size: 9px; font-weight: 620; outline: none; }
-.task-turn-select select:focus-visible { box-shadow: 0 0 0 2px color-mix(in oklab, var(--goal-accent) 38%, transparent); }
+.task-turn-select {
+	width: auto;
+	max-width: 190px;
+	height: 30px !important;
+	border-color: var(--goal-line) !important;
+	border-radius: 9px !important;
+	background: color-mix(in oklab, var(--goal-text) 5%, transparent) !important;
+	padding-inline: 9px 8px !important;
+	color: var(--goal-text-2) !important;
+	font-size: 9px !important;
+	font-weight: 620;
+	box-shadow: none !important;
+}
+.task-turn-select:hover { border-color: var(--goal-line-strong) !important; background: color-mix(in oklab, var(--goal-text) 8%, transparent) !important; color: var(--goal-text) !important; }
+.task-turn-select:focus-visible,
+.task-turn-select[data-state="open"] { border-color: color-mix(in oklab, var(--goal-accent) 42%, transparent) !important; box-shadow: 0 0 0 2px color-mix(in oklab, var(--goal-accent) 18%, transparent) !important; }
+.task-turn-select > svg { width: 12px !important; height: 12px !important; }
+.task-turn-select-content {
+	min-width: var(--radix-select-trigger-width) !important;
+	border-color: color-mix(in oklab, var(--foreground) 12%, transparent) !important;
+	border-radius: 10px !important;
+	background: color-mix(in oklab, var(--popover) 96%, transparent) !important;
+	padding: 3px;
+	box-shadow: 0 14px 36px color-mix(in oklab, black 18%, transparent) !important;
+	backdrop-filter: blur(18px);
+}
+.task-turn-select-item {
+	min-height: 30px;
+	border-radius: 7px !important;
+	padding-inline: 9px 26px !important;
+	color: var(--muted-foreground);
+	font-size: 10px !important;
+	font-weight: 540;
+}
+.task-turn-select-item:focus { background: color-mix(in oklab, var(--primary) 11%, transparent) !important; color: var(--foreground) !important; }
 .task-activity-list { display: grid; gap: 8px; }
 .task-activity-card { position: relative; display: grid; width: 100%; min-width: 0; grid-template-columns: 34px minmax(0,1fr); align-items: start; gap: 10px; border: 1px solid var(--goal-line); border-radius: 14px; background: color-mix(in oklab, var(--goal-text) 2.2%, transparent); padding: 12px; text-align: left; transition: border-color 140ms ease, background 140ms ease, transform 140ms ease; }
 .task-activity-card:hover { border-color: color-mix(in oklab, var(--goal-accent) 30%, transparent); background: var(--goal-accent-soft); transform: translateY(-1px); }
@@ -3617,6 +3825,22 @@ button.nav-user:focus-visible {
 	color: var(--home-text-3);
 	font-size: 10px;
 	transition: color 120ms ease, background 120ms ease;
+}
+.home-worker-result-footer {
+	display: flex;
+	min-height: 24px;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	margin-top: 3px;
+}
+.home-worker-result-footer .home-worker-result-toggle { margin-top: 0; }
+.home-worker-result-usage {
+	margin-left: auto;
+	color: var(--home-text-3);
+	font-size: 10px;
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
 }
 .home-worker-result-toggle:hover { color: var(--home-text-2); }
 .home-worker-result-toggle:focus-visible { outline: 2px solid color-mix(in oklab, var(--home-accent) 65%, transparent); outline-offset: 2px; }

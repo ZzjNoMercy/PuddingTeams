@@ -3,7 +3,7 @@ title: 部署方式
 description: 桌面 App 与源码部署的依赖、端口、数据目录和构建方式。
 ---
 
-<Status tone="preview">PREVIEW</Status>
+<Status>1.0 STABLE</Status>
 
 PuddingTeams 有两种运行形态，但只维护一套业务运行时：桌面 App 和 CLI 都启动相同的生产 Server bundle，读取相同的 `PUDDINGTEAMS_HOME`。
 
@@ -11,7 +11,7 @@ PuddingTeams 有两种运行形态，但只维护一套业务运行时：桌面 
 
 | 依赖 | 桌面 App | 源码部署 |
 | --- | --- | --- |
-| PuddingTeams 自身 Node 运行时 | Electron 内置 | Node.js 20+ |
+| PuddingTeams 自身 Node 运行时 | Electron 内置 | Node.js 22.19.0+ |
 | monorepo 包管理 | 不需要 | pnpm 10.32.1 |
 | Web 浏览器 | App 内置 Chromium | 本机浏览器 |
 | pi SDK | 随发行 runtime 打包 | `pnpm install` 安装 |
@@ -21,6 +21,14 @@ PuddingTeams 有两种运行形态，但只维护一套业务运行时：桌面 
 桌面 App “免 Node”不等于“内置所有 Agent”。它只内置 PuddingTeams 和第一方 Connector 代码；外部 CLI、登录态和上游服务仍属于各自 Agent。
 
 ## 桌面 App
+
+从 [GitHub Releases](https://github.com/ZzjNoMercy/PuddingTeams/releases/latest) 下载与你的平台匹配的安装包：
+
+- Apple Silicon Mac：`PuddingTeams-1.0.0-arm64.dmg`
+- Intel Mac：`PuddingTeams-1.0.0-x64.dmg`
+- Windows 10/11 x64：`PuddingTeams-1.0.0-x64.exe`
+
+同时下载 `SHA256SUMS.txt` 可校验文件完整性。macOS 正式发行包必须通过 Developer ID 签名与 Apple notarization；Windows 正式发行包必须通过 Authenticode 签名和 Windows 真机安装/卸载验收。
 
 当前工程提供 macOS DMG 和 Windows x64 NSIS 构建。安装后启动 App，它会：
 
@@ -49,9 +57,11 @@ pnpm build:electron:arm64
 pnpm build:electron:win:x64
 ```
 
-macOS 发行配置要求签名、hardened runtime 与 notarization；正式构建需要相应 Apple 凭据。Windows 当前构建脚本允许不强制代码签名，未签名安装包可能触发 SmartScreen。卸载桌面 App 不会删除 `PUDDINGTEAMS_HOME` 里的业务数据。
+macOS 发行配置要求签名、hardened runtime 与 notarization；正式构建需要相应 Apple 凭据。Windows 本地结构验证脚本允许不强制代码签名，但 GitHub 稳定发布工作流会拒绝上传未通过 Authenticode 校验的 EXE。卸载桌面 App 不会删除 `PUDDINGTEAMS_HOME` 里的业务数据。
 
 ## 源码开发运行
+
+源码方式要求 Node.js 22.19.0 或更高版本与 pnpm 10.32.1。推荐从已发布 tag 构建，避免 `main` 的开发中变化：
 
 ```bash
 corepack enable

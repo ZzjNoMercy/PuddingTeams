@@ -24,6 +24,7 @@ test("Harness 设置原子更新并施加安全边界", async () => {
 	assert.equal(updated.harness.goalRecovery.directMode, "manual");
 	assert.equal(updated.harness.verification.defaultWorkItemMode, "manager_review");
 	assert.equal(updated.harness.verification.defaultFinalGoalMode, "independent_evidence_review");
+	assert.equal(updated.harness.verification.reviewers.evidenceModel, "", "空值表示跟随 Manager 模型");
 	assert.equal(updated.harness.verification.firstReleaseScope, "cli_code_first");
 	assert.equal(updated.harness.verification.unavailableAction, "block");
 	assert.equal(updated.harness.workspaceExecution.gitWriteDefault, "isolated_worktree");
@@ -45,6 +46,10 @@ test("Harness 设置原子更新并施加安全边界", async () => {
 		workspaceExecution: { promotion: { conflictAction: "auto_merge" as "block_preserve_changes" } },
 	}), /conflictAction 必须为 block_preserve_changes/);
 	await assert.rejects(() => store.setHarness({ verification: { enabled: false } }), /enabled 必须为 true/);
+	const customVerifier = await store.setHarness({ verification: { reviewers: { evidenceModel: " openai/gpt-5 " } } });
+	assert.equal(customVerifier.harness.verification.reviewers.evidenceModel, "openai/gpt-5");
+	const inheritedVerifier = await store.setHarness({ verification: { reviewers: { evidenceModel: "" } } });
+	assert.equal(inheritedVerifier.harness.verification.reviewers.evidenceModel, "");
 	await assert.rejects(() => store.setHarness({ verification: { firstReleaseScope: "cli_and_gui" as "cli_code_first" } }), /首期必须为 cli_code_first/);
 	await assert.rejects(() => store.setHarness({
 		workspaceExecution: { nonGitWriteDefault: "isolated_copy_manual_apply" as "exclusive_write" },
