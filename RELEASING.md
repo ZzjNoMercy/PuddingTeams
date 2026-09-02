@@ -27,6 +27,8 @@ Build Windows x64 NSIS on Windows for the final release. A macOS cross-build is 
 pnpm build:electron:win:x64
 ```
 
+PuddingTeams 1.0.0 was published manually as an explicitly disclosed unsigned exception. The automated release workflow remains fail-closed: future releases require a valid Authenticode certificate plus clean-machine install, upgrade, and uninstall acceptance before the warning can be removed.
+
 After all three installers are present:
 
 ```bash

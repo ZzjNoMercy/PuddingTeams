@@ -20,7 +20,7 @@ All notable changes to PuddingTeams are documented here. The project follows Sem
 
 ### Known limitations
 
-- Windows artifacts require Authenticode signing before they should be presented as a trusted stable installer.
+- The Windows 1.0.0 installer is unsigned and may trigger an Unknown Publisher or SmartScreen warning; verify its published SHA-256 before installation.
 - Generic HTTP/RPC/ACP transports, Extension process isolation and a public Extension marketplace are not part of 1.0.
 
 [1.0.0]: https://github.com/ZzjNoMercy/PuddingTeams/releases/tag/v1.0.0

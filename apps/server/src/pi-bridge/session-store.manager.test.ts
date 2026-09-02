@@ -73,7 +73,9 @@ test("P3-R: Agent 运行指令与 Window collaboration 分层；Direct 固定 re
 test("Phase5: thinking level 新建会话即生效，运行中会话即时 setThinkingLevel", async () => {
 	const { teams, sessions } = await makeStack();
 	await teams.updateManager({ manager: { thinkingLevel: "high" } });
-	const summary = await sessions.create();
+	// 显式选用支持 high/max 的目录模型，避免测试结果依赖运行机器是否
+	// 配置了 provider 凭据；无可用默认模型时 SDK 会按设计钳制为 off。
+	const summary = await sessions.create("openai/gpt-5.6-sol");
 	const session = await sessions.open(summary.id);
 	assert.equal(session.thinkingLevel, "high", "manager 配置的 thinking level 必须应用到新会话");
 
@@ -84,7 +86,7 @@ test("Phase5: thinking level 新建会话即生效，运行中会话即时 setTh
 	assert.equal(session.thinkingLevel, "max");
 
 	// 新会话同样应用最新配置。
-	const s2 = await sessions.create();
+	const s2 = await sessions.create("openai/gpt-5.6-sol");
 	assert.equal((await sessions.open(s2.id)).thinkingLevel, "max");
 	await sessions.disposeAll();
 });

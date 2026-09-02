@@ -60,7 +60,7 @@ PuddingTeams 1.0 把一次次独立的 Agent 调用组织成可恢复的长期�
 
 桌面版内置 PuddingTeams Runtime、Web 与第一方 Connector 代码，不需要 Node.js 或 pnpm。使用 Codex、Claude Code、PuddingClaw 时，仍需自行安装并登录对应上游 CLI；模型账号和凭据始终由对应服务提供。
 
-建议同时下载 `SHA256SUMS.txt` 校验文件完整性。macOS 正式包经过 Developer ID 签名与 Apple notarization；Windows 稳定包只有在 Authenticode 签名和真机安装验收完成后才会发布。
+建议同时下载 `SHA256SUMS.txt` 校验文件完整性。macOS 正式包经过 Developer ID 签名与 Apple notarization。1.0.0 的 Windows 安装包尚未进行 Authenticode 签名，Windows 可能显示“未知发布者”或 Microsoft Defender SmartScreen 提示；继续安装前请先核对 SHA-256。
 
 ## 源码部署
 

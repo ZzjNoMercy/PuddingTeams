@@ -30,6 +30,8 @@ jobs:
           node-version: 22.19.0
           cache: pnpm
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
       - run: pnpm install --frozen-lockfile
       - run: pnpm docs:typecheck
       - run: pnpm --filter @puddingteams/docs run lint
