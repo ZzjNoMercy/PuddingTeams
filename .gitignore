@@ -19,3 +19,6 @@ electron/release/
 
 # 设计稿永不入库（本地设计探索目录）
 designs/
+
+# PuddingTeams 任务接力报告与证据（仅保留在本地）
+.pudding/handoff/
