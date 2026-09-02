@@ -65,8 +65,9 @@ W2 原型 ─┘
 关键区别：
 
 - Worker `completed` 只代表该次委托有结果；
-- 结果绑定到 WorkItem 后成为 `submitted`；
-- Manager 根据该 WorkItem 的验收条件明确给出 `accepted`、`revision` 或 `blocked`；
+- Runtime 把执行结果、产物和环境事实封装为 sealed `ExecutionReceipt`，匹配当前 WorkItem revision 的结果才能形成 `Submission`；
+- 需要独立复验时，Verifier 生成 `VerificationRecord`，但它不会直接接纳 WorkItem；
+- Manager 根据验收条件和所需复验明确给出 `accepted`、`revision` 或 `blocked`；
 - 所有 WorkItem accepted 只代表计划完成，Goal 仍要通过最终 completion review。
 
 Worker 自己的 Todo 只属于该 Worker 的执行过程，不会上升为 Manager WorkPlan。direct Goal 没有 Manager，因此只展示 Goal 契约和当前 Worker Timeline，不伪造 WorkItem DAG。
@@ -84,6 +85,14 @@ Worker 自己的 Todo 只属于该 Worker 的执行过程，不会上升为 Mana
 
 Goal 不是在 Manager 说“完成了”时自动结束。平台要求逐项核对冻结的 `completionBoundary`，并附证据引用。
 
+Goal 定义最低验收强度，WorkItem 可以提高但不能降低。策略在执行开始后冻结；WorkItem revision、Goal revision 或 execution epoch 变化会使旧 Submission/Verification 失效，避免拿旧环境中的通过记录验收新内容。
+
+| 模式 | 复核主体与边界 |
+| --- | --- |
+| `manager_review` | Manager 阅读 Submission，并引用至少一条 Delegation、Artifact、消息或只读观察证据 |
+| `independent_evidence_review` | 新的隔离 Reviewer 只判断冻结 criterion 与既有证据，不声称重新观察 Workspace |
+| `environment_verified` | 新的 Verifier 在平台签发环境中实际运行命令、检查文件或搜索结果，平台记录不可变观察 |
+
 ### Manager 模式
 
 Manager 在无活动委托、无待回答 Decision、WorkPlan 已验收且有最终 brief 时，逐项提交结论和证据。它不能用普通状态更新直接把 Goal 写成 resolved。
@@ -97,6 +106,12 @@ Manager 在无活动委托、无待回答 Decision、WorkPlan 已验收且有最
 - `needs_human`：证据无法替代人的主观判断或授权。
 
 `needs_human` 会转为 DecisionRequest，Goal 保持 active。人类不是默认逐项验收每个 Worker 输出，只处理真正属于人的判断。
+
+### Environment Verification 模式
+
+环境复验使用 fresh Verifier Session，禁止续接原 Executor 的会话。默认对当前可验证快照建立 `isolated_copy`，也可在必须检查目标环境时使用带前后指纹的 `same_target_guarded`。只有每条 criterion 都有平台实际观察支撑、输入指纹仍匹配且 integrity 为 clean，记录才能成为 `passed`。
+
+Verifier 自报“命令已运行”不算环境证据；平台必须在执行时间线中观察到对应的命令、文件读取或搜索事件。没有观察、环境绑定丢失、复验越权修改目标或使用旧 revision，都会失败或阻塞。详细流程和 1.0 能力边界见[可信验收与环境复验](/docs/verification/)。
 
 ## 中断恢复
 

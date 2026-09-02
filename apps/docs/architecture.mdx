@@ -13,6 +13,7 @@ Next.js Web / Electron
         ▼
 Fastify Server
   ├─ Window / Session / Goal / Workspace / Artifact
+  ├─ ExecutionReceipt / Verification / Settlement
   ├─ pi Manager Harness
   ├─ Agent Runtime（幂等、超时、交互、恢复）
   └─ Extension Registry
@@ -26,7 +27,7 @@ Fastify Server
 
 | 层 | 当前实现 | 作用 |
 | --- | --- | --- |
-| Manager Harness | `@earendil-works/pi-coding-agent` 0.84 | Manager 会话、工具、资源装配和本地 pi Worker |
+| Manager Harness | `@earendil-works/pi-coding-agent` 0.84.4（精确固定） | Manager 会话、工具、资源装配和本地 pi Worker |
 | Server | Node.js 22.19+、TypeScript、Fastify 5 | API、WebSocket、状态存储与 Agent Runtime |
 | Web | Next.js 16、React 19、Tailwind CSS 4 | 聊天、配置、执行 Inspector；生产态静态导出 |
 | Desktop | Electron 43、electron-builder | 启动同一 Server bundle，并加载同源 Web |
@@ -37,12 +38,16 @@ Fastify Server
 
 ## pi 在系统里的位置
 
-pi 有两种职责，不能混为一谈：
+[pi](https://github.com/earendil-works/pi) 是 PuddingTeams 的上游 Agent Harness 基座。1.0 在 `apps/server/package.json` 中精确固定 `@earendil-works/pi-coding-agent@0.84.4`，lockfile 中配套的 `pi-agent-core`、`pi-ai`、`pi-tui` 等包也解析到 `0.84.4`，避免运行语义随依赖范围静默变化。
+
+PuddingTeams 不是 pi 的官方发行版，也不维护一份未声明的 pi fork。它复用 pi 的 Session、Model Runtime、工具、资源加载和 Extension API，在应用层增加 Room/Teams、Manager/Worker 编排、Driver SPI/PWCP、Goal/WorkPlan、HITL、Workspace、Artifact 和可信验收。pi 有两种职责，不能混为一谈：
 
 1. **Manager Harness**：在 solo 和群聊里接收用户消息，读取最新 roster、Goal 和 WorkPlan，选择并委托 Worker。
 2. **本地 Worker Runtime**：某个 Agent 选择 pi Connector 时，任务在进程内 SDK Session 中执行，不创建 OS 子进程。
 
 PuddingTeams 不复制 pi 的默认系统提示词和资源加载器。它在 pi 原生 base/append 之后追加 Agent 指令、群聊协作规则和动态工作状态。非 pi Connector 不会自动继承这套提示词；它们只收到具体任务文本。
+
+pi 升级是一次显式兼容性变更：修改精确版本、更新 lockfile，再通过 `pnpm verify:release` 和真实 Connector smoke。PuddingTeams 的 Connector/Capability Extension 可以同时提供 pi Extension 门面与 PuddingTeams Driver contribution，但完整房间编排只存在于 PuddingTeams 控制面。
 
 ## PWCP：统一语义，不统一命令
 

@@ -15,6 +15,12 @@
 
 PuddingTeams 1.0 把一次次独立的 Agent 调用组织成可恢复的长期协作：共同目标、Manager 计划、Worker 委托、人的审批、Workspace 与最终产物都保存在同一条事实链上。Agent 可以更换，项目和协作状态仍归用户；进程可以中断，Session、证据与交付不会随之消失。
 
+## 基于 pi 构建的 Teams 层
+
+PuddingTeams 以 [pi](https://github.com/earendil-works/pi) 的 coding agent SDK 为上游基座，把 pi 的 Session、Model Runtime、工具和资源装配能力扩展成面向团队协作的产品：Rooms、Manager/Worker 编排、跨 Agent Connector、Goal/WorkPlan、HITL、Workspace、Artifact 与可信验收都由 PuddingTeams 提供。
+
+1.0 主程序**精确固化** `@earendil-works/pi-coding-agent@0.84.4`，lockfile 中配套的 pi 核心包也解析到 `0.84.4`。这不是一个未声明的 pi fork，也不是 pi 官方发行版；pi 负责单 Agent Harness 基础，PuddingTeams 在应用层增加 Teams 控制面。升级 pi 时会显式修改固定版本，并重新通过发布门禁和真实 Connector 验证，不随依赖范围自动漂移。
+
 ## 不是更多聊天窗口，而是一间真正能工作的房间
 
 | 普通多窗口工作流 | PuddingTeams |
@@ -23,7 +29,7 @@ PuddingTeams 1.0 把一次次独立的 Agent 调用组织成可恢复的长期�
 | 每次调用都像第一次见面 | Worker session handle 可续接、可恢复 |
 | 多 Agent 之间责任模糊 | Manager、Worker、Delegation 边界明确 |
 | 长结果淹没聊天记录 | 结果外置、摘要回传、分页回读 |
-| “完成了”缺少证据 | Artifact、receipt 与完成复核 |
+| “完成了”缺少证据 | Artifact、sealed Receipt、环境复验与完成复核 |
 | 人只能在最后返工 | input required、审批与 Decision 进入时间线 |
 
 系统坚持一个简单边界：**协作状态属于平台，执行协议属于 Connector，具体 Agent 可以替换。**
@@ -37,6 +43,25 @@ PuddingTeams 1.0 把一次次独立的 Agent 调用组织成可恢复的长期�
 | **群聊** | pi Manager | 多个专业角色共享 Goal，并行、接力和统一验收 |
 
 群聊不是让模型假装共享同一份上下文。共同事实由 Goal、WorkPlan、Decision、Delegation、Workspace 和 Artifact 显式保存。
+
+## 从 `completed` 到可信验收
+
+PuddingTeams 不把 Agent 的“我完成了”直接当成事实。正式 Goal 使用一条可追溯的验收链：
+
+```text
+Task Contract → Delegation Run → sealed ExecutionReceipt
+→ Submission → VerificationRecord → Manager acceptance → Goal resolved
+```
+
+执行结束、事实复验和管理验收是三个独立状态。Runtime 会把上游结果、产物和 Workspace 指纹封装为不可变 Receipt，再把平台实际观察写入 VerificationRecord；Verifier 只能按冻结的 criterion 判断，不能临时改写验收标准；Manager 最后决定接纳、返修或阻塞。
+
+| 验收等级 | 能证明什么 |
+| --- | --- |
+| `manager_review` | Manager 查看结果和至少一条证据后验收 |
+| `independent_evidence_review` | 新的隔离 Reviewer 按原始 criterion 复核既有证据 |
+| `environment_verified` | 新的 Verifier 在平台签发并绑定的环境中重新运行命令、检查文件或搜索结果 |
+
+默认 WorkItem 使用 Manager review，Goal 最终收口使用 Independent review；代码、测试、构建等高置信任务可提升为 Environment Verification。CLI/代码复验默认在 `isolated_copy` 中进行，Git 写任务默认在独立 worktree 执行并在验收后提升精确 change-set。1.0 只对平台能直接绑定环境的本地 SDK/spawn Driver 声明 `environment_verified`；远程 Driver、GUI/Computer Use 和无法安全执行的副作用会 fail closed 或转人工决策。
 
 ## 已连接的 Agent
 
@@ -108,6 +133,7 @@ Electron / Next.js Web
         ▼
 Fastify Server
   ├─ Window / Session / Goal / Workspace / Artifact
+  ├─ ExecutionReceipt / Verification / Settlement
   ├─ pi Manager Harness
   ├─ Agent Runtime（幂等、超时、交互、恢复）
   └─ Extension Registry
@@ -124,6 +150,7 @@ Fastify Server
 - [部署方式](https://zzjnomercy.github.io/PuddingTeams/docs/deployment/)
 - [协作模式](https://zzjnomercy.github.io/PuddingTeams/docs/room/)
 - [Harness 与长结果](https://zzjnomercy.github.io/PuddingTeams/docs/harness/)
+- [可信验收与环境复验](https://zzjnomercy.github.io/PuddingTeams/docs/verification/)
 - [Extension 机制](https://zzjnomercy.github.io/PuddingTeams/docs/connectors/)
 - [Connector 开发参考](https://zzjnomercy.github.io/PuddingTeams/docs/connector-development/)
 - [运行与排错](https://zzjnomercy.github.io/PuddingTeams/docs/operations/)

@@ -7,7 +7,7 @@ description: 一个以持续会话为中心、可连接不同 Agent 的本地协
 
 PuddingTeams 解决的不是“同时启动几个 Agent”，而是一个更基础的问题：**当工作跨越多个执行者、多个回合和人的判断时，怎样让上下文、责任、进度和交付仍然连续。**
 
-它以 pi 作为 Manager Harness，通过 Connector 接入 Pi、PuddingClaw、Codex、Claude Code 等 Agent，并把协作状态保存在本机。Agent 可以更换，知识与项目仍归用户；执行可以中断，Goal、证据和交付不会因此消失。
+它以 [pi](https://github.com/earendil-works/pi) 作为上游 Agent Harness 基座，通过 Connector 接入 pi、PuddingClaw、Codex、Claude Code 等 Agent，并把协作状态保存在本机。1.0 精确固定 `@earendil-works/pi-coding-agent@0.84.4`；PuddingTeams 在 pi 的 Session、Model Runtime、工具和资源装配之上增加 Rooms/Teams、多 Agent 编排与可信验收，而不是 pi 官方发行版或未声明的 fork。Agent 可以更换，知识与项目仍归用户；执行可以中断，Goal、证据和交付不会因此消失。
 
 <Principle title="第一性原理：协作必须有可恢复的共同状态">
 一次模型调用只能生成一次响应。工程协作还需要持续身份、工作目录、会话续接、等待输入、验收边界和可追溯交付。PuddingTeams 把这些状态放在 Agent 之外，才可能让不同 Agent 在同一工作上可靠接力。
@@ -46,15 +46,17 @@ PuddingTeams 自己负责：
 - 想理解系统：先读[技术架构](/docs/architecture/)和[协作模式](/docs/room/)。
 - 想安装运行：读[部署方式](/docs/deployment/)和[运行与排错](/docs/operations/)。
 - 想做长任务：读[Harness 与长结果](/docs/harness/)和[Session Goal](/docs/goals/)。
+- 想理解“Agent 说完成”和“平台验收通过”的区别：读[可信验收与环境复验](/docs/verification/)。
 - 想接入新的 Agent：读[Extension 机制](/docs/connectors/)和[Connector 开发参考](/docs/connector-development/)。
 
 ## 当前实现状态
 
 | 能力 | 状态 |
 | --- | --- |
-| pi SDK 与 spawn Connector | 已实现 |
+| pi SDK 0.84.4（精确固定）与 spawn Connector | 已实现 |
 | solo、单聊、群聊 | 已实现 |
 | Goal、WorkPlan、Decision、恢复 | 已实现 |
+| sealed ExecutionReceipt、独立证据复核、CLI/代码环境复验 | 已实现；GUI/Computer Use 复验不在 1.0 范围 |
 | 长结果外置与分页回读 | 已实现 |
 | Electron 与源码/CLI 运行 | 已实现 |
 | HTTP Transport | 协议已预留，生产实现尚未提供 |

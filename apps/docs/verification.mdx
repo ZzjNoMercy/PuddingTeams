@@ -1,0 +1,110 @@
+---
+title: 可信验收与环境复验
+description: ExecutionReceipt、Submission、VerificationRecord、Workspace 隔离与最终接纳如何组成可证明的完成链。
+---
+
+<Status>1.0 STABLE · CLI/CODE FIRST</Status>
+
+Agent 返回 `completed` 只能证明上游结束了一次执行，不能证明结果正确、环境一致或已经获得接纳。PuddingTeams 把**执行结束、事实复验和管理验收**拆成三个正交状态，并让每一次状态推进都绑定到明确的任务契约、revision、环境和证据。
+
+```text
+Task Contract
+  → Delegation Run
+  → sealed ExecutionReceipt
+  → Submission
+  → VerificationRecord
+  → Manager acceptance / revision / blocked
+  → Goal completion review
+  → resolved
+```
+
+## 四类记录各自负责什么
+
+| 记录 | 事实含义 | 不能代表什么 |
+| --- | --- | --- |
+| Delegation Run | 某个 Worker 在某次 attempt 中执行过任务 | 不代表结果正确 |
+| `ExecutionReceipt` | Runtime 封存的上游结果、产物、Workspace 指纹、change-set 和证据采集状态 | 不代表已验收 |
+| `Submission` | 当前 WorkItem revision 提交给 Manager 的候选交付 | 不代表已通过复验 |
+| `VerificationRecord` | Reviewer 对冻结 criterion 与绑定环境作出的逐项事实判断 | 不会直接把 WorkItem 变成 accepted |
+
+Runtime 只会从匹配当前 WorkItem、revision 和 execution epoch 的 `reported_completed` Receipt 生成 Submission。Receipt 由平台封存，Worker 不能事后改写；验收记录则继续绑定这份 Submission 和输入 fingerprint。任何一环变旧，后续门禁都会拒绝使用它。
+
+## 三档验收强度
+
+```text
+manager_review
+  < independent_evidence_review
+  < environment_verified
+```
+
+| 模式 | 怎样判断 | 适合 |
+| --- | --- | --- |
+| `manager_review` | Manager 查看 Submission，并引用至少一条可追溯证据 | 规划、总结、低风险中间结果 |
+| `independent_evidence_review` | fresh 隔离 Reviewer 按原始顺序逐条判断 criterion，只使用已有证据 | 调研核对、最终 Goal 的默认复核 |
+| `environment_verified` | fresh Verifier 在平台签发的环境中实际运行命令、读取文件或搜索，并由平台记录观察 | 代码、测试、构建和其他需要确认当前环境的结果 |
+
+默认 WorkItem 模式是 `manager_review`，默认 Goal 最终模式是 `independent_evidence_review`，触发方式是 `manager_request`。Goal 设定最低强度，WorkItem 可以提高但不能降低；首个 `in_progress` 后策略冻结，不能在看到结果后为了放行而降级。
+
+WorkItem 的通过只解锁 WorkPlan 下游，不取代 Goal 最终复核。若 Goal 使用 `environment_verified`，所有 WorkItem 都曾通过也仍要对**当前整合环境**重新做一次 Goal 级验证，防止后续合法改动使早期结论失效。
+
+## 在哪里配置和查看
+
+打开应用设置中的 **Harness → 独立验收**，可以选择默认验收强度、Manager 请求或 Submission 后自动触发、Reviewer、CLI 复验环境，以及是否强制使用不同 Agent；**Harness → Workspace** 用来选择 Git 写任务的隔离 worktree 或独占当前目录。设置只影响新任务，不会改写已经开始的 WorkItem 或 Goal。
+
+Session 的运行状态抽屉会显示每个 WorkItem 的冻结策略、Submission、Verification 状态、环境 profile、平台观察数量、evidence refs、integrity 和逐项 criterion 结论。活动抽屉则把状态归一为待复验、复验中、已复验、失败、受阻或过期，方便定位为什么任务还不能进入 accepted/resolved。
+
+## Environment Verification 怎样运行
+
+1. 平台根据 Goal/Window 绑定解析 Workspace；Manager 不能在提示词里指定任意 `cwd`。
+2. 平台签发一次性 verification environment，并把它绑定到 `verificationId`、Submission、revision、epoch 和输入 fingerprint。
+3. Verifier 使用 fresh Session；禁止续接原 Executor 的 Session，也不能把验证 Run 反向变成新的 Submission。
+4. Verifier 必须按原始顺序返回每条 criterion 的严格结果和 evidence refs。
+5. 平台把自己观察到的命令、文件读取和搜索事件写入不可变时间线，再封存 `VerificationRecord`。
+6. 只有 criterion 全部满足、证据绑定完整、输入未漂移且 integrity 为 clean，状态才是 `passed`。
+7. Manager 根据 VerificationRecord 选择 accepted、revision 或 blocked；环境通过本身不会绕过管理验收。
+
+Verifier 文本中自称“我运行了测试”不是证据。`environment_verified` 至少要有平台实际观察；没有观察、观察与 criterion 不匹配、环境绑定丢失、输入指纹过期或受控范围出现越权修改，都会 fail closed。
+
+## 两种复验环境
+
+| 环境模式 | 行为 | 失败边界 |
+| --- | --- | --- |
+| `isolated_copy` | 从当前可验证快照建立临时副本，在其中运行 test/build 等可能产生缓存的命令 | 副本 fingerprint 必须与 Submission 输入一致；默认用于 CLI/代码 |
+| `same_target_guarded` | 在目标 Workspace 中直接观察，执行前后计算 fingerprint | 复验造成越权修改时记录失效并 blocked |
+
+复验环境继承当前 Connector/账号的网络能力；PuddingTeams 不把它描述成离线安全沙箱。发布、购买、发送、删除和业务授权等外部副作用也不会因为“需要验证”就被自动执行，仍由现有 HITL、幂等和对账机制约束。
+
+## 执行 Workspace 与结算
+
+复验环境负责“如何重新观察”，WorkItem 的 Workspace policy 负责“原执行在哪里发生、修改怎样进入目标目录”：
+
+| Workspace policy | 执行所有权 | 接纳时怎样结算 |
+| --- | --- | --- |
+| `read_only_shared` | 可共享读取目标 Workspace；Driver 必须能强制只读 | 发现写入即 integrity violation |
+| `isolated_worktree` | Git 写任务使用独立 execution worktree | 先记录 Manager accepted 意图，再提升冻结 change-set；成功后才最终 accepted |
+| `exclusive_write` | 非 Git 或无法隔离的写任务获取独占 lease | 修改已在目标环境，以 baseline、write-set 和前后 fingerprint 对账 |
+
+`isolated_worktree` 不会自动 commit 或 push。提升发生冲突时，平台保留隔离副本并阻塞 WorkItem，不会把 Manager 的“同意接纳”伪装成“change-set 已成功落地”。`exclusive_write` 也不承诺自动回滚不可逆副作用。
+
+## 什么时候记录会过期
+
+以下变化会让旧 Submission 或 VerificationRecord 变为 stale，必须基于新事实重新提交或复验：
+
+- WorkItem revision 或 Goal revision 改变；
+- Server 恢复后进入新的 execution epoch；
+- Submission、criterion、Verifier 或环境 profile 不再匹配；
+- 当前 Workspace fingerprint 与验证输入不同；
+- Receipt 的 Artifact/condition evidence 采集不完整；
+- 隔离 worktree 的 change-set 尚未提升或提升失败。
+
+未知终态也不会被自动解释成成功。只读且没有外部副作用的确定性检查可以新建 attempt；写入、发布、发送、购买或删除等操作必须先对账。
+
+## 1.0 的明确边界
+
+- 首期范围是 `cli_code_first`：命令、文件和搜索观察已经纳入环境复验。
+- 只有平台能直接绑定签发环境的本地 `sdk` / `spawn` Driver 可以产出 `environment_verified`。
+- HTTP/RPC/ACP 远端 Driver 在没有可校验环境绑定回执前 fail closed；它们仍可执行普通任务或参与证据复核。
+- GUI/Computer Use 的真实环境复验尚未纳入 1.0 承诺，不能把截图描述或 Agent 自报提升为该等级。
+- `manager_review` 与 `independent_evidence_review` 仍是有效模式；不是所有任务都值得付出一次真实环境执行的成本。
+
+对 Goal、WorkItem 和 completion review 的整体关系，继续读 [Session Goal](/docs/goals/)；对 Workspace 信任、执行隔离和 Artifact 冻结，继续读 [Workspace 与数据](/docs/workspaces/)。

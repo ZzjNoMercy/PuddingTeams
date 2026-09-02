@@ -103,6 +103,20 @@ Markdown 文件链接按以下规则处理：
 
 Artifact 注册时把文件字节冻结到 `artifacts/blobs/` 并计算哈希。原 Workspace 路径只是可继续编辑的工作副本；下载、证据核验和跨 Agent 交接使用冻结快照，避免后续修改让旧验收引用失真。
 
+## 执行级 Workspace 所有权
+
+Workspace 信任回答“哪些项目资源可以进入 Agent 上下文”，执行策略进一步回答“这一次 WorkItem 可以在哪里读写”。策略按 WorkItem revision 冻结：
+
+| 模式 | 适用任务 | 并发与结算规则 |
+| --- | --- | --- |
+| `read_only_shared` | 调研、分析、检查 | 可共享目标 Workspace；Driver 必须能强制只读，发现写入即为 integrity violation |
+| `isolated_worktree` | Git 项目中的代码或文档修改 | 每个写任务使用独立 worktree；Manager 接纳后才把精确 change-set 提升到目标 Workspace |
+| `exclusive_write` | 非 Git 项目或无法隔离的目标修改 | 获取目标 Workspace 的独占 lease，记录前后 fingerprint 与 write-set；不承诺自动回滚 |
+
+默认路由是只读任务 `read_only_shared`、Git 写任务 `isolated_worktree`、非 Git 写任务 `exclusive_write`。隔离 worktree 不会只从 `HEAD` 猜测输入：当前可见工作树中的 staged、tracked 和未忽略 untracked 内容必须进入可审计 baseline；无法完整物化时阻塞或显式改用独占写入。
+
+`isolated_worktree` 的修改在验收前不会进入目标 Workspace。提升冲突会保留隔离副本并把 WorkItem 置为 blocked；平台不会自动 commit 或 push。环境复验如何绑定这些执行快照、指纹和 change-set，见[可信验收与环境复验](/docs/verification/)。
+
 ## 备份与迁移
 
 迁移到另一台机器时，至少备份完整的 `PUDDINGTEAMS_HOME`。如果要保留 pi Manager/Worker 的全局提示词和资源，还应单独迁移 `~/.pi/agent`；外部 Codex、Claude Code、PuddingClaw 的账号和 Session 由各自产品管理，不能只靠 PuddingTeams 目录恢复。
