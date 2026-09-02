@@ -94,6 +94,14 @@ PuddingTeams 激活时不会调用这个 pi 门面承担房间委托。平台自
 
 HTTP、RPC 和 ACP 已进入 capability/manifest 词汇，但当前没有通用平台 Transport。代码型 Driver 可以自行实现网络协议；文档不把它描述成已交付的官方能力。
 
+## MCP Server 与 Extension 的关系
+
+MCP Server 不属于 Agent Connector，也不作为 Capability 包安装。PuddingTeams 在“扩展 → MCP”维护一份全局 Server Catalog，再由每个 Manager 或 Pi Worker 单独勾选；未勾选的 Server 不会进入该 Agent 的会话。
+
+协议执行依赖 `pi-mcp-adapter`，它随 Server 发行并默认启用。平台向 adapter 传入显式的 Server 子集，并关闭宿主 MCP 配置发现，避免 `~/.pi` 中的配置绕过 Agent 白名单。Server 配置位于 `<PUDDINGTEAMS_HOME>/config/mcp-servers.json`，凭据单独加密存储，列表接口只显示已配置的密钥名称。
+
+本地 stdio MCP 与远端 MCP 工具调用使用当前 Agent 的运行权限；只添加可信 Server。当前没有额外的逐次 MCP 工具审批层，添加 Server 并把它勾选给 Agent 就代表授权该 Agent 使用。
+
 ## 生命周期与更新
 
 - Probe 检查 Extension 是否安装、上游是否可执行、配置/鉴权和兼容性；

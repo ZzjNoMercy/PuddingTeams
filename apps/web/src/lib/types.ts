@@ -485,8 +485,44 @@ export interface AgentConfig {
 	/** manager 条目的可编辑配置（§10.5）。 */
 	manager?: PiManagerSettings;
 	piResources?: PiResourceConfig;
+	/** 平台 MCP Server Catalog 中为该 Pi Agent 勾选的 Server id。 */
+	mcpServerIds?: string[];
 	/** Extension 配置版本（§3.3.5）。 */
 	extensionRevision?: number;
+}
+
+export interface McpServerDefinition {
+	command?: string;
+	args?: string[];
+	env?: Record<string, string>;
+	cwd?: string;
+	url?: string;
+	headers?: Record<string, string>;
+	auth?: "oauth" | "bearer" | false;
+	bearerTokenEnv?: string;
+	oauth?: Record<string, unknown> | false;
+	lifecycle?: "lazy" | "eager" | "keep-alive" | "lazy-keep-alive";
+	requestTimeoutMs?: number;
+	protocolVersion?: "legacy" | "auto" | "2026-07-28";
+	exposeResources?: boolean;
+	includeTools?: string[];
+	excludeTools?: string[];
+}
+
+export interface McpServerRecord {
+	id: string;
+	displayName: string;
+	description?: string;
+	definition: McpServerDefinition;
+	secretKeys: string[];
+	createdAt: string;
+	updatedAt: string;
+	usedBy: Array<{ id: string; displayName: string }>;
+}
+
+export interface McpCatalogResponse {
+	adapter: { id: "pi-mcp-adapter"; version: string; enabled: true };
+	servers: McpServerRecord[];
 }
 
 /** Agent 的显示名：displayName 缺省时回退内部 id（name）。所有展示位统一走这里。 */

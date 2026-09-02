@@ -58,6 +58,8 @@ export interface LocalPiDriverOptions {
 		env: NodeJS.ProcessEnv,
 		cwd: string,
 	) => Promise<{ activeBindings: number; skillPaths: string[]; env: NodeJS.ProcessEnv; issues: Array<{ code: string; message: string }> }>;
+	/** 平台托管的通用 Pi Extension（当前为按 Agent 过滤后的 MCP adapter）。 */
+	managedExtensionFactoriesFor?: (cwd: string) => Promise<InlineExtension[]>;
 	/** 会话存储目录；平台注入 `PUDDINGTEAMS_HOME/sessions/workers`，缺省（独立使用）派生 `<pi agentDir>/puddingteams-worker-sessions`。 */
 	sessionDir?: string;
 	/** 仅供运行时/测试调节；429/过载保持同一 Delegation 与 Session 冷却续跑。 */
@@ -303,6 +305,9 @@ export class LocalPiDriver implements AgentDriver {
 			console.warn(`[pi worker capability] ${issue.message} (${issue.code})`);
 		}
 		const extensionFactories: InlineExtension[] = [];
+		if (this.opts.managedExtensionFactoriesFor) {
+			extensionFactories.push(...await this.opts.managedExtensionFactoriesFor(cwd));
+		}
 		if (codeSearch?.provider === "fff" && codeSearch.workspace?.trusted && this.opts.fffStateRoot) {
 			extensionFactories.push(await buildWorkspaceFffExtension({
 				stateRoot: this.opts.fffStateRoot,

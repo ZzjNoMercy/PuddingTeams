@@ -10,7 +10,7 @@ import path from "node:path";
  * （`.teams`/`.sessions`）或 pi 全局目录：
  *
  * ```
- * <home>/config/product.json
+ * <home>/config/{product.json,mcp-servers.json}
  * <home>/state/{agents,windows,workspaces,delegations,interactions,work-states,artifacts}.json
  * <home>/state/delegation-timelines/<delegationId>.jsonl  # spawn worker append-only events
  * <home>/sessions/ + sessions/workers/      # pi manager JSONL + pi worker sessions
@@ -20,6 +20,7 @@ import path from "node:path";
  * <home>/artifacts/blobs/
  * <home>/workspaces/{managed/,unscoped/}   # unscoped = 无项目中立 cwd
  * <home>/secrets/{credentials.json,credentials.key,interaction-secrets.json,interactions.key,auth.json}
+ * <home>/secrets/mcp/{credentials.json,credentials.key} # MCP Server 加密凭据
  * <home>/secrets/capabilities/<extension>/<agent>/<binding>/ # CLI 自管认证状态
  * <home>/runtime/{backend.lease,tmp/,fff/workspaces/<workspace-key>/}
  * <home>/logs/  <home>/migrations/

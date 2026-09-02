@@ -60,6 +60,8 @@ import {
 	stripUnmanagedPiFff,
 	type ManagerCodeSearchProvider,
 } from "./code-search.js";
+import type { McpServerStore } from "../store/mcp-servers.js";
+import { buildManagedMcpExtension } from "./mcp-runtime.js";
 
 export interface SessionSummary {
 	id: string;
@@ -292,6 +294,7 @@ export class PiSessionStore {
 		private readonly productSettings?: ProductSettingsStore,
 		private readonly capabilityStateRoot?: string,
 		private readonly fffStateRoot?: string,
+		private readonly mcpServers?: McpServerStore,
 	) {
 		this.catalog = catalog ?? new ExtensionCatalog();
 		if (this.teamsStore && this.invoker) {
@@ -414,6 +417,9 @@ export class PiSessionStore {
 			}
 		}
 		const manager = await this.teamsStore?.getManager();
+		if (manager && this.mcpServers) {
+			factories.push(await buildManagedMcpExtension(this.mcpServers, manager.mcpServerIds ?? []));
+		}
 		const capabilityRuntime = manager && this.capabilityStateRoot
 			? await resolveAgentCapabilityRuntime({
 				agent: manager,

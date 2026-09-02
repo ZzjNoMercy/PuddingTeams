@@ -123,7 +123,8 @@ PuddingTeams package/source
 
 PUDDINGTEAMS_HOME/
 ├── config/
-│   └── product.json               # 用户显式产品设置，不保存默认值快照
+│   ├── product.json               # 用户显式产品设置，不保存默认值快照
+│   └── mcp-servers.json           # 全局 MCP Server Catalog；不含明文凭据
 ├── state/
 │   ├── agents.json                # Agent Registry + 用户 Agent Profile
 │   ├── windows.json               # 窗口、成员与 Session 引用
@@ -152,7 +153,10 @@ PUDDINGTEAMS_HOME/
 │   ├── credentials.key            # 0600
 │   ├── interaction-secrets.json   # 密文
 │   ├── interactions.key           # 0600
-│   └── auth.json                  # 平台 provider key（与 pi CLI ~/.pi/agent/auth.json 解耦）
+│   ├── auth.json                  # 平台 provider key（与 pi CLI ~/.pi/agent/auth.json 解耦）
+│   └── mcp/
+│       ├── credentials.json       # 按 Server id 分组的 MCP 密文
+│       └── credentials.key        # 0600
 ├── runtime/
 │   ├── backend.lease              # 单写者 Lease
 │   ├── locks/
@@ -169,6 +173,7 @@ PUDDINGTEAMS_HOME/
 - `workspaces/managed` 是 PuddingTeams 真正拥有的项目目录；外部 Workspace 只在 Registry 中登记绝对路径。
 - `workspaces/unscoped` 只是无项目文件工具的中性 cwd，永远不启用 Workspace 资源发现。
 - `artifacts/blobs` 保存冻结副本；`state/artifacts.json` 只保存 Registry 和摘要。
+- `config/mcp-servers.json` 是平台 MCP Server 全集；Agent 级白名单 `mcpServerIds` 仍属于 `state/agents.json`。MCP 密钥与普通配置分离，列表和 Agent 配置 API 均不返回明文。
 - `runtime/tmp`、`logs` 可按保留策略回收，不属于备份必须项。
 
 ## 5. 统一路径契约

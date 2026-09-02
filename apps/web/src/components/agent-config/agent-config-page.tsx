@@ -59,6 +59,7 @@ import {
 	LegacyInvokeSection,
 	StatusSection,
 } from "@/components/agent-config/connector-sections";
+import { McpSelectionSection } from "@/components/agent-config/mcp-selection-section";
 
 /**
  * Agent 独立配置页（§10.5）：所有角色统一入口。
@@ -521,7 +522,12 @@ export function AgentConfigPage({ name }: { name: string }) {
 								<ConnectorSection agent={agent} onMutation={handleMutation} />
 							)
 						) : null}
-						{section === "extensions" ? <BindingsSection agent={agent} onMutation={handleMutation} /> : null}
+						{section === "extensions" ? (
+							<div className="flex flex-col gap-5">
+								<McpSelectionSection agent={agent} onMutation={handleMutation} />
+								<BindingsSection agent={agent} onMutation={handleMutation} />
+							</div>
+						) : null}
 						{!piMode && section === "status" ? <StatusSection agent={agent} lastMutation={lastMutation} onToggleEnabled={handleToggleEnabled} toggling={toggling} /> : null}
 					</div>
 				</main>

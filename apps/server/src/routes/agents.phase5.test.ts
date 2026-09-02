@@ -19,6 +19,7 @@ import { registerAgentsRoutes } from "./agents.js";
 import { registerExtensionsRoutes } from "./extensions.js";
 import type { AgentDriver, AgentEvent, DriverCapabilities } from "../agent-runtime/types.js";
 import { ProductSettingsStore } from "../store/product-settings.js";
+import { McpServerStore } from "../store/mcp-servers.js";
 
 /**
  * Phase 5 路由测试（§10.1）：Connector/Capability 绑定 API、revision 与
@@ -74,6 +75,9 @@ async function makeStack(): Promise<Stack> {
 	const dir = freshDir("pt-p5-routes-");
 	const credentials = new CredentialsStore(path.join(dir, "sec"));
 	await credentials.init();
+	const mcpCredentials = new CredentialsStore(path.join(dir, "mcp-sec"));
+	await mcpCredentials.init();
+	const mcpServers = new McpServerStore(path.join(dir, "config"), mcpCredentials);
 	const teams = new TeamsStore(
 		{ state: path.join(dir, "teams"), assets: path.join(dir, "teams"), managedWorkspaces: path.join(dir, "managed") },
 		dir,
@@ -98,13 +102,14 @@ async function makeStack(): Promise<Stack> {
 	const invoker = new AgentInvoker(teams, runtime, drivers, credentials, dir);
 	const sessions = new PiSessionStore(dir, path.join(dir, "sessions"), teams, invoker, catalog);
 	const app = Fastify();
-	registerAgentsRoutes(app, teams, { credentials, runtime, invoker, extensions: registry, sessions });
+	registerAgentsRoutes(app, teams, { credentials, runtime, invoker, extensions: registry, sessions, mcpServers });
 	registerExtensionsRoutes(app, {
 		registry,
 		teams,
 		runtime,
 		sessions,
 		settings,
+		mcpServers,
 		capabilityStateRoot: path.join(dir, "capabilities"),
 	});
 	return { app, teams, credentials, registry, runtime, delegations, drivers, settings, sessions, dir };
@@ -564,6 +569,48 @@ test("Phase5: catalog 必须 kind 过滤且两类不混（§10.1）", async () =
 	assert.equal(connBody.extensions[0]!.origin, "builtin");
 	const capabilities = await app.inject({ method: "GET", url: "/api/extensions/catalog?kind=capability" });
 	assert.equal((capabilities.json() as { extensions: unknown[] }).extensions.length, 0, "预装零个用户 Capability（§10.4）");
+	await app.close();
+});
+
+test("MCP Catalog 可添加/删除，Pi Agent 单独勾选且引用期间禁止删除", async () => {
+	const { app, teams } = await makeStack();
+	const created = await app.inject({
+		method: "POST",
+		url: "/api/extensions/mcp/servers",
+		payload: {
+			id: "docs",
+			displayName: "Docs MCP",
+			definition: { url: "https://mcp.example.test", headers: { Authorization: "Bearer ${API_TOKEN}" } },
+			secrets: { API_TOKEN: "secret" },
+		},
+	});
+	assert.equal(created.statusCode, 201, created.body);
+
+	const selected = await app.inject({ method: "PUT", url: "/api/agents/manager/mcp", payload: { serverIds: ["docs", "docs"] } });
+	assert.equal(selected.statusCode, 200, selected.body);
+	assert.deepEqual((await teams.getAgent("manager"))?.mcpServerIds, ["docs"]);
+	const catalog = await app.inject({ method: "GET", url: "/api/extensions/mcp/servers" });
+	assert.deepEqual((catalog.json() as { servers: Array<{ usedBy: Array<{ id: string }> }> }).servers[0]?.usedBy, [{ id: "manager", displayName: "manager" }]);
+
+	const conflict = await app.inject({ method: "DELETE", url: "/api/extensions/mcp/servers/docs" });
+	assert.equal(conflict.statusCode, 409, conflict.body);
+	assert.match(conflict.body, /先取消勾选/);
+	const missing = await app.inject({ method: "PUT", url: "/api/agents/manager/mcp", payload: { serverIds: ["missing"] } });
+	assert.equal(missing.statusCode, 400);
+
+	await teams.upsertAgent({
+		name: "not-pi",
+		description: "command worker",
+		invoke: { type: "command", command: "echo", runArgs: [] },
+		enabled: true,
+	});
+	const unsupported = await app.inject({ method: "PUT", url: "/api/agents/not-pi/mcp", payload: { serverIds: ["docs"] } });
+	assert.equal(unsupported.statusCode, 400);
+
+	const cleared = await app.inject({ method: "PUT", url: "/api/agents/manager/mcp", payload: { serverIds: [] } });
+	assert.equal(cleared.statusCode, 200, cleared.body);
+	const removed = await app.inject({ method: "DELETE", url: "/api/extensions/mcp/servers/docs" });
+	assert.equal(removed.statusCode, 204, removed.body);
 	await app.close();
 });
 

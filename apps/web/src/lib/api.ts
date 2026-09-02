@@ -9,6 +9,9 @@ import type {
 	CustomProviderInput,
 	CustomProviderRecord,
 	ModelSummary,
+	McpCatalogResponse,
+	McpServerDefinition,
+	McpServerRecord,
 	MutationResponse,
 	PiManagerSettings,
 	PiResourceConfig,
@@ -652,6 +655,47 @@ export async function listExtensionConnections(): Promise<ExtensionConnectionSta
 	const res = await fetch(`${SERVER_URL}/api/extensions/connections`);
 	if (!res.ok) throw new Error(`list extension connections failed: ${res.status}`);
 	return ((await res.json()) as { connections: ExtensionConnectionStatus[] }).connections;
+}
+
+// ---- 平台托管 MCP Server Catalog ----
+
+export async function listMcpServers(): Promise<McpCatalogResponse> {
+	const res = await fetch(`${SERVER_URL}/api/extensions/mcp/servers`);
+	const body = (await res.json()) as Partial<McpCatalogResponse> & { error?: string };
+	if (!res.ok) throw new Error(body.error ?? `list MCP servers failed: ${res.status}`);
+	return body as McpCatalogResponse;
+}
+
+export function createMcpServer(input: {
+	id: string;
+	displayName: string;
+	description?: string;
+	definition: McpServerDefinition;
+	secrets?: Record<string, string>;
+}): Promise<McpServerRecord> {
+	return postJson<{ server: McpServerRecord }>("/api/extensions/mcp/servers", input, "create MCP server failed")
+		.then((result) => result.server);
+}
+
+export async function deleteMcpServer(id: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/extensions/mcp/servers/${encodeURIComponent(id)}`, { method: "DELETE" });
+	await ensureOk(res, "delete MCP server failed");
+}
+
+export async function getAgentMcpServers(name: string): Promise<{ serverIds: string[]; revision: number }> {
+	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}/mcp`);
+	const body = (await res.json()) as { serverIds?: string[]; revision?: number; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `get Agent MCP servers failed: ${res.status}`);
+	return { serverIds: body.serverIds ?? [], revision: body.revision ?? 0 };
+}
+
+export function putAgentMcpServers(name: string, serverIds: string[]): Promise<MutationResponse> {
+	return postJson<MutationResponse>(
+		`/api/agents/${encodeURIComponent(name)}/mcp`,
+		{ serverIds },
+		"save Agent MCP servers failed",
+		"PUT",
+	);
 }
 
 /** 执行连接卡明确声明、且由用户确认触发的动作。 */

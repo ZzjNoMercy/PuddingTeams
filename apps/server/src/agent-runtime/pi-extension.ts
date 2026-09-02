@@ -83,6 +83,10 @@ export function piExtensionHooks(defaults: { sessionDir?: string; fffStateRoot?:
 					typeof config.capabilityRuntimeFor === "function"
 						? (config.capabilityRuntimeFor as LocalPiDriverOptions["capabilityRuntimeFor"])
 						: undefined,
+				managedExtensionFactoriesFor:
+					typeof config.managedExtensionFactoriesFor === "function"
+						? (config.managedExtensionFactoriesFor as LocalPiDriverOptions["managedExtensionFactoriesFor"])
+						: undefined,
 				// Agent 未显式配置时用平台默认（PUDDINGTEAMS_HOME/sessions/workers）。
 				sessionDir: str(config.sessionDir) ?? defaults.sessionDir,
 			}),

@@ -20,6 +20,7 @@ import {
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { previewPiResources } from "../pi-bridge/pi-resources.js";
 import { PI_CONNECTOR_ID } from "../agent-runtime/pi-extension.js";
+import type { McpServerStore } from "../store/mcp-servers.js";
 
 /** 头像回退用的 connector id：有绑定用绑定；pinned manager / pi worker 归 pi。 */
 function avatarConnectorId(agent: AgentConfig): string | undefined {
@@ -38,6 +39,8 @@ export interface AgentsRouteDeps {
 	sessions?: PiSessionStore;
 	/** Capability 自管认证状态的 binding 级隔离根目录。 */
 	capabilityStateRoot?: string;
+	/** 平台 MCP Server Catalog，用于 Agent 勾选校验。 */
+	mcpServers?: McpServerStore;
 }
 
 interface MutationResponse {
@@ -74,7 +77,7 @@ function connectorSecurityWarnings(agent: AgentConfig): string[] {
 
 /** Thin HTTP facade over the worker registry (agents.json) + Phase 5 管理 API（§10.1）。 */
 export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, deps: AgentsRouteDeps = {}): void {
-	const { credentials, runtime, invoker, extensions, sessions, capabilityStateRoot } = deps;
+	const { credentials, runtime, invoker, extensions, sessions, capabilityStateRoot, mcpServers } = deps;
 
 	/** 给 API 的 Agent 视图补充包内默认头像事实；不写回 agents.json。 */
 	function presentAgent(agent: AgentConfig): AgentConfig & { hasDefaultAvatar?: true } {
@@ -329,6 +332,38 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 			}
 		},
 	);
+
+	/** Pi Agent 的 MCP Server 选择；Server 全集由扩展页统一维护。 */
+	app.get<{ Params: { name: string } }>("/api/agents/:name/mcp", async (req, reply) => {
+		const agent = await teams.getAgent(req.params.name);
+		if (!agent) return reply.code(404).send({ error: "agent not found" });
+		if (!agent.pinned && agent.connector?.connectorId !== PI_CONNECTOR_ID) {
+			return reply.code(400).send({ error: "只有 Pi Agent 支持平台 MCP Server" });
+		}
+		return { serverIds: agent.mcpServerIds ?? [], revision: agent.extensionRevision ?? 0 };
+	});
+
+	app.put<{ Params: { name: string }; Body: { serverIds?: unknown } }>("/api/agents/:name/mcp", async (req, reply) => {
+		const agent = await teams.getAgent(req.params.name);
+		if (!agent) return reply.code(404).send({ error: "agent not found" });
+		if (!agent.pinned && agent.connector?.connectorId !== PI_CONNECTOR_ID) {
+			return reply.code(400).send({ error: "只有 Pi Agent 支持平台 MCP Server" });
+		}
+		if (!Array.isArray(req.body?.serverIds) || req.body.serverIds.some((id) => typeof id !== "string" || !id.trim())) {
+			return reply.code(400).send({ error: "serverIds 必须是字符串数组" });
+		}
+		const serverIds = [...new Set(req.body.serverIds.map((id) => (id as string).trim()))];
+		if (mcpServers) {
+			const available = new Set((await mcpServers.list()).map((server) => server.id));
+			const missing = serverIds.filter((id) => !available.has(id));
+			if (missing.length > 0) return reply.code(400).send({ error: `MCP Server 不存在：${missing.join(", ")}` });
+		}
+		try {
+			return mutationReply(await teams.setMcpServerIds(agent.name, serverIds));
+		} catch (err) {
+			return notFoundOr400(reply, err);
+		}
+	});
 
 	/**
 	 * 统一配置接口（独立配置页，§10.5）：manager 与 pi worker 同构的合并更新。

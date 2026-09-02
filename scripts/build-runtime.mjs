@@ -6,6 +6,8 @@
  * （assets、extensions/connectors、apps/web/out、templates）在 npm 包内原样成立：
  *
  *   runtime/apps/server/src/server.bundle.mjs   esbuild 单文件（pi SDK 内联）
+ *   runtime/apps/server/src/{app-bridge.bundle.js,mcp-keyring-helper.cjs,mcp-script-worker.mjs}
+ *                                               pi-mcp-adapter 运行时资源
  *   runtime/apps/server/src/cli/cli.bundle.mjs  init/doctor/extension CLI
  *   runtime/apps/server/assets/                 pi 默认头像等包内资源
  *   runtime/apps/web/out/                       Next 静态导出产物（server 同源托管）
@@ -68,6 +70,14 @@ await bundle(
 	path.join(ROOT, "apps", "server", "src", "index.ts"),
 	path.join(RUNTIME, "apps", "server", "src", "server.bundle.mjs"),
 );
+
+step("pi-mcp-adapter 运行时资源");
+for (const asset of ["app-bridge.bundle.js", "mcp-keyring-helper.cjs", "mcp-script-worker.mjs"]) {
+	cpSync(
+		path.join(ROOT, "apps", "server", "node_modules", "pi-mcp-adapter", asset),
+		path.join(RUNTIME, "apps", "server", "src", asset),
+	);
+}
 
 step("cli bundle（init / doctor / extension）");
 await bundle(

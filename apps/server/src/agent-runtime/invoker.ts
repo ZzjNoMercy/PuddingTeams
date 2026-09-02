@@ -9,6 +9,8 @@ import { ExtensionCatalog, resolveAgentCapabilityRuntime } from "./extensions.js
 import type { ProductSettingsStore } from "../store/product-settings.js";
 import { resolveWorkerCodeSearch } from "../pi-bridge/code-search.js";
 import type { WorkspaceExecutionPolicy } from "./workspace-execution.js";
+import type { McpServerStore } from "../store/mcp-servers.js";
+import { buildManagedMcpExtension } from "../pi-bridge/mcp-runtime.js";
 
 export interface AgentInvokeParams {
 	/** Internal stable operation identity (replacement/recovery); manager tools omit it. */
@@ -141,6 +143,7 @@ export class AgentInvoker {
 		private readonly capabilityStateRoot?: string,
 		private readonly productSettings?: ProductSettingsStore,
 		private readonly fffStateRoot?: string,
+		private readonly mcpServers?: McpServerStore,
 	) {}
 
 	/** 注入 manager 会话通知器（PiSessionStore），启动时由 index.ts 调用。 */
@@ -1487,6 +1490,13 @@ export class AgentInvoker {
 												env,
 											}),
 									}
+								: {}),
+							...(this.mcpServers
+								? {
+									managedExtensionFactoriesFor: async () => [
+										await buildManagedMcpExtension(this.mcpServers!, agent.mcpServerIds ?? []),
+									],
+								}
 								: {}),
 						}
 					: (config ?? {}),

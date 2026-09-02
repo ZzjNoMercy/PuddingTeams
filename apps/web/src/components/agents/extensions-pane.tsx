@@ -18,6 +18,7 @@ import {
 	listAgents,
 	listExtensionCatalog,
 	listExtensionConnections,
+	listMcpServers,
 	listSkillLibrary,
 	pickWorkspaceDirectory,
 	runExtensionConnectionAction,
@@ -29,6 +30,7 @@ import { agentDisplayName, type AgentConfig, type CatalogEntry, type ConflictRun
 import { ClipboardSafeStreamdown } from "@/components/ai-elements/streamdown";
 import { ManagerAvatar, WorkerAvatar } from "@/components/chat/worker-avatar";
 import { SkillImportDialog } from "@/components/skills/skill-import-dialog";
+import { McpServersView } from "@/components/agents/mcp-servers-view";
 
 /**
  * Extension 接入目录（§10.1）：kind=connector 与 kind=capability 分开的目录
@@ -42,6 +44,26 @@ type ExtensionTabCounts = Record<ExtensionView, number | null>;
 
 const TAB_COUNT_STORAGE_KEY = "puddingteams:extension-tab-counts";
 const useIsomorphicLayoutEffect = typeof window !== "undefined" ? useLayoutEffect : useEffect;
+
+function ManagedMcpPluginRow({ version }: { version: string | null }) {
+	return (
+		<div className="ops-extension-row">
+			<div className="ops-extension-icon capability"><PackageIcon className="size-5" /></div>
+			<div className="min-w-0">
+				<div className="flex min-w-0 items-baseline gap-2">
+					<div className="truncate text-sm font-semibold">MCP</div>
+					<code className="truncate font-mono text-[11px] text-muted-foreground">pi-mcp-adapter</code>
+				</div>
+				<p className="mt-1 truncate text-xs text-muted-foreground">为 Pi Agent 提供 MCP Server 支持</p>
+			</div>
+			<div className="ops-extension-meta">
+				<span className="text-foreground">已加载</span>
+				<span>{version ? `插件 v${version}` : "系统插件"} · MCP</span>
+			</div>
+			<Badge variant="secondary">内置</Badge>
+		</div>
+	);
+}
 
 function cachedTabCounts(): Partial<Record<ExtensionView, number>> {
 	if (typeof window === "undefined") return {};
@@ -731,6 +753,7 @@ export function ExtensionsPane() {
 	const view: ExtensionView = rawTab === "skills" || rawTab === "mcp" || rawTab === "plugins" || rawTab === "connections" ? rawTab : "plugins";
 	const setView = (key: ExtensionView) => router.replace(`${pathname}?tab=${key}`, { scroll: false });
 	const [entries, setEntries] = useState<CatalogEntry[] | null>(null);
+	const [mcpAdapterVersion, setMcpAdapterVersion] = useState<string | null>(null);
 	const [query, setQuery] = useState("");
 	const [installPath, setInstallPath] = useState("");
 	const [installPin, setInstallPin] = useState("");
@@ -744,7 +767,7 @@ export function ExtensionsPane() {
 	// 消失和 Tab 文案位移。首次无缓存时仍保留一个固定尺寸的加载徽标。
 	const [tabCounts, setTabCounts] = useState<ExtensionTabCounts>({
 		skills: null,
-		mcp: 0,
+		mcp: null,
 		plugins: null,
 		connections: null,
 	});
@@ -759,6 +782,7 @@ export function ExtensionsPane() {
 		setTabCounts((current) => current[key] === value ? current : { ...current, [key]: value });
 		persistTabCount(key, value);
 	}, []);
+	const updateMcpCount = useCallback((count: number) => updateTabCount("mcp", count), [updateTabCount]);
 
 	// 静态预渲染的首个 state 不含 localStorage；hydration 会复用它而不会重跑
 	// lazy initializer。绘制前补入缓存，避免用户看到一段时间的空计数。
@@ -767,7 +791,7 @@ export function ExtensionsPane() {
 		setTabCounts((current) => {
 			const next = { ...current };
 			let changed = false;
-			for (const key of ["skills", "plugins", "connections"] as const) {
+			for (const key of ["skills", "mcp", "plugins", "connections"] as const) {
 				if (next[key] === null && cached[key] !== undefined) {
 					next[key] = cached[key]!;
 					changed = true;
@@ -786,13 +810,17 @@ export function ExtensionsPane() {
 				.some((value) => value.toLowerCase().includes(needle));
 		});
 	}, [entries, query]);
+	const mcpAdapterMatches = useMemo(() => {
+		const needle = query.trim().toLowerCase();
+		return !needle || ["mcp", "pi-mcp-adapter", "mcp server"].some((value) => value.includes(needle));
+	}, [query]);
 
 	const refreshPlugins = useCallback(() => {
 		Promise.all([listExtensionCatalog("connector"), listExtensionCatalog("capability")])
 			.then(([connectors, capabilities]) => {
 				const nextEntries = [...connectors, ...capabilities];
 				setEntries(nextEntries);
-				updateTabCount("plugins", nextEntries.length);
+				updateTabCount("plugins", nextEntries.length + 1);
 			})
 			.catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)));
 	}, [updateTabCount]);
@@ -834,6 +862,12 @@ export function ExtensionsPane() {
 	// /extensions?tab=skills 或 MCP 时 entries 会一直为空，计数徽标随之消失。
 	useEffect(() => {
 		void refreshPlugins();
+		listMcpServers()
+			.then((catalog) => {
+				setMcpAdapterVersion(catalog.adapter.version);
+				updateTabCount("mcp", catalog.servers.length);
+			})
+			.catch(() => updateTabCount("mcp", 0));
 		listExtensionConnections()
 			.then((nextConnections) => {
 				setConnections(nextConnections);
@@ -959,7 +993,7 @@ export function ExtensionsPane() {
 				{view === "skills" ? (
 					<SkillsLibraryView />
 				) : view === "mcp" ? (
-					<div className="ops-empty-state mx-auto mt-16 max-w-xl"><div className="text-sm font-medium">MCP 规划中</div><p className="mt-2 text-sm text-muted-foreground">MCP 用于连接外部工具、数据与服务；当前协议尚未接入可执行的 MCP Server，因此暂不提供伪配置动作。</p></div>
+					<McpServersView onCountChange={updateMcpCount} />
 				) : view === "connections" ? (
 					<ConnectionsView
 						connections={connections}
@@ -972,18 +1006,15 @@ export function ExtensionsPane() {
 						<LoaderIcon className="size-4 animate-spin" />
 						加载中…
 					</div>
-				) : entries.length === 0 ? (
-					<div className="pt-20 text-center text-sm text-muted-foreground">
-						还没有已安装插件。开启开发者模式后，可从本地目录安装连接插件或能力插件。
-					</div>
 				) : (
 					<div className="py-8">
 						<div className="mb-5 flex items-end justify-between gap-5">
 							<div><h2 className="text-base font-semibold tracking-tight">插件</h2><p className="mt-1 text-xs text-muted-foreground">扩充智能体的连接方式与运行能力</p></div>
 							<label className="ops-extension-search"><SearchIcon className="size-4" /><Input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索插件" aria-label="搜索插件" /></label>
 						</div>
-						{filteredEntries && filteredEntries.length > 0 ? <div className="ops-extension-list">
-							{filteredEntries.map((entry) => <EntryCard
+						{mcpAdapterMatches || (filteredEntries && filteredEntries.length > 0) ? <div className="ops-extension-list">
+							{mcpAdapterMatches ? <ManagedMcpPluginRow version={mcpAdapterVersion} /> : null}
+							{(filteredEntries ?? []).map((entry) => <EntryCard
 								key={entry.manifest.id}
 								entry={entry}
 								connection={connections?.find((connection) => connection.extensionId === entry.manifest.id)}

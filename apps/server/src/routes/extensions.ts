@@ -6,6 +6,8 @@ import type { PiSessionStore } from "../pi-bridge/session-store.js";
 import type { TeamsStore } from "../store/teams.js";
 import type { ExtensionConnectionStatus, ExtensionKind } from "../agent-runtime/extensions.js";
 import type { ProductSettingsStore } from "../store/product-settings.js";
+import type { McpServerInput, McpServerStore } from "../store/mcp-servers.js";
+import { MANAGED_MCP_ADAPTER_VERSION } from "../pi-bridge/mcp-runtime.js";
 
 export interface ExtensionRouteDeps {
 	registry: ExtensionRegistry;
@@ -17,6 +19,8 @@ export interface ExtensionRouteDeps {
 	settings: ProductSettingsStore;
 	/** Capability 的共享运行依赖根目录。 */
 	capabilityStateRoot: string;
+	/** 平台 MCP Server Catalog；协议执行由默认启用的 pi-mcp-adapter 提供。 */
+	mcpServers: McpServerStore;
 }
 
 /**
@@ -50,6 +54,12 @@ export function registerExtensionsRoutes(app: FastifyInstance, deps: ExtensionRo
 		}
 		await deps.sessions?.syncAgentConfigChange();
 	}
+	async function invalidateMcpAgents(serverId: string): Promise<void> {
+		for (const agent of await teams.listAgents()) {
+			if ((agent.mcpServerIds ?? []).includes(serverId)) await teams.bumpAgentRevision(agent.name);
+		}
+		await deps.sessions?.syncAgentConfigChange();
+	}
 
 	app.get("/api/extensions/developer-mode", async () => deps.settings.get());
 
@@ -70,6 +80,58 @@ export function registerExtensionsRoutes(app: FastifyInstance, deps: ExtensionRo
 			return reply.code(400).send({ error: 'kind 必须是 "connector" | "capability"' });
 		}
 		return { extensions: registry.list(kind as ExtensionKind | undefined) };
+	});
+
+	// ---- MCP Server Catalog（独立于 Connector/Capability 包） ----
+
+	app.get("/api/extensions/mcp/servers", async () => {
+		const agents = await teams.listAgents();
+		return {
+			adapter: { id: "pi-mcp-adapter", version: MANAGED_MCP_ADAPTER_VERSION, enabled: true },
+			servers: (await deps.mcpServers.list()).map((server) => ({
+				...server,
+				usedBy: agents
+					.filter((agent) => (agent.mcpServerIds ?? []).includes(server.id))
+					.map((agent) => ({ id: agent.name, displayName: agent.displayName ?? agent.name })),
+			})),
+		};
+	});
+
+	app.post<{ Body: Partial<McpServerInput> }>("/api/extensions/mcp/servers", async (req, reply) => {
+		try {
+			const body = req.body ?? {};
+			const server = await deps.mcpServers.create(body as McpServerInput);
+			return reply.code(201).send({ server });
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			return reply.code(message.includes("已存在") ? 409 : 400).send({ error: message });
+		}
+	});
+
+	app.put<{ Params: { serverId: string }; Body: Partial<Omit<McpServerInput, "id">> }>(
+		"/api/extensions/mcp/servers/:serverId",
+		async (req, reply) => {
+			try {
+				const server = await deps.mcpServers.update(req.params.serverId, req.body as Omit<McpServerInput, "id">);
+				await invalidateMcpAgents(server.id);
+				return { server };
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				return reply.code(message.includes("不存在") ? 404 : 400).send({ error: message });
+			}
+		},
+	);
+
+	app.delete<{ Params: { serverId: string } }>("/api/extensions/mcp/servers/:serverId", async (req, reply) => {
+		const agents = (await teams.listAgents()).filter((agent) => (agent.mcpServerIds ?? []).includes(req.params.serverId));
+		if (agents.length > 0) {
+			return reply.code(409).send({
+				error: `MCP Server「${req.params.serverId}」仍被 Agent 使用，请先取消勾选`,
+				agents: agents.map((agent) => ({ id: agent.name, displayName: agent.displayName ?? agent.name })),
+			});
+		}
+		if (!await deps.mcpServers.remove(req.params.serverId)) return reply.code(404).send({ error: "MCP Server 不存在" });
+		return reply.code(204).send();
 	});
 
 	/** 扩展贡献的外部系统连接状态。单个插件探测失败不能拖垮整页。 */

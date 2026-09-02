@@ -44,10 +44,25 @@ function isPiFffExtension(extension: LoadExtensionsResult["extensions"][number])
 	return source.includes("@ff-labs/pi-fff") || source.includes("/pi-fff/");
 }
 
-/** Product policy wins over pi user-global extension discovery. */
-export function stripUnmanagedPiFff(base: LoadExtensionsResult): LoadExtensionsResult {
-	return { ...base, extensions: base.extensions.filter((extension) => !isPiFffExtension(extension)) };
+function isPlatformManagedMcpAdapter(extension: LoadExtensionsResult["extensions"][number]): boolean {
+	const source = [extension.path, extension.resolvedPath]
+		.filter(Boolean)
+		.join("/")
+		.replaceAll("\\", "/")
+		.toLowerCase();
+	return source.includes("/pi-mcp-adapter/") || source.includes("/pi-mcp-adapter@");
 }
+
+/** Product policy wins over pi user-global discovery for platform-managed extensions. */
+export function stripUnmanagedPlatformExtensions(base: LoadExtensionsResult): LoadExtensionsResult {
+	return {
+		...base,
+		extensions: base.extensions.filter((extension) => !isPiFffExtension(extension) && !isPlatformManagedMcpAdapter(extension)),
+	};
+}
+
+/** @deprecated Use stripUnmanagedPlatformExtensions. */
+export const stripUnmanagedPiFff = stripUnmanagedPlatformExtensions;
 
 function isInside(root: string, candidate: string): boolean {
 	const relative = path.relative(root, candidate);

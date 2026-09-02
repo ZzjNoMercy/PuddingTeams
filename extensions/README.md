@@ -41,6 +41,10 @@ extensions/
 | pwcp（`shared/pwcp`，`@puddingteams/pwcp`） | PWCP 共享核心：Driver SPI 类型 + spawn/JSONL 与 HTTP/NDJSON transport + observe 机械收集（不依赖任何宿主） | 可用 |
 | templates（`shared/templates/`，非包，`.tmpl` 骨架） | `puddingteams extension init` 的模板：`connector/`（代码型双宿主包）、`connector-declarative/`（纯 manifest 声明式包） | 可用（P2-d） |
 
+### MCP 运行依赖（不进入上述包索引）
+
+`pi-mcp-adapter` 是 PuddingTeams Server 的默认运行依赖，不是 `extensions/` 下可单独绑定的 Connector/Capability 包。MCP Server 全集由“扩展 → MCP”页面和 `<PUDDINGTEAMS_HOME>/config/mcp-servers.json` 管理；每个 Manager/Pi Worker 只注入自身 `mcpServerIds` 白名单。这样不会改变本目录“一个可发布 Extension 包一个目录”的边界，也不会把 MCP Server 误当作另一个 Agent Connector。
+
 ## 脚手架与校验 CLI
 
 `puddingteams extension`（`apps/server/bin/puddingteams.mjs`，路线图 P2-d）：

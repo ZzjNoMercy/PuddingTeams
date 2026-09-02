@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
-import { ChevronDownIcon, PencilIcon, PlusIcon, Trash2Icon } from "lucide-react";
+import { ChevronDownIcon, KeyRoundIcon, PencilIcon, PlusIcon, Trash2Icon } from "lucide-react";
 import {
 	deleteCustomProvider,
 	deleteProviderKey,
@@ -121,17 +121,50 @@ function ProviderRow({
 					</div>
 					<div className="provider-row-actions" aria-label="凭证操作">
 						{confirmingDelete ? (
-							<>
-								<Button type="button" size="sm" variant="destructive" disabled={busy} onClick={remove}>确认删除</Button>
-								<Button type="button" size="sm" variant="ghost" onClick={() => setConfirmingDelete(false)}>取消</Button>
-							</>
+							<div className="provider-key-confirm">
+								<span>删除此 key？</span>
+								<Button
+									type="button"
+									size="sm"
+									variant="ghost"
+									className="provider-key-action provider-key-action-danger is-confirm"
+									disabled={busy}
+									onClick={remove}
+								>
+									<Trash2Icon aria-hidden="true" />
+									确认删除
+								</Button>
+								<Button
+									type="button"
+									size="sm"
+									variant="ghost"
+									className="provider-key-action provider-key-cancel"
+									onClick={() => setConfirmingDelete(false)}
+								>
+									取消
+								</Button>
+							</div>
 						) : (
 							<>
-								<Button type="button" size="sm" variant="ghost" onClick={() => setExpanded((v) => !v)}>
+								<Button
+									type="button"
+									size="sm"
+									variant="ghost"
+									className="provider-key-action provider-key-action-primary"
+									onClick={() => setExpanded((v) => !v)}
+								>
+									{expanded ? <ChevronDownIcon className="provider-key-collapse-icon" aria-hidden="true" /> : <KeyRoundIcon aria-hidden="true" />}
 									{expanded ? "收起" : provider.configured ? "替换 key" : "配置 key"}
 								</Button>
 								{provider.configured ? (
-									<Button type="button" size="sm" variant="ghost" className="text-muted-foreground hover:text-destructive" onClick={() => setConfirmingDelete(true)}>
+									<Button
+										type="button"
+										size="sm"
+										variant="ghost"
+										className="provider-key-action provider-key-action-danger"
+										onClick={() => setConfirmingDelete(true)}
+									>
+										<Trash2Icon aria-hidden="true" />
 										删除 key
 									</Button>
 								) : null}

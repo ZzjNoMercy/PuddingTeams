@@ -143,6 +143,8 @@ export interface AgentConfig {
 	manager?: PiManagerSettings;
 	/** 仅 pinned manager 或 connectorId=pi 的 worker 使用。 */
 	piResources?: PiResourceConfig;
+	/** 平台 MCP Server Catalog 中为该 Pi Agent 启用的稳定 Server id。 */
+	mcpServerIds?: string[];
 	/**
 	 * Extension 配置版本：Agent/绑定/启用状态每次变化递增（§3.3.5）。
 	 * manager Session 据此判断自身装配是否陈旧（runtimeDirty）。
@@ -899,6 +901,16 @@ export class TeamsStore {
 		if (agent.piResources && !agent.pinned && agent.connector?.connectorId !== "pi") {
 			throw new Error(`agent "${agent.name}": piResources 仅适用于 pi Agent`);
 		}
+		if (agent.mcpServerIds !== undefined) {
+			if (!Array.isArray(agent.mcpServerIds) || agent.mcpServerIds.some((id) => typeof id !== "string" || !id.trim())) {
+				throw new Error(`agent "${agent.name}": mcpServerIds 必须是非空字符串数组`);
+			}
+			if (!agent.pinned && agent.connector?.connectorId !== "pi") {
+				throw new Error(`agent "${agent.name}": MCP Server 仅适用于 pi Agent`);
+			}
+			agent.mcpServerIds = [...new Set(agent.mcpServerIds.map((id) => id.trim()))].sort();
+			if (agent.mcpServerIds.length === 0) delete agent.mcpServerIds;
+		}
 		if (agent.codeSearch && (agent.pinned || agent.connector?.connectorId !== "pi")) {
 			throw new Error(`agent "${agent.name}": codeSearch 仅适用于 pi Worker`);
 		}
@@ -1148,6 +1160,21 @@ export class TeamsStore {
 			if (list.length === (a.capabilityExtensions ?? []).length) throw new Error(`binding not found: ${bindingId}`);
 			a.capabilityExtensions = list;
 			return a;
+		});
+	}
+
+	/** 整体替换一个 Pi Agent 的 MCP Server 选择；Server 存在性由路由层校验。 */
+	async setMcpServerIds(name: string, serverIds: string[]): Promise<AgentConfig> {
+		const agent = await this.getAgent(name);
+		if (!agent) throw new Error(`agent not found: ${name}`);
+		if (!agent.pinned && agent.connector?.connectorId !== "pi") {
+			throw new Error(`agent「${name}」不是 Pi Agent，不能绑定 MCP Server`);
+		}
+		const normalized = [...new Set(serverIds.map((id) => id.trim()).filter(Boolean))].sort();
+		return this.mutateAgent(name, (current) => {
+			if (normalized.length) current.mcpServerIds = normalized;
+			else delete current.mcpServerIds;
+			return current;
 		});
 	}
 

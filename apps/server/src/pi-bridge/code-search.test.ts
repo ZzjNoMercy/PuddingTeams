@@ -3,6 +3,7 @@ import assert from "node:assert";
 import {
 	buildWorkspaceFffExtension,
 	resolveWorkerCodeSearch,
+	stripUnmanagedPlatformExtensions,
 	stripUnmanagedPiFff,
 	workspaceSearchKey,
 } from "./code-search.js";
@@ -30,6 +31,13 @@ test("过滤 pi 全局发现的非受控 pi-fff", () => {
 	const drop = { path: "/x/node_modules/@ff-labs/pi-fff/src/index.ts", resolvedPath: "/x/node_modules/@ff-labs/pi-fff/src/index.ts" };
 	const input = { extensions: [keep, drop], errors: [], runtime: {} } as unknown as LoadExtensionsResult;
 	assert.deepEqual(stripUnmanagedPiFff(input).extensions, [keep]);
+});
+
+test("过滤 pi 全局发现的 MCP adapter，避免绕过平台 Server 选择", () => {
+	const keep = { path: "/x/other.ts", resolvedPath: "/x/other.ts" };
+	const adapter = { path: "/x/node_modules/pi-mcp-adapter/index.ts", resolvedPath: "/x/node_modules/pi-mcp-adapter/index.ts" };
+	const input = { extensions: [keep, adapter], errors: [], runtime: {} } as unknown as LoadExtensionsResult;
+	assert.deepEqual(stripUnmanagedPlatformExtensions(input).extensions, [keep]);
 });
 
 test("受控 FFF 拒绝跨 Workspace path/cursor，且不暴露模式切换命令", async () => {

@@ -42,6 +42,7 @@ import { UploadStore } from "./store/uploads.js";
 import { configureSharedModelRuntime } from "./pi-bridge/model-runtime.js";
 import { verifyWorkItemSubmission } from "./pi-bridge/agent-extensions.js";
 import { registerWebStatic } from "./web-static.js";
+import { McpServerStore } from "./store/mcp-servers.js";
 
 // Electron 只需要该变量让自身二进制以 Node 模式启动 server。进入 server 后
 // 立即删除，避免 Connector/Worker 子进程继续继承 Electron 专用开关。
@@ -78,6 +79,9 @@ const defaultCwd = config.agentCwd ?? paths.unscopedWorkspace;
 // Extension manifest 明确声明的密钥加密存于 <home>/secrets，不进 agents.json。
 const credentials = new CredentialsStore(paths.secrets);
 await credentials.init();
+const mcpCredentials = new CredentialsStore(path.join(paths.secrets, "mcp"));
+await mcpCredentials.init();
+const mcpServers = new McpServerStore(paths.config, mcpCredentials);
 // Provider key 与 pi CLI 解耦（§10.6）：平台凭证落到 <home>/secrets/auth.json，
 // 不读写 pi 全局 agentDir 的 auth.json。必须先于任何 sharedModelRuntime 使用。
 configureSharedModelRuntime({ authPath: path.join(paths.secrets, "auth.json") });
@@ -172,6 +176,7 @@ const invoker = new AgentInvoker(
 	capabilityStateRoot,
 	productSettings,
 	fffStateRoot,
+	mcpServers,
 );
 
 const store = new PiSessionStore(
@@ -186,6 +191,7 @@ const store = new PiSessionStore(
 	productSettings,
 	capabilityStateRoot,
 	fffStateRoot,
+	mcpServers,
 );
 invoker.setManagerSender((managerSessionId, message, options) =>
 	store.sendCustomMessage(managerSessionId, message, options),
@@ -558,6 +564,7 @@ await registerAgentsRoutes(app, teams, {
 	extensions: extensionRegistry,
 	sessions: store,
 	capabilityStateRoot,
+	mcpServers,
 });
 await registerExtensionsRoutes(app, {
 	registry: extensionRegistry,
@@ -566,6 +573,7 @@ await registerExtensionsRoutes(app, {
 	sessions: store,
 	settings: productSettings,
 	capabilityStateRoot,
+	mcpServers,
 });
 registerResourcesRoutes(app);
 registerWorkspacesRoutes(app, teams.workspaces, undefined, store);
