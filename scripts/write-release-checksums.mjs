@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const releaseDir = path.join(root, "electron", "release");
-const pattern = /^PuddingTeams-1\.0\.0-(arm64|x64)\.(dmg|exe)$/;
+const pattern = /^PuddingTeams-1\.0\.1-(arm64|x64)\.(dmg|exe)$/;
 
 async function sha256(filePath) {
 	const hash = createHash("sha256");

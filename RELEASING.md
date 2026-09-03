@@ -27,7 +27,7 @@ Build Windows x64 NSIS on Windows for the final release. A macOS cross-build is 
 pnpm build:electron:win:x64
 ```
 
-PuddingTeams 1.0.0 was published manually as an explicitly disclosed unsigned exception. The automated release workflow remains fail-closed: future releases require a valid Authenticode certificate plus clean-machine install, upgrade, and uninstall acceptance before the warning can be removed.
+PuddingTeams 1.0.0 and 1.0.1 were published manually as explicitly disclosed unsigned exceptions. The automated release workflow remains fail-closed: 1.0.2 and later releases require a valid Authenticode certificate plus clean-machine install, upgrade, and uninstall acceptance before the warning can be removed.
 
 After all three installers are present:
 
@@ -38,11 +38,11 @@ pnpm release:checksums
 ## 3. Acceptance checklist
 
 - macOS arm64 and x64: `codesign --verify`, `spctl --assess` and notarization succeed; mount, drag-install, first launch, upgrade and uninstall are tested.
-- Windows x64: Authenticode signature is valid; install, first launch, upgrade, uninstall, Start Menu and desktop shortcuts are tested on a clean Windows machine.
+- Windows x64: Authenticode signature is valid (except the documented 1.0.0–1.0.1 manual exceptions); install, first launch, upgrade, uninstall, Start Menu and desktop shortcuts are tested on a clean Windows machine.
 - The app can create a room, configure a model, delegate to at least one Worker and restore the session after restart.
 - `SHA256SUMS.txt` matches the uploaded assets.
 - Public docs and the download link resolve without authentication.
 
 ## 4. Publish
 
-Create and push `v1.0.0` only after the acceptance checklist is complete. The release workflow uploads DMG/EXE/checksum artifacts to the GitHub Release. Never publish a stable release from a dirty worktree.
+Create and push the release tag only after the acceptance checklist is complete. The release workflow uploads DMG/EXE/checksum artifacts to the GitHub Release. Never publish a stable release from a dirty worktree.

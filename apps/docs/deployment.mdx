@@ -28,7 +28,7 @@ PuddingTeams 有两种运行形态，但只维护一套业务运行时：桌面 
 - Intel Mac：`PuddingTeams-1.0.1-x64.dmg`
 - Windows 10/11 x64：`PuddingTeams-1.0.1-x64.exe`
 
-同时下载 `SHA256SUMS.txt` 可校验文件完整性。macOS 正式发行包必须通过 Developer ID 签名与 Apple notarization。1.0.0 的 Windows 安装包尚未进行 Authenticode 签名，Windows 可能显示“未知发布者”或 Microsoft Defender SmartScreen 提示；继续安装前请先核对 SHA-256。
+同时下载 `SHA256SUMS.txt` 可校验文件完整性。macOS 正式发行包必须通过 Developer ID 签名与 Apple notarization。1.0.0 和 1.0.1 的 Windows 安装包尚未进行 Authenticode 签名，Windows 可能显示“未知发布者”或 Microsoft Defender SmartScreen 提示；继续安装前请先核对 SHA-256。
 
 当前工程提供 macOS DMG 和 Windows x64 NSIS 构建。安装后启动 App，它会：
 
@@ -57,7 +57,7 @@ pnpm build:electron:arm64
 pnpm build:electron:win:x64
 ```
 
-macOS 发行配置要求签名、hardened runtime 与 notarization；正式构建需要相应 Apple 凭据。1.0.0 是人工发布并明确披露的 Windows 未签名例外；自动 Release workflow 仍保持 fail-closed，后续版本需要 Authenticode 证书，并应补齐干净 Windows 环境的安装、升级和卸载验收。卸载桌面 App 不会删除 `PUDDINGTEAMS_HOME` 里的业务数据。
+macOS 发行配置要求签名、hardened runtime 与 notarization；正式构建需要相应 Apple 凭据。1.0.0 和 1.0.1 是人工发布并明确披露的 Windows 未签名例外；自动 Release workflow 仍保持 fail-closed，1.0.2 及后续版本需要 Authenticode 证书，并应补齐干净 Windows 环境的安装、升级和卸载验收。卸载桌面 App 不会删除 `PUDDINGTEAMS_HOME` 里的业务数据。
 
 ## 源码开发运行
 
