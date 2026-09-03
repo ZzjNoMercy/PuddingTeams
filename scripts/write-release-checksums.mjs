@@ -17,10 +17,10 @@ async function sha256(filePath) {
 }
 
 const names = (await readdir(releaseDir)).filter((name) => pattern.test(name)).sort();
-const required = ["PuddingTeams-1.0.0-arm64.dmg", "PuddingTeams-1.0.0-x64.dmg", "PuddingTeams-1.0.0-x64.exe"];
+const required = ["PuddingTeams-1.0.1-arm64.dmg", "PuddingTeams-1.0.1-x64.dmg", "PuddingTeams-1.0.1-x64.exe"];
 const missing = required.filter((name) => !names.includes(name));
 if (missing.length > 0) {
-	console.error(`✗ 缺少 1.0.0 安装包：${missing.join("、")}`);
+	console.error(`✗ 缺少 1.0.1 安装包：${missing.join("、")}`);
 	process.exit(1);
 }
 
