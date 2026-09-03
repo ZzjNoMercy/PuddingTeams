@@ -103,10 +103,12 @@ test("启动恢复优先补封存 pending terminal journal，不把已完成 Wor
 	assert.equal(sealed?.executionState, "reported_completed");
 	assert.equal(sealed?.result?.status, "completed");
 	assert.equal(sealed?.receipt?.reportedOutcome, "completed");
+	assert.equal(sealed?.workerStarted, true, "已观测完成边界必然证明 Worker 已启动");
+	assert.equal(sealed?.receipt?.workerStarted, true);
 	assert.equal(sealed?.pendingTerminal, undefined);
 });
 
-function remoteDriver(state: "completed" | "unknown"): AgentDriver {
+function remoteDriver(state: "completed" | "failed" | "unknown"): AgentDriver {
 	return {
 		id: "remote",
 		async capabilities() { return { operations: ["run", "continue"], interactionKinds: [], progress: "coarse", transport: "http", reconciliation: "query_run" }; },
@@ -114,9 +116,9 @@ function remoteDriver(state: "completed" | "unknown"): AgentDriver {
 		async *continue() {},
 		async *respond() {},
 		async reconcileRun() {
-			return state === "completed"
-				? { state: "completed", result: { agentId: "remote", status: "completed", content: "remote done", runHandle: "remote-run" } }
-				: { state: "unknown", reason: "upstream history unavailable" };
+			if (state === "completed") return { state: "completed", result: { agentId: "remote", status: "completed", content: "remote done", runHandle: "remote-run" } };
+			if (state === "failed") return { state: "failed", result: { agentId: "remote", status: "failed", errorCode: "remote_failed", error: "remote failed", recoverable: true, runHandle: "remote-failed" } };
+			return { state: "unknown", reason: "upstream history unavailable" };
 		},
 		async probe() { throw new Error("unused"); },
 	};
@@ -128,13 +130,25 @@ test("启动对账: 可查询远端 Run 封存真实完成 Receipt，未知效�
 	await delegations.init();
 	const secrets = new InteractionSecretStore(mkdtempSync(path.join(tmpdir(), "puddingteams-remote-reconcile-secrets-")));
 	await secrets.init();
-	let result: "completed" | "unknown" = "completed";
+	let result: "completed" | "failed" | "unknown" = "completed";
 	const runtime = new AgentRuntime(delegations, secrets, () => remoteDriver(result));
 	const completed = await delegations.createDelegation({ ...baseDelegation(), agentId: "remote", managerToolCallId: "remote-completed", driverTransport: "http" });
 	await delegations.transitionDelegation(completed.id, ["admitted"], { executionState: "running", runHandle: "remote-run" });
 	assert.equal(await runtime.reconcileOrphanedRuns(), 1);
-	assert.equal((await delegations.getDelegation(completed.id))?.executionState, "reported_completed");
-	assert.equal((await delegations.getDelegation(completed.id))?.receipt?.reportedOutcome, "completed");
+	const completedRecord = await delegations.getDelegation(completed.id);
+	assert.equal(completedRecord?.executionState, "reported_completed");
+	assert.equal(completedRecord?.workerStarted, true, "远端完成对账是可信的启动证据");
+	assert.equal(completedRecord?.receipt?.reportedOutcome, "completed");
+	assert.equal(completedRecord?.receipt?.workerStarted, true);
+
+	result = "failed";
+	const failed = await delegations.createDelegation({ ...baseDelegation(), agentId: "remote", managerToolCallId: "remote-failed", driverTransport: "http" });
+	await delegations.transitionDelegation(failed.id, ["admitted"], { executionState: "running", runHandle: "remote-failed" });
+	assert.equal(await runtime.reconcileOrphanedRuns(), 1);
+	const failedRecord = await delegations.getDelegation(failed.id);
+	assert.equal(failedRecord?.executionState, "reported_failed");
+	assert.equal(failedRecord?.workerStarted, true, "可信远端失败对账同样证明 Run 已启动");
+	assert.equal(failedRecord?.receipt?.workerStarted, true);
 
 	result = "unknown";
 	const unknown = await delegations.createDelegation({ ...baseDelegation(), agentId: "remote", managerToolCallId: "remote-unknown", driverTransport: "http" });
@@ -185,7 +199,9 @@ test("手工重挂原 Run: 先进入 reconciling，异步终态到达后通知�
 	assert.equal(result.status, "completed");
 	const completed = await delegations.getDelegation(lost.id);
 	assert.equal(completed?.executionState, "reported_completed");
+	assert.equal(completed?.workerStarted, true, "重挂流首事件应补齐启动边界");
 	assert.equal(completed?.receipt?.reportedOutcome, "completed");
+	assert.equal(completed?.receipt?.workerStarted, true);
 	assert.equal(runtime.isDelegationActive(lost.id), false);
 });
 
@@ -214,6 +230,7 @@ test("重挂流 started 的新 Session handle 会传递给后续 needs_input 并
 	assert.equal((await boundary).status, "needs_input");
 	const waiting = await delegations.getDelegation(lost.id);
 	assert.equal(waiting?.executionState, "waiting_input");
+	assert.equal(waiting?.workerStarted, true);
 	assert.equal(waiting?.sessionHandle, "reattach-input-session");
 	assert.equal((await runtime.canDelegate("reattach-input-session")).ok, false);
 	assert.equal(runtime.isDelegationActive(lost.id), true);

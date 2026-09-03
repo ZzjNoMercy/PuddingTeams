@@ -233,7 +233,7 @@ test("已结束委托：从 JSONL 回放 worker 会话历史，live=false", asyn
 		createdAt: d.createdAt,
 		live: false,
 		view: "session",
-		trustProjection: { execution: "observation_lost", verification: "not_required", settlement: "pending" },
+		trustProjection: { execution: "observation_lost", verification: "not_required", settlement: "not_required" },
 	});
 
 	const res = await app.inject({ method: "GET", url: `/api/delegations/${d.id}/process/messages` });

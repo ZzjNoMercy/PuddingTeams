@@ -18,6 +18,7 @@ import type { DelegationTimelineEvent } from "@/lib/types";
 import { timelineForDisplay, type TimelineDisplayEvent } from "@/lib/delegation-timeline-display";
 import { groupForRender, type RenderItem } from "@/lib/events";
 import { useAgentLabels } from "@/lib/avatars";
+import { workerProcessPresentation } from "@/lib/worker-process-presentation";
 import { AssistantGroup, Message } from "./message";
 import { WorkerAvatar } from "./worker-avatar";
 import { CollaborationTrustAxes } from "./session-activity-drawer";
@@ -188,8 +189,15 @@ function WorkerProcessRouter({
 	info: WorkerProcessInfo;
 	full: boolean;
 }) {
-	if (!info.workerStarted) {
-		return <div className="flex flex-1 items-center justify-center px-6 text-center text-sm text-muted-foreground">Worker 尚未启动，当前正在等待 Teams 准入决定。</div>;
+	const presentation = workerProcessPresentation(info);
+	if (presentation === "waiting_admission") {
+		return <div className="flex flex-1 items-center justify-center px-6 text-center text-sm text-muted-foreground">当前正在等待 Teams 准入决定。</div>;
+	}
+	if (presentation === "starting") {
+		return <div className="flex flex-1 items-center justify-center px-6 text-center text-sm text-muted-foreground">Teams 已接纳任务，正在等待 Worker 上报首个执行事件。</div>;
+	}
+	if (presentation === "terminal_without_start_evidence") {
+		return <div className="flex flex-1 items-center justify-center px-6 text-center text-sm text-muted-foreground">Teams 未观测到 Worker 启动；任务已经结束。具体原因请查看上方执行状态。</div>;
 	}
 	return info.view === "session"
 		? <WorkerProcessBody delegationId={info.delegationId} full={full} />

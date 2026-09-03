@@ -153,7 +153,13 @@ export function InteractionCard({
 				if (s === "approved" || s === "rejected" || s === "expired" || s === "failed") {
 					setStatus(s);
 					setBusy(false);
+					return;
 				}
+				// A pending card can be resolved in another room/tab or by startup
+				// reconciliation. Keep consulting the durable Interaction instead of
+				// freezing the mount-time snapshot forever.
+				setStatus(interaction.status === "responding" ? "busy" : "pending");
+				timer = setTimeout(() => void refresh(), 2_000);
 			} catch (err: unknown) {
 				// L3：服务端明确 404（已删除/过期）→ 卡片转已过期；网络错误保留 pending。
 				if (!cancelled && err instanceof Error && /404|not found/i.test(err.message)) {

@@ -5,7 +5,7 @@ import { config } from "../config.js";
 import type { WorkStateStore } from "../store/work-state.js";
 
 type VerificationProjection = "not_required" | "unverified" | "pending" | "running" | "waiting_input" | "passed" | "failed" | "blocked" | "stale";
-type SettlementProjection = "pending" | "submitted" | "accepted" | "revision" | "blocked" | "cancelled";
+type SettlementProjection = "not_required" | "pending" | "submitted" | "accepted" | "revision" | "blocked" | "cancelled";
 
 /**
  * Worker 执行过程可视化（只读）：pi 回放完整 AgentSession，spawn CLI
@@ -24,7 +24,10 @@ export function registerWorkerProcessRoutes(
 	const withTrustProjection = async <T extends Awaited<ReturnType<WorkerProcessService["resolve"]>>>(info: T) => {
 		if (!info) return info;
 		let verification: VerificationProjection = "not_required";
-		let settlement: SettlementProjection = info.executionState === "cancelled" ? "cancelled" : "pending";
+		// Settlement belongs to a formal WorkItem Submission. A plain Delegation
+		// has no acceptance aggregate, so projecting it as pending invents work
+		// that can never be settled.
+		let settlement: SettlementProjection = "not_required";
 		if (workStates && info.goalId) {
 			const goal = await workStates.getGoal(info.managerSessionId, info.goalId);
 			const item = goal?.plan && Object.values(goal.plan.items).find((candidate) => candidate.delegationIds.includes(info.delegationId));

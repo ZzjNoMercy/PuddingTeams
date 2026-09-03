@@ -339,7 +339,7 @@ export type ExecutionState =
 export type VerificationProjection =
 	| "not_required" | "unverified" | "pending" | "running" | "waiting_input"
 	| "passed" | "failed" | "blocked" | "stale";
-export type SettlementState = "pending" | "submitted" | "accepted" | "revision" | "blocked" | "cancelled";
+export type SettlementState = "not_required" | "pending" | "submitted" | "accepted" | "revision" | "blocked" | "cancelled";
 export interface CollaborationTrustProjection {
 	execution: ExecutionState;
 	verification: VerificationProjection;
@@ -368,7 +368,7 @@ export function collaborationTrustOf(source: CollaborationProjectionSource): Col
 	return source.trustProjection ?? {
 		execution: source.executionState,
 		verification: source.verification ?? "unverified",
-		settlement: source.settlement ?? "pending",
+		settlement: source.settlement ?? "not_required",
 	};
 }
 

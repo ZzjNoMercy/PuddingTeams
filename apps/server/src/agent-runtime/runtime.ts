@@ -268,6 +268,24 @@ export class AgentRuntime {
 		};
 	}
 
+	/** A recovered upstream observation is also an honest Worker-start boundary. */
+	private async markRecoveredWorkerStarted(delegation: DelegationRecord): Promise<DelegationRecord> {
+		if (delegation.workerStarted) return delegation;
+		const marked = await this.delegations.transitionDelegation(delegation.id, [delegation.executionState], {
+			executionState: delegation.executionState,
+			workerStarted: true,
+			revision: delegation.revision + 1,
+		});
+		if (marked.applied && marked.record) return marked.record;
+		// Preserve the caller's original allowed-state fence when another lifecycle
+		// transition won the race. Reusing a newer terminal record here could make a
+		// stale recovery observation attempt to reseal an immutable Receipt.
+		if (marked.record?.executionState === delegation.executionState && marked.record.workerStarted && !marked.record.receipt) {
+			return marked.record;
+		}
+		return delegation;
+	}
+
 	private withDelegationTransition<T>(delegationId: string, fn: () => Promise<T>): Promise<T> {
 		const previous = this.transitionQueues.get(delegationId) ?? Promise.resolve();
 		const run = previous.then(fn, fn);
@@ -1785,7 +1803,10 @@ export class AgentRuntime {
 			const ctx: InvocationContext = { cwd: orphan.executionCwd ?? orphan.cwdSnapshot, env: process.env, delegationId: orphan.id, operationId: orphan.operationId };
 			if (orphan.pendingTerminal) {
 				const pending = orphan.pendingTerminal;
-				const transition = await this.withDelegationTransition(orphan.id, () => this.sealTerminal(orphan, [orphan.executionState], pending.executionState, pending.result, ctx));
+				const terminalOwner = pending.executionState === "reported_completed"
+					? await this.markRecoveredWorkerStarted(orphan)
+					: orphan;
+				const transition = await this.withDelegationTransition(orphan.id, () => this.sealTerminal(terminalOwner, [terminalOwner.executionState], pending.executionState, pending.result, ctx));
 				if (transition.applied) {
 					await this.expireDelegationInteractions(orphan.id);
 					await this.recordBoundary(orphan, pending.result.status === "completed" ? { type: "completed", result: pending.result } : { type: "failed", result: pending.result });
@@ -1803,23 +1824,33 @@ export class AgentRuntime {
 				const observed = await driver.reconcileRun({ runHandle: orphan.runHandle, lastObservedAt: orphan.updatedAt }, ctx)
 					.catch((error: unknown) => ({ state: "unknown" as const, reason: error instanceof Error ? error.message : String(error) }));
 				if (observed.state === "completed") {
+					const observedOrphan = await this.markRecoveredWorkerStarted(orphan);
 					const publicResult = redactValue(observed.result);
-					const transition = await this.withDelegationTransition(orphan.id, () => this.sealTerminal(orphan, [orphan.executionState], "reported_completed", publicResult, ctx));
+					const transition = await this.withDelegationTransition(orphan.id, () => this.sealTerminal(observedOrphan, [observedOrphan.executionState], "reported_completed", publicResult, ctx));
 					if (transition.applied && notify) await notify(transition.record ?? orphan, publicResult).catch(() => undefined);
 				} else if (observed.state === "failed" || observed.state === "cancelled") {
+					const observedOrphan = await this.markRecoveredWorkerStarted(orphan);
 					const publicResult = redactValue(observed.result);
-					const transition = await this.withDelegationTransition(orphan.id, () => this.sealTerminal(orphan, [orphan.executionState], observed.state === "cancelled" ? "cancelled" : "reported_failed", publicResult, ctx));
+					const transition = await this.withDelegationTransition(orphan.id, () => this.sealTerminal(observedOrphan, [observedOrphan.executionState], observed.state === "cancelled" ? "cancelled" : "reported_failed", publicResult, ctx));
 					if (transition.applied && notify) await notify(transition.record ?? orphan, publicResult).catch(() => undefined);
 				} else if (observed.state === "running") {
-					await this.delegations.transitionDelegation(orphan.id, [orphan.executionState], { executionState: "running", runHandle: observed.runHandle, sessionHandle: observed.sessionHandle, revision: orphan.revision + 1 });
+					const resumed = await this.delegations.transitionDelegation(orphan.id, [orphan.executionState], { executionState: "running", workerStarted: true, runHandle: observed.runHandle, sessionHandle: observed.sessionHandle, revision: orphan.revision + 1 });
+					if (!resumed.applied) {
+						reconciled++;
+						continue;
+					}
 					this.activeDelegations.add(orphan.id);
 					if (observed.sessionHandle) this.activeRuns.set(observed.sessionHandle, orphan.id);
 				} else if (observed.state === "needs_input") {
 					const publicResult = redactValue(observed.result);
 					const effectiveRun = observed.result.runHandle ?? orphan.runHandle;
 					const effectiveSession = observed.result.sessionHandle ?? orphan.sessionHandle;
-					await this.delegations.transitionDelegation(orphan.id, [orphan.executionState], { executionState: "waiting_input", runHandle: effectiveRun, sessionHandle: effectiveSession, result: undefined, revision: orphan.revision + 1 });
-					await this.persistInteraction({ ...orphan, runHandle: effectiveRun, sessionHandle: effectiveSession }, publicResult, observed.providerState);
+					const waiting = await this.delegations.transitionDelegation(orphan.id, [orphan.executionState], { executionState: "waiting_input", workerStarted: true, runHandle: effectiveRun, sessionHandle: effectiveSession, result: undefined, revision: orphan.revision + 1 });
+					if (!waiting.applied || !waiting.record) {
+						reconciled++;
+						continue;
+					}
+					await this.persistInteraction(waiting.record, publicResult, observed.providerState);
 					this.activeDelegations.add(orphan.id);
 					if (effectiveSession) this.activeRuns.set(effectiveSession, orphan.id);
 				} else {
@@ -1924,6 +1955,7 @@ export class AgentRuntime {
 		let sessionHandle = orphan.sessionHandle;
 		try {
 			for await (const event of driver.reattachRun!({ runHandle: orphan.runHandle! }, ctx)) {
+				orphan = await this.markRecoveredWorkerStarted(orphan);
 				const outcome = await this.handleEvent(event, orphan, sessionHandle, ctx);
 				if (event.type === "started" && event.sessionHandle) sessionHandle = event.sessionHandle;
 				if (outcome.terminal) {

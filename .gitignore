@@ -6,6 +6,7 @@ apps/docs/out/
 .env
 .env.local
 .DS_Store
+.playwright-cli/
 apps/server/.sessions/
 apps/server/.teams/
 

@@ -49,7 +49,7 @@ const verificationLabels: Record<string, string> = {
 	passed: "已复验", failed: "复验失败", blocked: "复验受阻", stale: "复验已过期",
 };
 const settlementLabels: Record<string, string> = {
-	pending: "待结算", submitted: "已提交", accepted: "已接受", revision: "需返修", blocked: "已阻塞", cancelled: "已取消",
+	not_required: "无需结算", pending: "待结算", submitted: "已提交", accepted: "已接受", revision: "需返修", blocked: "已阻塞", cancelled: "已取消",
 };
 function axisClass(axis: "execution" | "verification" | "settlement", value: string): string {
 	if (axis === "execution" && ["observation_lost", "reported_failed"].includes(value)) return "is-danger";
