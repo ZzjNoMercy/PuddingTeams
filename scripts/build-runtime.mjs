@@ -35,6 +35,20 @@ function step(msg) {
 	console.log(`\x1b[36m▸\x1b[0m ${msg}`);
 }
 
+function runPnpm(args) {
+	const pnpmCli = process.env.npm_execpath;
+	if (pnpmCli && existsSync(pnpmCli)) {
+		return spawnSync(process.execPath, [pnpmCli, ...args], { cwd: ROOT, stdio: "inherit" });
+	}
+	if (process.platform === "win32") {
+		return spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", `pnpm ${args.join(" ")}`], {
+			cwd: ROOT,
+			stdio: "inherit",
+		});
+	}
+	return spawnSync("pnpm", args, { cwd: ROOT, stdio: "inherit" });
+}
+
 async function bundle(entry, outfile) {
 	await esbuild.build({
 		entryPoints: [entry],
@@ -92,7 +106,7 @@ if (skipWeb) {
 	step("跳过 web 构建（--skip-web），仅复制已有 apps/web/out");
 } else {
 	step("web 静态导出（next build）");
-	const res = spawnSync("pnpm", ["--filter", "@puddingteams/web", "build"], { cwd: ROOT, stdio: "inherit" });
+	const res = runPnpm(["--filter", "@puddingteams/web", "build"]);
 	if (res.status !== 0) throw new Error("web build 失败");
 }
 const webOut = path.join(ROOT, "apps", "web", "out");
