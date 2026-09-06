@@ -2,6 +2,20 @@
 
 All notable changes to PuddingTeams are documented here. The project follows Semantic Versioning.
 
+## [1.0.2] - 2026-09-06
+
+### Changed
+
+- Made Windows Authenticode signing optional in the automated desktop release: valid credentials produce and verify a signed installer, while absent credentials produce a verified unsigned installer with an explicit release warning.
+
+### Fixed
+
+- Preserved numeric input/output token usage metadata during recursive credential redaction and guarded the session UI against non-finite usage values.
+
+### Known limitations
+
+- The Windows 1.0.2 installer is unsigned and may trigger an Unknown Publisher or SmartScreen warning; verify its published SHA-256 before installation.
+
 ## [1.0.1] - 2026-09-03
 
 ### Fixed
@@ -35,5 +49,6 @@ All notable changes to PuddingTeams are documented here. The project follows Sem
 - The Windows 1.0.0 installer is unsigned and may trigger an Unknown Publisher or SmartScreen warning; verify its published SHA-256 before installation.
 - Generic HTTP/RPC/ACP transports, Extension process isolation and a public Extension marketplace are not part of 1.0.
 
+[1.0.2]: https://github.com/ZzjNoMercy/PuddingTeams/releases/tag/v1.0.2
 [1.0.1]: https://github.com/ZzjNoMercy/PuddingTeams/releases/tag/v1.0.1
 [1.0.0]: https://github.com/ZzjNoMercy/PuddingTeams/releases/tag/v1.0.0

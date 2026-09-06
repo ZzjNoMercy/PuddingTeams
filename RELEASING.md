@@ -27,7 +27,7 @@ Build Windows x64 NSIS on Windows for the final release. A macOS cross-build is 
 pnpm build:electron:win:x64
 ```
 
-PuddingTeams 1.0.0 and 1.0.1 were published manually as explicitly disclosed unsigned exceptions. The automated release workflow remains fail-closed: 1.0.2 and later releases require a valid Authenticode certificate plus clean-machine install, upgrade, and uninstall acceptance before the warning can be removed.
+Windows Authenticode signing is optional in the automated release workflow. When both `WIN_CSC_LINK` and `WIN_CSC_KEY_PASSWORD` are configured, the workflow signs and verifies the installer. When both are absent, it verifies that the installer is unsigned and adds an explicit warning to the workflow log and GitHub Release. Supplying only one of the two secrets remains a hard failure.
 
 After all three installers are present:
 
@@ -38,7 +38,7 @@ pnpm release:checksums
 ## 3. Acceptance checklist
 
 - macOS arm64 and x64: `codesign --verify`, `spctl --assess` and notarization succeed; mount, drag-install, first launch, upgrade and uninstall are tested.
-- Windows x64: Authenticode signature is valid (except the documented 1.0.0–1.0.1 manual exceptions); install, first launch, upgrade, uninstall, Start Menu and desktop shortcuts are tested on a clean Windows machine.
+- Windows x64: when signing credentials are configured, the Authenticode signature is valid; otherwise the installer is verified as unsigned and the release warning is present. Install, first launch, upgrade, uninstall, Start Menu and desktop shortcuts should be tested on a clean Windows machine before broad promotion.
 - The app can create a room, configure a model, delegate to at least one Worker and restore the session after restart.
 - `SHA256SUMS.txt` matches the uploaded assets.
 - Public docs and the download link resolve without authentication.
