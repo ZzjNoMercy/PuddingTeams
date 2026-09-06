@@ -42,7 +42,7 @@ jobs:
           test -n "$APPLE_ID"
           test -n "$APPLE_APP_SPECIFIC_PASSWORD"
           test -n "$APPLE_TEAM_ID"
-      - name: Build signed and notarized DMG
+      - name: Build signed and notarized app
         env:
           CSC_LINK: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
           CSC_KEY_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -52,7 +52,16 @@ jobs:
         run: pnpm build:electron:${{ matrix.arch }}
       - run: codesign --verify --deep --strict --verbose=2 electron/release/mac*/PuddingTeams.app
       - run: spctl --assess --type execute --verbose=2 electron/release/mac*/PuddingTeams.app
-      - run: xcrun stapler validate electron/release/PuddingTeams-1.0.2-${{ matrix.arch }}.dmg
+      - name: Notarize and staple DMG
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          DMG="electron/release/PuddingTeams-1.0.2-${{ matrix.arch }}.dmg"
+          xcrun notarytool submit "$DMG" --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
       - uses: actions/upload-artifact@v4
         with:
           name: PuddingTeams-macos-${{ matrix.arch }}

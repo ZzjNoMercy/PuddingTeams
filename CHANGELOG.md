@@ -12,6 +12,7 @@ All notable changes to PuddingTeams are documented here. The project follows Sem
 
 - Preserved numeric input/output token usage metadata during recursive credential redaction and guarded the session UI against non-finite usage values.
 - Made runtime assembly invoke the active pnpm CLI portably so Windows release runners can build the bundled Web application.
+- Ensured the release workflow notarizes and staples the outer macOS DMG after the packaged application passes notarization.
 
 ### Known limitations
 
