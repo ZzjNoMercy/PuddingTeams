@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DelegationTimelineStore } from "./delegation-timeline-store.js";
-import { redactText } from "./redaction.js";
+import { redactText, redactValue } from "./redaction.js";
 
 function activity(title: string) {
 	return {
@@ -83,4 +83,18 @@ test("脱敏文本可重复应用且结果保持幂等", () => {
 	const safeMarkdown = '```json\n{"auth":"Authorization: [redacted]","api_key":"[redacted]"}\n```';
 	assert.equal(redactText(markdown), safeMarkdown, "脱敏不得吞掉 JSON 引号或 Markdown 围栏");
 	assert.equal(redactText(safeMarkdown), safeMarkdown);
+});
+
+test("递归脱敏保留 token 用量统计，仅隐藏凭证字段", () => {
+	assert.deepEqual(redactValue({
+		usage: { inputTokens: 12_345, outputTokens: 678, totalTokens: 13_023 },
+		accessToken: "access-secret",
+		refresh_token: "refresh-secret",
+		OPENAI_API_KEY: "sk-secret-value",
+	}), {
+		usage: { inputTokens: 12_345, outputTokens: 678, totalTokens: 13_023 },
+		accessToken: "[redacted]",
+		refresh_token: "[redacted]",
+		OPENAI_API_KEY: "[redacted]",
+	});
 });

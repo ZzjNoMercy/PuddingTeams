@@ -370,8 +370,10 @@ interface TaskUsage {
 
 /** 「输入 12.3K · 输出 1.2K」；成本不在会话 UI 中展示。 */
 function usageMetaText(usage: TaskUsage | undefined): string | undefined {
-	if (!usage || (usage.inputTokens === undefined && usage.outputTokens === undefined)) return undefined;
-	return `输入 ${formatTokens(usage.inputTokens ?? 0)} · 输出 ${formatTokens(usage.outputTokens ?? 0)}`;
+	const inputTokens = typeof usage?.inputTokens === "number" && Number.isFinite(usage.inputTokens) ? usage.inputTokens : undefined;
+	const outputTokens = typeof usage?.outputTokens === "number" && Number.isFinite(usage.outputTokens) ? usage.outputTokens : undefined;
+	if (inputTokens === undefined && outputTokens === undefined) return undefined;
+	return `输入 ${formatTokens(inputTokens ?? 0)} · 输出 ${formatTokens(outputTokens ?? 0)}`;
 }
 
 function WorkerTaskEntry({

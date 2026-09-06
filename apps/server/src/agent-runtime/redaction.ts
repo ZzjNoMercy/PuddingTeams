@@ -1,4 +1,9 @@
-const SECRET_KEY = /api[_-]?key|token|secret|password|passwd|authorization|cookie|credential|private[_-]?key/i;
+/**
+ * Credential-shaped object keys. `token` is deliberately matched only as a
+ * singular suffix: usage metrics such as inputTokens/outputTokens are public
+ * numbers, while accessToken, refresh_token and TOKEN are credentials.
+ */
+const SECRET_KEY = /api[_-]?key|token$|secret|password|passwd|authorization|cookie|credential|private[_-]?key/i;
 
 /** Redact credential-shaped text before it crosses a public or persistence boundary. */
 export function redactText(value: string): string {
