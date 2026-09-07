@@ -677,11 +677,11 @@ export class AgentInvoker {
 			}
 			case "completed": {
 				const result = delegation.result;
-				const workspaceChangeSet = await this.runtime.getWorkspaceChangeSet(d.workspaceChangeSetId);
+				const { workspaceChangeSet, note } = await this.runtime.getWorkspaceResultContext(d);
 				return {
 					...base,
 					status: "completed",
-					content: result?.content ?? "",
+					content: `${result?.content ?? ""}${note}`,
 					details: {
 						...(result?.meta ?? {}),
 						artifacts: result?.artifacts,
@@ -1154,7 +1154,8 @@ export class AgentInvoker {
 				// §6.2/§6.3：完成后触发 manager follow-up 汇总（triggerTurn + followUp；
 				// direct 窗口无 manager 回合，taskResultOptions 降级为仅展示），并把
 				// worker 的真实结果带给 manager，否则汇总轮无内容可转述。
-				const details = { ...(outcome.result.meta ?? {}), artifacts: outcome.result.artifacts, usage: outcome.result.usage };
+				const { workspaceChangeSet, note } = await this.runtime.getWorkspaceResultContext(d);
+				const details = { ...(outcome.result.meta ?? {}), artifacts: outcome.result.artifacts, usage: outcome.result.usage, executionReceipt: d.receipt, workspaceChangeSet };
 				// The manager model consumes the custom message body, not its structured
 				// details.  A run that crossed an Interaction boundary no longer returns
 				// through the original delegate tool, so this resumed terminal projection
@@ -1163,8 +1164,8 @@ export class AgentInvoker {
 				const delegationNote = `\n\n（delegationId：${d.id}——需要该 worker 接力/追问时，用 handoffKind="followup" 并把它填进 parentDelegationId）`;
 				const taskResult = {
 					customType: "pudding:task_result",
-					content: `${outcome.result.content ?? ""}${delegationNote}`,
-					details: { interactionId, delegationId: d.id, worker: d.agentId, status: "completed", ...details },
+					content: `${outcome.result.content ?? ""}${note}${delegationNote}`,
+					details: { ...details, interactionId, delegationId: d.id, worker: d.agentId, status: "completed" },
 				};
 				if (targets.manager) {
 					// M5：manager 若在流式中，用 followUp 排队而不是 steer 打断。
@@ -1176,7 +1177,7 @@ export class AgentInvoker {
 				}
 				return {
 					status: "completed",
-					content: outcome.result.content ?? "",
+					content: `${outcome.result.content ?? ""}${note}`,
 					details,
 					delegationId: d.id,
 					runHandle: d.runHandle,
@@ -1214,12 +1215,14 @@ export class AgentInvoker {
 				};
 			}
 			case "failed": {
-				const errorText = outcome.result.status === "failed" ? outcome.result.error : "任务执行失败";
-				const details = { ...(outcome.result.meta ?? {}), errorCode: "errorCode" in outcome.result ? outcome.result.errorCode : undefined };
+				const error = "error" in outcome.result ? outcome.result.error : "任务执行失败";
+				const errorCode = "errorCode" in outcome.result ? outcome.result.errorCode : undefined;
+				const errorText = `${error}\n\n平台执行状态：${JSON.stringify({ delegationId: d.id, resultStatus: outcome.result.status, errorCode, executionState: d.executionState, workerStarted: d.workerStarted, waitingInput: false, readOnlyAssessment: d.readOnlyAssessment })}`;
+				const details = { ...(outcome.result.meta ?? {}), errorCode, resultStatus: outcome.result.status, executionState: d.executionState, workerStarted: d.workerStarted, waitingInput: false };
 				const taskResult = {
 					customType: "pudding:task_result",
 					content: errorText,
-					details: { interactionId, delegationId: d.id, worker: d.agentId, status: "failed", ...details },
+					details: { ...details, interactionId, delegationId: d.id, worker: d.agentId, status: "failed" },
 				};
 				if (targets.manager) {
 					this.sendOutcome(targets.manager, taskResult, taskResultOptions);

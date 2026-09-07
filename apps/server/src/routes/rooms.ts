@@ -60,7 +60,13 @@ async function buildWindowSummary(
 	const list = await sessions.list();
 	const byId = new Map(list.map((s) => [s.id, s]));
 	const { sessions: ids, active } = await teams.windowSessionList(w.id);
-	const members = await teams.windowMembers(w.id);
+	// 房间摘要展示的是窗口已配置的成员，而不是当前可委托 roster。
+	// windowMembers() 会按 enabled 过滤；停用 direct 房间唯一 worker 后，
+	// 如果复用它，前端会拿到空 members 并丢失房间的身份展示。
+	const configuredAgents = await teams.listAgents();
+	const members = w.members
+		.map((member) => configuredAgents.find((agent) => agent.name === member))
+		.filter((agent): agent is AgentConfig => Boolean(agent));
 	const workspace = w.workspaceId
 		? (await teams.workspaces.list()).find((item) => item.id === w.workspaceId)
 		: undefined;

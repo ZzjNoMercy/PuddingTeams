@@ -599,6 +599,14 @@ export class PuddingClawDriver implements AgentDriver {
 			}
 			if (raw !== undefined) return this.withHandoffPaths(normalizePuddingClawJson(raw), ctx);
 		}
+		// The CLI can exit before emitting JSONL when its Backend rejects the
+		// request. Preserve that transport failure instead of blaming the protocol.
+		const httpStatus = res.exitCode !== 0 ? res.stderr.match(/^\s*HTTP\s+(5\d{2})(?:\s|:|$)/m)?.[1] : undefined;
+		if (httpStatus) {
+			return this.httpFailure(new HttpJsonlError(
+				res.stderr, "http_error", Number(httpStatus),
+			), "");
+		}
 		return {
 			type: "failed",
 			result: {

@@ -56,6 +56,8 @@ export interface WorkspaceExecutionScope {
 	workspaceId?: string;
 	/** The canonical target workspace (or its Git root for a subdirectory workspace). */
 	canonicalRoot: string;
+	/** Root against which changedPaths are relative; may differ from executionCwd. */
+	executionRoot: string;
 	/** The exact cwd handed to the Driver. */
 	executionCwd: string;
 	mode: WorkspaceAccessMode;
@@ -97,8 +99,6 @@ interface SnapshotEntry {
 interface ScopeRecord extends WorkspaceExecutionScope {
 	/** Root of the original workspace, when workspacePath is a subdirectory. */
 	workspaceRoot: string;
-	/** Git worktree root; differs from executionCwd for a repository subdirectory. */
-	executionRoot: string;
 	baselineSnapshotPath: string;
 	baselineEntries: SnapshotEntry[];
 	/** Target HEAD frozen at admission; Worker-local commits are execution detail,
@@ -246,8 +246,31 @@ async function genericPaths(root: string, current = root, result: string[] = [])
 	return result.sort();
 }
 
+async function filesystemPaths(root: string): Promise<string[]> {
+	// A filesystem write lease can still target a Git project. Respect its file
+	// selection instead of traversing ignored installations and app bundles.
+	// Verification copies have no .git marker and use the same captured files.
+	let current = root;
+	while (true) {
+		if (await lstat(path.join(current, ".git")).catch(() => undefined)) {
+			const selected = await gitPaths(root);
+			// Handoff is deliberately gitignored but remains part of delivery proof.
+			const handoff = path.join(root, ".pudding", "handoff");
+			const puddingInfo = await lstat(path.dirname(handoff)).catch(() => undefined);
+			if (puddingInfo?.isSymbolicLink()) throw new WorkspaceExecutionError("unsupported_layout", "symbolic links are not supported: .pudding");
+			const handoffInfo = await lstat(handoff).catch(() => undefined);
+			if (handoffInfo?.isSymbolicLink()) throw new WorkspaceExecutionError("unsupported_layout", "symbolic links are not supported: .pudding/handoff");
+			if (handoffInfo?.isDirectory()) selected.push(...await genericPaths(root, handoff));
+			return [...new Set(selected)].sort();
+		}
+		const parent = path.dirname(current);
+		if (parent === current) return genericPaths(root);
+		current = parent;
+	}
+}
+
 async function entriesFor(root: string, git = false): Promise<SnapshotEntry[]> {
-	const paths = git ? await gitPaths(root) : await genericPaths(root);
+	const paths = git ? await gitPaths(root) : await filesystemPaths(root);
 	const entries: SnapshotEntry[] = [];
 	for (const relative of paths) {
 		const absolute = absoluteInside(root, relative);
@@ -524,7 +547,9 @@ export class WorkspaceExecutionCoordinator {
 			}
 			if (input.executionScopeId) {
 				const existing = state.scopes[input.executionScopeId];
-				if (!existing || existing.state === "released") throw new WorkspaceExecutionError("scope_not_found", `execution scope not found: ${input.executionScopeId}`);
+				if (!existing) throw new WorkspaceExecutionError("scope_not_found", `execution scope not found: ${input.executionScopeId}`);
+				if (existing.state !== "active") throw new WorkspaceExecutionError("scope_conflict", `execution scope is ${existing.state}: ${input.executionScopeId}`);
+				if (existing.workspaceId !== input.workspaceId || existing.goalId !== input.goalId || existing.goalEpoch !== input.goalEpoch) throw new WorkspaceExecutionError("scope_conflict", "execution scope owner binding is immutable");
 				if (existing.mode !== input.mode || existing.canonicalRoot !== canonicalRoot) throw new WorkspaceExecutionError("scope_conflict", "execution scope binding is immutable");
 				if (existing.ownerToken && input.ownerToken !== existing.ownerToken) throw new WorkspaceExecutionError("lease_conflict", "execution scope owner token mismatch");
 				if (input.mode === "exclusive_write" && existing.lease && existing.lease.state !== "active") throw new WorkspaceExecutionError("lease_fenced", "execution scope lease is fenced or released");

@@ -17,6 +17,7 @@ import type { ArtifactStore } from "../agent-runtime/artifact-store.js";
 import type { LargeWorkerResultStore } from "../store/large-worker-result.js";
 import type { ProductSettingsStore } from "../store/product-settings.js";
 import { ENVIRONMENT_OBSERVATION_REF, bindEnvironmentObservations, buildVerificationPrompt, parseVerificationOutput, type VerificationReviewInput } from "../agent-runtime/verification-review.js";
+import { managerHumanWait, MANAGER_HUMAN_WAIT_INSTRUCTION } from "./manager-human-wait.js";
 
 /**
  * Phase 4：manager Session 的 Extension 装配（方案 §3.3）。
@@ -80,6 +81,11 @@ function truncate(text: string): string {
 function throwIfAborted(signal?: AbortSignal): void {
 	if (!signal?.aborted) return;
 	throw signal.reason instanceof Error ? signal.reason : new Error("Manager tool call was aborted");
+}
+
+async function assertManagerNotWaiting(deps: ManagerExtensionDeps): Promise<void> {
+	const waiting = await managerHumanWait(deps.getSessionId(), deps.invoker, deps.workStates);
+	if (waiting) throw new Error(waiting);
 }
 
 // ---- 工具集规划（命名空间 + always/searchable 激活策略） ----
@@ -603,6 +609,7 @@ export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowCon
 		lines.join("\n"),
 		`委托工具默认全部已激活，按 roster 里的工具名直接调用，不要先搜索。标注「已激活」的扩展能力工具同样直接调用；只有未激活的扩展能力工具才先用 ${CORE_TOOL_SEARCH} 按名称激活后再调用。若调用返回工具不存在（Tool ... not found），说明它当前未激活（服务重启后会话重建会重置激活态）：用 ${CORE_TOOL_SEARCH} 激活后重试一次即可，不要当作 worker 不可用。只有搜索不到该 worker 的工具、或激活后调用仍被明确拒绝时，才说明该 worker 已不可用，不要继续重试。`,
 		"Worker 的原生 input_required/respond 是同一个 WorkItem、同一个 Delegation、同一个 Run 内的暂停与恢复：WorkPlan 必须把询问与用户回答后的继续执行建成一个 WorkItem，不得拆成询问前/后两个 WorkItem。用户在审批卡提交业务选择后，Runtime 会自动恢复原 Delegation；不得再发 followup、验证委托或替代委托来完成、提交或验收该流程。",
+		MANAGER_HUMAN_WAIT_INSTRUCTION,
 		...(soloCtx
 			? [
 					`只要任务需要两个及以上 worker——包括串行交接（一个 worker 的产出是另一个的输入，如"先查数据再做 PPT"）——就用 ${CORE_TOOL_CREATE_GROUP} 建群聊并把整体任务下达给房间 manager，让 worker 在群里直接交接、用户全程旁观。不要在 solo 里逐个单聊派活、自己搬运中间结果。只有纯单 worker 任务才直接委托该 worker。`,
@@ -617,6 +624,10 @@ export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowCon
 function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => void {
 	return (pi) => {
 		let latestUserSourceIds = new Set<string>();
+		pi.on("tool_call", async () => {
+			const waiting = await managerHumanWait(deps.getSessionId(), deps.invoker, deps.workStates);
+			if (waiting) return { block: true, reason: waiting, terminate: true };
+		});
 		// Work state is request-scoped rather than a sticky system-prompt
 		// override. pi's sendCustomMessage(triggerTurn) starts an agent turn
 		// without emitting before_agent_start; keeping Goal state only in that
@@ -637,6 +648,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 				message.role !== "custom" || !("display" in message) || message.display !== false,
 			);
 			const workState = deps.workStates ? await deps.workStates.getActive(deps.getSessionId()) : undefined;
+			const humanWait = await managerHumanWait(deps.getSessionId(), deps.invoker, deps.workStates);
 			const latestGoal = workState ?? (deps.workStates ? await deps.workStates.get(deps.getSessionId()) : undefined);
 			const contextWindow = await deps.resolveContext();
 			const harness = contextWindow && deps.productSettings ? (await deps.productSettings.get()).harness : undefined;
@@ -699,7 +711,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 					{
 						role: "custom" as const,
 						customType: "pudding:work_state_context",
-						content: workSection,
+						content: humanWait ? `${workSection}\n\n[PuddingTeams 等待人工反馈]\n${humanWait}` : workSection,
 						display: false,
 						timestamp: Date.now(),
 					},
@@ -802,6 +814,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 			description: "把目标明确、需要持续执行或多 Worker 协作的请求显式设为 Goal。只能规范化用户已表达的完成条件；含糊时先询问。",
 			parameters: CreateGoalParams,
 			async execute(toolCallId, params: Static<typeof CreateGoalParams>, signal) {
+				await assertManagerNotWaiting(deps);
 				if (!deps.workStates) throw new Error("Session Work State 未启用");
 				throwIfAborted(signal);
 				const sessionId = deps.getSessionId();
@@ -842,6 +855,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 			description: "创建或更新当前 Goal 的 WorkItem DAG。验收条件只能从冻结 Goal 条件、步骤产物和下游依赖派生；同时显式分类验证强度和工作区所有权。代码写入优先 isolated_worktree，非 Git 写入使用 exclusive_write，Manager 自己不得写工作区。",
 			parameters: UpdateWorkPlanParams,
 			async execute(toolCallId, params: Static<typeof UpdateWorkPlanParams>, signal) {
+				await assertManagerNotWaiting(deps);
 				if (!deps.workStates) throw new Error("Session Work State 未启用");
 				throwIfAborted(signal);
 				const sessionId = deps.getSessionId();
@@ -882,6 +896,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 			description: "推进 Manager 自己负责的 WorkItem：开始时置为 in_progress，交付完成后生成正式 Submission。不能用于 worker 工作项。",
 			parameters: AdvanceManagerWorkItemParams,
 			async execute(toolCallId, params: Static<typeof AdvanceManagerWorkItemParams>, signal) {
+				await assertManagerNotWaiting(deps);
 				if (!deps.workStates) throw new Error("Session Work State 未启用");
 				throwIfAborted(signal);
 				const current = await deps.workStates.getActive(deps.getSessionId());
@@ -901,6 +916,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 			description: "为最新 Submission 发起与 Executor/Manager 上下文隔离的结构化验收。manager_review 模式不需要调用。",
 			parameters: RequestWorkItemVerificationParams,
 			async execute(toolCallId, params: Static<typeof RequestWorkItemVerificationParams>, signal) {
+				await assertManagerNotWaiting(deps);
 				throwIfAborted(signal);
 				return verifyWorkItemSubmission(deps, toolCallId, params);
 			},
@@ -912,6 +928,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 			description: "验收最新 Submission。accepted 才会解锁依赖；revision/blocked 不会完成 Goal。",
 			parameters: ReviewWorkItemParams,
 			async execute(toolCallId, params: Static<typeof ReviewWorkItemParams>, signal) {
+				await assertManagerNotWaiting(deps);
 				if (!deps.workStates) throw new Error("Session Work State 未启用");
 				throwIfAborted(signal);
 				let revision = params.expectedRevision;
@@ -962,6 +979,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 			description: "更新当前 Goal 的权威工作摘要、等待项、下一步和完成状态；使用 revision 做乐观并发控制。",
 			parameters: UpdateWorkStateParams,
 			async execute(toolCallId, params: Static<typeof UpdateWorkStateParams>, signal) {
+				await assertManagerNotWaiting(deps);
 				if (!deps.workStates) throw new Error("Session Work State 未启用");
 				throwIfAborted(signal);
 				try {
@@ -1190,10 +1208,12 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 
 		pi.registerTool({
 			name: CORE_TOOL_REQUEST_DECISION,
+			executionMode: "sequential",
 			label: "Request Human Decision",
 			description: "创建业务级人类决策请求并暂停当前 Goal；它不替代 Connector 的 permission/confirmation 审批。",
 			parameters: RequestDecisionParams,
 			async execute(toolCallId, params: Static<typeof RequestDecisionParams>, signal) {
+				await assertManagerNotWaiting(deps);
 				if (!deps.workStates) throw new Error("Session Work State 未启用");
 				throwIfAborted(signal);
 				const sessionId = deps.getSessionId();
@@ -1223,6 +1243,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 				"创建多 worker 群聊房间，并把任务作为首条消息直接下达给房间 manager 开跑。需要拆分、并行、交接、裁决的多 worker 协作时使用；单 worker 任务请直接用该 worker 的 delegate 工具。仅 solo 对话可用。",
 			parameters: CreateGroupParams,
 			async execute(_toolCallId, params: Static<typeof CreateGroupParams>) {
+				await assertManagerNotWaiting(deps);
 				// 门禁双保险（激活策略已限定 solo；无窗口的 Session 不能建房）。
 				const ctx = await deps.resolveContext();
 				if (!ctx) throw new Error("当前 manager Session 不属于任何窗口，不能建群聊");
@@ -1291,6 +1312,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 				"把其他已启用 worker 拉进当前群聊。成员变化下一轮进入 worker 清单，其委托工具在会话装配刷新后可用。仅群聊窗口可用。",
 			parameters: InviteToGroupParams,
 			async execute(_toolCallId, params: Static<typeof InviteToGroupParams>) {
+				await assertManagerNotWaiting(deps);
 				const ctx = await deps.resolveContext();
 				if (ctx?.type !== "group") throw new Error(`${CORE_TOOL_INVITE} 仅在群聊窗口可用`);
 				const window = await deps.store.windowForSession(deps.getSessionId());
@@ -1401,6 +1423,7 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 			: "",
 		"当用户的请求属于这个 worker 的职责时使用，不要自己动手执行。",
 		"当 worker 需要审批才能继续时，结果会报告一个待处理的审批；不要重试任务——审批卡会处理它。",
+		MANAGER_HUMAN_WAIT_INSTRUCTION,
 	].filter(Boolean).join(" ");
 
 	return (pi) => {
@@ -1417,6 +1440,7 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 			},
 			parameters: DelegateParams,
 			async execute(toolCallId, params: DelegateInput, signal, onUpdate) {
+				await assertManagerNotWaiting(deps);
 				const sessionId = deps.getSessionId();
 				const goal = deps.workStates ? await deps.workStates.getActive(sessionId) : undefined;
 				if (goal && !params.workItemId) {
@@ -1628,9 +1652,9 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 							: `\n\n（未能同步到与 ${agent.name} 的单聊：对方会话忙碌）`;
 
 				// HITL（§6.2）：needs_input 时保存待处理 Interaction，返回“等待审批”
-				// 结构，manager 本轮正常结束，绝不指导它重跑任务。
+				// 结构；宿主在工具结果落盘后停止本轮，绝不指导它重跑任务。
 				if (result.status === "needs_input" || result.status === "conflict") {
-					const text = result.content;
+					const text = `${result.content}\n\n${MANAGER_HUMAN_WAIT_INSTRUCTION}`;
 					const interaction =
 						result.interactionId && result.status === "needs_input"
 							? {

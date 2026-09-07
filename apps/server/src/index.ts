@@ -17,6 +17,7 @@ import { registerAgentsRoutes } from "./routes/agents.js";
 import { registerResourcesRoutes } from "./routes/resources.js";
 import { registerRoomsRoutes } from "./routes/rooms.js";
 import { registerInteractionsRoutes } from "./routes/interactions.js";
+import { isWorkspaceOwnerClosed } from "./agent-runtime/workspace-owner-lifecycle.js";
 import { AgentRuntime } from "./agent-runtime/runtime.js";
 import { DriverRegistry } from "./agent-runtime/driver-registry.js";
 import { DelegationStore } from "./agent-runtime/delegation-store.js";
@@ -166,6 +167,7 @@ const runtime: AgentRuntime = new AgentRuntime(
 	delegationTimelines,
 	workspaceExecution,
 );
+runtime.setWorkspaceOwnerClosedResolver((owner) => isWorkspaceOwnerClosed(workStates, owner));
 const invoker = new AgentInvoker(
 	teams,
 	runtime,

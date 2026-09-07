@@ -209,10 +209,10 @@ export interface AbortSessionResult {
 
 export async function fetchMessages(sessionId: string): Promise<{ messages: unknown[]; runningToolCallIds: string[]; recoveredToolResults: RecoveredToolResult[] }> {
 	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/messages`);
-	if (!res.ok) throw new Error(`fetch messages failed: ${res.status}`);
-	const body = (await res.json()) as { messages: unknown[]; runningToolCallIds?: string[]; recoveredToolResults?: RecoveredToolResult[] };
+	const body = (await res.json()) as { messages?: unknown[]; runningToolCallIds?: string[]; recoveredToolResults?: RecoveredToolResult[]; error?: string };
+	if (!res.ok) throw new Error(sessionApiError(body.error, `fetch messages failed: ${res.status}`));
 	return {
-		messages: body.messages,
+		messages: body.messages ?? [],
 		runningToolCallIds: body.runningToolCallIds ?? [],
 		recoveredToolResults: body.recoveredToolResults ?? [],
 	};

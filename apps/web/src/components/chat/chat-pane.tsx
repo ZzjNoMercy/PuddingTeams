@@ -501,12 +501,21 @@ export function ChatPane({
 		};
 	}, [roomId]);
 
-	// 首条消息发出后 LLM 异步生成会话标题；轻量轮询把标题/时间刷出来
-	// （不覆盖 activeId，只在后台用 server 事实刷新 room 数据）。
+	// 首条消息发出后 LLM 异步生成会话标题；轻量轮询把标题/时间刷出来。
+	// 正常情况下保留当前 activeId；若另一个客户端切换了 Solo Workspace，
+	// 旧 Session 会被停放并从当前 sessions 移除，此时必须跟随服务端切到
+	// 新 activeSession，否则会持续请求 inactive context 并得到 409。
 	useEffect(() => {
 		const timer = setInterval(() => {
 			void getRoom(roomId)
-				.then((r) => setRoom((prev) => (prev ? { ...r } : prev)))
+				.then((r) => {
+					setRoom((prev) => (prev ? { ...r } : prev));
+					setActiveId((current) =>
+						r.sessions.some((session) => session.id === current)
+							? current
+							: r.activeSession || "",
+					);
+				})
 				.catch(() => undefined);
 		}, 8000);
 		return () => clearInterval(timer);
@@ -682,6 +691,7 @@ export function ChatPane({
 			setWorkspaceOpen(false);
 			if (result.room.id === roomId) {
 				setRoom(result.room);
+				setActiveId(result.room.activeSession || "");
 				onRoomUpdated?.(result.room);
 			} else {
 				onOpenWindow?.(result.room.id);
@@ -721,6 +731,7 @@ export function ChatPane({
 	}, [targetWorkspaceId, workspacePath, switchToDefault, workspaceOptions, doWorkspaceSwitch]);
 
 	const members = room?.members ?? [];
+	const directMemberName = members[0]?.name ?? "Worker";
 	const type = room?.type ?? "solo";
 	const isSingle = type === "direct";
 	const isGroup = type === "group";
@@ -759,7 +770,7 @@ export function ChatPane({
 					{isGroup ? (
 						<MemberStack members={members} size={34} />
 					) : isSingle ? (
-						<WorkerAvatar name={members[0]!.name} size={34} />
+						<WorkerAvatar name={directMemberName} size={34} />
 					) : (
 						<ManagerAvatar size={34} />
 					)}

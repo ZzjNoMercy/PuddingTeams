@@ -27,6 +27,7 @@ function WindowRow({
 	onDelete: (room: RoomSummary) => void;
 }) {
 	const members = room.members ?? [];
+	const directMemberName = members[0]?.name ?? "Worker";
 	const active = room.sessions.find((session) => session.active);
 	const fallback = room.type === "group"
 		? `${members.length} 位 Worker 共同协作`
@@ -44,7 +45,7 @@ function WindowRow({
 					{room.type === "group" ? (
 						<MemberStack members={members} size={36} />
 					) : room.type === "direct" ? (
-						<WorkerAvatar name={members[0]!.name} size={36} />
+						<WorkerAvatar name={directMemberName} size={36} />
 					) : (
 						<ManagerAvatar size={36} />
 					)}

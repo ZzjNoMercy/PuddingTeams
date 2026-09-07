@@ -37,6 +37,7 @@ import {
 	type ManagedToolPlan,
 	type ManagerWindowContext,
 } from "./agent-extensions.js";
+import { managerHumanWait } from "./manager-human-wait.js";
 import { sharedModelRuntime } from "./model-runtime.js";
 import { appendPiPrompts, piResourceLoaderOptions } from "./pi-resources.js";
 import {
@@ -517,6 +518,14 @@ export class PiSessionStore {
 		// hosts must bind them explicitly so session_start receives this Session's
 		// cwd (FFF uses it as the index root).
 		await session.bindExtensions({ mode: "rpc" });
+		// Stop at the completed tool batch, after toolResults/cards are persisted.
+		// Aborting the Session here would also signal in-flight Worker operations;
+		// a human wait must preserve the pending Interaction and its original Run.
+		const previousStop = session.agent.shouldStopAfterTurn;
+		session.agent.shouldStopAfterTurn = async (context, signal) => {
+			if (await managerHumanWait(session.sessionId, this.invoker, this.workStates)) return true;
+			return await previousStop?.(context, signal) ?? false;
+		};
 		// 激活策略（§3.3）：基础委托工具全窗口默认激活（省掉 search 轮次）；
 		// capability 扩展工具按绑定策略预注册，searchable 的保持 inactive，
 		// 由 search_agent_tools 按需纯加法激活。

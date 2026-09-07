@@ -71,6 +71,9 @@ export interface DelegationRecord {
 	};
 	receipt?: ExecutionReceipt;
 	workspaceExecutionPolicy?: WorkspaceExecutionPolicy;
+	/** Requested before admission; does not confer ownership or permit capture/release. */
+	requestedWorkspaceExecutionScopeId?: string;
+	/** Acquired only after WorkspaceExecutionCoordinator.begin succeeds. */
 	workspaceExecutionScopeId?: string;
 	workspaceChangeSetId?: string;
 	/** Actual cwd bound to the Driver; target cwdSnapshot remains immutable. */
@@ -271,7 +274,7 @@ export class DelegationStore {
 			"goalRevision", "workItemRevision", "task", "intent", "expectedOutcome",
 			"evidenceRequirements", "completionBoundary", "agentId", "agentRevision", "driverId",
 			"driverTransport", "operation", "sessionHandle", "runHandle", "executionState", "result",
-			"receipt", "workspaceExecutionScopeId", "workspaceChangeSetId", "purpose",
+			"receipt", "requestedWorkspaceExecutionScopeId", "workspaceExecutionScopeId", "workspaceChangeSetId", "purpose",
 			"workspaceExecutionPolicy", "executionCwd",
 			"workspaceCapabilities", "capabilityFingerprint", "readOnlyAssessment", "admissionInteractionId", "workerStarted", "options",
 			"replacementAdmissionReady",

@@ -30,6 +30,7 @@ import type {
 	NormalizedResult,
 	WorkerActivity,
 } from "./types.js";
+import { workspaceHandoffNote } from "./workspace-result-context.js";
 import { redactText, redactValue } from "./redaction.js";
 
 export interface DelegateInput {
@@ -151,6 +152,11 @@ export class AgentRuntime {
 	/** 正在执行的 respond（per-interaction 防并发，M3）。 */
 	private readonly responding = new Set<string>();
 	private readonly broker: InteractionBroker;
+	private workspaceOwnerClosed?: (owner: DelegationRecord) => Promise<boolean>;
+
+	setWorkspaceOwnerClosedResolver(resolver: (owner: DelegationRecord) => Promise<boolean>): void {
+		this.workspaceOwnerClosed = resolver;
+	}
 
 	constructor(
 		private readonly delegations: DelegationStore,
@@ -447,7 +453,7 @@ export class AgentRuntime {
 				operation: input.mode,
 				sessionHandle: knownSession,
 				options: input.options,
-			workspaceExecutionScopeId: input.workspaceExecutionScopeId,
+			requestedWorkspaceExecutionScopeId: input.workspaceExecutionScopeId,
 			workspaceChangeSetId: input.workspaceChangeSetId,
 			workspaceExecutionPolicy: input.workspaceExecutionPolicy,
 				executionCwd: verificationEnvironment?.executionCwd,
@@ -502,9 +508,8 @@ export class AgentRuntime {
 		}
 		if (this.workspaceExecution && input.workspaceExecutionPolicy && !verificationEnvironment) {
 			try {
-				const inheritedScopeId = input.workspaceExecutionScopeId
-					?? (input.parentDelegationId ? (await this.delegations.getDelegation(input.parentDelegationId))?.workspaceExecutionScopeId : undefined);
-				const inherited = inheritedScopeId ? await this.workspaceExecution.get(inheritedScopeId) : undefined;
+				const inherited = await this.resolveExecutionScope(input);
+				const inheritedScopeId = inherited?.id;
 				let mode = input.workspaceExecutionPolicy.mode;
 				const readOnlyEnforcement = driverCapabilities.workspace?.readOnlyEnforcement === "sandbox" || driverCapabilities.workspace?.readOnlyEnforcement === "remote_policy"
 					? "strong" as const
@@ -515,20 +520,15 @@ export class AgentRuntime {
 					// This does not grant or change Worker permissions.
 					mode = "exclusive_write";
 				}
-				if (mode === "exclusive_write") {
+				if (mode === "exclusive_write" && !inherited && this.workspaceOwnerClosed) {
 					const blocking = await this.workspaceExecution.getBlockingScope(input.workspaceId, input.cwdSnapshot);
-					if (blocking) {
+					if (blocking?.state === "active") {
 						const owners = await Promise.all(blocking.delegationIds.map((id) => this.delegations.getDelegation(id)));
-						const terminal = owners.length > 0 && owners.every((owner) => owner !== undefined && ["reported_completed", "reported_failed", "cancelled"].includes(owner.executionState));
-						if (terminal) {
-							// Safe lazy migration for leases retained by older runtimes: every
-							// owning Driver already has a durable terminal observation, so no
-							// upstream writer can still be active.
-							await this.workspaceExecution.release(blocking.id, {
-								ownerToken: blocking.ownerToken,
-								allowFenced: true,
-								cleanup: false,
-							});
+						// Completion alone does not close a WorkItem. Reconcile against
+						// durable acceptance/cancellation, including a crash after review.
+						if (owners.length && owners.every((owner): owner is DelegationRecord => !!owner?.receipt && ["reported_completed", "reported_failed", "cancelled"].includes(owner.executionState))
+							&& (await Promise.all(owners.map((owner) => this.workspaceOwnerClosed!(owner)))).every(Boolean)) {
+							await this.workspaceExecution.release(blocking.id, { ownerToken: blocking.ownerToken, cleanup: false });
 						}
 					}
 				}
@@ -1093,12 +1093,15 @@ export class AgentRuntime {
 		// coordination scope to exclusive_write; retaining that lease after a
 		// Driver-observed terminal result fences every later read-only query on the
 		// Workspace. Capture the change-set first, commit the terminal fact, then
-		// release the coordination scope. A fenced lease is safe to release here
+		// release the coordination scope. Standalone exclusive Runs also have no
+		// WorkItem acceptance to wait for, so close their own lease at this boundary.
+		// A fenced lease is safe to release here
 		// because this path itself is the terminal Driver observation.
 		if (terminal.applied
 			&& this.workspaceExecution
 			&& working.workspaceExecutionScopeId
-			&& working.workspaceExecutionPolicy?.mode === "read_only_shared") {
+			&& (working.workspaceExecutionPolicy?.mode === "read_only_shared"
+				|| (!working.workItemId && working.workspaceExecutionPolicy?.mode === "exclusive_write"))) {
 			const scope = await this.workspaceExecution.get(working.workspaceExecutionScopeId);
 			if (scope) {
 				await this.workspaceExecution.release(scope.id, {
@@ -1114,6 +1117,31 @@ export class AgentRuntime {
 	/** 恢复 provider state（仅 Runtime 内部使用，token 永不出 Runtime）。 */
 	private async providerStateOf(interactionId: string): Promise<Record<string, unknown> | undefined> {
 		return this.secrets.getProviderState(interactionId);
+	}
+
+	/** A causal parent is not a workspace owner. Only attempts of the same
+	 * WorkItem may share an active scope; admission resume rechecks durable state. */
+	private async resolveExecutionScope(input: DelegateInput) {
+		const sameOwner = (owner: DelegationRecord | undefined): owner is DelegationRecord => !!owner
+			&& !!input.workItemId && owner.workItemId === input.workItemId
+			&& owner.workPlanId === input.workPlanId && owner.goalId === input.goalId
+			&& owner.goalEpoch === input.goalEpoch && owner.managerSessionId === input.managerSessionId
+			&& owner.workspaceId === input.workspaceId && owner.cwdSnapshot === input.cwdSnapshot
+			&& owner.workspaceExecutionPolicy?.mode === input.workspaceExecutionPolicy?.mode;
+		const explicit = input.workspaceExecutionScopeId;
+		const parent = input.parentDelegationId ? await this.delegations.getDelegation(input.parentDelegationId) : undefined;
+		const id = explicit ?? (sameOwner(parent) ? parent.workspaceExecutionScopeId : undefined);
+		if (!id) return undefined;
+		const scope = await this.workspaceExecution!.get(id);
+		if (!scope) throw new Error(`execution scope not found: ${id}`);
+		const owners = await Promise.all(scope.delegationIds.map((ownerId) => this.delegations.getDelegation(ownerId)));
+		if (!owners.length || !owners.every(sameOwner)) throw new Error(`execution scope ownership mismatch: ${id}`);
+		if (!explicit && (scope.state === "released" || scope.state === "promoted")) return undefined;
+		if (scope.state !== "active") throw new Error(`execution scope is ${scope.state}: ${id}`);
+		if (owners.some((owner) => !["reported_completed", "reported_failed", "cancelled"].includes(owner.executionState))) {
+			throw new Error(`execution scope still has an active or unresolved owner: ${id}`);
+		}
+		return scope;
 	}
 
 	private admissionResumeInput(delegation: DelegationRecord, driver: AgentDriver): DelegateInput {
@@ -1149,7 +1177,7 @@ export class AgentRuntime {
 			sessionHandle: delegation.sessionHandle,
 			options: delegation.options,
 			requestId: delegation.operationId ?? delegation.id,
-			workspaceExecutionScopeId: delegation.workspaceExecutionScopeId,
+			workspaceExecutionScopeId: delegation.requestedWorkspaceExecutionScopeId,
 			workspaceChangeSetId: delegation.workspaceChangeSetId,
 			workspaceExecutionPolicy: delegation.workspaceExecutionPolicy,
 			driver,
@@ -2124,6 +2152,17 @@ export class AgentRuntime {
 				contentHash: `sha256:${createHash("sha256").update(JSON.stringify({ kind: event.kind, title: event.title, content: event.content, metadata: event.metadata })).digest("hex")}`,
 				...(event.itemId ? { itemId: event.itemId } : {}),
 			}));
+	}
+
+	async getWorkspaceResultContext(delegation: DelegationRecord) {
+		try {
+			const changeSet = await this.getWorkspaceChangeSet(delegation.workspaceChangeSetId);
+			const scope = changeSet && this.workspaceExecution ? await this.workspaceExecution.get(changeSet.executionScopeId) : undefined;
+			return { workspaceChangeSet: changeSet, note: workspaceHandoffNote(delegation, changeSet, scope) };
+		} catch {
+			// Observational projection must not turn a durable completion into failure.
+			return { workspaceChangeSet: undefined, note: "\n\n平台工作区变更记录暂不可读取；不能据此判断交付物不存在。" };
+		}
 	}
 
 	async getWorkspaceChangeSet(id: string | undefined): Promise<WorkspaceChangeSet | undefined> {

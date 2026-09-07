@@ -407,6 +407,41 @@ test("委托结果正文携带 delegationId，followup 凭它接力成功", asyn
 	assert.ok(secondText.includes("done"), `followup 必须被接受并完成：${secondText}`);
 });
 
+test("HITL 门禁覆盖跨 Worker 委托、计划写入与重复业务决策，回答后解除", async () => {
+	const teams = await makeTeams([agentConfig("alpha"), agentConfig("beta")]);
+	const invoker = await makeInvoker(teams, "alpha", "beta");
+	const catalog = new ExtensionCatalog();
+	const ctx: ManagerWindowContext = { type: "group", members: ["alpha", "beta"] };
+	const workStates = new WorkStateStore(freshDir("pt-human-wait-"));
+	await workStates.init();
+	const goal = await workStates.create({ sessionId: "sess-test", goal: "检查交付物", completionBoundary: "交付物已核验" });
+	const deps = { ...makeDeps(teams, invoker, catalog, ctx), workStates };
+	const plan = await planManagerTools(teams, catalog, ctx);
+	const { pi, tools, handlers } = mockPi();
+	for (const ext of buildManagerExtensionFactories(plan, deps)) await (typeof ext === "function" ? ext : ext.factory)(pi);
+	const decision = await workStates.createDecision({ sessionId: "sess-test", requestedBy: "manager", question: "选择范围？", context: "", options: [], blockedAction: "执行", resumeHint: "继续" });
+	const hook = handlers.get("tool_call")![0]!;
+	for (const name of [delegateToolName("beta"), CORE_TOOL_UPDATE_WORK_PLAN, CORE_TOOL_REQUEST_DECISION, CORE_TOOL_INVITE]) {
+		const blocked = await hook({ toolName: name }, {}) as { block: boolean; terminate: boolean; reason: string };
+		assert.equal(blocked.block, true);
+		assert.equal(blocked.terminate, true);
+		assert.match(blocked.reason, /等待用户在原卡片中回答/);
+		await assert.rejects(() => tools.get(name)!.execute("blocked", {} as never, undefined, undefined, {} as ExtensionContext), /等待用户在原卡片中回答/);
+	}
+	assert.equal((await workStates.listDecisions("sess-test", goal.goalId)).length, 1);
+	const context = await handlers.get("context")![0]!({ messages: [{ role: "user", content: "继续上一任务", timestamp: 1 }] }, {}) as { messages: Array<{ content: string }> };
+	assert.match(context.messages.at(-1)!.content, /普通聊天中的“继续”不等于已提交卡片/);
+	await workStates.answerDecision(decision.id, "范围 A");
+	assert.equal(await hook({ toolName: delegateToolName("beta") }, {}), undefined);
+	// Admission and native HITL must also work without a Goal/DecisionRequest.
+	for (const executionState of ["waiting_admission", "waiting_input"] as const) {
+		invoker.delegationsForManagerSession = async () => [{ id: "pending", agentId: "alpha", executionState }] as never;
+		assert.equal((await hook({ toolName: delegateToolName("beta") }, {}) as { block: boolean }).block, true);
+	}
+	invoker.delegationsForManagerSession = async () => [];
+	assert.equal(await hook({ toolName: CORE_TOOL_REQUEST_DECISION }, {}), undefined);
+});
+
 test("正式 Goal 未建立 WorkPlan 时拒绝无 workItemId 委托，且 Worker 不得启动", async () => {
 	const teams = await makeTeams([agentConfig("alpha")]);
 	const invoker = await makeInvoker(teams, "alpha");
@@ -451,6 +486,7 @@ test("solo 委托的启动前失败先结束 manager 工具，不被单聊镜像
 			delegationId: "delegation-preflight",
 			waitingInput: false,
 		}),
+		delegationsForManagerSession: async () => [],
 	} as unknown as AgentInvoker;
 
 	let mirrorStarted = false;

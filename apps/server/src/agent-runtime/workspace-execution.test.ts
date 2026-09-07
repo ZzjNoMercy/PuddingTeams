@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { WorkspaceExecutionCoordinator, WorkspaceExecutionError } from "./workspace-execution.js";
@@ -109,6 +109,74 @@ test("isolated_worktree ignores package-manager symlinks under ignored directori
 		assert.notEqual(scope.executionCwd, root);
 		assert.equal(await readFile(path.join(scope.executionCwd, "tracked.txt"), "utf8"), "base\n");
 		await assert.rejects(() => readFile(path.join(scope.executionCwd, "node_modules", "linked-package")));
+	} finally {
+		await rm(root, { recursive: true, force: true });
+		await rm(state, { recursive: true, force: true });
+	}
+});
+
+test("filesystem manifests exclude nested dependency links but capture ignored handoff outputs through verification", async () => {
+	const root = await gitRepo();
+	const state = await temp("pt-execution-state-");
+	try {
+		await writeFile(path.join(root, ".gitignore"), "node_modules\n.pudding/\nelectron/release/\n");
+		await mkdir(path.join(root, "electron/release/PuddingTeams.app"), { recursive: true });
+		await symlink("/missing/framework", path.join(root, "electron/release/PuddingTeams.app/Framework"));
+		await writeFile(path.join(root, "electron/release/tracked.txt"), "tracked input\n");
+		await git(root, ["add", "-f", "electron/release/tracked.txt"]);
+		const dependencies = path.join(root, "apps/docs/node_modules/@tailwindcss");
+		await mkdir(dependencies, { recursive: true });
+		await symlink("/missing/package", path.join(dependencies, "postcss"));
+		await mkdir(path.join(root, "apps/web"), { recursive: true });
+		await symlink("/missing/dependencies", path.join(root, "apps/web/node_modules"));
+		await mkdir(path.join(root, ".pudding/handoff"), { recursive: true });
+		const coordinator = new WorkspaceExecutionCoordinator(state);
+		await coordinator.init();
+		const scope = await coordinator.begin({ workspacePath: root, mode: "exclusive_write", delegationId: "d-pnpm" });
+		await writeFile(path.join(root, "tracked.txt"), "worker\n");
+		await writeFile(path.join(root, ".pudding/handoff/result.json"), "{}\n");
+		const restarted = new WorkspaceExecutionCoordinator(state);
+		await restarted.init();
+		const changes = await restarted.capture(scope.id, scope.ownerToken);
+		assert.deepEqual(changes.changedPaths, [".pudding/handoff/result.json", "tracked.txt"]);
+		const copy = await restarted.createVerificationCopy(scope.id, "verify-pnpm", scope.ownerToken);
+		assert.equal(await readFile(path.join(copy.executionCwd, ".pudding/handoff/result.json"), "utf8"), "{}\n");
+		assert.equal(await readFile(path.join(copy.executionCwd, "electron/release/tracked.txt"), "utf8"), "tracked input\n");
+		await assert.rejects(() => readFile(path.join(copy.executionCwd, "electron/release/PuddingTeams.app/Framework")));
+		await assert.rejects(() => readFile(path.join(copy.executionCwd, "apps/docs/node_modules/@tailwindcss/postcss")));
+		assert.deepEqual((await restarted.observeVerificationCopy(copy.id)).changedPaths, []);
+		await writeFile(path.join(copy.executionCwd, "tracked.txt"), "verifier mutation\n");
+		assert.deepEqual((await restarted.observeVerificationCopy(copy.id)).changedPaths, ["tracked.txt"]);
+		await symlink("/missing/source", path.join(root, "source-link"));
+		await assert.rejects(() => restarted.capture(scope.id, scope.ownerToken), /only regular files are supported: source-link/);
+		await rm(path.join(root, "source-link"));
+		await rm(path.join(root, ".pudding/handoff"), { recursive: true, force: true });
+		await symlink("/missing/handoff", path.join(root, ".pudding/handoff"));
+		await assert.rejects(() => restarted.capture(scope.id, scope.ownerToken), /symbolic links are not supported: .pudding\/handoff/);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+		await rm(state, { recursive: true, force: true });
+	}
+});
+
+test("filesystem manifests still reject source links and detect shared read-only mutations", async () => {
+	const root = await temp("pt-execution-links-");
+	const state = await temp("pt-execution-state-");
+	try {
+		await writeFile(path.join(root, "source.txt"), "base\n");
+		await symlink("/missing/source", path.join(root, "source-link"));
+		const coordinator = new WorkspaceExecutionCoordinator(state);
+		await coordinator.init();
+		await assert.rejects(
+			() => coordinator.begin({ workspacePath: root, mode: "exclusive_write", delegationId: "rejected" }),
+			(error: unknown) => error instanceof WorkspaceExecutionError && error.code === "unsupported_layout",
+		);
+		await rm(path.join(root, "source-link"));
+		const scope = await coordinator.begin({ workspacePath: root, mode: "read_only_shared", readOnlyEnforcement: "strong", delegationId: "readonly" });
+		await writeFile(path.join(root, "source.txt"), "changed\n");
+		const changes = await coordinator.capture(scope.id);
+		assert.equal(changes.integrity, "violation");
+		assert.deepEqual(changes.changedPaths, ["source.txt"]);
 	} finally {
 		await rm(root, { recursive: true, force: true });
 		await rm(state, { recursive: true, force: true });

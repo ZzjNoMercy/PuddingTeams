@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -382,6 +382,30 @@ test("PuddingClawDriver：respond 无 token 时按用户选择并入原任务重
 	const stdin = JSON.parse(readFileSync(stdinCapture, "utf-8")) as { message: string };
 	assert.ok(stdin.message.includes("分析一下上月的配置数据"), "重跑必须带原任务");
 	assert.ok(stdin.message.includes("「产品配置分析」"), "重跑必须并入用户选择");
+});
+
+test("PuddingClawDriver：审批后 CLI HTTP 500 归类上游错误且不自动重跑，普通非 JSON 仍为协议错误", async () => {
+	const dir = freshDir();
+	try {
+		const cli = path.join(dir, "failed-cli.sh");
+		const calls = path.join(dir, "calls.txt");
+		writeFileSync(cli, '#!/bin/sh\ncat >/dev/null\nprintf "call\\n" >> "$CALLS"\nprintf "%s\\n" "$FAILURE" >&2\nexit 1\n');
+		chmodSync(cli, 0o755);
+		for (const [failure, expectedCode] of [["HTTP 500", "http_error"], ["invalid output", "protocol_error"]] as const) {
+			const events = await collect(new PuddingClawDriver({ command: cli }).respond(
+				{ runHandle: "", interactionHandle: "h", requestId: "retry", responses: [{ requestId: "choice", action: "answer", value: "汽车行业综合分析" }] },
+				{ cwd: dir, env: { ...process.env, FAILURE: failure, CALLS: calls }, providerState: { task: "查询上市车系" } },
+			));
+			const failed = events.find((event) => event.type === "failed");
+			assert.ok(failed);
+			assert.equal(failed.result.errorCode, expectedCode);
+			assert.ok(failed.result.error?.includes(failure));
+			assert.equal(failed.result.recoverable, expectedCode === "http_error");
+		}
+		assert.equal(readFileSync(calls, "utf8"), "call\ncall\n");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 test("PuddingClawDriver：respond 无 token 且缺原任务/选择时明确失败，不静默重跑", async () => {

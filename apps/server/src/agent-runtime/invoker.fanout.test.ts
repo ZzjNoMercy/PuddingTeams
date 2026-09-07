@@ -7,6 +7,7 @@ import { TeamsStore, type AgentConfig } from "../store/teams.js";
 import { AgentRuntime } from "./runtime.js";
 import { DelegationStore } from "./delegation-store.js";
 import { InteractionSecretStore } from "./interaction-secret-store.js";
+import { WorkspaceExecutionCoordinator } from "./workspace-execution.js";
 import { DriverRegistry } from "./driver-registry.js";
 import { AgentInvoker } from "./invoker.js";
 import type { AgentDriver, AgentEvent, DriverCapabilities } from "./types.js";
@@ -27,11 +28,12 @@ type Sent = {
 	content: string;
 	status?: unknown;
 	revision?: unknown;
+	details?: Record<string, unknown>;
 	options: { triggerTurn: boolean; deliverAs?: string };
 };
 
 /** respond 后按 variant 产出不同终态的 mock driver。 */
-function makeDriver(variant: "completed" | "failed" | "needs_input"): AgentDriver {
+function makeDriver(variant: "completed" | "failed" | "blocked" | "needs_input"): AgentDriver {
 	return {
 		id: "puddingclaw",
 		async capabilities(): Promise<DriverCapabilities> {
@@ -61,6 +63,8 @@ function makeDriver(variant: "completed" | "failed" | "needs_input"): AgentDrive
 			yield { type: "started", sessionHandle: "worker-sess", runHandle: "run-1" };
 			if (variant === "completed") {
 				yield { type: "completed", result: { agentId: "puddingclaw", status: "completed", sessionHandle: "worker-sess", runHandle: "run-1", content: "分析完成" } };
+			} else if (variant === "blocked") {
+				yield { type: "failed", result: { agentId: "puddingclaw", status: "blocked", errorCode: "workspace_policy_blocked", error: "execution scope is released: old-scope", recoverable: true, meta: { status: "completed", workerStarted: false, waitingInput: true } } };
 			} else if (variant === "failed") {
 				yield { type: "failed", result: { agentId: "puddingclaw", status: "failed", sessionHandle: "worker-sess", runHandle: "run-1", errorCode: "boom", error: "worker 炸了", recoverable: false } };
 			} else {
@@ -91,7 +95,7 @@ function makeDriver(variant: "completed" | "failed" | "needs_input"): AgentDrive
 	};
 }
 
-async function makeStack(variant: "completed" | "failed" | "needs_input", managerSessionId = "manager-sess-1") {
+async function makeStack(variant: "completed" | "failed" | "blocked" | "needs_input", managerSessionId = "manager-sess-1", prestartBlocked = false) {
 	const dir = freshDir("pt-fanout-");
 	const teams = new TeamsStore({ state: dir, assets: dir, managedWorkspaces: path.join(dir, "managed") }, dir);
 	await teams.init();
@@ -114,7 +118,9 @@ async function makeStack(variant: "completed" | "failed" | "needs_input", manage
 	await secrets.init();
 	const drivers = new DriverRegistry();
 	drivers.register(makeDriver(variant));
-	const runtime = new AgentRuntime(delegations, secrets, (agentId) => drivers.get(agentId), { ttlMs: 24 * 60 * 60 * 1000 });
+	const scopes = prestartBlocked ? new WorkspaceExecutionCoordinator(freshDir("pt-fanout-scopes-")) : undefined;
+	await scopes?.init();
+	const runtime = new AgentRuntime(delegations, secrets, (agentId) => drivers.get(agentId), { ttlMs: 24 * 60 * 60 * 1000 }, undefined, undefined, scopes);
 	const invoker = new AgentInvoker(teams, runtime, drivers, undefined, dir);
 	const sent: Sent[] = [];
 	invoker.setManagerSender(async (sessionId, message, options) => {
@@ -124,6 +130,7 @@ async function makeStack(variant: "completed" | "failed" | "needs_input", manage
 			content: message.content,
 			status: message.details?.status,
 			revision: message.details?.revision,
+			details: message.details,
 			options,
 		});
 	});
@@ -137,11 +144,12 @@ async function makeStack(variant: "completed" | "failed" | "needs_input", manage
 			agentRevision: savedAgent?.extensionRevision ?? 0,
 			message: "分析一下",
 			mode: "run",
+			...(prestartBlocked ? { workspaceExecutionScopeId: "missing-scope", workspaceExecutionPolicy: { mode: "read_only_shared" as const, source: "user" as const, reason: "inspect", baselineStrategy: "filesystem_manifest" as const, promoteOnAcceptance: false } } : {}),
 		},
 		{ cwd: window.cwdSnapshot, env: {} },
 	);
 	assert.equal(delegated.status, "needs_input");
-	return { invoker, interactionId: delegated.interaction!.id, delegationId: delegated.delegation.id, sent, window, teams, runtime };
+	return { invoker, interaction: delegated.interaction!, interactionId: delegated.interaction!.id, delegationId: delegated.delegation.id, sent, window, teams, runtime };
 }
 
 const approve = {
@@ -278,4 +286,39 @@ test("两边同步: manager session 与单聊 active session 相同则只发一�
 		sent.every((s) => s.options.triggerTurn === false),
 		"direct 直派（§5.2）：manager session 属 direct 窗口时无 manager 回合，结果只展示不唤醒",
 	);
+});
+
+
+test("审批后 blocked 的真实错误和执行事实进入 Manager 正文，Worker meta 不能覆盖平台状态", async () => {
+	const { invoker, interactionId, delegationId, sent } = await makeStack("blocked");
+	await invoker.respond(interactionId, approve);
+	await waitForSent(sent, 4);
+	const results = sent.filter((message) => message.customType === "pudding:task_result");
+	assert.equal(results.length, 2);
+	for (const result of results) {
+		assert.match(result.content, /execution scope is released: old-scope/);
+		assert.match(result.content, /workspace_policy_blocked/);
+		assert.ok(result.content.includes(delegationId));
+		assert.match(result.content, /"waitingInput":false/);
+		assert.match(result.content, /"workerStarted":true/);
+		assert.equal(result.status, "failed");
+		assert.equal(result.details?.workerStarted, true);
+		assert.equal(result.details?.waitingInput, false);
+	}
+});
+
+
+test("Teams 准入已经批准但 workspace 启动失败时，Manager 收到真实 pre-start blocked 而非继续等待卡片", async () => {
+	const { invoker, interaction, sent } = await makeStack("completed", "manager-sess-1", true);
+	await invoker.respond(interaction.id, { requestId: "approve-admission", revision: interaction.revision, responses: [{ requestId: interaction.requests[0]!.requestId, action: "approve", scope: "proceed_with_worker" }] });
+	await waitForSent(sent, 2);
+	assert.ok(sent.every((message) => message.customType === "pudding:task_result"), "Worker 未启动时不能发布开始执行的 approved 投影");
+	const result = sent.find((message) => message.sessionId === "manager-sess-1" && message.customType === "pudding:task_result")!;
+	assert.match(result.content, /execution scope not found: missing-scope/);
+	assert.match(result.content, /workspace_policy_blocked/);
+	assert.match(result.content, /"workerStarted":false/);
+	assert.match(result.content, /"waitingInput":false/);
+	assert.match(result.content, /unverified_user_accepted/);
+	assert.equal(result.status, "failed");
+	assert.equal(result.options.triggerTurn, true);
 });

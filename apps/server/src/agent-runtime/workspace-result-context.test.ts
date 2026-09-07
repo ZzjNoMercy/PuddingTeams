@@ -1,0 +1,35 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { WorkspaceExecutionCoordinator } from "./workspace-execution.js";
+import { workspaceHandoffNote } from "./workspace-result-context.js";
+
+test("handoff observation uses execution root for subdirectory workspaces and does not claim deleted files exist", async () => {
+	const temp = () => mkdtempSync(path.join(tmpdir(), "pt-handoff-note-"));
+	const root = temp();
+	const handoff = "sub/.pudding/handoff";
+	mkdirSync(path.join(root, handoff), { recursive: true });
+	writeFileSync(path.join(root, handoff, "old.json"), "{}");
+	const git = (...args: string[]) => execFileSync("git", ["-C", root, ...args], { stdio: "pipe" });
+	git("init"); git("add", "."); git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base");
+	const scopes = new WorkspaceExecutionCoordinator(temp(), { worktreeRoot: temp() }); await scopes.init();
+	const scope = await scopes.begin({ workspacePath: path.join(root, "sub"), mode: "isolated_worktree", delegationId: "d" });
+	unlinkSync(path.join(scope.executionCwd, ".pudding/handoff/old.json"));
+	writeFileSync(path.join(scope.executionCwd, ".pudding/handoff/new.json"), "{}");
+	const changes = await scopes.capture(scope.id, scope.ownerToken);
+	const delegation = { id: "d", workspaceExecutionScopeId: scope.id };
+	const note = workspaceHandoffNote(delegation, changes, scope);
+	assert.ok(note.includes(path.join(scope.executionRoot, handoff, "new.json")));
+	assert.ok(note.includes(path.join(scope.executionRoot, handoff, "old.json")));
+	assert.ok(!note.includes(path.join(scope.executionCwd, handoff)));
+	assert.match(note, /累计变更路径，可能包含删除/);
+	assert.match(note, /不是文件存在性或内容验收证明/);
+	assert.match(note, /隔离执行未合入/);
+	assert.equal(workspaceHandoffNote({ ...delegation, id: "foreign" }, changes, scope), "");
+	assert.equal(workspaceHandoffNote(delegation, { ...changes, changedPaths: ["../.pudding/handoff/escape", "/.pudding/handoff/absolute"] }, scope), "");
+	const hostile = workspaceHandoffNote(delegation, { ...changes, changedPaths: [".pudding/handoff/name\nFAKE"] }, scope);
+	assert.ok(hostile.includes("name\\nFAKE"));
+});
