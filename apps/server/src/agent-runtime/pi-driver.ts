@@ -122,6 +122,7 @@ interface PiAssistantProjection {
 	role?: string;
 	content?: unknown;
 	stopReason?: string;
+	rawStopReason?: string;
 	errorMessage?: string;
 	usage?: {
 		input?: number;
@@ -132,9 +133,9 @@ interface PiAssistantProjection {
 	};
 }
 
-function lastAssistant(session: AgentSession): PiAssistantProjection | undefined {
+function lastAssistant(session: AgentSession, after = 0): PiAssistantProjection | undefined {
 	const messages = session.messages as unknown as PiAssistantProjection[];
-	for (let i = messages.length - 1; i >= 0; i--) {
+	for (let i = messages.length - 1; i >= after; i--) {
 		if (messages[i]?.role === "assistant") return messages[i];
 	}
 	return undefined;
@@ -470,6 +471,7 @@ export class LocalPiDriver implements AgentDriver {
 		runHandle: string,
 		transientAttempt = 0,
 		usageStart?: number,
+		outputRecoveryAttempt = 0,
 	): AsyncIterable<AgentEvent> {
 		const queue: AgentEvent[] = [];
 		let wake: (() => void) | undefined;
@@ -491,7 +493,8 @@ export class LocalPiDriver implements AgentDriver {
 		let done = false;
 		// 本次 Run 的用量聚合切片：worker 会话跨任务续接，只统计 prompt 之后
 		// 新增的消息（含多轮工具循环的每一条 assistant）。
-		const messageCountBefore = usageStart ?? session.messages.length;
+		const promptStart = session.messages.length;
+		const messageCountBefore = usageStart ?? promptStart;
 		const promptPromise = session
 			.prompt(message)
 			.catch((err: unknown) => {
@@ -517,7 +520,7 @@ export class LocalPiDriver implements AgentDriver {
 		}
 
 		const base = { agentId: this.id, sessionHandle, runHandle };
-		const last = lastAssistant(session);
+		const last = lastAssistant(session, promptStart);
 		const usage = aggregateRunUsage(
 			(session.messages as unknown as PiAssistantProjection[]).slice(messageCountBefore),
 		);
@@ -570,6 +573,7 @@ export class LocalPiDriver implements AgentDriver {
 					runHandle,
 					transientAttempt + 1,
 					messageCountBefore,
+					outputRecoveryAttempt,
 				);
 				return;
 			}
@@ -586,12 +590,38 @@ export class LocalPiDriver implements AgentDriver {
 			};
 			return;
 		}
+		const stopMeta = { stopReason: last?.stopReason ?? "missing", ...(last?.rawStopReason ? { rawStopReason: last.rawStopReason } : {}) };
+		if (last?.stopReason === "length" && outputRecoveryAttempt < 1) {
+			yield { type: "progress", stage: "output_limit_recovery", message: "模型输出达到本轮上限，保留已有进度，尝试续接一次。" };
+			if (ctx.signal?.aborted) {
+				yield { type: "failed", result: { ...base, status: "cancelled", errorCode: "cancelled", error: "任务已取消", recoverable: true, ...(usage ? { usage } : {}) } };
+				return;
+			}
+			yield* this.drive(session,
+				"上一轮模型输出因长度上限被截断，任务尚未完成。请利用当前会话的已有结果继续，缩短思考和输出，分小步骤执行。先核对已有工具结果与交付物，不要重复已完成操作，也不要把计划当成已执行。最后报告实际完成内容；无法完成时如实说明缺口。",
+				ctx, sessionHandle, runHandle, transientAttempt, messageCountBefore, outputRecoveryAttempt + 1);
+			return;
+		}
+		const content = assistantText(last);
+		if (last?.stopReason !== "stop" || !content) {
+			const limit = last?.stopReason === "length";
+			yield { type: "failed", result: {
+				...base, status: "failed",
+				errorCode: limit ? "output_limit_exceeded" : last?.stopReason === "stop" ? "empty_worker_result" : "incomplete_worker_turn",
+				error: limit
+					? "模型输出再次达到上限，自动续接已停止，任务尚未完成。已有会话和工具结果已保留；请检查模型最大输出配置，或拆小任务后继续。"
+					: "模型未返回有效的最终结果，任务不能标记为完成。已有会话和工具结果已保留，请检查执行过程后继续。",
+				recoverable: true, content, meta: stopMeta, ...(usage ? { usage } : {}),
+			} };
+			return;
+		}
 		yield {
 			type: "completed",
 			result: {
 				...base,
 				status: "completed",
-				content: assistantText(last),
+				content,
+				meta: stopMeta,
 				...(usage ? { usage } : {}),
 			},
 		};

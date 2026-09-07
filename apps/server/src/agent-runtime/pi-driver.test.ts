@@ -148,3 +148,69 @@ test("Phase6: probe——SDK 随 server 发布，detected/configured 恒 true", 
 	assert.deepEqual(probe.capabilities, PI_CAPABILITIES);
 	assert.ok(probe.authenticated === true || probe.authenticated === false || probe.authenticated === "unknown");
 });
+
+async function runStopSequence(sequence: Array<Record<string, unknown> | undefined>) {
+	const driver = new LocalPiDriver();
+	const prompts: string[] = [];
+	const session = {
+		messages: [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'old result' }] }] as Array<Record<string, unknown>>,
+		subscribe: () => () => undefined,
+		async prompt(message: string) {
+			prompts.push(message);
+			const next = sequence[prompts.length - 1];
+			if (next) this.messages.push({ role: 'assistant', usage: { input: 10, output: 8192 }, ...next });
+		},
+		async abort() {},
+	};
+	const drive = (driver as unknown as {
+		drive(session: unknown, message: string, context: InvocationContext, sessionHandle: string, runHandle: string): AsyncIterable<AgentEvent>;
+	}).drive.bind(driver);
+	return { events: await collect(drive(session, 'original', ctx, 'session-limit', 'run-limit')), prompts };
+}
+const truncatedThinking = { stopReason: 'length', rawStopReason: 'length', content: [{ type: 'thinking', thinking: '还准备写文件' }] };
+
+test('pi 输出截断在原 Session/Run 有界续接，累计用量且只取新的最终正文', async () => {
+	const { events, prompts } = await runStopSequence([truncatedThinking, { stopReason: 'stop', content: [{ type: 'text', text: 'done' }] }]);
+	assert.equal(prompts.length, 2);
+	assert.match(prompts[1]!, /不要重复已完成操作/);
+	assert.ok(events.some(e => e.type === 'progress' && e.stage === 'output_limit_recovery'));
+	const end = events.at(-1)!;
+	assert.equal(end.type, 'completed');
+	if (end.type !== 'completed') return;
+	assert.equal(end.result.content, 'done');
+	assert.equal(end.result.sessionHandle, 'session-limit');
+	assert.equal(end.result.runHandle, 'run-limit');
+	assert.equal(end.result.usage?.outputTokens, 16384);
+});
+
+test('pi 连续截断停止自动续接，保留部分正文和停止原因，绝不报 completed', async () => {
+	const { events, prompts } = await runStopSequence([truncatedThinking, { stopReason: 'length', rawStopReason: 'length', content: [{ type: 'text', text: 'partial' }] }]);
+	assert.equal(prompts.length, 2);
+	assert.ok(!events.some(e => e.type === 'completed'));
+	const end = events.at(-1)!;
+	assert.equal(end.type, 'failed');
+	if (end.type !== 'failed') return;
+	assert.equal(end.result.errorCode, 'output_limit_exceeded');
+	assert.equal(end.result.content, 'partial');
+	assert.equal(end.result.meta?.stopReason, 'length');
+	assert.equal(end.result.recoverable, true);
+});
+
+for (const ending of [undefined, { stopReason: 'stop', content: [{ type: 'thinking', thinking: 'plan' }] }, { stopReason: 'stop', content: [{ type: 'text', text: '  ' }] }, { stopReason: 'toolUse', content: [{ type: 'toolCall', id: 't', name: 'write', arguments: {} }] }]) {
+	test(`pi 不把旧结果、空正文或未结算工具边界当成功：${JSON.stringify(ending)}`, async () => {
+		const { events, prompts } = await runStopSequence([ending]);
+		assert.equal(prompts.length, 1);
+		assert.equal(events.at(-1)?.type, 'failed');
+		assert.ok(!events.some(e => e.type === 'completed'));
+	});
+}
+
+test('pi 截断恢复后取消与 Provider 错误保持真实失败边界', async () => {
+	for (const stopReason of ['aborted', 'error']) {
+		const { events } = await runStopSequence([truncatedThinking, { stopReason, errorMessage: 'provider failure' }]);
+		const end = events.at(-1)!;
+		assert.equal(end.type, 'failed');
+		if (end.type !== 'failed') continue;
+		assert.equal(end.result.status, stopReason === 'aborted' ? 'cancelled' : 'failed');
+	}
+});
