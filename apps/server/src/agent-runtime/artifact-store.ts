@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { copyFile, mkdir, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { constants, createReadStream, createWriteStream } from "node:fs";
+import { chmod, copyFile, mkdir, open, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { pipeline } from "node:stream/promises";
 import path from "node:path";
 
 /** 交付物登记记录（§15.6）：push / observe 两种来源登记后无差别。 */
@@ -142,6 +143,49 @@ export class ArtifactStore {
 
 	async get(id: string): Promise<ArtifactRecord | undefined> {
 		return (await this.load())[id];
+	}
+
+	/**
+	 * Materialize a named, read-only copy for the operating system's default app.
+	 * Blob names are opaque UUIDs, so opening the blob directly would lose the
+	 * file extension that Excel/Preview/etc. use for application dispatch.
+	 */
+	async materializeForOpen(id: string): Promise<string | undefined> {
+		const record = await this.get(id);
+		if (!record) return undefined;
+		const resolved = path.resolve(record.snapshotPath);
+		let handle;
+		try {
+			handle = await open(resolved, constants.O_RDONLY | constants.O_NOFOLLOW);
+			const [blobRoot, real, pathInfo, fdInfo] = await Promise.all([
+				realpath(this.blobsDir),
+				realpath(resolved),
+				stat(resolved),
+				handle.stat(),
+			]);
+			const relative = path.relative(blobRoot, real);
+			if (real !== record.snapshotPath || relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error("artifact snapshot path rejected");
+			if (!fdInfo.isFile() || pathInfo.dev !== fdInfo.dev || pathInfo.ino !== fdInfo.ino) throw new Error("artifact snapshot is not stable");
+		} catch (error) {
+			await handle?.close().catch(() => undefined);
+			throw error;
+		}
+		const safeName = path.basename(record.name).replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_") || `artifact-${id}`;
+		const directory = path.join(this.blobsDir, "open", id);
+		await mkdir(directory, { recursive: true });
+		const target = path.join(directory, safeName);
+		const temporary = `${target}.${randomUUID().slice(0, 8)}.tmp`;
+		try {
+			await pipeline(handle.createReadStream({ autoClose: true }), createWriteStream(temporary, { flags: "wx", mode: 0o600 }));
+			await chmod(temporary, 0o444).catch(() => undefined);
+			await rm(target, { force: true });
+			await rename(temporary, target);
+		} catch (error) {
+			await handle.close().catch(() => undefined);
+			await rm(temporary, { force: true }).catch(() => undefined);
+			throw error;
+		}
+		return target;
 	}
 
 	async list(filter: { windowId?: string; delegationId?: string } = {}): Promise<ArtifactRecord[]> {

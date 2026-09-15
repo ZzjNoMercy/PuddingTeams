@@ -18,6 +18,16 @@ async function makeStack() {
 	return { app, store, dir };
 }
 
+async function makeOpenStack() {
+	const dir = mkdtempSync(path.join(tmpdir(), "pt-artifacts-open-api-"));
+	const store = new ArtifactStore(dir, path.join(dir, "blobs"));
+	await store.init();
+	const opened: string[] = [];
+	const app = Fastify({ logger: false });
+	registerArtifactsRoutes(app, store, { open: async (target) => { opened.push(target); } });
+	return { app, store, dir, opened };
+}
+
 const project = (cwd: string) => ({ workspaceId: "workspace-1", cwdSnapshot: realpathSync(cwd) });
 
 test("GET /api/artifacts 按 windowId/delegationId 过滤", async () => {
@@ -88,5 +98,28 @@ test("登记拒绝 workspace 外路径；原文件删除后冻结版本仍可下
 	assert.equal(gone.statusCode, 200, "登记后原文件丢失不影响冻结版本");
 	assert.equal(gone.body, "ghost");
 
+	await app.close();
+});
+
+test("POST /api/artifacts/:id/open 用原文件名打开冻结的只读副本", async () => {
+	const { app, store, dir, opened } = await makeOpenStack();
+	const file = path.join(dir, "source.xlsx");
+	writeFileSync(file, "frozen bytes");
+	const rec = await store.register({ ...project(dir), name: "市场分析.xlsx", path: file, origin: "push", producer: "worker", delegationId: "d1", windowId: "w1" });
+	writeFileSync(file, "later bytes");
+
+	const response = await app.inject({ method: "POST", url: `/api/artifacts/${rec.id}/open` });
+	assert.equal(response.statusCode, 200);
+	assert.equal(path.basename(opened[0]!), "市场分析.xlsx");
+	assert.equal(await import("node:fs/promises").then(({ readFile }) => readFile(opened[0]!, "utf8")), "frozen bytes");
+	assert.equal((await import("node:fs/promises").then(({ stat }) => stat(opened[0]!))).mode & 0o222, 0);
+
+	const outside = path.join(dir, "outside.xlsx");
+	writeFileSync(outside, "secret");
+	unlinkSync(rec.snapshotPath);
+	symlinkSync(outside, rec.snapshotPath);
+	const replaced = await app.inject({ method: "POST", url: `/api/artifacts/${rec.id}/open` });
+	assert.equal(replaced.statusCode, 500);
+	assert.equal(opened.length, 1, "被替换成 symlink 的冻结 blob 不能交给系统应用");
 	await app.close();
 });

@@ -36,6 +36,7 @@ import { LargeWorkerResultStore } from "./store/large-worker-result.js";
 import { WorkStateStore } from "./store/work-state.js";
 import { registerWorkStateRoutes } from "./routes/work-state.js";
 import { registerWorkerProcessRoutes } from "./routes/worker-process.js";
+import { registerRuntimeFilesRoutes } from "./routes/runtime-files.js";
 import { WorkerProcessService } from "./agent-runtime/worker-process.js";
 import { DelegationTimelineStore } from "./agent-runtime/delegation-timeline-store.js";
 import { WorkspaceExecutionCoordinator } from "./agent-runtime/workspace-execution.js";
@@ -585,6 +586,7 @@ await registerRoomsRoutes(app, store, teams, invoker, workStates, {
 });
 await registerInteractionsRoutes(app, runtime, invoker, teams, workStates);
 registerArtifactsRoutes(app, artifacts);
+registerRuntimeFilesRoutes(app, delegations, workspaceExecution);
 registerWorkStateRoutes(app, workStates, teams, store, runtime, productSettings);
 registerWorkerProcessRoutes(app, new WorkerProcessService(delegations, teams, paths.workerSessions, delegationTimelines), {
 	cancel: (delegationId, signal) => invoker.cancel(delegationId, signal),

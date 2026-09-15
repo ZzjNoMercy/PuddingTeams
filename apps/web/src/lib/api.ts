@@ -332,6 +332,30 @@ export interface WorkerProcessListItem extends WorkerProcessInfo {
 	expectedOutcome?: string;
 }
 
+export interface RuntimeFileItem {
+	name: string;
+	path: string;
+	extension: string;
+	size?: number;
+	updatedAt?: string;
+	state: "available" | "deleted";
+	preview: "markdown" | "json" | "csv" | "text" | "external";
+}
+
+export interface ArtifactListItem {
+	id: string;
+	name: string;
+	kind?: string;
+	size?: number;
+	origin: "push" | "observe";
+	producer: string;
+	delegationId: string;
+	windowId: string;
+	workspaceId?: string;
+	contentHash: string;
+	createdAt: string;
+}
+
 /** Execution / Verification / Settlement are intentionally independent axes. */
 export type ExecutionState =
 	| "admitted" | "waiting_admission" | "running" | "waiting_input" | "reported_completed" | "reported_failed"
@@ -393,6 +417,55 @@ export async function fetchDelegationProcess(delegationId: string): Promise<Work
 	const res = await fetch(`${SERVER_URL}/api/delegations/${delegationId}/process`);
 	if (!res.ok) throw new Error(`fetch delegation process failed: ${res.status}`);
 	return (await res.json()) as WorkerProcessInfo;
+}
+
+async function responseError(res: Response, fallback: string): Promise<Error> {
+	const body = await res.json().catch(() => undefined) as { error?: string } | undefined;
+	return new Error(body?.error ?? `${fallback}: ${res.status}`);
+}
+
+export async function fetchDelegationFiles(delegationId: string): Promise<{ files: RuntimeFileItem[]; scopeAvailable: boolean }> {
+	const res = await fetch(`${SERVER_URL}/api/delegations/${encodeURIComponent(delegationId)}/files`);
+	if (!res.ok) throw await responseError(res, "fetch runtime files failed");
+	return (await res.json()) as { files: RuntimeFileItem[]; scopeAvailable: boolean };
+}
+
+export async function fetchRuntimeFileContent(delegationId: string, relativePath: string): Promise<string> {
+	const params = new URLSearchParams({ path: relativePath });
+	const res = await fetch(`${SERVER_URL}/api/delegations/${encodeURIComponent(delegationId)}/files/content?${params.toString()}`);
+	if (!res.ok) throw await responseError(res, "fetch runtime file failed");
+	return res.text();
+}
+
+export async function openRuntimeFile(delegationId: string, relativePath: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/delegations/${encodeURIComponent(delegationId)}/files/open`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ path: relativePath }),
+	});
+	if (!res.ok) throw await responseError(res, "open runtime file failed");
+}
+
+export async function fetchDelegationArtifacts(delegationId: string): Promise<ArtifactListItem[]> {
+	const params = new URLSearchParams({ delegationId });
+	const res = await fetch(`${SERVER_URL}/api/artifacts?${params.toString()}`);
+	if (!res.ok) throw await responseError(res, "fetch artifacts failed");
+	return ((await res.json()) as { artifacts?: ArtifactListItem[] }).artifacts ?? [];
+}
+
+export async function fetchArtifactContent(artifactId: string): Promise<string> {
+	const res = await fetch(`${SERVER_URL}/api/artifacts/${encodeURIComponent(artifactId)}/content`);
+	if (!res.ok) throw await responseError(res, "fetch artifact failed");
+	return res.text();
+}
+
+export function artifactContentUrl(artifactId: string): string {
+	return `${SERVER_URL}/api/artifacts/${encodeURIComponent(artifactId)}/content`;
+}
+
+export async function openArtifact(artifactId: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/artifacts/${encodeURIComponent(artifactId)}/open`, { method: "POST" });
+	if (!res.ok) throw await responseError(res, "open artifact failed");
 }
 
 export async function fetchDelegationProcessMessages(

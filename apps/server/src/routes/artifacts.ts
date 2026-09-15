@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { open, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import type { ArtifactStore } from "../agent-runtime/artifact-store.js";
+import { openNativeFile } from "../platform/native-file-opener.js";
 
 /**
  * 交付物查询 API（§15.6：第一阶段只要求登记 + API 可查，不做产物面板）。
@@ -13,7 +14,12 @@ import type { ArtifactStore } from "../agent-runtime/artifact-store.js";
  * 防穿越：只读 store 里登记过的 artifact 的登记路径本身——没有路径参数，
  * realpath 必须等于登记路径（拒绝 symlink 指向登记目录之外）。
  */
-export function registerArtifactsRoutes(app: FastifyInstance, artifacts: ArtifactStore): void {
+export function registerArtifactsRoutes(
+	app: FastifyInstance,
+	artifacts: ArtifactStore,
+	options: { open?: (targetPath: string) => Promise<void> } = {},
+): void {
+	const openFile = options.open ?? openNativeFile;
 	app.get<{ Querystring: { windowId?: string; delegationId?: string } }>("/api/artifacts", async (req) => {
 		return {
 			artifacts: await artifacts.list({
@@ -71,5 +77,16 @@ export function registerArtifactsRoutes(app: FastifyInstance, artifacts: Artifac
 		reply.header("x-content-sha256", record.contentHash);
 		reply.header("content-disposition", `attachment; filename*=UTF-8''${encodeURIComponent(record.name)}`);
 		return reply.send(handle.createReadStream({ autoClose: true }));
+	});
+
+	app.post<{ Params: { id: string } }>("/api/artifacts/:id/open", async (req, reply) => {
+		try {
+			const target = await artifacts.materializeForOpen(req.params.id);
+			if (!target) return reply.code(404).send({ error: "artifact not found" });
+			await openFile(target);
+			return { opened: true };
+		} catch (error) {
+			return reply.code(500).send({ error: error instanceof Error ? error.message : String(error) });
+		}
 	});
 }

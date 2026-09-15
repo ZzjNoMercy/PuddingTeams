@@ -90,6 +90,13 @@ export interface WorkspaceChangeSet {
 	integrity: "clean" | "violation";
 }
 
+/** Read-only, point-in-time observation for a live execution scope. */
+export interface WorkspaceChangeObservation {
+	executionScopeId: string;
+	outputFingerprint: string;
+	changedPaths: string[];
+}
+
 interface SnapshotEntry {
 	path: string;
 	hash: string;
@@ -660,6 +667,23 @@ export class WorkspaceExecutionCoordinator {
 	async getChangeSet(changeSetId: string): Promise<WorkspaceChangeSet | undefined> {
 		const changeSet = (await this.load()).changeSets[changeSetId];
 		return changeSet ? structuredClone(changeSet) : undefined;
+	}
+
+	/**
+	 * Observe the current working copy without minting a change-set or requiring
+	 * the write capability. This is the read authority used by the runtime-file
+	 * viewer while a Worker is still running.
+	 */
+	async observeChanges(scopeId: string): Promise<WorkspaceChangeObservation> {
+		const state = await this.load();
+		const scope = state.scopes[scopeId];
+		if (!scope) throw new WorkspaceExecutionError("scope_not_found", `execution scope not found: ${scopeId}`);
+		const current = await this.currentEntries(scope);
+		return {
+			executionScopeId: scope.id,
+			outputFingerprint: current.fingerprint,
+			changedPaths: changedPaths(scope.baselineEntries, current.entries),
+		};
 	}
 
 	async createVerificationCopy(scopeId: string, verificationId: string, ownerToken?: string): Promise<VerificationEnvironmentCopy> {

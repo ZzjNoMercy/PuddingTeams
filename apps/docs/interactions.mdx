@@ -75,6 +75,17 @@ Driver 的 completed result 可以返回 `artifacts`。平台只登记明确导�
 
 `origin: push` 表示 Agent 主动导出；`origin: observe` 表示 Driver 比较任务前后的 git 基线收集新增变更。两者都必须经过路径边界校验。
 
+## 运行文件与交付物查看器
+
+执行详情把文件分成两个事实来源：
+
+- **运行文件**是本次 Delegation 的工作副本，相对入场 baseline 的实时变更；运行中仍可能继续变化，不能当成冻结证据。
+- **交付物**是已经登记的 Artifact，预览、下载与系统打开都读取登记瞬间的冻结快照，并显示内容哈希。
+
+Markdown、JSON、CSV 和常见文本可以在应用内预览；Markdown 不自动加载外部图片。Excel、PDF 等二进制格式使用“系统打开”，交给当前电脑的默认关联应用。对 Artifact，系统打开的是带原文件扩展名的只读冻结副本；对运行文件，打开的是当前执行工作副本。
+
+前端从不发送绝对路径。Server 依据 Delegation 绑定的 execution scope 重新验证相对路径确实属于本次 change-set，并拒绝路径穿越、符号链接、已删除文件和不属于本次执行的 baseline 文件。
+
 ## 安全判断顺序
 
 遇到需要人介入的卡片时，先判断：

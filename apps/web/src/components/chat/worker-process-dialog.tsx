@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { BrainIcon, CheckCircle2Icon, CircleDotIcon, FilePenIcon, ListChecksIcon, MessageSquareIcon, SearchIcon, ShieldAlertIcon, SlidersHorizontalIcon, TerminalIcon, WrenchIcon, XCircleIcon, XIcon } from "lucide-react";
+import { BrainIcon, CheckCircle2Icon, CircleDotIcon, FilePenIcon, FilesIcon, ListChecksIcon, MessageSquareIcon, PackageCheckIcon, SearchIcon, ShieldAlertIcon, SlidersHorizontalIcon, TerminalIcon, WrenchIcon, XCircleIcon, XIcon } from "lucide-react";
 import {
 	Conversation,
 	ConversationContent,
@@ -22,6 +22,7 @@ import { workerProcessPresentation } from "@/lib/worker-process-presentation";
 import { AssistantGroup, Message } from "./message";
 import { WorkerAvatar } from "./worker-avatar";
 import { CollaborationTrustAxes } from "./session-activity-drawer";
+import { RuntimeArtifactViewer } from "./runtime-artifact-viewer";
 
 function WorkerProcessBody({
 	delegationId,
@@ -243,6 +244,7 @@ export function WorkerProcessDrawer({
 	const [fullSessionDelegationId, setFullSessionDelegationId] = useState<string | null>(null);
 	const [takeoverRationale, setTakeoverRationale] = useState("");
 	const [reconciling, setReconciling] = useState(false);
+	const [detailView, setDetailView] = useState<"process" | "runtime" | "artifacts">("process");
 	const labels = useAgentLabels();
 	const orderedItems = useMemo(() => [...items].sort((a, b) => {
 		const activeA = a.executionState === "running" || a.executionState === "waiting_input" || a.executionState === "cancel_requested" || a.executionState === "reconciling" ? 1 : 0;
@@ -325,17 +327,17 @@ export function WorkerProcessDrawer({
 	};
 
 	return (
-		<aside className={`worker-process-inspector ${open ? "open" : ""}`} aria-hidden={!open} inert={!open} aria-label="执行过程抽屉">
+		<aside className={`worker-process-inspector ${open ? "open" : ""}`} data-content={detailView} aria-hidden={!open} inert={!open} aria-label="执行详情抽屉">
 			<div className="worker-process-panel flex h-full min-w-0 flex-col overflow-hidden">
 				<header className="worker-process-head flex shrink-0 items-start justify-between gap-4">
 					<div className="min-w-0">
 						<div className="flex items-center gap-2">
-							<h2 className="text-sm font-semibold">执行过程</h2>
+							<h2 className="text-sm font-semibold">执行详情</h2>
 							{activeCount > 0 ? <span className="inline-flex items-center gap-1 text-[11px] text-emerald-600"><span className="size-1.5 animate-pulse rounded-full bg-emerald-500" />{activeCount} 个运行中</span> : null}
 						</div>
-						<p className="mt-1 text-[11px] text-muted-foreground">{showWorkerFilter ? "先选择 Worker，再查看一次委托的完整任务流。" : "查看每次委托的完整任务流与原始事件。"}</p>
+						<p className="mt-1 text-[11px] text-muted-foreground">{showWorkerFilter ? "先选择 Worker，再查看过程、运行文件与交付物。" : "查看一次委托的过程、运行文件与冻结交付物。"}</p>
 					</div>
-					<button type="button" aria-label="关闭执行过程" onClick={() => onOpenChange(false)} className="chat-info-close"><XIcon className="size-4" /></button>
+					<button type="button" aria-label="关闭执行详情" onClick={() => onOpenChange(false)} className="chat-info-close"><XIcon className="size-4" /></button>
 				</header>
 
 				{showWorkerFilter ? <div className="worker-process-filter shrink-0">
@@ -364,7 +366,12 @@ export function WorkerProcessDrawer({
 				<section className="worker-process-detail flex min-h-0 min-w-0 flex-1 flex-col">
 						{selected ? (
 							<>
-								{selected.view === "session" || selectedWorkerItems.length > 1 ? (
+								<nav className="worker-process-view-tabs" aria-label="执行详情视图">
+									<button type="button" data-active={detailView === "process" ? "true" : "false"} onClick={() => setDetailView("process")}><TerminalIcon />过程</button>
+									<button type="button" data-active={detailView === "runtime" ? "true" : "false"} onClick={() => setDetailView("runtime")}><FilesIcon />运行文件</button>
+									<button type="button" data-active={detailView === "artifacts" ? "true" : "false"} onClick={() => setDetailView("artifacts")}><PackageCheckIcon />交付物</button>
+								</nav>
+								{detailView === "process" && (selected.view === "session" || selectedWorkerItems.length > 1) ? (
 									<div className="worker-process-detail-toolbar shrink-0">
 										{selected.view === "session" ? (
 											<button type="button" className="worker-process-session-scope" onClick={() => setFullSessionDelegationId(showFullSession ? null : selected.delegationId)}>
@@ -388,11 +395,13 @@ export function WorkerProcessDrawer({
 										) : null}
 									</div>
 								) : null}
-								<div className={`worker-process-trust ${isObservationLost(selected) ? "is-observation-lost" : ""}`}>
-									<CollaborationTrustAxes source={selected} />
-								</div>
-								{isObservationLost(selected) ? <div className="shrink-0 border-b border-destructive/20 bg-destructive/5 p-2 text-[11px]"><div className="flex gap-2"><Button size="sm" variant="outline" disabled={reconciling} onClick={() => void resolveUnknown()}>重新对账原 Run</Button><Input value={takeoverRationale} onChange={(event) => setTakeoverRationale(event.target.value)} placeholder="上游已终止的确认依据（至少 8 字）" /><Button size="sm" variant="destructive" disabled={reconciling || takeoverRationale.trim().length < 8} onClick={() => void resolveUnknown(true)}>确认并接管</Button></div></div> : null}
-								<WorkerProcessRouter key={`${selected.delegationId}:${selected.view}`} info={selected} full={showFullSession} />
+								{detailView === "process" ? <>
+									<div className={`worker-process-trust ${isObservationLost(selected) ? "is-observation-lost" : ""}`}>
+										<CollaborationTrustAxes source={selected} />
+									</div>
+									{isObservationLost(selected) ? <div className="shrink-0 border-b border-destructive/20 bg-destructive/5 p-2 text-[11px]"><div className="flex gap-2"><Button size="sm" variant="outline" disabled={reconciling} onClick={() => void resolveUnknown()}>重新对账原 Run</Button><Input value={takeoverRationale} onChange={(event) => setTakeoverRationale(event.target.value)} placeholder="上游已终止的确认依据（至少 8 字）" /><Button size="sm" variant="destructive" disabled={reconciling || takeoverRationale.trim().length < 8} onClick={() => void resolveUnknown(true)}>确认并接管</Button></div></div> : null}
+									<WorkerProcessRouter key={`${selected.delegationId}:${selected.view}`} info={selected} full={showFullSession} />
+								</> : <RuntimeArtifactViewer key={`${selected.delegationId}:${detailView}`} delegationId={selected.delegationId} kind={detailView} live={selected.live} />}
 							</>
 						) : (
 							<div className={`flex flex-1 items-center justify-center gap-2 px-5 text-center text-xs ${error ? "text-destructive" : "text-muted-foreground"}`}>
