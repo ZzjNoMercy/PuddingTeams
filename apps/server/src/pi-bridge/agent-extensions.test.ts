@@ -34,6 +34,8 @@ import {
 	CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION,
 	CORE_TOOL_REVIEW_WORK_ITEM,
 	CORE_TOOL_READ_DELEGATION_RESULT,
+	CORE_TOOL_ABANDON_GOAL,
+	CORE_TOOL_SUPERSEDE_GOAL,
 	CORE_TOOL_CREATE_GROUP,
 	CORE_TOOL_INVITE,
 	type ManagerExtensionDeps,
@@ -197,6 +199,8 @@ test("Phase4: 窗口内只有成员的工具可见（direct 非成员 Agent 不�
 			CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM,
 			CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION,
 			CORE_TOOL_REVIEW_WORK_ITEM,
+			CORE_TOOL_ABANDON_GOAL,
+			CORE_TOOL_SUPERSEDE_GOAL,
 		],
 		"Goal 状态机工具必须在 provider 请求前常驻，执行期再校验 durable Goal",
 	);
@@ -229,6 +233,8 @@ test("Phase4: 激活策略——委托工具全窗口默认激活，capability �
 		CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM,
 		CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION,
 		CORE_TOOL_REVIEW_WORK_ITEM,
+		CORE_TOOL_ABANDON_GOAL,
+		CORE_TOOL_SUPERSEDE_GOAL,
 		CORE_TOOL_CREATE_GOAL,
 	];
 	assert.deepEqual(
@@ -428,6 +434,8 @@ test("HITL 门禁覆盖跨 Worker 委托、计划写入与重复业务决策，�
 		assert.match(blocked.reason, /等待用户在原卡片中回答/);
 		await assert.rejects(() => tools.get(name)!.execute("blocked", {} as never, undefined, undefined, {} as ExtensionContext), /等待用户在原卡片中回答/);
 	}
+	assert.equal(await hook({ toolName: CORE_TOOL_ABANDON_GOAL }, {}), undefined, "废弃必须能收敛 pending 人工卡");
+	assert.equal(await hook({ toolName: CORE_TOOL_SUPERSEDE_GOAL }, {}), undefined, "更换必须能收敛 pending 人工卡");
 	assert.equal((await workStates.listDecisions("sess-test", goal.goalId)).length, 1);
 	const context = await handlers.get("context")![0]!({ messages: [{ role: "user", content: "继续上一任务", timestamp: 1 }] }, {}) as { messages: Array<{ content: string }> };
 	assert.match(context.messages.at(-1)!.content, /普通聊天中的“继续”不等于已提交卡片/);
@@ -468,6 +476,18 @@ test("正式 Goal 未建立 WorkPlan 时拒绝无 workItemId 委托，且 Worker
 			{} as ExtensionContext,
 		),
 		/必须先建立 WorkPlan 并绑定 workItemId/,
+	);
+	const current = (await workStates.getActive("sess-test"))!;
+	await workStates.interruptGoal("sess-test", current.revision, { kind: "manager_interrupted", fingerprint: "manager-stop", delegationIds: [] }, "manager-stop", current.goalId);
+	await assert.rejects(
+		() => tools.get(delegateToolName("alpha"))!.execute(
+			"call-after-interrupt",
+			{ task: "改做图片", intent: "新任务", expectedOutcome: "图片", completionBoundary: "图片交付" },
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		),
+		/supersede_session_goal.*abandon_session_goal/,
 	);
 	assert.equal((await invoker.delegationsForManagerSession("sess-test")).length, 0);
 });
@@ -779,6 +799,8 @@ test("产品验收冻结: Goal 上下文在 custom-message turn 前按最新状�
 	assert.match(await textOf(), /尚未设置 Goal/);
 	assert.ok(getActive().includes(CORE_TOOL_CREATE_GOAL));
 	assert.ok(getActive().includes(CORE_TOOL_UPDATE_WORK_PLAN), "同一 provider turn 创建 Goal 后必须仍可建立 WorkPlan");
+	assert.ok(getActive().includes(CORE_TOOL_ABANDON_GOAL));
+	assert.ok(getActive().includes(CORE_TOOL_SUPERSEDE_GOAL));
 	await workStates.create({
 		sessionId: "sess-test",
 		goal: "冻结验收",
@@ -789,6 +811,7 @@ test("产品验收冻结: Goal 上下文在 custom-message turn 前按最新状�
 	assert.doesNotMatch(await textOf(), /尚未设置 Goal/);
 	assert.ok(!getActive().includes(CORE_TOOL_CREATE_GOAL));
 	assert.ok(getActive().includes(CORE_TOOL_UPDATE_WORK_PLAN));
+	assert.match(await textOf(), /supersede_session_goal/);
 });
 
 test("Goal 工具契约: 创建使用条件数组，WorkPlan 只回传条件序号", async () => {
@@ -840,6 +863,60 @@ test("Goal 工具契约: 创建使用条件数组，WorkPlan 只回传条件序�
 	const planned = await workStates.getActive("sess-test");
 	assert.deepEqual(planned?.plan?.items.w1?.sourceGoalCriteria, ["goal:1:1"]);
 	assert.deepEqual(planned?.plan?.items.w2?.sourceGoalCriteria, ["goal:1:2"]);
+});
+
+test("review_work_item 绑定 Submission 目标并在无关 Goal 写入后安全对齐，不猜 revision", async () => {
+	const teams = await makeTeams([]);
+	const catalog = new ExtensionCatalog();
+	const invoker = await makeInvoker(teams);
+	const workStates = new WorkStateStore(freshDir("pt-review-tool-cas-"));
+	await workStates.init();
+	const ctx: ManagerWindowContext = { type: "solo", members: [] };
+	const deps = { ...makeDeps(teams, invoker, catalog, ctx), workStates };
+	const plan = await planManagerTools(teams, catalog, ctx);
+	const { pi, handlers, tools } = mockPi();
+	for (const ext of buildManagerExtensionFactories(plan, deps)) {
+		const factory = typeof ext === "function" ? ext : ext.factory;
+		await factory(pi);
+	}
+
+	const goal = await workStates.create({ sessionId: "sess-test", goal: "汇总报告", completionBoundary: "报告已验收" });
+	const planned = await workStates.updatePlan("sess-test", goal.revision, {
+		upsertItems: [{ id: "W1", title: "Manager 汇总", assignedAgentId: "manager", acceptanceCriteria: ["报告完整"], sourceGoalCriteria: ["goal:1:1"] }],
+		reason: "建立 Manager 工作项",
+	}, "plan-review-tool", goal.execution.epoch, goal.goalId);
+	const running = await workStates.advanceManagerWorkItem("sess-test", "W1", planned.revision, { status: "in_progress" }, "start-review-tool", goal.execution.epoch, goal.goalId);
+	const submitted = await workStates.advanceManagerWorkItem("sess-test", "W1", running.revision, {
+		status: "submitted", summary: "报告正文", evidenceRefs: ["message:report"],
+	}, "submit-review-tool", goal.execution.epoch, goal.goalId);
+	const item = submitted.plan!.items.W1!;
+	const submission = item.submissions.at(-1)!;
+
+	const context = handlers.get("context")?.[0];
+	assert.ok(context);
+	const contextResult = await context!({ messages: [] }, {}) as { messages: Array<{ content?: unknown }> };
+	const prompt = String(contextResult.messages.at(-1)?.content);
+	assert.match(prompt, new RegExp(`itemRevision=${item.revision}`));
+	assert.match(prompt, new RegExp(`submissionId=${submission.id}`));
+	assert.match(prompt, new RegExp(`submittedStateRevision=${submission.submittedStateRevision}`));
+	assert.match(prompt, /禁止推算、递增猜测/);
+
+	const advanced = await workStates.update("sess-test", submitted.revision, { currentBrief: "observer 更新摘要" }, "observer-update", goal.execution.epoch, goal.goalId);
+	const result = await tools.get(CORE_TOOL_REVIEW_WORK_ITEM)!.execute("review-tool", {
+		goalId: goal.goalId,
+		expectedEpoch: goal.execution.epoch,
+		workItemId: "W1",
+		expectedRevision: submitted.revision,
+		expectedWorkItemRevision: item.revision,
+		expectedSubmissionId: submission.id,
+		verdict: "accepted",
+		summary: "报告符合条件",
+		evidenceRefs: ["message:report"],
+	}, undefined, undefined, {} as ExtensionContext);
+	assert.match(result.content.map((entry) => entry.type === "text" ? entry.text : "").join("\n"), new RegExp(`安全对齐全局 revision ${submitted.revision}→${advanced.revision}`));
+	const accepted = (result.details as { workState: import("../store/work-state.js").SessionWorkState }).workState;
+	assert.equal(accepted.plan?.items.W1?.status, "accepted");
+	assert.equal(accepted.plan?.items.W1?.submissions.at(-1)?.review?.rebasedFromRevision, submitted.revision);
 });
 
 test("模型上下文剔除 display:false 审计投影，保持 toolCall/toolResult 相邻", async () => {

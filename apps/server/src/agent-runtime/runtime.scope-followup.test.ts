@@ -189,7 +189,13 @@ test("durable WorkState acceptance unlocks the next exclusive WorkItem, includin
 	const submitted = await workStates.noteDelegation("s", { goalId: goal.goalId, workItemId: item.id, delegationId: first.delegation.id, delegationStatus: "completed", goalEpoch: goal.execution.epoch, executionReceipt: first.delegation.receipt, workspaceChangeSet: await s.runtime.getWorkspaceChangeSet(first.delegation.workspaceChangeSetId) }, "boundary");
 	assert.equal(submitted.plan?.items.W1?.status, "submitted");
 	assert.equal(await isWorkspaceOwnerClosed(workStates, first.delegation), false);
-	await workStates.reviewWorkItem("s", "W1", submitted.revision, { verdict: "accepted", summary: "inspected result", evidenceRefs: [first.delegation.id] }, "review", goal.execution.epoch, goal.goalId);
+	await workStates.reviewWorkItem("s", "W1", submitted.revision, {
+		expectedWorkItemRevision: submitted.plan!.items.W1!.revision,
+		expectedSubmissionId: submitted.plan!.items.W1!.submissions.at(-1)!.id,
+		verdict: "accepted",
+		summary: "inspected result",
+		evidenceRefs: [first.delegation.id],
+	}, "review", goal.execution.epoch, goal.goalId);
 	assert.equal(await isWorkspaceOwnerClosed(workStates, first.delegation), true);
 	assert.equal(await isWorkspaceOwnerClosed(workStates, { ...first.delegation, workspaceExecutionScopeId: "foreign" }), false);
 	// No release ran during review: admission must reconcile the durable closure.

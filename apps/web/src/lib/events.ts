@@ -9,6 +9,7 @@ import type {
 	PiToolResultMessage,
 	PiUsage,
 	ToolCallView,
+	ModelErrorPresentation,
 } from "./types";
 import type { RecoveredToolResult } from "./api";
 
@@ -34,7 +35,7 @@ function safeErrorDetail(raw: string): string {
 }
 
 /** Convert provider/SDK diagnostics into actionable user copy. */
-export function friendlyModelError(raw: string): { content: string; detail: string } {
+export function friendlyModelError(raw: string): { content: string; detail: string; presentation: ModelErrorPresentation } {
 	const detail = safeErrorDetail(raw.trim() || "unknown error");
 	const value = detail.toLowerCase();
 	let title = "Manager 本轮回复失败";
@@ -70,6 +71,7 @@ export function friendlyModelError(raw: string): { content: string; detail: stri
 	return {
 		content: `**${title}**\n\n${explanation}\n\n${action}`,
 		detail,
+		presentation: { title, explanation, action },
 	};
 }
 
@@ -80,6 +82,7 @@ export function renderPiMessage(m: PiAssistantMessage): {
 	toolCalls: ToolCallView[];
 	usage?: PiUsage;
 	error?: boolean;
+	modelError?: ModelErrorPresentation;
 	errorDetail?: string;
 } {
 	const blocks = Array.isArray(m.content) ? m.content : [];
@@ -104,8 +107,32 @@ export function renderPiMessage(m: PiAssistantMessage): {
 		toolCalls,
 		usage: m.usage,
 		error: friendlyError ? true : undefined,
+		modelError: friendlyError ? { ...friendlyError.presentation, ...(content ? { partialContent: content } : {}) } : undefined,
 		errorDetail: friendlyError?.detail,
 	};
+}
+
+function isMergeableModelError(message: ChatMessage): boolean {
+	return Boolean(message.error && message.modelError && !message.thinking && message.toolCalls.length === 0);
+}
+
+function sameModelError(left: ChatMessage, right: ChatMessage): boolean {
+	return isMergeableModelError(left)
+		&& isMergeableModelError(right)
+		&& left.modelError?.title === right.modelError?.title
+		&& left.modelError?.explanation === right.modelError?.explanation
+		&& left.modelError?.action === right.modelError?.action;
+}
+
+/** Consecutive provider failures in one manager run are pi SDK retry attempts, not separate replies. */
+export function groupConsecutiveModelErrors(messages: ChatMessage[]): ChatMessage[][] {
+	const groups: ChatMessage[][] = [];
+	for (const message of messages) {
+		const previous = groups[groups.length - 1];
+		if (previous?.length && sameModelError(previous[0]!, message)) previous.push(message);
+		else groups.push([message]);
+	}
+	return groups;
 }
 
 /** Map a pi custom_message (e.g. pudding:task_assign/result) to chat view state. */
@@ -493,6 +520,7 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 					role: "assistant",
 					content: friendly.content,
 					error: true,
+					modelError: friendly.presentation,
 					errorDetail: friendly.detail,
 					toolCalls: [],
 					timestamp: Date.now(),

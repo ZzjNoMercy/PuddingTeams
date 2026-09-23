@@ -30,7 +30,13 @@ export function registerWorkStateRoutes(
 		return raw.trim();
 	};
 	const sendError = (reply: import("fastify").FastifyReply, err: unknown) => {
-		if (err instanceof WorkStateConflictError) return reply.code(409).send({ error: err.message, current: err.current, code: "stale_goal_state" });
+		if (err instanceof WorkStateConflictError) return reply.code(409).send({
+			error: err.message,
+			code: "stale_goal_state",
+			expectedRevision: err.expectedRevision,
+			currentRevision: err.current.revision,
+			current: err.current,
+		});
 		if (err instanceof WorkStateOperationConflictError) return reply.code(409).send({ error: err.message, code: err.code });
 		const message = err instanceof Error ? err.message : String(err);
 		if (message.includes("所属项目未激活")) return reply.code(409).send({ error: "session_context_inactive" });
@@ -134,7 +140,7 @@ export function registerWorkStateRoutes(
 			}
 			if (req.body?.revision === undefined) {
 				if (req.body?.goal?.trim() && req.body?.completionBoundary?.trim()) {
-					return reply.code(409).send({ error: "当前已有进行中的 Goal，请先完成或取消后再创建下一个" });
+					return reply.code(409).send({ error: "当前已有进行中的 Goal，请先完成、废弃，或使用更换 Goal" });
 				}
 				return reply.code(400).send({ error: "更新 Session Goal 需要 revision" });
 			}
@@ -189,11 +195,12 @@ export function registerWorkStateRoutes(
 
 	app.post<{
 		Params: { id: string; workItemId: string };
-		Body: { expectedGoalId: string; expectedRevision: number; expectedEpoch?: number; verdict: "accepted" | "revision" | "blocked"; summary: string; evidenceRefs?: string[] };
+		Body: { expectedGoalId: string; expectedRevision: number; expectedEpoch: number; expectedWorkItemRevision: number; expectedSubmissionId: string; verdict: "accepted" | "revision" | "blocked"; summary: string; evidenceRefs?: string[] };
 	}>("/api/sessions/:id/work-items/:workItemId/review", async (req, reply) => {
 		try {
 			await requireOwnedSession(req.params.id);
 			if (!req.body.expectedGoalId?.trim()) return reply.code(400).send({ error: "验收 WorkItem 需要 expectedGoalId" });
+			if (!req.body.expectedSubmissionId?.trim()) return reply.code(400).send({ error: "验收 WorkItem 需要 expectedSubmissionId" });
 			const { expectedGoalId, expectedRevision, expectedEpoch, ...review } = req.body;
 			const workState = await workStates.reviewWorkItem(req.params.id, req.params.workItemId, expectedRevision, review, idempotencyKey(req.headers as Record<string, unknown>), expectedEpoch, expectedGoalId);
 			return { workState, workItem: workState.plan?.items[req.params.workItemId] };
@@ -235,9 +242,8 @@ export function registerWorkStateRoutes(
 		try {
 			await requireOwnedSession(req.params.id);
 			if (!req.body.expectedGoalId?.trim()) return reply.code(400).send({ error: "暂停 Goal 需要 expectedGoalId" });
-			const current = await workStates.getActive(req.params.id);
-			if (!current) return reply.code(404).send({ error: "当前没有进行中的 Goal" });
-			const active = runtime ? (await runtime.listDelegations(undefined, req.params.id)).filter((item) => item.goalId === current.goalId && (item.executionState === "waiting_admission" || item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling")) : [];
+			if (!await workStates.getGoal(req.params.id, req.body.expectedGoalId)) return reply.code(404).send({ error: "Goal 不存在" });
+			const active = runtime ? (await runtime.listDelegations(undefined, req.params.id)).filter((item) => item.goalId === req.body.expectedGoalId && (item.executionState === "waiting_admission" || item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling")) : [];
 			const key = idempotencyKey(req.headers as Record<string, unknown>);
 			const workState = await workStates.interruptGoal(req.params.id, req.body.expectedRevision, {
 				kind: req.body.kind ?? "user",
@@ -266,6 +272,58 @@ export function registerWorkStateRoutes(
 				}, key, req.body.expectedGoalId),
 			);
 			return { workState };
+		} catch (err) { return sendError(reply, err) }
+	});
+
+	app.post<{
+		Params: { id: string };
+		Body: { expectedGoalId: string; expectedRevision: number; reason: string };
+	}>("/api/sessions/:id/goal/abandon", async (req, reply) => {
+		try {
+			await requireOwnedSession(req.params.id);
+			if (!req.body.expectedGoalId?.trim()) return reply.code(400).send({ error: "废弃 Goal 需要 expectedGoalId" });
+			if (!req.body.reason?.trim()) return reply.code(400).send({ error: "废弃 Goal 需要 reason" });
+			if (!await workStates.getGoal(req.params.id, req.body.expectedGoalId)) return reply.code(404).send({ error: "Goal 不存在" });
+			const active = runtime ? (await runtime.listDelegations(undefined, req.params.id)).filter((item) => item.goalId === req.body.expectedGoalId && ["waiting_admission", "running", "waiting_input", "cancel_requested", "reconciling"].includes(item.executionState)) : [];
+			const workState = await workStates.abandonGoal(req.params.id, req.body.expectedRevision, {
+				kind: "user_abandoned",
+				by: "user",
+				reason: req.body.reason,
+				delegationIds: active.map((item) => item.id),
+			}, idempotencyKey(req.headers as Record<string, unknown>), req.body.expectedGoalId);
+			if (runtime) await Promise.all(active.map((item) => runtime.cancel(item.id, { cwd: item.cwdSnapshot, env: process.env }).catch(() => undefined)));
+			return { workState };
+		} catch (err) { return sendError(reply, err) }
+	});
+
+	app.post<{
+		Params: { id: string };
+		Body: {
+			expectedGoalId: string; expectedRevision: number; reason: string;
+			goal: string; completionBoundary: string; reviewMode?: CompletionReviewMode; reviewerModel?: string;
+		};
+	}>("/api/sessions/:id/goal/supersede", async (req, reply) => {
+		try {
+			const window = await requireOwnedSession(req.params.id);
+			if (!req.body.expectedGoalId?.trim()) return reply.code(400).send({ error: "更换 Goal 需要 expectedGoalId" });
+			if (!req.body.reason?.trim()) return reply.code(400).send({ error: "更换 Goal 需要 reason" });
+			if (!req.body.goal?.trim() || !req.body.completionBoundary?.trim()) return reply.code(400).send({ error: "更换 Goal 需要新 goal 与 completionBoundary" });
+			if (productSettings && (await productSettings.get()).harness.goalActivation[window.type] === "disabled") return reply.code(403).send({ error: `Harness 已禁用 ${window.type} Goal` });
+			if (!await workStates.getGoal(req.params.id, req.body.expectedGoalId)) return reply.code(404).send({ error: "Goal 不存在" });
+			const active = runtime ? (await runtime.listDelegations(undefined, req.params.id)).filter((item) => item.goalId === req.body.expectedGoalId && ["waiting_admission", "running", "waiting_input", "cancel_requested", "reconciling"].includes(item.executionState)) : [];
+			const result = await workStates.supersedeGoal(req.params.id, req.body.expectedRevision, {
+				by: "user",
+				reason: req.body.reason,
+				delegationIds: active.map((item) => item.id),
+				goal: req.body.goal,
+				completionBoundary: req.body.completionBoundary,
+				reviewMode: req.body.reviewMode,
+				reviewerModel: req.body.reviewerModel,
+				participantAgentIds: window.members,
+				contractProvenance: { criteriaOrigin: "user_input", sourceMessageIds: [] },
+			}, idempotencyKey(req.headers as Record<string, unknown>), req.body.expectedGoalId);
+			if (runtime) await Promise.all(active.map((item) => runtime.cancel(item.id, { cwd: item.cwdSnapshot, env: process.env }).catch(() => undefined)));
+			return result;
 		} catch (err) { return sendError(reply, err) }
 	});
 

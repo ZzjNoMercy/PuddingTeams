@@ -1,13 +1,13 @@
 "use client";
 
 import { Fragment, useEffect, useMemo, useState } from "react";
-import { AlertCircleIcon, CheckCircle2Icon, CircleIcon, Clock3Icon, ExternalLinkIcon, GitBranchIcon, ListTreeIcon, PauseCircleIcon, PlayIcon, RotateCcwIcon, ShieldCheckIcon, SquareIcon, TargetIcon, XCircleIcon } from "lucide-react";
+import { AlertCircleIcon, BanIcon, CheckCircle2Icon, CircleIcon, Clock3Icon, ExternalLinkIcon, GitBranchIcon, ListTreeIcon, PauseCircleIcon, PlayIcon, RefreshCwIcon, RotateCcwIcon, ShieldCheckIcon, SquareIcon, TargetIcon, XCircleIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { cancelDelegation, interruptGoal, reconcileDelegation, resumeGoal, reviewWorkItem, takeoverDelegation, type CollaborationProjectionSource, type SettlementState, type VerificationProjection } from "@/lib/api";
+import { abandonGoal, cancelDelegation, interruptGoal, reconcileDelegation, resumeGoal, reviewWorkItem, takeoverDelegation, WorkStateApiConflictError, type CollaborationProjectionSource, type SettlementState, type VerificationProjection } from "@/lib/api";
 import { CollaborationTrustAxes } from "./session-activity-drawer";
 import type { CompletionReview, CompletionReviewCriterion, DecisionRequest, DelegationTrace, SessionGoalSummary, SessionWorkState, WorkItem, WorkItemStatus } from "@/lib/types";
 import { RuntimeViewTabs, type SessionRuntimeView } from "./session-activity-drawer";
@@ -61,7 +61,8 @@ function executionIsLive(status: SessionWorkState["execution"]["status"]): boole
 }
 function executionText(state: SessionWorkState): string {
 	if (state.status === "resolved") return "已完成";
-	if (state.status === "cancelled") return "已取消";
+	if (state.status === "cancelled") return "已废弃";
+	if (state.status === "superseded") return "已更换";
 	return { idle: "待推进", running: "执行中", waiting_human: "等待决定", interrupted: "已暂停", recovering: "恢复中", reviewing: "验收中" }[state.execution.status];
 }
 function matchesFilter(item: WorkItem, filter: PlanFilter, live = true): boolean {
@@ -93,7 +94,7 @@ function WorkPlanGraph({ goal, items, selectedId, filter, executionStatus, onSel
 }
 
 export function SessionRuntimeDrawer({
-	workState, initialWorkItemId, activeGoalId, goals, selectedGoalId, goalLoading, goalLoadError, decisions, delegations, answerById, submitting, open, onOpenChange, onRuntimeViewChange, onGoalSelect, onRetryGoal, onAnswerChange, onAnswer, onWorkStateChange,
+	workState, initialWorkItemId, activeGoalId, goals, selectedGoalId, goalLoading, goalLoadError, decisions, delegations, answerById, submitting, open, onOpenChange, onRuntimeViewChange, onGoalSelect, onRetryGoal, onAnswerChange, onAnswer, onWorkStateChange, onRequestSupersede,
 }: {
 	workState: SessionWorkState; activeGoalId: string | null; goals: SessionGoalSummary[]; decisions: DecisionRequest[]; delegations: DelegationTrace[]; answerById: Record<string, string>;
 	initialWorkItemId?: string;
@@ -103,6 +104,7 @@ export function SessionRuntimeDrawer({
 	onGoalSelect: (goalId: string) => void; onRetryGoal: () => void;
 	onAnswerChange: (decisionId: string, value: string) => void; onAnswer: (decision: DecisionRequest, value: string) => void;
 	onWorkStateChange: (state: SessionWorkState) => void;
+	onRequestSupersede: (state: SessionWorkState) => void;
 }) {
 	const items = useMemo(() => Object.values(workState.plan?.items ?? {}), [workState.plan]);
 	const [selectedId, setSelectedId] = useState<string>();
@@ -151,17 +153,43 @@ export function SessionRuntimeDrawer({
 
 	const review = async (verdict: "accepted" | "revision" | "blocked") => {
 		if (!selected || !reviewSummary.trim()) return;
+		const pendingSubmission = [...selected.submissions].reverse().find((entry) => !entry.review);
+		if (!pendingSubmission) { toast.error("当前 WorkItem 没有待验收 Submission，请刷新状态"); return }
 		setWorking(true);
 		try {
-			const next = await reviewWorkItem(workState.sessionId, selected.id, { expectedGoalId: workState.goalId, expectedRevision: workState.revision, expectedEpoch: workState.execution.epoch, verdict, summary: reviewSummary.trim(), evidenceRefs: effectiveDelegationId ? [effectiveDelegationId] : [] });
-			onWorkStateChange(next); setReviewSummary(""); toast.success(verdict === "accepted" ? "已接受交付" : verdict === "revision" ? "已要求返修" : "已标记阻塞");
-		} catch (error) { toast.error(error instanceof Error ? error.message : String(error)) } finally { setWorking(false) }
+			const next = await reviewWorkItem(workState.sessionId, selected.id, {
+				expectedGoalId: workState.goalId,
+				expectedRevision: workState.revision,
+				expectedEpoch: workState.execution.epoch,
+				expectedWorkItemRevision: selected.revision,
+				expectedSubmissionId: pendingSubmission.id,
+				verdict,
+				summary: reviewSummary.trim(),
+				evidenceRefs: effectiveDelegationId ? [effectiveDelegationId] : [],
+			});
+			const appliedReview = next.plan?.items[selected.id]?.submissions.find((entry) => entry.id === pendingSubmission.id)?.review;
+			const aligned = appliedReview?.rebasedFromRevision === undefined ? "" : `；状态已安全对齐 r${appliedReview.rebasedFromRevision}→r${appliedReview.reviewedStateRevision}`;
+			onWorkStateChange(next); setReviewSummary(""); toast.success((verdict === "accepted" ? "已接受交付" : verdict === "revision" ? "已要求返修" : "已标记阻塞") + aligned);
+		} catch (error) {
+			if (error instanceof WorkStateApiConflictError) onWorkStateChange(error.current);
+			toast.error(error instanceof Error ? error.message : String(error));
+		} finally { setWorking(false) }
 	};
 	const changeRecovery = async (action: "interrupt" | "resume") => {
 		setWorking(true);
 		try {
 			const next = action === "interrupt" ? await interruptGoal(workState.sessionId, workState.goalId, workState.revision) : await resumeGoal(workState.sessionId, workState.goalId, workState.revision);
-			onWorkStateChange(next); toast.success(action === "interrupt" ? "Goal 已暂停，可稍后继续" : "Goal 正在从安全点继续");
+			onWorkStateChange(next); toast.success(action === "interrupt" ? (next.status === "active" ? "Goal 已暂停，可稍后继续" : "Goal 已无可继续项，已自动关闭") : "Goal 正在从安全点继续");
+		} catch (error) { toast.error(error instanceof Error ? error.message : String(error)) } finally { setWorking(false) }
+	};
+	const abandonCurrent = async () => {
+		const reason = window.prompt("请填写废弃原因（会保留全部执行与验收历史）", "用户明确不再继续该目标");
+		if (!reason?.trim() || !window.confirm("确认废弃当前 Goal？未终态 WorkItem、待处理决策和在飞委托都会被取消。")) return;
+		setWorking(true);
+		try {
+			const next = await abandonGoal(workState.sessionId, workState.goalId, workState.revision, reason.trim());
+			onWorkStateChange(next);
+			toast.success("Goal 已废弃；现在可以在同一 Session 建立新目标");
 		} catch (error) { toast.error(error instanceof Error ? error.message : String(error)) } finally { setWorking(false) }
 	};
 	const terminateDelegation = async (delegationId: string) => {
@@ -186,7 +214,7 @@ export function SessionRuntimeDrawer({
 	return <Dialog modal={false} open={open} onOpenChange={onOpenChange}>
 		<DialogContent positionMode="drawer" overlayClassName="goal-runtime-overlay" className="context-drawer runtime-drawer goal-runtime-drawer task-runtime-drawer is-goal grid grid-rows-[auto_auto_auto_auto_minmax(0,1fr)] gap-0 p-0">
 			<DialogHeader className="runtime-drawer-head goal-drawer-head">
-				<div className="goal-drawer-title-row"><DialogTitle><ListTreeIcon />任务与执行</DialogTitle><span className={"goal-state-label is-" + (goalLoading ? "loading" : workState.status === "active" ? workState.execution.status : workState.status)}><i />{goalLoading ? "载入中" : executionText(workState)}</span>{goals.length > 1 ? <select className="goal-history-select" aria-label="选择当前或历史 Goal" title={goals.find((goal) => goal.goalId === selectedGoalId)?.goal} value={selectedGoalId} disabled={goalLoading} onChange={(event) => onGoalSelect(event.target.value)}>{goals.map((goal) => <option key={goal.goalId} value={goal.goalId}>{goal.goalId === activeGoalId ? "当前" : goal.status === "resolved" ? "已完成" : "已取消"} · {formatTime(goal.createdAt)} · {goal.goal}</option>)}</select> : null}</div>
+				<div className="goal-drawer-title-row"><DialogTitle><ListTreeIcon />任务与执行</DialogTitle><span className={"goal-state-label is-" + (goalLoading ? "loading" : workState.status === "active" ? workState.execution.status : workState.status)}><i />{goalLoading ? "载入中" : executionText(workState)}</span>{goals.length > 1 ? <select className="goal-history-select" aria-label="选择当前或历史 Goal" title={goals.find((goal) => goal.goalId === selectedGoalId)?.goal} value={selectedGoalId} disabled={goalLoading} onChange={(event) => onGoalSelect(event.target.value)}>{goals.map((goal) => <option key={goal.goalId} value={goal.goalId}>{goal.goalId === activeGoalId ? "当前" : goal.status === "resolved" ? "已完成" : goal.status === "superseded" ? "已更换" : "已废弃"} · {formatTime(goal.createdAt)} · {goal.goal}</option>)}</select> : null}</div>
 				<DialogDescription className="sr-only">查看当前目标的计划、验收与执行记录</DialogDescription>
 				<span className="goal-progress-label">{goalLoading ? "加载中" : `${accepted}/${items.filter((item) => item.status !== "cancelled").length || conditions.length} 已验收`}</span>
 			</DialogHeader>
@@ -203,8 +231,10 @@ export function SessionRuntimeDrawer({
 				<button type="button" role="tab" title="仅筛选当前真正执行中的 WorkItem；不会启动任务" aria-selected={filter === "running"} className={filter === "running" ? "is-active" : ""} onClick={() => { setFilter("running"); const target = items.find((item) => matchesFilter(item, "running", executionLive)); if (target) { setSelectedId(target.id); setSelectedDelegationId(undefined) } }}>执行中 <span>{running}</span></button>
 			</div>
 			<div className="goal-drawer-scroll">
+				{workState.status !== "active" && workState.abandonment ? <div className="goal-recovery-banner"><BanIcon className="size-4" /><div><strong>{workState.status === "superseded" ? "Goal 已被新目标取代" : "Goal 已废弃"}</strong><p>{workState.abandonment.reason}{workState.abandonment.evidenceGaps.length ? ` · ${workState.abandonment.evidenceGaps.length} 项未验收证据缺口` : ""}</p></div></div> : null}
 				{workState.plan?.needsReconcile ? <div className="goal-recovery-banner"><AlertCircleIcon className="size-4" /><div><strong>WorkPlan 需要重新对账</strong><p>Goal 契约已更新；现有 accepted 仅是旧版本历史，不能用于完成当前 Goal。Manager 必须更新条件映射后再继续。</p></div></div> : null}
-				{!readOnly && (workState.execution.status === "interrupted" || workState.execution.status === "recovering") ? <div className="goal-recovery-banner"><RotateCcwIcon className="size-4" /><div className="min-w-0 flex-1"><strong>{workState.execution.status === "interrupted" ? "Goal 已暂停" : "正在继续"}</strong><p>暂停不会删除 Goal；继续后会为当前 WorkItem 新增一条执行记录。</p></div>{workState.execution.status === "interrupted" ? <Button size="sm" disabled={working} onClick={() => void changeRecovery("resume")}><PlayIcon className="size-3.5" />继续 Goal</Button> : null}</div> : canInterrupt ? <div className="goal-interrupt-row"><span>暂停当前 Goal，保留计划和已完成结果</span><Button size="sm" variant="ghost" title="暂停当前 Goal，可稍后继续" disabled={working} onClick={() => void changeRecovery("interrupt")}><PauseCircleIcon className="size-3.5" />暂停 Goal</Button></div> : null}
+				{!readOnly && (workState.execution.status === "interrupted" || workState.execution.status === "recovering") ? <div className="goal-recovery-banner"><RotateCcwIcon className="size-4" /><div className="min-w-0 flex-1"><strong>{workState.execution.status === "interrupted" ? "Goal 已暂停" : "正在继续"}</strong><p>暂停不会删除 Goal；继续后会为当前 WorkItem 新增一条执行记录。</p></div>{workState.execution.status === "interrupted" ? <Button size="sm" disabled={working} onClick={() => void changeRecovery("resume")}><PlayIcon className="size-3.5" />继续 Goal</Button> : null}</div> : null}
+				{!readOnly && workState.status === "active" ? <div className="goal-interrupt-row"><span>暂停可恢复；废弃与更换会终结当前 Goal</span>{canInterrupt ? <Button size="sm" variant="ghost" title="暂停当前 Goal，可稍后继续" disabled={working} onClick={() => void changeRecovery("interrupt")}><PauseCircleIcon className="size-3.5" />暂停</Button> : null}<Button size="sm" variant="ghost" title="关闭旧 Goal 并创建新 Goal" disabled={working} onClick={() => onRequestSupersede(workState)}><RefreshCwIcon className="size-3.5" />更换</Button><Button size="sm" variant="ghost" className="text-destructive" title="永久关闭当前 Goal" disabled={working} onClick={() => void abandonCurrent()}><BanIcon className="size-3.5" />废弃</Button></div> : null}
 				{items.length ? <Section icon={<GitBranchIcon />} title="Goal 任务树" metric={workState.plan?.needsReconcile ? "需对账" : "层级主干 · 依赖合流"} className="goal-tree-section"><WorkPlanGraph goal={workState.goal} items={items} selectedId={selected?.id} filter={filter} executionStatus={workState.execution.status} onSelect={(id) => { setSelectedId(id); setSelectedDelegationId(undefined) }} /></Section> : <Section icon={<GitBranchIcon />} title="执行结构"><p className="text-xs text-muted-foreground">{delegations.length ? "当前是 direct Goal 或尚未建立 Manager WorkPlan；只展示真实 Delegation，不推测 Worker 私有 Todo。" : "尚无 WorkPlan。Manager 会在需要多步骤、依赖或多 Worker 时建立计划。"}</p></Section>}
 				{selected ? <section className="runtime-section goal-selected-detail">
 					{selected.description ? <p className="mb-3 text-xs text-muted-foreground">{selected.description}</p> : null}

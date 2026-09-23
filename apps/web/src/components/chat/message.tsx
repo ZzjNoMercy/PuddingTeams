@@ -1,7 +1,7 @@
 "use client";
 
 import { createContext, type ComponentProps, type ReactNode, useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { CheckIcon, ChevronDownIcon, ChevronRightIcon, CopyIcon, ExternalLinkIcon, FilePenIcon, FileSearchIcon, FileTextIcon, FolderIcon, ListTreeIcon, RotateCcwIcon, SquareIcon, SquareTerminalIcon, UserPlusIcon, UsersIcon, WrenchIcon } from "lucide-react";
+import { CheckIcon, ChevronDownIcon, ChevronRightIcon, CircleAlertIcon, CopyIcon, ExternalLinkIcon, FilePenIcon, FileSearchIcon, FileTextIcon, FolderIcon, ListTreeIcon, RotateCcwIcon, SquareIcon, SquareTerminalIcon, UserPlusIcon, UsersIcon, WrenchIcon } from "lucide-react";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
 	Message as AiMessage,
@@ -18,7 +18,7 @@ import { Badge } from "@/components/ui/badge";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { streamdownPlugins } from "@/core/streamdown/plugins";
 import { writeTextToClipboard } from "@/core/clipboard";
-import { delegateWorker, isDelegateCall } from "@/lib/events";
+import { delegateWorker, groupConsecutiveModelErrors, isDelegateCall } from "@/lib/events";
 import { useAgentLabel } from "@/lib/avatars";
 import { formatTokens } from "@/lib/session-stats";
 import { cancelDelegation, openRoomFile } from "@/lib/api";
@@ -412,6 +412,7 @@ function WorkerTaskEntry({
 	// 完成态的长结果另有 clamp，运行中的长任务默认折叠成三行可展开。
 	// worker prop 是内部 id（头像/详情用），展示渲染显示名。
 	const workerLabel = useAgentLabel(worker);
+	const { renderInlineProcess } = useWorkerProcessDrawer();
 	const finished = !running && result !== undefined && result !== "";
 	const [open, setOpen] = useState(true);
 	const [resultOpen, setResultOpen] = useState(true);
@@ -486,6 +487,10 @@ function WorkerTaskEntry({
 			{task}
 		</button>
 	) : null;
+
+	const inlineId = (processDetails as { delegationId?: string } | undefined)?.delegationId;
+	const inlineProcess = inlineId ? renderInlineProcess?.(inlineId, result) : null;
+	if (inlineProcess) return <div className="w-full min-w-0">{inlineProcess}{actions}{children}</div>;
 
 	if (finished) {
 		return (
@@ -1096,14 +1101,15 @@ function MessageBody({
 						)}
 						{showContent && (
 							<>
-								<MessageResponse
-									className={`home-message-response ${message.error ? "text-destructive" : ""}`}
-									{...chatStreamdownProps}
-								>
-									{message.content}
-								</MessageResponse>
-								<ErrorTechnicalDetails detail={message.errorDetail} />
-								{!message.streaming && message.content ? <MessageQuickActions kind={assistantAs ? "worker" : "manager"} content={message.content} workerLabel={assistantAs ? assistantLabel : undefined} /> : null}
+								{message.error && message.modelError ? (
+									<ModelErrorSummary messages={[message]} />
+								) : (
+									<>
+										<MessageResponse className="home-message-response" {...chatStreamdownProps}>{message.content}</MessageResponse>
+										<ErrorTechnicalDetails detail={message.errorDetail} />
+									</>
+								)}
+								{!message.streaming && message.content && !message.error ? <MessageQuickActions kind={assistantAs ? "worker" : "manager"} content={message.content} workerLabel={assistantAs ? assistantLabel : undefined} /> : null}
 							</>
 						)}
 					</div>
@@ -1143,16 +1149,9 @@ function AssistantReasoning({
 	startedAt: number;
 	className?: string;
 }) {
-	// Freeze the mount-time streaming flag: live messages mount open and auto-close
-	// when the stream ends; history messages mount already collapsed, so switching
-	// sessions never plays an open→close jump (vendored Reasoning auto-closes
-	// whenever defaultOpen && !isStreaming).
-	const [defaultOpen] = useState(() => streaming);
-
 	return (
 		<Reasoning
 			isStreaming={streaming}
-			defaultOpen={defaultOpen}
 			startTimeProp={streaming ? startedAt : null}
 			className={className}
 		>
@@ -1174,6 +1173,37 @@ function ErrorTechnicalDetails({ detail }: { detail?: string }) {
 				<pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all text-xs text-muted-foreground">{detail}</pre>
 			</CollapsibleContent>
 		</Collapsible>
+	);
+}
+
+function ModelErrorSummary({ messages, recovered = false }: { messages: ChatMessage[]; recovered?: boolean }) {
+	const latest = messages[messages.length - 1];
+	if (!latest?.modelError) return null;
+	const attempts = messages.length;
+	const detail = messages
+		.map((message, index) => message.errorDetail ? `${attempts > 1 ? `尝试 ${index + 1}\n` : ""}${message.errorDetail}` : "")
+		.filter(Boolean)
+		.join("\n\n");
+	const status = recovered
+		? "已恢复"
+		: attempts > 1
+			? `${attempts} 次失败`
+			: "请求失败";
+	const summary = recovered
+		? "模型服务连接已经恢复。"
+		: latest.modelError.explanation;
+
+	return (
+		<div className={`home-model-error${recovered ? " is-recovered" : ""}`} role={recovered ? "status" : "alert"}>
+			<span className="home-model-error-icon">{recovered ? <CheckIcon /> : <CircleAlertIcon />}</span>
+			<div className="home-model-error-body">
+				{latest.modelError.partialContent ? <MessageResponse className="home-message-response mb-2" {...chatStreamdownProps}>{latest.modelError.partialContent}</MessageResponse> : null}
+				<div className="home-model-error-title"><strong>{recovered ? "模型连接已恢复" : latest.modelError.title}</strong><span>{status}</span></div>
+				<p>{summary}</p>
+				{!recovered ? <p className="home-model-error-action">{latest.modelError.action}</p> : null}
+				<ErrorTechnicalDetails detail={detail} />
+			</div>
+		</div>
 	);
 }
 
@@ -1269,17 +1299,24 @@ function AssistantGroupBody({
 						/>
 					);
 				}
-				const segments = node.merged
-					.map((m) => ({
-						m,
-						showThinking:
-							Boolean(m.thinking) || (m.streaming && !m.content && m.toolCalls.length === 0),
-						showContent: Boolean(m.content) || m.error,
-						foldCalls: m.toolCalls.filter((c) => !isDelegateCall(c)),
-						cardCalls: memberFlow ? [] : m.toolCalls.filter((c) => isDelegateCall(c)),
-					}))
+				const visibleMessages = node.merged
+					.filter((m) => Boolean(m.thinking) || (m.streaming && !m.content && m.toolCalls.length === 0) || Boolean(m.content) || m.error || m.toolCalls.length > 0);
+				const segments = groupConsecutiveModelErrors(visibleMessages)
+					.map((messages) => {
+						const m = messages[messages.length - 1]!;
+						return {
+							m,
+							messages,
+							showThinking:
+								Boolean(m.thinking) || (m.streaming && !m.content && m.toolCalls.length === 0),
+							showContent: Boolean(m.content) || m.error,
+							foldCalls: m.toolCalls.filter((c) => !isDelegateCall(c)),
+							cardCalls: memberFlow ? [] : m.toolCalls.filter((c) => isDelegateCall(c)),
+						};
+					})
 					.filter((s) => s.showThinking || s.showContent || s.foldCalls.length > 0 || s.cardCalls.length > 0);
 				if (segments.length === 0) return null;
+				const quickActionContent = [...new Set(segments.filter((segment) => !segment.m.error).map((segment) => segment.m.content).filter(Boolean))].join("\n\n");
 				const lastTime = new Date(segments[segments.length - 1]!.m.timestamp).toLocaleTimeString("zh-CN", {
 					hour: "2-digit",
 					minute: "2-digit",
@@ -1298,18 +1335,17 @@ function AssistantGroupBody({
 								<span>{lastTime}</span>
 							</div>
 							<div className="flex w-full flex-col gap-3">
-								{segments.map((s) => (
+								{segments.map((s, segmentIndex) => (
 									<div key={s.m.id} className="home-assistant-segment flex w-full flex-col gap-2">
 										{s.showThinking && <AssistantReasoning streaming={s.m.streaming} thinking={s.m.thinking} startedAt={s.m.timestamp} className="mb-0" />}
 										{s.showContent && (
-											<MessageResponse
-												className={`home-message-response ${s.m.error ? "text-destructive" : ""}`}
-												{...chatStreamdownProps}
-											>
-												{s.m.content}
-											</MessageResponse>
+											s.m.error && s.m.modelError ? (
+												<ModelErrorSummary messages={s.messages} recovered={segments.slice(segmentIndex + 1).some((segment) => !segment.m.error)} />
+											) : (
+												<MessageResponse className="home-message-response" {...chatStreamdownProps}>{s.m.content}</MessageResponse>
+											)
 										)}
-										<ErrorTechnicalDetails detail={s.m.errorDetail} />
+										{!s.m.modelError ? <ErrorTechnicalDetails detail={s.m.errorDetail} /> : null}
 										{s.foldCalls.length > 0 && (
 											<ToolSummaryRow
 												calls={s.foldCalls}
@@ -1329,8 +1365,8 @@ function AssistantGroupBody({
 										))}
 									</div>
 								))}
-								{!segments.some((segment) => segment.m.streaming) && segments.some((segment) => Boolean(segment.m.content)) ? (
-									<MessageQuickActions kind={assistantAs ? "worker" : "manager"} content={segments.map((segment) => segment.m.content).filter(Boolean).join("\n\n")} workerLabel={assistantAs ? assistantLabel : undefined} />
+								{!segments.some((segment) => segment.m.streaming) && quickActionContent ? (
+									<MessageQuickActions kind={assistantAs ? "worker" : "manager"} content={quickActionContent} workerLabel={assistantAs ? assistantLabel : undefined} />
 								) : null}
 							</div>
 						</div>

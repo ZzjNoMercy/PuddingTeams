@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyRecoveredToolResults, markRunningToolCalls, reducePiEvent, renderHistory, replayPiEvents } from "./events";
+import { applyRecoveredToolResults, groupConsecutiveModelErrors, markRunningToolCalls, reducePiEvent, renderHistory, replayPiEvents } from "./events";
 import type { PiMessage } from "./types";
 
 test("历史回放保留 running 投影里的 Delegation 与执行过程入口", () => {
@@ -165,4 +165,35 @@ test("历史重对齐后的实时 thinking 保留 assistant turn 起点", () => 
 
 	assert.equal(rendered[0]?.streaming, true);
 	assert.equal(rendered[0]?.timestamp, 1_000, "计时必须继续使用原 turn 起点，不能改成重挂载时间");
+});
+
+test("pi SDK 连续自动重试错误合并为一个渲染组", () => {
+	const attempts = Array.from({ length: 4 }, (_, index) => ({
+		id: `error-${index}`,
+		role: "assistant" as const,
+		content: "暂时无法连接模型服务",
+		toolCalls: [],
+		timestamp: index,
+		streaming: false,
+		error: true,
+		modelError: {
+			title: "暂时无法连接模型服务",
+			explanation: "请求在传输过程中超时或连接中断。",
+			action: "请检查网络后重试。",
+		},
+		errorDetail: `attempt ${index + 1}`,
+	}));
+	const recovered = {
+		id: "success",
+		role: "assistant" as const,
+		content: "连接恢复",
+		toolCalls: [],
+		timestamp: 5,
+		streaming: false,
+	};
+
+	const groups = groupConsecutiveModelErrors([...attempts, recovered]);
+	assert.equal(groups.length, 2);
+	assert.equal(groups[0]?.length, 4);
+	assert.equal(groups[1]?.[0]?.id, "success");
 });

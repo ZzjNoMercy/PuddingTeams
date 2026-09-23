@@ -6,7 +6,7 @@ export async function isWorkspaceOwnerClosed(workStates: Pick<WorkStateStore, "g
 	if (!owner.goalId || !owner.workItemId) return false;
 	const goal = await workStates.getGoal(owner.managerSessionId, owner.goalId);
 	if (!goal?.plan || goal.plan.id !== owner.workPlanId) return false;
-	if (goal.status === "cancelled") return true;
+	if (goal.status === "cancelled" || goal.status === "superseded") return true;
 	const item = goal.plan.items[owner.workItemId];
 	if (item?.status === "cancelled") return true;
 	if (item?.status !== "accepted") return false;

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { ChevronDownIcon, EllipsisIcon, FolderGit2Icon, FolderOpenIcon, InfoIcon, LayersIcon, ListTreeIcon, PanelLeftOpenIcon } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -51,6 +51,14 @@ import { SessionWorkCard } from "./session-work-card";
 import type { SessionExecutionTurn, SessionRuntimeSummary, SessionRuntimeView } from "./session-activity-drawer";
 import { WorkerProcessDrawer } from "./worker-process-dialog";
 import { WorkerProcessProvider } from "./worker-process-context";
+import { InlinePiHistoryGate, InlinePiProcessProvider } from "./inline-pi-process";
+
+const inlinePreferenceEvent = "pudding:inline-pi-process";
+function subscribeInlinePreference(notify: () => void) {
+	window.addEventListener("storage", notify);
+	window.addEventListener(inlinePreferenceEvent, notify);
+	return () => { window.removeEventListener("storage", notify); window.removeEventListener(inlinePreferenceEvent, notify); };
+}
 
 /** StickToBottom 的 isAtBottom 桥给悬浮层外的兄弟组件（统计条淡入淡出）。 */
 function AtBottomReporter({ onChange }: { onChange: (atBottom: boolean) => void }) {
@@ -301,6 +309,12 @@ function SessionChat({
 		() => [...messages].reverse().find((message) => message.role === "custom" && message.customType === "pudding:work_plan_update")?.id,
 		[messages],
 	);
+	const inlineHistoryIds = messages.flatMap((message) => {
+		const details = message.details as { delegationId?: string; taskId?: string; status?: string; from?: string } | undefined;
+		const rendered = message.customType === "pudding:task_result" || (message.customType === "pudding:task_assign"
+			&& (details?.from === "direct" || details?.from === "solo") && details.status === "running" && !resolvedTaskIds.has(details.taskId ?? ""));
+		return rendered && details?.delegationId ? [details.delegationId] : [];
+	});
 	// 拆分「等 worker」与「manager 思考」：delegate 工具阻塞在 manager 的 run 里，
 	// run 活跃不等于 manager 在生成。有 running 态委托调用时，composer 提示
 	// 等待哪个 worker，而不是笼统的「处理中」。
@@ -357,6 +371,7 @@ function SessionChat({
 				<MessageQuickActionProvider onDraft={draftFromMessage}>
 					<Conversation initial="instant" resize={layoutReady ? "smooth" : "instant"}>
 						<AtBottomReporter onChange={setAtBottom} />
+						<InlinePiHistoryGate ids={inlineHistoryIds} historyLoading={historyLoading}>
 						<QueryInputAxis items={queryAxisItems} />
 						<ConversationContent className="home-message-column">
 							<div className="home-session-marker"><span />{sessionLabel}{sessionModifiedAt ? ` · ${compactDay(sessionModifiedAt)}` : ""}<span /></div>
@@ -374,6 +389,7 @@ function SessionChat({
 								)
 							)}
 						</ConversationContent>
+						</InlinePiHistoryGate>
 						<ConversationScrollButton
 							portalTarget={scrollButtonHost}
 							className="home-scroll-to-bottom"
@@ -437,6 +453,16 @@ export function ChatPane({
 	onRoomsMayHaveChanged?: () => void;
 }) {
 	const [room, setRoom] = useState<RoomSummary | null>(null);
+	const inlinePreferenceKey = `pudding:inline-pi-process:${roomId}`;
+	const inlinePiProcess = useSyncExternalStore(subscribeInlinePreference, () => {
+		try { return localStorage.getItem(inlinePreferenceKey) === "true"; } catch { return false; }
+	}, () => false);
+	const toggleInlinePiProcess = () => {
+		try {
+			localStorage.setItem(inlinePreferenceKey, String(!inlinePiProcess));
+			window.dispatchEvent(new Event(inlinePreferenceEvent));
+		} catch { toast.error("无法保存显示偏好"); }
+	};
 	const [activeId, setActiveId] = useState<string>("");
 	const [status, setStatus] = useState<ChatStatus>("connecting");
 	const [delayedConnectionStatus, setDelayedConnectionStatus] = useState<ChatStatus | null>(null);
@@ -734,6 +760,7 @@ export function ChatPane({
 	const directMemberName = members[0]?.name ?? "Worker";
 	const type = room?.type ?? "solo";
 	const isSingle = type === "direct";
+	const canInlinePiProcess = isSingle && members[0]?.connector?.connectorId === "pi";
 	const isGroup = type === "group";
 	const headerTitle = room?.name ?? "与 pi manager 对话";
 	const activeSession = room?.sessions.find((s) => s.active);
@@ -784,6 +811,12 @@ export function ChatPane({
 					</div>
 				</div>
 				<div className="home-chat-actions">
+					{canInlinePiProcess ? <button type="button" role="switch" aria-checked={inlinePiProcess}
+						aria-label="在主对话中显示执行过程" title="在主对话中显示 Pi Worker 的思考、工具调用和回复"
+						className="flex items-center gap-2 rounded-lg px-2 py-1.5 text-xs text-muted-foreground hover:bg-muted"
+						onClick={toggleInlinePiProcess}>
+						<span>执行过程</span><span className={`flex h-4 w-7 items-center rounded-full p-0.5 transition-colors ${inlinePiProcess ? "bg-primary" : "bg-muted-foreground/30"}`}><span className={`size-3 rounded-full bg-background transition-transform ${inlinePiProcess ? "translate-x-3" : ""}`} /></span>
+					</button> : null}
 					<SessionMenu
 						sessions={room?.sessions ?? []}
 						trigger={(
@@ -830,7 +863,7 @@ export function ChatPane({
 				</div>
 			</header>
 			{activeId && room ? (
-				<WorkerProcessProvider value={{ openWorkerProcess }}>
+				<InlinePiProcessProvider key={activeId} enabled={canInlinePiProcess && inlinePiProcess} roomId={roomId} sessionId={activeId} openWorkerProcess={openWorkerProcess}>
 				<SessionChat
 					key={activeId}
 					roomId={roomId}
@@ -855,7 +888,7 @@ export function ChatPane({
 					onRuntimeViewChange={setRuntimeView}
 					onRuntimeSummaryChange={setRuntimeSummary}
 				/>
-				</WorkerProcessProvider>
+				</InlinePiProcessProvider>
 			) : null}
 			</div>
 

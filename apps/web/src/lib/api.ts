@@ -1372,18 +1372,35 @@ function operationKey(kind: string): string {
 	return `${kind}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
 }
 
+export class WorkStateApiConflictError extends Error {
+	constructor(
+		message: string,
+		readonly expectedRevision: number,
+		readonly currentRevision: number,
+		readonly current: SessionWorkState,
+	) {
+		super(message);
+		this.name = "WorkStateApiConflictError";
+	}
+}
+
 export async function reviewWorkItem(
 	sessionId: string,
 	workItemId: string,
-	input: { expectedGoalId: string; expectedRevision: number; expectedEpoch: number; verdict: "accepted" | "revision" | "blocked"; summary: string; evidenceRefs?: string[] },
+	input: { expectedGoalId: string; expectedRevision: number; expectedEpoch: number; expectedWorkItemRevision: number; expectedSubmissionId: string; verdict: "accepted" | "revision" | "blocked"; summary: string; evidenceRefs?: string[] },
 ): Promise<SessionWorkState> {
 	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/work-items/${encodeURIComponent(workItemId)}/review`, {
 		method: "POST",
 		headers: { "content-type": "application/json", "Idempotency-Key": operationKey("work-item-review") },
 		body: JSON.stringify(input),
 	});
-	const body = (await res.json()) as { workState?: SessionWorkState; error?: string };
-	if (!res.ok) throw new Error(body.error ?? `review work item failed: ${res.status}`);
+	const body = (await res.json()) as { workState?: SessionWorkState; current?: SessionWorkState; expectedRevision?: number; currentRevision?: number; error?: string; code?: string };
+	if (!res.ok) {
+		if (res.status === 409 && body.code === "stale_goal_state" && body.current && body.expectedRevision !== undefined && body.currentRevision !== undefined) {
+			throw new WorkStateApiConflictError(body.error ?? "验收目标已变化", body.expectedRevision, body.currentRevision, body.current);
+		}
+		throw new Error(body.error ?? `review work item failed: ${res.status}`);
+	}
 	return body.workState!;
 }
 
@@ -1407,6 +1424,34 @@ export async function resumeGoal(sessionId: string, expectedGoalId: string, expe
 	const body = (await res.json()) as { workState?: SessionWorkState; error?: string };
 	if (!res.ok) throw new Error(body.error ?? `resume goal failed: ${res.status}`);
 	return body.workState!;
+}
+
+export async function abandonGoal(sessionId: string, expectedGoalId: string, expectedRevision: number, reason: string): Promise<SessionWorkState> {
+	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/goal/abandon`, {
+		method: "POST",
+		headers: { "content-type": "application/json", "Idempotency-Key": operationKey("goal-abandon") },
+		body: JSON.stringify({ expectedGoalId, expectedRevision, reason }),
+	});
+	const body = (await res.json()) as { workState?: SessionWorkState; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `abandon goal failed: ${res.status}`);
+	return body.workState!;
+}
+
+export async function supersedeGoal(
+	sessionId: string,
+	input: {
+		expectedGoalId: string; expectedRevision: number; reason: string;
+		goal: string; completionBoundary: string; reviewMode?: "manager" | "independent"; reviewerModel?: string;
+	},
+): Promise<{ previous: SessionWorkState; workState: SessionWorkState }> {
+	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/goal/supersede`, {
+		method: "POST",
+		headers: { "content-type": "application/json", "Idempotency-Key": operationKey("goal-supersede") },
+		body: JSON.stringify(input),
+	});
+	const body = (await res.json()) as { previous?: SessionWorkState; workState?: SessionWorkState; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `supersede goal failed: ${res.status}`);
+	return { previous: body.previous!, workState: body.workState! };
 }
 
 /** Switch the active pi session of a window. */

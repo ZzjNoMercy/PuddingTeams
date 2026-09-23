@@ -183,6 +183,14 @@ export interface ToolCallView {
 
 export type ChatMessageRole = "user" | "assistant" | "toolResult" | "custom";
 
+export interface ModelErrorPresentation {
+	title: string;
+	explanation: string;
+	action: string;
+	/** Partial model text received before the provider stream failed. */
+	partialContent?: string;
+}
+
 export interface ChatMessage {
 	id: string;
 	role: ChatMessageRole;
@@ -192,6 +200,8 @@ export interface ChatMessage {
 	timestamp: number;
 	streaming: boolean;
 	error?: boolean;
+	/** User-facing provider failure copy, kept structured so retries can share one compact card. */
+	modelError?: ModelErrorPresentation;
 	/** Raw provider/SDK diagnostic, rendered collapsed and never as primary copy. */
 	errorDetail?: string;
 	name?: string;
@@ -633,7 +643,7 @@ export interface RoomSession {
 	model?: string;
 }
 
-export type SessionWorkStatus = "active" | "resolved" | "cancelled";
+export type SessionWorkStatus = "active" | "resolved" | "cancelled" | "superseded";
 export type CompletionReviewMode = "manager" | "independent";
 export type GoalExecutionStatus = "idle" | "running" | "waiting_human" | "interrupted" | "recovering" | "reviewing";
 export type WorkItemStatus = "planned" | "ready" | "in_progress" | "waiting_admission" | "waiting_input" | "submitted" | "revision" | "accepted" | "blocked" | "cancelled";
@@ -769,6 +779,15 @@ export interface SessionWorkState {
 		};
 		resumeLease?: { ownerId: string; token: string; expiresAt: string };
 	};
+	abandonment?: {
+		kind: "user_abandoned" | "manager_abandoned" | "terminal_interrupt" | "superseded";
+		by: string;
+		reason: string;
+		at: string;
+		evidenceGaps: string[];
+	};
+	supersededByGoalId?: string;
+	supersedesGoalId?: string;
 	plan?: GoalWorkPlan;
 	artifactIds: string[];
 	revision: number;
@@ -787,17 +806,29 @@ export interface WorkItemSubmission {
 	executionReceipt?: ExecutionReceipt;
 	workspaceChangeSetId?: string;
 	workspaceChangeSet?: WorkspaceChangeSet;
+	submittedStateRevision: number;
 	goalRevision: number;
 	workItemRevision: number;
 	inputFingerprint: string;
 	verifications: VerificationRecord[];
-	acceptanceIntent?: { verdict: "accepted"; summary: string; evidenceRefs: string[]; requestedAt: string };
+	acceptanceIntent?: {
+		verdict: "accepted";
+		summary: string;
+		evidenceRefs: string[];
+		expectedStateRevision: number;
+		reviewedStateRevision: number;
+		rebasedFromRevision?: number;
+		requestedAt: string;
+	};
 	summary?: string;
 	submittedAt: string;
 	review?: {
 		verdict: "accepted" | "revision" | "blocked";
 		summary: string;
 		evidenceRefs: string[];
+		expectedStateRevision: number;
+		reviewedStateRevision: number;
+		rebasedFromRevision?: number;
 		reviewedAt: string;
 	};
 }

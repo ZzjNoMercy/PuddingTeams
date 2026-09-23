@@ -313,13 +313,19 @@ agent_<worker>__delegate({
 })
 
 review_work_item({
+	goalId,
+	expectedEpoch,
   workItemId,
   expectedRevision,
+	expectedWorkItemRevision,
+	expectedSubmissionId,
   verdict: "accepted" | "revision" | "blocked",
   summary,
   evidenceRefs?: string[]
 })
 ```
+
+`review_work_item` 的结论必须绑定 Manager 实际阅读的不可变 Submission，而不能只绑定易被 observer/其他 WorkItem 推进的 Goal 全局 `revision`。context 对每个未完成 WorkItem同时投影 `itemRevision + submissionId + submittedStateRevision + submissionWorkItemRevision`；Manager 必须原样回传，禁止推算或猜测 revision。`submittedStateRevision` 是该 Submission 首次进入权威快照的全局 revision，调用方声称看到的 `expectedRevision` 不得早于它，也不得大于当前 revision。Store 在同一串行临界区内校验 `goalId + epoch + WorkItem revision + Submission id + Submission 冻结契约`：这些目标事实任一变化都 fail-closed；只有合法旧快照中的 Goal 全局 revision 因无关写入继续前进、而验收目标完全相同时，才允许安全 rebase 到当前聚合快照。review/acceptance-intent 审计同时记录 `expectedStateRevision/reviewedStateRevision/rebasedFromRevision`。
 
 `sourceGoalCriterionIndexes` 是从 1 开始的结构化序号，只引用 context 中展示的 `{index, criterion}`。Manager 不读写 `goal:<revision>:<ordinal>` 内部 ID，也不能把 `id=文本` 展示串回传；core tool 在当前 `goalId/revision` 下把序号原子映射为持久化的 `sourceGoalCriteria` 稳定引用。
 
@@ -513,6 +519,8 @@ GET  /api/sessions/:sessionId/work-plan/summary
 GET  /api/sessions/:sessionId/goal/recovery
 POST /api/sessions/:sessionId/goal/interrupt
 POST /api/sessions/:sessionId/goal/resume
+POST /api/sessions/:sessionId/goal/abandon
+POST /api/sessions/:sessionId/goal/supersede
 ```
 
 所有写接口要求 `Idempotency-Key`；请求体仍带 `expectedRevision`。HTTP 重试使用原 key，用户明确发起一次新操作才生成新 key。Manager core tool 不让模型生成 key，直接用 pi `toolCallId` 作 `operationId`。
@@ -546,12 +554,20 @@ Goal 是持久控制面，不是一个长时间内存进程。服务重启、Man
 
 “恢复 Goal”取得当前 epoch 的 resume lease，把执行态从 `interrupted → recovering → running/waiting_human`，不再次提升 epoch。同一 interruption fingerprint、interrupt operationId 或 resume operationId 的重放都必须返回原结果。
 
+暂停、废弃和更换是三种不同命令：
+
+1. `interrupt` 只表达“稍后继续”。若中断时没有在飞 Delegation、没有 pending Decision，且 WorkPlan 至少有一项并且全部处于不可再推进的 `accepted/cancelled` 终态，则继续已无可达状态；同一次命令直接把 Goal 收敛为 `cancelled`，保留 `interruption`，并记录 `abandonment.kind=terminal_interrupt`。`blocked` 仍可由 Manager 显式 reopen，不算此处终态。
+2. `abandon` 表达“不再继续”。它把 Goal 置为 `cancelled`，写入 `abandonment { kind, by, reason, at, evidenceGaps }`，取消所有非终态 WorkItem 与 pending Decision，并经既有 Runtime cancel/reconcile 生命周期终止在飞 Delegation。Manager 对等工具为 `abandon_session_goal`，UI 必须二次确认。
+3. `supersede` 表达“换成另一个持续目标”。一次 store 原子写内把旧 Goal 置为 `superseded`、通过 `supersededByGoalId` 链到新 Goal，同时创建带 `supersedesGoalId` 的新 Goal；不得先关旧 Goal 再另发 create。旧 Goal 已提交但未验收的 Submission 写入 `abandonment.evidenceGaps`，不能因更换而伪装成已验收。
+
+`abandon/supersede` 都会提升旧 Goal epoch，旧回调只能保留审计。新 Goal 从 epoch 1、revision 0 开始，随后仍须按正常规则建立 WorkPlan。
+
 ### 10.2 业务状态与执行状态分层
 
 当前 `SessionWorkStatus` 把 `waiting_human` 混进 Goal 生命周期。目标结构直接拆开：
 
 ```ts
-status: "active" | "resolved" | "cancelled";
+status: "active" | "resolved" | "cancelled" | "superseded";
 execution: {
   epoch: number;
   status: "idle" | "running" | "waiting_human" | "interrupted" | "recovering" | "reviewing";
@@ -570,7 +586,7 @@ execution: {
 operationId + goalId + sessionId + epoch + kind + payloadHash + expectedRevision
 ```
 
-- 新 `operationId`：先校验 `expectedGoalId === activeGoalId`，再按 `expectedRevision + epoch` 校验后执行，在一次原子写中提交新快照、operation result 和 outbox event；
+- 新 `operationId`：先校验 `expectedGoalId === activeGoalId`，再按 `expectedRevision + epoch` 校验后执行，在一次原子写中提交新快照、operation result 和 outbox event；`review_work_item` 额外执行下述目标级 CAS；
 - 相同 `operationId + payloadHash`：直接返回已记录结果，不增 revision、不再追加 review/Decision/Submission；
 - 相同 `operationId` 但 payload 不同：`409 idempotency_conflict`；
 - 新 `operationId` 但 goalId/revision/epoch 过期：`409 stale_goal_state`，返回当前快照；
@@ -578,6 +594,15 @@ operationId + goalId + sessionId + epoch + kind + payloadHash + expectedRevision
 - 独立复核另用 `review:<sessionId>:<goalRevision>:<evidenceDigest>` 去重，避免服务在 reviewer 返回后、落盘前崩溃导致重复追加。
 
 `expectedRevision` 只防并发覆盖，不能代替幂等键；没有 operation ledger 时，“落盘成功但 HTTP/toolResult 丢失”的重试仍会重复执行。除 `create_goal` 以 Session 为幂等作用域外，所有 Goal 写命令的 ledger 都以 `goalId + operationId` 为作用域：后继 Goal 可合法复用客户端幂等键，旧 Goal 的迟到工具调用、HTTP 请求或 reviewer 结果则只能重放旧结果或被拒绝，不能隐式解析并写入新 active Goal。
+
+WorkItem 验收使用两级 CAS，而不是放松并发控制：
+
+```text
+第一层：goalId + execution.epoch 必须与 Manager 观察时一致
+第二层：WorkItem.revision + pending Submission.id + Submission(goalRevision/workItemRevision) 必须一致
+```
+
+若两层目标身份均一致，且 `submittedStateRevision <= expectedRevision < currentRevision`，说明 Manager 确实可能观察过该 Submission，随后只有聚合状态继续前进；Store 可在原子写内把 review 安全落到当前 revision，并记录 rebase 来源。`expectedRevision < submittedStateRevision` 的快照不可能包含该 Submission，`expectedRevision > currentRevision` 则是未来版本猜测，两者都必须拒绝。若验收对象、契约、Goal contract 或 epoch 变化，同样返回 `stale_goal_state`，包含 `expectedRevision/currentRevision/current`，调用方必须重新阅读最新 Submission；禁止直接把旧 verdict 套用到最新 revision。模型提示明确禁止 `0→1→8` 式猜数，工具也不实现无限自动重试。
 
 ### 10.4 Outbox 与唤醒
 

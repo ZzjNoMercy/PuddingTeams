@@ -53,11 +53,13 @@ export const CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM = "advance_manager_work_item";
 export const CORE_TOOL_REVIEW_WORK_ITEM = "review_work_item";
 export const CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION = "request_work_item_verification";
 export const CORE_TOOL_READ_DELEGATION_RESULT = "read_delegation_result";
+export const CORE_TOOL_ABANDON_GOAL = "abandon_session_goal";
+export const CORE_TOOL_SUPERSEDE_GOAL = "supersede_session_goal";
 /** solo：manager 自建群聊并下达首条任务（房间即群聊 §manager 建房）。 */
 export const CORE_TOOL_CREATE_GROUP = "create_group_window";
 /** group：拉其他已启用 worker 进本群（成员变化走既有撤权/重建链）。 */
 export const CORE_TOOL_INVITE = "invite_to_group";
-const GOAL_ACTIVE_TOOLS = [CORE_TOOL_UPDATE_WORK_STATE, CORE_TOOL_REQUEST_DECISION, CORE_TOOL_UPDATE_WORK_PLAN, CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM, CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION, CORE_TOOL_REVIEW_WORK_ITEM] as const;
+const GOAL_ACTIVE_TOOLS = [CORE_TOOL_UPDATE_WORK_STATE, CORE_TOOL_REQUEST_DECISION, CORE_TOOL_UPDATE_WORK_PLAN, CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM, CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION, CORE_TOOL_REVIEW_WORK_ITEM, CORE_TOOL_ABANDON_GOAL, CORE_TOOL_SUPERSEDE_GOAL] as const;
 const GOAL_CONTROLLED_TOOLS = [CORE_TOOL_CREATE_GOAL, ...GOAL_ACTIVE_TOOLS] as const;
 
 /** manager Session 的窗口上下文（装配时解析，工具执行期按需重读）。 */
@@ -126,6 +128,8 @@ export async function planManagerTools(
 		CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM,
 		CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION,
 		CORE_TOOL_REVIEW_WORK_ITEM,
+		CORE_TOOL_ABANDON_GOAL,
+		CORE_TOOL_SUPERSEDE_GOAL,
 		CORE_TOOL_READ_DELEGATION_RESULT,
 		CORE_TOOL_CREATE_GROUP,
 		CORE_TOOL_INVITE,
@@ -250,7 +254,6 @@ const UpdateWorkStateParams = Type.Object({
 		Type.Union([
 			Type.Literal("active"),
 			Type.Literal("resolved"),
-			Type.Literal("cancelled"),
 		]),
 	),
 	verifierAgentId: Type.Optional(Type.String({ description: "Goal finalGoalMode=environment_verified 时使用的 Verifier Worker。" })),
@@ -281,6 +284,30 @@ const CreateGoalParams = Type.Object({
 		source: Type.Union([Type.Literal("user"), Type.Literal("manager_derived")]),
 		reason: Type.String({ minLength: 1, description: "为何本 Goal 需要该验证强度；用户明确要求时 source=user。" }),
 	}, { description: "可显式提高 Harness 默认验证等级；Goal 生效后不能静默降低。" })),
+});
+
+const AbandonGoalParams = Type.Object({
+	goalId: Type.String({ description: "当前 Goal id。" }),
+	expectedRevision: Type.Integer({ minimum: 0 }),
+	reason: Type.String({ minLength: 1, description: "用户不再继续该 Goal 的明确原因。" }),
+});
+
+const SupersedeGoalParams = Type.Object({
+	goalId: Type.String({ description: "要被更换的当前 Goal id。" }),
+	expectedRevision: Type.Integer({ minimum: 0 }),
+	reason: Type.String({ minLength: 1, description: "为何新目标替代旧目标。" }),
+	goal: Type.String({ description: "用户已经明确表达的新目标。" }),
+	completionCriteria: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, uniqueItems: true }),
+	completionReviewMode: Type.Optional(Type.Union([Type.Literal("manager"), Type.Literal("independent")])),
+	criteriaOrigin: Type.Union([Type.Literal("user_input"), Type.Literal("manager_derived")]),
+	sourceMessageIds: Type.Array(Type.String(), { minItems: 1, description: "新目标所依据的用户消息 id。" }),
+	verificationPolicy: Type.Optional(Type.Object({
+		minimumWorkItemMode: Type.Union([Type.Literal("manager_review"), Type.Literal("independent_evidence_review"), Type.Literal("environment_verified")]),
+		finalGoalMode: Type.Union([Type.Literal("manager_review"), Type.Literal("independent_evidence_review"), Type.Literal("environment_verified")]),
+		trigger: Type.Union([Type.Literal("manager_request"), Type.Literal("auto_on_submission")]),
+		source: Type.Union([Type.Literal("user"), Type.Literal("manager_derived")]),
+		reason: Type.String({ minLength: 1 }),
+	})),
 });
 
 const UpdateWorkPlanParams = Type.Object({
@@ -321,8 +348,11 @@ const UpdateWorkPlanParams = Type.Object({
 
 const ReviewWorkItemParams = Type.Object({
 	goalId: Type.String({ description: "系统提示中当前 Goal 的 goalId。" }),
+	expectedEpoch: Type.Integer({ minimum: 1, description: "系统提示中当前 Goal 的 execution epoch。epoch 变化后不得沿用旧验收结论。" }),
 	workItemId: Type.String(),
-	expectedRevision: Type.Integer({ minimum: 0 }),
+	expectedRevision: Type.Integer({ minimum: 0, description: "形成验收结论时看到的 Goal 全局 revision；只能来自权威上下文或上一写操作返回值，禁止猜测。" }),
+	expectedWorkItemRevision: Type.Integer({ minimum: 0, description: "形成验收结论时看到的 WorkItem 契约 revision。" }),
+	expectedSubmissionId: Type.String({ minLength: 1, description: "本次结论所验收的不可变 Submission id。" }),
 	verdict: Type.Union([Type.Literal("accepted"), Type.Literal("revision"), Type.Literal("blocked")]),
 	summary: Type.String(),
 	evidenceRefs: Type.Optional(Type.Array(Type.String())),
@@ -403,7 +433,7 @@ export async function verifyWorkItemSubmission(
 	// immutable Submission id, so a Goal-only revision advance must not suppress
 	// the unique scheduled verification. Manual calls retain the strict revision
 	// fence so stale model tool calls still fail closed.
-	if (current.revision !== params.expectedRevision && trigger !== "auto_on_submission") throw new WorkStateConflictError(current);
+	if (current.revision !== params.expectedRevision && trigger !== "auto_on_submission") throw new WorkStateConflictError(current, params.expectedRevision);
 	const item = current.plan.items[params.workItemId];
 	if (!item || item.status !== "submitted") throw new Error("只有 submitted WorkItem 可以复验");
 	const submission = [...item.submissions].reverse().find((entry) => !entry.review);
@@ -624,7 +654,8 @@ export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowCon
 function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => void {
 	return (pi) => {
 		let latestUserSourceIds = new Set<string>();
-		pi.on("tool_call", async () => {
+		pi.on("tool_call", async (event) => {
+			if (event.toolName === CORE_TOOL_ABANDON_GOAL || event.toolName === CORE_TOOL_SUPERSEDE_GOAL) return;
 			const waiting = await managerHumanWait(deps.getSessionId(), deps.invoker, deps.workStates);
 			if (waiting) return { block: true, reason: waiting, terminate: true };
 		});
@@ -680,14 +711,14 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 					.slice(0, 24)
 					.map((item) => {
 						const submission = item.submissions.at(-1);
-						return `- ${item.id} [${item.status}] dependsOn=${item.dependsOn.join(",") || "无"} active=${item.activeDelegationId ?? "无"}${submission?.summary ? `｜最近提交：${truncate(submission.summary).slice(0, 500)}` : ""}`;
+						return `- ${item.id} [${item.status}] itemRevision=${item.revision} dependsOn=${item.dependsOn.join(",") || "无"} active=${item.activeDelegationId ?? "无"}${submission ? ` submissionId=${submission.id} submittedStateRevision=${submission.submittedStateRevision} submissionWorkItemRevision=${submission.workItemRevision}` : ""}${submission?.summary ? `｜最近提交：${truncate(submission.summary).slice(0, 500)}` : ""}`;
 					})
 				: [];
 			const workSection = workState
 				? [
 						"[PuddingTeams 当前工作上下文]",
 						"当前 Session 是一个需要持续负责的 Goal。manager 是唯一可更新当前工作状态的责任主体。",
-						"先判断本轮用户意图是否属于当前 Goal：相关追问、补充或约束变更才继续当前 Goal；无关的一次性问答正常回答且不得改写 Goal；若用户提出另一个需要持续执行的目标，不得静默覆盖当前 Goal，当前 Goal 未结束时先请用户选择继续、结束或另开 Session。Goal 终态后可在同一 Session 创建新的 Goal，旧 Goal 保留为历史。",
+						`先判断本轮用户意图是否属于当前 Goal：相关追问、补充或约束变更才继续当前 Goal；无关的一次性问答正常回答且不得改写 Goal。用户明确不再继续时调用 ${CORE_TOOL_ABANDON_GOAL}；用户明确提出另一个持续目标或新请求明显取代旧目标时调用 ${CORE_TOOL_SUPERSEDE_GOAL}，禁止把新任务绑定到旧 WorkPlan。Goal 终态后可在同一 Session 创建新的 Goal，旧 Goal 保留为历史。`,
 						`目标：${workState.goal}`,
 						`完成边界：${workState.completionBoundary}`,
 						`完成复核：${workState.reviewMode === "independent" ? `独立 reviewer${workState.reviewerModel ? `（${workState.reviewerModel}）` : "（自动选择模型）"}` : "manager 自审"}`,
@@ -698,7 +729,8 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 						`冻结 Goal 完成条件（update_work_plan 的 sourceGoalCriterionIndexes 只填写 index）：\n${JSON.stringify(goalCriterionRefs(workState).map((item, index) => ({ index: index + 1, criterion: item.text })))}`,
 						...(harness ? [`Harness 新 WorkItem 默认：verification=${harness.verification.defaultWorkItemMode}/${harness.verification.trigger}；Git 写任务 workspace=${harness.workspaceExecution.gitWriteDefault}；非 Git 写任务 workspace=${harness.workspaceExecution.nonGitWriteDefault}。创建/修改 WorkItem 时必须按任务事实显式填写 verificationPolicy 与 workspaceExecutionPolicy：讨论/拆解可 manager_review+read_only_shared；调研证据至少 independent_evidence_review；代码、构建、页面和真实交付提高到 environment_verified；Git 写入按 Harness 默认 isolated_worktree/exclusive_write，非 Git 写入用 exclusive_write。不得把写任务声明成 Manager 自执行。`] : []),
 						...(workState.plan ? [`Manager WorkPlan（覆盖 Goal r${workState.plan.coveredGoalRevision}${workState.plan.needsReconcile ? "，必须先对账当前 Goal 契约" : ""}）：\n${planLines.join("\n") || "（全部已验收）"}`] : ["Manager WorkPlan：尚未建立。多步骤、依赖或多 Worker 任务先调用 update_work_plan。"]),
-						`Goal 状态写操作必须串行：一次只调用一个 ${CORE_TOOL_UPDATE_WORK_PLAN}/${CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM}/${CORE_TOOL_REVIEW_WORK_ITEM}/${CORE_TOOL_UPDATE_WORK_STATE}，拿到新 revision 后再调用下一个，禁止在同一轮并行提交多个写操作。`,
+						`Goal 状态写操作必须串行：一次只调用一个 ${CORE_TOOL_UPDATE_WORK_PLAN}/${CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM}/${CORE_TOOL_REVIEW_WORK_ITEM}/${CORE_TOOL_UPDATE_WORK_STATE}/${CORE_TOOL_ABANDON_GOAL}/${CORE_TOOL_SUPERSEDE_GOAL}，拿到新 revision 后再调用下一个，禁止在同一轮并行提交多个写操作。`,
+						`revision 只能来自本段权威工作上下文或上一个写工具的成功结果，禁止推算、递增猜测或复用委托开始前的 revision。${CORE_TOOL_REVIEW_WORK_ITEM} 必须原样携带当前 WorkItem 的 itemRevision、submissionId 和 Goal epoch；全局 revision 变化但验收目标未变时 Store 会安全对齐，目标或契约变化时必须重新阅读最新 Submission 后再判断。`,
 						`assignedAgentId=manager 的 WorkItem 开始时调用 ${CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM} 标记 in_progress，完成交付后再标记 submitted，然后调用 ${CORE_TOOL_REVIEW_WORK_ITEM} 验收；不得删除 Manager 工作项绕过提交和验收。worker 委托完成只代表 submitted，同样必须明确验收。`,
 						`只有完成边界已满足且证据充分时才提交 status=resolved。manager 自审必须在 completionCriteria 中逐条原样回填全部冻结条件、证据和 satisfied 结论；独立复核 Goal 会启动隔离 reviewer。Worker 原生 input_required/respond 必须作为同一个 WorkItem、同一个 Delegation、同一个 Run 的暂停与恢复处理：不得拆成询问前后两个 WorkItem，用户通过审批卡回答后不得再发 followup、验证委托或替代委托。上游限流由 Runtime 在同一 Delegation/Session 内冷却续跑，不要因 429 立即重新委托。遇到产品/业务取舍时调用 ${CORE_TOOL_REQUEST_DECISION}。`,
 					].join("\n")
@@ -850,6 +882,70 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 		});
 
 		pi.registerTool({
+			name: CORE_TOOL_ABANDON_GOAL,
+			label: "Abandon Session Goal",
+			description: "用户明确表示不再继续当前 Goal 时，将其关闭为废弃终态。会取消未终态 WorkItem、待处理决策和在飞委托；不要把暂时暂停当成废弃。",
+			parameters: AbandonGoalParams,
+			async execute(toolCallId, params: Static<typeof AbandonGoalParams>, signal) {
+				if (!deps.workStates) throw new Error("Session Work State 未启用");
+				throwIfAborted(signal);
+				const sessionId = deps.getSessionId();
+				if (!await deps.workStates.getGoal(sessionId, params.goalId)) throw new Error("Goal 不存在");
+				const active = (await deps.invoker.delegationsForManagerSession(sessionId)).filter((item) => item.goalId === params.goalId && ["waiting_admission", "running", "waiting_input", "cancel_requested", "reconciling"].includes(item.executionState));
+				const state = await deps.workStates.abandonGoal(sessionId, params.expectedRevision, {
+					kind: "manager_abandoned",
+					by: "manager",
+					reason: params.reason,
+					delegationIds: active.map((item) => item.id),
+				}, toolCallId, params.goalId);
+				await Promise.all(active.map((item) => deps.invoker.cancel(item.id, signal).catch(() => undefined)));
+				return { content: [{ type: "text", text: `Goal 已废弃并关闭（goalId ${state.goalId}）。后续新任务不再受其 WorkPlan 门禁约束。` }], details: { workState: state } };
+			},
+		});
+
+		pi.registerTool({
+			name: CORE_TOOL_SUPERSEDE_GOAL,
+			label: "Supersede Session Goal",
+			description: "用户明确把持续目标换成另一件事时，原子地把旧 Goal 标为 superseded 并建立新 Goal。旧 Goal 的未验收 Submission 会作为 evidence gap 保留。",
+			parameters: SupersedeGoalParams,
+			async execute(toolCallId, params: Static<typeof SupersedeGoalParams>, signal) {
+				if (!deps.workStates) throw new Error("Session Work State 未启用");
+				throwIfAborted(signal);
+				const sessionId = deps.getSessionId();
+				const ctx = await deps.resolveContext();
+				if (!ctx || ctx.type === "direct") throw new Error("direct Session 只能由用户通过 Goal UI 更换 Goal");
+				const activation = deps.productSettings ? (await deps.productSettings.get()).harness.goalActivation[ctx.type] : "manager_explicit";
+				if (activation !== "manager_explicit") throw new Error(`当前 Harness goalActivation.${ctx.type}=${activation}，Manager 无权更换 Goal`);
+				if (!await deps.workStates.getGoal(sessionId, params.goalId)) throw new Error("Goal 不存在");
+				const invalidSources = params.sourceMessageIds.filter((id) => !latestUserSourceIds.has(id));
+				if (invalidSources.length) throw new Error(`sourceMessageIds 不是当前上下文中的真实用户消息引用：${invalidSources.join("、")}`);
+				const completionCriteria = params.completionCriteria.map((criterion) => criterion.trim());
+				if (completionCriteria.some((criterion) => !criterion)) throw new Error("completionCriteria 不能包含空条件");
+				const active = (await deps.invoker.delegationsForManagerSession(sessionId)).filter((item) => item.goalId === params.goalId && ["waiting_admission", "running", "waiting_input", "cancel_requested", "reconciling"].includes(item.executionState));
+				const result = await deps.workStates.supersedeGoal(sessionId, params.expectedRevision, {
+					by: "manager",
+					reason: params.reason,
+					delegationIds: active.map((item) => item.id),
+					goal: params.goal,
+					completionBoundary: completionCriteria.join("\n"),
+					reviewMode: params.completionReviewMode,
+					participantAgentIds: ctx.members,
+					contractProvenance: {
+						criteriaOrigin: params.criteriaOrigin,
+						sourceMessageIds: params.sourceMessageIds,
+						...(params.criteriaOrigin === "manager_derived" ? { authoredByAgentId: "manager" as const } : {}),
+					},
+					verificationPolicy: params.verificationPolicy,
+				}, toolCallId, params.goalId);
+				await Promise.all(active.map((item) => deps.invoker.cancel(item.id, signal).catch(() => undefined)));
+				return {
+					content: [{ type: "text", text: `旧 Goal 已标为 superseded，新 Goal 已建立（goalId ${result.workState.goalId}，revision ${result.workState.revision}）。多步骤工作下一步建立 WorkPlan。` }],
+					details: result,
+				};
+			},
+		});
+
+		pi.registerTool({
 			name: CORE_TOOL_UPDATE_WORK_PLAN,
 			label: "Update Work Plan",
 			description: "创建或更新当前 Goal 的 WorkItem DAG。验收条件只能从冻结 Goal 条件、步骤产物和下游依赖派生；同时显式分类验证强度和工作区所有权。代码写入优先 isolated_worktree，非 Git 写入使用 exclusive_write，Manager 自己不得写工作区。",
@@ -925,7 +1021,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 		pi.registerTool({
 			name: CORE_TOOL_REVIEW_WORK_ITEM,
 			label: "Review Work Item",
-			description: "验收最新 Submission。accepted 才会解锁依赖；revision/blocked 不会完成 Goal。",
+			description: "验收明确绑定的 Submission。必须从当前权威上下文原样传入 expectedRevision、expectedEpoch、expectedWorkItemRevision、expectedSubmissionId，禁止猜版本。仅全局状态发生无关变化时 Store 才会安全对齐；验收目标或契约变化会拒绝。accepted 才会解锁依赖；revision/blocked 不会完成 Goal。",
 			parameters: ReviewWorkItemParams,
 			async execute(toolCallId, params: Static<typeof ReviewWorkItemParams>, signal) {
 				await assertManagerNotWaiting(deps);
@@ -936,16 +1032,21 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 				let effectiveSummary = params.summary;
 				const goalSnapshot = await deps.workStates.getActive(deps.getSessionId());
 				if (!goalSnapshot || goalSnapshot.goalId !== params.goalId) throw new Error("当前 Goal 已变化，请重新读取目标状态后再验收");
+				if (goalSnapshot.execution.epoch !== params.expectedEpoch) throw new WorkStateConflictError(goalSnapshot, params.expectedRevision, `验收所属 execution epoch 已变化（本次传入 ${params.expectedEpoch}，当前 ${goalSnapshot.execution.epoch}）`);
 				if (params.verdict === "accepted") {
 					const current = goalSnapshot;
-					if (!current?.plan || current.goalId !== params.goalId || current.revision !== revision) throw new Error("当前 Goal revision 已变化");
+					if (!current.plan) throw new Error("WorkPlan 不存在");
 					const item = current.plan.items[params.workItemId];
-					const submission = item ? [...item.submissions].reverse().find((entry) => !entry.review) : undefined;
+					const submission = item?.submissions.find((entry) => entry.id === params.expectedSubmissionId && !entry.review);
+					if (!item || item.status !== "submitted" || item.revision !== params.expectedWorkItemRevision || !submission) {
+						const pending = item ? [...item.submissions].reverse().find((entry) => !entry.review) : undefined;
+						throw new WorkStateConflictError(current, params.expectedRevision, `验收目标已变化（WorkItem ${params.workItemId} 当前 itemRevision=${item?.revision ?? "无"}、submissionId=${pending?.id ?? "无"}）`);
+					}
 					const isolatedChangeSet = submission?.workspaceChangeSet?.mode === "isolated_worktree";
 					if ((item?.workspaceExecutionPolicy.mode === "isolated_worktree" && item.workspaceExecutionPolicy.promoteOnAcceptance) || isolatedChangeSet) {
 						const intentState = await deps.workStates.recordAcceptanceIntent(
 							deps.getSessionId(), params.workItemId, revision,
-							{ summary: params.summary, evidenceRefs: params.evidenceRefs }, `${toolCallId}:acceptance-intent`, current.execution.epoch, current.goalId,
+							{ expectedWorkItemRevision: params.expectedWorkItemRevision, expectedSubmissionId: params.expectedSubmissionId, summary: params.summary, evidenceRefs: params.evidenceRefs }, `${toolCallId}:acceptance-intent`, params.expectedEpoch, current.goalId,
 						);
 						revision = intentState.revision;
 						const scopeId = submission?.executionReceipt?.workspaceExecutionScopeId;
@@ -964,12 +1065,16 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 				}
 				const state = await deps.workStates.reviewWorkItem(
 					deps.getSessionId(), params.workItemId, revision,
-					{ verdict: effectiveVerdict, summary: effectiveSummary, evidenceRefs: params.evidenceRefs },
+					{ expectedWorkItemRevision: params.expectedWorkItemRevision, expectedSubmissionId: params.expectedSubmissionId, verdict: effectiveVerdict, summary: effectiveSummary, evidenceRefs: params.evidenceRefs },
 					`${toolCallId}:review`,
-					goalSnapshot.execution.epoch,
+					params.expectedEpoch,
 					params.goalId,
 				);
-				return { content: [{ type: "text", text: `WorkItem ${params.workItemId} 已标记为 ${effectiveVerdict}（revision ${state.revision}）。` }], details: { workState: state } };
+				const reviewedSubmission = state.plan?.items[params.workItemId]?.submissions.find((entry) => entry.id === params.expectedSubmissionId);
+				const reviewed = reviewedSubmission?.review;
+				const alignmentAudit = reviewed?.rebasedFromRevision === undefined ? reviewedSubmission?.acceptanceIntent : reviewed;
+				const alignment = alignmentAudit?.rebasedFromRevision === undefined ? "" : `，已确认验收目标未变并安全对齐全局 revision ${alignmentAudit.rebasedFromRevision}→${alignmentAudit.reviewedStateRevision}`;
+				return { content: [{ type: "text", text: `WorkItem ${params.workItemId} 的 Submission ${params.expectedSubmissionId} 已标记为 ${effectiveVerdict}（revision ${state.revision}${alignment}）。` }], details: { workState: state, review: reviewed } };
 			},
 		});
 
@@ -989,7 +1094,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 						const current = await deps.workStates.getActive(sessionId);
 						if (!current) throw new Error("Session Goal 不存在");
 						if (current.goalId !== goalId) throw new Error("当前 Goal 已变化，请重新读取目标状态后再提交。");
-						if (current.revision !== revision) throw new WorkStateConflictError(current);
+					if (current.revision !== revision) throw new WorkStateConflictError(current, revision);
 						const delegations = (await deps.invoker.delegationsForManagerSession(sessionId)).filter((item) => item.goalId === current.goalId);
 						const active = delegations.filter((item) => item.executionState === "waiting_admission" || item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling");
 						if (active.length > 0) throw new Error(`仍有 ${active.length} 个委托正在执行或等待输入，不能完成 Goal`);
@@ -1199,7 +1304,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 					};
 				} catch (err) {
 					if (err instanceof WorkStateConflictError) {
-						throw new Error(`当前工作已被更新，请按 revision ${err.current.revision} 的最新状态重新判断后再提交。`);
+						throw err;
 					}
 					throw err;
 				}
@@ -1444,6 +1549,7 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 				const sessionId = deps.getSessionId();
 				const goal = deps.workStates ? await deps.workStates.getActive(sessionId) : undefined;
 				if (goal && !params.workItemId) {
+					if (goal.execution.status === "interrupted") throw new Error("当前 Goal 已暂停：若要继续旧目标请先恢复；若新任务取代旧目标，请先调用 supersede_session_goal；若旧目标不再继续，请调用 abandon_session_goal");
 					throw new Error("当前 Session 有正式 Goal，所有 Worker 委托必须先建立 WorkPlan 并绑定 workItemId");
 				}
 				if (params.workItemId && !goal?.plan?.items[params.workItemId]) throw new Error("workItemId 不属于当前 Goal WorkPlan");

@@ -110,3 +110,110 @@ test("parked Session 的 Decision 不能被回答，也不会提前消费恢复�
 	await stack.sessions.disposeAll();
 	await stack.app.close();
 });
+
+test("Goal abandon/supersede 路由释放 active 门禁并原子链接新旧 Goal", async () => {
+	const stack = await makeStack();
+	const sessionId = stack.solo.activeSession;
+	const first = await stack.workStates.create({ sessionId, goal: "旧 Goal", completionBoundary: "旧任务完成" });
+	const abandon = await stack.app.inject({
+		method: "POST",
+		url: `/api/sessions/${sessionId}/goal/abandon`,
+		headers: { "idempotency-key": "route-abandon" },
+		payload: { expectedGoalId: first.goalId, expectedRevision: first.revision, reason: "用户不再继续" },
+	});
+	assert.equal(abandon.statusCode, 200, abandon.body);
+	assert.equal(abandon.json().workState.status, "cancelled");
+	assert.equal(await stack.workStates.getActive(sessionId), undefined);
+	const abandonReplay = await stack.app.inject({
+		method: "POST", url: `/api/sessions/${sessionId}/goal/abandon`, headers: { "idempotency-key": "route-abandon" },
+		payload: { expectedGoalId: first.goalId, expectedRevision: first.revision, reason: "用户不再继续" },
+	});
+	assert.equal(abandonReplay.statusCode, 200, abandonReplay.body);
+	assert.equal(abandonReplay.json().workState.revision, abandon.json().workState.revision);
+
+	const second = await stack.workStates.create({ sessionId, goal: "中间 Goal", completionBoundary: "中间任务完成" });
+	const supersede = await stack.app.inject({
+		method: "POST",
+		url: `/api/sessions/${sessionId}/goal/supersede`,
+		headers: { "idempotency-key": "route-supersede" },
+		payload: {
+			expectedGoalId: second.goalId,
+			expectedRevision: second.revision,
+			reason: "用户改做图片任务",
+			goal: "生成图片",
+			completionBoundary: "图片已交付",
+			reviewMode: "manager",
+		},
+	});
+	assert.equal(supersede.statusCode, 200, supersede.body);
+	const body = supersede.json();
+	assert.equal(body.previous.status, "superseded");
+	assert.equal(body.previous.supersededByGoalId, body.workState.goalId);
+	assert.equal(body.workState.supersedesGoalId, second.goalId);
+	assert.equal((await stack.workStates.getActive(sessionId))?.goal, "生成图片");
+	const supersedeReplay = await stack.app.inject({
+		method: "POST", url: `/api/sessions/${sessionId}/goal/supersede`, headers: { "idempotency-key": "route-supersede" },
+		payload: { expectedGoalId: second.goalId, expectedRevision: second.revision, reason: "用户改做图片任务", goal: "生成图片", completionBoundary: "图片已交付", reviewMode: "manager" },
+	});
+	assert.equal(supersedeReplay.statusCode, 200, supersedeReplay.body);
+	assert.equal(supersedeReplay.json().workState.goalId, body.workState.goalId);
+	await stack.sessions.disposeAll();
+	await stack.app.close();
+});
+
+test("WorkItem review 路由返回结构化冲突，并对未变化的 Submission 安全 rebase", async () => {
+	const stack = await makeStack();
+	const sessionId = stack.solo.activeSession;
+	const goal = await stack.workStates.create({ sessionId, goal: "汇总报告", completionBoundary: "报告已验收" });
+	const planned = await stack.workStates.updatePlan(sessionId, goal.revision, {
+		upsertItems: [{ id: "W1", title: "Manager 汇总", assignedAgentId: "manager", acceptanceCriteria: ["报告完整"], sourceGoalCriteria: ["goal:1:1"] }],
+		reason: "建立验收目标",
+	}, "route-review-plan", goal.execution.epoch, goal.goalId);
+	const running = await stack.workStates.advanceManagerWorkItem(sessionId, "W1", planned.revision, { status: "in_progress" }, "route-review-start", goal.execution.epoch, goal.goalId);
+	const submitted = await stack.workStates.advanceManagerWorkItem(sessionId, "W1", running.revision, {
+		status: "submitted", summary: "报告正文", evidenceRefs: ["message:report"],
+	}, "route-review-submit", goal.execution.epoch, goal.goalId);
+	const item = submitted.plan!.items.W1!;
+	const submission = item.submissions.at(-1)!;
+	const advanced = await stack.workStates.update(sessionId, submitted.revision, { currentBrief: "observer 更新摘要" }, "route-review-observer", goal.execution.epoch, goal.goalId);
+
+	const conflict = await stack.app.inject({
+		method: "POST",
+		url: `/api/sessions/${sessionId}/work-items/W1/review`,
+		headers: { "idempotency-key": "route-review-conflict" },
+		payload: {
+			expectedGoalId: goal.goalId,
+			expectedRevision: submitted.revision,
+			expectedEpoch: goal.execution.epoch,
+			expectedWorkItemRevision: item.revision,
+			expectedSubmissionId: "submission-other",
+			verdict: "accepted",
+			summary: "错误目标",
+		},
+	});
+	assert.equal(conflict.statusCode, 409, conflict.body);
+	assert.equal(conflict.json().code, "stale_goal_state");
+	assert.equal(conflict.json().expectedRevision, submitted.revision);
+	assert.equal(conflict.json().currentRevision, advanced.revision);
+	assert.equal(conflict.json().current.revision, advanced.revision);
+
+	const accepted = await stack.app.inject({
+		method: "POST",
+		url: `/api/sessions/${sessionId}/work-items/W1/review`,
+		headers: { "idempotency-key": "route-review-rebase" },
+		payload: {
+			expectedGoalId: goal.goalId,
+			expectedRevision: submitted.revision,
+			expectedEpoch: goal.execution.epoch,
+			expectedWorkItemRevision: item.revision,
+			expectedSubmissionId: submission.id,
+			verdict: "accepted",
+			summary: "目标未变化，允许对齐",
+		},
+	});
+	assert.equal(accepted.statusCode, 200, accepted.body);
+	assert.equal(accepted.json().workItem.status, "accepted");
+	assert.equal(accepted.json().workItem.submissions.at(-1).review.rebasedFromRevision, submitted.revision);
+	await stack.sessions.disposeAll();
+	await stack.app.close();
+});

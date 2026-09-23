@@ -1,9 +1,10 @@
 "use client";
 
-import { createContext, useContext } from "react";
+import { createContext, useContext, type ReactNode } from "react";
 
 type WorkerProcessContextValue = {
 	openWorkerProcess: (delegationId: string) => void;
+	renderInlineProcess?: (delegationId: string, fallback?: string) => ReactNode;
 };
 
 const WorkerProcessContext = createContext<WorkerProcessContextValue | null>(null);

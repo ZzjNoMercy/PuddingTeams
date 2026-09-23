@@ -15,6 +15,13 @@ function sealedReceipt(state: SessionWorkState, item: WorkItem, delegationId: st
 	};
 }
 
+function reviewTarget(state: SessionWorkState, workItemId: string): { expectedWorkItemRevision: number; expectedSubmissionId: string } {
+	const item = state.plan?.items[workItemId];
+	const submission = item ? [...item.submissions].reverse().find((entry) => !entry.review) : undefined;
+	if (!item || !submission) throw new Error(`missing review target ${workItemId}`);
+	return { expectedWorkItemRevision: item.revision, expectedSubmissionId: submission.id };
+}
+
 test("P3-G: Session Goal revision、业务决策与清理闭环", async () => {
 	const store = new WorkStateStore(mkdtempSync(path.join(tmpdir(), "pt-work-state-")));
 	await store.init();
@@ -36,7 +43,13 @@ test("P3-G: Session Goal revision、业务决策与清理闭环", async () => {
 	assert.deepEqual(created.participantAgentIds, ["codex"]);
 	const updated = await store.update("s1", 0, { currentBrief: "实现完成", nextAction: "请求审核" });
 	assert.equal(updated.revision, 1);
-	await assert.rejects(() => store.update("s1", 0, { currentBrief: "旧状态覆盖" }), WorkStateConflictError);
+	await assert.rejects(
+		() => store.update("s1", 0, { currentBrief: "旧状态覆盖" }),
+		(error: unknown) => error instanceof WorkStateConflictError
+			&& error.expectedRevision === 0
+			&& error.current.revision === 1
+			&& /本次传入 revision 0，当前 revision 1/.test(error.message),
+	);
 	await assert.rejects(() => store.update("s1", 1, { status: "resolved", currentBrief: "" }), /resolved/);
 	await assert.rejects(() => store.update("s1", 1, { status: "resolved", currentBrief: "完成" }), /只能通过完成复核/);
 
@@ -153,10 +166,11 @@ test("Goal v5: WorkItem DAG、Submission、验收与幂等闭环", async () => {
 	assert.equal(submitted.plan?.items.W1?.status, "submitted");
 	assert.equal(submitted.plan?.items.W2?.status, "planned", "submitted 不能解锁下游");
 	const accepted = await store.reviewWorkItem("plan", "W1", submitted.revision, {
+		...reviewTarget(submitted, "W1"),
 		verdict: "accepted",
 		summary: "证据充分",
 		evidenceRefs: ["D1"],
-	}, "review-D1", 1);
+	}, "review-D1", 1, goal.goalId);
 	assert.equal(accepted.plan?.items.W1?.status, "accepted");
 	assert.equal(accepted.plan?.items.W2?.status, "ready", "只有 accepted 解锁下游");
 	const lateWaiting = await store.noteDelegation("plan", {
@@ -182,24 +196,161 @@ test("Goal v5: WorkItem DAG、Submission、验收与幂等闭环", async () => {
 		executionReceipt: sealedReceipt(revisedPlan, revisedPlan.plan!.items.W2!, "D2"),
 	}, "delegation-boundary:D2:completed");
 	const blocked = await store.reviewWorkItem("plan", "W2", secondSubmission.revision, {
+		...reviewTarget(secondSubmission, "W2"),
 		verdict: "blocked", summary: "等待外部资料",
-	}, "review-D2", 1);
+	}, "review-D2", 1, goal.goalId);
 	const reopened = await store.updatePlan("plan", blocked.revision, {
 		upsertItems: [], reopenItemIds: ["W2"], reason: "外部资料已到齐",
 	}, "reopen-W2", 1);
 	assert.equal(reopened.plan?.items.W2?.status, "revision");
 	const replay = await store.reviewWorkItem("plan", "W1", submitted.revision, {
+		...reviewTarget(submitted, "W1"),
 		verdict: "accepted",
 		summary: "证据充分",
 		evidenceRefs: ["D1"],
-	}, "review-D1", 1);
+	}, "review-D1", 1, goal.goalId);
 	assert.equal(replay.revision, accepted.revision, "相同 operationId+payload 不重复增加 revision");
 	await assert.rejects(
 		() => store.reviewWorkItem("plan", "W1", submitted.revision, {
+			...reviewTarget(submitted, "W1"),
 			verdict: "blocked",
 			summary: "不同载荷",
-		}, "review-D1", 1),
+		}, "review-D1", 1, goal.goalId),
 		(error: unknown) => error instanceof WorkStateOperationConflictError && error.code === "idempotency_conflict",
+	);
+});
+
+test("WorkItem 验收使用目标级 CAS：无关 Goal 写入可安全 rebase，目标变化必须拒绝", async () => {
+	const store = new WorkStateStore(mkdtempSync(path.join(tmpdir(), "pt-review-target-cas-")));
+	await store.init();
+	const goal = await store.create({ sessionId: "review-cas", goal: "交付报告", completionBoundary: "报告通过验收" });
+	const planned = await store.updatePlan("review-cas", goal.revision, {
+		upsertItems: [{ id: "W1", title: "生成报告", acceptanceCriteria: ["内容完整"], sourceGoalCriteria: ["goal:1:1"] }],
+		reason: "建立验收目标",
+	}, "plan-review-cas", goal.execution.epoch, goal.goalId);
+	const submitted = await store.noteDelegation("review-cas", {
+		goalId: goal.goalId,
+		workItemId: "W1",
+		delegationId: "D-review-cas",
+		delegationStatus: "completed",
+		goalEpoch: goal.execution.epoch,
+		executionReceipt: sealedReceipt(planned, planned.plan!.items.W1!, "D-review-cas"),
+	}, "boundary-review-cas");
+	const target = reviewTarget(submitted, "W1");
+	assert.equal(submitted.plan!.items.W1!.submissions.at(-1)!.submittedStateRevision, submitted.revision);
+
+	await assert.rejects(
+		() => store.reviewWorkItem("review-cas", "W1", submitted.revision, {
+			...target,
+			expectedSubmissionId: "submission-other",
+			verdict: "accepted",
+			summary: "错误目标",
+			evidenceRefs: ["D-review-cas"],
+		}, "review-wrong-submission", goal.execution.epoch, goal.goalId),
+		(error: unknown) => error instanceof WorkStateConflictError
+			&& /待验收 Submission 已变化/.test(error.message)
+			&& error.expectedRevision === submitted.revision,
+	);
+	await assert.rejects(
+		() => store.reviewWorkItem("review-cas", "W1", 0, {
+			...target,
+			verdict: "accepted",
+			summary: "使用 Submission 出现前的快照",
+			evidenceRefs: ["D-review-cas"],
+		}, "review-before-submission", goal.execution.epoch, goal.goalId),
+		(error: unknown) => error instanceof WorkStateConflictError
+			&& /不可能包含本次验收目标/.test(error.message)
+			&& error.expectedRevision === 0
+			&& error.current.revision === submitted.revision,
+	);
+	await assert.rejects(
+		() => store.reviewWorkItem("review-cas", "W1", submitted.revision + 5, {
+			...target,
+			verdict: "accepted",
+			summary: "猜测未来版本",
+			evidenceRefs: ["D-review-cas"],
+		}, "review-future-revision", goal.execution.epoch, goal.goalId),
+		(error: unknown) => error instanceof WorkStateConflictError
+			&& /未来 revision/.test(error.message)
+			&& error.expectedRevision === submitted.revision + 5
+			&& error.current.revision === submitted.revision,
+	);
+
+	const unrelated = await store.update("review-cas", submitted.revision, {
+		currentBrief: "另一个 observer 更新了 Goal 摘要",
+	}, "unrelated-goal-write", goal.execution.epoch, goal.goalId);
+	const accepted = await store.reviewWorkItem("review-cas", "W1", submitted.revision, {
+		...target,
+		verdict: "accepted",
+		summary: "目标 Submission 未变化，允许安全对齐",
+		evidenceRefs: ["D-review-cas"],
+	}, "review-rebased", goal.execution.epoch, goal.goalId);
+	const review = accepted.plan!.items.W1!.submissions.at(-1)!.review!;
+	assert.equal(review.expectedStateRevision, submitted.revision);
+	assert.equal(review.reviewedStateRevision, unrelated.revision);
+	assert.equal(review.rebasedFromRevision, submitted.revision);
+	assert.equal(accepted.revision, unrelated.revision + 1);
+	assert.equal(accepted.plan?.items.W1?.status, "accepted");
+});
+
+test("WorkItem 验收目标的契约或 epoch 变化时 fail-closed", async () => {
+	const makeSubmitted = async (sessionId: string) => {
+		const store = new WorkStateStore(mkdtempSync(path.join(tmpdir(), `pt-review-fence-${sessionId}-`)));
+		await store.init();
+		const goal = await store.create({ sessionId, goal: "交付代码", completionBoundary: "代码通过验收" });
+		const planned = await store.updatePlan(sessionId, goal.revision, {
+			upsertItems: [{ id: "W1", title: "实现", acceptanceCriteria: ["功能正确"], sourceGoalCriteria: ["goal:1:1"] }],
+			reason: "建立计划",
+		}, `plan-${sessionId}`, goal.execution.epoch, goal.goalId);
+		const submitted = await store.noteDelegation(sessionId, {
+			goalId: goal.goalId, workItemId: "W1", delegationId: `D-${sessionId}`, delegationStatus: "completed", goalEpoch: goal.execution.epoch,
+			executionReceipt: sealedReceipt(planned, planned.plan!.items.W1!, `D-${sessionId}`),
+		}, `boundary-${sessionId}`);
+		return { store, goal, submitted, target: reviewTarget(submitted, "W1") };
+	};
+
+	const contractCase = await makeSubmitted("contract-change");
+	await contractCase.store.updatePlan("contract-change", contractCase.submitted.revision, {
+		upsertItems: [{ id: "W1", title: "实现", acceptanceCriteria: ["功能正确", "新增回归测试"], sourceGoalCriteria: ["goal:1:1"] }],
+		reason: "验收契约发生变化",
+	}, "change-contract", contractCase.goal.execution.epoch, contractCase.goal.goalId);
+	await assert.rejects(
+		() => contractCase.store.reviewWorkItem("contract-change", "W1", contractCase.submitted.revision, {
+			...contractCase.target, verdict: "accepted", summary: "沿用旧结论", evidenceRefs: ["D-contract-change"],
+		}, "review-old-contract", contractCase.goal.execution.epoch, contractCase.goal.goalId),
+		(error: unknown) => error instanceof WorkStateConflictError && /WorkItem W1 契约 revision 已变化/.test(error.message),
+	);
+
+	const submissionCase = await makeSubmitted("submission-change");
+	const requestedRevision = await submissionCase.store.reviewWorkItem("submission-change", "W1", submissionCase.submitted.revision, {
+		...submissionCase.target, verdict: "revision", summary: "需要第二次提交",
+	}, "request-new-submission", submissionCase.goal.execution.epoch, submissionCase.goal.goalId);
+	const secondRunning = await submissionCase.store.noteDelegation("submission-change", {
+		goalId: submissionCase.goal.goalId, workItemId: "W1", delegationId: "D-submission-change-2", delegationStatus: "running", goalEpoch: submissionCase.goal.execution.epoch,
+	}, "second-running");
+	const secondSubmitted = await submissionCase.store.noteDelegation("submission-change", {
+		goalId: submissionCase.goal.goalId, workItemId: "W1", delegationId: "D-submission-change-2", delegationStatus: "completed", goalEpoch: submissionCase.goal.execution.epoch,
+		executionReceipt: sealedReceipt(secondRunning, secondRunning.plan!.items.W1!, "D-submission-change-2"),
+	}, "second-submitted");
+	assert.notEqual(secondSubmitted.plan!.items.W1!.submissions.at(-1)!.id, submissionCase.target.expectedSubmissionId);
+	await assert.rejects(
+		() => submissionCase.store.reviewWorkItem("submission-change", "W1", requestedRevision.revision, {
+			...submissionCase.target, verdict: "accepted", summary: "错误沿用第一次提交的结论", evidenceRefs: ["D-submission-change"],
+		}, "review-old-submission", submissionCase.goal.execution.epoch, submissionCase.goal.goalId),
+		(error: unknown) => error instanceof WorkStateConflictError && /WorkItem W1 契约 revision 已变化|待验收 Submission 已变化/.test(error.message),
+	);
+
+	const epochCase = await makeSubmitted("epoch-change");
+	const interrupted = await epochCase.store.interruptGoal("epoch-change", epochCase.submitted.revision, {
+		kind: "user", fingerprint: "pause-before-review", delegationIds: [],
+	}, "interrupt-before-review", epochCase.goal.goalId);
+	const resumed = await epochCase.store.resumeGoal("epoch-change", interrupted.revision, { ownerId: "manager" }, "resume-before-review", epochCase.goal.goalId);
+	assert.notEqual(resumed.execution.epoch, epochCase.goal.execution.epoch);
+	await assert.rejects(
+		() => epochCase.store.reviewWorkItem("epoch-change", "W1", epochCase.submitted.revision, {
+			...epochCase.target, verdict: "accepted", summary: "沿用旧 epoch 结论", evidenceRefs: ["D-epoch-change"],
+		}, "review-old-epoch", epochCase.goal.execution.epoch, epochCase.goal.goalId),
+		(error: unknown) => error instanceof WorkStateConflictError && /execution epoch 已变化/.test(error.message),
 	);
 });
 
@@ -341,6 +492,7 @@ test("Goal v5: Manager 工作项必须开始、提交、验收，完成时逐条
 	assert.equal(submitted.plan?.items.W3?.submissions[0]?.source, "manager");
 	assert.deepEqual(submitted.plan?.items.W3?.submissions[0]?.resultRef, { kind: "manager_summary", evidenceRefs: ["message:final-report"] });
 	const accepted = await store.reviewWorkItem("manager-item", "W3", submitted.revision, {
+		...reviewTarget(submitted, "W3"),
 		verdict: "accepted", summary: "汇总符合验收条件", evidenceRefs: ["message:final-report"],
 	}, "review-w3", 1, goal.goalId);
 	await assert.rejects(() => store.updatePlan("manager-item", accepted.revision, {
@@ -401,6 +553,72 @@ test("Goal v5: 中断 epoch fence 与 resume lease", async () => {
 	);
 });
 
+test("Goal 关闭语义: abandon 清理门禁，terminal interrupt 自动收敛", async () => {
+	const store = new WorkStateStore(mkdtempSync(path.join(tmpdir(), "pt-goal-abandon-")));
+	await store.init();
+	const goal = await store.create({ sessionId: "abandon", goal: "旧任务", completionBoundary: "旧任务完成" });
+	const planned = await store.updatePlan("abandon", goal.revision, {
+		upsertItems: [{ id: "W1", title: "待执行", dependsOn: [], acceptanceCriteria: ["有结果"] }],
+		reason: "建立计划",
+	}, "plan-abandon", 1, goal.goalId);
+	const decision = await store.createDecision({
+		sessionId: "abandon", requestedBy: "manager", question: "是否继续？", context: "旧目标", blockedAction: "执行", resumeHint: "回答后继续",
+	}, "decision-abandon", planned.revision, goal.goalId);
+	const abandoned = await store.abandonGoal("abandon", planned.revision + 1, {
+		kind: "manager_abandoned", by: "manager", reason: "用户更换任务", delegationIds: [],
+	}, "abandon-old", goal.goalId);
+	assert.equal(abandoned.status, "cancelled");
+	assert.equal(abandoned.plan?.items.W1?.status, "cancelled");
+	assert.equal(abandoned.abandonment?.kind, "manager_abandoned");
+	assert.equal((await store.getDecision(decision.id))?.status, "cancelled");
+	assert.equal(await store.getActive("abandon"), undefined);
+	const replay = await store.abandonGoal("abandon", planned.revision + 1, {
+		kind: "manager_abandoned", by: "manager", reason: "用户更换任务", delegationIds: [],
+	}, "abandon-old", goal.goalId);
+	assert.equal(replay.revision, abandoned.revision);
+
+	const terminal = await store.create({ sessionId: "auto-close", goal: "无剩余工作", completionBoundary: "完成" });
+	const terminalPlan = await store.updatePlan("auto-close", terminal.revision, {
+		upsertItems: [{ id: "W1", title: "已取消项", dependsOn: [], acceptanceCriteria: ["完成"] }],
+		reason: "建立计划",
+	}, "plan-auto-close", 1, terminal.goalId);
+	const cancelledPlan = await store.updatePlan("auto-close", terminalPlan.revision, { upsertItems: [], cancelItemIds: ["W1"], reason: "不再需要" }, "cancel-item", 1, terminal.goalId);
+	const closed = await store.interruptGoal("auto-close", cancelledPlan.revision, { kind: "manager_interrupted", fingerprint: "stop-terminal", delegationIds: [] }, "interrupt-terminal", terminal.goalId);
+	assert.equal(closed.status, "cancelled");
+	assert.equal(closed.execution.status, "idle");
+	assert.equal(closed.execution.interruption?.fingerprint, "stop-terminal");
+	assert.equal(closed.abandonment?.kind, "terminal_interrupt");
+	const interruptReplay = await store.interruptGoal("auto-close", cancelledPlan.revision, { kind: "manager_interrupted", fingerprint: "stop-terminal", delegationIds: [] }, "interrupt-terminal", terminal.goalId);
+	assert.equal(interruptReplay.revision, closed.revision);
+});
+
+test("Goal 更换语义: supersede 原子建新 Goal 并保留未验收证据缺口", async () => {
+	const store = new WorkStateStore(mkdtempSync(path.join(tmpdir(), "pt-goal-supersede-")));
+	await store.init();
+	const oldGoal = await store.create({ sessionId: "replace", goal: "实现 add.py", completionBoundary: "脚本完成", reviewMode: "independent" });
+	const planned = await store.updatePlan("replace", oldGoal.revision, {
+		upsertItems: [{ id: "W1", title: "产出脚本", assignedAgentId: "manager", dependsOn: [], acceptanceCriteria: ["脚本完成"] }],
+		reason: "建立旧目标计划",
+	}, "plan-replace", 1, oldGoal.goalId);
+	const submitted = await store.advanceManagerWorkItem("replace", "W1", planned.revision, { status: "submitted", summary: "脚本草稿", evidenceRefs: ["message:draft"] }, "submit-old", 1, oldGoal.goalId);
+	const result = await store.supersedeGoal("replace", submitted.revision, {
+		by: "manager", reason: "用户改为图片任务", goal: "生成图片", completionBoundary: "图片已交付",
+		participantAgentIds: ["image-worker"], contractProvenance: { criteriaOrigin: "manager_derived", sourceMessageIds: ["user:new-image"] },
+	}, "replace-goal", oldGoal.goalId);
+	assert.equal(result.previous.status, "superseded");
+	assert.equal(result.previous.supersededByGoalId, result.workState.goalId);
+	assert.equal(result.previous.plan?.items.W1?.status, "cancelled");
+	assert.match(result.previous.abandonment?.evidenceGaps[0] ?? "", /尚未验收/);
+	assert.equal(result.workState.supersedesGoalId, oldGoal.goalId);
+	assert.equal(result.workState.goal, "生成图片");
+	assert.equal((await store.getActive("replace"))?.goalId, result.workState.goalId);
+	const replay = await store.supersedeGoal("replace", submitted.revision, {
+		by: "manager", reason: "用户改为图片任务", goal: "生成图片", completionBoundary: "图片已交付",
+		participantAgentIds: ["image-worker"], contractProvenance: { criteriaOrigin: "manager_derived", sourceMessageIds: ["user:new-image"] },
+	}, "replace-goal", oldGoal.goalId);
+	assert.equal(replay.workState.goalId, result.workState.goalId);
+});
+
 test("Goal v5: 同一 Session 串行多个 Goal，旧执行事实不能写入新 Goal", async () => {
 	const store = new WorkStateStore(mkdtempSync(path.join(tmpdir(), "pt-goal-history-")));
 	await store.init();
@@ -413,12 +631,12 @@ test("Goal v5: 同一 Session 串行多个 Goal，旧执行事实不能写入新
 		goalId: goalA.goalId, workItemId: "W1", delegationId: "D-A", delegationStatus: "completed", goalEpoch: 1,
 		executionReceipt: sealedReceipt(planA, planA.plan!.items.W1!, "D-A"),
 	}, "boundary-a");
-	const acceptedA = await store.reviewWorkItem("serial", "W1", submittedA.revision, { verdict: "accepted", summary: "A 已验收", evidenceRefs: ["delegation:D-A"] }, "review-a", 1, goalA.goalId);
+	const acceptedA = await store.reviewWorkItem("serial", "W1", submittedA.revision, { ...reviewTarget(submittedA, "W1"), verdict: "accepted", summary: "A 已验收", evidenceRefs: ["delegation:D-A"] }, "review-a", 1, goalA.goalId);
 	const decisionA = await store.createDecision({
 		sessionId: "serial", requestedBy: "manager", question: "是否归档 A？", context: "", blockedAction: "完成 A", resumeHint: "按决定继续",
 	}, "decision-a", acceptedA.revision, goalA.goalId);
 	const waitingA = await store.getActive("serial");
-	const resolvedA = await store.update("serial", waitingA!.revision, { status: "cancelled", currentBrief: "A 已结束" }, "cancel-a", 1, goalA.goalId);
+	const resolvedA = await store.abandonGoal("serial", waitingA!.revision, { kind: "manager_abandoned", by: "manager", reason: "A 已结束" }, "cancel-a", goalA.goalId);
 	assert.equal(resolvedA.status, "cancelled");
 	assert.equal((await store.listDecisions("serial", goalA.goalId))[0]?.status, "cancelled");
 	await assert.rejects(() => store.answerDecision(decisionA.id, "是", undefined, "late-answer-a"), /已处理/);
@@ -492,7 +710,7 @@ test("Goal v6: sealed Receipt、VerificationRecord 与 isolated worktree 提升�
 	const item = planned.plan!.items.W1!;
 	const changeSet = { id: "cs-v6", executionScopeId: "scope-v6", delegationIds: ["D-v6"], mode: "isolated_worktree" as const, baselineFingerprint: "base", outputFingerprint: "out", changedPaths: ["src/a.ts"], promotionState: "applied" as const, createdAt: new Date().toISOString(), promotedAt: new Date().toISOString() };
 	const submitted = await store.noteDelegation("v6", { goalId: goal.goalId, workItemId: "W1", delegationId: "D-v6", delegationStatus: "completed", goalEpoch: 1, executionReceipt: sealedReceipt(planned, item, "D-v6"), workspaceChangeSet: changeSet }, "boundary-v6");
-	await assert.rejects(() => store.reviewWorkItem("v6", "W1", submitted.revision, { verdict: "accepted", summary: "先验收" }, "review-before-v6"), /VerificationRecord/);
+	await assert.rejects(() => store.reviewWorkItem("v6", "W1", submitted.revision, { ...reviewTarget(submitted, "W1"), verdict: "accepted", summary: "先验收" }, "review-before-v6", 1, goal.goalId), /VerificationRecord/);
 	const submission = submitted.plan!.items.W1!.submissions[0]!;
 	const verified = await store.recordVerification("v6", submitted.revision, {
 		id: "verification-v6", goalId: goal.goalId, workPlanId: submitted.plan!.id, workItemId: "W1", submissionId: submission.id,
@@ -500,15 +718,15 @@ test("Goal v6: sealed Receipt、VerificationRecord 与 isolated worktree 提升�
 		environmentMode: "isolated_copy", inputFingerprint: submission.inputFingerprint, criteria: [{ criterion: "测试通过", status: "satisfied", evidenceRefs: ["test-v6"], explanation: "测试成功" }], evidenceRefs: ["test-v6"], integrity: "clean", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), completedAt: new Date().toISOString(),
 		}, "verification-v6");
 	await assert.rejects(
-		() => store.reviewWorkItem("v6", "W1", verified.revision, { verdict: "accepted", summary: "跳过两阶段提升" }, "review-without-intent-v6"),
+		() => store.reviewWorkItem("v6", "W1", verified.revision, { ...reviewTarget(verified, "W1"), verdict: "accepted", summary: "跳过两阶段提升" }, "review-without-intent-v6", 1, goal.goalId),
 		/accepted 意图记录/,
 	);
-	const intended = await store.recordAcceptanceIntent("v6", "W1", verified.revision, { summary: "独立证据充分" }, "intent-v6");
+	const intended = await store.recordAcceptanceIntent("v6", "W1", verified.revision, { ...reviewTarget(verified, "W1"), summary: "独立证据充分" }, "intent-v6", 1, goal.goalId);
 	await assert.rejects(
-		() => store.recordAcceptanceIntent("v6", "W1", intended.revision, { summary: "尝试覆盖意图" }, "intent-v6-overwrite"),
+		() => store.recordAcceptanceIntent("v6", "W1", intended.revision, { ...reviewTarget(intended, "W1"), summary: "尝试覆盖意图" }, "intent-v6-overwrite", 1, goal.goalId),
 		/不允许覆盖/,
 	);
-	const accepted = await store.reviewWorkItem("v6", "W1", intended.revision, { verdict: "accepted", summary: "独立证据充分" }, "review-after-v6");
+	const accepted = await store.reviewWorkItem("v6", "W1", intended.revision, { ...reviewTarget(intended, "W1"), verdict: "accepted", summary: "独立证据充分" }, "review-after-v6", 1, goal.goalId);
 	assert.equal(accepted.plan?.items.W1?.status, "accepted");
 });
 
@@ -542,14 +760,15 @@ test("manager_review 可验收普通 Connector 的 partial Receipt，但必须�
 		executionReceipt: receipt,
 	}, "boundary-manager-review");
 	await assert.rejects(
-		() => store.reviewWorkItem("manager-review", "W1", submitted.revision, { verdict: "accepted", summary: "已读回结果" }, "review-without-evidence"),
+		() => store.reviewWorkItem("manager-review", "W1", submitted.revision, { ...reviewTarget(submitted, "W1"), verdict: "accepted", summary: "已读回结果" }, "review-without-evidence", 1, goal.goalId),
 		/必须引用至少一条/,
 	);
 	const accepted = await store.reviewWorkItem("manager-review", "W1", submitted.revision, {
+		...reviewTarget(submitted, "W1"),
 		verdict: "accepted",
 		summary: "已读回 Worker 结果，分支与 HEAD 完整",
 		evidenceRefs: ["delegation:D-plain"],
-	}, "review-with-manager-evidence");
+	}, "review-with-manager-evidence", 1, goal.goalId);
 	assert.equal(accepted.plan?.items.W1?.status, "accepted");
 });
 

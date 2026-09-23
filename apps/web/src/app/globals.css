@@ -2034,7 +2034,7 @@ html[data-reduce-motion="true"] *::after {
 	backdrop-filter: blur(22px) saturate(1.1);
 }
 .task-runtime-drawer.is-activity { width: min(430px, calc(100vw - 18px)) !important; }
-.task-runtime-drawer.is-goal { width: clamp(430px, calc(100vw - 840px), 720px) !important; }
+.task-runtime-drawer.is-goal { width: clamp(430px, 36vw, 580px) !important; }
 .dark .task-runtime-drawer {
 	--goal-panel: rgba(17,23,28,.97);
 	--goal-panel-2: #151c21;
@@ -2101,6 +2101,7 @@ html[data-reduce-motion="true"] *::after {
 .goal-state-label.is-waiting_human, .goal-state-label.is-interrupted { color: #d8922b; }
 .goal-state-label.is-resolved { color: #35a56c; }
 .goal-state-label.is-cancelled { color: var(--destructive); }
+.goal-state-label.is-superseded { color: #7c6fd0; }
 .goal-history-select { min-width: 0; max-width: 150px; height: 24px; border: 0; border-radius: 7px; background: color-mix(in oklab, var(--goal-text) 4%, transparent); padding: 0 22px 0 7px; color: var(--goal-text-3); font-size: 8px; text-overflow: ellipsis; }
 .goal-history-select:disabled { cursor: wait; opacity: .72; }
 .goal-progress-label { position: absolute; top: 11px; right: 50px; border-radius: 999px; background: color-mix(in oklab, var(--goal-text) 4%, transparent); padding: 5px 8px; color: var(--goal-text-3); font-size: 9px; font-variant-numeric: tabular-nums; }
@@ -2302,7 +2303,7 @@ html[data-reduce-motion="true"] *::after {
 	.home-chat-primary.runtime-drawer-open.runtime-view-activity .home-session-chat { width: auto; margin-right: 448px; }
 }
 @media (min-width: 1200px) {
-	.home-chat-primary.runtime-drawer-open.runtime-view-goal .home-session-chat { width: auto; margin-right: clamp(448px, calc(100vw - 822px), 738px); }
+	.home-chat-primary.runtime-drawer-open.runtime-view-goal .home-session-chat { width: auto; margin-right: clamp(448px, calc(36vw + 18px), 598px); }
 }
 .chat-info-inspector {
 	position: relative;
@@ -3877,6 +3878,41 @@ button.nav-user:focus-visible {
 /* 合并气泡段内：正文首尾段落的 .5em 外边距会与 flex gap 叠加造成间距不均，收掉。 */
 .home-assistant-segment .home-message-response > :first-child { margin-top: 0; }
 .home-assistant-segment .home-message-response > :last-child { margin-bottom: 0; }
+.home-model-error {
+	display: grid;
+	max-width: 620px;
+	grid-template-columns: 28px minmax(0,1fr);
+	align-items: start;
+	gap: 10px;
+	border: 1px solid color-mix(in oklab, var(--destructive) 18%, var(--home-line));
+	border-radius: 12px;
+	background: color-mix(in oklab, var(--destructive) 4%, var(--home-surface-1));
+	padding: 10px 12px;
+	color: var(--home-text-2);
+}
+.home-model-error.is-recovered {
+	border-color: color-mix(in oklab, #35a56c 24%, var(--home-line));
+	background: color-mix(in oklab, #35a56c 5%, var(--home-surface-1));
+}
+.home-model-error-icon {
+	display: grid;
+	width: 28px;
+	height: 28px;
+	place-items: center;
+	border-radius: 9px;
+	background: color-mix(in oklab, var(--destructive) 10%, transparent);
+	color: color-mix(in oklab, var(--destructive) 76%, var(--home-text));
+}
+.home-model-error.is-recovered .home-model-error-icon { background: color-mix(in oklab, #35a56c 12%, transparent); color: #35a56c; }
+.home-model-error-icon svg { width: 14px; height: 14px; stroke-width: 1.9; }
+.home-model-error-body { min-width: 0; }
+.home-model-error-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.home-model-error-title strong { color: var(--home-text); font-size: 12px; font-weight: 650; }
+.home-model-error-title > span { flex: 0 0 auto; border-radius: 999px; background: var(--home-soft); padding: 2px 7px; color: var(--home-text-3); font-size: 9px; font-weight: 600; }
+.home-model-error-body > p { margin-top: 4px; color: var(--home-text-3); font-size: 11px; line-height: 1.6; }
+.home-model-error-body > .home-model-error-action { color: var(--home-text-2); }
+.home-model-error-body [data-slot="collapsible-trigger"] { margin-top: 5px; color: var(--home-text-3); font-size: 10px; }
+.home-model-error-body [data-slot="collapsible-content"] { border-color: var(--home-line); background: var(--home-soft); }
 .home-worker-entry { grid-template-columns: 34px minmax(0,1fr); gap: 12px; }
 .home-worker-entry button span { font-family: inherit; font-size: 12px; }
 .home-worker-entry p,

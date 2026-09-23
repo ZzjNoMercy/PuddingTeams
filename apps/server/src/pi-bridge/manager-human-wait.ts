@@ -1,7 +1,7 @@
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import type { WorkStateStore } from "../store/work-state.js";
 
-export const MANAGER_HUMAN_WAIT_INSTRUCTION = "出现待处理的人工反馈卡时，停止推进并等待用户在原卡片中回答；不要重试、改派 Worker、修改计划或另建 request_human_decision。Teams 准入不是 Worker 不可用，也不需要用户另外启动 Worker。普通聊天中的“继续”不等于已提交卡片；卡片受理后由 Runtime 恢复原委托。";
+export const MANAGER_HUMAN_WAIT_INSTRUCTION = "出现待处理的人工反馈卡时，停止推进并等待用户在原卡片中回答；不要重试、改派 Worker、修改计划或另建 request_human_decision。若用户明确废弃当前 Goal 或用新 Goal 取代它，可以调用 abandon_session_goal / supersede_session_goal 收敛旧卡片与委托。Teams 准入不是 Worker 不可用，也不需要用户另外启动 Worker。普通聊天中的“继续”不等于已提交卡片；卡片受理后由 Runtime 恢复原委托。";
 
 /** Read durable card owners, rather than the derived waiting_human label or chat text. */
 export async function managerHumanWait(

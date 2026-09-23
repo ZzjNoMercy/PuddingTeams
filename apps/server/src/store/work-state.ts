@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-export type SessionWorkStatus = "active" | "resolved" | "cancelled";
+export type SessionWorkStatus = "active" | "resolved" | "cancelled" | "superseded";
 export type GoalExecutionStatus = "idle" | "running" | "waiting_human" | "interrupted" | "recovering" | "reviewing";
 export type CompletionReviewMode = "manager" | "independent";
 export type CompletionReviewVerdict = "satisfied" | "not_satisfied" | "needs_human";
@@ -138,6 +138,13 @@ export interface GoalInterruption {
 	delegationIds: string[];
 	interruptedAt: string;
 }
+export interface GoalAbandonment {
+	kind: "user_abandoned" | "manager_abandoned" | "terminal_interrupt" | "superseded";
+	by: string;
+	reason: string;
+	at: string;
+	evidenceGaps: string[];
+}
 export interface GoalExecution {
 	epoch: number;
 	status: GoalExecutionStatus;
@@ -158,17 +165,33 @@ export interface WorkItemSubmission {
 	executionReceipt?: ExecutionReceipt;
 	workspaceChangeSetId?: string;
 	workspaceChangeSet?: WorkspaceChangeSet;
+	/** Global SessionWorkState revision that first made this Submission observable. */
+	submittedStateRevision: number;
 	goalRevision: number;
 	workItemRevision: number;
 	inputFingerprint: string;
 	verifications: VerificationRecord[];
-	acceptanceIntent?: { verdict: "accepted"; summary: string; evidenceRefs: string[]; requestedAt: string };
+	acceptanceIntent?: {
+		verdict: "accepted";
+		summary: string;
+		evidenceRefs: string[];
+		expectedStateRevision: number;
+		reviewedStateRevision: number;
+		rebasedFromRevision?: number;
+		requestedAt: string;
+	};
 	summary?: string;
 	submittedAt: string;
 	review?: {
 		verdict: "accepted" | "revision" | "blocked";
 		summary: string;
 		evidenceRefs: string[];
+		/** Manager originally observed this global state revision. */
+		expectedStateRevision: number;
+		/** Global state revision atomically inspected immediately before applying the review. */
+		reviewedStateRevision: number;
+		/** Present when unrelated Goal writes advanced the global revision while the review target stayed identical. */
+		rebasedFromRevision?: number;
 		reviewedAt: string;
 	};
 }
@@ -191,6 +214,13 @@ export interface WorkItem {
 	revision: number;
 	createdAt: string;
 	updatedAt: string;
+}
+export interface WorkItemReviewInput {
+	expectedWorkItemRevision: number;
+	expectedSubmissionId: string;
+	verdict: "accepted" | "revision" | "blocked";
+	summary: string;
+	evidenceRefs?: string[];
 }
 export interface GoalWorkPlan {
 	id: string;
@@ -221,6 +251,9 @@ export interface SessionWorkState {
 	goalVerifications: VerificationRecord[];
 	status: SessionWorkStatus;
 	execution: GoalExecution;
+	abandonment?: GoalAbandonment;
+	supersededByGoalId?: string;
+	supersedesGoalId?: string;
 	plan?: GoalWorkPlan;
 	artifactIds: string[];
 	revision: number;
@@ -278,8 +311,12 @@ interface WorkStateFile {
 }
 
 export class WorkStateConflictError extends Error {
-	constructor(readonly current: SessionWorkState, message = `目标状态刚刚发生变化（当前 revision ${current.revision}）。请基于最新状态串行执行下一步`) {
-		super(message);
+	constructor(
+		readonly current: SessionWorkState,
+		readonly expectedRevision: number,
+		reason?: string,
+	) {
+		super(`[stale_goal_state] ${reason ? `${reason}；` : ""}目标状态刚刚发生变化（本次传入 revision ${expectedRevision}，当前 revision ${current.revision}）。请基于最新状态重新判断，禁止猜测 revision`);
 		this.name = "WorkStateConflictError";
 	}
 }
@@ -452,8 +489,51 @@ export class WorkStateStore {
 	private current(state: SessionWorkState, revision: number, epoch?: number, goalId?: string): void {
 		if (!Number.isInteger(revision) || revision < 0) throw new Error("revision 必须是非负整数");
 		if (goalId !== undefined && state.goalId !== goalId) throw new WorkStateOperationConflictError("当前 Goal 已变化，请重新读取目标状态", "stale_goal_state");
-		if (state.revision !== revision) throw new WorkStateConflictError(state);
+		if (state.revision !== revision) throw new WorkStateConflictError(state, revision);
 		if (epoch !== undefined && state.execution.epoch !== epoch) throw new WorkStateOperationConflictError("Goal execution epoch 已变化", "stale_goal_state");
+	}
+	private reviewTarget(
+		state: SessionWorkState,
+		workItemId: string,
+		expectedRevision: number,
+		expectedEpoch: number,
+		expectedGoalId: string,
+		expectedWorkItemRevision: number,
+		expectedSubmissionId: string,
+	): { item: WorkItem; submission: WorkItemSubmission; rebased: boolean } {
+		if (!Number.isInteger(expectedRevision) || expectedRevision < 0) throw new Error("expectedRevision 必须是非负整数");
+		if (!Number.isInteger(expectedEpoch) || expectedEpoch < 1) throw new Error("expectedEpoch 必须是正整数");
+		if (!Number.isInteger(expectedWorkItemRevision) || expectedWorkItemRevision < 0) throw new Error("expectedWorkItemRevision 必须是非负整数");
+		if (state.goalId !== expectedGoalId) {
+			throw new WorkStateConflictError(state, expectedRevision, `验收所属 Goal 已变化（本次传入 ${expectedGoalId}，当前 ${state.goalId}）`);
+		}
+		if (state.execution.epoch !== expectedEpoch) {
+			throw new WorkStateConflictError(state, expectedRevision, `验收所属 execution epoch 已变化（本次传入 ${expectedEpoch}，当前 ${state.execution.epoch}）`);
+		}
+		if (!state.plan) throw new Error("WorkPlan 不存在");
+		if (state.plan.needsReconcile || state.plan.coveredGoalRevision !== state.goalRevision) {
+			throw new WorkStateConflictError(state, expectedRevision, "WorkPlan 尚未对账当前 Goal 契约，不能沿用旧验收结论");
+		}
+		const item = state.plan.items[workItemId];
+		if (!item) throw new WorkStateConflictError(state, expectedRevision, `验收目标 WorkItem ${workItemId} 已不存在`);
+		if (item.status !== "submitted") throw new WorkStateConflictError(state, expectedRevision, `WorkItem ${workItemId} 当前状态为 ${item.status}，已不是待验收提交`);
+		if (item.revision !== expectedWorkItemRevision) {
+			throw new WorkStateConflictError(state, expectedRevision, `WorkItem ${workItemId} 契约 revision 已变化（本次传入 ${expectedWorkItemRevision}，当前 ${item.revision}）`);
+		}
+		const submission = [...item.submissions].reverse().find((entry) => !entry.review);
+		if (!submission || submission.id !== expectedSubmissionId) {
+			throw new WorkStateConflictError(state, expectedRevision, `WorkItem ${workItemId} 待验收 Submission 已变化（本次传入 ${expectedSubmissionId}，当前 ${submission?.id ?? "无"}）`);
+		}
+		if (submission.goalRevision !== state.goalRevision || submission.workItemRevision !== item.revision) {
+			throw new WorkStateConflictError(state, expectedRevision, `Submission ${submission.id} 的冻结契约已过期`);
+		}
+		if (expectedRevision < submission.submittedStateRevision) {
+			throw new WorkStateConflictError(state, expectedRevision, `本次 revision ${expectedRevision} 早于 Submission ${submission.id} 首次可见的 revision ${submission.submittedStateRevision}，该快照不可能包含本次验收目标`);
+		}
+		if (expectedRevision > state.revision) {
+			throw new WorkStateConflictError(state, expectedRevision, "本次传入的是尚不存在的未来 revision，不能作为已观察状态；禁止猜测 revision");
+		}
+		return { item, submission, rebased: state.revision !== expectedRevision };
 	}
 	private sessionGoals(data: WorkStateFile, sessionId: string): SessionWorkState[] {
 		return Object.values(data.states).filter((state) => state.sessionId === sessionId).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
@@ -471,6 +551,70 @@ export class WorkStateStore {
 		for (const [id, decision] of Object.entries(data.decisions)) {
 			if (decision.goalId === goalId && decision.status === "pending") data.decisions[id] = { ...decision, status: "cancelled", updatedAt: timestamp };
 		}
+	}
+	private abandonmentEvidenceGaps(state: SessionWorkState): string[] {
+		return Object.values(state.plan?.items ?? {}).flatMap((item) => {
+			const pending = [...item.submissions].reverse().find((submission) => !submission.review);
+			return pending ? [`WorkItem ${item.id} 的 Submission ${pending.id} 尚未验收`] : [];
+		});
+	}
+	private closeWorkItems(state: SessionWorkState, reason: string, timestamp: string): GoalWorkPlan | undefined {
+		if (!state.plan) return undefined;
+		const plan = copy(state.plan);
+		let changed = false;
+		for (const item of Object.values(plan.items)) {
+			if (["accepted", "cancelled"].includes(item.status)) continue;
+			const previousRevision = item.revision;
+			item.status = "cancelled";
+			delete item.activeDelegationId;
+			item.revision += 1;
+			item.updatedAt = timestamp;
+			item.lastChange = { reason, changedAt: timestamp, previousRevision };
+			changed = true;
+		}
+		if (changed) {
+			plan.revision += 1;
+			plan.updatedAt = timestamp;
+		}
+		return plan;
+	}
+	private makeGoalState(input: {
+		sessionId: string; goal: string; completionBoundary: string; reviewMode?: CompletionReviewMode;
+		reviewerModel?: string; participantAgentIds?: string[]; contractProvenance?: GoalContractProvenance;
+		verificationPolicy?: Partial<GoalVerificationPolicy>;
+	}, goalId = randomUUID(), timestamp = now(), supersedesGoalId?: string): SessionWorkState {
+		const goal = requiredText(input.goal, "goal");
+		const completionBoundary = requiredText(input.completionBoundary, "completionBoundary");
+		const provenance = input.contractProvenance ?? { criteriaOrigin: "user_input" as const, sourceMessageIds: [] };
+		if (provenance.criteriaOrigin === "manager_derived" && provenance.sourceMessageIds.length === 0) throw new Error("Manager 自动创建 Goal 必须引用至少一条来源消息");
+		const requestedPolicy = input.verificationPolicy ?? {};
+		const verificationPolicy: GoalVerificationPolicy = {
+			...this.goalVerificationDefaults,
+			...requestedPolicy,
+			minimumWorkItemMode: validVerificationMode(requestedPolicy.minimumWorkItemMode ?? this.goalVerificationDefaults.minimumWorkItemMode, "verificationPolicy.minimumWorkItemMode"),
+			finalGoalMode: validVerificationMode(requestedPolicy.finalGoalMode ?? this.goalVerificationDefaults.finalGoalMode, "verificationPolicy.finalGoalMode"),
+			trigger: validTrigger(requestedPolicy.trigger ?? this.goalVerificationDefaults.trigger, "verificationPolicy.trigger"),
+			source: requestedPolicy.source ?? this.goalVerificationDefaults.source,
+			reason: requiredText(requestedPolicy.reason ?? this.goalVerificationDefaults.reason, "verificationPolicy.reason"),
+		};
+		if (!["user", "harness_default", "manager_derived"].includes(verificationPolicy.source)) throw new Error("verificationPolicy.source 无效");
+		verificationPolicy.finalGoalMode = stricterMode(verificationPolicy.finalGoalMode, verificationPolicy.minimumWorkItemMode);
+		const inferredReviewMode: CompletionReviewMode = verificationPolicy.finalGoalMode === "manager_review" ? "manager" : "independent";
+		return {
+			goalId, sessionId: input.sessionId, goal,
+			contractProvenance: {
+				criteriaOrigin: provenance.criteriaOrigin,
+				sourceMessageIds: strings(provenance.sourceMessageIds, "sourceMessageIds"),
+				...(provenance.criteriaOrigin === "manager_derived" ? { authoredByAgentId: "manager" as const } : {}),
+			},
+			responsibleAgentId: "manager", participantAgentIds: [...new Set(input.participantAgentIds ?? [])],
+			currentBrief: "", completionBoundary, goalRevision: 1, reviewMode: input.reviewMode ?? inferredReviewMode,
+			verificationPolicy, goalVerifications: [],
+			...(optionalText(input.reviewerModel, "reviewerModel") ? { reviewerModel: input.reviewerModel!.trim() } : {}),
+			completionReviews: [], status: "active", execution: { epoch: 1, status: "idle" },
+			...(supersedesGoalId ? { supersedesGoalId } : {}),
+			artifactIds: [], revision: 0, createdAt: timestamp, updatedAt: timestamp,
+		};
 	}
 	async get(sessionId: string): Promise<SessionWorkState | undefined> {
 		const data = await this.load();
@@ -513,44 +657,10 @@ export class WorkStateStore {
 			if (Object.values(data.operations).some((item) => item.id === operationId)) {
 				throw new WorkStateOperationConflictError("同一 Goal 创建 operationId 已属于另一 Session", "idempotency_conflict");
 			}
-			if (this.active(data, input.sessionId)) throw new Error("该 Session 已有正在进行的 Goal；请先完成或取消当前 Goal");
-			const provenance = input.contractProvenance ?? { criteriaOrigin: "user_input" as const, sourceMessageIds: [] };
-			if (provenance.criteriaOrigin === "manager_derived" && provenance.sourceMessageIds.length === 0) throw new Error("Manager 自动创建 Goal 必须引用至少一条来源消息");
+			if (this.active(data, input.sessionId)) throw new Error("该 Session 已有正在进行的 Goal；请先完成、废弃或原子更换当前 Goal");
 			const timestamp = now();
 			const goalId = randomUUID();
-			const requestedPolicy = input.verificationPolicy ?? {};
-			const verificationPolicy: GoalVerificationPolicy = {
-				...this.goalVerificationDefaults,
-				...requestedPolicy,
-				minimumWorkItemMode: validVerificationMode(requestedPolicy.minimumWorkItemMode ?? this.goalVerificationDefaults.minimumWorkItemMode, "verificationPolicy.minimumWorkItemMode"),
-				finalGoalMode: validVerificationMode(requestedPolicy.finalGoalMode ?? this.goalVerificationDefaults.finalGoalMode, "verificationPolicy.finalGoalMode"),
-				trigger: validTrigger(requestedPolicy.trigger ?? this.goalVerificationDefaults.trigger, "verificationPolicy.trigger"),
-				source: requestedPolicy.source ?? this.goalVerificationDefaults.source,
-				reason: requiredText(requestedPolicy.reason ?? this.goalVerificationDefaults.reason, "verificationPolicy.reason"),
-			};
-			if (!["user", "harness_default", "manager_derived"].includes(verificationPolicy.source)) throw new Error("verificationPolicy.source 无效");
-			verificationPolicy.finalGoalMode = stricterMode(verificationPolicy.finalGoalMode, verificationPolicy.minimumWorkItemMode);
-			// `verificationPolicy.finalGoalMode` is the current Harness contract.
-			// Keep the legacy CompletionReviewMode projection aligned when callers
-			// omit it; otherwise `finalGoalMode=manager_review` could still launch an
-			// independent Goal reviewer and leave an already accepted Goal active.
-			const inferredReviewMode: CompletionReviewMode = verificationPolicy.finalGoalMode === "manager_review"
-				? "manager"
-				: "independent";
-			const state: SessionWorkState = {
-				goalId, sessionId: input.sessionId, goal,
-				contractProvenance: {
-					criteriaOrigin: provenance.criteriaOrigin,
-					sourceMessageIds: strings(provenance.sourceMessageIds, "sourceMessageIds"),
-					...(provenance.criteriaOrigin === "manager_derived" ? { authoredByAgentId: "manager" as const } : {}),
-				},
-				responsibleAgentId: "manager", participantAgentIds: [...new Set(input.participantAgentIds ?? [])],
-				currentBrief: "", completionBoundary, goalRevision: 1, reviewMode: input.reviewMode ?? inferredReviewMode,
-				verificationPolicy, goalVerifications: [],
-				...(optionalText(input.reviewerModel, "reviewerModel") ? { reviewerModel: input.reviewerModel!.trim() } : {}),
-				completionReviews: [], status: "active", execution: { epoch: 1, status: "idle" },
-				artifactIds: [], revision: 0, createdAt: timestamp, updatedAt: timestamp,
-			};
+			const state = this.makeGoalState({ ...input, goal, completionBoundary }, goalId, timestamp);
 			data.states[goalId] = state;
 			this.event(data, { id: `goal-created:${goalId}`, goalId, sessionId: input.sessionId, epoch: 1, kind: "goal_changed", payload: { action: "created" } });
 			this.commit(data, input.sessionId, operationId, 1, "create_goal", payload, state, 0, goalId, "session");
@@ -581,6 +691,7 @@ export class WorkStateStore {
 			const currentBrief = patch.currentBrief === undefined ? state.currentBrief : (patch.currentBrief.trim() ? requiredText(patch.currentBrief, "currentBrief") : "");
 			const requestedStatus = patch.status ?? state.status;
 			if (patch.status === "resolved") throw new Error("Goal 只能通过完成复核置为 resolved；Manager 使用 applyManagerCompletion，独立复核使用 applyCompletionReview");
+			if (patch.status === "cancelled" || patch.status === "superseded") throw new Error("Goal 终态关闭必须通过 abandonGoal 或 supersedeGoal");
 			const contractChanged = goal !== state.goal || boundary !== state.completionBoundary;
 			const status: SessionWorkStatus = contractChanged ? "active" : requestedStatus;
 			const next: SessionWorkState = {
@@ -864,7 +975,7 @@ export class WorkStateStore {
 							executionReceiptId: receipt.id,
 							executionReceipt: copy(receipt),
 							...(input.workspaceChangeSet ? { workspaceChangeSetId: input.workspaceChangeSet.id, workspaceChangeSet: copy(input.workspaceChangeSet) } : receipt.workspaceChangeSetId ? { workspaceChangeSetId: receipt.workspaceChangeSetId } : {}),
-							goalRevision: state.goalRevision, workItemRevision: item.revision,
+							submittedStateRevision: state.revision + 1, goalRevision: state.goalRevision, workItemRevision: item.revision,
 							inputFingerprint: receipt.inputFingerprint ?? hash({ receiptId: receipt.id, contractHash: receipt.contractHash, artifactCapture: receipt.artifactCapture, workspaceChangeSetId: receipt.workspaceChangeSetId }),
 							verifications: [],
 							...(input.summary?.trim() ? { summary: input.summary.trim() } : {}), submittedAt: timestamp,
@@ -919,7 +1030,7 @@ export class WorkStateStore {
 				item.submissions.push({
 					id: randomUUID(), attempt: item.submissions.length + 1, source: "manager",
 					resultRef: { kind: "manager_summary", evidenceRefs }, artifactIds: [], summary, submittedAt: timestamp,
-					goalRevision: state.goalRevision, workItemRevision: item.revision, inputFingerprint: hash({ goalId: state.goalId, workPlanId: plan.id, workItemId: item.id, revision: item.revision, summary, evidenceRefs }), verifications: [],
+					submittedStateRevision: state.revision + 1, goalRevision: state.goalRevision, workItemRevision: item.revision, inputFingerprint: hash({ goalId: state.goalId, workPlanId: plan.id, workItemId: item.id, revision: item.revision, summary, evidenceRefs }), verifications: [],
 				});
 				item.status = "submitted";
 			}
@@ -980,27 +1091,40 @@ export class WorkStateStore {
 	}
 	async recordAcceptanceIntent(
 		sessionId: string, workItemId: string, expectedRevision: number,
-		input: { summary: string; evidenceRefs?: string[] }, operationId: string,
-		expectedEpoch?: number, expectedGoalId?: string,
+		input: { expectedWorkItemRevision: number; expectedSubmissionId: string; summary: string; evidenceRefs?: string[] }, operationId: string,
+		expectedEpoch: number, expectedGoalId: string,
 	): Promise<SessionWorkState> {
 		const payload = { workItemId, expectedRevision, input, expectedEpoch, expectedGoalId };
 		return this.serialize(async () => {
 			const data = await this.load();
+			const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "acceptance_intent", payload, expectedGoalId);
+			if (replay) return replay;
 			const state = this.active(data, sessionId);
 			if (!state?.plan) throw new Error("WorkPlan 不存在");
-			const goalId = expectedGoalId ?? state.goalId;
-			const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "acceptance_intent", payload, goalId);
-			if (replay) return replay;
-			this.current(state, expectedRevision, expectedEpoch, goalId);
+			const goalId = expectedGoalId;
+			const target = this.reviewTarget(state, workItemId, expectedRevision, expectedEpoch, goalId, input.expectedWorkItemRevision, input.expectedSubmissionId);
 			const next = copy(state);
-			const item = next.plan!.items[workItemId];
-			if (!item || item.status !== "submitted") throw new Error("只有 submitted WorkItem 可以请求 accepted");
-			const submission = [...item.submissions].reverse().find((entry) => !entry.review);
-			if (!submission) throw new Error("没有待验收 Submission");
+			const item = next.plan!.items[workItemId]!;
+			const submission = item.submissions.find((entry) => entry.id === input.expectedSubmissionId)!;
 			this.assertSubmissionCanAccept(state, state.plan, state.plan.items[workItemId]!, submission, input.evidenceRefs ?? [], true);
-			if (submission.acceptanceIntent) throw new Error("当前 Submission 已冻结 Manager accepted 意图，不允许覆盖");
+			if (submission.acceptanceIntent) {
+				const requested = { verdict: "accepted" as const, summary: requiredText(input.summary, "summary"), evidenceRefs: strings(input.evidenceRefs ?? [], "evidenceRefs") };
+				const existing = { verdict: submission.acceptanceIntent.verdict, summary: submission.acceptanceIntent.summary, evidenceRefs: submission.acceptanceIntent.evidenceRefs };
+				if (stable(existing) !== stable(requested)) throw new Error("当前 Submission 已冻结不同的 Manager accepted 意图，不允许覆盖");
+				this.commit(data, sessionId, operationId, next.execution.epoch, "acceptance_intent", payload, next, next.revision, state.goalId);
+				await this.write(data);
+				return copy(next);
+			}
 			const timestamp = now();
-			submission.acceptanceIntent = { verdict: "accepted", summary: requiredText(input.summary, "summary"), evidenceRefs: strings(input.evidenceRefs ?? [], "evidenceRefs"), requestedAt: timestamp };
+			submission.acceptanceIntent = {
+				verdict: "accepted",
+				summary: requiredText(input.summary, "summary"),
+				evidenceRefs: strings(input.evidenceRefs ?? [], "evidenceRefs"),
+				expectedStateRevision: expectedRevision,
+				reviewedStateRevision: state.revision,
+				...(target.rebased ? { rebasedFromRevision: expectedRevision } : {}),
+				requestedAt: timestamp,
+			};
 			item.updatedAt = timestamp; next.plan!.revision += 1; next.plan!.updatedAt = timestamp; next.revision += 1; next.updatedAt = timestamp;
 			data.states[state.goalId] = next;
 			this.event(data, { id: `acceptance-intent:${state.goalId}:${submission.id}`, goalId: state.goalId, sessionId, epoch: next.execution.epoch, kind: "goal_changed", payload: { action: "acceptance_intent", workItemId, submissionId: submission.id, revision: next.revision } });
@@ -1092,32 +1216,38 @@ export class WorkStateStore {
 	}
 	async reviewWorkItem(
 		sessionId: string, workItemId: string, expectedRevision: number,
-		input: { verdict: "accepted" | "revision" | "blocked"; summary: string; evidenceRefs?: string[] },
-		operationId: string, expectedEpoch?: number, expectedGoalId?: string,
+		input: WorkItemReviewInput,
+		operationId: string, expectedEpoch: number, expectedGoalId: string,
 	): Promise<SessionWorkState> {
 		const payload = { expectedGoalId, workItemId, expectedRevision, input, expectedEpoch };
 		return this.serialize(async () => {
 			const data = await this.load();
+			const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "review_work_item", payload, expectedGoalId);
+			if (replay) return replay;
 			const state = this.active(data, sessionId);
 			if (!state?.plan) throw new Error("WorkPlan 不存在");
-			const goalId = expectedGoalId ?? state.goalId;
-			const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "review_work_item", payload, goalId);
-			if (replay) return replay;
-			this.current(state, expectedRevision, expectedEpoch, goalId);
+			const goalId = expectedGoalId;
+			const target = this.reviewTarget(state, workItemId, expectedRevision, expectedEpoch, goalId, input.expectedWorkItemRevision, input.expectedSubmissionId);
 			const plan = copy(state.plan);
-			const item = plan.items[workItemId];
-			if (!item || item.status !== "submitted") throw new Error("只有 submitted WorkItem 可以验收");
-			const submission = [...item.submissions].reverse().find((entry) => !entry.review);
-			if (!submission) throw new Error("没有待验收 Submission");
+			const item = plan.items[workItemId]!;
+			const submission = item.submissions.find((entry) => entry.id === target.submission.id)!;
 			if (input.verdict === "accepted") this.assertSubmissionCanAccept(state, plan, item, submission, input.evidenceRefs ?? []);
 			const timestamp = now();
-			submission.review = { verdict: input.verdict, summary: requiredText(input.summary, "summary"), evidenceRefs: strings(input.evidenceRefs ?? [], "evidenceRefs"), reviewedAt: timestamp };
+			submission.review = {
+				verdict: input.verdict,
+				summary: requiredText(input.summary, "summary"),
+				evidenceRefs: strings(input.evidenceRefs ?? [], "evidenceRefs"),
+				expectedStateRevision: expectedRevision,
+				reviewedStateRevision: state.revision,
+				...(target.rebased ? { rebasedFromRevision: expectedRevision } : {}),
+				reviewedAt: timestamp,
+			};
 			item.status = input.verdict;
 			input.verdict === "accepted" ? item.acceptedSubmissionId = submission.id : delete item.acceptedSubmissionId;
 			item.revision += 1; item.updatedAt = timestamp; plan.revision += 1; plan.updatedAt = timestamp; deriveReady(plan);
 			const next = { ...state, plan, revision: state.revision + 1, updatedAt: timestamp };
 			data.states[state.goalId] = next;
-			this.event(data, { id: `work-item-review:${state.goalId}:${submission.id}`, goalId: state.goalId, sessionId, epoch: next.execution.epoch, kind: "goal_changed", payload: { action: "work_item_reviewed", workPlanId: plan.id, workItemId: item.id, status: item.status, revision: next.revision } });
+			this.event(data, { id: `work-item-review:${state.goalId}:${submission.id}`, goalId: state.goalId, sessionId, epoch: next.execution.epoch, kind: "goal_changed", payload: { action: "work_item_reviewed", workPlanId: plan.id, workItemId: item.id, submissionId: submission.id, status: item.status, expectedRevision, reviewedStateRevision: state.revision, rebased: target.rebased, revision: next.revision } });
 			this.commit(data, sessionId, operationId, next.execution.epoch, "review_work_item", payload, next, next.revision, state.goalId);
 			await this.write(data);
 			return copy(next);
@@ -1212,22 +1342,164 @@ export class WorkStateStore {
 			return copy(next);
 		});
 	}
+	async abandonGoal(
+		sessionId: string,
+		expectedRevision: number,
+		input: { kind: Exclude<GoalAbandonment["kind"], "superseded">; by: string; reason: string; delegationIds?: string[] },
+		operationId: string,
+		expectedGoalId?: string,
+	): Promise<SessionWorkState> {
+		const payload = { expectedGoalId, expectedRevision, input };
+		return this.serialize(async () => {
+			const data = await this.load();
+			if (expectedGoalId) {
+				const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "abandon_goal", payload, expectedGoalId);
+				if (replay) return replay;
+			}
+			const state = this.active(data, sessionId);
+			if (!state) throw new Error("Session Goal 不存在");
+			const goalId = expectedGoalId ?? state.goalId;
+			if (!expectedGoalId) {
+				const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "abandon_goal", payload, goalId);
+				if (replay) return replay;
+			}
+			this.current(state, expectedRevision, undefined, goalId);
+			const timestamp = now();
+			const reason = requiredText(input.reason, "reason");
+			const abandonment: GoalAbandonment = {
+				kind: input.kind,
+				by: requiredText(input.by, "by"),
+				reason,
+				at: timestamp,
+				evidenceGaps: this.abandonmentEvidenceGaps(state),
+			};
+			const closedPlan = this.closeWorkItems(state, reason, timestamp);
+			const next: SessionWorkState = {
+				...state,
+				status: "cancelled",
+				execution: { epoch: state.execution.epoch + 1, status: "idle", ...(state.execution.interruption ? { interruption: state.execution.interruption } : {}) },
+				abandonment,
+				...(closedPlan ? { plan: closedPlan } : {}),
+				revision: state.revision + 1,
+				updatedAt: timestamp,
+			};
+			delete next.waitingOn;
+			delete next.nextAction;
+			this.cancelPendingDecisions(data, state.goalId, timestamp);
+			data.states[state.goalId] = next;
+			this.event(data, { id: `goal-abandoned:${state.goalId}:${next.execution.epoch}`, goalId: state.goalId, sessionId, epoch: next.execution.epoch, kind: "goal_changed", payload: { action: "abandoned", abandonment } });
+			this.commit(data, sessionId, operationId, next.execution.epoch, "abandon_goal", payload, next, next.revision, state.goalId);
+			await this.write(data);
+			return copy(next);
+		});
+	}
+	async supersedeGoal(
+		sessionId: string,
+		expectedRevision: number,
+		input: {
+			by: string; reason: string; delegationIds?: string[];
+			goal: string; completionBoundary: string; reviewMode?: CompletionReviewMode; reviewerModel?: string;
+			participantAgentIds?: string[]; contractProvenance?: GoalContractProvenance; verificationPolicy?: Partial<GoalVerificationPolicy>;
+		},
+		operationId: string,
+		expectedGoalId?: string,
+	): Promise<{ previous: SessionWorkState; workState: SessionWorkState }> {
+		const normalized = { ...input, goal: requiredText(input.goal, "goal"), completionBoundary: requiredText(input.completionBoundary, "completionBoundary") };
+		const payload = { expectedGoalId, expectedRevision, input: normalized };
+		return this.serialize(async () => {
+			const data = await this.load();
+			if (expectedGoalId) {
+				const replay = this.replay<{ previous: SessionWorkState; workState: SessionWorkState }>(data, sessionId, operationId, "supersede_goal", payload, expectedGoalId);
+				if (replay) return replay;
+			}
+			const state = this.active(data, sessionId);
+			if (!state) throw new Error("Session Goal 不存在");
+			const goalId = expectedGoalId ?? state.goalId;
+			if (!expectedGoalId) {
+				const replay = this.replay<{ previous: SessionWorkState; workState: SessionWorkState }>(data, sessionId, operationId, "supersede_goal", payload, goalId);
+				if (replay) return replay;
+			}
+			this.current(state, expectedRevision, undefined, goalId);
+			const timestamp = now();
+			const replacementGoalId = randomUUID();
+			const reason = requiredText(input.reason, "reason");
+			const abandonment: GoalAbandonment = {
+				kind: "superseded",
+				by: requiredText(input.by, "by"),
+				reason,
+				at: timestamp,
+				evidenceGaps: this.abandonmentEvidenceGaps(state),
+			};
+			const closedPlan = this.closeWorkItems(state, reason, timestamp);
+			const previous: SessionWorkState = {
+				...state,
+				status: "superseded",
+				execution: { epoch: state.execution.epoch + 1, status: "idle", ...(state.execution.interruption ? { interruption: state.execution.interruption } : {}) },
+				abandonment,
+				supersededByGoalId: replacementGoalId,
+				...(closedPlan ? { plan: closedPlan } : {}),
+				revision: state.revision + 1,
+				updatedAt: timestamp,
+			};
+			delete previous.waitingOn;
+			delete previous.nextAction;
+			const workState = this.makeGoalState({ ...normalized, sessionId }, replacementGoalId, timestamp, state.goalId);
+			this.cancelPendingDecisions(data, state.goalId, timestamp);
+			data.states[state.goalId] = previous;
+			data.states[replacementGoalId] = workState;
+			this.event(data, { id: `goal-superseded:${state.goalId}:${replacementGoalId}`, goalId: state.goalId, sessionId, epoch: previous.execution.epoch, kind: "goal_changed", payload: { action: "superseded", replacementGoalId, abandonment } });
+			this.event(data, { id: `goal-created:${replacementGoalId}`, goalId: replacementGoalId, sessionId, epoch: 1, kind: "goal_changed", payload: { action: "created", supersedesGoalId: state.goalId } });
+			const result = { previous, workState };
+			this.commit(data, sessionId, operationId, previous.execution.epoch, "supersede_goal", payload, result, workState.revision, state.goalId);
+			await this.write(data);
+			return copy(result);
+		});
+	}
 	async interruptGoal(sessionId: string, expectedRevision: number, input: { kind: GoalInterruption["kind"]; fingerprint: string; delegationIds: string[] }, operationId: string, expectedGoalId?: string): Promise<SessionWorkState> {
 		const payload = { expectedGoalId, expectedRevision, input };
 		return this.serialize(async () => {
 			const data = await this.load();
+			if (expectedGoalId) {
+				const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "interrupt_goal", payload, expectedGoalId);
+				if (replay) return replay;
+			}
 			const state = this.active(data, sessionId);
 			if (!state) throw new Error("Session Goal 不存在");
 			const goalId = expectedGoalId ?? state.goalId;
-			const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "interrupt_goal", payload, goalId);
-			if (replay) return replay;
+			if (!expectedGoalId) {
+				const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "interrupt_goal", payload, goalId);
+				if (replay) return replay;
+			}
 			this.current(state, expectedRevision, undefined, goalId);
 			if (state.execution.interruption?.fingerprint === input.fingerprint) return copy(state);
 			const epoch = state.execution.epoch + 1;
 			const interruption: GoalInterruption = { id: randomUUID(), kind: input.kind, fingerprint: requiredText(input.fingerprint, "fingerprint"), delegationIds: strings(input.delegationIds, "delegationIds"), interruptedAt: now() };
-			const next: SessionWorkState = { ...state, execution: { epoch, status: "interrupted", interruption }, revision: state.revision + 1, updatedAt: now() };
+			const timestamp = now();
+			const items = Object.values(state.plan?.items ?? {});
+			const noPendingDecisions = !Object.values(data.decisions).some((decision) => decision.goalId === state.goalId && decision.status === "pending");
+			const terminalInterrupt = input.delegationIds.length === 0
+				&& noPendingDecisions
+				&& items.length > 0
+				&& items.every((item) => ["accepted", "cancelled"].includes(item.status));
+			const next: SessionWorkState = {
+				...state,
+				...(terminalInterrupt ? {
+					status: "cancelled" as const,
+					abandonment: {
+						kind: "terminal_interrupt" as const,
+						by: input.kind === "manager_interrupted" ? "manager" : input.kind === "user" ? "user" : "system",
+						reason: "中断时已无在飞委托、待处理决策或可继续推进的 WorkItem，自动关闭 Goal",
+						at: timestamp,
+						evidenceGaps: this.abandonmentEvidenceGaps(state),
+					},
+				} : {}),
+				execution: { epoch, status: terminalInterrupt ? "idle" : "interrupted", interruption },
+				revision: state.revision + 1,
+				updatedAt: timestamp,
+			};
+			if (terminalInterrupt) { delete next.waitingOn; delete next.nextAction; }
 			data.states[state.goalId] = next;
-			this.event(data, { id: `goal-interrupted:${state.goalId}:${epoch}`, goalId: state.goalId, sessionId, epoch, kind: "goal_interrupted", payload: { interruption } });
+			this.event(data, { id: `goal-interrupted:${state.goalId}:${epoch}`, goalId: state.goalId, sessionId, epoch, kind: "goal_interrupted", payload: { interruption, terminal: terminalInterrupt } });
 			this.commit(data, sessionId, operationId, epoch, "interrupt_goal", payload, next, next.revision, state.goalId);
 			await this.write(data);
 			return copy(next);

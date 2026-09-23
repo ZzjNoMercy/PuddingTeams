@@ -344,7 +344,7 @@ test("Goal v5：历史 Goal 的 Delegation 只能查看，不能再取消", asyn
 		cwdSnapshot: dir, windowId: "w1", managerSessionId: "s-goal", goalId: goalA.goalId,
 		agentId: "codex", agentRevision: 0, operation: "run",
 	});
-	await workStates.update("s-goal", goalA.revision, { status: "cancelled", currentBrief: "A 已结束" }, "cancel-a", goalA.execution.epoch, goalA.goalId);
+	await workStates.abandonGoal("s-goal", goalA.revision, { kind: "manager_abandoned", by: "manager", reason: "A 已结束" }, "cancel-a", goalA.goalId);
 	await workStates.create({ sessionId: "s-goal", goal: "B", completionBoundary: "B 完成", operationId: "create-b" });
 	const response = await app.inject({
 		method: "POST", url: `/api/delegations/${delegation.id}/cancel`,

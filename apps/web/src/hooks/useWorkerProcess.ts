@@ -11,7 +11,7 @@ import type { ChatMessage, PiMessage } from "@/lib/types";
  * `full=false` 按委托创建时间切出本次委托的片段（worker 会话跨任务续接）；
  * `full=true` 展示完整会话，便于跨任务 trace。
  */
-export function useWorkerProcess(delegationId: string | null, full = false) {
+export function useWorkerProcess(delegationId: string | null, full = false, liveUpdates = true) {
 	const [messages, setMessages] = useState<ChatMessage[]>([]);
 	const [loading, setLoading] = useState(true);
 	const [live, setLive] = useState(false);
@@ -31,6 +31,7 @@ export function useWorkerProcess(delegationId: string | null, full = false) {
 		const connectWs = () => {
 			ws = new WebSocket(delegationProcessWsUrl(delegationId));
 			ws.onmessage = (m) => {
+				if (disposed) return;
 				let event: { type: string; [k: string]: unknown };
 				try {
 					event = JSON.parse(m.data as string);
@@ -61,7 +62,8 @@ export function useWorkerProcess(delegationId: string | null, full = false) {
 					setStatus(st);
 					setCreatedAt(created);
 					setLoading(false);
-					if (isLive) connectWs();
+					setError(null);
+					if (isLive && liveUpdates) connectWs();
 				})
 				.catch((err: unknown) => {
 					if (disposed) return;
@@ -80,7 +82,7 @@ export function useWorkerProcess(delegationId: string | null, full = false) {
 			if (retryTimer) clearTimeout(retryTimer);
 			ws?.close();
 		};
-	}, [delegationId, full]);
+	}, [delegationId, full, liveUpdates]);
 
 	return { messages, loading, live, agentId, status, createdAt, error };
 }

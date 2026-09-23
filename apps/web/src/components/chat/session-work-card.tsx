@@ -14,7 +14,7 @@ import {
 } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { answerDecisionRequest, fetchRoomDelegationProcesses, getSessionWorkState, listModels, putSessionWorkState, type WorkerProcessListItem } from "@/lib/api";
+import { answerDecisionRequest, fetchRoomDelegationProcesses, getSessionWorkState, listModels, putSessionWorkState, supersedeGoal, type WorkerProcessListItem } from "@/lib/api";
 import type { CompletionReviewMode, DecisionRequest, DelegationTrace, ModelSummary, SessionGoalSummary, SessionWorkState } from "@/lib/types";
 import { groupActivitiesByTurn, SessionActivityDrawer, type SessionExecutionTurn, type SessionRuntimeSummary, type SessionRuntimeView, RuntimeViewTabs } from "./session-activity-drawer";
 import { SessionRuntimeDrawer } from "./session-runtime-drawer";
@@ -74,6 +74,7 @@ export function SessionWorkCard({
 	const [activityItems, setActivityItems] = useState<WorkerProcessListItem[]>([]);
 	const [activityLoading, setActivityLoading] = useState(true);
 	const [activityError, setActivityError] = useState<string>();
+	const [supersedeSource, setSupersedeSource] = useState<SessionWorkState>();
 	const requestSequence = useRef(0);
 	const viewedGoalRef = useRef<string | undefined>(undefined);
 	const autoOpenedWorkItems = useRef(new Set<string>());
@@ -185,6 +186,11 @@ export function SessionWorkCard({
 	}, [refresh, workStateSignal]);
 
 	const pending = useMemo(() => decisions.filter((item) => item.status === "pending"), [decisions]);
+	const effectiveSupersedeSource = supersedeSource ?? (activeGoalId && workState?.goalId === activeGoalId ? workState : undefined);
+	const setCreateDialogOpen = useCallback((open: boolean) => {
+		if (!open) setSupersedeSource(undefined);
+		onCreateOpenChange(open);
+	}, [onCreateOpenChange]);
 	const activeGoalSummary = goals.find((item) => item.goalId === activeGoalId);
 	const currentTurnItems = useMemo(() => groupActivitiesByTurn(activityItems, executionTurns).find((group) => group.isCurrent)?.items ?? [], [activityItems, executionTurns]);
 	const activityRunning = currentTurnItems.filter((item) => item.executionState === "running" || item.executionState === "reconciling").length;
@@ -203,38 +209,39 @@ export function SessionWorkCard({
 
 	const createGoal = useCallback(async () => {
 		if (!goal.trim() || !completionBoundary.trim()) return;
-		if (activeGoalId) {
-			toast.error("当前 Goal 已开始执行，请刷新后再创建下一个");
-			return;
-		}
+		if (activeGoalId && (!effectiveSupersedeSource || effectiveSupersedeSource.goalId !== activeGoalId)) return toast.error("请先切换到当前 Goal，再执行更换");
 		const hasHistory = goals.length > 0;
 		setSubmitting(true);
 		try {
-			const next = await putSessionWorkState(sessionId, {
+			const replacement = {
 					goal: goal.trim(),
 					completionBoundary: completionBoundary.trim(),
 					reviewMode,
 					...(reviewMode === "independent" && reviewerModel !== "__manager__" ? { reviewerModel } : {}),
-				});
+			};
+			const superseded = effectiveSupersedeSource
+				? await supersedeGoal(sessionId, { expectedGoalId: effectiveSupersedeSource.goalId, expectedRevision: effectiveSupersedeSource.revision, reason: "用户通过 Goal UI 更换目标", ...replacement })
+				: undefined;
+			const next = superseded?.workState ?? await putSessionWorkState(sessionId, replacement);
 			setWorkState(next);
 			setActiveGoalId(next.goalId);
 			viewedGoalRef.current = undefined;
 			setViewedGoalId(undefined);
 			setGoalLoading(false);
 			setGoalLoadError(undefined);
-			setGoals((previous) => [{ goalId: next.goalId, goal: next.goal, status: next.status, executionStatus: next.execution.status, pending: 0, running: false, createdAt: next.createdAt, updatedAt: next.updatedAt }, ...previous.filter((item) => item.goalId !== next.goalId)]);
+			setGoals((previous) => [{ goalId: next.goalId, goal: next.goal, status: next.status, executionStatus: next.execution.status, pending: 0, running: false, createdAt: next.createdAt, updatedAt: next.updatedAt }, ...previous.filter((item) => item.goalId !== next.goalId).map((item) => superseded && item.goalId === superseded.previous.goalId ? { ...item, status: superseded.previous.status, executionStatus: superseded.previous.execution.status, pending: 0, running: false, updatedAt: superseded.previous.updatedAt } : item)]);
 			setDecisions([]);
 			setDelegations([]);
 			setAnswerById({});
 			onGoalStateChange?.(true);
-			onCreateOpenChange(false);
-			toast.success(hasHistory ? "已创建下一个 Goal，已切换到最新目标" : "已创建 Goal");
+			setCreateDialogOpen(false);
+			toast.success(superseded ? "旧 Goal 已关闭，已切换到新目标" : hasHistory ? "已创建下一个 Goal，已切换到最新目标" : "已创建 Goal");
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
 			setSubmitting(false);
 		}
-	}, [activeGoalId, completionBoundary, goal, goals.length, onCreateOpenChange, onGoalStateChange, reviewMode, reviewerModel, sessionId]);
+	}, [activeGoalId, completionBoundary, effectiveSupersedeSource, goal, goals.length, onGoalStateChange, reviewMode, reviewerModel, sessionId, setCreateDialogOpen]);
 
 	const selectGoal = useCallback((goalId: string) => {
 		requestSequence.current += 1;
@@ -268,14 +275,14 @@ export function SessionWorkCard({
 	}, [refresh]);
 
 	const createDialog = (
-		<Dialog open={createOpen} onOpenChange={onCreateOpenChange}>
+		<Dialog open={createOpen} onOpenChange={setCreateDialogOpen}>
 			<DialogContent className="sm:max-w-xl">
 				<DialogHeader>
 					<div className="mb-1 flex size-9 items-center justify-center rounded-xl bg-primary/10 text-primary">
 						<TargetIcon className="size-4.5" />
 					</div>
-					<DialogTitle><span className="font-mono text-primary">/goal</span> 创建持续目标</DialogTitle>
-					<DialogDescription>manager 会持续推进这项工作；满足你确认的完成条件后才会结束。</DialogDescription>
+					<DialogTitle><span className="font-mono text-primary">/goal</span> {effectiveSupersedeSource ? "更换持续目标" : "创建持续目标"}</DialogTitle>
+					<DialogDescription>{effectiveSupersedeSource ? "旧 Goal 会以 superseded 终态保留，未验收提交会记录为证据缺口。" : "manager 会持续推进这项工作；满足你确认的完成条件后才会结束。"}</DialogDescription>
 				</DialogHeader>
 				<div className="space-y-4">
 					{goalLoadError ? <div className="flex items-center justify-between gap-3 rounded-xl border border-destructive/25 bg-destructive/5 p-3 text-xs text-destructive"><span>目标状态加载失败，暂时不能创建：{goalLoadError}</span><Button size="sm" variant="outline" onClick={retryGoal}>重新加载</Button></div> : null}
@@ -313,8 +320,8 @@ export function SessionWorkCard({
 					</div>
 				</div>
 				<DialogFooter>
-					<Button variant="ghost" onClick={() => onCreateOpenChange(false)}>取消</Button>
-					<Button disabled={submitting || Boolean(goalLoadError) || !goal.trim() || !completionBoundary.trim()} onClick={() => void createGoal()}>创建 Goal</Button>
+					<Button variant="ghost" onClick={() => setCreateDialogOpen(false)}>取消</Button>
+					<Button disabled={submitting || Boolean(goalLoadError) || !goal.trim() || !completionBoundary.trim()} onClick={() => void createGoal()}>{effectiveSupersedeSource ? "更换 Goal" : "创建 Goal"}</Button>
 				</DialogFooter>
 			</DialogContent>
 		</Dialog>
@@ -360,6 +367,7 @@ export function SessionWorkCard({
 			onRetryGoal={retryGoal}
 			onAnswerChange={(decisionId, value) => setAnswerById((prev) => ({ ...prev, [decisionId]: value }))}
 			onAnswer={(decision, value) => void answer(decision, value)}
+			onRequestSupersede={(state) => { setSupersedeSource(state); onCreateOpenChange(true) }}
 			onWorkStateChange={(state) => {
 				setWorkState(state);
 				setActiveGoalId(state.status === "active" ? state.goalId : null);
