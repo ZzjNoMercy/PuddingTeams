@@ -79,9 +79,9 @@ Task Contract → Delegation Run → sealed ExecutionReceipt
 
 前往 [GitHub Releases](https://github.com/ZzjNoMercy/PuddingTeams/releases/latest) 下载：
 
-- `PuddingTeams-1.0.2-arm64.dmg` — Apple Silicon Mac
-- `PuddingTeams-1.0.2-x64.dmg` — Intel Mac
-- `PuddingTeams-1.0.2-x64.exe` — Windows 10/11 x64
+- `PuddingTeams-1.1.0-arm64.dmg` — Apple Silicon Mac
+- `PuddingTeams-1.1.0-x64.dmg` — Intel Mac
+- `PuddingTeams-1.1.0-x64.exe` — Windows 10/11 x64
 
 桌面版内置 PuddingTeams Runtime、Web 与第一方 Connector 代码，不需要 Node.js 或 pnpm。使用 Codex、Claude Code、PuddingClaw 时，仍需自行安装并登录对应上游 CLI；模型账号和凭据始终由对应服务提供。
 

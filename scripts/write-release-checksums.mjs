@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const releaseDir = path.join(root, "electron", "release");
-const pattern = /^PuddingTeams-1\.0\.2-(arm64|x64)\.(dmg|exe)$/;
+const pattern = /^PuddingTeams-1\.1\.0-(arm64|x64)\.(dmg|exe)$/;
 
 async function sha256(filePath) {
 	const hash = createHash("sha256");
@@ -17,10 +17,10 @@ async function sha256(filePath) {
 }
 
 const names = (await readdir(releaseDir)).filter((name) => pattern.test(name)).sort();
-const required = ["PuddingTeams-1.0.2-arm64.dmg", "PuddingTeams-1.0.2-x64.dmg", "PuddingTeams-1.0.2-x64.exe"];
+const required = ["PuddingTeams-1.1.0-arm64.dmg", "PuddingTeams-1.1.0-x64.dmg", "PuddingTeams-1.1.0-x64.exe"];
 const missing = required.filter((name) => !names.includes(name));
 if (missing.length > 0) {
-	console.error(`✗ 缺少 1.0.2 安装包：${missing.join("、")}`);
+	console.error(`✗ 缺少 1.1.0 安装包：${missing.join("、")}`);
 	process.exit(1);
 }
 

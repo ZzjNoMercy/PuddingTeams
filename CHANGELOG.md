@@ -2,6 +2,28 @@
 
 All notable changes to PuddingTeams are documented here. The project follows Semantic Versioning.
 
+## [1.1.0] - 2026-09-23
+
+### Added
+
+- Added an in-app runtime file and artifact viewer for inspecting worker outputs without leaving a room.
+- Added inline pi worker conversations and richer execution context directly in the message timeline.
+- Added scoped follow-up coverage and explicit workspace owner lifecycle handling for long-running collaboration.
+
+### Changed
+
+- Stabilized Goal and WorkPlan lifecycle transitions, including human-wait recovery, completion evidence and session restoration.
+- Improved artifact persistence, runtime context projection and room execution state synchronization.
+
+### Fixed
+
+- Recovered truncated pi output without incorrectly reporting successful completion.
+- Hardened worker approval, cancellation and restart recovery paths.
+
+### Known limitations
+
+- The Windows 1.1.0 installer may be unsigned when the Release workflow has no Authenticode credentials; verify its published SHA-256 before installation.
+
 ## [1.0.2] - 2026-09-06
 
 ### Changed
@@ -51,6 +73,7 @@ All notable changes to PuddingTeams are documented here. The project follows Sem
 - The Windows 1.0.0 installer is unsigned and may trigger an Unknown Publisher or SmartScreen warning; verify its published SHA-256 before installation.
 - Generic HTTP/RPC/ACP transports, Extension process isolation and a public Extension marketplace are not part of 1.0.
 
+[1.1.0]: https://github.com/ZzjNoMercy/PuddingTeams/releases/tag/v1.1.0
 [1.0.2]: https://github.com/ZzjNoMercy/PuddingTeams/releases/tag/v1.0.2
 [1.0.1]: https://github.com/ZzjNoMercy/PuddingTeams/releases/tag/v1.0.1
 [1.0.0]: https://github.com/ZzjNoMercy/PuddingTeams/releases/tag/v1.0.0
