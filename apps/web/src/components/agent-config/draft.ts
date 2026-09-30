@@ -1,4 +1,4 @@
-import type { AgentConfig, AgentResponsibilityProfile, PiManagerSettings, PiResourceConfig } from "@/lib/types";
+import type { AgentConfig, AgentResponsibilityProfile, PiManagerSettings, PiManagerSettingsPatch, PiResourceConfig } from "@/lib/types";
 
 /**
  * 独立配置页的页面级草稿：概览 / 模型与运行 / 提示词 / 模板四个分区；
@@ -68,6 +68,11 @@ export function serializeDraft(draft: ConfigDraft): string {
 	return JSON.stringify(draft);
 }
 
+/** Save responses may arrive after a further edit; keep that edit as the active draft. */
+export function draftAfterSave(current: ConfigDraft | null, submitted: ConfigDraft, saved: ConfigDraft): ConfigDraft {
+	return current && serializeDraft(current) !== serializeDraft(submitted) ? current : saved;
+}
+
 /** 责任边界：全空 = null（清除）；填了任一字段则 domain 必填。 */
 export function buildResponsibility(draft: ConfigDraft): AgentResponsibilityProfile | null {
 	const has = Boolean(
@@ -102,7 +107,7 @@ export function buildPiResources(draft: ConfigDraft): PiResourceConfig {
 
 /**
  * 统一保存的请求体：pinned manager 走 manager 键级合并（空 model / 默认
- * thinkingLevel 不提交，与 manager-dialog 语义一致）；pi worker 走
+ * thinkingLevel 显式传 null 清除）；pi worker 走
  * connector.config 整体替换。
  */
 export function buildConfigBody(
@@ -112,7 +117,7 @@ export function buildConfigBody(
 	displayName: string | null;
 	description: string;
 	responsibility: AgentResponsibilityProfile | null;
-	manager?: Partial<PiManagerSettings>;
+	manager?: PiManagerSettingsPatch;
 	connector?: { config: Record<string, unknown> };
 	piResources: PiResourceConfig;
 	codeSearch?: AgentConfig["codeSearch"];
@@ -125,13 +130,13 @@ export function buildConfigBody(
 		piResources: buildPiResources(draft),
 	};
 	if (agent.pinned) {
-		const manager: Partial<PiManagerSettings> = {
+		const manager: PiManagerSettingsPatch = {
 			codeSearch: draft.manager.codeSearch ?? "off",
 			builtinTools: draft.manager.builtinTools ?? true,
 			noExtensions: draft.manager.noExtensions ?? false,
+			model: draft.manager.model?.trim() || null,
+			thinkingLevel: draft.manager.thinkingLevel ?? null,
 		};
-		if (draft.manager.model?.trim()) manager.model = draft.manager.model.trim();
-		if (draft.manager.thinkingLevel) manager.thinkingLevel = draft.manager.thinkingLevel;
 		return { ...base, manager };
 	}
 	return { ...base, codeSearch: draft.codeSearch, connector: { config: draft.connectorConfig } };

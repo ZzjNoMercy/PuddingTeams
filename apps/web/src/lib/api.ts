@@ -1,4 +1,5 @@
 import type {
+	ExtensionAuthorizationSession,
 	AgentCapabilityBinding,
 	AgentConfig,
 	AgentConnectorBinding,
@@ -8,12 +9,13 @@ import type {
 	ConflictRun,
 	CustomProviderInput,
 	CustomProviderRecord,
+	ManagerWorkIndexItem,
 	ModelSummary,
 	McpCatalogResponse,
 	McpServerDefinition,
 	McpServerRecord,
 	MutationResponse,
-	PiManagerSettings,
+	PiManagerSettingsPatch,
 	PiResourceConfig,
 	PiResourcePreview,
 	ProviderSummary,
@@ -46,11 +48,759 @@ import { getDesktopBridge } from "./desktop";
 // 发行态 web 静态产物由 server 同源托管，生产构建直接走 location.origin（端口由
 // 安装时的 server 决定，构建期不可知）；dev（next dev :8934 跨端口）回退到 8933。
 // NEXT_PUBLIC_SERVER_URL 可显式覆盖两者。
-const SERVER_URL =
+export const SERVER_URL =
 	process.env.NEXT_PUBLIC_SERVER_URL ??
 	(process.env.NODE_ENV === "production" && typeof window !== "undefined"
 		? window.location.origin
 		: "http://127.0.0.1:8933");
+
+export type CalendarEventInput = {
+	title: string; description: string; location: string; kind: "event" | "focus"; timeZone: string; busy: boolean;
+} & ({ allDay: true; startDate: string; endDateExclusive: string } | { allDay: false; start: string; end: string });
+export type CalendarEventRecord = CalendarEventInput & { id: string; sourceId: "platform"; revision: number; operationId: string; status: "confirmed" | "cancelled" };
+export async function listCalendarEvents(): Promise<CalendarEventRecord[]> {
+	return (await knowledgeResponse<{ events: CalendarEventRecord[] }>(await fetch(`${SERVER_URL}/api/calendar/events`))).events;
+}
+export async function getCalendarEvent(id: string): Promise<CalendarEventRecord> {
+	return (await knowledgeResponse<{ event: CalendarEventRecord }>(await fetch(`${SERVER_URL}/api/calendar/events/${encodeURIComponent(id)}`))).event;
+}
+export async function mutateCalendarEvent(action: "create" | "update" | "cancel", id: string | undefined, operation: { operationId: string; expectedRevision: number; event?: CalendarEventInput }): Promise<CalendarEventRecord> {
+	return (await knowledgeResponse<{ event: CalendarEventRecord }>(await fetch(`${SERVER_URL}/api/calendar/events${id ? `/${encodeURIComponent(id)}` : ""}`, {
+		method: action === "create" ? "POST" : action === "update" ? "PUT" : "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify(operation),
+	}))).event;
+}
+
+// ---- 知识库（M2）：绑定 / 目录树 / 笔记快照 / 自动同步 / 搜索 / 链接解析 / 接入与结构 ----
+// 错误体统一 { error, code?, details? }；409 需要 code/details 时抛 KnowledgeApiError。
+
+export interface KnowledgeBindingSummary {
+	id: string;
+	name: string;
+	description: string;
+	canonicalBindingRoot: string;
+	contentRoot: string;
+	bindingRevision: number;
+	metadataMode: "registry" | "file";
+	/** 服务端随绑定一并返回；无结构声明的纯 Markdown 库缺席该字段。 */
+	schemaRef?: { format: string; id: string; revision: number; hash: string; originPresetId?: string };
+	availability: "available" | "offline" | "revoked";
+}
+
+export type KnowledgeNoteStatus = "current" | "publishing" | "unreadable" | "missing";
+
+export interface KnowledgeTreeNode {
+	path: string;
+	name: string;
+	type: "directory" | "note";
+	/** 当前文件的同步/读取状态；缺失文件不进入目录树。 */
+	status?: KnowledgeNoteStatus;
+	children?: KnowledgeTreeNode[];
+}
+
+export class KnowledgeApiError extends Error {
+	constructor(
+		message: string,
+		readonly status: number,
+		readonly code?: string,
+		readonly details?: unknown,
+	) {
+		super(message);
+		this.name = "KnowledgeApiError";
+	}
+}
+
+async function knowledgeResponse<T>(response: Response): Promise<T> {
+	const body = await response.json().catch(() => ({})) as T & { error?: string; code?: string; details?: unknown };
+	if (!response.ok) {
+		throw new KnowledgeApiError(body.error ?? `知识库请求失败：${response.status}`, response.status, body.code, body.details);
+	}
+	return body;
+}
+
+export async function listKnowledgeBindings(): Promise<KnowledgeBindingSummary[]> {
+	return (await knowledgeResponse<{ bindings: KnowledgeBindingSummary[] }>(await fetch(`${SERVER_URL}/api/knowledge`))).bindings;
+}
+
+export type MemorySetupStatus = { status: "pending" | "deferred" } | { status: "configured"; binding: KnowledgeBindingSummary };
+export async function getMemorySetup(): Promise<MemorySetupStatus> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/knowledge/memory-setup`));
+}
+export async function deferMemorySetup(): Promise<MemorySetupStatus> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/knowledge/memory-setup/defer`, { method: "POST" }));
+}
+export async function planMemorySetup(path: string): Promise<KnowledgePlan> {
+	return (await knowledgeResponse<{ plan: KnowledgePlan }>(await fetch(`${SERVER_URL}/api/knowledge/memory-setup/plan`, {
+		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path }),
+	}))).plan;
+}
+export async function applyMemorySetup(planId: string): Promise<MemorySetupStatus> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/knowledge/memory-setup/apply`, {
+		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ planId }),
+	}));
+}
+
+export interface KnowledgeSelectionSummary {
+	contextKey: string;
+	selectedBindingIds: string[];
+	revision: number;
+}
+
+export async function getKnowledgeSelection(contextKey: string): Promise<KnowledgeSelectionSummary> {
+	const url = `${SERVER_URL}/api/knowledge-selection?contextKey=${encodeURIComponent(contextKey)}`;
+	return (await knowledgeResponse<{ selection: KnowledgeSelectionSummary }>(await fetch(url))).selection;
+}
+
+export async function updateKnowledgeSelection(selection: KnowledgeSelectionSummary, selectedBindingIds: string[]): Promise<KnowledgeSelectionSummary> {
+	return (await knowledgeResponse<{ selection: KnowledgeSelectionSummary }>(await fetch(`${SERVER_URL}/api/knowledge-selection`, {
+		method: "PUT",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ contextKey: selection.contextKey, expectedRevision: selection.revision, selectedBindingIds }),
+	}))).selection;
+}
+
+export async function updateKnowledgeDescription(binding: KnowledgeBindingSummary, description: string): Promise<KnowledgeBindingSummary> {
+	return (await knowledgeResponse<{ binding: KnowledgeBindingSummary }>(await fetch(`${SERVER_URL}/api/knowledge/${encodeURIComponent(binding.id)}`, {
+		method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ description, expectedRevision: binding.bindingRevision }),
+	}))).binding;
+}
+
+export async function revokeKnowledgeBinding(binding: KnowledgeBindingSummary): Promise<void> {
+	await knowledgeResponse(await fetch(`${SERVER_URL}/api/knowledge/${encodeURIComponent(binding.id)}`, {
+		method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ expectedRevision: binding.bindingRevision }),
+	}));
+}
+
+export async function listKnowledgeTree(id: string): Promise<KnowledgeTreeNode[]> {
+	return (await knowledgeResponse<{ tree: KnowledgeTreeNode[] }>(await fetch(`${SERVER_URL}/api/knowledge/${encodeURIComponent(id)}/tree`))).tree;
+}
+
+export type KnowledgeNoteVersion = "observed" | "accepted";
+
+export interface KnowledgeNote {
+	path: string;
+	content: string;
+	size: number;
+	version: KnowledgeNoteVersion;
+	contentHash: string;
+	status: KnowledgeNoteStatus;
+	acceptedAt?: string;
+}
+
+export async function readKnowledgeNote(id: string, notePath: string, version: KnowledgeNoteVersion = "observed"): Promise<KnowledgeNote> {
+	const url = `${SERVER_URL}/api/knowledge/${encodeURIComponent(id)}/note?path=${encodeURIComponent(notePath)}&version=${version}`;
+	return (await knowledgeResponse<{ note: KnowledgeNote }>(await fetch(url))).note;
+}
+
+export interface KnowledgeObservedFile {
+	path: string;
+	hash: string;
+	size: number;
+	state: KnowledgeNoteStatus;
+	declaredId?: string;
+	title?: string;
+	/** 平台自动同步的内部快照标识，用于固定编译来源。 */
+	acceptanceId?: string;
+	/** 库根的契约 / 首页 / 日志：在文件树里可见，但不计入笔记数。 */
+	control?: boolean;
+}
+
+export interface KnowledgeObservations {
+	scannedAt: string;
+	acceptanceRevision: number;
+	files: KnowledgeObservedFile[];
+	duplicates: Array<{ declaredId: string; paths: string[] }>;
+}
+
+/** 只读取观察快照；服务端在从未扫描时会顺带完成首次扫描。 */
+export async function getKnowledgeObservations(id: string): Promise<KnowledgeObservations> {
+	return knowledgeResponse<KnowledgeObservations>(await fetch(`${SERVER_URL}/api/knowledge/${encodeURIComponent(id)}/observations`));
+}
+
+export interface KnowledgeScanResult {
+	scannedAt: string;
+	acceptanceRevision: number;
+	counts: Record<string, number>;
+	duplicates: Array<{ declaredId: string; paths: string[] }>;
+}
+
+/** 强制重扫磁盘并返回计数。 */
+export async function scanKnowledgeBinding(id: string): Promise<KnowledgeScanResult> {
+	return knowledgeResponse<KnowledgeScanResult>(await fetch(`${SERVER_URL}/api/knowledge/${encodeURIComponent(id)}/scan`, { method: "POST" }));
+}
+
+export interface KnowledgeDiffLine {
+	kind: "same" | "add" | "del";
+	text: string;
+}
+
+export interface KnowledgeDiffHunk {
+	aStart: number;
+	aLines: number;
+	bStart: number;
+	bLines: number;
+	lines: KnowledgeDiffLine[];
+}
+
+/** 内部固定快照 vs 当前磁盘的行级 diff。 */
+export async function getKnowledgeNoteDiff(id: string, notePath: string): Promise<{ path: string; hunks: KnowledgeDiffHunk[]; truncated: boolean }> {
+	const url = `${SERVER_URL}/api/knowledge/${encodeURIComponent(id)}/note-diff?path=${encodeURIComponent(notePath)}`;
+	return knowledgeResponse(await fetch(url));
+}
+
+export interface KnowledgeSearchHit {
+	path: string;
+	title: string;
+	snippet: string;
+	score: number;
+}
+
+/** 检索当前同步内容。 */
+export async function searchKnowledge(id: string, query: string, limit = 20): Promise<{ results: KnowledgeSearchHit[]; truncated: boolean }> {
+	const url = `${SERVER_URL}/api/knowledge/${encodeURIComponent(id)}/search?q=${encodeURIComponent(query)}&limit=${limit}`;
+	return knowledgeResponse(await fetch(url));
+}
+
+export type KnowledgeLinkResolution =
+	| { status: "ok"; note: { path: string; title: string }; anchor?: string }
+	| { status: "ambiguous"; candidates: Array<{ path: string; title: string }> }
+	| { status: "broken" }
+	| { status: "out_of_scope" };
+
+export async function resolveKnowledgeLink(id: string, from: string, link: string, kind: "wiki" | "md"): Promise<KnowledgeLinkResolution> {
+	const url = `${SERVER_URL}/api/knowledge/${encodeURIComponent(id)}/resolve?from=${encodeURIComponent(from)}&link=${encodeURIComponent(link)}&kind=${kind}`;
+	return knowledgeResponse<KnowledgeLinkResolution>(await fetch(url));
+}
+
+export interface KnowledgeBacklink {
+	sourcePath: string;
+	sourceTitle: string;
+	kind: "wiki" | "md";
+	snippet: string;
+}
+
+export async function getKnowledgeBacklinks(id: string, notePath: string): Promise<KnowledgeBacklink[]> {
+	const url = `${SERVER_URL}/api/knowledge/${encodeURIComponent(id)}/backlinks?path=${encodeURIComponent(notePath)}`;
+	return (await knowledgeResponse<{ backlinks: KnowledgeBacklink[] }>(await fetch(url))).backlinks;
+}
+
+/** 库内图片等二进制资源；直接作为 <img src> 使用。 */
+export function knowledgeAssetUrl(id: string, assetPath: string): string {
+	return `${SERVER_URL}/api/knowledge/${encodeURIComponent(id)}/asset?path=${encodeURIComponent(assetPath)}`;
+}
+
+/** 服务端校验后生成 obsidian:// URI；打开动作由桌面宿主复核执行。 */
+export async function createKnowledgeObsidianUri(id: string, notePath: string): Promise<string> {
+	return (await knowledgeResponse<{ uri: string }>(await fetch(`${SERVER_URL}/api/knowledge/${encodeURIComponent(id)}/obsidian-uri`, {
+		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: notePath }),
+	}))).uri;
+}
+
+// ---- T20 接入管理：探测（10 分钟 TTL）→ 计划 → 应用；UI 在 connect 切片使用 ----
+
+export interface KnowledgeProbeRecord {
+	probeId: string;
+	ownerId: string;
+	canonicalBindingRoot: string;
+	/** 目录尚不存在（targetExists:false）时为 null。 */
+	rootIdentity: string | null;
+	/** false 表示目录尚不存在，将在应用计划时创建（需 intent=create 探测）。 */
+	targetExists: boolean;
+	profile: "markdown" | "managed-wiki";
+	contentRoot: string;
+	linkRoot: string;
+	obsidianRoot?: string;
+	obsidianRootCandidates?: string[];
+	markers: {
+		hasWiki: boolean;
+		hasRaw: boolean;
+		hasManifest: boolean;
+		hasSchema: boolean;
+		hasObsidianRoot: boolean;
+		hasObsidianWiki: boolean;
+	};
+	capabilities: { read: boolean; layoutReady: boolean; structuredPrepare: boolean; publish: boolean };
+	warnings: string[];
+	createdAt: string;
+}
+
+export async function createKnowledgeProbe(path: string, intent?: "bind" | "create"): Promise<{ probeId: string; probe: KnowledgeProbeRecord }> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/knowledge/probes`, {
+		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(intent ? { path, intent } : { path }),
+	}));
+}
+
+export interface KnowledgePlanFileItem {
+	relativePath: string;
+	content: string;
+	contentHash: string;
+	bytes: number;
+}
+
+export interface KnowledgePlan {
+	version: 1;
+	planId: string;
+	ownerId: string;
+	probeId: string;
+	mode: "bind" | "create";
+	name: string;
+	description: string;
+	canonicalBindingRoot: string;
+	/** createRootDir 计划（probe 时目录不存在）为 null，apply 创建目录后重算。 */
+	rootIdentity: string | null;
+	/** true 表示根目录本身也由本计划创建。 */
+	createRootDir?: boolean;
+	contentRoot: string;
+	linkRoot: string;
+	obsidianRoot?: string;
+	schemaPresetId?: string;
+	filesToCreate: KnowledgePlanFileItem[];
+	filesToSkip: Array<{ relativePath: string; reason: string }>;
+	warnings: string[];
+	createdAt: string;
+	planRevision: 1;
+}
+
+export async function createKnowledgePlan(input: {
+	probeId: string;
+	name: string;
+	description: string;
+	mode?: "bind" | "create";
+	obsidianRoot?: string;
+	schemaPresetId?: string;
+}): Promise<KnowledgePlan> {
+	return (await knowledgeResponse<{ plan: KnowledgePlan }>(await fetch(`${SERVER_URL}/api/knowledge/plans`, {
+		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
+	}))).plan;
+}
+
+export async function getKnowledgePlan(planId: string): Promise<KnowledgePlan> {
+	return (await knowledgeResponse<{ plan: KnowledgePlan }>(await fetch(`${SERVER_URL}/api/knowledge/plans/${encodeURIComponent(planId)}`))).plan;
+}
+
+export interface KnowledgeApplyReceipt {
+	relativePath: string;
+	status: "created" | "skipped_exists" | "failed";
+	error?: string;
+}
+
+export async function applyKnowledgePlan(planId: string): Promise<{ binding: KnowledgeBindingSummary; receipts: KnowledgeApplyReceipt[] }> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/knowledge/plans/${encodeURIComponent(planId)}/apply`, { method: "POST" }));
+}
+
+// ---- T21/K05 结构：预置清单、生效结构、影响预览与库内结构保存 ----
+
+export type KnowledgeSchemaFieldType = "text" | "date" | "datetime" | "text_list" | "source_refs" | "note_refs" | "enum";
+
+export interface KnowledgeSchemaField {
+	name: string;
+	type: KnowledgeSchemaFieldType;
+	required: boolean;
+	values?: string[];
+	requiresSourceField?: string;
+}
+
+export interface KnowledgeSchemaEntity {
+	type: string;
+	directory: string;
+	fields: KnowledgeSchemaField[];
+}
+
+export interface KnowledgeSchemaRelation {
+	type: string;
+	from?: string;
+	to?: string;
+	endpoints?: Array<{ from: string; to: string }>;
+	inverseName?: string;
+	requiresEvidence: boolean;
+}
+
+export interface KnowledgeSchemaPreset {
+	formatVersion: 1;
+	schemaId: string;
+	revision: number;
+	name: string;
+	/** 一句话说明用途（创建向导的结构选择卡片展示）。 */
+	description: string;
+	entities: KnowledgeSchemaEntity[];
+	relations: KnowledgeSchemaRelation[];
+}
+
+export interface KnowledgeSchemaPresetSummary extends KnowledgeSchemaPreset {
+	hash: string;
+}
+
+export async function listKnowledgePresets(): Promise<KnowledgeSchemaPresetSummary[]> {
+	return (await knowledgeResponse<{ presets: KnowledgeSchemaPresetSummary[] }>(await fetch(`${SERVER_URL}/api/knowledge/presets`))).presets;
+}
+
+export interface KnowledgeEffectiveSchema {
+	origin: "vault_declaration" | "none";
+	schema?: KnowledgeSchemaPreset;
+	schemaRef?: { format: string; id: string; revision: number; hash: string; originPresetId?: string };
+	capabilities: { read: boolean; structured: boolean; structuredPrepare: boolean; publish: boolean };
+	warnings: string[];
+}
+
+export async function getKnowledgeSchema(id: string): Promise<KnowledgeEffectiveSchema> {
+	return knowledgeResponse<KnowledgeEffectiveSchema>(await fetch(`${SERVER_URL}/api/knowledge/${encodeURIComponent(id)}/schema`));
+}
+
+export interface KnowledgeSchemaChange {
+	kind: "entity_added" | "entity_removed" | "entity_directory_changed" | "field_added" | "field_removed" | "field_changed"
+		| "relation_added" | "relation_removed" | "relation_changed";
+	entity?: string;
+	field?: string;
+	relation?: string;
+	from?: unknown;
+	to?: unknown;
+}
+
+export interface KnowledgeSchemaImpact {
+	changes: KnowledgeSchemaChange[];
+	affectedFiles: Array<{ path: string; entity: string; reasons: string[] }>;
+	unknownFieldsPreserved: boolean;
+	note: string;
+}
+
+export async function planKnowledgeSchema(id: string, schema: KnowledgeSchemaPreset): Promise<KnowledgeSchemaImpact> {
+	return (await knowledgeResponse<{ impact: KnowledgeSchemaImpact }>(await fetch(`${SERVER_URL}/api/knowledge/${encodeURIComponent(id)}/schema-plans`, {
+		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ schema }),
+	}))).impact;
+}
+
+export async function saveKnowledgeSchema(id: string, schema: KnowledgeSchemaPreset, expectedHash: string, expectedAffectedFiles: KnowledgeSchemaImpact["affectedFiles"], acknowledgeAffected: boolean): Promise<KnowledgeSchemaPreset> {
+	return (await knowledgeResponse<{ schema: KnowledgeSchemaPreset }>(await fetch(`${SERVER_URL}/api/knowledge/${encodeURIComponent(id)}/schema`, {
+		method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ schema, expectedHash, expectedAffectedFiles, acknowledgeAffected }),
+	}))).schema;
+}
+
+// ---- Wiki 编译 / 审核 / 发布（M3/M4：T30/T31/T33/T40/T42/T44）----
+// 错误体沿用 { error, code }；409 的 code 区分 expired / state_conflict / conflict 等。
+
+export type WikiCompileJobStatus = "queued" | "running" | "candidate_ready" | "failed" | "cancelled";
+
+export interface WikiCompileJob {
+	id: string;
+	operationId: string;
+	targetBindingId: string;
+	agentId: string;
+	task: string;
+	status: WikiCompileJobStatus;
+	candidateBatchId?: string;
+	failureCode?: string;
+	createdAt: string;
+	updatedAt: string;
+}
+
+export type WikiBatchStatus = "candidate" | "pending_review" | "approved" | "publishing" | "published" | "partial" | "conflict" | "rejected" | "returned";
+
+export interface WikiCuratorJob {
+	id: string;
+	operationId: string;
+	targetBindingId: string;
+	agentId: string;
+	task: string;
+	status: "queued" | "running" | "pending_review" | "no_changes" | "needs_attention" | "failed" | "cancelled";
+	candidateBatchId?: string;
+	failureCode?: string;
+	createdAt: string;
+	updatedAt: string;
+}
+
+export async function createWikiCuratorJob(input: {
+	operationId: string; bindingId: string; agentId: string; task: string; uploads?: MessageAttachmentInput[];
+}): Promise<{ job: WikiCuratorJob; replayed?: boolean }> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/wiki/curator-jobs`, {
+		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
+	}));
+}
+
+export async function listWikiCuratorJobs(bindingId: string): Promise<WikiCuratorJob[]> {
+	return (await knowledgeResponse<{ jobs: WikiCuratorJob[] }>(await fetch(`${SERVER_URL}/api/wiki/curator-jobs?bindingId=${encodeURIComponent(bindingId)}`))).jobs;
+}
+
+export async function getWikiCuratorJob(id: string): Promise<{ job: WikiCuratorJob }> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/wiki/curator-jobs/${encodeURIComponent(id)}`));
+}
+
+export async function cancelWikiCuratorJob(id: string): Promise<{ job: WikiCuratorJob }> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/wiki/curator-jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" }));
+}
+
+export async function retryWikiCuratorJob(id: string, operationId: string): Promise<{ job: WikiCuratorJob; replayed: boolean }> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/wiki/curator-jobs/${encodeURIComponent(id)}/retry`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ operationId }) }));
+}
+
+export interface WikiBatchFile {
+	kind?: "markdown" | "image";
+	mediaType?: string;
+	sourceIds?: string[];
+	operation: "create" | "update" | "delete";
+	targetPath: string;
+	expectedHashOrAbsent: string | null;
+	candidateHash: string | null;
+	blobRef: string | null;
+}
+
+export interface WikiPublicationBatch {
+	id: string;
+	revision: number;
+	bindingId: string;
+	manifestHash: string;
+	rootIdentity: string;
+	files: WikiBatchFile[];
+	sourceSnapshots: string[];
+	schemaHash?: string;
+	bindingRevision: number;
+	trustRevision: number;
+	dependencyGroups: string[][];
+	validationReceipt: string;
+	compilerVersion: string;
+	parentBatchId?: string;
+	status: WikiBatchStatus;
+}
+
+export interface WikiBatchSummary {
+	conflictClosure?: { operationId: string; actorId: string; closedAt: string };
+	id: string;
+	bindingId: string;
+	bindingName?: string;
+	bindingAvailability?: KnowledgeBindingSummary["availability"];
+	title?: string;
+	status: WikiBatchStatus;
+	/** 账本代际：批次内容每次变化 +1；审核时作为 expectedBatchRevision 栅栏。 */
+	revision: number;
+	manifestHash: string;
+	fileCount: number;
+	enteredReviewAt: string;
+	reviewDeadline: string;
+	decidedAt?: string;
+	decisionId?: string;
+	publishRequestedAt?: string;
+	createdAt: string;
+	updatedAt: string;
+}
+
+export interface WikiBatchDetail extends WikiBatchSummary {
+	conflictBlockedReason?: string;
+	batch: WikiPublicationBatch;
+	returnRequest?: { feedback: string; jobId?: string; newBatchId?: string; operationId: string; actorId: string; reviewedFiles: string[]; createdAt: string };
+	parentBatchId?: string;
+}
+
+export interface WikiBatchMarkdownView {
+	kind?: "markdown";
+	path: string;
+	operation: "create" | "update" | "delete";
+	candidate: { content: string; hash: string };
+	baseline: { content: string; hash: string } | null;
+	hunks: KnowledgeDiffHunk[];
+	truncated: boolean;
+}
+
+export interface WikiBatchImageView {
+	kind: "image";
+	path: string;
+	operation: "create" | "update";
+	candidate: { hash: string; mediaType: string; base64: string };
+	baseline: { hash: string } | null;
+	sourceIds?: string[];
+}
+
+export type WikiBatchFileView = WikiBatchMarkdownView | WikiBatchImageView;
+
+export function wikiBatchAssetUrl(batchId: string, path: string): string {
+	return `${SERVER_URL}/api/wiki/batches/${encodeURIComponent(batchId)}/assets?path=${encodeURIComponent(path)}`;
+}
+
+export function knowledgeHistoryAssetUrl(bindingId: string, versionId: string, path: string): string {
+	return `${SERVER_URL}/api/knowledge/${encodeURIComponent(bindingId)}/history/${encodeURIComponent(versionId)}/assets?path=${encodeURIComponent(path)}`;
+}
+
+export interface WikiReviewDecision {
+	id: string;
+	batchId: string;
+	revision: number;
+	manifestHash: string;
+	actorId: string;
+	decidedAt: string;
+	decision: "approve" | "reject";
+	reviewedFiles: string[];
+	expectedTargets: string[];
+	policyRevision: number;
+}
+
+export interface WikiReviewResponse extends WikiBatchDetail {
+	decision: WikiReviewDecision;
+	replayed: boolean;
+	publish?: { accepted: boolean; note?: string };
+}
+
+export type WikiPublicationState = "queued" | "running" | "published" | "partial" | "conflict" | "unknown";
+
+export interface WikiPublicationSummary {
+	id: string;
+	batchId: string;
+	bindingId: string;
+	state: WikiPublicationState;
+	journalRef: string;
+	fileCount: number;
+	committedGroups: number;
+	createdAt: string;
+	updatedAt: string;
+	finishedAt?: string;
+}
+
+export type WikiPublishFileStatus = "pending" | "applied" | "failed" | "conflict" | "uncertain" | "rejected" | "rolled_back";
+
+export interface WikiPublishReceipt {
+	step: "preflight" | "before_image" | "write" | "verify" | "rollback" | "reconcile";
+	at: string;
+	detail?: string;
+}
+
+export interface WikiPublishFileRecord {
+	targetPath: string;
+	operation: "create" | "update" | "delete";
+	candidateHash: string | null;
+	baselineHash: string | null;
+	beforeImageRef: string | null;
+	status: WikiPublishFileStatus;
+	receipts: WikiPublishReceipt[];
+	error?: string;
+}
+
+export interface WikiPublicationDetail extends Omit<WikiPublicationSummary, "committedGroups"> {
+	stopReason?: string;
+	conflictReason?: "review_window_expired" | "publish_rejected" | "publish_preflight" | "publish_interrupted" | "publish_external" | "publish_uncertain";
+	/** Current comparison, not a reconstruction of the historic failure. */
+	currentContextChanges?: string[];
+	reviewId: string;
+	idempotencyKey: string;
+	files: WikiPublishFileRecord[];
+	committedGroups: string[][];
+	results: Array<{ path: string; beforeHash: string | null; afterHash: string | null; status: string; receiptRef?: string }>;
+}
+
+export async function createWikiCompileJob(input: {
+	operationId: string; bindingId: string; agentId: string; task: string; sourceAcceptanceIds: string[];
+}): Promise<{ job: WikiCompileJob; replayed: boolean }> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/wiki/compile-jobs`, {
+		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
+	}));
+}
+
+export async function listWikiCompileJobs(bindingId?: string): Promise<WikiCompileJob[]> {
+	const query = bindingId ? `?bindingId=${encodeURIComponent(bindingId)}` : "";
+	return (await knowledgeResponse<{ jobs: WikiCompileJob[] }>(await fetch(`${SERVER_URL}/api/wiki/compile-jobs${query}`))).jobs;
+}
+
+export async function getWikiCompileJob(id: string): Promise<{ job: WikiCompileJob; batch?: WikiPublicationBatch }> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/wiki/compile-jobs/${encodeURIComponent(id)}`));
+}
+
+export async function cancelWikiCompileJob(id: string): Promise<WikiCompileJob> {
+	return (await knowledgeResponse<{ job: WikiCompileJob }>(await fetch(`${SERVER_URL}/api/wiki/compile-jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" }))).job;
+}
+
+export async function listWikiBatches(bindingId?: string): Promise<WikiBatchSummary[]> {
+	const query = bindingId ? `?bindingId=${encodeURIComponent(bindingId)}` : "";
+	return (await knowledgeResponse<{ batches: WikiBatchSummary[] }>(await fetch(`${SERVER_URL}/api/wiki/batches${query}`))).batches;
+}
+
+export type WikiReviewStatusFilter = "pending" | "needs_action" | "processed" | "all";
+
+export interface WikiBatchPage {
+	batches: WikiBatchSummary[];
+	filteredTotal: number;
+	pendingCount: number;
+	needsActionCount: number;
+	processedCount: number;
+	total: number;
+	limit: number;
+	offset: number;
+}
+
+export async function listWikiBatchPage(input: {
+	bindingId?: string; status?: WikiReviewStatusFilter; q?: string; limit?: number; offset?: number;
+} = {}): Promise<WikiBatchPage> {
+	const query = new URLSearchParams();
+	for (const [key, value] of Object.entries(input)) if (value !== undefined && value !== "") query.set(key, String(value));
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/wiki/batches?${query.toString()}`));
+}
+
+export async function getWikiBatch(id: string): Promise<WikiBatchDetail> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/wiki/batches/${encodeURIComponent(id)}`));
+}
+
+export async function getWikiBatchFile(batchId: string, targetPath: string): Promise<WikiBatchFileView> {
+	const url = `${SERVER_URL}/api/wiki/batches/${encodeURIComponent(batchId)}/file?path=${encodeURIComponent(targetPath)}`;
+	return knowledgeResponse(await fetch(url));
+}
+
+export interface WikiBatchSources {
+	sources: Array<{
+		id: string; kind: "text" | "markdown" | "image" | "pdf"; title: string; originalHash: string;
+		derivedFrom?: string; textHash?: string; status: string; locations: Array<{ kind: "lines"; startLine: number; endLine: number } | { kind: "image_region"; page?: number; segmentId?: string; startLine?: number; endLine?: number; x?: number; y?: number; width?: number; height?: number }>; warnings: string[]; content?: string; base64?: string; mediaType: string;
+		extraction?: { extractorId: string; version: number; modelRef: string; originalHash: string; artifactHash: string; warnings: string[] };
+	}>;
+	origin: { windowId: string; sessionId: string; sessionAvailable: boolean } | null;
+}
+
+export async function getWikiBatchSources(id: string): Promise<WikiBatchSources> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/wiki/batches/${encodeURIComponent(id)}/sources`));
+}
+
+export async function requestWikiRevision(batchId: string, input: {
+	operationId: string; manifestHash: string; expectedBatchRevision: number; feedback: string; reviewedFiles: string[];
+}): Promise<{ job: WikiCuratorJob; replayed: boolean }> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/wiki/batches/${encodeURIComponent(batchId)}/revisions`, {
+		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
+	}));
+}
+
+export async function closeWikiConflict(batchId: string, input: { operationId: string; manifestHash: string; expectedBatchRevision: number }): Promise<WikiBatchDetail> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/wiki/batches/${encodeURIComponent(batchId)}/close-conflict`, {
+		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
+	}));
+}
+
+export interface KnowledgeHistoryVersion {
+	id: string; noteId: string; revision: number; relativePath: string; contentHash: string; actorId: string;
+	previousPath?: string;
+	channel: "initial" | "agent_publish" | "external_sync"; acceptedAt: string; createdAt: string; operationId: string; batchId?: string; summary: string; sourceIds: string[]; current: boolean;
+	actorName?: string;
+	changeKind?: "create" | "update" | "rename" | "delete";
+	deleted?: boolean;
+}
+export interface KnowledgeHistoryDetail {
+	version: KnowledgeHistoryVersion; content: string; previousContent?: string; previousVersionId?: string;
+	diff: { hunks: KnowledgeDiffHunk[]; truncated: boolean };
+}
+export async function listKnowledgeHistory(bindingId: string, path: string): Promise<{ noteId: string | null; currentVersionId: string | null; versions: KnowledgeHistoryVersion[] }> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/knowledge/${encodeURIComponent(bindingId)}/history?path=${encodeURIComponent(path)}`));
+}
+export async function getKnowledgeHistoryVersion(bindingId: string, versionId: string): Promise<KnowledgeHistoryDetail> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/knowledge/${encodeURIComponent(bindingId)}/history/${encodeURIComponent(versionId)}`));
+}
+
+/** 提交审核决定；409 code=expired（超期）/ state_conflict（revision/manifest 变化或已有决定）。 */
+export async function submitWikiReview(batchId: string, input: {
+	operationId: string; decision: "approve" | "reject"; manifestHash: string; expectedBatchRevision: number; reviewedFiles: string[];
+}): Promise<WikiReviewResponse> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/wiki/batches/${encodeURIComponent(batchId)}/reviews`, {
+		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
+	}));
+}
+
+export async function listWikiPublications(bindingId?: string): Promise<WikiPublicationSummary[]> {
+	const query = bindingId ? `?bindingId=${encodeURIComponent(bindingId)}` : "";
+	return (await knowledgeResponse<{ publications: WikiPublicationSummary[] }>(await fetch(`${SERVER_URL}/api/wiki/publications${query}`))).publications;
+}
+
+export async function getWikiPublication(id: string): Promise<WikiPublicationDetail> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/wiki/publications/${encodeURIComponent(id)}`));
+}
 
 export interface HealthInfo {
 	ok: boolean;
@@ -71,10 +821,52 @@ export async function getViewerIdentity(): Promise<ViewerIdentity> {
 	return (await res.json()) as ViewerIdentity;
 }
 
+export function viewerAvatarUrl(version: number): string {
+	return `${SERVER_URL}/api/identity/avatar?v=${version}`;
+}
+
+async function viewerIdentityResponse(response: Response): Promise<ViewerIdentity> {
+	if (!response.ok) {
+		const body = (await response.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `更新个人资料失败 (${response.status})`);
+	}
+	return (await response.json()) as ViewerIdentity;
+}
+
+export async function updateViewerProfile(displayName: string): Promise<ViewerIdentity> {
+	return viewerIdentityResponse(await fetch(`${SERVER_URL}/api/identity/profile`, {
+		method: "PATCH",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ displayName }),
+	}));
+}
+
+export async function uploadViewerAvatar(file: File): Promise<ViewerIdentity> {
+	if (file.size > 2 * 1024 * 1024) throw new Error("头像不能超过 2 MB");
+	const bytes = new Uint8Array(await file.arrayBuffer());
+	let binary = "";
+	for (let index = 0; index < bytes.length; index += 0x8000) binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+	return viewerIdentityResponse(await fetch(`${SERVER_URL}/api/identity/avatar`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ data: btoa(binary) }),
+	}));
+}
+
+export async function deleteViewerAvatar(): Promise<ViewerIdentity> {
+	return viewerIdentityResponse(await fetch(`${SERVER_URL}/api/identity/avatar`, { method: "DELETE" }));
+}
+
 export async function listSessions(): Promise<SessionSummary[]> {
 	const res = await fetch(`${SERVER_URL}/api/sessions`);
 	if (!res.ok) throw new Error(`list sessions failed: ${res.status}`);
 	return ((await res.json()) as { sessions: SessionSummary[] }).sessions;
+}
+
+export async function listManagerWorks(): Promise<ManagerWorkIndexItem[]> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/solo/work-index`);
+	if (!res.ok) throw new Error(`list Manager works failed: ${res.status}`);
+	return ((await res.json()) as { works: ManagerWorkIndexItem[] }).works;
 }
 
 export async function listModels(): Promise<ModelSummary[]> {
@@ -119,29 +911,27 @@ export const MODELS_CHANGED_EVENT = "puddingteams:models-changed";
 
 // ---- 自定义 Provider（models.json 控制面） ----
 
-export async function listCustomProviders(): Promise<CustomProviderRecord[]> {
+export async function listCustomProviders(): Promise<{ providers: CustomProviderRecord[]; revision: string }> {
 	const res = await fetch(`${SERVER_URL}/api/providers/custom`);
-	if (!res.ok) throw new Error(`list custom providers failed: ${res.status}`);
-	return ((await res.json()) as { providers: CustomProviderRecord[] }).providers;
+	await ensureOk(res, "list custom providers failed");
+	return (await res.json()) as { providers: CustomProviderRecord[]; revision: string };
 }
 
-export async function upsertCustomProvider(id: string, input: CustomProviderInput): Promise<CustomProviderRecord> {
+export async function upsertCustomProvider(id: string, input: CustomProviderInput, expectedRevision: string): Promise<CustomProviderRecord> {
 	const res = await fetch(`${SERVER_URL}/api/providers/custom/${encodeURIComponent(id)}`, {
 		method: "PUT",
 		headers: { "content-type": "application/json" },
-		body: JSON.stringify(input),
+		body: JSON.stringify({ ...input, expectedRevision }),
 	});
-	const data = (await res.json()) as { provider?: CustomProviderRecord; error?: string };
-	if (!res.ok) throw new Error(data.error ?? `save custom provider failed: ${res.status}`);
+	await ensureOk(res, "save custom provider failed");
+	const data = (await res.json()) as { provider?: CustomProviderRecord };
 	return data.provider!;
 }
 
-export async function deleteCustomProvider(id: string): Promise<void> {
-	const res = await fetch(`${SERVER_URL}/api/providers/custom/${encodeURIComponent(id)}`, { method: "DELETE" });
-	if (!res.ok) {
-		const data = (await res.json().catch(() => ({}))) as { error?: string };
-		throw new Error(data.error ?? `delete custom provider failed: ${res.status}`);
-	}
+export async function deleteCustomProvider(id: string, expectedRevision: string): Promise<{ recoveryPending: boolean }> {
+	const res = await fetch(`${SERVER_URL}/api/providers/custom/${encodeURIComponent(id)}`, { method: "DELETE", headers: { "x-expected-revision": expectedRevision } });
+	await ensureOk(res, "delete custom provider failed");
+	return { recoveryPending: res.status === 202 };
 }
 
 export interface ProviderProbeResult {
@@ -182,7 +972,7 @@ export async function deleteSession(sessionId: string): Promise<void> {
 	if (!res.ok) throw new Error(`delete session failed: ${res.status}`);
 }
 
-export async function setSessionModel(sessionId: string, model: string): Promise<void> {
+export async function setSessionModel(sessionId: string, model: string): Promise<string> {
 	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/model`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
@@ -192,6 +982,25 @@ export async function setSessionModel(sessionId: string, model: string): Promise
 		const body = (await res.json().catch(() => null)) as { error?: string } | null;
 		throw new Error(sessionApiError(body?.error, `set model failed: ${res.status}`));
 	}
+	const body = (await res.json().catch(() => null)) as { model?: { id?: unknown } } | null;
+	if (typeof body?.model?.id !== "string" || !body.model.id) throw new Error("模型已提交，但服务端响应未确认当前模型；请刷新会话核对");
+	return body.model.id;
+}
+
+/** 会话级 thinking level（§10.6）：composer 对该 Session 的选择，服务端按模型能力 clamp 后返回生效档位。 */
+export async function setSessionThinkingLevel(sessionId: string, thinkingLevel: string): Promise<string> {
+	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/thinking-level`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ thinkingLevel }),
+	});
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(sessionApiError(body?.error, `set thinking level failed: ${res.status}`));
+	}
+	const body = (await res.json().catch(() => null)) as { thinkingLevel?: unknown } | null;
+	if (typeof body?.thinkingLevel !== "string" || !body.thinkingLevel) throw new Error("思考强度已提交，但服务端响应未确认当前档位；请刷新会话核对");
+	return body.thinkingLevel;
 }
 
 export interface RecoveredToolResult {
@@ -207,12 +1016,22 @@ export interface AbortSessionResult {
 	reconciledToolResults: number;
 }
 
-export async function fetchMessages(sessionId: string): Promise<{ messages: unknown[]; runningToolCallIds: string[]; recoveredToolResults: RecoveredToolResult[] }> {
+export class SessionMessagesError extends Error {
+	constructor(message: string, readonly status: number, readonly code?: string) {
+		super(message);
+		this.name = "SessionMessagesError";
+	}
+}
+
+export async function fetchMessages(sessionId: string): Promise<{ messages: unknown[]; running: boolean; unansweredUserMessage: boolean; unfinishedAssistantTurn: boolean; runningToolCallIds: string[]; recoveredToolResults: RecoveredToolResult[] }> {
 	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/messages`);
-	const body = (await res.json()) as { messages?: unknown[]; runningToolCallIds?: string[]; recoveredToolResults?: RecoveredToolResult[]; error?: string };
-	if (!res.ok) throw new Error(sessionApiError(body.error, `fetch messages failed: ${res.status}`));
+	const body = (await res.json()) as { messages?: unknown[]; running?: boolean; unansweredUserMessage?: boolean; unfinishedAssistantTurn?: boolean; runningToolCallIds?: string[]; recoveredToolResults?: RecoveredToolResult[]; error?: string };
+	if (!res.ok) throw new SessionMessagesError(sessionApiError(body.error, `fetch messages failed: ${res.status}`), res.status, body.error);
 	return {
 		messages: body.messages ?? [],
+		running: body.running === true,
+		unansweredUserMessage: body.unansweredUserMessage === true,
+		unfinishedAssistantTurn: body.unfinishedAssistantTurn === true,
 		runningToolCallIds: body.runningToolCallIds ?? [],
 		recoveredToolResults: body.recoveredToolResults ?? [],
 	};
@@ -236,19 +1055,42 @@ export interface MessageAttachmentInput {
 	data: string;
 }
 
+export class MessageDeliveryUnconfirmedError extends Error {
+	constructor(reason: string) {
+		super(`发送结果未确认，请先核对会话历史，再决定是否重新发送。${reason}`);
+		this.name = "MessageDeliveryUnconfirmedError";
+	}
+}
+
+export class MessageOperationRejectedError extends Error {
+	constructor(reason: string) {
+		super(reason);
+		this.name = "MessageOperationRejectedError";
+	}
+}
+
 function sessionApiError(error: string | undefined, fallback: string): string {
 	return error === "session_context_inactive" ? "该会话属于另一个项目，请先切回对应项目" : (error ?? fallback);
 }
 
-export async function sendMessage(sessionId: string, content: string, attachments: MessageAttachmentInput[] = []): Promise<void> {
-	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/messages`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ content, attachments }),
-	});
+export async function sendMessage(sessionId: string, content: string, attachments: MessageAttachmentInput[], operationId: string): Promise<void> {
+	let res: Response;
+	try {
+		res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/messages`, {
+			method: "POST",
+			headers: { "content-type": "application/json", "idempotency-key": operationId },
+			body: JSON.stringify({ content, attachments }),
+		});
+	} catch (error) {
+		throw new MessageDeliveryUnconfirmedError(error instanceof Error ? error.message : String(error));
+	}
 	if (!res.ok) {
-		const body = (await res.json().catch(() => null)) as { error?: string } | null;
-		throw new Error(sessionApiError(body?.error, `send message failed: ${res.status}`));
+		const body = (await res.json().catch(() => null)) as { error?: string; code?: string } | null;
+		if (body?.error === "session_context_inactive") throw new Error(sessionApiError(body.error, "session context inactive"));
+		if (res.status === 404) throw new Error("会话不存在，请重新打开对话");
+		if (body?.code === "message_operation_required") throw new Error("发送请求缺少操作身份，请刷新页面后重试");
+		if (body?.code === "message_operation_rejected") throw new MessageOperationRejectedError(body.error ?? "消息未通过发送前检查");
+		throw new MessageDeliveryUnconfirmedError(sessionApiError(body?.error, `send message failed: ${res.status}`));
 	}
 }
 
@@ -360,12 +1202,14 @@ export interface ArtifactListItem {
 export type ExecutionState =
 	| "admitted" | "waiting_admission" | "running" | "waiting_input" | "reported_completed" | "reported_failed"
 	| "cancel_requested" | "reconciling" | "cancelled" | "observation_lost";
+/** WorkItem UI also has states before any Delegation exists or while its trace is unavailable. */
+export type ExecutionProjectionState = ExecutionState | "not_started" | "unknown";
 export type VerificationProjection =
 	| "not_required" | "unverified" | "pending" | "running" | "waiting_input"
 	| "passed" | "failed" | "blocked" | "stale";
 export type SettlementState = "not_required" | "pending" | "submitted" | "accepted" | "revision" | "blocked" | "cancelled";
 export interface CollaborationTrustProjection {
-	execution: ExecutionState;
+	execution: ExecutionProjectionState;
 	verification: VerificationProjection;
 	settlement: SettlementState;
 }
@@ -381,7 +1225,7 @@ export interface ExecutionReceiptView {
 
 /** Exact trust fields emitted by the server, or locally projected from WorkState. */
 export interface CollaborationProjectionSource {
-	executionState: ExecutionState;
+	executionState: ExecutionProjectionState;
 	trustProjection?: CollaborationTrustProjection;
 	verification?: VerificationProjection;
 	settlement?: SettlementState;
@@ -408,7 +1252,7 @@ export async function fetchRoomDelegationProcesses(
 	if (managerSessionId) params.set("managerSessionId", managerSessionId);
 	const query = params.size ? `?${params.toString()}` : "";
 	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/delegation-processes${query}`);
-	if (!res.ok) throw new Error(`fetch room delegation processes failed: ${res.status}`);
+	if (!res.ok) throw new Error(`HTTP ${res.status}`);
 	const body = (await res.json()) as { delegations?: WorkerProcessListItem[] };
 	return body.delegations ?? [];
 }
@@ -454,7 +1298,7 @@ export async function fetchDelegationArtifacts(delegationId: string): Promise<Ar
 }
 
 export async function fetchArtifactContent(artifactId: string): Promise<string> {
-	const res = await fetch(`${SERVER_URL}/api/artifacts/${encodeURIComponent(artifactId)}/content`);
+	const res = await fetch(`${SERVER_URL}/api/artifacts/${encodeURIComponent(artifactId)}/preview`);
 	if (!res.ok) throw await responseError(res, "fetch artifact failed");
 	return res.text();
 }
@@ -470,22 +1314,34 @@ export async function openArtifact(artifactId: string): Promise<void> {
 
 export async function fetchDelegationProcessMessages(
 	delegationId: string,
+	full = false,
 ): Promise<{ messages: unknown[]; live: boolean; agentId: string; status: string; createdAt: string; runningToolCallIds: string[] }> {
-	const res = await fetch(`${SERVER_URL}/api/delegations/${delegationId}/process/messages`);
-	if (!res.ok) throw new Error(`fetch worker messages failed: ${res.status}`);
+	const res = await fetch(`${SERVER_URL}/api/delegations/${encodeURIComponent(delegationId)}/process/messages?scope=${full ? "full" : "delegation"}`);
+	if (!res.ok) {
+		const error = await responseError(res, "fetch worker messages failed");
+		if (!full && res.status === 409) throw new WorkerProcessScopeError(error.message);
+		throw error;
+	}
 	const body = (await res.json()) as {
 		messages: unknown[];
 		live: boolean;
 		agentId: string;
-		status: string;
+		executionState: string;
 		createdAt: string;
 		runningToolCallIds?: string[];
 	};
-	return { ...body, runningToolCallIds: body.runningToolCallIds ?? [] };
+	return { messages: body.messages, live: body.live, agentId: body.agentId, status: body.executionState, createdAt: body.createdAt, runningToolCallIds: body.runningToolCallIds ?? [] };
 }
 
-export function delegationProcessWsUrl(delegationId: string): string {
-	return `${SERVER_URL.replace(/^http/, "ws")}/api/delegations/${delegationId}/process/ws`;
+export class WorkerProcessScopeError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "WorkerProcessScopeError";
+	}
+}
+
+export function delegationProcessWsUrl(delegationId: string, full = false): string {
+	return `${SERVER_URL.replace(/^http/, "ws")}/api/delegations/${encodeURIComponent(delegationId)}/process/ws?scope=${full ? "full" : "delegation"}`;
 }
 
 export async function fetchDelegationTimeline(delegationId: string): Promise<{
@@ -497,13 +1353,14 @@ export async function fetchDelegationTimeline(delegationId: string): Promise<{
 }> {
 	const res = await fetch(`${SERVER_URL}/api/delegations/${encodeURIComponent(delegationId)}/process/timeline`);
 	if (!res.ok) throw new Error(`fetch delegation timeline failed: ${res.status}`);
-	return (await res.json()) as {
+	const body = (await res.json()) as {
 		events: DelegationTimelineEvent[];
 		live: boolean;
 		agentId: string;
-		status: string;
+		executionState: string;
 		createdAt: string;
 	};
+	return { events: body.events, live: body.live, agentId: body.agentId, status: body.executionState, createdAt: body.createdAt };
 }
 
 export function delegationTimelineWsUrl(delegationId: string, afterSeq = 0): string {
@@ -572,21 +1429,31 @@ export interface HarnessSettings {
 		managerWritePolicy: "delegation_required";
 	};
 }
-export async function getHarnessSettings(): Promise<HarnessSettings> {
-	const res = await fetch(`${SERVER_URL}/api/settings/harness`);
-	const body = (await res.json()) as { harness?: HarnessSettings; error?: string };
-	if (!res.ok || !body.harness) throw new Error(body.error ?? "get harness settings failed");
-	return body.harness;
+export interface HarnessSettingsSnapshot { harness: HarnessSettings; revision: string }
+
+export class HarnessSettingsConflictError extends Error {
+	constructor(readonly currentRevision?: string) {
+		super("Harness 设置已被其他客户端修改，请核对最新配置");
+		this.name = "HarnessSettingsConflictError";
+	}
 }
-export async function setHarnessSettings(settings: Partial<HarnessSettings>): Promise<HarnessSettings> {
+
+export async function getHarnessSettings(): Promise<HarnessSettingsSnapshot> {
+	const res = await fetch(`${SERVER_URL}/api/settings/harness`);
+	const body = (await res.json()) as Partial<HarnessSettingsSnapshot> & { error?: string };
+	if (!res.ok || !body.harness || !body.revision) throw new Error(body.error ?? "get harness settings failed");
+	return { harness: body.harness, revision: body.revision };
+}
+export async function setHarnessSettings(settings: Partial<HarnessSettings>, expectedRevision: string): Promise<HarnessSettingsSnapshot> {
 	const res = await fetch(`${SERVER_URL}/api/settings/harness`, {
 		method: "PUT",
 		headers: { "content-type": "application/json" },
-		body: JSON.stringify(settings),
+		body: JSON.stringify({ ...settings, expectedRevision }),
 	});
-	const body = (await res.json()) as { harness?: HarnessSettings; error?: string };
-	if (!res.ok || !body.harness) throw new Error(body.error ?? "update harness settings failed");
-	return body.harness;
+	const body = (await res.json()) as Partial<HarnessSettingsSnapshot> & { error?: string; currentRevision?: string };
+	if (res.status === 409) throw new HarnessSettingsConflictError(body.currentRevision);
+	if (!res.ok || !body.harness || !body.revision) throw new Error(body.error ?? "update harness settings failed");
+	return { harness: body.harness, revision: body.revision };
 }
 
 // ---- agents registry (teams.json) ----
@@ -597,14 +1464,22 @@ export async function listAgents(): Promise<AgentConfig[]> {
 	return ((await res.json()) as { agents: AgentConfig[] }).agents;
 }
 
-export async function createAgent(agent: AgentConfig): Promise<AgentConfig> {
+export class AgentCreationUncertainError extends Error {
+	constructor(message: string, readonly agentName: string) {
+		super(message);
+		this.name = "AgentCreationUncertainError";
+	}
+}
+
+export async function createAgent(agent: AgentConfig, operationId?: string): Promise<AgentConfig> {
 	const res = await fetch(`${SERVER_URL}/api/agents`, {
 		method: "POST",
-		headers: { "content-type": "application/json" },
+		headers: { "content-type": "application/json", ...(operationId ? { "Idempotency-Key": operationId } : {}) },
 		body: JSON.stringify(agent),
 	});
 	if (!res.ok) {
-		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		const body = (await res.json().catch(() => null)) as { error?: string; code?: string; agentName?: string } | null;
+		if (res.status === 409 && body?.code === "agent_creation_uncertain" && body.agentName) throw new AgentCreationUncertainError(body.error ?? "Agent 创建结果未确认", body.agentName);
 		throw new Error(body?.error ?? `create agent failed: ${res.status}`);
 	}
 	return ((await res.json()) as { agent: AgentConfig }).agent;
@@ -624,18 +1499,20 @@ export async function updateAgent(name: string, agent: AgentConfig): Promise<Age
 	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}`, {
 		method: "PUT",
 		headers: { "content-type": "application/json" },
-		body: JSON.stringify(agent),
+		body: JSON.stringify({ ...agent, expectedRevision: agent.extensionRevision ?? 0 }),
 	});
 	if (!res.ok) {
 		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		if (res.status === 409) throw new ApiConflictError(body?.error ?? "Agent 配置已变化", {});
 		throw new Error(body?.error ?? `update agent failed: ${res.status}`);
 	}
 	return ((await res.json()) as { agent: AgentConfig }).agent;
 }
 
-export async function deleteAgent(name: string): Promise<void> {
+export async function deleteAgent(name: string): Promise<{ credentialsCleanup: "complete" | "pending" }> {
 	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}`, { method: "DELETE" });
-	if (!res.ok) throw new Error(`delete agent failed: ${res.status}`);
+	await ensureOk(res, "delete agent failed");
+	return res.status === 202 ? { credentialsCleanup: "pending" } : { credentialsCleanup: "complete" };
 }
 
 export async function probeAgent(name: string): Promise<AgentProbeResult> {
@@ -681,6 +1558,35 @@ export async function listAgentConnectorConfigOptions(name: string, field: strin
 	}
 	const body = (await res.json()) as { options?: DriverConfigOption[] };
 	return body.options ?? [];
+}
+
+export interface WorkerRuntimeModelState {
+	supported: boolean;
+	modelCatalog: "pi" | "driver";
+	effortLevels: string[];
+	settings: { model?: string; effort?: string };
+	defaults: { model?: string; effort?: string };
+}
+
+async function workerModelResponse<T>(response: Response): Promise<T> {
+	const body = await response.json();
+	if (!response.ok) throw new Error(body.error ?? `会话模型设置失败：${response.status}`);
+	return body as T;
+}
+
+export async function getWorkerRuntimeModel(sessionId: string): Promise<WorkerRuntimeModelState> {
+	return workerModelResponse(await fetch(`${SERVER_URL}/api/sessions/${encodeURIComponent(sessionId)}/worker-runtime-model`));
+}
+
+export async function setWorkerRuntimeModel(sessionId: string, patch: { model?: string | null; effort?: string | null }): Promise<WorkerRuntimeModelState["settings"]> {
+	const result = await workerModelResponse<{ settings: WorkerRuntimeModelState["settings"] }>(await fetch(`${SERVER_URL}/api/sessions/${encodeURIComponent(sessionId)}/worker-runtime-model`, {
+		method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch),
+	}));
+	return result.settings;
+}
+
+export async function getWorkerRuntimeModelOptions(sessionId: string): Promise<DriverConfigOption[]> {
+	return (await workerModelResponse<{ options: DriverConfigOption[] }>(await fetch(`${SERVER_URL}/api/sessions/${encodeURIComponent(sessionId)}/worker-runtime-model/options`))).options;
 }
 
 // ---- Phase 5：Extension 目录与 Connector/Capability 绑定（§10.1） ----
@@ -776,10 +1682,10 @@ export async function getAgentMcpServers(name: string): Promise<{ serverIds: str
 	return { serverIds: body.serverIds ?? [], revision: body.revision ?? 0 };
 }
 
-export function putAgentMcpServers(name: string, serverIds: string[]): Promise<MutationResponse> {
+export function putAgentMcpServers(name: string, serverIds: string[], expectedRevision: number): Promise<MutationResponse> {
 	return postJson<MutationResponse>(
 		`/api/agents/${encodeURIComponent(name)}/mcp`,
-		{ serverIds },
+		{ serverIds, expectedRevision },
 		"save Agent MCP servers failed",
 		"PUT",
 	);
@@ -799,6 +1705,25 @@ export async function runExtensionConnectionAction(
 		throw new Error(body?.error ?? `connection action failed: ${res.status}`);
 	}
 	return ((await res.json()) as { connection: ExtensionConnectionStatus }).connection;
+}
+
+/** 从本地目录安装 Extension：link（默认）= 开发者本地链接；copy = 用户安装（复制进数据目录）。 */
+export async function extensionAuthorization(
+	connection: Pick<ExtensionConnectionStatus, "extensionId" | "connectionId">,
+	request: { actionId: string } | { sessionId: string; cancel?: boolean },
+): Promise<ExtensionAuthorizationSession | null> {
+	const base = `${SERVER_URL}/api/extensions/${encodeURIComponent(connection.extensionId)}/connections/${encodeURIComponent(connection.connectionId)}/authorizations`;
+	const res = await fetch("sessionId" in request ? `${base}/${encodeURIComponent(request.sessionId)}` : base, {
+		method: "actionId" in request ? "POST" : request.cancel ? "DELETE" : "GET",
+		...( "actionId" in request ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(request) } : {}),
+		cache: "no-store",
+		signal: AbortSignal.timeout(40_000),
+	});
+	if (!res.ok) {
+		const body = await res.json().catch(() => null) as { error?: string } | null;
+		throw new Error(body?.error ?? "授权状态请求失败，请重试");
+	}
+	return res.status === 204 ? null : ((await res.json()) as { session: ExtensionAuthorizationSession }).session;
 }
 
 /** 从本地目录安装 Extension：link（默认）= 开发者本地链接；copy = 用户安装（复制进数据目录）。 */
@@ -839,6 +1764,7 @@ export async function getAgentConnector(
 export function putAgentConnector(
 	name: string,
 	input: {
+		expectedRevision: number;
 		extensionId: string;
 		connectorId: string;
 		transport: AgentConnectorBinding["transport"];
@@ -868,6 +1794,7 @@ export async function listAgentBindings(
 export function addAgentBinding(
 	name: string,
 	input: {
+		expectedRevision: number;
 		extensionId: string;
 		capabilityId: string;
 		enabled?: boolean;
@@ -885,6 +1812,7 @@ export function patchAgentBinding(
 	name: string,
 	bindingId: string,
 	patch: {
+		expectedRevision: number;
 		enabled?: boolean;
 		config?: Record<string, unknown>;
 		activation?: ToolActivation;
@@ -901,10 +1829,10 @@ export function patchAgentBinding(
 }
 
 /** 删除 Capability 绑定（保留安装包本身）。 */
-export async function deleteAgentBinding(name: string, bindingId: string): Promise<MutationResponse> {
+export async function deleteAgentBinding(name: string, bindingId: string, expectedRevision: number): Promise<MutationResponse> {
 	const res = await fetch(
 		`${SERVER_URL}/api/agents/${encodeURIComponent(name)}/extensions/${encodeURIComponent(bindingId)}`,
-		{ method: "DELETE" },
+		{ method: "DELETE", headers: { "x-expected-revision": String(expectedRevision) } },
 	);
 	await ensureOk(res, "delete binding failed");
 	return (await res.json()) as MutationResponse;
@@ -930,11 +1858,12 @@ export async function probeAgentBinding(name: string, bindingId: string): Promis
 export function setAgentEnabled(
 	name: string,
 	enabled: boolean,
+	expectedRevision: number,
 	resolve?: "keep" | "cancel",
 ): Promise<MutationResponse> {
 	return postJson<MutationResponse>(
 		`/api/agents/${encodeURIComponent(name)}/enabled`,
-		{ enabled, ...(resolve ? { resolve } : {}) },
+		{ enabled, expectedRevision, ...(resolve ? { resolve } : {}) },
 		"set enabled failed",
 		"PUT",
 	);
@@ -942,8 +1871,9 @@ export function setAgentEnabled(
 
 /** pinned manager 可编辑配置（§10.5）：描述 + manager settings 合并更新。 */
 export function updateManager(input: {
+	expectedRevision: number;
 	description?: string;
-	manager?: Partial<PiManagerSettings>;
+	manager?: PiManagerSettingsPatch;
 	responsibility?: AgentConfig["responsibility"] | null;
 	piResources?: PiResourceConfig | null;
 }): Promise<MutationResponse> {
@@ -958,10 +1888,10 @@ export async function previewAgentPiResources(name: string, workspaceId?: string
 	return body.preview!;
 }
 
-export function putAgentPiResources(name: string, piResources: PiResourceConfig | null): Promise<MutationResponse> {
+export function putAgentPiResources(name: string, piResources: PiResourceConfig | null, expectedRevision: number): Promise<MutationResponse> {
 	return postJson<MutationResponse>(
 		`/api/agents/${encodeURIComponent(name)}/pi-resources`,
-		{ piResources },
+		{ piResources, expectedRevision },
 		"save pi resources failed",
 		"PUT",
 	);
@@ -975,9 +1905,11 @@ export function putAgentPiResources(name: string, piResources: PiResourceConfig 
 export function putAgentConfig(
 	name: string,
 	input: {
+		expectedRevision: number;
 		description?: string;
+		displayName?: string | null;
 		responsibility?: AgentConfig["responsibility"] | null;
-		manager?: Partial<PiManagerSettings>;
+		manager?: PiManagerSettingsPatch;
 		connector?: { config?: Record<string, unknown> };
 		piResources?: PiResourceConfig | null;
 		codeSearch?: AgentConfig["codeSearch"];
@@ -1122,8 +2054,9 @@ export async function deleteAgentSecret(name: string, key: string): Promise<void
 // ---- avatars (§11) ----
 
 /** URL for an agent's uploaded avatar; `v` busts the cache after changes. */
-export function agentAvatarUrl(name: string, v = 0): string {
-	return `${SERVER_URL}/api/agents/${encodeURIComponent(name)}/avatar?v=${v}`;
+export function agentAvatarUrl(name: string, v = 0, defaultRevision?: string): string {
+	const revision = defaultRevision ? `&default=${encodeURIComponent(defaultRevision)}` : "";
+	return `${SERVER_URL}/api/agents/${encodeURIComponent(name)}/avatar?v=${v}${revision}`;
 }
 
 export async function uploadAgentAvatar(name: string, file: File): Promise<AgentConfig> {
@@ -1144,9 +2077,10 @@ export async function uploadAgentAvatar(name: string, file: File): Promise<Agent
 	return ((await res.json()) as { agent: AgentConfig }).agent;
 }
 
-export async function deleteAgentAvatar(name: string): Promise<void> {
+export async function deleteAgentAvatar(name: string): Promise<AgentConfig> {
 	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}/avatar`, { method: "DELETE" });
 	if (!res.ok) throw new Error(`delete avatar failed: ${res.status}`);
+	return ((await res.json()) as { agent: AgentConfig }).agent;
 }
 
 // ---- rooms / windows ----
@@ -1182,19 +2116,51 @@ export async function openRoomFile(roomId: string, targetPath: string): Promise<
 }
 
 /** 发起对话：direct（单聊）/ group（群聊）。单聊按 worker 去重，命中返回 existed。 */
+export class WorkerDisabledError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "WorkerDisabledError";
+	}
+}
+
+export class RoomSelectionStaleError extends Error {
+	constructor(message: string, readonly selection: "worker" | "workspace") {
+		super(message);
+		this.name = "RoomSelectionStaleError";
+	}
+}
+
+export class RoomSourceStaleError extends Error {
+	constructor(message: string, readonly unavailable: boolean) {
+		super(message);
+		this.name = "RoomSourceStaleError";
+	}
+}
+
+export class RoomCreationOperationConflictError extends Error {
+	constructor(message: string) { super(message); this.name = "RoomCreationOperationConflictError"; }
+}
+
 export async function createRoom(input: {
 	type: "direct" | "group";
 	members: string[];
 	workspaceId?: string;
 	name?: string;
-}): Promise<{ room: RoomSummary; existed: boolean }> {
+}, operationId?: string): Promise<{ room: RoomSummary; existed: boolean }> {
 	const res = await fetch(`${SERVER_URL}/api/rooms`, {
 		method: "POST",
-		headers: { "content-type": "application/json" },
+		headers: { "content-type": "application/json", ...(operationId ? { "idempotency-key": operationId } : {}) },
 		body: JSON.stringify(input),
 	});
 	if (!res.ok) {
-		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		const body = (await res.json().catch(() => null)) as { error?: string; code?: string } | null;
+		if (res.status === 409 && body?.code === "worker_disabled") {
+			throw new WorkerDisabledError(body.error ?? "Worker 已停用，请重新选择");
+		}
+		if (body?.code === "worker_unavailable" || body?.code === "workspace_unavailable") {
+			throw new RoomSelectionStaleError(body.error ?? "发起对话的选择已失效，请重新选择", body.code === "worker_unavailable" ? "worker" : "workspace");
+		}
+		if (body?.code === "room_operation_conflict" || body?.code === "room_operation_gone") throw new RoomCreationOperationConflictError(body.error ?? "群聊创建操作键不可再用，请核对房间列表");
 		throw new Error(body?.error ?? `create room failed: ${res.status}`);
 	}
 	return (await res.json()) as { room: RoomSummary; existed: boolean };
@@ -1274,14 +2240,28 @@ export async function switchRoomWorkspace(
 	roomId: string,
 	workspaceId: string | null,
 	mode: "new_window" | "in_place" = "new_window",
+	operationId?: string,
+	source?: RoomSummary,
 	): Promise<{ room: RoomSummary; existed: boolean; restored: boolean }> {
 	const res = await fetch(`${SERVER_URL}/api/rooms/${roomId}/switch-workspace`, {
 		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ workspaceId, mode }),
+		headers: { "content-type": "application/json", ...(operationId ? { "idempotency-key": operationId } : {}) },
+		body: JSON.stringify({ workspaceId, mode, ...(source && mode === "new_window" ? { source: {
+			type: source.type,
+			name: source.name,
+			members: source.members.map((member) => member.name),
+			prompt: source.prompt,
+			workspaceId: source.workspace?.id ?? null,
+			cwdSnapshot: source.cwdSnapshot,
+		} } : {}) }),
 	});
-	const body = (await res.json()) as { room?: RoomSummary; existed?: boolean; restored?: boolean; error?: string };
-	if (!res.ok) throw new Error(body.error ?? `switch workspace failed: ${res.status}`);
+	const body = (await res.json()) as { room?: RoomSummary; existed?: boolean; restored?: boolean; error?: string; code?: string };
+	if (!res.ok) {
+		if (body.code === "room_operation_conflict" || body.code === "room_operation_gone") throw new RoomCreationOperationConflictError(body.error ?? "群聊创建操作键不可再用，请核对房间列表");
+		if (body.code === "workspace_unavailable" || body.code === "worker_unavailable") throw new RoomSelectionStaleError(body.error ?? "项目或 Worker 选择已失效，请重新选择", body.code === "workspace_unavailable" ? "workspace" : "worker");
+		if (body.code === "room_source_changed" || body.code === "room_source_unavailable") throw new RoomSourceStaleError(body.error ?? "来源房间已变化，请刷新后重试", body.code === "room_source_unavailable");
+		throw new Error(body.error ?? `switch workspace failed: ${res.status}`);
+	}
 	return { room: body.room!, existed: body.existed === true, restored: body.restored === true };
 }
 
@@ -1323,6 +2303,47 @@ export async function createRoomSession(
 	});
 	if (!res.ok) throw new Error(`create room session failed: ${res.status}`);
 	return ((await res.json()) as { session: SessionSummary }).session;
+}
+
+/** Reserve one Manager Session and submit its first message as one retryable operation. */
+export class ManagerWorkSubmissionError extends Error {
+	constructor(message: string, readonly sessionId: string, readonly code?: string) {
+		super(message);
+		this.name = "ManagerWorkSubmissionError";
+	}
+}
+
+export async function createManagerWork(roomId: string, content: string, operationId: string, context: { workspaceId: string | null; cwdSnapshot: string }, modelRef?: string, attachments: MessageAttachmentInput[] = [], thinkingLevel?: string): Promise<string> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/new-work`, {
+		method: "POST",
+		headers: { "content-type": "application/json", "Idempotency-Key": operationId },
+		body: JSON.stringify({ content, ...context, ...(modelRef ? { modelRef } : {}), ...(thinkingLevel ? { thinkingLevel } : {}), attachments }),
+	});
+	const body = (await res.json()) as { sessionId?: string; error?: string; code?: string };
+	if (!res.ok || !body.sessionId) {
+		const message = body.error ?? `create Manager work failed: ${res.status}`;
+		if (body.sessionId) throw new ManagerWorkSubmissionError(message, body.sessionId, body.code);
+		throw new Error(message);
+	}
+	return body.sessionId;
+}
+
+export async function markRoomRead(roomId: string, sessionId: string, activityRevision: number): Promise<{ readRevision: number; activityRevision: number; hasUnreadActivity: boolean }> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/read-watermark`, {
+		method: "PUT",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ sessionId, activityRevision }),
+	});
+	const body = (await res.json()) as { readRevision?: number; activityRevision?: number; hasUnreadActivity?: boolean; error?: string };
+	if (!res.ok || body.readRevision === undefined || body.activityRevision === undefined) throw new Error(body.error ?? `mark room read failed: ${res.status}`);
+	return { readRevision: body.readRevision, activityRevision: body.activityRevision, hasUnreadActivity: body.hasUnreadActivity === true };
+}
+
+export async function getManagerSessionLocation(roomId: string, sessionId: string): Promise<{ roomId: string; sessionId: string; workspaceId: string | null; active: boolean }> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(sessionId)}/location`);
+	const body = (await res.json()) as { roomId?: string; sessionId?: string; workspaceId?: string | null; active?: boolean; error?: string };
+	if (!res.ok || body.roomId !== roomId || body.sessionId !== sessionId) throw new Error(body.error ?? `locate Manager session failed: ${res.status}`);
+	return { roomId: body.roomId, sessionId: body.sessionId, workspaceId: body.workspaceId ?? null, active: body.active === true };
 }
 
 export async function getSessionWorkState(sessionId: string, goalId?: string): Promise<{
@@ -1456,10 +2477,13 @@ export async function supersedeGoal(
 
 /** Switch the active pi session of a window. */
 export async function setActiveRoomSession(roomId: string, sessionId: string): Promise<void> {
-	const res = await fetch(`${SERVER_URL}/api/rooms/${roomId}/sessions/${sessionId}/activate`, {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(sessionId)}/activate`, {
 		method: "POST",
 	});
-	if (!res.ok) throw new Error(`switch session failed: ${res.status}`);
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `switch session failed: ${res.status}`);
+	}
 }
 
 /** Delete a pi session inside a window (the last one is protected). */
@@ -1528,15 +2552,8 @@ export interface InteractionView {
 }
 
 export interface InteractionDelegationView {
-	id: string;
-	windowId: string;
-	managerSessionId: string;
 	goalId?: string;
-	agentId: string;
-	status: string;
 	workerStarted: boolean;
-	createdAt: string;
-	updatedAt: string;
 }
 
 /** 列出窗口下的审批卡（页面刷新/对账恢复）。 */
@@ -1591,4 +2608,48 @@ export async function cancelInteraction(id: string, expectedGoalId?: string): Pr
 		const body = (await res.json().catch(() => null)) as { error?: string } | null;
 		throw new Error(body?.error ?? `cancel interaction failed: ${res.status}`);
 	}
+}
+
+export type WebSearchProvider = "tavily" | "deepseek" | "grok";
+export interface WebResearchConfig {
+ enabled:boolean; fetchEnabled:boolean; defaultScope:"domestic"|"global"; fallbackEnabled:boolean; crossCheckEnabled:boolean; maxProviderAttempts:number;
+ domesticOrder:WebSearchProvider[]; globalOrder:WebSearchProvider[]; proxyUrl:string;
+ providers:Record<WebSearchProvider,{enabled:boolean;model:string;searchDepth?:"basic"|"advanced";webEnabled?:boolean;xEnabled?:boolean}>;
+}
+export interface WebResearchGrant { search:boolean; fetch:boolean }
+export interface WebResearchTarget { id:string; name:string; kind:"manager"|"worker"; supported:boolean; enabled:boolean; reason?:string }
+export interface WebResearchView {
+ revision:number; settings:WebResearchConfig;
+ grants:Record<string,WebResearchGrant>; targets:WebResearchTarget[];
+ providers:Record<WebSearchProvider,{configured:boolean;credentialSource:"network"|"model"|"none";test:{status:"ready"|"error";checkedAt:string;message:string}|null}>;
+}
+export const WEB_RESEARCH_CHANGED_EVENT = "puddingteams:web-research-changed";
+export const WEB_RESEARCH_REVISION_KEY = "puddingteams:web-research-revision";
+function publishWebResearchChange(revision:number):void {
+ if (typeof window === "undefined") return;
+ try { window.localStorage.setItem(WEB_RESEARCH_REVISION_KEY,String(revision)); } catch { /* Availability does not depend on browser storage. */ }
+ window.dispatchEvent(new Event(WEB_RESEARCH_CHANGED_EVENT));
+}
+export async function putWorkerWebResearchGrant(agentId:string,grant:WebResearchGrant,expectedRevision:number):Promise<WebResearchView> {
+ const result=await knowledgeResponse<WebResearchView>(await fetch(`${SERVER_URL}/api/settings/web-research/workers/${encodeURIComponent(agentId)}`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({expectedRevision,grant})}));
+ publishWebResearchChange(result.revision);
+ return result;
+}
+export async function getWebResearchSettings():Promise<WebResearchView> {
+ return knowledgeResponse<WebResearchView>(await fetch(`${SERVER_URL}/api/settings/web-research`));
+}
+export async function saveWebResearchSettings(value:{expectedRevision:number;settings:WebResearchConfig;keys?:Partial<Record<WebSearchProvider,string>>;grants?:Record<string,WebResearchGrant>}):Promise<WebResearchView> {
+ const result=await knowledgeResponse<WebResearchView>(await fetch(`${SERVER_URL}/api/settings/web-research`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(value)}));
+ publishWebResearchChange(result.revision);
+ return result;
+}
+export async function testWebResearchProvider(provider:WebSearchProvider):Promise<WebResearchView> {
+ const result=await knowledgeResponse<WebResearchView>(await fetch(`${SERVER_URL}/api/settings/web-research/${provider}/test`,{method:"POST"}));
+ publishWebResearchChange(result.revision);
+ return result;
+}
+export async function testAndSaveWebResearchProvider(provider:WebSearchProvider,value:Parameters<typeof saveWebResearchSettings>[0]):Promise<WebResearchView> {
+ const result=await knowledgeResponse<WebResearchView>(await fetch(`${SERVER_URL}/api/settings/web-research/${provider}/test-and-save`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(value)}));
+ publishWebResearchChange(result.revision);
+ return result;
 }

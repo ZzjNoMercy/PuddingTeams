@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { AgentInvokeResult, AgentInvoker } from "./invoker.js";
 import type { PiSessionStore } from "../pi-bridge/session-store.js";
 import type { TeamsStore, WindowConfig } from "../store/teams.js";
@@ -15,11 +15,17 @@ import type { WorkStateStore } from "../store/work-state.js";
 
 export interface DirectDispatchDeps {
 	teams: Pick<TeamsStore, "windowForSession" | "getAgent">;
-	sessions: Pick<PiSessionStore, "sendCustomMessage" | "ensureSessionFile" | "rename" | "sessionName">;
-	invoker: Pick<AgentInvoker, "requireAgent" | "delegate">;
+	sessions: Pick<PiSessionStore, "sendCustomMessage" | "sendCustomMessageDurable" | "rename" | "sessionName">;
+	runtimeModelFor?: (sessionId: string) => Promise<import("./types.js").RuntimeModelSettings>;
+	invoker: Pick<AgentInvoker, "requireAgent" | "delegate" | "withActiveSessionLifecycle">;
 	workStates?: Pick<WorkStateStore, "getActive">;
 	onError?: (sessionId: string, message: string) => void;
 	log?: (message: string) => void;
+	onUserMessageDurable?: (sessionId: string, sourceRefs: import("../knowledge/chat-intake.js").ChatSourceRefs) => Promise<void>;
+}
+
+export function directTaskId(operationId: string): string {
+	return createHash("sha256").update(`direct-task:${operationId}`).digest("hex");
 }
 
 /** direct 窗口的成员 worker（单成员且不是内置 manager）；非 direct 返回 undefined。 */
@@ -49,7 +55,7 @@ function resultCard(
 	return {
 		customType: "pudding:task_result",
 		content: result.content,
-			details: {
+		details: {
 			taskId,
 			worker: workerName,
 			windowId,
@@ -77,42 +83,54 @@ export async function dispatchDirectMessage(
 	sessionId: string,
 	content: string,
 	display?: string,
+	operationKey?: string,
+	sourceRefs?: import("../knowledge/chat-intake.js").ChatSourceRefs,
 ): Promise<boolean> {
 	const target = await directWorkerFor(deps.teams, sessionId);
 	if (!target) return false;
 	const { window, workerName, processView } = target;
 	const displayText = display ?? content;
+	const operationId = operationKey ?? randomUUID();
+	const taskId = directTaskId(operationId);
 	const goal = await deps.workStates?.getActive(sessionId);
+	let runtimeModel: import("./types.js").RuntimeModelSettings | undefined;
 
-	await deps.sessions.sendCustomMessage(
-		sessionId,
-		{ customType: "pudding:user_message", content: displayText, details: { windowId: window.id } },
-		{ triggerTurn: false },
-	);
-	// 全新 direct 窗口的 session 文件可能还没落盘（SDK 首条 assistant 消息前
-	// 不持久化）：先复制 SDK 的首刷，避免重启后整段对话蒸发。
-	await deps.sessions.ensureSessionFile(sessionId);
-	// direct 窗口没有 manager 回合，永远不会走 LLM 标题生成；pi 的
-	// firstMessage 元数据又只认 user 角色消息（本会话全是 custom 卡），
-	// 不起名的话会话下拉只能显示 pi 的 "(no messages)" 占位。首条消息
-	// 时用任务文本截断命名；用户改过的名字不覆盖。
-	if (!(await deps.sessions.sessionName(sessionId))) {
-		const title = displayText.replace(/\s+/g, " ").trim().slice(0, 40);
-		if (title) await deps.sessions.rename(sessionId, title).catch(() => undefined);
-	}
-	const taskId = randomUUID();
-	await deps.sessions.sendCustomMessage(
-		sessionId,
-		{
-			customType: "pudding:task_assign",
-			content: displayText,
-			details: { taskId, worker: workerName, windowId: window.id, from: "direct", status: "running", ...(goal ? { goalId: goal.goalId } : {}) },
-		},
-		{ triggerTurn: false },
-	);
+	await deps.invoker.withActiveSessionLifecycle(sessionId, async () => {
+		const current = await directWorkerFor(deps.teams, sessionId);
+		if (!current || current.window.id !== window.id || current.workerName !== workerName) {
+			throw new Error("direct 窗口在消息写入前已变化");
+		}
+		runtimeModel = await deps.runtimeModelFor?.(sessionId);
+		if (runtimeModel && Object.keys(runtimeModel).length === 0) runtimeModel = undefined;
+		await deps.sessions.sendCustomMessageDurable(
+			sessionId,
+			{ customType: "pudding:user_message", content: displayText, details: { windowId: window.id, operationId, ...(sourceRefs ? { sourceRefs } : {}) } },
+		);
+		if (sourceRefs) await deps.onUserMessageDurable?.(sessionId, sourceRefs);
+		// direct 没有 manager 回合，首条消息用任务文本命名。
+		if (!(await deps.sessions.sessionName(sessionId))) {
+			const title = displayText.replace(/\s+/g, " ").trim().slice(0, 40);
+			if (title) await deps.sessions.rename(sessionId, title).catch(() => undefined);
+		}
+		await deps.sessions.sendCustomMessageDurable(
+			sessionId,
+			{
+				customType: "pudding:task_assign",
+				content: displayText,
+				details: { operationId, taskId, worker: workerName, windowId: window.id, from: "direct", status: "running", ...(goal ? { goalId: goal.goalId } : {}) },
+			},
+		);
+	});
 
 	const send = (message: { customType: string; content: string; details?: Record<string, unknown> }) =>
 		deps.sessions.sendCustomMessage(sessionId, message, { triggerTurn: false });
+	let resolveAdmission!: () => void;
+	let rejectAdmission!: (error: unknown) => void;
+	let admitted = false;
+	const admission = new Promise<void>((resolve, reject) => {
+		resolveAdmission = resolve;
+		rejectAdmission = reject;
+	});
 
 	void (async () => {
 		// Runtime 接单后立即带回 delegationId；补写同 taskId 的富化指派卡
@@ -126,12 +144,18 @@ export async function dispatchDirectMessage(
 			windowId: window.id,
 			managerSessionId: sessionId,
 			managerToolCallId: taskId,
+			operationId,
+			onDelegationCreated: () => {
+				admitted = true;
+				resolveAdmission();
+			},
 			goalId: goal?.goalId,
 			goalEpoch: goal?.execution.epoch,
 			intent: goal ? `推进当前 Goal：${goal.goal}` : undefined,
 			completionBoundary: goal?.completionBoundary,
 			handoffKind: "request",
 			message: content,
+			runtimeModel,
 			// binding 有 handle 就 continue，没有/失效由 runtime 透明回退 run。
 			mode: "continue",
 			onUpdate: (_text, details) => {
@@ -144,7 +168,8 @@ export async function dispatchDirectMessage(
 				void send({
 					customType: "pudding:task_assign",
 					content: displayText,
-						details: {
+					details: {
+						operationId,
 						taskId,
 						worker: workerName,
 						windowId: window.id,
@@ -152,12 +177,16 @@ export async function dispatchDirectMessage(
 						status: "running",
 						delegationId: d.delegationId,
 						...(d.sessionHandle ? { sessionHandle: d.sessionHandle } : {}),
-							processView,
-							...(goal ? { goalId: goal.goalId } : {}),
+						processView,
+						...(goal ? { goalId: goal.goalId } : {}),
 					},
 				});
 			},
 		});
+		if (!admitted) {
+			admitted = true;
+			resolveAdmission(); // A durable early terminal outcome can settle before onDelegationCreated.
+		}
 		if (result.status === "needs_input") {
 			// 审批卡已由 invoker 写进本 session（managerSessionId = 本窗口）。
 			return;
@@ -165,6 +194,7 @@ export async function dispatchDirectMessage(
 		await send(resultCard(workerName, taskId, window.id, result, processView, goal?.goalId));
 		deps.log?.(`direct dispatch: ${sessionId} → ${workerName} (${result.status})`);
 	})().catch((err: unknown) => {
+		if (!admitted) rejectAdmission(err);
 		const message = err instanceof Error ? err.message : String(err);
 		deps.onError?.(sessionId, message);
 		void send({
@@ -174,5 +204,12 @@ export async function dispatchDirectMessage(
 		});
 	});
 
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await Promise.race([
+			admission,
+			new Promise<void>((_, reject) => { timer = setTimeout(() => reject(new Error("direct 委托接单未确认")), 30000); }),
+		]);
+	} finally { if (timer) clearTimeout(timer); }
 	return true;
 }

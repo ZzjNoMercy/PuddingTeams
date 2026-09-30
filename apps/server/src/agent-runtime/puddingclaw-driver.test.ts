@@ -279,15 +279,18 @@ test("PuddingClawDriver：input_required 时原任务文本进 providerState 私
 	const ws = path.join(dir, "ws");
 	mkdirSync(ws, { recursive: true });
 	const driver = new PuddingClawDriver({ command: fakeCli(dir) });
+	const updates: string[] = [];
 	const ctx: InvocationContext = {
 		cwd: ws,
 		env: { ...process.env, ARGV_CAPTURE: path.join(dir, "argv.txt"), STDIN_CAPTURE: path.join(dir, "stdin.txt") },
+		onUpdate: (message) => { updates.push(message); },
 	};
 	const events = await collect(driver.run({ message: "分析一下上月的配置数据", requestId: "req-1" }, ctx));
 	const needs = events.find((e) => e.type === "input_required");
 	assert.ok(needs && needs.type === "input_required");
 	assert.equal(needs.providerState?.task, "分析一下上月的配置数据", "clarify-and-retry 需要原任务文本");
 	assert.equal(needs.providerState?.continuation_token, undefined, "该形发问本来就没有 token");
+	assert.equal(updates.includes("worker 执行完成"), false, "等待人工输入不能先显示任务完成");
 	const stdin = JSON.parse(readFileSync(path.join(dir, "stdin.txt"), "utf-8")) as { workspace_path?: string };
 	assert.equal(stdin.workspace_path, ws, "spawn transport 也必须把目标 Workspace 传给 PuddingClaw");
 });
@@ -476,7 +479,8 @@ test("PuddingClawDriver：长连接丢失后用同一 request_id 恢复幂等终
 		command: cli,
 		connectionRecoveryMinAgeMs: 0,
 		connectionRecoveryIntervalMs: 1,
-		connectionRecoveryMs: 1_000,
+		// Full-suite parallel load can delay three short CLI processes beyond 1s.
+		connectionRecoveryMs: 10_000,
 	});
 	const events = await collect(driver.run(
 		{ message: "long task", requestId: "stable-request-id" },

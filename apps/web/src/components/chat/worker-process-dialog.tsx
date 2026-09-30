@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BrainIcon, CheckCircle2Icon, CircleDotIcon, FilePenIcon, FilesIcon, ListChecksIcon, MessageSquareIcon, PackageCheckIcon, SearchIcon, ShieldAlertIcon, SlidersHorizontalIcon, TerminalIcon, WrenchIcon, XCircleIcon, XIcon } from "lucide-react";
 import {
 	Conversation,
@@ -19,6 +19,7 @@ import { timelineForDisplay, type TimelineDisplayEvent } from "@/lib/delegation-
 import { groupForRender, type RenderItem } from "@/lib/events";
 import { useAgentLabels } from "@/lib/avatars";
 import { workerProcessPresentation } from "@/lib/worker-process-presentation";
+import { delegationMessageEnd } from "@/lib/worker-process-scope";
 import { AssistantGroup, Message } from "./message";
 import { WorkerAvatar } from "./worker-avatar";
 import { CollaborationTrustAxes } from "./session-activity-drawer";
@@ -27,29 +28,41 @@ import { RuntimeArtifactViewer } from "./runtime-artifact-viewer";
 function WorkerProcessBody({
 	delegationId,
 	full,
+	until,
+	liveUpdates,
 }: {
 	delegationId: string;
 	full: boolean;
+	until: number;
+	liveUpdates: boolean;
 }) {
-	const { messages, loading, live, agentId, status, createdAt, error } = useWorkerProcess(delegationId, full);
+	const [attempt, setAttempt] = useState(0);
+	// A receipt can change liveUpdates before the last WS event is reflected in
+	// HTTP history. Keep this attempt mounted until its own offline signal.
+	return <WorkerProcessBodyAttempt key={`${delegationId}:${full}:${attempt}`} delegationId={delegationId} full={full} until={until} liveUpdates={liveUpdates} onRetry={() => setAttempt((value) => value + 1)} />;
+}
+
+function WorkerProcessBodyAttempt({ delegationId, full, until, liveUpdates, onRetry }: { delegationId: string; full: boolean; until: number; liveUpdates: boolean; onRetry: () => void }) {
+	const { messages, loading, live, agentId, status, createdAt, error, scopeError, connectionError, refreshing, refresh } = useWorkerProcess(delegationId, full, liveUpdates);
 	const resolvedTaskIds = useMemo(() => new Set<string>(), []);
+	const visibleMessages = useMemo(() => full ? messages : messages.filter((message) => message.timestamp < until), [full, messages, until]);
 
 	// 完整会话模式下，本次委托的起点（此前都是历史任务的过程）。
 	// 分组在分界两侧分别进行，保证分隔线落在精确的消息边界上。
 	const since = Date.parse(createdAt);
-	const boundaryIdx = full && !Number.isNaN(since) ? messages.findIndex((m) => m.timestamp >= since) : -1;
+	const boundaryIdx = full && !Number.isNaN(since) ? visibleMessages.findIndex((m) => m.timestamp >= since) : -1;
 	const items = useMemo<(RenderItem | "divider")[]>(() => {
 		if (boundaryIdx > 0) {
 			return [
-				...groupForRender(messages.slice(0, boundaryIdx)),
+				...groupForRender(visibleMessages.slice(0, boundaryIdx)),
 				"divider" as const,
-				...groupForRender(messages.slice(boundaryIdx)),
+				...groupForRender(visibleMessages.slice(boundaryIdx)),
 			];
 		}
-		return groupForRender(messages);
-	}, [messages, boundaryIdx]);
-	const currentTaskMessages = Number.isNaN(since) ? messages : messages.filter((message) => message.timestamp >= since);
-	const waitingForFirstModelEvent = status === "running"
+		return groupForRender(visibleMessages);
+	}, [visibleMessages, boundaryIdx]);
+	const currentTaskMessages = Number.isNaN(since) ? visibleMessages : visibleMessages.filter((message) => message.timestamp >= since);
+	const waitingForFirstModelEvent = status === "running" && !connectionError
 		&& !currentTaskMessages.some((message) => message.role === "assistant" || message.role === "toolResult");
 
 	if (loading) {
@@ -61,8 +74,9 @@ function WorkerProcessBody({
 	}
 	if (error) {
 		return (
-			<div className="flex flex-1 items-center justify-center text-xs text-destructive">
-				加载失败：{error}
+			<div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-xs text-destructive" role="alert">
+				<p>{scopeError ? error : `Worker 执行记录暂时无法加载：${error}`}</p>
+				{scopeError ? <p>可使用上方「查看完整会话」核对原始记录。</p> : <Button type="button" size="sm" variant="outline" onClick={onRetry}>重试执行记录</Button>}
 			</div>
 		);
 	}
@@ -70,9 +84,10 @@ function WorkerProcessBody({
 	return (
 		<Conversation initial="instant" className="min-h-0 flex-1">
 				<ConversationContent className="home-message-column">
-					{messages.length === 0 ? (
+					{connectionError ? <div role="alert" className="mx-auto my-3 flex w-full max-w-xl flex-wrap items-center gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 px-4 py-3 text-xs text-foreground"><span>{connectionError}</span><Button type="button" size="sm" variant="outline" disabled={refreshing} onClick={refresh}>{refreshing ? "正在重新读取…" : "重新读取执行记录"}</Button></div> : null}
+					{visibleMessages.length === 0 ? (
 						<div className="flex flex-1 items-center justify-center pt-16 text-sm text-muted-foreground">
-							worker 会话还没有消息
+							{connectionError ? "执行记录尚未确认完整" : "worker 会话还没有消息"}
 						</div>
 					) : (
 						items.map((item) => {
@@ -166,11 +181,16 @@ function WorkerTimelineBody({
 }: {
 	delegationId: string;
 }) {
+	const [attempt, setAttempt] = useState(0);
+	return <WorkerTimelineBodyAttempt key={`${delegationId}:${attempt}`} delegationId={delegationId} onRetry={() => setAttempt((value) => value + 1)} />;
+}
+
+function WorkerTimelineBodyAttempt({ delegationId, onRetry }: { delegationId: string; onRetry: () => void }) {
 	const { events, loading, error } = useDelegationTimeline(delegationId);
 	const displayEvents = useMemo(() => timelineForDisplay(events), [events]);
 
 	if (loading) return <div className="flex flex-1 items-center justify-center text-xs text-muted-foreground"><Loader size={14} />正在加载时间线…</div>;
-	if (error) return <div className="flex flex-1 items-center justify-center text-xs text-destructive">加载失败：{error}</div>;
+	if (error) return <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-xs text-destructive" role="alert"><p>Worker 时间线暂时无法加载：{error}</p><Button type="button" size="sm" variant="outline" onClick={onRetry}>重试时间线</Button></div>;
 	return (
 		<Conversation initial="instant" className="min-h-0 flex-1">
 			<ConversationContent className="mx-auto w-full max-w-2xl px-4 py-4">
@@ -186,9 +206,11 @@ function WorkerTimelineBody({
 function WorkerProcessRouter({
 	info,
 	full,
+	until,
 }: {
 	info: WorkerProcessInfo;
 	full: boolean;
+	until: number;
 }) {
 	const presentation = workerProcessPresentation(info);
 	if (presentation === "waiting_admission") {
@@ -201,7 +223,7 @@ function WorkerProcessRouter({
 		return <div className="flex flex-1 items-center justify-center px-6 text-center text-sm text-muted-foreground">Teams 未观测到 Worker 启动；任务已经结束。具体原因请查看上方执行状态。</div>;
 	}
 	return info.view === "session"
-		? <WorkerProcessBody delegationId={info.delegationId} full={full} />
+		? <WorkerProcessBody delegationId={info.delegationId} full={full} until={until} liveUpdates={full || (until === Infinity && ["running", "waiting_input", "cancel_requested", "reconciling"].includes(info.executionState))} />
 		: <WorkerTimelineBody delegationId={info.delegationId} />;
 }
 
@@ -226,6 +248,7 @@ export function WorkerProcessDrawer({
 	roomId,
 	managerSessionId,
 	requestedDelegationId,
+	requestedFullSession,
 	showWorkerFilter,
 	open,
 	onOpenChange,
@@ -233,6 +256,7 @@ export function WorkerProcessDrawer({
 	roomId: string;
 	managerSessionId: string;
 	requestedDelegationId: string | null;
+	requestedFullSession: boolean;
 	showWorkerFilter: boolean;
 	open: boolean;
 	onOpenChange: (open: boolean) => void;
@@ -241,10 +265,11 @@ export function WorkerProcessDrawer({
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState<string | null>(null);
-	const [fullSessionDelegationId, setFullSessionDelegationId] = useState<string | null>(null);
+	const [fullSessionDelegationId, setFullSessionDelegationId] = useState<string | null>(requestedFullSession ? requestedDelegationId : null);
 	const [takeoverRationale, setTakeoverRationale] = useState("");
 	const [reconciling, setReconciling] = useState(false);
 	const [detailView, setDetailView] = useState<"process" | "runtime" | "artifacts">("process");
+	const refreshGeneration = useRef(0);
 	const labels = useAgentLabels();
 	const orderedItems = useMemo(() => [...items].sort((a, b) => {
 		const activeA = a.executionState === "running" || a.executionState === "waiting_input" || a.executionState === "cancel_requested" || a.executionState === "reconciling" ? 1 : 0;
@@ -252,6 +277,7 @@ export function WorkerProcessDrawer({
 		return activeB - activeA || b.updatedAt.localeCompare(a.updatedAt);
 	}), [items]);
 	const selected = orderedItems.find((item) => item.delegationId === selectedId) ?? null;
+	const selectedUntil = selected?.view === "session" ? delegationMessageEnd(selected, items) : Infinity;
 	const workerOptions = useMemo(() => {
 		const byAgent = new Map<string, { agentId: string; count: number; active: boolean; latest: WorkerProcessListItem }>();
 		for (const item of orderedItems) {
@@ -270,10 +296,21 @@ export function WorkerProcessDrawer({
 		() => selected ? orderedItems.filter((item) => item.agentId === selected.agentId) : [],
 		[orderedItems, selected],
 	);
+	const closeInspector = useCallback(() => {
+		const active = document.activeElement;
+		if (active instanceof HTMLElement && active.closest(".worker-process-inspector")) active.blur();
+		onOpenChange(false);
+		requestAnimationFrame(() => {
+			(document.querySelector<HTMLButtonElement>('button[aria-label="任务与执行"]')
+				?? document.querySelector<HTMLButtonElement>('button[aria-label="聊天设置"]'))?.focus();
+		});
+	}, [onOpenChange]);
 
 	const refresh = useCallback(async () => {
+		const generation = ++refreshGeneration.current;
 		try {
 			const next = await fetchRoomDelegationProcesses(roomId, managerSessionId);
+			if (generation !== refreshGeneration.current) return;
 			setItems(next);
 			setError(null);
 			setSelectedId((current) => {
@@ -282,30 +319,41 @@ export function WorkerProcessDrawer({
 				return next[0]?.delegationId ?? null;
 			});
 		} catch (reason) {
+			if (generation !== refreshGeneration.current) return;
 			setError(reason instanceof Error ? reason.message : String(reason));
 		} finally {
-			setLoading(false);
+			if (generation === refreshGeneration.current) setLoading(false);
 		}
 	}, [managerSessionId, requestedDelegationId, roomId]);
 
 	useEffect(() => {
 		if (!open) return;
-		const initial = setTimeout(() => void refresh(), 0);
-		const timer = setInterval(() => void refresh(), 2500);
+		const generationRef = refreshGeneration;
+		let cancelled = false;
+		let timer: ReturnType<typeof setTimeout>;
+		const poll = async () => {
+			try {
+				await refresh();
+			} finally {
+				if (!cancelled) timer = setTimeout(() => void poll(), 2500);
+			}
+		};
+		timer = setTimeout(() => void poll(), 0);
 		return () => {
-			clearTimeout(initial);
-			clearInterval(timer);
+			cancelled = true;
+			clearTimeout(timer);
+			generationRef.current++;
 		};
 	}, [open, refresh]);
 
 	useEffect(() => {
 		if (!open) return;
 		const closeOnEscape = (event: KeyboardEvent) => {
-			if (event.key === "Escape") onOpenChange(false);
+			if (event.key === "Escape") closeInspector();
 		};
 		window.addEventListener("keydown", closeOnEscape);
 		return () => window.removeEventListener("keydown", closeOnEscape);
-	}, [onOpenChange, open]);
+	}, [closeInspector, open]);
 
 	const activeCount = orderedItems.filter((item) => item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "cancel_requested" || item.executionState === "reconciling").length;
 	const showFullSession = selected !== null && fullSessionDelegationId === selected.delegationId;
@@ -332,12 +380,12 @@ export function WorkerProcessDrawer({
 				<header className="worker-process-head flex shrink-0 items-start justify-between gap-4">
 					<div className="min-w-0">
 						<div className="flex items-center gap-2">
-							<h2 className="text-sm font-semibold">执行详情</h2>
+							<h2 className="text-sm font-medium">执行详情</h2>
 							{activeCount > 0 ? <span className="inline-flex items-center gap-1 text-[11px] text-emerald-600"><span className="size-1.5 animate-pulse rounded-full bg-emerald-500" />{activeCount} 个运行中</span> : null}
 						</div>
 						<p className="mt-1 text-[11px] text-muted-foreground">{showWorkerFilter ? "先选择 Worker，再查看过程、运行文件与交付物。" : "查看一次委托的过程、运行文件与冻结交付物。"}</p>
 					</div>
-					<button type="button" aria-label="关闭执行详情" onClick={() => onOpenChange(false)} className="chat-info-close"><XIcon className="size-4" /></button>
+					<button type="button" aria-label="关闭执行详情" onClick={closeInspector} className="chat-info-close"><XIcon className="size-4" /></button>
 				</header>
 
 				{showWorkerFilter ? <div className="worker-process-filter shrink-0">
@@ -400,13 +448,15 @@ export function WorkerProcessDrawer({
 										<CollaborationTrustAxes source={selected} />
 									</div>
 									{isObservationLost(selected) ? <div className="shrink-0 border-b border-destructive/20 bg-destructive/5 p-2 text-[11px]"><div className="flex gap-2"><Button size="sm" variant="outline" disabled={reconciling} onClick={() => void resolveUnknown()}>重新对账原 Run</Button><Input value={takeoverRationale} onChange={(event) => setTakeoverRationale(event.target.value)} placeholder="上游已终止的确认依据（至少 8 字）" /><Button size="sm" variant="destructive" disabled={reconciling || takeoverRationale.trim().length < 8} onClick={() => void resolveUnknown(true)}>确认并接管</Button></div></div> : null}
-									<WorkerProcessRouter key={`${selected.delegationId}:${selected.view}`} info={selected} full={showFullSession} />
+									<WorkerProcessRouter key={`${selected.delegationId}:${selected.view}`} info={selected} full={showFullSession} until={selectedUntil} />
 								</> : <RuntimeArtifactViewer key={`${selected.delegationId}:${detailView}`} delegationId={selected.delegationId} kind={detailView} live={selected.live} />}
 							</>
 						) : (
-							<div className={`flex flex-1 items-center justify-center gap-2 px-5 text-center text-xs ${error ? "text-destructive" : "text-muted-foreground"}`}>
-								{loading ? <Loader size={13} /> : null}
-								{loading ? "正在加载执行过程…" : error ?? "当前会话还没有执行任务"}
+							<div className={`flex flex-1 flex-col items-center justify-center gap-3 px-5 text-center text-xs ${error ? "text-destructive" : "text-muted-foreground"}`}>
+								{loading ? <><Loader size={13} />正在加载执行过程…</> : error ? <>
+									<p role="alert">执行索引暂时无法加载：{error}</p>
+									<Button type="button" size="sm" variant="outline" onClick={() => void refresh()}>重试执行索引</Button>
+								</> : "当前会话还没有执行任务"}
 							</div>
 						)}
 				</section>

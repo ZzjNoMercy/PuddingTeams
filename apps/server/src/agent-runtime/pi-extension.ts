@@ -34,18 +34,34 @@ export const piConnectorManifest: ConnectorExtensionManifest = {
 			properties: {
 				model: {
 					type: "string",
+					// title 是 UI 标签：缺省会退化成 schema key（model/thinkingLevel/
+					// sessionDir），把内部字段名直接暴露给用户。
+					title: "模型",
 					// format: "model" —— 前端渲染为可用模型下拉（数据源 /api/models），
 					// 不是自由文本；任何 connector 都可用这个注解（pi 不特殊化）。
 					format: "model",
-					description: "worker 使用的模型；留空用 pi 默认模型",
+					// description 渲染在字段标题下面（不是控件下面）：它解释"这个字段
+					// 是干什么的"，控件下面留给随当前值变化的动态说明。
+					description: "智能体使用的模型，留空使用全局默认",
 				},
 				thinkingLevel: {
 					type: "string",
-					enum: ["off", "minimal", "low", "medium", "high", "xhigh"],
-					description: "thinking 级别（留空用 pi 默认）",
+					title: "思考强度",
+					// 与 teams.ts 校验枚举、pi-ai EXTENDED_THINKING_LEVELS 逐项一致。
+					// 曾少列 "max"，导致 worker 表单选不到该档（Kimi K3 / GLM / DeepSeek
+					// 都支持），而 manager 表单用的是另一份 7 档常量，两边选项不一致。
+					// 某模型实际可选的档位由 /api/models 的 thinkingLevels 决定，
+					// 本 enum 只是未选定模型时的回退全集。
+					enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+					"x-puddingteams-thinking-levels-from": "model",
+					description: "留空使用全局默认，档位随所选模型变化",
 				},
 				sessionDir: {
 					type: "string",
+					title: "会话存储目录",
+					// 运维向字段：仍可由 API / teams.json 写入、运行时照常读取，但配置页
+					// 不生成表单——普通用户没有改会话存储位置的场景。
+					"x-puddingteams-hidden": true,
 					description: "会话存储目录（可选，默认派生到 pi 配置目录下）",
 				},
 			},
@@ -63,6 +79,8 @@ export function piExtensionHooks(defaults: { sessionDir?: string; fffStateRoot?:
 	return {
 		driverFactory: (config) =>
 			new LocalPiDriver({
+				executionProfile: config.executionProfile === "wiki_curator" ? "wiki_curator" : undefined,
+				knowledgeFor: typeof config.knowledgeFor === "function" ? config.knowledgeFor as LocalPiDriverOptions["knowledgeFor"] : undefined,
 				model: str(config.model),
 				thinkingLevel: str(config.thinkingLevel),
 				piResources:
@@ -87,6 +105,10 @@ export function piExtensionHooks(defaults: { sessionDir?: string; fffStateRoot?:
 					typeof config.managedExtensionFactoriesFor === "function"
 						? (config.managedExtensionFactoriesFor as LocalPiDriverOptions["managedExtensionFactoriesFor"])
 						: undefined,
+				managedExtensionsFingerprintFor: typeof config.managedExtensionsFingerprintFor === "function"
+					? config.managedExtensionsFingerprintFor as LocalPiDriverOptions["managedExtensionsFingerprintFor"] : undefined,
+				webResearchToolsFor: typeof config.webResearchToolsFor === "function"
+					? config.webResearchToolsFor as LocalPiDriverOptions["webResearchToolsFor"] : undefined,
 				// Agent 未显式配置时用平台默认（PUDDINGTEAMS_HOME/sessions/workers）。
 				sessionDir: str(config.sessionDir) ?? defaults.sessionDir,
 			}),

@@ -3,7 +3,7 @@ import assert from "node:assert";
 import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { configureSharedModelRuntime } from "./model-runtime.js";
+import { configureSharedModelRuntime, sharedModelRuntime } from "./model-runtime.js";
 import { PiSessionStore } from "./session-store.js";
 
 /**
@@ -38,4 +38,21 @@ test("provider key 写入平台自有 auth.json，与 pi CLI agentDir 隔离", a
 	await sessions.removeProviderKey("deepseek");
 	const after = JSON.parse(readFileSync(path.join(secretsDir, "auth.json"), "utf-8")) as Record<string, unknown>;
 	assert.ok(!after.deepseek, "删除后平台 auth.json 不得残留");
+});
+
+test("Provider key 持久写入失败后清除运行时 override", async () => {
+	const cwd = mkdtempSync(path.join(tmpdir(), "pt-key-write-failure-"));
+	const sessions = new PiSessionStore(cwd, path.join(cwd, "sessions"));
+	const rt = await sharedModelRuntime();
+	await sessions.setProviderKey("deepseek", "durable-old-key");
+	const credentials = (rt as unknown as { credentials: { modify: (...args: unknown[]) => Promise<unknown> } }).credentials;
+	const originalModify = credentials.modify;
+	credentials.modify = async () => { throw new Error("injected auth persistence failure"); };
+	try {
+		await assert.rejects(() => sessions.setProviderKey("deepseek", "transient-key"), /injected auth persistence failure/);
+		assert.equal((await rt.getAuth("deepseek"))?.auth.apiKey, "durable-old-key", "失败的替换不得覆盖原持久 key");
+	} finally {
+		credentials.modify = originalModify;
+		await sessions.removeProviderKey("deepseek");
+	}
 });

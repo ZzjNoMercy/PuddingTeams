@@ -1,8 +1,10 @@
 import assert from "node:assert";
-import { readFile, writeFile } from "node:fs/promises";
+import { access, readFile, writeFile } from "node:fs/promises";
 import { mkdtempSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { CredentialsStore } from "./credentials.js";
 import { McpServerStore, normalizeMcpServerDefinition } from "./mcp-servers.js";
@@ -89,3 +91,47 @@ test("删除 MCP Server 同时清除其密钥", async () => {
 	assert.equal(await store.get("local"), undefined);
 	assert.equal(await store.remove("local"), false);
 });
+
+test("MCP Catalog 重命名后目录同步失败时保留待对账并拒绝继续", async () => {
+	const { root, store } = await makeStore();
+	await store.create({ id: "docs", displayName: "Old", definition: { command: "server" }, secrets: { API_TOKEN: "old-token" } });
+	const faulted = store as unknown as { syncCatalogDirectory: (directory: string) => Promise<void> };
+	faulted.syncCatalogDirectory = async () => { throw new Error("injected directory sync failure"); };
+	await assert.rejects(() => store.update("docs", {
+		displayName: "New", definition: { command: "server" }, secrets: { API_TOKEN: "new-token" },
+	}), (error: unknown) => (error as { statusCode?: number }).statusCode === 503);
+	await assert.rejects(() => store.list(), (error: unknown) => (error as { statusCode?: number }).statusCode === 503);
+	await access(path.join(root, "secrets", "binding-transaction.json"));
+	const credentials = new CredentialsStore(path.join(root, "secrets"));
+	await credentials.init();
+	const restarted = new McpServerStore(path.join(root, "config"), credentials);
+	await restarted.recoverSecretTransaction();
+	assert.equal((await restarted.get("docs"))?.displayName, "New");
+	assert.equal((await credentials.getSecrets("docs")).API_TOKEN, "new-token");
+});
+
+for (const operation of ["create", "update", "delete"] as const) {
+for (const phase of ["before-catalog", "after-catalog"] as const) {
+	test(`MCP 密钥与目录事务：${operation} 真实 SIGKILL ${phase} 后按目录提交标记恢复`, async () => {
+		const root = mkdtempSync(path.join(tmpdir(), "pt-mcp-sigkill-"));
+		const child = spawnSync(process.execPath, ["--import", "tsx", fileURLToPath(new URL("../../scripts/mcp-secret-sigkill-child.ts", import.meta.url)), root, operation, phase], {
+			cwd: path.join(process.cwd()), encoding: "utf8", timeout: 30_000,
+		});
+		assert.equal(child.signal, "SIGKILL", `${child.status}: ${child.stderr}`);
+		const credentials = new CredentialsStore(path.join(root, "secrets", "mcp"));
+		await credentials.init();
+		const store = new McpServerStore(path.join(root, "config"), credentials);
+		await assert.rejects(() => store.list(), /requires startup recovery/);
+		await store.recoverSecretTransaction();
+		const expected = operation === "create"
+			? phase === "before-catalog" ? { name: undefined, token: undefined } : { name: "New", token: "new-token" }
+			: operation === "delete"
+				? phase === "before-catalog" ? { name: "Old", token: "old-token" } : { name: undefined, token: undefined }
+				: phase === "before-catalog" ? { name: "Old", token: "old-token" } : { name: "New", token: "new-token" };
+		assert.equal((await store.get("docs"))?.displayName, expected.name);
+		assert.equal((await credentials.getSecrets("docs")).API_TOKEN, expected.token);
+		await store.recoverSecretTransaction();
+		assert.equal((await credentials.getSecrets("docs")).API_TOKEN, expected.token);
+	});
+}
+}

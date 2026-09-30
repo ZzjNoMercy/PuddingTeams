@@ -25,7 +25,7 @@ test("WorkspaceStore：canonical path 去重，Window 只引用 workspaceId", as
 
 	const window = await store.createWindow({
 		type: "direct",
-		members: ["puddingclaw"],
+		members: ["codex"],
 		workspaceId: first.id,
 		sessionId: "sess-1",
 	});
@@ -258,6 +258,9 @@ test("solo 原地切换按 workspace 停放并恢复 sessions 与 worker binding
 
 test("direct identity 按 (worker, workspace) 唯一且拒绝原地切换", async () => {
 	const { store } = await makeStore();
+	for (const name of ["alpha", "beta"]) {
+		await store.upsertAgent({ name, description: name, invoke: { type: "command", command: name, runArgs: [] } });
+	}
 	const a = await store.workspaces.createManaged("A");
 	const b = await store.workspaces.createManaged("B");
 	const alphaA = await store.createWindow({ type: "direct", members: ["alpha"], workspaceId: a.id, sessionId: "alpha-a" });

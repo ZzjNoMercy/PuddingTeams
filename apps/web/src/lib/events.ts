@@ -42,7 +42,11 @@ export function friendlyModelError(raw: string): { content: string; detail: stri
 	let explanation = "你的消息已经保存，但模型服务没有成功返回结果。";
 	let action = "请再次发送上一条消息；如果仍然失败，可以刷新页面或切换模型后重试。";
 
-	if (/role ['\"]?tool|tool_calls|preceding message/.test(value)) {
+	if (/知识库上下文已变化/.test(detail)) {
+		title = "知识库上下文已更新";
+		explanation = "知识库结构、授权或工具配置已经变化。当前会话保留着更新前的上下文，系统已停止继续使用它。";
+		action = "请打开顶部会话菜单，点击「新建会话」，选择知识库后重新提交原始资料。旧会话和候选记录仍保留。";
+	} else if (/role ['\"]?tool|tool_calls|preceding message/.test(value)) {
 		title = "会话上下文暂时异常";
 		explanation = "系统在整理之前的工具调用记录时发现顺序不一致，因此安全停止了本轮请求。你的任务尚未开始执行。";
 		action = "请直接重试上一条消息；如果仍然出现此提示，再新建会话继续。";
@@ -81,6 +85,8 @@ export function renderPiMessage(m: PiAssistantMessage): {
 	thinking?: string;
 	toolCalls: ToolCallView[];
 	usage?: PiUsage;
+	puddingMessageId?: string;
+	piStopReason?: string;
 	error?: boolean;
 	modelError?: ModelErrorPresentation;
 	errorDetail?: string;
@@ -106,6 +112,8 @@ export function renderPiMessage(m: PiAssistantMessage): {
 		thinking: thinking.length ? thinking : undefined,
 		toolCalls,
 		usage: m.usage,
+		puddingMessageId: m.puddingMessageId,
+		piStopReason: m.stopReason,
 		error: friendlyError ? true : undefined,
 		modelError: friendlyError ? { ...friendlyError.presentation, ...(content ? { partialContent: content } : {}) } : undefined,
 		errorDetail: friendlyError?.detail,
@@ -344,6 +352,7 @@ export function renderHistory(msgs: PiMessage[]): ChatMessage[] {
 				id: uid(),
 				role: "user",
 				content: typeof m.content === "string" ? m.content : textOf(m.content),
+				puddingMessageId: m.puddingMessageId,
 				toolCalls: [],
 				timestamp: m.timestamp ?? Date.now(),
 				streaming: false,
@@ -417,6 +426,34 @@ function findLastAssistant(messages: ChatMessage[]): number {
 		if (messages[i]!.role === "assistant") return i;
 	}
 	return -1;
+}
+
+function findAssistantForEvent(messages: ChatMessage[], message: PiAssistantMessage): number {
+	if (message.puddingMessageId) {
+		for (let index = messages.length - 1; index >= 0; index--) {
+			if (messages[index]!.role === "assistant" && messages[index]!.puddingMessageId === message.puddingMessageId) return index;
+		}
+		// pi may publish a fresh assistant object for every streaming update.
+		// The wire ID is then different even though the turn timestamp is stable.
+		// Only coalesce into an unfinished turn, never an earlier completed turn.
+		if (typeof message.timestamp === "number") {
+			for (let index = messages.length - 1; index >= 0; index--) {
+				const candidate = messages[index]!;
+				if (candidate.role === "user") break;
+				if (candidate.role === "assistant" && candidate.streaming && candidate.timestamp === message.timestamp) return index;
+			}
+		}
+		return -1;
+	}
+	if (typeof message.timestamp === "number") {
+		for (let index = messages.length - 1; index >= 0; index--) {
+			if (messages[index]!.role === "assistant" && messages[index]!.timestamp === message.timestamp) return index;
+		}
+		return -1;
+	}
+	const index = findLastAssistant(messages);
+	if (index < 0 || messages.slice(index + 1).some((item) => item.role === "user")) return -1;
+	return index;
 }
 
 /** Find the (latest) message that already holds a tool call with this id. */
@@ -548,12 +585,14 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 				return upsertCustomMessage(messages, next);
 			}
 			if (m.role === "user") {
+				if (m.puddingMessageId && messages.some((item) => item.role === "user" && item.puddingMessageId === m.puddingMessageId)) return messages;
 				return [
 					...messages,
 					{
 						id: uid(),
 						role: "user",
 						content: typeof m.content === "string" ? m.content : textOf(m.content),
+						puddingMessageId: m.puddingMessageId,
 						toolCalls: [],
 						timestamp: m.timestamp ?? Date.now(),
 						streaming: false,
@@ -561,6 +600,8 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 				];
 			}
 			if (m.role === "assistant") {
+				const existing = m.puddingMessageId || typeof m.timestamp === "number" ? findAssistantForEvent(messages, m) : -1;
+				if (existing >= 0 && (m.puddingMessageId || !messages.slice(existing + 1).some((item) => item.role === "user"))) return messages;
 				// Backstop: a new assistant message means any earlier one finished
 				// — clear leftover streaming flags even if its message_end was lost.
 				const settled = messages.map((msg) => (msg.streaming ? { ...msg, streaming: false } : msg));
@@ -580,21 +621,31 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 		case "message_update": {
 			const m = event.message as PiAssistantMessage;
 			if (!m) return messages;
-			const idx = findLastAssistant(messages);
-			if (idx < 0) return messages;
+			const idx = findAssistantForEvent(messages, m);
+			if (idx < 0) return [...messages, { id: uid(), role: "assistant", ...renderPiMessage(m), timestamp: m.timestamp ?? Date.now(), streaming: true }];
 			const prev = messages[idx]!;
-			const previousById = new Map(prev.toolCalls.map((t) => [t.id, t]));
-			const toolCalls = renderPiMessage(m).toolCalls.map((t) => ({
-				...(previousById.get(t.id) ?? {}),
-				...t,
-				status: previousById.get(t.id)?.status ?? t.status,
-			}));
-			return messages.map((msg, i) => (i === idx ? { ...msg, ...renderPiMessage(m), toolCalls, streaming: true } : msg));
+			if (!prev.streaming && prev.piStopReason) return messages;
+			const incoming = renderPiMessage(m);
+			// HTTP history can already contain a later stream snapshot when an older
+			// WS update queued during that request is replayed. Pi text/thinking and
+			// emitted tool calls grow within a turn; an older prefix must not erase
+			// visible progress or a tool card.
+			const content = prev.content.startsWith(incoming.content) ? prev.content : incoming.content;
+			const thinking = prev.thinking?.startsWith(incoming.thinking ?? "") ? prev.thinking : incoming.thinking;
+			const incomingById = new Map(incoming.toolCalls.map((call) => [call.id, call]));
+			const toolCalls = prev.toolCalls.map((call) => {
+				const next = incomingById.get(call.id);
+				return next ? { ...call, ...next, status: call.status } : call;
+			});
+			for (const call of incoming.toolCalls) {
+				if (!prev.toolCalls.some((existing) => existing.id === call.id)) toolCalls.push(call);
+			}
+			return messages.map((msg, i) => (i === idx ? { ...msg, ...incoming, content, thinking, toolCalls, streaming: true } : msg));
 		}
 		case "message_end": {
 			const m = event.message as PiMessage;
 			if (!m || m.role !== "assistant") return messages;
-			const idx = findLastAssistant(messages);
+			const idx = findAssistantForEvent(messages, m);
 			if (idx < 0) {
 				return [
 					...messages,
@@ -602,6 +653,7 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 				];
 			}
 			const prev = messages[idx]!;
+			if (!prev.streaming && prev.piStopReason) return messages;
 			const previousById = new Map(prev.toolCalls.map((t) => [t.id, t]));
 			const toolCalls = renderPiMessage(m).toolCalls.map((t) => ({
 				...(previousById.get(t.id) ?? {}),

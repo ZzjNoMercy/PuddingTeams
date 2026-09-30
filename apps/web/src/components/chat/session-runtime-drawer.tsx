@@ -141,12 +141,14 @@ export function SessionRuntimeDrawer({
 		? selected.status as SettlementState
 		: "pending";
 	const selectedTrustSource: CollaborationProjectionSource = {
-		executionState: selectedDelegationProjection?.executionState ?? "admitted",
+		executionState: selectedDelegationProjection?.executionState ?? (selected?.delegationIds.length ? "unknown" : "not_started"),
 		receipt: selectedDelegationProjection?.receipt,
 		verification: latestSubmission?.verifications.at(-1)?.status as VerificationProjection | undefined,
 		settlement: workItemSettlement,
 	};
-	const canInterrupt = !readOnly && workState.status === "active" && ["running", "waiting_human", "reviewing"].includes(workState.execution.status);
+	// A newly created Goal is active but idle. Pausing it must remain available
+	// before the first Worker run, as well as while recovery is in progress.
+	const canInterrupt = !readOnly && workState.status === "active" && workState.execution.status !== "interrupted";
 	useEffect(() => {
 		try { localStorage.setItem("puddingteams:goal-selection:" + workState.sessionId + ":" + workState.goalId, JSON.stringify({ workItemId: selected?.id, delegationId: effectiveDelegationId })) } catch { /* private mode */ }
 	}, [effectiveDelegationId, selected?.id, workState.goalId, workState.sessionId]);
@@ -165,11 +167,12 @@ export function SessionRuntimeDrawer({
 				expectedSubmissionId: pendingSubmission.id,
 				verdict,
 				summary: reviewSummary.trim(),
-				evidenceRefs: effectiveDelegationId ? [effectiveDelegationId] : [],
+				evidenceRefs: pendingSubmission.delegationId ? [`delegation:${pendingSubmission.delegationId}`] : [],
 			});
 			const appliedReview = next.plan?.items[selected.id]?.submissions.find((entry) => entry.id === pendingSubmission.id)?.review;
+			if (!appliedReview) throw new Error("验收结果尚未写入，请刷新状态核对");
 			const aligned = appliedReview?.rebasedFromRevision === undefined ? "" : `；状态已安全对齐 r${appliedReview.rebasedFromRevision}→r${appliedReview.reviewedStateRevision}`;
-			onWorkStateChange(next); setReviewSummary(""); toast.success((verdict === "accepted" ? "已接受交付" : verdict === "revision" ? "已要求返修" : "已标记阻塞") + aligned);
+			onWorkStateChange(next); setReviewSummary(""); toast.success((appliedReview.verdict === "accepted" ? "已接受交付" : appliedReview.verdict === "revision" ? "已要求返修" : "提升未完成，交付已阻塞") + aligned);
 		} catch (error) {
 			if (error instanceof WorkStateApiConflictError) onWorkStateChange(error.current);
 			toast.error(error instanceof Error ? error.message : String(error));
@@ -259,7 +262,7 @@ export function SessionRuntimeDrawer({
 						</div>
 					</details> : null}
 					{selectedDelegations.length ? <div className="mt-4"><label className="text-[11px] font-medium" htmlFor="goal-attempt">执行记录</label><div className="mt-1.5 flex gap-2"><select id="goal-attempt" className="goal-attempt-select" value={effectiveDelegationId ?? ""} onChange={(event) => setSelectedDelegationId(event.target.value)}>{selectedDelegations.map((item, index) => <option key={item.id} value={item.id}>D{index + 1} · {item.agentId} · {item.executionState}</option>)}</select><Button size="sm" variant="outline" disabled={!effectiveDelegationId || selectedDelegations.some((item) => item.id === effectiveDelegationId && item.workerStarted === false)} onClick={() => { if (effectiveDelegationId) openProcess(effectiveDelegationId) }}>执行过程</Button>{!readOnly && effectiveDelegationId && selectedDelegations.find((item) => item.id === effectiveDelegationId && (item.executionState === "waiting_admission" || item.executionState === "running" || item.executionState === "waiting_input" || item.executionState === "reconciling")) ? <Button size="sm" variant="destructive" disabled={working} onClick={() => void terminateDelegation(effectiveDelegationId)}><SquareIcon className="size-3 fill-current" />终止任务</Button> : null}</div></div> : null}
-					{!readOnly && selected.status === "submitted" ? <div className="goal-review-box"><div className="text-xs font-semibold">Submission 待 Manager 验收</div><Textarea value={reviewSummary} onChange={(event) => setReviewSummary(event.target.value)} rows={3} placeholder="填写验收摘要与证据判断（必填）" /><div className="grid grid-cols-3 gap-2"><Button size="sm" disabled={working || !reviewSummary.trim()} onClick={() => void review("accepted")}>接受</Button><Button size="sm" variant="outline" disabled={working || !reviewSummary.trim()} onClick={() => void review("revision")}>要求返修</Button><Button size="sm" variant="destructive" disabled={working || !reviewSummary.trim()} onClick={() => void review("blocked")}>标记阻塞</Button></div></div> : null}
+					{!readOnly && selected.status === "submitted" ? <div className="goal-review-box"><div className="text-xs font-medium">Submission 待 Manager 验收</div><Textarea value={reviewSummary} onChange={(event) => setReviewSummary(event.target.value)} rows={3} placeholder="填写验收摘要与证据判断（必填）" /><div className="grid grid-cols-3 gap-2"><Button size="sm" disabled={working || !reviewSummary.trim()} onClick={() => void review("accepted")}>接受</Button><Button size="sm" variant="outline" disabled={working || !reviewSummary.trim()} onClick={() => void review("revision")}>要求返修</Button><Button size="sm" variant="destructive" disabled={working || !reviewSummary.trim()} onClick={() => void review("blocked")}>标记阻塞</Button></div></div> : null}
 					{selected.submissions.length ? <div className="mt-3 space-y-2">{[...selected.submissions].reverse().map((submission) => <div key={submission.id} className="rounded-lg border p-2 text-[11px]"><div className="font-medium">第 {submission.attempt} 次交付 · {submission.review ? submissionVerdictText[submission.review.verdict] : "待验收"}</div><p className="mt-1 text-muted-foreground"><span className="font-medium text-foreground">{submission.review ? "Manager 验收结论：" : "交付摘要："}</span>{submission.review?.summary ?? submission.summary ?? "请在执行过程中查看完整结果"}</p></div>)}</div> : null}
 				</section> : null}
 				<Section icon={<ShieldCheckIcon />} title="Goal 验收" metric={latestReview ? latestReview.criteria.filter((item) => item.status === "satisfied").length + "/" + conditions.length + " 项通过" : conditions.length + " 项标准"} className="goal-secondary-section">

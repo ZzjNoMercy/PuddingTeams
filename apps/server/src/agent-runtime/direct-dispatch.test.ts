@@ -7,6 +7,18 @@ import { directWorkerFor, dispatchDirectMessage, type DirectDispatchDeps } from 
 const worker: AgentConfig = { name: "puddingclaw", description: "数据分析 worker", enabled: true };
 const manager: AgentConfig = { name: "pi", description: "内置 manager", invoke: { type: "pi" }, pinned: true, enabled: true };
 
+test("direct freezes session model settings before the Worker admission boundary", async () => {
+	const fixture = makeDeps({});
+	let settings = { model: "model-a", effort: "high" };
+	fixture.deps.runtimeModelFor = async () => ({ ...settings });
+	const result = await dispatchDirectMessage(fixture.deps, "s-direct", "hello");
+	assert.equal(result, true);
+	settings = { model: "model-b", effort: "low" };
+	assert.deepEqual(fixture.delegateCalls[0]?.runtimeModel, { model: "model-a", effort: "high" });
+	await dispatchDirectMessage(fixture.deps, "s-direct", "next");
+	assert.deepEqual(fixture.delegateCalls[1]?.runtimeModel, settings);
+});
+
 function directWindow(overrides: Partial<WindowConfig> = {}): WindowConfig {
 	return {
 		id: "w-direct",
@@ -32,6 +44,7 @@ function makeDeps(overrides: {
 	window?: WindowConfig;
 	agents?: Map<string, AgentConfig>;
 	delegate?: (params: AgentInvokeParams) => Promise<AgentInvokeResult>;
+	durableMessage?: (message: { customType: string }) => Promise<void>;
 }) {
 	const sent: SentMessage[] = [];
 	const errors: string[] = [];
@@ -48,7 +61,10 @@ function makeDeps(overrides: {
 			sendCustomMessage: async (sessionId, message) => {
 				sent.push({ sessionId, customType: message.customType, content: message.content, details: message.details });
 			},
-			ensureSessionFile: async () => {},
+			sendCustomMessageDurable: async (sessionId, message) => {
+				await overrides.durableMessage?.(message);
+				sent.push({ sessionId, customType: message.customType, content: message.content, details: message.details });
+			},
 			sessionName: async () => renames[0] ?? "",
 			rename: async (_id, name) => {
 				renames.push(name);
@@ -56,6 +72,7 @@ function makeDeps(overrides: {
 			},
 		},
 		invoker: {
+			withActiveSessionLifecycle: async (_id, action) => action(),
 			requireAgent: async (name) => {
 				const agent = agents.get(name);
 				if (!agent || agent.enabled === false) throw new Error(`agent「${name}」已被禁用，委托被拒绝`);
@@ -81,6 +98,19 @@ function makeDeps(overrides: {
 	return { deps, sent, errors, renames, delegateCalls, settle };
 }
 
+test("direct admission card write failure never starts a Worker", async () => {
+	for (const failingType of ["pudding:user_message", "pudding:task_assign"]) {
+		const { deps, sent, delegateCalls } = makeDeps({
+			durableMessage: async (message) => {
+				if (message.customType === failingType) throw new Error("JSONL write failed");
+			},
+		});
+		await assert.rejects(() => dispatchDirectMessage(deps, "s-direct", "任务", undefined, "operation-12345678"), /JSONL write failed/);
+		assert.equal(delegateCalls.length, 0);
+		assert.deepEqual(sent.map((message) => message.customType), failingType === "pudding:user_message" ? [] : ["pudding:user_message"]);
+	}
+});
+
 test("非 direct 窗口不拦截，返回 false 交回调用方走 manager 回合", async () => {
 	const { deps, sent } = makeDeps({ window: directWindow({ type: "group", members: [worker.name, "codex"] }) });
 	const handled = await dispatchDirectMessage(deps, "s-direct", "你好");
@@ -90,17 +120,19 @@ test("非 direct 窗口不拦截，返回 false 交回调用方走 manager 回�
 
 test("direct 窗口命中：先写用户消息与 running 指派卡，后台 delegate 完成后写结果卡", async () => {
 	const { deps, sent, renames, delegateCalls, settle } = makeDeps({});
-	const handled = await dispatchDirectMessage(deps, "s-direct", "查一下千线激光雷达车型");
+	const handled = await dispatchDirectMessage(deps, "s-direct", "查一下千线激光雷达车型", undefined, "operation-12345678");
 	assert.equal(handled, true);
 
 	// 首条消息用任务文本自动起名（direct 窗口没有 manager 回合，走不到 LLM 标题）。
 	assert.deepEqual(renames, ["查一下千线激光雷达车型"]);
 
 	// 同步段：用户消息 + running 指派卡（都在返回前落进消息流）。
-	assert.deepEqual(sent.map((m) => m.customType), ["pudding:user_message", "pudding:task_assign"]);
+	assert.deepEqual(sent.slice(0, 2).map((m) => m.customType), ["pudding:user_message", "pudding:task_assign"]);
 	assert.equal(sent[0]!.content, "查一下千线激光雷达车型");
 	assert.equal(sent[1]!.details?.status, "running");
 	assert.equal(sent[1]!.details?.from, "direct");
+	assert.equal(sent[0]!.details?.operationId, "operation-12345678");
+	assert.equal(sent[1]!.details?.operationId, "operation-12345678");
 
 	await settle();
 	assert.equal(delegateCalls.length, 1);
@@ -110,6 +142,7 @@ test("direct 窗口命中：先写用户消息与 running 指派卡，后台 del
 	assert.equal(call.managerSessionId, "s-direct");
 	assert.equal(call.mode, "continue");
 	assert.equal(call.message, "查一下千线激光雷达车型");
+	assert.equal(call.operationId, "operation-12345678");
 
 	assert.equal(sent.length, 3);
 	assert.equal(sent[2]!.customType, "pudding:task_result");
@@ -138,8 +171,7 @@ test("worker 被禁用：delegate 抛错写失败卡并经 onError 透出", asyn
 	const { deps, sent, errors, settle } = makeDeps({
 		agents: new Map([[worker.name, { ...worker, enabled: false }]]),
 	});
-	const handled = await dispatchDirectMessage(deps, "s-direct", "你好");
-	assert.equal(handled, true);
+	await assert.rejects(() => dispatchDirectMessage(deps, "s-direct", "你好"), /已被禁用/);
 	await settle();
 	assert.equal(errors.length, 1);
 	const last = sent.at(-1);

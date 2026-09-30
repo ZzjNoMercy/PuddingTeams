@@ -1,4 +1,4 @@
-import { TeamsStore, agentDisplayName, type AgentConfig, type WindowConfig } from "../store/teams.js";
+import { TeamsStore, agentDisplayName, agentRunConfigRevision, type AgentConfig, type WindowConfig } from "../store/teams.js";
 import { CredentialsStore } from "../store/credentials.js";
 import { AgentRuntime, SessionConflictError } from "./runtime.js";
 import type { DelegationRecord } from "./delegation-store.js";
@@ -9,8 +9,12 @@ import { ExtensionCatalog, resolveAgentCapabilityRuntime } from "./extensions.js
 import type { ProductSettingsStore } from "../store/product-settings.js";
 import { resolveWorkerCodeSearch } from "../pi-bridge/code-search.js";
 import type { WorkspaceExecutionPolicy } from "./workspace-execution.js";
-import type { McpServerStore } from "../store/mcp-servers.js";
+import { McpCatalogRecoveryRequiredError, type McpServerStore } from "../store/mcp-servers.js";
 import { buildManagedMcpExtension } from "../pi-bridge/mcp-runtime.js";
+import { scopedAgentSecrets } from "./agent-secrets.js";
+import type { InlineExtension, ToolDefinition } from "@earendil-works/pi-coding-agent";
+
+type ManagedMcpDefinitions = Awaited<ReturnType<McpServerStore["definitionsFor"]>>;
 
 export interface AgentInvokeParams {
 	/** Internal stable operation identity (replacement/recovery); manager tools omit it. */
@@ -44,6 +48,8 @@ export interface AgentInvokeParams {
 	mode: "run" | "continue";
 	/** Worker-specific business model (e.g. analytics_model_id). */
 	model?: string;
+	/** Host-only direct-chat settings, frozen before admission. */
+	runtimeModel?: import("./types.js").RuntimeModelSettings;
 	signal?: AbortSignal;
 	onUpdate?: (content: string, details?: unknown) => void;
 	/** Internal admission-replacement barrier; not exposed to manager tools. */
@@ -126,6 +132,7 @@ export class AgentInvoker {
 		  ) => Promise<void>)
 		| undefined;
 	private delegationStateObserver: (() => Promise<void>) | undefined;
+	private knowledgeFor: ((agent: AgentConfig, ctx: InvocationContext, message: string) => Promise<import("../knowledge/runtime-service.js").KnowledgeMountSurface>) | undefined;
 	private replacementWindowResolver:
 		| ((delegation: DelegationRecord, agent: AgentConfig) => Promise<string>)
 		| undefined;
@@ -160,6 +167,11 @@ export class AgentInvoker {
 	setDelegationStateObserver(observer: () => Promise<void>): void {
 		this.delegationStateObserver = observer;
 	}
+	setKnowledgeRuntime(provider: NonNullable<AgentInvoker["knowledgeFor"]>): void { this.knowledgeFor = provider; }
+	private webResearchExtension?: (agentId: string) => InlineExtension;
+	private webResearchFingerprint?: (agentId: string) => Promise<string>;
+	private webResearchTools?: (agentId: string) => Promise<ToolDefinition[]>;
+	setWebResearchExtension(factory: (agentId: string) => InlineExtension, fingerprint?: (agentId: string) => Promise<string>, tools?: (agentId: string) => Promise<ToolDefinition[]>): void { this.webResearchExtension = factory; this.webResearchFingerprint = fingerprint; this.webResearchTools = tools; }
 
 	setReplacementWindowResolver(resolver: (delegation: DelegationRecord, agent: AgentConfig) => Promise<string>): void {
 		this.replacementWindowResolver = resolver;
@@ -229,7 +241,11 @@ export class AgentInvoker {
 
 	private async envFor(agent: AgentConfig): Promise<NodeJS.ProcessEnv> {
 		const secrets = this.credentials ? await this.credentials.getSecrets(agent.name) : {};
-		return { ...process.env, ...(agent.env ?? {}), ...secrets };
+		const current = await this.teams.getAgent(agent.name);
+		if (!current || (current.extensionRevision ?? 0) !== (agent.extensionRevision ?? 0)) {
+			throw new Error(`agent「${agent.name}」配置在读取密钥时发生变化，请重试`);
+		}
+		return { ...process.env, ...(agent.env ?? {}), ...scopedAgentSecrets(agent, secrets) };
 	}
 
 	/** 解析当前房间 Session 对该 worker 的 handle（continue 用）。 */
@@ -247,7 +263,7 @@ export class AgentInvoker {
 		if (!legalTarget || binding.targetWindowId !== target.id) return undefined;
 		if (binding.workspaceId !== target.workspaceId) return undefined;
 		if (binding.cwdSnapshot !== (await this.teams.workspaceFor(windowId))) return undefined;
-		if (binding.agentRevision !== (agent.extensionRevision ?? 0)) return undefined;
+		if (binding.agentRevision !== agentRunConfigRevision(agent)) return undefined;
 		return binding.sessionHandle;
 	}
 
@@ -436,6 +452,12 @@ export class AgentInvoker {
 		return driver;
 	}
 
+	async runtimeModelOptions(agentName: string, cwd: string) {
+		const agent = await this.requireAgent(agentName);
+		const driver = await this.driverFor(agentName);
+		return driver?.listConfigOptions ? driver.listConfigOptions("model", { cwd, env: await this.envFor(agent) }) : [];
+	}
+
 	private assertBindingTransport(agent: AgentConfig, capabilities: DriverCapabilities): void {
 		if (!agent.connector || capabilities.transport === agent.connector.transport) return;
 		throw new Error(
@@ -459,7 +481,7 @@ export class AgentInvoker {
 			}
 			const managerOwner = await this.teams.windowForSession(managerSessionId);
 			if (!managerOwner) throw new Error("manager Session 不属于任何窗口，委托被拒绝");
-			const prepared = await this.withWindowLifecycles([windowId, managerOwner.id], async () => {
+			const prepared = await this.withWindowLifecycles([windowId, managerOwner.id], () => this.teams.withAgentRunAdmission(params.agent.name, async () => {
 				// The gate covers the last authoritative window read and persistence of
 				// the Run record. A switch therefore sees every accepted delegation.
 				const freshAgent = await this.requireAgent(params.agent.name);
@@ -474,8 +496,13 @@ export class AgentInvoker {
 				if (params.purpose !== "verification" && window.type !== "solo" && !window.members.includes(freshAgent.name)) {
 					throw new Error(`agent「${freshAgent.name}」不是当前窗口的成员，委托被拒绝`);
 				}
-				const driver = this.drivers.get(freshAgent.name) ?? this.resolveDriverFor(freshAgent);
+				const registeredDriver = this.drivers.get(freshAgent.name);
+				const mcpDefinitions = !registeredDriver ? await this.captureMcpDefinitions(freshAgent) : undefined;
+				const driver = registeredDriver ?? this.resolveDriverFor(freshAgent, mcpDefinitions);
 				if (!driver) throw new Error(`agent「${freshAgent.name}」没有可用的 Driver（未安装对应 Connector）`);
+				if (params.runtimeModel && (window.type !== "direct" || window.id !== managerOwner.id || !(await driver.capabilities()).runtimeModel)) {
+					throw new Error("该通道不支持 Worker 会话模型覆盖");
+				}
 				this.assertBindingTransport(freshAgent, await driver.capabilities());
 				const cwd = await this.teams.workspaceFor(windowId);
 				if (managerContext.workspaceId !== window.workspaceId || managerContext.cwdSnapshot !== cwd) {
@@ -521,12 +548,16 @@ export class AgentInvoker {
 						evidenceRequirements: params.evidenceRequirements,
 						completionBoundary: params.completionBoundary,
 						agentId: freshAgent.name,
-						agentRevision: freshAgent.extensionRevision ?? 0,
+						agentRevision: agentRunConfigRevision(freshAgent),
+						workerSessionDir: freshAgent.connector?.connectorId === "pi"
+							? (typeof freshAgent.connector.config?.sessionDir === "string" && freshAgent.connector.config.sessionDir.trim()
+								? freshAgent.connector.config.sessionDir.trim() : null)
+							: undefined,
 						message: messageForWorkspaceExecution(message, params.workspaceExecutionPolicy),
 						mode,
 						sessionHandle: nextSession,
 						requestId: params.operationId,
-						options: params.model ? { model: params.model } : undefined,
+						options: params.model || params.runtimeModel ? { ...(params.model ? { model: params.model } : {}), ...(params.runtimeModel ? { runtimeModel: { ...params.runtimeModel } } : {}) } : undefined,
 						onCreated: (record) => {
 							params.onDelegationCreated?.(record);
 							createdResolve();
@@ -551,7 +582,7 @@ export class AgentInvoker {
 				void runPromise.then(createdResolve, createdReject);
 				await created;
 				return { agent: freshAgent, sessionHandle: nextSession, runPromise };
-			});
+			}));
 			agent = prepared.agent;
 			sessionHandle = prepared.sessionHandle;
 			delegation = await prepared.runPromise;
@@ -813,6 +844,7 @@ export class AgentInvoker {
 		replacementAgentId: string,
 		signal?: AbortSignal,
 	): Promise<AgentInvokeResult> {
+		if (original.purpose === "knowledge_compile") throw new Error("CompileJob cannot be replaced through Manager admission");
 		const currentInteraction = await this.runtime.getInteraction(interactionId);
 		const replayCandidate = currentInteraction?.consumedRequestId === input.requestId;
 		const candidate = replayCandidate
@@ -905,6 +937,7 @@ export class AgentInvoker {
 			message: original.task ?? "",
 			mode: "run",
 			model: typeof original.options?.model === "string" ? original.options.model : undefined,
+			runtimeModel: original.options?.runtimeModel as import("./types.js").RuntimeModelSettings | undefined,
 			signal,
 			onBeforeDriverStart: async (replacement) => {
 				if (!this.replacementStateGuard) throw new Error("replacement WorkState guard is unavailable");
@@ -1093,27 +1126,32 @@ export class AgentInvoker {
 		if (delegation) {
 			const agent = await this.teams.getAgent(delegation.agentId);
 			if (agent) {
-				if ((agent.extensionRevision ?? 0) !== delegation.agentRevision) {
-					throw new Error("Agent 配置已变化，不能用新配置恢复旧 Run；请取消旧任务后重试");
-				}
-				const window = await this.teams.getWindow(delegation.windowId);
-				if (
-					!window ||
-					window.workspaceId !== delegation.workspaceId ||
-					window.cwdSnapshot !== delegation.cwdSnapshot
-				) {
-					throw new Error("窗口项目已变化，不能恢复旧 Run");
-				}
-				await this.teams.workspaceFor(window.id);
-				ctxEnv = await this.envFor(agent);
-				driverSnapshot = this.drivers.get(agent.name) ?? this.resolveDriverFor(agent);
-				if (!driverSnapshot) throw new Error(`agent「${agent.name}」没有可用的 Driver`);
-				const revisionCheck = await this.teams.getAgent(agent.name);
-				if ((revisionCheck?.extensionRevision ?? -1) !== delegation.agentRevision) {
-					throw new Error("Agent 配置在恢复 Run 时发生变化，请重试");
-				}
-				// 恢复同一条 Run 必须使用 Delegation 创建时的不可变快照。
-				cwd = delegation.cwdSnapshot;
+				await this.teams.withAgentRunAdmission(agent.name, async () => {
+					const current = await this.teams.getAgent(agent.name);
+					if (!current || agentRunConfigRevision(current) !== delegation.agentRevision) {
+						throw new Error("Agent 配置已变化，不能用新配置恢复旧 Run；请取消旧任务后重试");
+					}
+					const window = await this.teams.getWindow(delegation.windowId);
+					if (
+						!window ||
+						window.workspaceId !== delegation.workspaceId ||
+						window.cwdSnapshot !== delegation.cwdSnapshot
+					) {
+						throw new Error("窗口项目已变化，不能恢复旧 Run");
+					}
+					await this.teams.workspaceFor(window.id);
+					ctxEnv = await this.envFor(current);
+					const registeredDriver = this.drivers.get(current.name);
+					const mcpDefinitions = !registeredDriver ? await this.captureMcpDefinitions(current) : undefined;
+					driverSnapshot = registeredDriver ?? this.resolveDriverFor(current, mcpDefinitions);
+					if (!driverSnapshot) throw new Error(`agent「${current.name}」没有可用的 Driver`);
+					const revisionCheck = await this.teams.getAgent(current.name);
+					if (!revisionCheck || agentRunConfigRevision(revisionCheck) !== delegation.agentRevision) {
+						throw new Error("Agent 配置在恢复 Run 时发生变化，请重试");
+					}
+					// 恢复同一条 Run 必须使用 Delegation 创建时的不可变快照。
+					cwd = delegation.cwdSnapshot;
+				});
 			}
 		}
 		const outcome = await this.runtime.respond(
@@ -1377,10 +1415,15 @@ export class AgentInvoker {
 		// waiting_input 的 tool call 已经在审批边界返回；此时若只封存
 		// Delegation，manager 永远收不到新的终态。因此显式投影取消结果并唤醒
 		// manager 完成本轮闭环，同时同步到 worker 单聊窗口。
-		if (applied && wasWaitingInput) await this.notifyWaitingCancellation(delegation);
+		if (applied && wasWaitingInput) {
+			const state = (await this.runtime.getDelegation(delegationId))?.executionState;
+			if (state === "cancelled" || state === "observation_lost") {
+				await this.notifyWaitingCancellation(delegation, state);
+			}
+		}
 	}
 
-	private async notifyWaitingCancellation(delegation: DelegationRecord): Promise<void> {
+	private async notifyWaitingCancellation(delegation: DelegationRecord, state: "cancelled" | "observation_lost"): Promise<void> {
 		const targets = await this.outcomeTargets(delegation);
 		const managerWindow = delegation.managerSessionId
 			? await this.teams.windowForSession(delegation.managerSessionId)
@@ -1394,16 +1437,20 @@ export class AgentInvoker {
 			...(interaction ? { interactionId: interaction.id } : {}),
 			delegationId: delegation.id,
 			worker: delegation.agentId,
-			status: "cancelled",
+			status: state,
 		};
 		const resolved = {
 			customType: "pudding:interaction_resolved",
-			content: `用户已终止 worker「${workerLabel}」的待审批任务。`,
+			content: state === "cancelled"
+				? `worker「${workerLabel}」的待审批任务已确认取消。`
+				: `worker「${workerLabel}」的待审批任务已停止等待，但上游是否停止仍未确认。`,
 			details,
 		};
 		const taskResult = {
 			customType: "pudding:task_result",
-			content: `worker「${workerLabel}」任务已由用户取消。`,
+			content: state === "cancelled"
+				? `worker「${workerLabel}」任务已确认取消。`
+				: `worker「${workerLabel}」失去观测，上游执行效果未知；请先对账，勿重复执行。`,
 			details,
 		};
 		if (targets.manager) {
@@ -1460,7 +1507,22 @@ export class AgentInvoker {
 	 * 构造，支持同一 Connector 多 Agent 实例）；legacy command invoke 退回
 	 * 第一方 PuddingClaw Driver。
 	 */
-	private resolveDriverFor(agent: AgentConfig): AgentDriver | undefined {
+	private async captureMcpDefinitions(agent: AgentConfig): Promise<ManagedMcpDefinitions | undefined> {
+		if (agent.connector?.connectorId !== "pi" || !this.mcpServers) return undefined;
+		if (!agent.mcpServerIds?.length) return {};
+		try {
+			return await this.mcpServers.definitionsFor(agent.mcpServerIds);
+		} catch (error) {
+			// 未决目录事务必须等冷启动对账，不能把不确定的授权降级为普通缺工具。
+			if (error instanceof McpCatalogRecoveryRequiredError) throw error;
+			// MCP 是可选工具面；在接单门禁内冻结本次的空集合，延迟启动时
+			// 不再回读可能已变化的 Catalog。具体错误只进服务端诊断。
+			console.error(`MCP: Pi Worker「${agent.name}」定义读取失败，本轮不装载 MCP tools：${error instanceof Error ? error.message : String(error)}`);
+			return {};
+		}
+	}
+
+	private resolveDriverFor(agent: AgentConfig, mcpDefinitions?: ManagedMcpDefinitions): AgentDriver | undefined {
 		if (agent.connector) {
 			const { connectorId, transport, config } = agent.connector;
 			return this.drivers.create(
@@ -1470,6 +1532,9 @@ export class AgentInvoker {
 					? {
 							...(config ?? {}),
 							piResources: agent.piResources,
+							executionProfile: agent.builtinId === "wiki" ? "wiki_curator" : undefined,
+							webResearchToolsFor: this.webResearchTools ? () => this.webResearchTools!(agent.name) : undefined,
+							...(this.knowledgeFor ? { knowledgeFor: (ctx: InvocationContext, message: string) => this.knowledgeFor!(agent, ctx, message) } : {}),
 							// 信任门判定单点（§7.2）：Driver 装配会话时按 workspaceId 实时判定。
 							workspaceAccessFor: (workspaceId?: string) => this.teams.workspaces.resourceAccessFor(workspaceId),
 							codeSearchFor: async (workspaceId?: string) => {
@@ -1494,10 +1559,17 @@ export class AgentInvoker {
 											}),
 									}
 								: {}),
-							...(this.mcpServers
+							...(this.mcpServers || this.webResearchExtension
 								? {
+									managedExtensionsFingerprintFor: this.webResearchFingerprint ? () => this.webResearchFingerprint!(agent.name) : undefined,
 									managedExtensionFactoriesFor: async () => [
-										await buildManagedMcpExtension(this.mcpServers!, agent.mcpServerIds ?? []),
+										...(this.webResearchExtension ? [this.webResearchExtension(agent.name)] : []),
+										...(this.mcpServers ? [await buildManagedMcpExtension(
+											mcpDefinitions
+												? { definitionsFor: async () => structuredClone(mcpDefinitions) }
+												: this.mcpServers!,
+											agent.mcpServerIds ?? [],
+										)] : []),
 									],
 								}
 								: {}),

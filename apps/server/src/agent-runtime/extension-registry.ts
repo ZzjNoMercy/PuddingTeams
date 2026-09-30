@@ -73,6 +73,7 @@ async function computePackageDigest(dir: string): Promise<string> {
 			const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
 			if (entry.isDirectory()) await walk(abs, rel);
 			else if (entry.isFile()) files.push(rel);
+			else throw new Error(`unsupported package entry: ${rel}`);
 		}
 	}
 	await walk(dir, "");
@@ -165,6 +166,10 @@ export class ExtensionRegistry {
 	private readonly moduleActivationCounts = new Map<string, number>();
 	/** 最近一次成功激活的运行时对象；更新失败时不依赖已被覆盖的源目录即可恢复。 */
 	private readonly activeHooks = new Map<string, BuiltinExtensionHooks | null>();
+	/** Digest captured around the module import that produced the active hooks. */
+	private readonly activePackageDigests = new Map<string, string>();
+	/** In-process third-party code can retain effects after unregistering. */
+	private untrustedCodeLoaded = false;
 	/** user 包的落地根目录：`<extensionsDir>/packages/<id>/<version>/`。 */
 	private readonly packagesDir: string;
 
@@ -196,12 +201,19 @@ export class ExtensionRegistry {
 		}
 		for (const record of records) {
 			this.installed.set(record.manifest.id, record);
+			// Persisted bundled paths are only hints from a previous installation.
+			// The host must re-project the package from this release before import;
+			// legacy records may have no digest, and their paths are not authority.
+			if (record.origin === "bundled") {
+				this.loadErrors.set(record.manifest.id, "awaiting current bundled release projection");
+				continue;
+			}
 			if (record.origin === "local-link") {
 				await this.checkLinkDrift(record);
-				if (!this.developerMode) {
-					this.loadErrors.set(record.manifest.id, "开发者模式未开启，本地代码 Extension 未加载");
-					continue;
-				}
+			}
+			if (!this.developerMode && (record.origin === "local-link" || (record.origin === "user" && record.manifest.entry))) {
+				this.loadErrors.set(record.manifest.id, "开发者模式未开启，未隔离的代码 Extension 不会在 Server 中加载");
+				continue;
 			}
 			// bundled 的 sourcePath 是发行投影事实：路径失效时激活失败只记
 			// loadError，由启动预装流程（installOrUpdateFromDir）重新解析自愈。
@@ -212,23 +224,24 @@ export class ExtensionRegistry {
 		}
 	}
 
-	/** 开发者模式是未隔离本地代码的唯一闸门；关闭后立即卸载其运行时注册。 */
+	/** 开发者模式是未隔离用户代码的唯一闸门；关闭后立即卸载其运行时注册。 */
 	async setDeveloperMode(enabled: boolean): Promise<void> {
 		await this.serialize(async () => {
 			if (enabled === this.developerMode) return;
 			this.developerMode = enabled;
 			for (const record of this.installed.values()) {
-				if (record.origin !== "local-link") continue;
+				if (record.origin !== "local-link" && !(record.origin === "user" && record.manifest.entry)) continue;
 				if (!enabled) {
-					if (this.activeLocal.has(record.manifest.id)) this.deactivate(record.manifest);
+					this.deactivate(record.manifest);
+					this.activeHooks.delete(record.manifest.id);
 					this.activeLocal.delete(record.manifest.id);
-					this.loadErrors.set(record.manifest.id, "开发者模式未开启，本地代码 Extension 未加载");
+					this.loadErrors.set(record.manifest.id, "开发者模式未开启，未隔离的代码 Extension 不会在 Server 中加载");
 					continue;
 				}
-				await this.checkLinkDrift(record);
+				if (record.origin === "local-link") await this.checkLinkDrift(record);
 				try {
 					await this.activate(record);
-					this.activeLocal.add(record.manifest.id);
+					if (record.origin === "local-link") this.activeLocal.add(record.manifest.id);
 				} catch (err) {
 					this.loadErrors.set(record.manifest.id, err instanceof Error ? err.message : String(err));
 				}
@@ -320,8 +333,37 @@ export class ExtensionRegistry {
 		return this.list().find((e) => e.manifest.id === id);
 	}
 
+	/** Failure recovery compares actual registry state, including same-version code digest. */
+	mutationFingerprint(): string {
+		return JSON.stringify({
+			developerMode: this.developerMode,
+			installed: [...this.installed.entries()].sort(([a], [b]) => a.localeCompare(b)),
+			loadErrors: [...this.loadErrors.entries()].sort(([a], [b]) => a.localeCompare(b)),
+			activeLocal: [...this.activeLocal].sort(),
+			driftedLinks: [...this.driftedLinks].sort(),
+		});
+	}
+
 	manifestOf(id: string): PuddingTeamsExtensionManifest | undefined {
 		return this.builtins.get(id)?.manifest ?? this.installed.get(id)?.manifest;
+	}
+
+	/** Compile admission must attest the actual active factory and its instance,
+	 * rather than trusting a Job-supplied package hash or Driver's self-reported id. */
+	async attestBundledDriver(id: string, driver: AgentDriver): Promise<string | undefined> {
+		const record = this.installed.get(id);
+		const hooks = this.activeHooks.get(id);
+		const digest = this.activePackageDigests.get(id);
+		if (this.untrustedCodeLoaded || !record || record.origin !== "bundled" || !record.digest || !digest || digest !== record.digest ||
+			record.manifest.kind !== "connector" || !record.manifest.entry?.endsWith(".mjs") || !hooks?.driverFactory || this.loadErrors.has(id) ||
+			!this.drivers.isCurrentFactoryInstance(record.manifest.connector.id, id, hooks.driverFactory, driver)) return undefined;
+		if (await computePackageDigest(record.sourcePath) !== digest) return undefined;
+		// Recheck after the asynchronous file walk: an update can replace the
+		// active factory while the digest is being calculated.
+		if (this.untrustedCodeLoaded || this.installed.get(id) !== record || this.activeHooks.get(id) !== hooks ||
+			this.activePackageDigests.get(id) !== digest || this.loadErrors.has(id) ||
+			!this.drivers.isCurrentFactoryInstance(record.manifest.connector.id, id, hooks.driverFactory, driver)) return undefined;
+		return digest.slice("sha256:".length);
 	}
 
 	/** 动态 probe / Session 资源装配读取已激活的 Capability 模块。 */
@@ -446,6 +488,7 @@ export class ExtensionRegistry {
 			// manifest 读取与校验与 CLI validate 共用 readManifestFromDir（extensions.ts）。
 			const manifest = await readManifestFromDir(dir);
 			this.assertEngineCompatible(manifest);
+			if (manifest.entry && !this.developerMode) throw new Error("未隔离的代码 Extension 只能在开发者模式安装");
 			if (opts.versionPin && manifest.version !== opts.versionPin) {
 				throw new Error(`已固定版本 ${opts.versionPin}，目录中的版本 ${manifest.version} 不匹配`);
 			}
@@ -558,6 +601,7 @@ export class ExtensionRegistry {
 		// manifest 读取与校验与 CLI validate 共用 readManifestFromDir（extensions.ts）。
 		const manifest = await readManifestFromDir(dir);
 		this.assertEngineCompatible(manifest);
+		if (opts.origin === "local-link" && manifest.entry && !this.developerMode) throw new Error("未隔离的代码 Extension 只能在开发者模式更新");
 		if (opts.versionPin && manifest.version !== opts.versionPin) {
 			throw new Error(`已固定版本 ${opts.versionPin}，目录中的版本 ${manifest.version} 不匹配`);
 		}
@@ -568,8 +612,8 @@ export class ExtensionRegistry {
 				manifest,
 				origin: opts.origin,
 				sourcePath: dir,
-				// bundled 以 manifest id+版本为事实，不记 digest。
-				...(opts.origin === "local-link" ? { digest: await computePackageDigest(dir) } : {}),
+				// First-party admission also needs the bytes that produced the loaded factory.
+				...(opts.origin === "bundled" || opts.origin === "local-link" ? { digest: await computePackageDigest(dir) } : {}),
 				installedAt: now,
 				updatedAt: now,
 				version: manifest.version,
@@ -608,6 +652,7 @@ export class ExtensionRegistry {
 		const dir = path.resolve(sourceDir);
 		const manifest = await readManifestFromDir(dir);
 		this.assertEngineCompatible(manifest);
+		if (manifest.entry && !this.developerMode) throw new Error("未隔离的代码 Extension 只能在开发者模式更新");
 		const id = existing.manifest.id;
 		if (manifest.id !== id) throw new Error(`目录中的 manifest id「${manifest.id}」与「${id}」不一致`);
 		if (pin && manifest.version !== pin) {
@@ -689,6 +734,12 @@ export class ExtensionRegistry {
 	private async prepareActivation(record: InstalledExtensionRecord): Promise<BuiltinExtensionHooks | null> {
 		const { manifest } = record;
 		this.assertEngineCompatible(manifest);
+		if (record.origin === "bundled" && record.digest && await computePackageDigest(record.sourcePath) !== record.digest) {
+			throw new Error(`bundled extension「${manifest.id}」changed before module import`);
+		}
+		if (manifest.entry && record.origin !== "bundled" && !this.developerMode) {
+			throw new Error("开发者模式未开启，未隔离的代码 Extension 不会在 Server 中加载");
+		}
 		if (!manifest.entry) {
 			if (manifest.kind === "capability") {
 				throw new Error(`capability extension「${manifest.id}」缺少 entry 模块入口`);
@@ -707,9 +758,13 @@ export class ExtensionRegistry {
 		}
 		const entryPath = path.join(record.sourcePath, manifest.entry);
 		const moduleUrl = new URL(pathToFileURL(entryPath).href);
+		if (record.origin !== "bundled") this.untrustedCodeLoaded = true;
 		const activationCount = this.moduleActivationCounts.get(manifest.id) ?? 0;
 		if (activationCount > 0) moduleUrl.searchParams.set("puddingteams", `${record.updatedAt}-${activationCount}`);
 		const mod = (await import(moduleUrl.href)) as LoadedModule;
+		if (record.origin === "bundled" && record.digest && await computePackageDigest(record.sourcePath) !== record.digest) {
+			throw new Error(`bundled extension「${manifest.id}」changed during module import`);
+		}
 		this.moduleActivationCounts.set(manifest.id, activationCount + 1);
 		const inner = (mod.default ?? {}) as LoadedModule | CapabilityExtensionModule;
 		const createDriver = mod.createDriver ?? (inner as LoadedModule).createDriver;
@@ -728,12 +783,15 @@ export class ExtensionRegistry {
 	/** 加载并注册模块（capability→ExtensionCatalog，connector→DriverRegistry）。 */
 	private async activate(record: InstalledExtensionRecord): Promise<void> {
 		const hooks = await this.prepareActivation(record);
-		this.activatePrepared(record.manifest, hooks);
+		this.activatePrepared(record, hooks);
 	}
 
-	private activatePrepared(manifest: PuddingTeamsExtensionManifest, hooks: BuiltinExtensionHooks | null): void {
+	private activatePrepared(record: InstalledExtensionRecord, hooks: BuiltinExtensionHooks | null): void {
+		const { manifest } = record;
 		if (hooks) this.activateHooks(manifest, hooks);
 		this.activeHooks.set(manifest.id, hooks);
+		if (record.origin === "bundled" && record.digest) this.activePackageDigests.set(manifest.id, record.digest);
+		else this.activePackageDigests.delete(manifest.id);
 		this.loadErrors.delete(manifest.id);
 	}
 
@@ -795,7 +853,7 @@ export class ExtensionRegistry {
 
 		this.deactivate(existing.manifest);
 		try {
-			this.activatePrepared(candidate.manifest, candidateHooks);
+			this.activatePrepared(candidate, candidateHooks);
 			this.installed.set(id, replacement);
 			if (existing.origin === "local-link") this.activeLocal.add(id);
 			this.driftedLinks.delete(id);
@@ -806,7 +864,7 @@ export class ExtensionRegistry {
 			if (wasActiveLocal) this.activeLocal.add(id);
 			else this.activeLocal.delete(id);
 			try {
-				if (hadOldHooks) this.activatePrepared(existing.manifest, oldHooks);
+				if (hadOldHooks) this.activatePrepared(existing, oldHooks);
 				else this.loadErrors.set(id, "旧版本原本未激活；更新失败后保持未激活状态");
 			} catch (rollbackError) {
 				this.loadErrors.set(id, rollbackError instanceof Error ? rollbackError.message : String(rollbackError));
@@ -835,6 +893,7 @@ export class ExtensionRegistry {
 		if (this.contributionOwners.get(key) !== manifest.id) return;
 		if (manifest.kind === "capability") this.catalog.unregister(manifest.id);
 		else this.drivers.unregister(manifest.connector.id);
+		this.activePackageDigests.delete(manifest.id);
 		this.contributionOwners.delete(key);
 	}
 }

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseExtensionManifest, ExtensionCatalog } from "./extensions.js";
@@ -41,6 +42,7 @@ async function collect(events: AsyncIterable<AgentEvent>): Promise<AgentEvent[]>
 test("P1: codex 能力诚实声明——run/continue/cancel、无 HITL、stream、spawn", async () => {
 	const driver = new CodexDriver();
 	assert.deepEqual(await driver.capabilities(), {
+		runtimeModel: { effortLevels: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] },
 		operations: ["run", "continue", "cancel"],
 		interactionKinds: [],
 		progress: "stream",
@@ -140,6 +142,19 @@ test("P1: codex respond 防御性失败——headless 不支持跨进程审批",
 test("P1: codex cancel 对未知 runHandle 是 no-op（不抛异常）", async () => {
 	const driver = new CodexDriver();
 	await driver.cancel({ runHandle: "nonexistent" }, ctx);
+});
+
+test("Codex 无换行 stdout 超限即终止且不进入 JSONL 解析器", async () => {
+	const dir = freshDir("codex-output-limit-");
+	const fake = path.join(dir, "fake-codex");
+	writeFileSync(fake, `#!/usr/bin/env node\nprocess.stdout.write("x".repeat(2 * 1024 * 1024 + 1));\n`);
+	chmodSync(fake, 0o755);
+	const events = await collect(new CodexDriver({ command: fake }).run(
+		{ message: "synthetic", requestId: "output-limit" }, { cwd: dir, env: process.env },
+	));
+	const boundary = events.at(-1);
+	assert.equal(boundary?.type, "failed");
+	if (boundary?.type === "failed") assert.equal(boundary.result.errorCode, "output_limit");
 });
 
 test("P1: codex probe——形状合法（二进制存在与否都返回可解释结果）", async () => {
@@ -250,6 +265,129 @@ test("P1: codex 归一化——turn.failed/error 事件归一为 failed 边界",
 	assert.equal(boundary.result.errorCode, "worker_failed");
 	assert.equal(boundary.result.sessionHandle, "t-2");
 	assert.match(boundary.result.error, /stream disconnected/);
+});
+
+test("Codex 退出 0 也必须具有完整 thread/turn 边界", async () => {
+	for (const [name, stream, expected] of [
+		["空流", [], /thread\.started/],
+		["仅有正文", [{ type: "item.completed", item: { type: "agent_message", text: "伪造成功" } }], /thread\.started/],
+		["只有 thread", [{ type: "thread.started", thread_id: "t-incomplete" }], /turn\.completed/],
+	] as const) {
+		const reducer = new CodexEventReducer();
+		for (const event of stream) reducer.push(event);
+		const boundary = reducer.boundary("codex");
+		assert.equal(boundary.type, "failed", name);
+		if (boundary.type !== "failed") continue;
+		assert.equal(boundary.result.errorCode, "protocol_incomplete");
+		assert.match(boundary.result.error, expected);
+	}
+	const dir = freshDir("codex-empty-exec-");
+	const fake = path.join(dir, "fake-codex");
+	writeFileSync(fake, "#!/bin/sh\nexit 0\n", "utf8");
+	chmodSync(fake, 0o755);
+	const driver = new CodexDriver({ command: fake });
+	for (const events of [
+		await collect(driver.run({ message: "synthetic", requestId: "run-1" }, { cwd: dir, env: process.env })),
+		await collect(driver.continue({ message: "synthetic", requestId: "run-2", sessionHandle: "old-thread" }, { cwd: dir, env: process.env })),
+	]) {
+		const boundary = events.at(-1);
+		assert.equal(boundary?.type, "failed");
+		if (boundary?.type === "failed") assert.equal(boundary.result.errorCode, "protocol_incomplete");
+	}
+});
+
+test("子进程被 OS 信号终止不能映射为退出码 0", async () => {
+	const dir = freshDir("codex-signalled-exec-");
+	const fake = path.join(dir, "fake-codex");
+	writeFileSync(fake, "#!/bin/sh\nkill -ABRT $$\n", "utf8");
+	chmodSync(fake, 0o755);
+	const events = await collect(new CodexDriver({ command: fake }).run({ message: "synthetic", requestId: "signal" }, { cwd: dir, env: process.env }));
+	const boundary = events.at(-1);
+	assert.equal(boundary?.type, "failed");
+	if (boundary?.type === "failed") {
+		assert.equal(boundary.result.errorCode, "worker_failed");
+		assert.match(boundary.result.error, /退出码 -1/);
+	}
+});
+
+test("Codex 非零退出时优先呈现 JSONL 中的模型错误", async () => {
+	const dir = freshDir("codex-model-error-");
+	const fake = path.join(dir, "fake-codex");
+	writeFileSync(fake, '#!/bin/sh\nprintf \'%s\\n\' \'{"type":"thread.started","thread_id":"t-model"}\' \'{"type":"turn.failed","error":{"message":"model unavailable for account"}}\'\necho "Reading additional input from stdin..." >&2\nexit 1\n', "utf8");
+	chmodSync(fake, 0o755);
+	const events = await collect(new CodexDriver({ command: fake }).run({ message: "synthetic", requestId: "model-error" }, { cwd: dir, env: process.env }));
+	const boundary = events.at(-1);
+	assert.equal(boundary?.type, "failed");
+	if (boundary?.type === "failed") {
+		assert.match(boundary.result.error, /model unavailable for account/);
+		assert.doesNotMatch(boundary.result.error, /Reading additional input/);
+	}
+});
+
+test("T03 受保护编译：Run/continue 拒绝 Agent 命令替换、探测旁路和篡改的 CLI/profile", async () => {
+	const dir = freshDir("codex-protected-compile-");
+	const trusted = realpathSync(freshDir("codex-protected-trusted-"));
+	const fake = path.join(trusted, "fake-codex");
+	const profile = path.join(trusted, "compile.sb");
+	writeFileSync(fake, "#!/bin/sh\nexit 0\n", "utf8");
+	writeFileSync(profile, "(version 1)\n(deny default)\n", "utf8");
+	chmodSync(fake, 0o755);
+	const hash = (file: string) => createHash("sha256").update(readFileSync(file)).digest("hex");
+	const protectedCtx: InvocationContext = {
+		cwd: dir, env: { HOST_SENTINEL: "must-not-inherit" },
+		protectedCompile: {
+			jobId: "synthetic-compile-job", stagingRoot: realpathSync(dir),
+			commandPath: fake, commandSha256: hash(fake),
+			sandboxProfilePath: profile, sandboxProfileSha256: hash(profile),
+			env: { PATH: "/usr/bin:/bin" },
+		},
+	};
+	assert.deepEqual(codexExecutionPolicyArgs("danger-full-access", protectedCtx), [
+		"-s", "danger-full-access", "-c", 'approval_policy="never"', "--ignore-user-config", "--ignore-rules",
+	]);
+	assert.deepEqual(codexExecutionPolicyArgs("danger-full-access", {
+		...protectedCtx, protectedCompile: { ...protectedCtx.protectedCompile!, modelChannel: { port: 55123 } },
+	}), [
+		"-s", "danger-full-access", "-c", 'approval_policy="never"', "--ignore-user-config", "--ignore-rules",
+		"-c", 'model_provider="puddingteams_compile"',
+		"-c", 'model_providers.puddingteams_compile.name="PuddingTeams Compile"',
+		"-c", 'model_providers.puddingteams_compile.base_url="http://127.0.0.1:55123/v1"',
+		"-c", 'model_providers.puddingteams_compile.wire_api="responses"',
+		"-c", "model_providers.puddingteams_compile.requires_openai_auth=false",
+		"-c", "model_providers.puddingteams_compile.supports_websockets=false",
+		"-c", "model_providers.puddingteams_compile.request_max_retries=0",
+		"-c", "model_providers.puddingteams_compile.stream_max_retries=0",
+	]);
+	assert.throws(() => codexExecutionPolicyArgs("workspace-write", {
+		...protectedCtx, protectedCompile: { ...protectedCtx.protectedCompile!, modelChannel: { port: 0 } },
+	}), /invalid protected compile model channel/);
+	const overridden = new CodexDriver({ command: fake, sandbox: "danger-full-access" });
+	for (const events of [
+		overridden.run({ message: "attack", requestId: "run" }, protectedCtx),
+		overridden.continue({ message: "attack", requestId: "continue", sessionHandle: "old" }, protectedCtx),
+	]) await assert.rejects(collect(events), /Agent-configured command/);
+	await assert.rejects(overridden.probe(protectedCtx), /cannot run Connector probe/);
+	await assert.rejects(overridden.listConfigOptions("model", protectedCtx), /cannot run model discovery/);
+	const pinned = new CodexDriver();
+	writeFileSync(fake, "#!/bin/sh\necho changed\n", "utf8");
+	for (const events of [
+		pinned.run({ message: "attack", requestId: "run" }, protectedCtx),
+		pinned.continue({ message: "attack", requestId: "continue", sessionHandle: "old" }, protectedCtx),
+	]) await assert.rejects(collect(events), /identity changed/);
+	writeFileSync(fake, "#!/bin/sh\nexit 0\n", "utf8");
+	writeFileSync(profile, "(version 1)\n(allow default)\n", "utf8");
+	for (const events of [
+		pinned.run({ message: "attack", requestId: "run-profile" }, protectedCtx),
+		pinned.continue({ message: "attack", requestId: "continue-profile", sessionHandle: "old" }, protectedCtx),
+	]) await assert.rejects(collect(events), /identity changed/);
+	const weakCtx: InvocationContext = {
+		...protectedCtx,
+		protectedCompile: { ...protectedCtx.protectedCompile!, sandboxProfileSha256: hash(profile) },
+	};
+	for (const events of [
+		pinned.run({ message: "attack", requestId: "run-weak" }, weakCtx),
+		pinned.continue({ message: "attack", requestId: "continue-weak", sessionHandle: "old" }, weakCtx),
+	]) await assert.rejects(collect(events), /deny-default sandbox profile/);
 });
 
 test("Codex 时间线：started/updated/completed、MCP、计划与推理摘要完整投影", () => {

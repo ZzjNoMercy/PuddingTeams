@@ -34,6 +34,8 @@ extensions/
 | --- | --- | --- | --- |
 | lark-cli（`capabilities/lark-cli`，`@puddingteams/capability-lark-cli`） | pinned Manager / 本地 Pi Worker | 直接从飞书官方渠道自动同步 CLI 与内嵌 `lark-*` Skills，注入 binding 隔离认证目录 | 可用（双宿主，默认未绑定） |
 
+| web-research（`capabilities/web-research`，`@puddingteams/capability-web-research`） | Manager Solo / 本地 Pi Worker（平台设置级） | Tavily、DeepSeek、Grok 搜索与公开网页正文抓取；设置页配置、加密凭据、真实探测门禁；独立 Pi 门面 | 适配器可用，供应商真实状态以设置页测试为准 |
+
 ### Shared（`shared/`）
 
 | 包 | 内容 | 状态 |

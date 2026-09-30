@@ -41,6 +41,7 @@ function isActive(executionState: string): boolean {
 }
 
 const executionLabels: Record<string, string> = {
+	not_started: "尚未委派", unknown: "执行记录未加载",
 	admitted: "已接纳", waiting_admission: "等待 Teams 准入", running: "执行中", waiting_input: "等待输入", reported_completed: "Worker 已报告完成",
 	reported_failed: "Worker 已报告失败", cancel_requested: "取消请求中", reconciling: "正在重挂原 Run", cancelled: "已取消", observation_lost: "失去观测 · effect_unknown",
 };
@@ -218,7 +219,7 @@ export function SessionActivityDrawer({
 						{stateText ? <span className={`goal-state-label ${running > 0 ? "is-running" : "is-waiting_human"}`}><i />{stateText}</span> : null}
 					</div>
 					<DialogDescription className="sr-only">查看当前会话的 Worker 执行动态</DialogDescription>
-					{current.items.length > 0 ? <span className="goal-progress-label">{completed}/{current.items.length} 完成</span> : null}
+					{current.items.length > 0 ? <span className="goal-progress-label">Worker 已报告 {completed}/{current.items.length}</span> : null}
 				</DialogHeader>
 				<RuntimeViewTabs view="activity" hasGoal={hasGoal} onViewChange={onViewChange} />
 				<div className="task-activity-scroll">
@@ -235,7 +236,7 @@ export function SessionActivityDrawer({
 								))}
 							</SelectContent>
 						</Select>
-						{selected.id !== current.id ? <span>{selectedPending > 0 ? `${selectedPending} 待处理` : selectedRunning > 0 ? `${selectedRunning} 运行中` : selected.items.length > 0 ? `${selectedCompleted}/${selected.items.length} 完成` : "无任务"}</span> : null}
+						{selected.id !== current.id ? <span>{selectedPending > 0 ? `${selectedPending} 待处理` : selectedRunning > 0 ? `${selectedRunning} 运行中` : selected.items.length > 0 ? `Worker 已报告 ${selectedCompleted}/${selected.items.length}` : "无任务"}</span> : null}
 					</div>
 					{loading && items.length === 0 ? (
 						<div className="task-activity-empty" role="status"><Loader size={14} />正在加载任务…</div>

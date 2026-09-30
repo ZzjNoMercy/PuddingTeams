@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import Fastify, { type FastifyInstance } from "fastify";
-import { TeamsStore } from "../store/teams.js";
+import { TeamsStore, agentRunConfigRevision } from "../store/teams.js";
 import { CredentialsStore } from "../store/credentials.js";
 import { registerAgentsRoutes } from "./agents.js";
 
@@ -52,6 +52,7 @@ test("config: pinned manager 合并更新（manager settings 键级合并）", a
 		method: "PUT",
 		url: "/api/agents/manager/config",
 		payload: {
+			expectedRevision: 1,
 			description: "新描述",
 			manager: { model: "openai/gpt-5" },
 			piResources: { enabledSkills: ["lib-skill"], systemPrompt: "人格" },
@@ -68,7 +69,7 @@ test("config: pinned manager 合并更新（manager settings 键级合并）", a
 	const second = await app.inject({
 		method: "PUT",
 		url: "/api/agents/manager/config",
-		payload: { manager: { thinkingLevel: "high" } },
+		payload: { expectedRevision: agent.extensionRevision, manager: { thinkingLevel: "high" } },
 	});
 	assert.equal(second.statusCode, 200);
 	const merged = second.json().agent;
@@ -76,6 +77,16 @@ test("config: pinned manager 合并更新（manager settings 键级合并）", a
 	assert.equal(merged.manager.model, "openai/gpt-5");
 	assert.equal(merged.description, "新描述");
 	assert.deepEqual(merged.piResources, { enabledSkills: ["lib-skill"], systemPrompt: "人格" });
+
+	const cleared = await app.inject({
+		method: "PUT",
+		url: "/api/agents/manager/config",
+		payload: { expectedRevision: merged.extensionRevision, manager: { model: null, thinkingLevel: null } },
+	});
+	assert.equal(cleared.statusCode, 200);
+	assert.equal(cleared.json().agent.manager.model, undefined);
+	assert.equal(cleared.json().agent.manager.thinkingLevel, undefined);
+	assert.equal(cleared.json().agent.manager.codeSearch, merged.manager.codeSearch);
 });
 
 test("config: manager 传 connector 字段 400", async () => {
@@ -83,7 +94,7 @@ test("config: manager 传 connector 字段 400", async () => {
 	const res = await app.inject({
 		method: "PUT",
 		url: "/api/agents/manager/config",
-		payload: { connector: { config: {} } },
+		payload: { expectedRevision: 1, connector: { config: {} } },
 	});
 	assert.equal(res.statusCode, 400);
 });
@@ -94,6 +105,7 @@ test("config: pi worker 合并更新（description/piResources/connector.config�
 		method: "PUT",
 		url: "/api/agents/piworker/config",
 		payload: {
+			expectedRevision: 1,
 			description: "改过的",
 			responsibility: { domain: "代码", owns: ["review"], excludes: [] },
 			piResources: { enabledSkills: ["a", "b", "a"], enabledPrompts: [] },
@@ -115,7 +127,7 @@ test("config: pi worker 合并更新（description/piResources/connector.config�
 	const cleared = await app.inject({
 		method: "PUT",
 		url: "/api/agents/piworker/config",
-		payload: { responsibility: null, piResources: null },
+		payload: { expectedRevision: agent.extensionRevision, responsibility: null, piResources: null },
 	});
 	assert.equal(cleared.statusCode, 200);
 	assert.equal(cleared.json().agent.responsibility, undefined);
@@ -129,27 +141,27 @@ test("config: 非 pi worker 传 manager 或 connector 字段 400", async () => {
 	const withManager = await app.inject({
 		method: "PUT",
 		url: "/api/agents/cmdworker/config",
-		payload: { manager: { model: "openai/gpt-5" } },
+		payload: { expectedRevision: 1, manager: { model: "openai/gpt-5" } },
 	});
 	assert.equal(withManager.statusCode, 400);
 	const withConnector = await app.inject({
 		method: "PUT",
 		url: "/api/agents/cmdworker/config",
-		payload: { connector: { config: {} } },
+		payload: { expectedRevision: 1, connector: { config: {} } },
 	});
 	assert.equal(withConnector.statusCode, 400);
 	// 非 pi worker 传 piResources 也被 store 校验拒绝。
 	const withResources = await app.inject({
 		method: "PUT",
 		url: "/api/agents/cmdworker/config",
-		payload: { piResources: { enabledSkills: ["a"] } },
+		payload: { expectedRevision: 1, piResources: { enabledSkills: ["a"] } },
 	});
 	assert.equal(withResources.statusCode, 400);
 	// 普通 description 更新仍然可用。
 	const ok = await app.inject({
 		method: "PUT",
 		url: "/api/agents/cmdworker/config",
-		payload: { description: "合法更新" },
+		payload: { expectedRevision: 1, description: "合法更新" },
 	});
 	assert.equal(ok.statusCode, 200);
 	assert.equal(ok.json().agent.description, "合法更新");
@@ -161,24 +173,24 @@ test("config: worker displayName 更新与清除（name/id 解耦）", async () 
 	const set = await app.inject({
 		method: "PUT",
 		url: "/api/agents/piworker/config",
-		payload: { displayName: "数据分析员" },
+		payload: { expectedRevision: 1, displayName: "数据分析员" },
 	});
 	assert.equal(set.statusCode, 200);
 	assert.equal(set.json().agent.name, "piworker");
 	assert.equal(set.json().agent.displayName, "数据分析员");
 	// 清除（null 与空串等价）：displayName 删除，展示回退 id。
 	for (const payload of [{ displayName: null }, { displayName: "  " }]) {
-		const cleared = await app.inject({ method: "PUT", url: "/api/agents/piworker/config", payload });
+		const cleared = await app.inject({ method: "PUT", url: "/api/agents/piworker/config", payload: { ...payload, expectedRevision: (await teams.getAgent("piworker"))?.extensionRevision } });
 		assert.equal(cleared.statusCode, 200);
 		assert.equal(cleared.json().agent.displayName, undefined);
 	}
 	// 非法类型 400；超长 400。
 	assert.equal(
-		(await app.inject({ method: "PUT", url: "/api/agents/piworker/config", payload: { displayName: 42 } })).statusCode,
+		(await app.inject({ method: "PUT", url: "/api/agents/piworker/config", payload: { expectedRevision: (await teams.getAgent("piworker"))?.extensionRevision, displayName: 42 } })).statusCode,
 		400,
 	);
 	assert.equal(
-		(await app.inject({ method: "PUT", url: "/api/agents/piworker/config", payload: { displayName: "超".repeat(41) } })).statusCode,
+		(await app.inject({ method: "PUT", url: "/api/agents/piworker/config", payload: { expectedRevision: (await teams.getAgent("piworker"))?.extensionRevision, displayName: "超".repeat(41) } })).statusCode,
 		400,
 	);
 	assert.equal((await teams.getAgent("piworker"))?.displayName, undefined);
@@ -189,11 +201,68 @@ test("config: pinned manager displayName 更新", async () => {
 	const res = await app.inject({
 		method: "PUT",
 		url: "/api/agents/manager/config",
-		payload: { displayName: "大管家" },
+		payload: { expectedRevision: 1, displayName: "大管家" },
 	});
 	assert.equal(res.statusCode, 200);
 	assert.equal(res.json().agent.name, "manager");
 	assert.equal(res.json().agent.displayName, "大管家");
+});
+
+test("config: 旧版本 manager 与 worker 草稿均被拒绝且不覆盖新配置", async () => {
+	const { app, teams } = await makeStack();
+	for (const name of ["manager", "piworker", "cmdworker"]) {
+		const original = await teams.getAgent(name);
+		assert.ok(original);
+		const current = await app.inject({ method: "PUT", url: `/api/agents/${name}/config`, payload: { expectedRevision: original.extensionRevision, description: "新配置" } });
+		assert.equal(current.statusCode, 200);
+		const stale = await app.inject({ method: "PUT", url: `/api/agents/${name}/config`, payload: { expectedRevision: original.extensionRevision, description: "旧草稿" } });
+		assert.equal(stale.statusCode, 409);
+		assert.equal(stale.json().code, "binding_conflict");
+		assert.equal((await teams.getAgent(name))?.description, "新配置");
+	}
+	const missing = await app.inject({ method: "PUT", url: "/api/agents/piworker/config", payload: { description: "缺少版本" } });
+	assert.equal(missing.statusCode, 400);
+});
+
+test("legacy 全量 Agent 更新也拒绝旧快照", async () => {
+	const { app, teams } = await makeStack();
+	const original = await teams.getAgent("cmdworker");
+	assert.ok(original);
+	const newer = await app.inject({ method: "PUT", url: "/api/agents/cmdworker/config", payload: { expectedRevision: original.extensionRevision, description: "另一处修改" } });
+	assert.equal(newer.statusCode, 200);
+	const stale = await app.inject({ method: "PUT", url: "/api/agents/cmdworker", payload: { ...original, expectedRevision: original.extensionRevision, description: "旧表单" } });
+	assert.equal(stale.statusCode, 409);
+	assert.equal((await teams.getAgent("cmdworker"))?.description, "另一处修改");
+	const latest = await teams.getAgent("cmdworker");
+	assert.ok(latest);
+	const saved = await app.inject({ method: "PUT", url: "/api/agents/cmdworker", payload: { ...latest, expectedRevision: latest.extensionRevision, description: "当前表单" } });
+	assert.equal(saved.statusCode, 200);
+	assert.equal((await teams.getAgent("cmdworker"))?.description, "当前表单");
+	assert.equal(Object.hasOwn((await teams.getAgent("cmdworker"))!, "expectedRevision"), false);
+});
+
+test("独立 Manager PATCH 与 Pi 资源 PUT 拒绝旧版本整份表单", async () => {
+	const { app, teams } = await makeStack();
+	const manager = await teams.getAgent("manager");
+	assert.ok(manager);
+	const managerCurrent = await app.inject({ method: "PATCH", url: "/api/agents/manager/manager", payload: { expectedRevision: manager.extensionRevision, description: "新 Manager" } });
+	assert.equal(managerCurrent.statusCode, 200);
+	const managerStale = await app.inject({ method: "PATCH", url: "/api/agents/manager/manager", payload: { expectedRevision: manager.extensionRevision, description: "旧 Manager" } });
+	assert.equal(managerStale.statusCode, 409);
+	assert.equal((await teams.getAgent("manager"))?.description, "新 Manager");
+	const managerMissing = await app.inject({ method: "PATCH", url: "/api/agents/manager/manager", payload: { description: "缺少版本" } });
+	assert.equal(managerMissing.statusCode, 400);
+	for (const name of ["manager", "piworker"]) {
+		const original = await teams.getAgent(name);
+		assert.ok(original);
+		const current = await app.inject({ method: "PUT", url: `/api/agents/${name}/pi-resources`, payload: { expectedRevision: original.extensionRevision, piResources: { enabledSkills: ["new"] } } });
+		assert.equal(current.statusCode, 200, current.body);
+		const stale = await app.inject({ method: "PUT", url: `/api/agents/${name}/pi-resources`, payload: { expectedRevision: original.extensionRevision, piResources: { enabledSkills: ["old"] } } });
+		assert.equal(stale.statusCode, 409, stale.body);
+		assert.deepEqual((await teams.getAgent(name))?.piResources?.enabledSkills, ["new"]);
+	}
+	const missing = await app.inject({ method: "PUT", url: "/api/agents/piworker/pi-resources", payload: { piResources: null } });
+	assert.equal(missing.statusCode, 400);
 });
 
 test("create: 无 name 时从 displayName 派生内部 id", async () => {
@@ -342,13 +411,17 @@ test("duplicate identity: 删除后的 id 永不复用，旧 Window/binding、�
 		"old-session-handle",
 		undefined,
 		oldWindow.cwdSnapshot,
-		enabled.extensionRevision!,
+		agentRunConfigRevision(enabled),
 	);
 	assert.equal(
 		(await teams.getWindow(oldWindow.id))?.workerBindings?.[oldWindow.activeSession]?.[first.name]?.sessionHandle,
 		"old-session-handle",
 	);
 
+	const stillEnabled = await app.inject({ method: "DELETE", url: `/api/agents/${first.name}` });
+	assert.equal(stillEnabled.statusCode, 409, "启用的 Worker 先停用才可删除");
+	assert.equal(stillEnabled.json().code, "agent_enabled");
+	await teams.setEnabled(first.name, false);
 	const removed = await app.inject({ method: "DELETE", url: `/api/agents/${first.name}` });
 	assert.equal(removed.statusCode, 204);
 	const persistedRegistry = JSON.parse(readFileSync(path.join(dir, "teams", "agents.json"), "utf-8"));
@@ -403,6 +476,29 @@ test("duplicate identity: 删除后的 id 永不复用，旧 Window/binding、�
 	assert.match(resurrect.json().error, /已退役/);
 });
 
+test("删除已提交但凭证清理失败时报告部分结果，重启按退役身份清理", async () => {
+	const { app, teams, credentials, dir } = await makeStack();
+	try {
+		await teams.upsertAgent({ name: "cleanup-worker", description: "cleanup", invoke: { type: "command", command: "echo", runArgs: [] }, enabled: false });
+		await credentials.setSecrets("cleanup-worker", { API_TOKEN: "secret" });
+		credentials.removeAgentSecrets = async () => { throw new Error("simulated cleanup failure"); };
+		const deleted = await app.inject({ method: "DELETE", url: "/api/agents/cleanup-worker" });
+		assert.equal(deleted.statusCode, 202, deleted.body);
+		assert.deepEqual(deleted.json(), { deleted: true, agentName: "cleanup-worker", credentialsCleanup: "pending" });
+		assert.equal(await teams.getAgent("cleanup-worker"), undefined);
+		assert.deepEqual(await credentials.listConfigured("cleanup-worker"), ["API_TOKEN"]);
+		const restartedCredentials = new CredentialsStore(path.join(dir, "sec"));
+		await restartedCredentials.init();
+		const restartedTeams = new TeamsStore(
+			{ state: path.join(dir, "teams"), assets: path.join(dir, "teams"), managedWorkspaces: path.join(dir, "managed") },
+			dir, 900_000, restartedCredentials,
+		);
+		await restartedTeams.init();
+		assert.deepEqual(await restartedCredentials.listConfigured("cleanup-worker"), []);
+		assert.ok((await restartedTeams.reservedAgentIds()).includes("cleanup-worker"));
+	} finally { await app.close(); }
+});
+
 test("config: pi worker 传 manager 字段 400；未知 agent 404", async () => {
 	const { app, teams } = await makeStack();
 	assert.equal(
@@ -410,7 +506,7 @@ test("config: pi worker 传 manager 字段 400；未知 agent 404", async () => 
 			await app.inject({
 				method: "PUT",
 				url: "/api/agents/piworker/config",
-				payload: { manager: { model: "x" } },
+				payload: { expectedRevision: 1, manager: { model: "x" } },
 			})
 		).statusCode,
 		400,
@@ -423,7 +519,7 @@ test("config: pi worker 传 manager 字段 400；未知 agent 404", async () => 
 		(await app.inject({
 			method: "PUT",
 			url: "/api/agents/fresh-id",
-			payload: { description: "不得借更新接口创建", invoke: { type: "command", command: "echo", runArgs: [] } },
+			payload: { expectedRevision: 0, description: "不得借更新接口创建", invoke: { type: "command", command: "echo", runArgs: [] } },
 		})).statusCode,
 		404,
 	);
@@ -431,7 +527,7 @@ test("config: pi worker 传 manager 字段 400；未知 agent 404", async () => 
 		(await app.inject({
 			method: "PUT",
 			url: "/api/agents/unsafe%20id",
-			payload: { description: "不得持久化不安全 id", invoke: { type: "command", command: "echo", runArgs: [] } },
+				payload: { expectedRevision: 0, description: "不得持久化不安全 id", invoke: { type: "command", command: "echo", runArgs: [] } },
 		})).statusCode,
 		404,
 	);

@@ -1,12 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert";
 import { mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import Fastify from "fastify";
 import { DelegationStore } from "../agent-runtime/delegation-store.js";
 import { WorkspaceExecutionCoordinator } from "../agent-runtime/workspace-execution.js";
 import { registerRuntimeFilesRoutes } from "./runtime-files.js";
+import { readBoundedPreviewBytes, TEXT_PREVIEW_LIMIT } from "./file-preview.js";
 
 async function makeStack() {
 	const state = mkdtempSync(path.join(tmpdir(), "pt-runtime-files-state-"));
@@ -45,6 +47,30 @@ test("运行文件只列出相对 baseline 的当前变更并支持文本预览"
 
 	const unrelated = await app.inject({ method: "GET", url: `/api/delegations/${delegation.id}/files/content?path=existing.md` });
 	assert.equal(unrelated.statusCode, 404, "baseline 文件不能借 viewer 任意读取");
+	await app.close();
+});
+
+test("运行文件预览在大小检查后增长也不返回截断内容", async () => {
+	const file = path.join(mkdtempSync(path.join(tmpdir(), "pt-runtime-growing-preview-")), "growing.md");
+	writeFileSync(file, "initial");
+	const handle = await open(file, "r");
+	try {
+		assert.ok((await handle.stat()).size < TEXT_PREVIEW_LIMIT);
+		writeFileSync(file, Buffer.alloc(TEXT_PREVIEW_LIMIT + 1, 0x61));
+		assert.equal(await readBoundedPreviewBytes(handle), undefined);
+	} finally {
+		await handle.close();
+	}
+});
+
+test("运行文件超限或编码无效时不内联展示", async () => {
+	const { app, workspace, delegation } = await makeStack();
+	writeFileSync(path.join(workspace, "huge.md"), Buffer.alloc(TEXT_PREVIEW_LIMIT + 1, 0x61));
+	writeFileSync(path.join(workspace, "invalid.md"), Buffer.from([0xc3, 0x28]));
+	const huge = await app.inject({ method: "GET", url: `/api/delegations/${delegation.id}/files/content?path=huge.md` });
+	assert.equal(huge.statusCode, 413);
+	const invalid = await app.inject({ method: "GET", url: `/api/delegations/${delegation.id}/files/content?path=invalid.md` });
+	assert.equal(invalid.statusCode, 415);
 	await app.close();
 });
 

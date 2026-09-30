@@ -9,6 +9,7 @@ import { DelegationStore } from "./delegation-store.js";
 import { InteractionSecretStore } from "./interaction-secret-store.js";
 import { ArtifactStore } from "./artifact-store.js";
 import { WorkspaceExecutionCoordinator } from "./workspace-execution.js";
+import { settleWorkItemReview } from "./work-item-settlement.js";
 import { WorkStateStore, workItemContractHash } from "../store/work-state.js";
 import type { AgentDriver } from "./types.js";
 
@@ -67,8 +68,16 @@ test("Runtime 在 Driver 启动前把无只读强制能力的 Git 任务路由�
 	assert.equal(changeSet?.promotionState, "pending");
 	const submitted = await workStates.noteDelegation("s", { goalId: goal.goalId, workItemId: item.id, delegationId: outcome.delegation.id, delegationStatus: "completed", goalEpoch: goal.execution.epoch, executionReceipt: outcome.delegation.receipt, workspaceChangeSet: changeSet }, "boundary");
 	assert.equal(submitted.plan?.items.W1?.status, "submitted", "Runtime Receipt 必须能通过 WorkState 的同一冻结契约门禁");
-	const promoted = await runtime.promoteWorkspaceChangeSet(outcome.delegation.workspaceExecutionScopeId!, outcome.delegation.workspaceChangeSetId!);
-	assert.equal(promoted.promotionState, "applied");
+	const { state: accepted } = await settleWorkItemReview({
+		workStates, sessionId: "s", goalId: goal.goalId, workItemId: "W1", expectedRevision: submitted.revision,
+		expectedEpoch: 1, review: { expectedWorkItemRevision: submitted.plan!.items.W1!.revision,
+			expectedSubmissionId: submitted.plan!.items.W1!.submissions[0]!.id, verdict: "accepted",
+			summary: "已检查 result.txt", evidenceRefs: ["delegation:" + outcome.delegation.id] },
+		operationId: "review-real-git-write",
+		promoteWorkspaceChangeSet: (scopeId, changeSetId) => runtime.promoteWorkspaceChangeSet(scopeId, changeSetId),
+	});
+	assert.equal(accepted.plan?.items.W1?.status, "accepted");
+	assert.equal(accepted.plan?.items.W1?.submissions[0]?.workspaceChangeSet?.promotionState, "applied");
 	assert.equal(readFileSync(path.join(root, "result.txt"), "utf8"), "result\n");
 });
 

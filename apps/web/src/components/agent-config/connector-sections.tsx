@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertCircleIcon, CheckCircle2Icon, CheckIcon, LoaderIcon, PauseCircleIcon, PlayIcon, PlusIcon, PuzzleIcon, RefreshCwIcon, TrashIcon, XCircleIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -10,10 +10,11 @@ import { Textarea } from "@/components/ui/textarea";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
+	ApiConflictError,
 	addAgentBinding,
 	deleteAgentBinding,
-	getAgentConnector,
 	getAgentExecutionCapabilities,
+	listAgents,
 	listAgentBindings,
 	listExtensionCatalog,
 	listExtensionConnections,
@@ -58,6 +59,18 @@ const ORIGIN_LABELS: Record<CatalogEntry["origin"], string> = {
 	user: "用户安装",
 	"local-link": "开发者本地链接",
 };
+
+function warnIfCredentialMutationNeedsReview(response: MutationResponse): boolean {
+	if (response.credentialsCleanup === "pending") {
+		toast.warning("配置已提交；凭据事务清理待服务重启恢复。当前密钥操作已暂停，请重启后核对。");
+		return true;
+	}
+	if (response.commitState === "committed_readback") {
+		toast.warning("配置已提交，但提交后的响应中断；已回读当前配置，请核对后再继续。");
+		return true;
+	}
+	return false;
+}
 
 const SOURCE_LABELS: Record<string, string> = {
 	builtin: "内置来源",
@@ -191,7 +204,7 @@ function ConnectorProbeView({ probe }: { probe: ConnectorProbeResult }) {
 					{summary.tone === "warning" ? <AlertCircleIcon className="mt-0.5 size-4 shrink-0 text-amber-600" /> : null}
 					{summary.tone === "error" ? <XCircleIcon className="mt-0.5 size-4 shrink-0 text-destructive" /> : null}
 					<div className="min-w-0">
-						<p className="text-sm font-semibold leading-5">{summary.title}</p>
+						<p className="text-sm font-medium leading-5">{summary.title}</p>
 						<p className="mt-0.5 text-xs leading-5 text-muted-foreground">{summary.description}</p>
 					</div>
 				</div>
@@ -323,17 +336,24 @@ function BindingProbeView({ probe }: { probe: BindingProbeResult }) {
 export function ConnectorSection({
 	agent,
 	onMutation,
+	onAgentReloaded,
 }: {
 	agent: AgentConfig;
 	onMutation: (res: MutationResponse) => void;
+	onAgentReloaded: (agent: AgentConfig) => void;
 }) {
 	const [catalog, setCatalog] = useState<CatalogEntry[] | null>(null);
+	const [catalogError, setCatalogError] = useState<string | null>(null);
+	const [executionCapabilitiesError, setExecutionCapabilitiesError] = useState<string | null>(null);
+	const [readAttempt, setReadAttempt] = useState(0);
 	const [extensionId, setExtensionId] = useState(agent.connector?.extensionId ?? "");
 	const [transport, setTransport] = useState<AgentConnectorBinding["transport"] | "">(agent.connector?.transport ?? "");
 	const [config, setConfig] = useState<Record<string, unknown>>(agent.connector?.config ?? {});
 	const [secrets, setSecrets] = useState<Record<string, string>>({});
 	const [versionPin, setVersionPin] = useState(agent.connector?.versionPin ?? "");
 	const [saving, setSaving] = useState(false);
+	const [conflict, setConflict] = useState(false);
+	const [reloading, setReloading] = useState(false);
 	const [probe, setProbe] = useState<AgentProbeResult | null>(null);
 	const [probing, setProbing] = useState(false);
 	const [executionCapabilities, setExecutionCapabilities] = useState<AgentExecutionCapabilities | null>(null);
@@ -355,20 +375,26 @@ export function ConnectorSection({
 		let cancelled = false;
 		listExtensionCatalog("connector")
 			.then((entries) => {
-				if (!cancelled) setCatalog(entries);
+				if (!cancelled) { setCatalog(entries); setCatalogError(null); }
 			})
 			.catch((err: unknown) => {
-				if (!cancelled) toast.error(err instanceof Error ? err.message : String(err));
+				if (!cancelled) setCatalogError(err instanceof Error ? err.message : String(err));
 			});
-		// GET connector 拿贡献 manifest（catalog 已含，这里保底刷新绑定态）。
-		getAgentConnector(agent.name).catch(() => undefined);
 		getAgentExecutionCapabilities(agent.name)
-			.then((value) => { if (!cancelled) setExecutionCapabilities(value); })
-			.catch(() => { if (!cancelled) setExecutionCapabilities(null); });
+			.then((value) => { if (!cancelled) { setExecutionCapabilities(value); setExecutionCapabilitiesError(null); } })
+			.catch((err: unknown) => { if (!cancelled) setExecutionCapabilitiesError(err instanceof Error ? err.message : String(err)); });
 		return () => {
 			cancelled = true;
 		};
-	}, [agent.name, agent.extensionRevision]);
+	}, [agent.name, agent.extensionRevision, readAttempt]);
+
+	const retryRead = () => {
+		setCatalog(null);
+		setCatalogError(null);
+		setExecutionCapabilities(null);
+		setExecutionCapabilitiesError(null);
+		setReadAttempt((attempt) => attempt + 1);
+	};
 
 	const selected = catalog?.find((e) => e.manifest.id === extensionId);
 	const contribution = selected?.manifest.kind === "connector" ? selected.manifest.connector : undefined;
@@ -399,10 +425,11 @@ export function ConnectorSection({
 	};
 
 	const handleSave = async () => {
-		if (!selected || !contribution) return;
+		if (!selected || !contribution || conflict) return;
 		setSaving(true);
 		try {
 			const res = await putAgentConnector(agent.name, {
+				expectedRevision: agent.extensionRevision ?? 0,
 				extensionId,
 				connectorId: contribution.id,
 				transport: selectedTransport as AgentConnectorBinding["transport"],
@@ -411,12 +438,29 @@ export function ConnectorSection({
 				...(versionPin.trim() ? { versionPin: versionPin.trim() } : {}),
 			});
 			setSecrets({});
+			setConflict(false);
 			onMutation(res);
-			toast.success(`「${agent.name}」Connector 绑定已保存`);
+			if (!warnIfCredentialMutationNeedsReview(res)) toast.success(`「${agent.name}」Connector 绑定已保存`);
 		} catch (err) {
+			if (err instanceof ApiConflictError) setConflict(true);
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
 			setSaving(false);
+		}
+	};
+
+	const reloadAfterConflict = async () => {
+		setReloading(true);
+		try {
+			const latest = (await listAgents()).find((item) => item.name === agent.name);
+			if (!latest) throw new Error("Agent 已不存在");
+			onAgentReloaded(latest);
+			setConflict(false);
+			toast.success("已读取最新 Connector 配置，可以重新编辑");
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		} finally {
+			setReloading(false);
 		}
 	};
 
@@ -433,6 +477,14 @@ export function ConnectorSection({
 		}
 	};
 
+	if (catalogError) {
+		return (
+			<div role="alert" className="flex flex-wrap items-center gap-2 py-6 text-sm text-destructive">
+				<span>连接插件目录读取失败：{catalogError}</span>
+				<Button type="button" size="sm" variant="outline" onClick={retryRead}>重试读取</Button>
+			</div>
+		);
+	}
 	if (catalog === null) {
 		return (
 			<div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
@@ -446,7 +498,8 @@ export function ConnectorSection({
 
 	return (
 		<div className="flex flex-col gap-3">
-			<section className="agent-config-card flex flex-col gap-3">
+			{conflict ? <div role="alert" className="agent-config-callout is-warning">Connector 绑定已变化。当前表单与密钥输入仍保留；请先核对，再明确读取最新配置。<Button type="button" size="sm" variant="outline" className="ml-3" disabled={reloading} onClick={() => void reloadAfterConflict()}>读取最新配置（丢弃当前输入）</Button></div> : null}
+			<section className="agent-config-card">
 				<div className="agent-config-card-head"><h2>连接插件</h2><p>选择已安装的连接插件；安装与更新在「扩展」页完成。</p></div>
 			{/* 当前绑定 */}
 			{agent.connector ? (
@@ -464,8 +517,8 @@ export function ConnectorSection({
 			)}
 
 			{/* Connector 选择/更换（安装扩展是独立动作，在「扩展目录」页完成） */}
-			<label className="flex flex-col gap-1 text-sm">
-				<span className="text-muted-foreground">连接插件</span>
+			<label className="agent-config-field">
+				<span>连接插件</span>
 				<Select value={extensionId} onValueChange={handleSelect}>
 					<SelectTrigger className="w-full">
 						<SelectValue placeholder="选择已安装的连接插件" />
@@ -480,7 +533,7 @@ export function ConnectorSection({
 					</SelectContent>
 				</Select>
 				{installed.length === 0 ? (
-					<span className="text-xs text-muted-foreground/70">没有已安装的连接插件，请先到「扩展」安装。</span>
+					<small>没有已安装的连接插件，请先到「扩展」安装。</small>
 				) : null}
 			</label>
 			{selected && !selected.loaded ? (
@@ -524,7 +577,7 @@ export function ConnectorSection({
 							<div className="flex flex-wrap gap-1.5">
 								{selected.manifest.permissions?.length ? selected.manifest.permissions.map((permission) => (
 									<Badge key={permission} variant="outline">{PERMISSION_LABELS[permission]}</Badge>
-								)) : <span className="text-muted-foreground">无需额外权限</span>}
+								)) : <span>无需额外权限</span>}
 							</div>
 						</div>
 					</div>
@@ -534,9 +587,14 @@ export function ConnectorSection({
 			{/* config schema 表单 + secret + 固定版本 */}
 			</section>
 			{contribution ? (
-				<section className="agent-config-card flex flex-col gap-3">
+				<section className="agent-config-card">
 					<div className="agent-config-card-head"><h2>接入配置</h2><p>按连接插件声明的配置项填写；密钥加密存储，只保存引用。</p></div>
-					{executionCapabilities ? (
+					{executionCapabilitiesError ? (
+						<div role="alert" className="flex flex-wrap items-center gap-2 text-xs text-destructive">
+							<span>执行能力读取失败，无法确认只读约束：{executionCapabilitiesError}</span>
+							<Button type="button" size="sm" variant="outline" onClick={retryRead}>重试读取</Button>
+						</div>
+					) : executionCapabilities ? (
 						<div className="agent-config-inset p-3 text-xs">
 							<p className="font-medium">当前执行能力（Connector 声明）</p>
 							<div className="mt-2 flex flex-wrap gap-1.5">
@@ -551,9 +609,10 @@ export function ConnectorSection({
 								<p className="mt-2 text-destructive">只读任务不会自动修改 Worker 权限；执行前由 Teams 请求用户决定是否仍使用该 Worker。</p>
 							) : null}
 						</div>
-					) : null}
-					<label className="flex flex-col gap-1 text-sm">
-						<span className="text-muted-foreground">传输方式</span>
+					) : <p className="text-xs text-muted-foreground">正在确认执行能力…</p>}
+					<div className="flex flex-col gap-4">
+						<label className="agent-config-field">
+							<span>传输方式</span>
 						<Select value={selectedTransport} onValueChange={(value) => setTransport(value as AgentConnectorBinding["transport"])}>
 							<SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
 							<SelectContent>
@@ -562,9 +621,9 @@ export function ConnectorSection({
 								))}
 							</SelectContent>
 						</Select>
-						<span className="text-xs text-muted-foreground/70">此 Worker 实例固定使用所选 transport；切换会影响后续委托。</span>
-					</label>
-					<ConfigSchemaForm schema={contribution.configSchema} value={config} onChange={setConfig} agentName={agent.name} transport={selectedTransport} />
+						<small>此 Worker 实例固定使用所选 transport；切换会影响后续委托。</small>
+						</label>
+						<ConfigSchemaForm schema={contribution.configSchema} value={config} onChange={setConfig} agentName={agent.name} transport={selectedTransport} />
 			{securityWarnings.map((warning) => (
 				<div key={warning} role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 p-2.5 text-xs text-destructive">
 					{warning}
@@ -581,15 +640,16 @@ export function ConnectorSection({
 				/>
 			) : null}
 
-				<label className="flex flex-col gap-1 text-sm">
-					<span className="text-muted-foreground">固定版本（可选）</span>
+				<label className="agent-config-field">
+					<span>固定版本（可选）</span>
 					<Input value={versionPin} onChange={(e) => setVersionPin(e.target.value)} placeholder="如 0.9.1" className="font-mono text-xs" />
 				</label>
-				</section>
+			</div>
+			</section>
 			) : null}
 
 			<div className="flex items-center gap-2">
-				<Button type="button" size="sm" disabled={!selected || !selected.loaded || saving} onClick={() => void handleSave()}>
+				<Button type="button" size="sm" disabled={!selected || !selected.loaded || saving || conflict} onClick={() => void handleSave()}>
 					{saving ? <LoaderIcon className="size-3.5 animate-spin" /> : null}
 					保存绑定
 				</Button>
@@ -610,7 +670,7 @@ export function ConnectorSection({
 
 // ---- 分区 1（legacy）：command invoke 编辑 ----
 
-export function LegacyInvokeSection({ agent, onSaved }: { agent: AgentConfig; onSaved: (agent: AgentConfig) => void }) {
+export function LegacyInvokeSection({ agent, onSaved, onConflict, conflicted }: { agent: AgentConfig; onSaved: (agent: AgentConfig) => void; onConflict: () => void; conflicted: boolean }) {
 	const invoke = agent.invoke?.type === "command" ? agent.invoke : undefined;
 	const [command, setCommand] = useState(invoke?.command ?? "");
 	const [runArgs, setRunArgs] = useState((invoke?.runArgs ?? []).join(", "));
@@ -665,6 +725,7 @@ export function LegacyInvokeSection({ agent, onSaved }: { agent: AgentConfig; on
 			onSaved(updated);
 			toast.success(`「${agent.name}」接入命令已保存`);
 		} catch (err) {
+			if (err instanceof ApiConflictError) onConflict();
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
 			setSaving(false);
@@ -686,22 +747,22 @@ export function LegacyInvokeSection({ agent, onSaved }: { agent: AgentConfig; on
 
 	return (
 		<div className="flex flex-col gap-3">
-			<section className="agent-config-card flex flex-col gap-3">
+			<section className="agent-config-card">
 				<div className="agent-config-card-head"><h2>接入命令</h2><p>该智能体使用旧版命令接入。推荐改用连接插件：先创建新智能体，或在「扩展」页面安装插件。</p></div>
-			<label className="flex flex-col gap-1 text-sm">
-				<span className="text-muted-foreground">命令（可执行文件或绝对路径）</span>
+			<label className="agent-config-field">
+				<span>命令（可执行文件或绝对路径）</span>
 				<Input value={command} onChange={(e) => setCommand(e.target.value)} placeholder="puddingclaw" />
 			</label>
-			<label className="flex flex-col gap-1 text-sm">
-				<span className="text-muted-foreground">run 参数（逗号或换行分隔）</span>
+			<label className="agent-config-field">
+				<span>run 参数（逗号或换行分隔）</span>
 				<Input value={runArgs} onChange={(e) => setRunArgs(e.target.value)} placeholder="run, --input-json, -, --json" />
 			</label>
-			<label className="flex flex-col gap-1 text-sm">
-				<span className="text-muted-foreground">健康探测参数（可选，默认 doctor --json）</span>
+			<label className="agent-config-field">
+				<span>健康探测参数（可选，默认 doctor --json）</span>
 				<Input value={probeArgs} onChange={(e) => setProbeArgs(e.target.value)} placeholder="doctor, --json" />
 			</label>
-			<label className="flex flex-col gap-1 text-sm">
-				<span className="text-muted-foreground">环境变量（JSON 对象，可选）</span>
+			<label className="agent-config-field">
+				<span>环境变量（JSON 对象，可选）</span>
 				<Textarea
 					value={envText}
 					onChange={(e) => setEnvText(e.target.value)}
@@ -710,10 +771,10 @@ export function LegacyInvokeSection({ agent, onSaved }: { agent: AgentConfig; on
 					className="font-mono text-xs"
 				/>
 			</label>
-			<SecretsEditor agent={agent} />
+			<SecretsEditor key={agent.name} agent={agent} />
 			</section>
 			<div className="flex items-center gap-2">
-				<Button type="button" size="sm" disabled={saving || !command.trim()} onClick={() => void handleSave()}>
+				<Button type="button" size="sm" disabled={saving || conflicted || !command.trim()} onClick={() => void handleSave()}>
 					{saving ? <LoaderIcon className="size-3.5 animate-spin" /> : null}
 					保存接入
 				</Button>
@@ -736,21 +797,30 @@ export function LegacyInvokeSection({ agent, onSaved }: { agent: AgentConfig; on
 function BindingCard({
 	agent,
 	binding,
+	revision,
 	entry,
+	catalogKnown,
 	onMutation,
+	onConflict,
 }: {
 	agent: AgentConfig;
 	binding: AgentCapabilityBinding;
+	revision: number;
 	entry: CatalogEntry | undefined;
+	catalogKnown: boolean;
 	onMutation: (res: MutationResponse) => void;
+	onConflict: () => void;
 }) {
 	const manifest = entry?.manifest.kind === "capability" ? entry.manifest : undefined;
 	const [config, setConfig] = useState<Record<string, unknown>>(binding.config);
 	const [secrets, setSecrets] = useState<Record<string, string>>({});
+	const [draftRevision, setDraftRevision] = useState(revision);
+	const [externalBindingChange, setExternalBindingChange] = useState(false);
 	const [editOpen, setEditOpen] = useState(false);
 	const [probe, setProbe] = useState<BindingProbeResult | null>(null);
 	const [busy, setBusy] = useState<string | null>(null);
 	const [confirmDelete, setConfirmDelete] = useState(false);
+	const [deleteRevision, setDeleteRevision] = useState(revision);
 	const [installPrompt, setInstallPrompt] = useState<{
 		connection: ExtensionConnectionStatus;
 		action: ExtensionConnectionAction;
@@ -758,23 +828,33 @@ function BindingCard({
 
 	// 绑定更新后同步草稿（渲染期间重置）。
 	const [prevBinding, setPrevBinding] = useState(binding);
-	if (prevBinding !== binding) {
+	const [prevRevision, setPrevRevision] = useState(revision);
+	if (prevBinding !== binding || prevRevision !== revision) {
+		const hasLocalDraft = editOpen && (JSON.stringify(config) !== JSON.stringify(prevBinding.config) || Object.keys(secrets).length > 0);
 		setPrevBinding(binding);
-		setConfig(binding.config);
-		setSecrets({});
+		setPrevRevision(revision);
+		if (!hasLocalDraft || busy === "config") {
+			setConfig(binding.config);
+			setSecrets({});
+			setDraftRevision(revision);
+			setExternalBindingChange(false);
+		} else {
+			setExternalBindingChange(true);
+		}
 		setProbe(null);
 	}
 
-	const run = async (action: string, fn: () => Promise<MutationResponse>): Promise<boolean> => {
+	const run = async (action: string, fn: () => Promise<MutationResponse>): Promise<{ needsReview: boolean; revision: number } | null> => {
 		setBusy(action);
 		try {
 			const res = await fn();
 			onMutation(res);
 			setProbe(null);
-			return true;
+			return { needsReview: warnIfCredentialMutationNeedsReview(res), revision: res.revision };
 		} catch (err) {
+			if (err instanceof ApiConflictError) onConflict();
 			toast.error(err instanceof Error ? err.message : String(err));
-			return false;
+			return null;
 		} finally {
 			setBusy(null);
 		}
@@ -817,25 +897,28 @@ function BindingCard({
 	const handleSaveConfig = async () => {
 		const saved = await run("config", () =>
 			patchAgentBinding(agent.name, binding.id, {
+				expectedRevision: draftRevision,
 				config,
 				...(Object.keys(secrets).length > 0 ? { secrets } : {}),
 			}),
 		);
 		if (!saved) return;
+		setDraftRevision(saved.revision);
+		setExternalBindingChange(false);
 		setSecrets({});
 		setEditOpen(false);
-		toast.success("插件配置已保存");
+		if (!saved.needsReview) toast.success("插件配置已保存");
 	};
 
 	return (
-		<div className="agent-config-card agent-plugin-binding-card flex flex-col gap-3">
+		<div className="agent-config-card agent-plugin-binding-card">
 			<div className="agent-plugin-binding-head">
 				<div className="agent-plugin-binding-icon"><PuzzleIcon className="size-4" /></div>
 				<div className="min-w-0 flex-1">
 					<div className="flex flex-wrap items-center gap-2">
-						<span className="text-sm font-semibold">{manifest?.displayName ?? binding.extensionId}</span>
+						<span className="text-sm font-medium">{manifest?.displayName ?? binding.extensionId}</span>
 						<span className={`agent-plugin-state ${binding.enabled ? "enabled" : "disabled"}`}>{binding.enabled ? "已启用" : "已停用"}</span>
-						{!entry ? <Badge variant="destructive">插件未安装</Badge> : !entry.loaded ? <Badge variant="destructive">加载失败</Badge> : null}
+						{catalogKnown && !entry ? <Badge variant="destructive">插件未安装</Badge> : entry && !entry.loaded ? <Badge variant="destructive">加载失败</Badge> : null}
 					</div>
 					<div className="agent-plugin-binding-id">
 						<span>插件标识</span>
@@ -873,7 +956,7 @@ function BindingCard({
 					value={binding.activation ?? "default"}
 					onValueChange={(v) => {
 						if (v === "default") return;
-						void run("activation", () => patchAgentBinding(agent.name, binding.id, { activation: v as ToolActivation }));
+						void run("activation", () => patchAgentBinding(agent.name, binding.id, { expectedRevision: revision, activation: v as ToolActivation }));
 					}}
 					disabled={busy !== null}
 				>
@@ -891,7 +974,7 @@ function BindingCard({
 					size="sm"
 					variant="outline"
 					disabled={busy !== null}
-					onClick={() => void run("toggle", () => patchAgentBinding(agent.name, binding.id, { enabled: !binding.enabled }))}
+					onClick={() => void run("toggle", () => patchAgentBinding(agent.name, binding.id, { expectedRevision: revision, enabled: !binding.enabled }))}
 				>
 					{busy === "toggle" ? <LoaderIcon className="size-3.5 animate-spin" /> : null}
 					{binding.enabled ? "停用" : "启用"}
@@ -913,18 +996,20 @@ function BindingCard({
 					{busy === "probe" ? <LoaderIcon className="size-3.5 animate-spin" /> : <RefreshCwIcon className="size-3.5" />}
 					探测
 				</Button>
-				<Button type="button" size="sm" variant="ghost" className="ml-auto" aria-label={`删除「${manifest?.displayName ?? binding.extensionId}」绑定`} disabled={busy !== null} onClick={() => setConfirmDelete(true)}>
+				<Button type="button" size="sm" variant="ghost" className="ml-auto" aria-label={`删除「${manifest?.displayName ?? binding.extensionId}」绑定`} disabled={busy !== null} onClick={() => { setDeleteRevision(revision); setConfirmDelete(true); }}>
 					<TrashIcon className="size-3.5" />
 				</Button>
 			</div>
 
 			{editOpen ? (
-				<div className="flex flex-col gap-2 border-t pt-2">
+				<fieldset className="flex flex-col gap-2 border-t pt-2" disabled={busy !== null}>
 					<span className="text-xs text-muted-foreground">绑定配置</span>
+					{externalBindingChange ? <div className="text-xs text-amber-700 dark:text-amber-300" role="alert">服务端绑定已更新，当前草稿已保留。使用旧版本保存会被拒绝；核对后可重新加载。<Button type="button" size="sm" variant="outline" className="ml-2" onClick={() => { setConfig(binding.config); setSecrets({}); setDraftRevision(revision); setExternalBindingChange(false); }}>放弃草稿并加载最新</Button></div> : null}
 					<ConfigSchemaForm
 						schema={manifest?.capability.configSchema}
 						value={config}
 						onChange={(next) => {
+							if (busy !== null) return;
 							setConfig(next);
 							setProbe(null);
 						}}
@@ -933,7 +1018,7 @@ function BindingCard({
 						schema={manifest?.capability.secretSchema}
 						configuredKeys={Object.keys(binding.secretRefs ?? {})}
 						values={secrets}
-						onChange={setSecrets}
+						onChange={(next) => { if (busy === null) setSecrets(next); }}
 					/>
 					<div>
 						<Button
@@ -946,7 +1031,7 @@ function BindingCard({
 							保存配置
 						</Button>
 					</div>
-				</div>
+				</fieldset>
 			) : null}
 
 			{probe ? <BindingProbeView probe={probe} /> : null}
@@ -990,7 +1075,9 @@ function BindingCard({
 							variant="destructive"
 							disabled={busy !== null}
 							onClick={() =>
-								void run("delete", () => deleteAgentBinding(agent.name, binding.id)).then(() => setConfirmDelete(false))
+								void run("delete", () => deleteAgentBinding(agent.name, binding.id, deleteRevision)).then((result) => {
+									if (result) setConfirmDelete(false);
+								})
 							}
 						>
 							删除
@@ -1009,33 +1096,59 @@ export function BindingsSection({
 	agent: AgentConfig;
 	onMutation: (res: MutationResponse) => void;
 }) {
-	const [bindings, setBindings] = useState<AgentCapabilityBinding[] | null>(null);
+	const [bindingSnapshot, setBindingSnapshot] = useState<{ bindings: AgentCapabilityBinding[]; revision: number } | null>(null);
+	const [bindingError, setBindingError] = useState<string | null>(null);
+	const bindings = bindingError ? null : bindingSnapshot?.bindings ?? null;
+	const bindingRevision = bindingSnapshot?.revision ?? 0;
 	const [catalog, setCatalog] = useState<CatalogEntry[] | null>(null);
+	const [catalogError, setCatalogError] = useState<string | null>(null);
+	const [catalogAttempt, setCatalogAttempt] = useState(0);
 	const [addOpen, setAddOpen] = useState(false);
+	const [addRevision, setAddRevision] = useState(0);
 	const [addExtensionId, setAddExtensionId] = useState("");
 	const [addConfig, setAddConfig] = useState<Record<string, unknown>>({});
 	const [addSecrets, setAddSecrets] = useState<Record<string, string>>({});
 	const [addActivation, setAddActivation] = useState<"default" | ToolActivation>("default");
 	const [adding, setAdding] = useState(false);
+	const bindingRefreshSequence = useRef(0);
 
 	const refresh = useCallback(() => {
+		const sequence = ++bindingRefreshSequence.current;
 		listAgentBindings(agent.name)
-			.then((data) => setBindings(data.bindings))
-			.catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)));
+			.then((data) => {
+				if (sequence !== bindingRefreshSequence.current) return;
+				setBindingSnapshot(data);
+				setBindingError(null);
+			})
+			.catch((err: unknown) => { if (sequence === bindingRefreshSequence.current) setBindingError(err instanceof Error ? err.message : String(err)); });
 	}, [agent.name]);
 
+	const retryBindings = () => {
+		setBindingError(null);
+		setBindingSnapshot(null);
+		refresh();
+	};
+	const retryCatalog = () => {
+		setCatalog(null);
+		setCatalogError(null);
+		setCatalogAttempt((attempt) => attempt + 1);
+	};
+
 	useEffect(() => {
+		let cancelled = false;
 		refresh();
 		listExtensionCatalog("capability")
-			.then(setCatalog)
-			.catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)));
-	}, [refresh, agent.extensionRevision]);
+			.then((entries) => { if (!cancelled) { setCatalog(entries); setCatalogError(null); } })
+			.catch((err: unknown) => { if (!cancelled) setCatalogError(err instanceof Error ? err.message : String(err)); });
+		return () => { cancelled = true; bindingRefreshSequence.current += 1; };
+	}, [refresh, agent.extensionRevision, catalogAttempt]);
 
-	const entryOf = (extensionId: string) => catalog?.find((e) => e.manifest.id === extensionId);
+	const catalogKnown = catalog !== null && !catalogError;
+	const entryOf = (extensionId: string) => catalogKnown ? catalog.find((e) => e.manifest.id === extensionId) : undefined;
 
 	// “添加 Extension”只列 kind=capability 且与当前 connectorId 兼容的项（§10.1）。
 	// pinned Manager 的宿主也是 pi；compatibleConnectors 缺省视为兼容全部。
-	const addable = (catalog ?? []).filter((entry) => {
+	const addable = (catalogKnown && bindings !== null ? catalog : []).filter((entry) => {
 		if (!entry.installed || !entry.loaded || entry.manifest.kind !== "capability") return false;
 		if ((bindings ?? []).some((b) => b.extensionId === entry.manifest.id)) return false;
 		const compatible = entry.manifest.capability.compatibleConnectors;
@@ -1059,6 +1172,7 @@ export function BindingsSection({
 		setAdding(true);
 		try {
 			const res = await addAgentBinding(agent.name, {
+				expectedRevision: addRevision,
 				extensionId: addEntry.manifest.id,
 				capabilityId: addManifest.capability.id,
 				config: addConfig,
@@ -1069,8 +1183,9 @@ export function BindingsSection({
 			refresh();
 			resetAdd();
 			setAddOpen(false);
-			toast.success(`已绑定「${addManifest.displayName}」`);
+			if (!warnIfCredentialMutationNeedsReview(res)) toast.success(`已绑定「${addManifest.displayName}」`);
 		} catch (err) {
+			if (err instanceof ApiConflictError) refresh();
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
 			setAdding(false);
@@ -1079,27 +1194,37 @@ export function BindingsSection({
 
 	return (
 		<div className="agent-plugin-section flex flex-col gap-3">
-			<section className="agent-plugin-overview">
-				<div className="agent-plugin-overview-icon"><PuzzleIcon className="size-5" /></div>
+			<section className="agent-config-card-head has-action">
 				<div className="min-w-0">
-					<div className="agent-plugin-overview-label">
-						<span>能力插件</span>
-						{bindings !== null ? <span className="agent-plugin-count">已绑定 {bindings.length} 个</span> : null}
-					</div>
-					<h2>{bindings === null ? "正在读取插件绑定" : bindings.length === 0 ? "尚未绑定能力插件" : "插件能力已接入"}</h2>
+					<h2>能力插件</h2>
 					<p>{agent.pinned
 						? "绑定后，Manager 可在 Pi 会话中使用插件提供的工具、CLI 与技能。"
 						: "这里只展示与当前 Worker 连接方式兼容的插件，绑定后由该 Worker 独立使用。"}</p>
+					<p>安装与更新在「扩展」中管理；此处添加、保存与启停会立即提交。</p>
 				</div>
+				<div className="agent-config-section-actions">
+					{bindings !== null ? <span className="agent-config-muted-note">已绑定 {bindings.length} 个</span> : null}
 				{addOpen ? <span className="agent-plugin-mode">正在添加插件</span> : (
-					<Button type="button" size="sm" disabled={bindings === null || catalog === null} onClick={() => setAddOpen(true)}>
+						<Button type="button" size="sm" disabled={bindings === null || !catalogKnown} onClick={() => { setAddRevision(bindingRevision); setAddOpen(true); }}>
 						<PlusIcon className="size-3.5" />
 						添加插件
 					</Button>
-				)}
+					)}
+				</div>
 			</section>
 
-			{bindings === null ? (
+			{catalogError ? (
+				<div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-destructive">
+					<span>能力插件目录读取失败，无法确认安装状态：{catalogError}</span>
+					<Button type="button" size="sm" variant="outline" onClick={retryCatalog}>重试目录</Button>
+				</div>
+			) : null}
+			{bindingError ? (
+				<div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-destructive">
+					<span>插件绑定读取失败，当前绑定与版本无法确认：{bindingError}</span>
+					<Button type="button" size="sm" variant="outline" onClick={retryBindings}>重试绑定</Button>
+				</div>
+			) : bindings === null ? (
 				<div className="agent-plugin-loading flex items-center gap-2 text-sm text-muted-foreground">
 					<LoaderIcon className="size-4 animate-spin" />
 					正在读取插件绑定…
@@ -1110,17 +1235,20 @@ export function BindingsSection({
 						key={binding.id}
 						agent={agent}
 						binding={binding}
+					revision={bindingRevision}
 						entry={entryOf(binding.extensionId)}
+						catalogKnown={catalogKnown}
 						onMutation={(res) => {
 							onMutation(res);
 							refresh();
 						}}
+						onConflict={refresh}
 					/>
 				))
 			) : null}
 
 			{addOpen ? (
-				<div className="agent-config-card agent-plugin-add-card flex flex-col gap-3">
+				<div className="agent-config-card agent-plugin-add-card">
 					<div className="agent-plugin-add-head">
 						<div className="agent-plugin-add-icon"><PlusIcon className="size-4" /></div>
 						<div><h2>添加能力插件</h2><p>选择兼容插件并确认权限，添加后可继续配置和探测。</p></div>
@@ -1230,11 +1358,13 @@ export function StatusSection({
 	lastMutation,
 	onToggleEnabled,
 	toggling,
+	mutationBusy = false,
 }: {
 	agent: AgentConfig;
 	lastMutation: MutationResponse | null;
 	onToggleEnabled: (enabled: boolean) => Promise<void> | void;
 	toggling: boolean;
+	mutationBusy?: boolean;
 }) {
 	const [probe, setProbe] = useState<AgentProbeResult | null>(null);
 	const [probing, setProbing] = useState(false);
@@ -1277,7 +1407,7 @@ export function StatusSection({
 						type="button"
 						size="sm"
 						variant={agent.enabled !== false ? "outline" : "default"}
-						disabled={toggling}
+						disabled={toggling || mutationBusy}
 						onClick={() => void onToggleEnabled(agent.enabled === false)}
 					>
 						{toggling ? <LoaderIcon className="size-3.5 animate-spin" /> : agent.enabled !== false ? <PauseCircleIcon className="size-3.5" /> : <PlayIcon className="size-3.5" />}

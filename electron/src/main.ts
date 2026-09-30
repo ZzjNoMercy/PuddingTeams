@@ -11,6 +11,7 @@ import {
 	parseManagedServerState,
 	resolvePuddingTeamsHome,
 } from "./runtime.js";
+import { assertValidObsidianUri } from "./obsidian-uri.js";
 
 /**
  * PuddingTeams 桌面宿主。
@@ -31,6 +32,7 @@ const IPC = {
 	pickDirectory: "puddingteams:pick-directory",
 	revealInFinder: "puddingteams:reveal-in-finder",
 	openExternal: "puddingteams:open-external",
+	openInObsidian: "puddingteams:open-in-obsidian",
 } as const;
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
@@ -329,6 +331,19 @@ function registerIpc(): void {
 		if (typeof url !== "string") return;
 		const parsed = new URL(url);
 		if (parsed.protocol === "https:" || parsed.protocol === "http:") await shell.openExternal(parsed.toString());
+	});
+	// T24：obsidian:// 走独立通道复核，openExternal 的 http/https 白名单不放开。
+	ipcMain.handle(IPC.openInObsidian, async (event, uri: unknown) => {
+		assertTrustedSender(event);
+		if (typeof uri !== "string") return { ok: false, error: "URI 必须是字符串" };
+		const check = assertValidObsidianUri(uri);
+		if (!check.ok) return { ok: false, error: check.error };
+		try {
+			await shell.openExternal(uri);
+			return { ok: true };
+		} catch (error) {
+			return { ok: false, error: error instanceof Error ? error.message : String(error) };
+		}
 	});
 }
 

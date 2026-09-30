@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { abortSession, fetchMessages, sendMessage, sessionWsUrl, type MessageAttachmentInput } from "@/lib/api";
+import { abortSession, fetchMessages, sendMessage, sessionWsUrl, MessageDeliveryUnconfirmedError, MessageOperationRejectedError, SessionMessagesError, type MessageAttachmentInput } from "@/lib/api";
+import { ChatSendIntentChangedError, clearChatSendOperation, reserveChatSendOperation } from "@/lib/chat-send-operation";
 import { applyRecoveredToolResults, markRunningToolCalls, reducePiEvent, renderHistory, replayPiEvents } from "@/lib/events";
 import type { ChatMessage, ChatStatus, PiMessage } from "@/lib/types";
 
@@ -11,6 +12,8 @@ const historyCache = new Map<string, ChatMessage[]>();
 interface HistorySnapshot {
 	messages: ChatMessage[];
 	hasRunning: boolean;
+	unansweredUserMessage: boolean;
+	unfinishedAssistantTurn: boolean;
 }
 
 function rememberHistory(sessionId: string, messages: ChatMessage[]): ChatMessage[] {
@@ -25,12 +28,14 @@ function rememberHistory(sessionId: string, messages: ChatMessage[]): ChatMessag
 }
 
 async function loadHistorySnapshot(sessionId: string): Promise<HistorySnapshot> {
-	const { messages, runningToolCallIds, recoveredToolResults } = await fetchMessages(sessionId);
+	const { messages, running, unansweredUserMessage, unfinishedAssistantTurn, runningToolCallIds, recoveredToolResults } = await fetchMessages(sessionId);
 	const rendered = renderHistory(messages as PiMessage[]);
 	const reconciled = markRunningToolCalls(applyRecoveredToolResults(rendered, recoveredToolResults), runningToolCallIds);
 	return {
 		messages: reconciled,
-		hasRunning: reconciled.some((message) => message.toolCalls.some((call) => call.status === "running")),
+		hasRunning: running || reconciled.some((message) => message.toolCalls.some((call) => call.status === "running")),
+		unansweredUserMessage,
+		unfinishedAssistantTurn,
 	};
 }
 
@@ -46,10 +51,18 @@ export function useChat(sessionId: string) {
 	const cachedHistory = historyCache.get(sessionId);
 	const [messages, setMessages] = useState<ChatMessage[]>(() => cachedHistory ?? []);
 	const [historyLoading, setHistoryLoading] = useState(() => !cachedHistory);
+	const [historyLoaded, setHistoryLoaded] = useState(false);
 	const [status, setStatus] = useState<ChatStatus>("connecting");
 	const [running, setRunning] = useState(() => cachedHistory?.some((message) => message.toolCalls.some((call) => call.status === "running")) ?? false);
+	const [unansweredUserMessage, setUnansweredUserMessage] = useState(false);
+	const [unfinishedAssistantTurn, setUnfinishedAssistantTurn] = useState(false);
+	const [sending, setSending] = useState(false);
+	const sendingRef = useRef(false);
+	const connectionReadyRef = useRef(false);
+	const goneRef = useRef(false);
 	const [stopping, setStopping] = useState(false);
 	const [error, setError] = useState<string | null>(null);
+	const [unconfirmedOperation, setUnconfirmedOperation] = useState<{ key: string; historyReviewed: boolean } | null>(null);
 	const wsRef = useRef<WebSocket | null>(null);
 	const stoppingRef = useRef(false);
 	const activityVersionRef = useRef(0);
@@ -75,21 +88,35 @@ export function useChat(sessionId: string) {
 		wsEventsRef.current = wsEventsRef.current.filter((entry) => entry.seq > cutoffSeq);
 		rememberHistory(sessionId, messages);
 		setMessages(messages);
+		setUnansweredUserMessage(snapshot.unansweredUserMessage);
+		setUnfinishedAssistantTurn(snapshot.unfinishedAssistantTurn);
 		return {
 			messages,
-			hasRunning: messages.some((message) => message.toolCalls.some((call) => call.status === "running")),
+			hasRunning: snapshot.hasRunning || messages.some((message) => message.toolCalls.some((call) => call.status === "running")),
+			unansweredUserMessage: snapshot.unansweredUserMessage,
+			unfinishedAssistantTurn: snapshot.unfinishedAssistantTurn,
 		};
+	}, [sessionId]);
+	const markGone = useCallback(() => {
+		goneRef.current = true;
+		connectionReadyRef.current = false;
+		snapshotRequestRef.current += 1;
+		activeSnapshotRequestRef.current = null;
+		wsEventsRef.current = [];
+		historyCache.delete(sessionId);
+		setStatus("gone");
+		setError("会话不存在或已被删除");
+		if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.close();
 	}, [sessionId]);
 
 	useEffect(() => {
 		if (!sessionId) return;
+		connectionReadyRef.current = false;
+		goneRef.current = false;
 		let disposed = false;
-		// Set when the server says the session does not exist (HTTP 404 on
-		// /messages or WS close code 4404): stop reconnecting — retrying
-		// would just loop the same failure forever.
-		let gone = false;
 		let attempt = 0;
 		let retryTimer: ReturnType<typeof setTimeout> | null = null;
+		let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
 		let historyReadyFrame: number | null = null;
 
 		const markHistoryReady = () => {
@@ -99,65 +126,77 @@ export function useChat(sessionId: string) {
 			});
 		};
 
-		const loadHistory = (initial = false) => {
+		const loadHistory = (): Promise<boolean> => {
 			const activityVersion = activityVersionRef.current;
 			const { requestId, baselineSeq } = beginHistorySnapshot();
 			return loadHistorySnapshot(sessionId)
 				.then((snapshot) => {
-					if (!disposed && snapshotRequestRef.current === requestId) {
+					const applied = !disposed && snapshotRequestRef.current === requestId;
+					if (applied) {
 						const merged = applyHistorySnapshot(snapshot, baselineSeq);
+						setHistoryLoaded(true);
 						activeSnapshotRequestRef.current = null;
 						// A WS start/settled event arriving after this request began is
 						// newer than the HTTP snapshot and must win the running flag race.
 						if (activityVersionRef.current === activityVersion) setRunning(merged.hasRunning);
+						markHistoryReady();
 					}
-					if (initial) markHistoryReady();
+					return applied;
 				})
 				.catch((err: unknown) => {
-					if (snapshotRequestRef.current === requestId) activeSnapshotRequestRef.current = null;
+					if (disposed || snapshotRequestRef.current !== requestId) return false;
+					activeSnapshotRequestRef.current = null;
 					const message = err instanceof Error ? err.message : String(err);
-					if (message.endsWith(": 404")) {
-						gone = true;
-						historyCache.delete(sessionId);
-						if (!disposed) {
-							setStatus("gone");
-							setError("会话不存在或已被删除");
-						}
-					} else if (!disposed) {
+					if (err instanceof SessionMessagesError && err.status === 404) {
+						markGone();
+					} else {
 						setError(message);
 					}
-					if (initial) markHistoryReady();
+					markHistoryReady();
+					return false;
 				});
 		};
 
-		void loadHistory(true);
+		void loadHistory();
 
 		const connect = () => {
-			if (disposed || gone) return;
+			if (disposed || goneRef.current) return;
 			setStatus(attempt === 0 ? "connecting" : "reconnecting");
 			const ws = new WebSocket(sessionWsUrl(sessionId));
 			wsRef.current = ws;
-
+			let sessionReady = false;
 			ws.onopen = () => {
-				if (disposed) return;
-				const wasReconnect = attempt > 0;
-				attempt = 0;
-				setStatus("connected");
-				// Re-align with the server after a drop: events emitted while the
-				// socket was down were never delivered. Reset the running flag —
-				// if a turn is still live, the reloaded history + new events
-				// restore an accurate view.
-				if (wasReconnect) {
-					activityVersionRef.current += 1;
-					setRunning(false);
-					void loadHistory();
-				}
+				if (goneRef.current) { ws.close(); return; }
+				handshakeTimer = setTimeout(() => {
+					if (!sessionReady && ws.readyState === WebSocket.OPEN) ws.close();
+				}, 15000);
 			};
 			ws.onmessage = (m) => {
+				if (goneRef.current) return;
 				let event: { type: string; [k: string]: unknown };
 				try {
 					event = JSON.parse(m.data as string);
 				} catch {
+					return;
+				}
+				if (event.type === "session_ready") {
+					if (sessionReady) return;
+					sessionReady = true;
+					if (handshakeTimer) clearTimeout(handshakeTimer);
+					handshakeTimer = null;
+					// The server sends ready immediately before subscribing to pi
+					// events. By the time this frame is handled, that subscription is
+					// active; the new snapshot can replay every later WS event.
+					void loadHistory().then((loaded) => {
+						if (disposed || wsRef.current !== ws || ws.readyState !== WebSocket.OPEN) return;
+						if (!loaded) {
+							ws.close(); // Retry the snapshot through the normal reconnect path.
+							return;
+						}
+						attempt = 0;
+						connectionReadyRef.current = true;
+						setStatus("connected");
+					});
 					return;
 				}
 				messageEventSeqRef.current += 1;
@@ -176,16 +215,16 @@ export function useChat(sessionId: string) {
 			};
 			ws.onclose = (ev) => {
 				if (disposed) return;
-				// A dropped socket can't deliver agent_settled; unblock the UI
-				// so the user isn't stuck with a permanently disabled input.
-				setRunning(false);
+				if (handshakeTimer) clearTimeout(handshakeTimer);
+				handshakeTimer = null;
+				connectionReadyRef.current = false;
+				// Preserve the last running state until a fresh server snapshot arrives.
 				if (ev.code === 4404) {
 					// Server says the session is gone — do not retry.
-					gone = true;
-					setStatus("gone");
-					setError("会话不存在或已被删除");
+					markGone();
 					return;
 				}
+				if (goneRef.current) return;
 				// Exponential backoff: 1s, 2s, 4s, … capped at 15s. Retries never
 				// stop; after a few failures the UI switches to the "disconnected"
 				// hint while reconnecting continues in the background.
@@ -199,7 +238,9 @@ export function useChat(sessionId: string) {
 
 		return () => {
 			disposed = true;
+			connectionReadyRef.current = false;
 			if (retryTimer) clearTimeout(retryTimer);
+			if (handshakeTimer) clearTimeout(handshakeTimer);
 			if (historyReadyFrame !== null) cancelAnimationFrame(historyReadyFrame);
 			const ws = wsRef.current;
 			wsRef.current = null;
@@ -217,23 +258,82 @@ export function useChat(sessionId: string) {
 				ws.close();
 			}
 		};
-	}, [applyHistorySnapshot, beginHistorySnapshot, sessionId]);
+	}, [applyHistorySnapshot, beginHistorySnapshot, markGone, sessionId]);
 
 	const send = useCallback(
 		async (text: string, attachments: MessageAttachmentInput[] = []) => {
 			const content = text.trim();
-			if ((!content && attachments.length === 0) || running) return;
+			if (!content && attachments.length === 0) throw new Error("请输入消息或添加附件");
+			if (!connectionReadyRef.current) throw new Error("连接正在恢复，请稍后重试");
+			if (running || sendingRef.current) throw new Error("当前会话正在处理消息，请等待后重试");
+			sendingRef.current = true;
+			setSending(true);
 			setError(null);
+			let operationId: string | undefined;
 			try {
-				await sendMessage(sessionId, content, attachments);
+				operationId = await reserveChatSendOperation(sessionId, content, attachments);
+				await sendMessage(sessionId, content, attachments, operationId);
+				clearChatSendOperation(sessionId, operationId);
+				setUnconfirmedOperation(null);
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
 				setError(message);
+				if (operationId && err instanceof MessageOperationRejectedError) {
+					clearChatSendOperation(sessionId, operationId);
+					setUnconfirmedOperation(null);
+				}
+				if (err instanceof ChatSendIntentChangedError) {
+					setUnconfirmedOperation((current) => current?.key === err.key ? current : { key: err.key, historyReviewed: false });
+				}
+				if (operationId && err instanceof MessageDeliveryUnconfirmedError) {
+					setUnconfirmedOperation({ key: operationId, historyReviewed: false });
+				}
 				throw err;
+			} finally {
+				sendingRef.current = false;
+				setSending(false);
 			}
 		},
 		[sessionId, running],
 	);
+
+	/** Reconcile durable history with WebSocket events before a viewer acknowledges a room revision. */
+	const refreshHistory = useCallback(async (): Promise<boolean> => {
+		if (goneRef.current) return false;
+		const activityVersion = activityVersionRef.current;
+		const { requestId, baselineSeq } = beginHistorySnapshot();
+		try {
+			const snapshot = await loadHistorySnapshot(sessionId);
+			if (snapshotRequestRef.current !== requestId) return false;
+			const merged = applyHistorySnapshot(snapshot, baselineSeq);
+			activeSnapshotRequestRef.current = null;
+			setHistoryLoaded(true);
+			if (activityVersionRef.current === activityVersion) setRunning(merged.hasRunning);
+			return true;
+		} catch (err) {
+			if (snapshotRequestRef.current === requestId) {
+				activeSnapshotRequestRef.current = null;
+				if (err instanceof SessionMessagesError && err.status === 404) markGone();
+			}
+			return false;
+		}
+	}, [applyHistorySnapshot, beginHistorySnapshot, markGone, sessionId]);
+
+	const reviewUnconfirmedHistory = useCallback(async (): Promise<boolean> => {
+		const key = unconfirmedOperation?.key;
+		if (!key) return false;
+		const refreshed = await refreshHistory();
+		if (refreshed) setUnconfirmedOperation((current) => current?.key === key ? { ...current, historyReviewed: true } : current);
+		return refreshed;
+	}, [refreshHistory, unconfirmedOperation?.key]);
+
+	const startNewMessageIntent = useCallback((): boolean => {
+		if (!unconfirmedOperation?.historyReviewed || sendingRef.current) return false;
+		clearChatSendOperation(sessionId, unconfirmedOperation.key);
+		setUnconfirmedOperation(null);
+		setError(null);
+		return true;
+	}, [sessionId, unconfirmedOperation]);
 
 	const stop = useCallback(async () => {
 		if (stoppingRef.current) throw new Error("停止请求正在处理中");
@@ -267,5 +367,5 @@ export function useChat(sessionId: string) {
 		}
 	}, [applyHistorySnapshot, beginHistorySnapshot, sessionId]);
 
-	return { messages, historyLoading, status, running, stopping, error, send, stop };
+	return { messages, historyLoading, historyLoaded, status, running, unansweredUserMessage, unfinishedAssistantTurn, sending, stopping, error, unconfirmedOperation, send, stop, refreshHistory, reviewUnconfirmedHistory, startNewMessageIntent };
 }

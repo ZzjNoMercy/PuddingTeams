@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { acquireLease, ensurePaths, puddingTeamsHomeId, resolvePuddingTeamsPaths } from "./paths.js";
@@ -24,6 +24,14 @@ test("缺省根解析为 <home>/.puddingteams，目录树按文档 §4 派生", 
 	assert.equal(paths.extensions, "/tmp/pt-user/.puddingteams/extensions");
 	assert.equal(paths.uploads, "/tmp/pt-user/.puddingteams/uploads");
 	assert.equal(paths.artifactBlobs, "/tmp/pt-user/.puddingteams/artifacts/blobs");
+	assert.equal(paths.knowledgeState, "/tmp/pt-user/.puddingteams/state/knowledge");
+	assert.equal(paths.knowledgeAcceptance, "/tmp/pt-user/.puddingteams/state/knowledge/acceptance");
+	assert.equal(paths.knowledgePlans, "/tmp/pt-user/.puddingteams/state/knowledge/plans");
+	assert.equal(paths.knowledgeReviews, "/tmp/pt-user/.puddingteams/state/knowledge/reviews");
+	assert.equal(paths.knowledgeOperations, "/tmp/pt-user/.puddingteams/state/knowledge/operations");
+	assert.equal(paths.knowledgeObjects, "/tmp/pt-user/.puddingteams/knowledge/objects");
+	assert.equal(paths.knowledgeCache, "/tmp/pt-user/.puddingteams/cache/knowledge");
+	assert.equal(paths.calendarState, "/tmp/pt-user/.puddingteams/state/calendar");
 	assert.equal(paths.managedWorkspaces, "/tmp/pt-user/.puddingteams/workspaces/managed");
 	assert.equal(paths.unscopedWorkspace, "/tmp/pt-user/.puddingteams/workspaces/unscoped");
 	assert.equal(paths.secrets, "/tmp/pt-user/.puddingteams/secrets");
@@ -59,6 +67,14 @@ test("ensurePaths 建出完整目录树", async () => {
 		path.join(paths.assets, "avatars"),
 		paths.uploads,
 		paths.artifactBlobs,
+		paths.knowledgeState,
+		paths.knowledgeAcceptance,
+		paths.knowledgePlans,
+		paths.knowledgeReviews,
+		paths.knowledgeOperations,
+		paths.knowledgeObjects,
+		paths.knowledgeCache,
+		paths.calendarState,
 		paths.managedWorkspaces,
 		paths.unscopedWorkspace,
 		paths.secrets,
@@ -85,17 +101,32 @@ test("Lease：存活实例持有时第二个实例拒绝启动", async () => {
 test("Lease：stale（进程已死）自动回收重建", async () => {
 	const paths = resolvePuddingTeamsPaths({ PUDDINGTEAMS_HOME: freshHome() });
 	await ensurePaths(paths);
-	const leaseFile = path.join(paths.runtime, "backend.lease");
+	const leaseDirectory = path.join(paths.runtime, "backend.leases");
+	mkdirSync(leaseDirectory, { recursive: true });
+	const leaseFile = path.join(leaseDirectory, "99999999-00000000-0000-4000-8000-000000000000.json");
 	// 99999999 超出常见 pid_max，必然不存在。
 	writeFileSync(leaseFile, JSON.stringify({ pid: 99_999_999, startedAt: "2026-01-01T00:00:00Z" }) + "\n");
 	const release = await acquireLease(paths);
+	assert.equal(existsSync(leaseFile), false);
 	await release();
 });
 
-test("Lease：内容损坏视为 stale 回收", async () => {
+test("Lease：遗留单文件存在时安全拒绝，不删除未知旧实例的凭据", async () => {
 	const paths = resolvePuddingTeamsPaths({ PUDDINGTEAMS_HOME: freshHome() });
 	await ensurePaths(paths);
-	writeFileSync(path.join(paths.runtime, "backend.lease"), "not json\n");
-	const release = await acquireLease(paths);
-	await release();
+	const legacyFile = path.join(paths.runtime, "backend.lease");
+	writeFileSync(legacyFile, "not json\n");
+	await assert.rejects(() => acquireLease(paths), /旧版后端 lease/);
+	assert.equal(existsSync(legacyFile), true);
+});
+
+test("Lease：同时竞选同一 Home 最多一个取得资格，释放只删除自己的文件", async () => {
+	const paths = resolvePuddingTeamsPaths({ PUDDINGTEAMS_HOME: freshHome() });
+	await ensurePaths(paths);
+	const results = await Promise.allSettled([acquireLease(paths), acquireLease(paths)]);
+	const winners = results.filter((result): result is PromiseFulfilledResult<() => Promise<void>> => result.status === "fulfilled");
+	assert.ok(winners.length <= 1);
+	for (const winner of winners) await winner.value();
+	const next = await acquireLease(paths);
+	await next();
 });

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseExtensionManifest, ExtensionCatalog, EXTENSION_MANIFEST_FILE } from "./extensions.js";
@@ -93,6 +93,10 @@ function writeExtension(dir: string, manifest: Record<string, unknown>, entryCod
 }
 
 test("Phase5: manifest 校验——禁止混包、kind/engines/permissions 必须合法", () => {
+	for (const id of ["../escape", "a/b", "a\\b", "..", "A-Upper"]) {
+		assert.throws(() => parseExtensionManifest({ ...connectorManifest(), id }), /manifest.id/);
+	}
+	assert.throws(() => parseExtensionManifest({ ...connectorManifest(), version: "../escape" }), /manifest.version/);
 	// 混包禁止（§10）。
 	assert.throws(() => parseExtensionManifest({ ...capabilityManifest(), connector: {} }), /同时贡献/);
 	// kind 判别。
@@ -325,6 +329,10 @@ test("Phase5: 更新与版本固定——pin 不匹配拒绝，不静默换版",
 	const updated = await registry.update("cap-ext", { versionPin: "1.1.0" });
 	assert.equal(updated.version, "1.1.0");
 	assert.equal(updated.versionPin, "1.1.0");
+	writeExtension(extDir, capabilityManifest("1.2.0"), CAPABILITY_ENTRY);
+	const unpinned = await registry.update("cap-ext", { versionPin: "" });
+	assert.equal(unpinned.version, "1.2.0", "空字符串应解除 pin 并允许目录的新版本");
+	assert.equal(unpinned.versionPin, undefined);
 });
 
 test("P3-0: Extension 更新加载失败时旧版本保持 active 且持久化记录不变", async () => {
@@ -511,7 +519,7 @@ test("P4: user 安装——复制到 packages/<id>/<version>/、记录 digest，
 	const dir = freshDir("pt-user-install-");
 	const drivers = new DriverRegistry();
 	const registry = new ExtensionRegistry(dir, new ExtensionCatalog(), drivers);
-	await registry.init();
+	await registry.init({ developerMode: true });
 
 	const src = writeExtension(path.join(dir, "src-conn"), connectorManifest(), CONNECTOR_ENTRY);
 	const entry = await registry.installUserPackage(src);
@@ -535,14 +543,39 @@ test("P4: user 安装——复制到 packages/<id>/<version>/、记录 digest，
 	// 复制语义而非链接：源目录删除后重启仍能加载。
 	rmSync(src, { recursive: true, force: true });
 	const registry2 = new ExtensionRegistry(dir, new ExtensionCatalog(), new DriverRegistry());
-	await registry2.init();
+	await registry2.init({ developerMode: true });
 	assert.equal(registry2.get("conn-ext")?.loaded, true);
+});
+
+test("P4: 普通模式拒绝用户代码包执行，关闭开发者模式立即卸载并阻断冷启动", async () => {
+	const dir = freshDir("pt-user-code-gate-");
+	const marker = path.join(dir, "entry-ran");
+	const src = writeExtension(path.join(dir, "source"), connectorManifest(),
+		`import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "ran");\n${CONNECTOR_ENTRY}`);
+	const drivers = new DriverRegistry();
+	const registry = new ExtensionRegistry(dir, new ExtensionCatalog(), drivers);
+	await registry.init();
+	await assert.rejects(() => registry.installUserPackage(src), /开发者模式/);
+	assert.equal(existsSync(marker), false, "拒绝必须发生在模块 import 前");
+	assert.equal(existsSync(path.join(dir, "packages")), false, "拒绝前不得复制用户代码");
+	await registry.setDeveloperMode(true);
+	await registry.installUserPackage(src);
+	assert.equal(existsSync(marker), true);
+	assert.ok(drivers.create("conn-ext", "spawn", {}));
+	await registry.setDeveloperMode(false);
+	assert.equal(registry.get("conn-ext")?.loaded, false);
+	assert.equal(drivers.create("conn-ext", "spawn", {}), undefined);
+	const restartedDrivers = new DriverRegistry();
+	const restarted = new ExtensionRegistry(dir, new ExtensionCatalog(), restartedDrivers);
+	await restarted.init();
+	assert.equal(restarted.get("conn-ext")?.loaded, false);
+	assert.equal(restartedDrivers.create("conn-ext", "spawn", {}), undefined);
 });
 
 test("P4: user 安装失败——校验/激活失败不留包目录与记录残留", async () => {
 	const dir = freshDir("pt-user-fail-");
 	const registry = new ExtensionRegistry(dir, new ExtensionCatalog(), new DriverRegistry(), "1.0.0");
-	await registry.init();
+	await registry.init({ developerMode: true });
 
 	// engines 校验失败：发生在 staging 之前，packages 目录都不应出现。
 	const badEngines = writeExtension(
@@ -571,7 +604,7 @@ test("P4: user 更新——staging 原子切换；失败保留旧版本目录/�
 	const dir = freshDir("pt-user-update-");
 	const drivers = new DriverRegistry();
 	const registry = new ExtensionRegistry(dir, new ExtensionCatalog(), drivers);
-	await registry.init();
+	await registry.init({ developerMode: true });
 	const v1 = writeExtension(path.join(dir, "v1"), connectorManifest("1.0.0"), CONNECTOR_ENTRY);
 	await registry.installUserPackage(v1);
 
@@ -654,7 +687,7 @@ test("P4: 三态互不静默覆盖——bundled/user/local-link 同 id 冲突拒
 	// bundled 预装与 user 同 id → 拒绝；local-link 与 user 同 id → 拒绝。
 	const dir2 = freshDir("pt-origin-conflict2-");
 	const registry2 = new ExtensionRegistry(dir2, new ExtensionCatalog(), new DriverRegistry());
-	await registry2.init();
+	await registry2.init({ developerMode: true });
 	await registry2.installUserPackage(writeExtension(path.join(dir2, "user"), connectorManifest(), CONNECTOR_ENTRY));
 	await assert.rejects(
 		() => registry2.installOrUpdateFromDir(writeExtension(path.join(dir2, "bundled"), connectorManifest(), CONNECTOR_ENTRY)),
@@ -704,6 +737,27 @@ test("P4: bundled 预装按发行投影自愈 sourcePath——旧绝对路径失
 	assert.equal(persisted.extensions[0]!.sourcePath, dirB, "sourcePath 必须自愈为重新解析的投影路径");
 });
 
+test("T03: cold startup never imports a persisted bundled path before the current release projects it", async () => {
+	const home = freshDir("pt-bundled-startup-gate-");
+	const marker = path.join(home, "old-import-ran");
+	const oldDir = writeExtension(path.join(home, "old"), connectorManifest(),
+		`import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "ran");\n${CONNECTOR_ENTRY}`);
+	writeFileSync(path.join(home, "registry.json"), JSON.stringify({ version: 1, extensions: [{
+		manifest: connectorManifest(), origin: "bundled", sourcePath: oldDir,
+		installedAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", version: "1.0.0",
+	}] }));
+	const drivers = new DriverRegistry();
+	const registry = new ExtensionRegistry(home, new ExtensionCatalog(), drivers);
+	await registry.init({ bundledIds: ["conn-ext"] });
+	assert.equal(existsSync(marker), false, "persisted old source must not execute at startup");
+	assert.equal(registry.get("conn-ext")?.loaded, false);
+	const current = writeExtension(path.join(home, "current"), connectorManifest(), CONNECTOR_ENTRY);
+	await registry.installOrUpdateFromDir(current);
+	assert.equal(existsSync(marker), false);
+	assert.equal(registry.get("conn-ext")?.loaded, true);
+	assert.ok(await registry.attestBundledDriver("conn-ext", drivers.create("conn-ext", "spawn")!));
+});
+
 test("P4: 退出发行物的 bundled Extension 在启动时自动移除", async () => {
 	const dir = freshDir("pt-bundled-retired-");
 	const registry = new ExtensionRegistry(dir, new ExtensionCatalog(), new DriverRegistry());
@@ -721,7 +775,7 @@ test("P4: 退出发行物的 bundled Extension 在启动时自动移除", async 
 test("P4: 卸载——user 包删除 packages 目录；bundled 拒绝卸载", async () => {
 	const dir = freshDir("pt-uninstall-user-");
 	const registry = new ExtensionRegistry(dir, new ExtensionCatalog(), new DriverRegistry());
-	await registry.init();
+	await registry.init({ developerMode: true });
 	await registry.installUserPackage(writeExtension(path.join(dir, "user"), connectorManifest(), CONNECTOR_ENTRY));
 	assert.ok(existsSync(path.join(dir, "packages", "conn-ext")));
 	await registry.uninstall("conn-ext");
@@ -733,4 +787,46 @@ test("P4: 卸载——user 包删除 packages 目录；bundled 拒绝卸载", as
 	await registry2.init();
 	await registry2.installOrUpdateFromDir(writeExtension(path.join(dir2, "bundled"), connectorManifest(), CONNECTOR_ENTRY));
 	await assert.rejects(() => registry2.uninstall("conn-ext"), /不可卸载/);
+});
+
+test("T03: bundled Driver attestation follows loaded factory generation and package bytes", async () => {
+	const dir = freshDir("pt-bundled-attestation-");
+	const packageDir = writeExtension(path.join(dir, "bundled"), connectorManifest(), CONNECTOR_ENTRY);
+	const drivers = new DriverRegistry();
+	const registry = new ExtensionRegistry(path.join(dir, "registry"), new ExtensionCatalog(), drivers);
+	await registry.init();
+	await registry.installOrUpdateFromDir(packageDir);
+	const first = drivers.create("conn-ext", "spawn");
+	assert.ok(first);
+	const firstDigest = await registry.attestBundledDriver("conn-ext", first);
+	assert.match(firstDigest ?? "", /^[a-f0-9]{64}$/);
+	assert.equal(await registry.attestBundledDriver("conn-ext", { ...first }), undefined, "self-reported Driver shape is not provenance");
+	writeFileSync(path.join(packageDir, "index.mjs"), `${CONNECTOR_ENTRY}\n// changed package bytes\n`);
+	assert.equal(await registry.attestBundledDriver("conn-ext", first), undefined, "changed bytes invalidate the active package");
+	await registry.installOrUpdateFromDir(packageDir);
+	const second = drivers.create("conn-ext", "spawn");
+	assert.ok(second);
+	const secondDigest = await registry.attestBundledDriver("conn-ext", second);
+	assert.match(secondDigest ?? "", /^[a-f0-9]{64}$/);
+	assert.notEqual(secondDigest, firstDigest);
+	assert.equal(await registry.attestBundledDriver("conn-ext", first), undefined, "old factory instance is stale");
+	drivers.registerFactory("conn-ext", () => second, "conn-ext");
+	assert.equal(await registry.attestBundledDriver("conn-ext", second), undefined, "out-of-band factory replacement is not trusted");
+	const linked = writeExtension(path.join(dir, "linked"), connectorManifest(), CONNECTOR_ENTRY);
+	symlinkSync(path.join(linked, "index.mjs"), path.join(linked, "other.mjs"));
+	await assert.rejects(() => registry.installOrUpdateFromDir(linked), /unsupported package entry/, "a symlink cannot disappear from the package digest");
+});
+
+test("T03: loading developer code permanently taints compile attestation until process restart", async () => {
+	const dir = freshDir("pt-compile-process-taint-");
+	const drivers = new DriverRegistry();
+	const registry = new ExtensionRegistry(path.join(dir, "registry"), new ExtensionCatalog(), drivers);
+	await registry.init({ developerMode: true });
+	await registry.installOrUpdateFromDir(writeExtension(path.join(dir, "bundled"), connectorManifest(), CONNECTOR_ENTRY));
+	const driver = drivers.create("conn-ext", "spawn")!;
+	assert.ok(await registry.attestBundledDriver("conn-ext", driver));
+	await registry.installUserPackage(writeExtension(path.join(dir, "user"), capabilityManifest(), CAPABILITY_ENTRY));
+	assert.equal(await registry.attestBundledDriver("conn-ext", driver), undefined);
+	await registry.setDeveloperMode(false);
+	assert.equal(await registry.attestBundledDriver("conn-ext", driver), undefined, "unregister cannot undo code already executed in this process");
 });

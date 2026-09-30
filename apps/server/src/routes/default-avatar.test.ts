@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import Fastify from "fastify";
 import { TeamsStore } from "../store/teams.js";
 import { CredentialsStore } from "../store/credentials.js";
@@ -109,7 +110,9 @@ test("§11: avatar GET 回退链——包内默认 → 上传优先 → 删除�
 
 	// 3. 删除上传：回到包内默认。
 	const del = await app.inject({ method: "DELETE", url: "/api/agents/ava-worker/avatar" });
-	assert.equal(del.statusCode, 204);
+	assert.equal(del.statusCode, 200);
+	assert.equal(del.json().agent.name, "ava-worker");
+	assert.equal(del.json().agent.avatar, undefined);
 	const back = await app.inject({ method: "GET", url: "/api/agents/ava-worker/avatar" });
 	assert.equal(back.statusCode, 200);
 	assert.equal(back.headers["content-type"], "image/svg+xml");
@@ -201,4 +204,55 @@ test("§11: 首装把发行内置 Designer 头像复制到用户数据目录", a
 	const avatar = await teams.readAvatar("pi-b");
 	assert.equal(avatar?.mime, "image/webp");
 	assert.equal(avatar?.buf.toString("ascii"), "RIFFxxxxWEBP");
+});
+
+test("§11: Wiki 宿主狐狸默认在重启与删除上传后保留，普通 pi 和副本仍用 Connector 默认", async (t) => {
+	const dir = freshDir("pt-avatar-wiki-");
+	const bundledAssets = fileURLToPath(new URL("../../assets/", import.meta.url));
+	const fox = readFileSync(path.join(bundledAssets, "wiki-fox.png"));
+	const dirs = { state: path.join(dir, "state"), assets: path.join(dir, "assets"), managedWorkspaces: path.join(dir, "managed"), bundledAssets };
+	const registry = new ExtensionRegistry(dirs.state, new ExtensionCatalog(), new DriverRegistry());
+	registry.registerBuiltin(piConnectorManifest, {}, { assetsDir: bundledAssets });
+	await registry.init();
+	const teams = new TeamsStore(dirs, dir);
+	await teams.init();
+	const app = Fastify();
+	registerAgentsRoutes(app, teams, { extensions: registry });
+	t.after(async () => { await app.close(); rmSync(dir, { recursive: true, force: true }); });
+	const list = await app.inject({ method: "GET", url: "/api/agents" });
+	const wiki = list.json().agents.find((agent: { name: string }) => agent.name === "wiki");
+	assert.equal(wiki.hasDefaultAvatar, true);
+	assert.ok(wiki.defaultAvatarRevision, "宿主默认资源必须有版本，前端更新时绕过缓存中的 pi 图标");
+	assert.equal(wiki.avatar, undefined, "宿主默认不冒充用户上传");
+	const initial = await app.inject({ method: "GET", url: "/api/agents/wiki/avatar" });
+	assert.equal(initial.statusCode, 200);
+	assert.equal(initial.headers["content-type"], "image/png");
+	assert.deepEqual(initial.rawPayload, fox);
+
+	const upload = await app.inject({ method: "POST", url: "/api/agents/wiki/avatar", payload: { data: PNG_B64 } });
+	assert.equal(upload.statusCode, 200);
+	const uploadedList = await app.inject({ method: "GET", url: "/api/agents" });
+	assert.equal(uploadedList.json().agents.find((agent: { name: string }) => agent.name === "wiki").hasDefaultAvatar, true,
+		"上传后刷新列表仍告知默认头像，前端删除上传可立即恢复狐狸");
+	const uploaded = await app.inject({ method: "GET", url: "/api/agents/wiki/avatar" });
+	assert.deepEqual(uploaded.rawPayload, Buffer.from(PNG_B64, "base64"));
+	const removed = await app.inject({ method: "DELETE", url: "/api/agents/wiki/avatar" });
+	assert.equal(removed.statusCode, 200);
+	const restored = await app.inject({ method: "GET", url: "/api/agents/wiki/avatar" });
+	assert.deepEqual(restored.rawPayload, fox);
+
+	const reopened = new TeamsStore(dirs, dir);
+	await reopened.init();
+	const reopenedApp = Fastify();
+	registerAgentsRoutes(reopenedApp, reopened, { extensions: registry });
+	t.after(() => reopenedApp.close());
+	const persisted = await reopenedApp.inject({ method: "GET", url: "/api/agents/wiki/avatar" });
+	assert.deepEqual(persisted.rawPayload, fox);
+	const duplicate = await reopened.duplicateAgent("wiki");
+	assert.equal(duplicate.builtinId, undefined);
+	for (const name of ["manager", duplicate.name]) {
+		const ordinary = await reopenedApp.inject({ method: "GET", url: `/api/agents/${name}/avatar` });
+		assert.equal(ordinary.statusCode, 200);
+		assert.equal(ordinary.headers["content-type"], "image/svg+xml");
+	}
 });

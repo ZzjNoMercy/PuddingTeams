@@ -156,6 +156,7 @@ export interface ExtensionConnectionStatus {
 	version?: string;
 	accountName?: string;
 	identity?: string;
+	userAuthorization?: "authorized" | "expired" | "missing";
 	message?: string;
 	actions?: ExtensionConnectionAction[];
 	checkedAt: string;
@@ -164,6 +165,7 @@ export interface ExtensionConnectionStatus {
 export interface ExtensionConnectionAction {
 	id: string;
 	label: string;
+	kind?: "authorization";
 	description?: string;
 	confirmation?: {
 		title: string;
@@ -179,12 +181,27 @@ export interface ExtensionConnectionContext {
 	stateDir: string;
 }
 
+/** 仅公开授权入口与状态；设备码、token 永不进入此投影。 */
+export interface ExtensionAuthorizationSession {
+	id: string;
+	state: "pending" | "completed" | "failed" | "expired" | "cancelled";
+	verificationUrl?: string;
+	qrCodeDataUrl?: string;
+	expiresAt: string;
+	message?: string;
+}
+
 /** Capability Extension 运行时模块（当前进程内加载，隔离 Host 后迁入 Broker）。 */
 export interface CapabilityExtensionModule {
 	manifest: ExtensionManifest;
 	register(ctx: CapabilityRegistration): void | Promise<void>;
 	/** 可选：给绑定目标自身的 Pi Session 追加 Skills/CLI 环境与动态 probe。 */
 	runtime?: CapabilityRuntimeContribution;
+	authorization?: {
+		begin(connectionId: string, actionId: string, ctx: ExtensionConnectionContext): Promise<ExtensionAuthorizationSession>;
+		status(connectionId: string, sessionId: string, ctx: ExtensionConnectionContext): Promise<ExtensionAuthorizationSession | undefined>;
+		cancel(connectionId: string, sessionId: string, ctx: ExtensionConnectionContext): Promise<void>;
+	};
 	/** 可选：向扩展页贡献只读连接状态；不依赖 Agent binding。 */
 	listConnections?(ctx: ExtensionConnectionContext): ExtensionConnectionStatus[] | Promise<ExtensionConnectionStatus[]>;
 	/** 可选：执行连接卡声明的显式动作；探测本身不得隐式调用。 */
@@ -727,9 +744,13 @@ export function parseExtensionManifest(raw: unknown): PuddingTeamsExtensionManif
 		throw new Error("禁止一个 manifest 同时贡献 Connector 与 Capability（§10）");
 	}
 	const id = requireString(m.id, "id");
+	if (!/^[a-z0-9][a-z0-9._-]*$/.test(id) || id.includes("..")) {
+		throw new Error("manifest.id 只能使用小写字母、数字、点、下划线和连字符，且不能包含路径分隔符或 ..");
+	}
 	const publisher = requireString(m.publisher, "publisher");
 	const displayName = requireString(m.displayName, "displayName");
 	const version = requireString(m.version, "version");
+	if (semver.validRange(version) !== version) throw new Error("manifest.version 必须是合法的精确 semver 版本");
 	const source = m.source;
 	if (source !== "builtin" && source !== "trusted" && source !== "external") {
 		throw new Error('manifest.source 必须是 "builtin" | "trusted" | "external"');

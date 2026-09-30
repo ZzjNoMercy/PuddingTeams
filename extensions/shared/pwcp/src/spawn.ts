@@ -1,4 +1,7 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { readFile, realpath } from "node:fs/promises";
+import { isAbsolute } from "node:path";
 
 /** Cap on accumulated worker stdout so a runaway process can't OOM the server. */
 export const MAX_STDOUT = 2 * 1024 * 1024;
@@ -16,6 +19,8 @@ export interface SpawnResult {
 	lines: unknown[];
 	/** True when no stdout chunk arrived within `startupMs`. */
 	startupTimedOut: boolean;
+	/** Child exceeded the stdout budget; output and callbacks stopped. */
+	outputLimitExceeded: boolean;
 }
 
 export interface SpawnOptions {
@@ -34,6 +39,22 @@ export interface SpawnOptions {
 	/** First-event deadline: reject when no data arrives within startupMs. */
 	startupMs?: number;
 	onStdout?: (chunk: string) => void;
+	/** OS-enforced boundary for a host-issued protected CompileJob. */
+	protectedProcess?: {
+		commandPath: string;
+		commandSha256: string;
+		sandboxProfilePath: string;
+		sandboxProfileSha256: string;
+	};
+}
+
+async function assertPinnedFile(file: string, expectedSha256: string): Promise<Buffer> {
+	if (!isAbsolute(file) || !/^[a-f0-9]{64}$/.test(expectedSha256)) throw new Error("protected process identity is invalid");
+	if (await realpath(file) !== file) throw new Error("protected process path must be canonical");
+	const bytes = await readFile(file);
+	const actual = createHash("sha256").update(bytes).digest("hex");
+	if (actual !== expectedSha256) throw new Error("protected process identity changed");
+	return bytes;
 }
 
 /**
@@ -56,7 +77,20 @@ export async function spawnWorker(opts: SpawnOptions): Promise<SpawnResult> {
 		startupMs = 30_000,
 		onStdout,
 	} = opts;
-	const proc = spawn(command, args, { cwd, shell: false, stdio: ["pipe", "pipe", "pipe"], env });
+	let launchCommand = command;
+	let launchArgs = args;
+	if (opts.protectedProcess) {
+		if (command !== opts.protectedProcess.commandPath) throw new Error("protected compile command mismatch");
+		await assertPinnedFile(command, opts.protectedProcess.commandSha256);
+		const profile = (await assertPinnedFile(opts.protectedProcess.sandboxProfilePath, opts.protectedProcess.sandboxProfileSha256)).toString("utf8");
+		if (!/\(deny\s+default\)/.test(profile) || /\(allow\s+default\)/.test(profile)) {
+			throw new Error("protected compile requires a deny-default sandbox profile");
+		}
+		if (process.platform !== "darwin") throw new Error("protected compile requires a supported OS sandbox");
+		launchCommand = "/usr/bin/sandbox-exec";
+		launchArgs = ["-f", opts.protectedProcess.sandboxProfilePath, command, ...args];
+	}
+	const proc = spawn(launchCommand, launchArgs, { cwd, shell: false, stdio: ["pipe", "pipe", "pipe"], env });
 
 	if (stdinJson !== undefined) {
 		proc.stdin.write(JSON.stringify(stdinJson));
@@ -74,13 +108,21 @@ export async function spawnWorker(opts: SpawnOptions): Promise<SpawnResult> {
 	let spawnError: Error | undefined;
 	let firstChunkAt: number | null = null;
 	let startupTimedOut = false;
+	let outputLimitExceeded = false;
 	let startupTimer: NodeJS.Timeout | undefined;
 
 	const lines: unknown[] = [];
 	let lineBuf = "";
 
 	const onChunk = (chunk: string) => {
-		if (stdout.length < MAX_STDOUT) stdout += chunk;
+		if (outputLimitExceeded) return;
+		const remaining = MAX_STDOUT - stdout.length;
+		if (chunk.length > remaining) {
+			outputLimitExceeded = true;
+			killProc();
+			return;
+		}
+		stdout += chunk;
 		onStdout?.(chunk);
 		if (firstChunkAt === null) {
 			firstChunkAt = Date.now();
@@ -149,7 +191,9 @@ export async function spawnWorker(opts: SpawnOptions): Promise<SpawnResult> {
 		proc.on("close", (code) => {
 			exited = true;
 			if (killTimer) clearTimeout(killTimer);
-			resolve(code ?? 0);
+			// A signal-terminated child reports code=null. It is never a successful
+			// worker boundary (notably when an OS sandbox kills the process).
+			resolve(code ?? -1);
 		});
 	});
 
@@ -166,5 +210,5 @@ export async function spawnWorker(opts: SpawnOptions): Promise<SpawnResult> {
 		}
 	}
 
-	return { exitCode, stdout, stderr, timedOut, killed, spawnError, lines, startupTimedOut };
+	return { exitCode, stdout, stderr, timedOut, killed, spawnError, lines, startupTimedOut, outputLimitExceeded };
 }

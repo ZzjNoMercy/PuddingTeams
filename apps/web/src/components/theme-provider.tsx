@@ -37,13 +37,19 @@ function resolveTheme(theme: Theme): "light" | "dark" {
 }
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
-	const [theme, setThemeState] = useState<Theme>(() => {
-		if (typeof window === "undefined") return "dark";
-		const stored = localStorage.getItem(STORAGE_KEY);
+	// SSR 与首次客户端渲染统一用 "dark"。若在 useState 里直接读 localStorage，
+	// 服务端拿不到用户偏好，读到 "light" 的用户会在 hydration 时把整棵子树判成不一致
+	// （设置页的 aria-pressed 就是这么炸的）。真实偏好在下面的 layout effect 里补，
+	// 绘制前同步完成，不会闪白。
+	const [theme, setThemeState] = useState<Theme>("dark");
+
+	useIsomorphicLayoutEffect(() => {
+		let stored: string | null = null;
+		try { stored = localStorage.getItem(STORAGE_KEY); } catch { /* Keep the default usable when browser storage is denied. */ }
 		// Calm Ops is intentionally dark by default; an explicit light/system choice
 		// remains available from Settings.
-		return stored === "light" || stored === "dark" || stored === "system" ? stored : "dark";
-	});
+		if (stored === "light" || stored === "dark" || stored === "system") setThemeState(stored);
+	}, []);
 
 	useIsomorphicLayoutEffect(() => {
 		const root = document.documentElement;
@@ -64,7 +70,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 	}, [theme]);
 
 	const setTheme = (next: Theme) => {
-		localStorage.setItem(STORAGE_KEY, next);
+		try { localStorage.setItem(STORAGE_KEY, next); } catch { /* This tab can still apply the selected theme. */ }
 		setThemeState(next);
 	};
 

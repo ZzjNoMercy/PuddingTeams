@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyRecoveredToolResults, groupConsecutiveModelErrors, markRunningToolCalls, reducePiEvent, renderHistory, replayPiEvents } from "./events";
+import { applyRecoveredToolResults, friendlyModelError, groupConsecutiveModelErrors, markRunningToolCalls, reducePiEvent, renderHistory, replayPiEvents } from "./events";
 import type { PiMessage } from "./types";
+
+test("知识上下文变化指向会话菜单的新建入口，不误报模型故障或建议切模型重试", () => {
+	const error = friendlyModelError("知识库上下文已变化，请新建工作会话后继续");
+	assert.equal(error.presentation.title, "知识库上下文已更新");
+	assert.match(error.presentation.action, /顶部会话菜单/);
+	assert.match(error.presentation.action, /新建会话/);
+	assert.doesNotMatch(error.content, /模型服务没有成功|切换模型|再次发送上一条/);
+});
 
 test("历史回放保留 running 投影里的 Delegation 与执行过程入口", () => {
 	const messages = [
@@ -52,6 +60,72 @@ test("隐藏的 interaction_required 审计投影仍渲染审批卡，历史与�
 	const live = reducePiEvent([], { type: "message_start", message: interaction });
 	assert.equal(live.length, 1);
 	assert.equal(live[0]?.customType, "pudding:interaction_required");
+});
+
+test("模型接纳后 401 失败在历史与实时消息中保持可见错误", () => {
+	const failed = {
+		role: "assistant", content: [], stopReason: "error",
+		errorMessage: '401: {"message":"fixture upstream rejected credential","type":"authentication_error"}',
+		timestamp: 3,
+	} as unknown as PiMessage;
+	const history = renderHistory([failed]);
+	const live = reducePiEvent(reducePiEvent([], { type: "message_start", message: failed }), { type: "message_end", message: failed });
+	for (const item of [history[0], live[0]]) {
+		assert.equal(item?.role, "assistant");
+		assert.equal(item?.error, true);
+		assert.ok(item?.modelError?.title);
+		assert.match(item?.errorDetail ?? "", /fixture upstream rejected credential/);
+		assert.equal(item?.streaming, false);
+	}
+});
+
+test("错过本轮 message_start 时结束事件不覆盖上一轮回复", () => {
+	const old = { role: "assistant", content: [{ type: "text", text: "上一轮正常回复" }], stopReason: "stop", timestamp: 1 } as unknown as PiMessage;
+	const user = { role: "user", content: "新一轮请求", timestamp: 2 } as unknown as PiMessage;
+	const failed = { role: "assistant", content: [], stopReason: "error", errorMessage: "401: credential rejected", timestamp: 3 } as unknown as PiMessage;
+	const snapshot = renderHistory([old, user]);
+	const settled = reducePiEvent(snapshot, { type: "message_end", message: failed });
+	assert.equal(settled.length, 3);
+	assert.equal(settled[0]?.content, "上一轮正常回复");
+	assert.equal(settled[2]?.error, true);
+	assert.equal(settled[2]?.streaming, false);
+	const update = { role: "assistant", content: [{ type: "text", text: "正在处理" }], timestamp: 3 } as unknown as PiMessage;
+	const resumed = reducePiEvent(snapshot, { type: "message_update", message: update });
+	assert.equal(resumed.length, 3);
+	assert.equal(resumed[0]?.content, "上一轮正常回复");
+	assert.equal(resumed[2]?.content, "正在处理");
+	assert.equal(reducePiEvent(resumed, { type: "message_end", message: failed })[2]?.error, true);
+	const replayed = reducePiEvent(renderHistory([old, user, failed]), { type: "message_end", message: failed });
+	assert.equal(replayed.length, 3, "历史已包含同一条失败时不重复追加");
+	const withStart = replayPiEvents(renderHistory([old, user, failed]), [
+		{ type: "message_start", message: failed }, { type: "message_end", message: failed },
+	]);
+	assert.equal(withStart.length, 3, "快照已含完整回复时缓冲区里的 start/end 不重复追加");
+	const later = { role: "assistant", content: [{ type: "text", text: "更新一轮回复" }], stopReason: "stop", timestamp: 4 } as unknown as PiMessage;
+	const olderEvent = { role: "assistant", content: [{ type: "text", text: "过期事件内容" }], timestamp: 1 } as unknown as PiMessage;
+	const newerSnapshot = renderHistory([old, user, failed, later]);
+	const afterStale = reducePiEvent(newerSnapshot, { type: "message_end", message: olderEvent });
+	assert.equal(afterStale.length, 4);
+	assert.equal(afterStale[0]?.content, "上一轮正常回复", "较早结束事件不能改写快照里的终态");
+	assert.equal(afterStale[3]?.content, "更新一轮回复");
+	const sameMillisecond = { role: "assistant", content: [{ type: "text", text: "同毫秒新回合" }], timestamp: 1 } as unknown as PiMessage;
+	const started = reducePiEvent(renderHistory([old, user]), { type: "message_start", message: sameMillisecond });
+	assert.equal(started.length, 3, "有新 user 分隔时同毫秒 start 不能被误去重");
+	assert.equal(started[2]?.content, "同毫秒新回合");
+});
+
+test("历史与实时按消息 ID 对账，保留同毫秒同正文的不同 user", () => {
+	const first = { role: "user", content: "重复请求", timestamp: 100, puddingMessageId: "user-1" } as unknown as PiMessage;
+	const second = { role: "user", content: "重复请求", timestamp: 100, puddingMessageId: "user-2" } as unknown as PiMessage;
+	const snapshot = renderHistory([first]);
+	assert.equal(reducePiEvent(snapshot, { type: "message_start", message: first }).length, 1);
+	const separate = reducePiEvent(snapshot, { type: "message_start", message: second });
+	assert.equal(separate.length, 2);
+	assert.deepEqual(separate.map((item) => item.puddingMessageId), ["user-1", "user-2"]);
+	const reply = { role: "assistant", content: [{ type: "text", text: "第二轮回复" }], timestamp: 100, puddingMessageId: "assistant-2" } as unknown as PiMessage;
+	const withReply = reducePiEvent(separate, { type: "message_start", message: reply });
+	assert.equal(withReply.length, 3);
+	assert.equal(reducePiEvent(withReply, { type: "message_end", message: { ...reply, stopReason: "stop" } }).at(-1)?.content, "第二轮回复");
 });
 
 test("延迟 toolResult 按 toolCallId 回填原 assistant，不误绑到最新一轮", () => {
@@ -165,6 +239,37 @@ test("历史重对齐后的实时 thinking 保留 assistant turn 起点", () => 
 
 	assert.equal(rendered[0]?.streaming, true);
 	assert.equal(rendered[0]?.timestamp, 1_000, "计时必须继续使用原 turn 起点，不能改成重挂载时间");
+});
+
+test("同一 assistant turn 的流快照换对象和 wire ID 时不重复渲染 thinking", () => {
+	const assistant = (id: string, thinking: string) => ({
+		role: "assistant" as const,
+		puddingMessageId: id,
+		content: [{ type: "thinking" as const, thinking }],
+		timestamp: 1_000,
+	});
+	let rendered = reducePiEvent([], { type: "message_start", message: assistant("start", "开始") });
+	rendered = reducePiEvent(rendered, { type: "message_update", message: assistant("update-1", "开始分析") });
+	rendered = reducePiEvent(rendered, { type: "message_update", message: assistant("update-2", "开始分析并核对") });
+	rendered = reducePiEvent(rendered, { type: "message_end", message: assistant("end", "分析完毕") });
+	assert.equal(rendered.length, 1);
+	assert.equal(rendered[0]?.thinking, "分析完毕");
+	assert.equal(rendered[0]?.streaming, false);
+});
+
+test("迟到的旧流快照不能撤回已显示的 assistant 正文或 thinking", () => {
+	const assistant = (id: string, text: string, thinking: string) => ({
+		role: "assistant" as const,
+		puddingMessageId: id,
+		content: [{ type: "thinking" as const, thinking }, { type: "text" as const, text }],
+		timestamp: 1_000,
+	});
+	let rendered = reducePiEvent([], { type: "message_start", message: assistant("start", "", "思考") });
+	rendered = reducePiEvent(rendered, { type: "message_update", message: assistant("latest", "完整回复", "思考完成") });
+	rendered = reducePiEvent(rendered, { type: "message_update", message: assistant("late-old", "完整", "思考") });
+	assert.equal(rendered.length, 1);
+	assert.equal(rendered[0]?.content, "完整回复");
+	assert.equal(rendered[0]?.thinking, "思考完成");
 });
 
 test("pi SDK 连续自动重试错误合并为一个渲染组", () => {

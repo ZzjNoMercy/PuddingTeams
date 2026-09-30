@@ -162,6 +162,22 @@ export class CodexEventReducer {
 				},
 			};
 		}
+		// A clean process exit is not a Codex turn boundary. In particular, a
+		// replaced CLI (or a truncated JSONL stream) can exit 0 without ever
+		// starting a thread or completing a turn. Do not turn that into success.
+		if (!this.threadId || !this.sawTurnCompleted) {
+			return {
+				type: "failed",
+				result: {
+					agentId,
+					status: "failed",
+					...(this.threadId ? { sessionHandle: this.threadId, runHandle: this.threadId } : {}),
+					errorCode: "protocol_incomplete",
+					error: !this.threadId ? "Codex 未报告 thread.started" : "Codex 未报告 turn.completed",
+					recoverable: true,
+				},
+			};
+		}
 		return {
 			type: "completed",
 			result: {
@@ -227,6 +243,7 @@ function truncate(value: string, max: number): string {
 }
 
 export const CODEX_CAPABILITIES: DriverCapabilities = {
+	runtimeModel: { effortLevels: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] },
 	operations: ["run", "continue", "cancel"],
 	interactionKinds: [],
 	progress: "stream",

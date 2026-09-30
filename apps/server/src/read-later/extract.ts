@@ -1,0 +1,294 @@
+import { parse } from "parse5";
+import { canonicalizeUrl } from "./public-fetch.js";
+interface Node {
+  nodeName: string;
+  tagName?: string;
+  value?: string;
+  attrs?: Array<{
+    name: string;
+    value: string;
+  }>;
+  childNodes?: Node[];
+}
+export interface ExtractedArticle {
+  title: string;
+  siteName: string;
+  author: string;
+  description: string;
+  content: string;
+  images: Array<{
+    url: string;
+    alt: string;
+    role: "cover" | "body";
+  }>;
+  warnings: string[];
+}
+const attr = (node: Node, name: string) =>
+  node.attrs?.find((a) => a.name === name)?.value ?? "";
+const text = (node: Node): string =>
+  node.value ?? (node.childNodes ?? []).map(text).join("");
+const nodes = (root: Node): Node[] => [
+  root,
+  ...(root.childNodes ?? []).flatMap(nodes),
+];
+const noise = new Set([
+  "script",
+  "style",
+  "noscript",
+  "nav",
+  "footer",
+  "header",
+  "aside",
+  "form",
+  "dialog",
+  "button",
+  "iframe",
+  "svg",
+  "canvas",
+  "template",
+]);
+function hidden(n: Node) {
+  return (
+    noise.has(n.tagName ?? "") ||
+    /(^|\s)(comments?|comment-list|advertisement|advertising|ads?|sidebar|cookie-banner|social-share|navigation|menu)(\s|$)/i.test(
+      attr(n, "class"),
+    ) ||
+    n.attrs?.some(
+      (a) =>
+        a.name === "hidden" || (a.name === "aria-hidden" && a.value === "true"),
+    ) ||
+    /display\s*:\s*none|visibility\s*:\s*hidden/i.test(attr(n, "style"))
+  );
+}
+const escape = (s: string) => s.replace(/[\\`*_{}\[\]<>]/g, "\\$&");
+export function extractArticle(
+  html: string,
+  url: string,
+  contentType = "text/html",
+): ExtractedArticle {
+  const host = new URL(url).hostname,
+    article: ExtractedArticle = {
+      title: host,
+      siteName: host,
+      author: "",
+      description: "",
+      content: "",
+      images: [],
+      warnings: [],
+    };
+  if (contentType.startsWith("text/plain")) {
+    article.title = html.trim().split("\n")[0]!.slice(0, 120);
+    article.content = html.trim();
+    return article;
+  }
+  const root = parse(html) as unknown as Node,
+    all = nodes(root);
+  const meta = (name: string) =>
+    all
+      .find(
+        (n) =>
+          n.tagName === "meta" &&
+          [attr(n, "property"), attr(n, "name")].includes(name),
+      )
+      ?.attrs?.find((a) => a.name === "content")
+      ?.value.trim() ?? "";
+  const byId = (id: string) => all.find((n) => attr(n, "id") === id);
+  article.title =
+    meta("og:title") ||
+    text(all.find((n) => n.tagName === "title") ?? root)
+      .trim()
+      .slice(0, 300) ||
+    host;
+  article.siteName =
+    host === "mp.weixin.qq.com"
+      ? "微信公众号"
+      : ["x.com", "www.x.com", "twitter.com", "www.twitter.com"].includes(host)
+        ? "X"
+        : meta("og:site_name") || host;
+  article.description = (meta("og:description") || meta("description")).slice(
+    0,
+    2000,
+  );
+  article.author = meta("author") || meta("article:author");
+  if (host === "mp.weixin.qq.com") {
+    article.title = text(
+      byId("activity-name") ?? { nodeName: "", value: article.title },
+    ).trim();
+    article.author = text(
+      byId("js_name") ??
+        all.find((n) =>
+          attr(n, "class").includes("rich_media_meta_nickname"),
+        ) ?? { nodeName: "" },
+    ).trim();
+  }
+  const isX = ["x.com", "www.x.com", "twitter.com", "www.twitter.com"].includes(host);
+  // X Articles render the full body separately from the tweet's OG summary.
+  // Never choose the surrounding timeline: it also contains replies and controls.
+  const xArticleBody = isX
+    ? all.find((n) =>
+        !hidden(n) &&
+        (/\bx-article-body\b/.test(attr(n, "class")) ||
+          attr(n, "itemprop").split(/\s+/).includes("articleBody")),
+      )
+    : undefined;
+  if (isX) {
+    const match = /^(.*?)\s*\(@[^)]+\)\s*on X/.exec(article.title);
+    if (match) article.author = match[1]!;
+    article.title = article.description.slice(0, 120) || article.title;
+  }
+  const candidates = all.filter(
+    (n) =>
+      !hidden(n) &&
+      (attr(n, "id") === "js_content" ||
+        n.tagName === "article" ||
+        n.tagName === "main" ||
+        /^(articleBody|article-body|article-content|article__body|post-content|entry-content)$/.test(
+          attr(n, "id"),
+        ) ||
+        /(^|\s)(article-content|post-content|entry-content)(\s|$)/.test(
+          attr(n, "class"),
+        )),
+  );
+  const chosen =
+    byId("js_content") ??
+    candidates.sort((a, b) => visible(b).length - visible(a).length)[0] ??
+    all.find((n) => n.tagName === "body") ??
+    root;
+  function visible(n: Node): string {
+    if (hidden(n)) return "";
+    return n.value ?? (n.childNodes ?? []).map(visible).join(" ");
+  }
+  function safe(raw: string): string | undefined {
+    try {
+      const absolute = new URL(raw, url);
+      canonicalizeUrl(absolute.href);
+      return absolute.href;
+    } catch {
+      return undefined;
+    }
+  }
+  function image(raw: string, alt: string, role: "cover" | "body") {
+    const absolute = safe(raw);
+    if (!absolute) return "";
+    let index = article.images.findIndex((i) => i.url === absolute);
+    if (index < 0) {
+      index = article.images.length;
+      article.images.push({ url: absolute, alt: alt.slice(0, 300), role });
+    }
+    return `\n\n![${escape(alt)}](read-later-image:${index})\n\n`;
+  }
+  function render(n: Node): string {
+    if (hidden(n)) return "";
+    if (n.nodeName === "#text")
+      return escape((n.value ?? "").replace(/\s+/g, " "));
+    const children = () => (n.childNodes ?? []).map(render).join("");
+    const tag = n.tagName ?? "";
+    if (tag === "img") {
+      const src =
+        attr(n, "data-src") ||
+        attr(n, "data-original") ||
+        attr(n, "data-lazy-src") ||
+        attr(n, "data-actualsrc") ||
+        attr(n, "src");
+      return image(src, attr(n, "alt"), "body");
+    }
+    if (tag === "pre")
+      return `\n\n\`\`\`\n${text(n).replace(/`{3}/g, "` ` `")}\n\`\`\`\n\n`;
+    if (tag === "code") return `\`${text(n).replace(/`/g, "ˋ")}\``;
+    if (tag === "br") return "\n";
+    if (tag === "hr") return "\n\n---\n\n";
+    if (/^h[1-6]$/.test(tag))
+      return `\n\n${"#".repeat(Number(tag[1]))} ${children().trim()}\n\n`;
+    if (tag === "a") {
+      const content = children();
+      // Linked article images are rendered as blocks; wrapping that block in an
+      // inline Markdown link breaks the image and leaves raw brackets in readers.
+      if (nodes(n).some((child) => child.tagName === "img")) return content;
+      const href = safe(attr(n, "href"));
+      return href
+        ? `[${content}](<${href.replace(/[<>\r\n]/g, "")}>)`
+        : content;
+    }
+    if (tag === "strong" || tag === "b") return `**${children()}**`;
+    if (tag === "em" || tag === "i") return `*${children()}*`;
+    if (tag === "li") return `\n- ${children().trim().replace(/\n/g, "\n  ")}`;
+    if (tag === "blockquote")
+      return `\n\n${children()
+        .trim()
+        .split("\n")
+        .map((line) => `> ${line}`)
+        .join("\n")}\n\n`;
+    if (tag === "table") {
+      const rows = nodes(n)
+        .filter((r) => r.tagName === "tr")
+        .map((r) =>
+          (r.childNodes ?? [])
+            .filter((c) => ["td", "th"].includes(c.tagName ?? ""))
+            .map((c) =>
+              render(c).trim().replace(/\|/g, "\\|").replace(/\n+/g, " "),
+            ),
+        );
+      if (!rows.length) return "";
+      const width = Math.max(...rows.map((r) => r.length)),
+        line = (r: string[]) =>
+          `| ${Array.from({ length: width }, (_, i) => r[i] ?? "").join(" | ")} |`;
+      return `\n\n${line(rows[0]!)}\n${line(Array(width).fill("---"))}\n${rows.slice(1).map(line).join("\n")}\n\n`;
+    }
+    if (
+      [
+        "p",
+        "div",
+        "section",
+        "article",
+        "main",
+        "ul",
+        "ol",
+        "figure",
+        "figcaption",
+      ].includes(tag)
+    )
+      return `\n\n${children()}\n\n`;
+    return children();
+  }
+  article.content = (xArticleBody
+    ? render(xArticleBody)
+    : isX
+      ? escape(article.description)
+      : render(chosen))
+    .replace(/\n[ \t]+\n/g, "\n\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (isX) {
+    const pattern = /["']original_img_url["']\s*:\s*["']([^"']+)/g;
+    for (const match of html
+      .replace(/\\u002[Ff]|\\\//g, "/")
+      .matchAll(pattern)) {
+      try {
+        const media = new URL(match[1]!);
+        if (
+          media.hostname === "pbs.twimg.com" &&
+          media.pathname.startsWith("/media/")
+        )
+          article.content += image(media.href, "原文图片", "body");
+      } catch {
+        /* Invalid relay media. */
+      }
+    }
+  }
+  const cover = meta("og:image") || meta("twitter:image");
+  if (cover && (!isX || !/\/profile_(?:images|banners)\//.test(cover))) {
+    const absolute = safe(cover);
+    if (absolute && !article.images.some((i) => i.url === absolute))
+      article.content = image(cover, "封面", "cover") + article.content;
+  }
+  article.title = article.title.slice(0, 300);
+  article.author = article.author.slice(0, 300);
+  if (visible(chosen).trim().length < 80 && !isX)
+    article.warnings.push("正文不足 80 字，可能需要登录或原站未提供正文");
+  if (
+    article.content.replace(/!\[[^\]]*\]\([^)]*\)/g, "").replace(/\s/g, "")
+      .length < 80
+  )
+    article.warnings.push("正文不足 80 字");
+  return article;
+}

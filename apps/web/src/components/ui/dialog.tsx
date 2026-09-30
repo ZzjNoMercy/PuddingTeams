@@ -90,7 +90,21 @@ function DialogHeader({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div
       data-slot="dialog-header"
-      className={cn("flex flex-col gap-2 text-center sm:text-left", className)}
+      className={cn("flex shrink-0 flex-col gap-2 text-center sm:text-left", className)}
+      {...props}
+    />
+  );
+}
+
+/**
+ * 弹窗滚动体：内容超出时只滚这里，头部（DialogHeader）留在原位。
+ * 容器需改成 `flex max-h-[…] flex-col overflow-hidden`；负外边距由 --dialog-pad 抵消容器内边距。
+ */
+function DialogBody({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="dialog-body"
+      className={cn("min-h-0 flex-1 overflow-y-auto", className)}
       {...props}
     />
   );
@@ -116,7 +130,7 @@ function DialogTitle({
   return (
     <DialogPrimitive.Title
       data-slot="dialog-title"
-      className={cn("text-lg leading-none font-semibold", className)}
+      className={cn("text-lg leading-none font-medium", className)}
       {...props}
     />
   );
@@ -137,6 +151,7 @@ function DialogDescription({
 
 export {
   Dialog,
+  DialogBody,
   DialogClose,
   DialogContent,
   DialogDescription,

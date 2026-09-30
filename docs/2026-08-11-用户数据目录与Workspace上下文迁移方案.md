@@ -127,6 +127,9 @@ PUDDINGTEAMS_HOME/
 │   └── mcp-servers.json           # 全局 MCP Server Catalog；不含明文凭据
 ├── state/
 │   ├── agents.json                # Agent Registry + 用户 Agent Profile
+│   ├── agent-creation-operations.json # Agent 首次创建操作键与预约身份
+│   ├── session-creation-operations.json # Manager 首次发送的 Session 预约
+│   ├── room-activity.json         # 业务活动投影与已读水位
 │   ├── windows.json               # 窗口、成员与 Session 引用
 │   ├── workspaces.json            # 项目书签、身份、信任与授权
 │   ├── delegations.json
@@ -158,7 +161,7 @@ PUDDINGTEAMS_HOME/
 │       ├── credentials.json       # 按 Server id 分组的 MCP 密文
 │       └── credentials.key        # 0600
 ├── runtime/
-│   ├── backend.lease              # 单写者 Lease
+│   ├── backend.leases/            # 单写者候选文件（PID + 随机 ID）
 │   ├── locks/
 │   └── tmp/
 ├── logs/
@@ -174,7 +177,14 @@ PUDDINGTEAMS_HOME/
 - `workspaces/unscoped` 只是无项目文件工具的中性 cwd，永远不启用 Workspace 资源发现。
 - `artifacts/blobs` 保存冻结副本；`state/artifacts.json` 只保存 Registry 和摘要。
 - `config/mcp-servers.json` 是平台 MCP Server 全集；Agent 级白名单 `mcpServerIds` 仍属于 `state/agents.json`。MCP 密钥与普通配置分离，列表和 Agent 配置 API 均不返回明文。
+- MCP Server 的目录与加密密钥共同变更采用 `secrets/mcp/binding-transaction.json` 前后镜像与 Catalog 提交标记；启动先恢复待对账记录，再开放读取和执行。目录写入需文件与目录同步，重命名后同步失败在当前进程拒绝继续。此保证以本机单写者和本机文件系统为边界。
 - `runtime/tmp`、`logs` 可按保留策略回收，不属于备份必须项。
+
+> Teams 2.0 M0 增量（2026-09-23）：`paths.ts` 已为知识与日历服务预留 `state/knowledge/`、`knowledge/objects/`、`cache/knowledge/`、`state/calendar/`，并由 `ensurePaths` 创建。`state/knowledge/` 将保存绑定、选择、采纳、审核与操作账本；`knowledge/objects/` 保存候选/基线/采纳的内容寻址快照；`cache/knowledge/` 仅保存可重建索引；`state/calendar/` 保存平台日程。当前仅有路径契约，相关持久化服务尚未交付。参见 Teams 2.0 方案 §6.3。
+>
+> Teams 2.0 M2 增量（2026-09-29）：知识域持久化已落地。`state/knowledge/bindings.json` 为绑定登记（含四根映射与 rootIdentity）；`state/knowledge/acceptance/<bindingId>.json` 为采纳账本（固定版本清单，删除/离线/撤权后仍保留供审计）；`state/knowledge/plans/<planId>.json` 为接入计划（probe 结论、拟创建文件字节与 hash，apply 逐项回执）；`state/knowledge/selections.json` 为按 owner + 工作上下文隔离的读取选择，首页通过 `GET/PUT /api/knowledge-selection` 读取与 revision 门禁更新。`knowledge/objects/<sha256前2位>/<sha256>.md` 为采纳版本的内容寻址快照，`cache/knowledge/<bindingId>-index.json` 为可重建检索/反链索引——索引只允许从采纳账本 + 快照重建，缓存失配即重建，绝不把磁盘当前版本重新全量批准。绑定与账本文件均为同卷临时文件 + 原子 rename、0600 权限。编译候选、审核与发布账本（M3+）尚未交付。
+>
+> Teams 2.0 M3/M4 增量（2026-09-28）：审核与发布账本落地。`state/knowledge/reviews/reviews.sqlite` 为人工审核账本（`review_batches` 批次快照 + 状态机 + 24h 审核窗；`review_decisions` 以 operationId 为幂等键的审核决定）；`state/knowledge/operations/operations.sqlite` 为发布操作日志（PublishOperation + 逐文件 {path, operation, candidateHash, baselineHash, beforeImageRef, receipts, 结果态}，idempotencyKey=审核决定 id 防双写）；`state/knowledge/operations/<operationId>/before/<targetPath>` 为 update 写入前的磁盘 before-image（对账回滚的唯一恢复源，0600）。两者均为内置 SQLite（WAL 不启用，`BEGIN IMMEDIATE` + `busy_timeout=5000`），事务为权威边界；compile cache 目录视为可重建，审核/发布只读这两本账。
 
 ## 5. 统一路径契约
 
@@ -194,6 +204,7 @@ PUDDINGTEAMS_HOME/
 - 测试必须注入临时 Home，禁止写开发者真实 `~/.puddingteams`。
 - 保留细粒度目录注入仅供测试；生产配置不再暴露互相独立的 `SESSION_DIR/TEAMS_DIR/SECRETS_DIR` 三套默认根。
 - 同一 Home 采用单写者模型；第二个 Backend 不得依赖各 Store 的进程内 Promise queue 冒险并发写 JSON。
+- 2026-09-26 起，每个候选后端在 `runtime/backend.leases/` 创建独立文件后扫描同目录；其他存活 PID 一律拒绝启动，已退出 PID 的文件按独立名称回收。并发启动可同时拒绝，但不得同时获得写入资格；退出只删除本实例文件。发现旧 `runtime/backend.lease` 时安全拒绝，须先确认旧进程停止并移走旧文件。此门禁针对本机文件系统，不宣称跨主机共享盘互斥。
 
 建议接口：
 

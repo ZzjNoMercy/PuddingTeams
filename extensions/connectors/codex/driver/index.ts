@@ -10,6 +10,8 @@ import type {
 	RunInput,
 } from "@puddingteams/pwcp/types";
 import { spawn } from "node:child_process";
+import { realpath } from "node:fs/promises";
+import { sep } from "node:path";
 import { createInterface } from "node:readline";
 import { gitBaseline, observeGitArtifacts } from "@puddingteams/pwcp/observe";
 import { spawnWorker, type SpawnResult } from "@puddingteams/pwcp/spawn";
@@ -21,6 +23,7 @@ export interface CodexDriverOptions {
 	command?: string;
 	/** 模型（-m）；留空用 codex 默认。 */
 	model?: string;
+	effort?: string;
 	/** 沙箱模式（-s），默认 workspace-write。 */
 	sandbox?: "read-only" | "workspace-write" | "danger-full-access";
 	/** 单次 run/continue 超时。 */
@@ -29,8 +32,32 @@ export interface CodexDriverOptions {
 
 export function codexExecutionPolicyArgs(
 	configuredSandbox: CodexDriverOptions["sandbox"],
-	ctx: Pick<InvocationContext, "verificationProfile" | "workspaceBoundary">,
+	ctx: Pick<InvocationContext, "verificationProfile" | "workspaceBoundary" | "protectedCompile">,
 ): string[] {
+	if (ctx.protectedCompile) {
+		const channel = ctx.protectedCompile.modelChannel;
+		if (channel && (!Number.isSafeInteger(channel.port) || channel.port < 1 || channel.port > 65535)) {
+			throw new Error("invalid protected compile model channel");
+		}
+		return [
+			// macOS sandbox-exec already encloses the entire native CLI process tree.
+			// A second Codex workspace sandbox cannot be applied inside it, which
+			// would prevent every compile tool call from running.
+			"-s", "danger-full-access",
+			"-c", 'approval_policy="never"',
+			"--ignore-user-config", "--ignore-rules",
+			...(channel ? [
+				"-c", 'model_provider="puddingteams_compile"',
+				"-c", 'model_providers.puddingteams_compile.name="PuddingTeams Compile"',
+				"-c", `model_providers.puddingteams_compile.base_url="http://127.0.0.1:${channel.port}/v1"`,
+				"-c", 'model_providers.puddingteams_compile.wire_api="responses"',
+				"-c", "model_providers.puddingteams_compile.requires_openai_auth=false",
+				"-c", "model_providers.puddingteams_compile.supports_websockets=false",
+				"-c", "model_providers.puddingteams_compile.request_max_retries=0",
+				"-c", "model_providers.puddingteams_compile.stream_max_retries=0",
+			] : []),
+		];
+	}
 	const sandbox = ctx.verificationProfile ? "workspace-write" : configuredSandbox ?? "workspace-write";
 	if (ctx.workspaceBoundary === "platform_isolated_checkout" && sandbox === "workspace-write") return ["--approve-for-me"];
 	return ["-s", sandbox];
@@ -82,6 +109,7 @@ export class CodexDriver implements AgentDriver {
 	 * starts app-server only for discovery; task execution remains spawn + JSONL.
 	 */
 	async listConfigOptions(field: string, ctx: InvocationContext): Promise<DriverConfigOption[]> {
+		if (ctx.protectedCompile) throw new Error("protected compile cannot run model discovery");
 		if (field !== "model") return [];
 		return new Promise((resolve, reject) => {
 			const child = spawn(this.cmd(), ["app-server", "--stdio"], {
@@ -122,7 +150,7 @@ export class CodexDriver implements AgentDriver {
 				if (!line.trim() || settled) return;
 				let message: {
 					id?: number;
-					result?: { data?: Array<{ id?: string; model?: string; displayName?: string; description?: string; isDefault?: boolean }>; nextCursor?: string | null };
+					result?: { data?: Array<{ id?: string; model?: string; displayName?: string; description?: string; isDefault?: boolean; supportedReasoningEfforts?: Array<{ reasoningEffort: string }> }>; nextCursor?: string | null };
 					error?: { message?: string };
 				};
 				try {
@@ -148,6 +176,7 @@ export class CodexDriver implements AgentDriver {
 						label: model.displayName?.trim() || value,
 						description: model.description?.trim() || undefined,
 						isDefault: model.isDefault === true,
+						...(model.supportedReasoningEfforts ? { effortLevels: model.supportedReasoningEfforts.map((item) => item.reasoningEffort) } : {}),
 					});
 				}
 				if (message.result.nextCursor) requestPage(message.result.nextCursor);
@@ -176,9 +205,12 @@ export class CodexDriver implements AgentDriver {
 		return codexExecutionPolicyArgs(this.opts.sandbox, ctx);
 	}
 
-	private runArgs(ctx: InvocationContext): string[] {
+	private runArgs(ctx: InvocationContext, settings?: import("@puddingteams/pwcp/types").RuntimeModelSettings): string[] {
 		const args = ["--json", "--skip-git-repo-check", "-C", ctx.cwd ?? process.cwd(), ...this.executionPolicyArgs(ctx)];
-		if (this.opts.model) args.push("-m", this.opts.model);
+		const model = settings?.model ?? this.opts.model;
+		const effort = settings?.effort ?? this.opts.effort;
+		if (model) args.push("-m", model);
+		if (effort) args.push("-c", `model_reasoning_effort=${JSON.stringify(effort)}`);
 		return args;
 	}
 
@@ -186,9 +218,12 @@ export class CodexDriver implements AgentDriver {
 	 * resume 子命令的 options 是 exec 的子集：没有 -C/-s（工作目录由 spawn cwd
 	 * 保证；沙箱经 -c 配置覆盖传同一值，避免 resume 掉回默认 read-only）。
 	 */
-	private resumeArgs(): string[] {
+	private resumeArgs(settings?: import("@puddingteams/pwcp/types").RuntimeModelSettings): string[] {
 		const args = ["--json", "--skip-git-repo-check"];
-		if (this.opts.model) args.push("-m", this.opts.model);
+		const model = settings?.model ?? this.opts.model;
+		const effort = settings?.effort ?? this.opts.effort;
+		if (model) args.push("-m", model);
+		if (effort) args.push("-c", `model_reasoning_effort=${JSON.stringify(effort)}`);
 		return args;
 	}
 
@@ -197,8 +232,21 @@ export class CodexDriver implements AgentDriver {
 	 */
 	private async runCli(args: string[], ctx: InvocationContext): Promise<AgentEvent> {
 		const cwd = ctx.cwd ?? process.cwd();
+		const protectedCompile = ctx.protectedCompile;
+		if (protectedCompile) {
+			if (this.opts.command) throw new Error("protected compile cannot use an Agent-configured command");
+			if (protectedCompile.modelChannel && !this.opts.model) throw new Error("protected compile model channel requires a frozen model");
+			if (!protectedCompile.jobId || await realpath(cwd) !== protectedCompile.stagingRoot) throw new Error("protected compile staging identity changed");
+			if (protectedCompile.commandPath.startsWith(`${protectedCompile.stagingRoot}${sep}`) || protectedCompile.sandboxProfilePath.startsWith(`${protectedCompile.stagingRoot}${sep}`)) {
+				throw new Error("protected compile command and profile must be outside writable staging");
+			}
+		}
+		const command = protectedCompile?.commandPath ?? this.cmd();
+		const env = protectedCompile?.env ?? ctx.env;
 		// §15.4：任务前 git 基线，完成后只收新增变更（防止脏工作区误报）。
-		const baseline = await gitBaseline(cwd, ctx.env);
+		// A protected compile cannot launch an unsandboxed Git process from a
+		// Connector observe hook; its output is validated from staging instead.
+		const baseline = protectedCompile ? undefined : await gitBaseline(cwd, env);
 		const reducer = new CodexEventReducer();
 		const parser = new JsonlLineParser();
 		const feedRaw = (raw: unknown) => {
@@ -215,16 +263,23 @@ export class CodexDriver implements AgentDriver {
 			}
 		};
 		const res: SpawnResult = await spawnWorker({
-			command: this.cmd(),
+			command,
 			args,
-			env: ctx.env,
+			env,
 			cwd,
+			...(protectedCompile ? { protectedProcess: protectedCompile } : {}),
 			signal: ctx.signal,
 			timeoutMs: this.opts.timeoutMs ?? ctx.timeouts?.activeMs ?? 900_000,
 			startupMs: ctx.timeouts?.startupMs ?? 30_000,
 			onStdout: feed,
 		});
 		for (const raw of parser.flush()) feedRaw(raw);
+		if (res.outputLimitExceeded) {
+			return {
+				type: "failed",
+				result: { agentId: this.id, status: "failed", errorCode: "output_limit", error: "worker stdout 超出上限", recoverable: false },
+			};
+		}
 
 		if (res.timedOut) {
 			return {
@@ -251,7 +306,7 @@ export class CodexDriver implements AgentDriver {
 					agentId: this.id,
 					status: "failed",
 					errorCode: "startup_timeout",
-					error: `worker「${this.cmd()}」在 ${Math.round((ctx.timeouts?.startupMs ?? 30_000) / 1000)}s 内未输出任何内容`,
+					error: `worker 在 ${Math.round((ctx.timeouts?.startupMs ?? 30_000) / 1000)}s 内未输出任何内容`,
 					recoverable: false,
 				},
 			};
@@ -263,12 +318,16 @@ export class CodexDriver implements AgentDriver {
 					agentId: this.id,
 					status: "failed",
 					errorCode: "spawn_error",
-					error: `无法启动 worker「${this.cmd()}」：${res.spawnError.message}`,
+					error: `无法启动 worker：${res.spawnError.message}`,
 					recoverable: true,
 				},
 			};
 		}
 		if (res.exitCode !== 0) {
+			// Codex can emit the actual API failure in JSONL while stderr only says
+			// "Reading additional input from stdin...". Keep the structured cause.
+			const reported = reducer.boundary(this.id);
+			if (reported.type === "failed" && reported.result.errorCode === "worker_failed") return reported;
 			return {
 				type: "failed",
 				result: {
@@ -285,8 +344,8 @@ export class CodexDriver implements AgentDriver {
 
 		const boundary = reducer.boundary(this.id);
 		// §15.4 observe 轨：completed 时对比任务前基线，只收新增变更。
-		if (boundary.type === "completed") {
-			const observed = await observeGitArtifacts(cwd, ctx.env, baseline);
+		if (boundary.type === "completed" && baseline) {
+			const observed = await observeGitArtifacts(cwd, env, baseline);
 			if (observed.length) {
 				boundary.result.artifacts = [...(boundary.result.artifacts ?? []), ...observed];
 			}
@@ -298,13 +357,13 @@ export class CodexDriver implements AgentDriver {
 	async *run(input: RunInput, ctx: InvocationContext): AsyncIterable<AgentEvent> {
 		ctx.onUpdate?.("worker 正在执行…", { running: true });
 		yield { type: "started" };
-		yield await this.runCli(["exec", ...this.runArgs(ctx), input.message], ctx);
+		yield await this.runCli(["exec", ...this.runArgs(ctx, input.options?.runtimeModel), input.message], ctx);
 	}
 
 	async *continue(input: ContinueInput, ctx: InvocationContext): AsyncIterable<AgentEvent> {
 		ctx.onUpdate?.("worker 正在续接会话…", { running: true });
 		yield { type: "started", sessionHandle: input.sessionHandle };
-		yield await this.runCli(["exec", ...this.executionPolicyArgs(ctx), "resume", ...this.resumeArgs(), input.sessionHandle, input.message], ctx);
+		yield await this.runCli(["exec", ...this.executionPolicyArgs(ctx), "resume", ...this.resumeArgs(input.options?.runtimeModel), input.sessionHandle, input.message], ctx);
 	}
 
 	async *respond(input: RespondInput, _ctx: InvocationContext): AsyncIterable<AgentEvent> {
@@ -327,6 +386,7 @@ export class CodexDriver implements AgentDriver {
 	}
 
 	async probe(ctx: InvocationContext): Promise<ProbeResult> {
+		if (ctx.protectedCompile) throw new Error("protected compile cannot run Connector probe");
 		const res = await spawnWorker({
 			command: this.cmd(),
 			args: ["--version"],
@@ -370,6 +430,7 @@ export function createDriver(config: Record<string, unknown>): AgentDriver {
 	return new CodexDriver({
 		command: str(config.command),
 		model: str(config.model),
+		effort: str(config.effort),
 		sandbox: sandboxOf(config.sandbox),
 	});
 }

@@ -47,7 +47,7 @@ export function SessionMenu({
 	sessions: RoomSession[];
 	trigger: ReactElement;
 	onSwitch: (sessionId: string) => void | Promise<void>;
-	onNew: () => void | Promise<void>;
+	onNew?: () => void | Promise<void>;
 	onRename: (session: RoomSession) => void;
 	onDelete: (session: RoomSession) => void;
 	align?: "start" | "center" | "end";
@@ -94,10 +94,10 @@ export function SessionMenu({
 						</button>
 					</DropdownMenuItem>
 				))}
-				<DropdownMenuItem onSelect={() => void onNew()} className="home-session-menu-new">
+				{onNew ? <DropdownMenuItem onSelect={() => void onNew()} className="home-session-menu-new">
 					<PlusIcon />
 					<span>新建会话</span>
-				</DropdownMenuItem>
+				</DropdownMenuItem> : null}
 			</DropdownMenuContent>
 		</DropdownMenu>
 	);

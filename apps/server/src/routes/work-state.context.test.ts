@@ -11,10 +11,10 @@ import { InteractionSecretStore } from "../agent-runtime/interaction-secret-stor
 import { AgentRuntime } from "../agent-runtime/runtime.js";
 import { PiSessionStore } from "../pi-bridge/session-store.js";
 import { TeamsStore } from "../store/teams.js";
-import { WorkStateStore } from "../store/work-state.js";
+import { WorkStateStore, workItemContractHash, type ExecutionReceipt } from "../store/work-state.js";
 import { registerWorkStateRoutes } from "./work-state.js";
 
-async function makeStack() {
+async function makeStack(promote?: (scopeId: string, changeSetId: string) => Promise<unknown>) {
 	const dir = mkdtempSync(path.join(tmpdir(), "pt-work-state-context-"));
 	process.env.PI_CODING_AGENT_DIR = path.join(dir, "agent-dir");
 	const teams = new TeamsStore({ state: path.join(dir, "teams"), assets: path.join(dir, "teams"), managedWorkspaces: path.join(dir, "managed") }, dir);
@@ -30,13 +30,102 @@ async function makeStack() {
 	const workStates = new WorkStateStore(path.join(dir, "work-state"));
 	await workStates.init();
 	const app = Fastify({ logger: false });
-	registerWorkStateRoutes(app, workStates, teams, sessions);
+	registerWorkStateRoutes(app, workStates, teams, sessions, promote ? { promoteWorkspaceChangeSet: promote } as unknown as AgentRuntime : undefined);
 	const solo = await teams.ensureSoloWindow(
 		async (workspaceId, cwd) => sessions.create(undefined, { type: "solo", members: [], workspaceId, cwd }),
 		async () => false,
 	);
 	return { app, teams, sessions, invoker, workStates, solo };
 }
+
+test("页面验收 Git 写 Submission 时先记录意图、提升 change-set，再接受且可重放", async () => {
+	let stack: Awaited<ReturnType<typeof makeStack>>;
+	let promotions = 0;
+	stack = await makeStack(async (scopeId, changeSetId) => {
+		promotions += 1;
+		const state = await stack.workStates.getActive(stack.solo.activeSession);
+		const targetId = changeSetId === "cs-conflict" ? "W2" : "W1";
+		assert.ok(state?.plan?.items[targetId]?.submissions[0]?.acceptanceIntent, "提升前必须冻结 accepted 意图");
+		assert.ok(["scope-route", "scope-conflict"].includes(scopeId));
+		assert.ok(["cs-route", "cs-conflict"].includes(changeSetId));
+		if (changeSetId === "cs-route") {
+			const item = state!.plan!.items.W1!;
+			const competing = await stack.app.inject({ method: "POST", url: `/api/sessions/${stack.solo.activeSession}/work-items/W1/review`,
+				headers: { "idempotency-key": "competing-revision" }, payload: { expectedGoalId: state!.goalId, expectedRevision: state!.revision,
+					expectedEpoch: state!.execution.epoch, expectedWorkItemRevision: item.revision, expectedSubmissionId: item.submissions[0]!.id,
+					verdict: "revision", summary: "并发要求返修" } });
+			assert.equal(competing.statusCode, 400, competing.body);
+			assert.equal((await stack.workStates.getActive(stack.solo.activeSession))?.plan?.items.W1?.status, "submitted");
+			const unrelated = await stack.workStates.noteDelegation(stack.solo.activeSession, {
+				goalId: state!.goalId, workItemId: "W2", delegationId: "D-conflict",
+				delegationStatus: "running", goalEpoch: state!.execution.epoch,
+			}, "unrelated-during-promotion");
+			assert.ok(unrelated.revision > state!.revision, "无关 WorkItem 可以推进全局修订号");
+		}
+		return changeSetId === "cs-conflict"
+			? { ...conflictChangeSet, promotionState: "conflict" as const }
+			: { ...changeSet, promotionState: "applied" as const, promotedAt: new Date().toISOString() };
+	});
+	const sessionId = stack.solo.activeSession;
+	const goal = await stack.workStates.create({ sessionId, goal: "交付 Git 文件", completionBoundary: "文件存在" });
+	const planned = await stack.workStates.updatePlan(sessionId, goal.revision, {
+		upsertItems: ["W1", "W2"].map((id) => ({ id, title: "写入文件", acceptanceCriteria: ["文件存在"], sourceGoalCriteria: ["goal:1:1"], workspaceExecutionClass: "git_write" as const,
+			verificationPolicy: { mode: "manager_review" as const, trigger: "manager_request" as const, source: "user" as const, reason: "人工检查" } })), reason: "建立 Git 写任务",
+	}, "plan-route");
+	const item = planned.plan!.items.W1!;
+	assert.equal(item.workspaceExecutionPolicy.mode, "isolated_worktree");
+	const receipt: ExecutionReceipt = {
+		id: "receipt-route", delegationId: "D-route", goalId: goal.goalId, workPlanId: planned.plan!.id, workItemId: item.id,
+		goalRevision: planned.goalRevision, workItemRevision: item.revision, goalEpoch: planned.execution.epoch,
+		taskContractHash: workItemContractHash(planned, planned.plan!, item), contractHash: "sha256:runtime-envelope", reportedOutcome: "completed",
+		requirementResults: [{ requirement: "文件存在", status: "provided", evidenceRefs: ["D-route"] }], artifactCapture: [],
+		collectionStatus: "complete", integrity: "clean", issues: [], sealedAt: new Date().toISOString(), workspaceExecutionScopeId: "scope-route",
+	};
+	const changeSet = { id: "cs-route", executionScopeId: "scope-route", delegationIds: ["D-route"], mode: "isolated_worktree" as const,
+		baselineFingerprint: "base", outputFingerprint: "out", changedPaths: ["result.txt"], promotionState: "pending" as const, createdAt: new Date().toISOString() };
+	const conflictChangeSet = { ...changeSet, id: "cs-conflict", executionScopeId: "scope-conflict", delegationIds: ["D-conflict"] };
+	const submitted = await stack.workStates.noteDelegation(sessionId, { goalId: goal.goalId, workItemId: "W1", delegationId: "D-route",
+		delegationStatus: "completed", goalEpoch: 1, executionReceipt: receipt, workspaceChangeSet: changeSet }, "submit-route");
+	const target = submitted.plan!.items.W1!;
+	const body = { expectedGoalId: goal.goalId, expectedRevision: submitted.revision, expectedEpoch: 1,
+		expectedWorkItemRevision: target.revision, expectedSubmissionId: target.submissions[0]!.id,
+		verdict: "accepted", summary: "文件已验证", evidenceRefs: ["delegation:D-route"] };
+	try {
+		const url = `/api/sessions/${sessionId}/work-items/W1/review`;
+		const response = await stack.app.inject({ method: "POST", url, headers: { "idempotency-key": "review-route" }, payload: body });
+		assert.equal(response.statusCode, 200, response.body);
+		assert.equal(response.json().workItem.status, "accepted");
+		assert.equal(response.json().workItem.submissions[0].workspaceChangeSet.promotionState, "applied");
+		assert.equal(promotions, 1);
+		const replay = await stack.app.inject({ method: "POST", url, headers: { "idempotency-key": "review-route" }, payload: body });
+		assert.equal(replay.statusCode, 200, replay.body);
+		assert.equal(promotions, 1);
+		const beforeConflict = await stack.workStates.getActive(sessionId);
+		const conflictItem = beforeConflict!.plan!.items.W2!;
+		const conflictReceipt: ExecutionReceipt = { ...receipt, id: "receipt-conflict", delegationId: "D-conflict", workItemId: "W2",
+			workItemRevision: conflictItem.revision, taskContractHash: workItemContractHash(beforeConflict!, beforeConflict!.plan!, conflictItem),
+			workspaceExecutionScopeId: "scope-conflict" };
+		const conflictSubmitted = await stack.workStates.noteDelegation(sessionId, { goalId: goal.goalId, workItemId: "W2", delegationId: "D-conflict",
+			delegationStatus: "completed", goalEpoch: 1, executionReceipt: conflictReceipt, workspaceChangeSet: conflictChangeSet }, "submit-conflict");
+		const conflictTarget = conflictSubmitted.plan!.items.W2!;
+		const conflictResponse = await stack.app.inject({ method: "POST", url: `/api/sessions/${sessionId}/work-items/W2/review`,
+			headers: { "idempotency-key": "review-conflict" }, payload: { ...body, expectedRevision: conflictSubmitted.revision,
+				expectedWorkItemRevision: conflictTarget.revision, expectedSubmissionId: conflictTarget.submissions[0]!.id } });
+		assert.equal(conflictResponse.statusCode, 200, conflictResponse.body);
+		assert.equal(conflictResponse.json().workItem.status, "blocked");
+		assert.equal(conflictResponse.json().workItem.submissions[0].workspaceChangeSet.promotionState, "conflict");
+		assert.equal(promotions, 2);
+		const conflictReplay = await stack.app.inject({ method: "POST", url: `/api/sessions/${sessionId}/work-items/W2/review`,
+			headers: { "idempotency-key": "review-conflict" }, payload: { ...body, expectedRevision: conflictSubmitted.revision,
+				expectedWorkItemRevision: conflictTarget.revision, expectedSubmissionId: conflictTarget.submissions[0]!.id } });
+		assert.equal(conflictReplay.statusCode, 200, conflictReplay.body);
+		assert.equal(conflictReplay.json().workItem.status, "blocked");
+		assert.equal(promotions, 2);
+	} finally {
+		await stack.sessions.disposeAll();
+		await stack.app.close();
+	}
+});
 
 async function parkSolo(
 	stack: Awaited<ReturnType<typeof makeStack>>,

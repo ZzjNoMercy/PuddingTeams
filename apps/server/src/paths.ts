@@ -1,6 +1,6 @@
 import { constants as fsConstants } from "node:fs";
-import { access, mkdir, open, readFile, rm } from "node:fs/promises";
-import { createHash } from "node:crypto";
+import { access, mkdir, open, readdir, rm } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
@@ -18,11 +18,13 @@ import path from "node:path";
  * <home>/assets/avatars/
  * <home>/uploads/
  * <home>/artifacts/blobs/
+ * <home>/state/knowledge/ + state/knowledge/{acceptance,plans,reviews,operations}/ + knowledge/objects/ + cache/knowledge/ # Teams 2.0
+ * <home>/state/calendar/                                  # Teams 2.0
  * <home>/workspaces/{managed/,unscoped/}   # unscoped = 无项目中立 cwd
  * <home>/secrets/{credentials.json,credentials.key,interaction-secrets.json,interactions.key,auth.json}
  * <home>/secrets/mcp/{credentials.json,credentials.key} # MCP Server 加密凭据
  * <home>/secrets/capabilities/<extension>/<agent>/<binding>/ # CLI 自管认证状态
- * <home>/runtime/{backend.lease,tmp/,fff/workspaces/<workspace-key>/}
+ * <home>/runtime/{backend.leases/,tmp/,fff/workspaces/<workspace-key>/}
  * <home>/logs/  <home>/migrations/
  * ```
  */
@@ -36,6 +38,14 @@ export interface PuddingTeamsPaths {
 	assets: string;
 	uploads: string;
 	artifactBlobs: string;
+	knowledgeState: string;
+	knowledgeAcceptance: string;
+	knowledgePlans: string;
+	knowledgeReviews: string;
+	knowledgeOperations: string;
+	knowledgeObjects: string;
+	knowledgeCache: string;
+	calendarState: string;
 	managedWorkspaces: string;
 	unscopedWorkspace: string;
 	secrets: string;
@@ -70,6 +80,14 @@ export function resolvePuddingTeamsPaths(env: NodeJS.ProcessEnv = process.env, h
 		assets: path.join(root, "assets"),
 		uploads: path.join(root, "uploads"),
 		artifactBlobs: path.join(root, "artifacts", "blobs"),
+		knowledgeState: path.join(root, "state", "knowledge"),
+		knowledgeAcceptance: path.join(root, "state", "knowledge", "acceptance"),
+		knowledgePlans: path.join(root, "state", "knowledge", "plans"),
+		knowledgeReviews: path.join(root, "state", "knowledge", "reviews"),
+		knowledgeOperations: path.join(root, "state", "knowledge", "operations"),
+		knowledgeObjects: path.join(root, "knowledge", "objects"),
+		knowledgeCache: path.join(root, "cache", "knowledge"),
+		calendarState: path.join(root, "state", "calendar"),
 		managedWorkspaces: path.join(root, "workspaces", "managed"),
 		unscopedWorkspace: path.join(root, "workspaces", "unscoped"),
 		secrets: path.join(root, "secrets"),
@@ -98,6 +116,14 @@ export async function ensurePaths(paths: PuddingTeamsPaths): Promise<void> {
 		path.join(paths.assets, "avatars"),
 		paths.uploads,
 		paths.artifactBlobs,
+		paths.knowledgeState,
+		paths.knowledgeAcceptance,
+		paths.knowledgePlans,
+		paths.knowledgeReviews,
+		paths.knowledgeOperations,
+		paths.knowledgeObjects,
+		paths.knowledgeCache,
+		paths.calendarState,
 		paths.managedWorkspaces,
 		paths.unscopedWorkspace,
 		paths.secrets,
@@ -127,41 +153,49 @@ function processAlive(pid: number): boolean {
 }
 
 /**
- * 单写者 Lease：`runtime/backend.lease` 以 O_EXCL 创建（内容 {pid,
- * startedAt}）。已存在且记录的进程仍存活 → 拒绝启动；进程已死或内容
- * 损坏（stale）→ 回收后重建。返回 release 函数（进程退出时删除 lease）。
+ * 每个候选进程创建独立的 lease 文件，文件名在写入内容之前就包含 PID。
+ * 随后扫描同目录：存在其他存活进程的候选文件就拒绝启动。两个同时
+ * 回收 stale 文件的进程不会删除彼此的新文件；同时竞选可能双双拒绝，
+ * 但绝不能双双取得单写者资格。遗留单文件 lease 一律拒绝，避免
+ * 无法确认旧版后端是否仍在写入。仅支持本机文件系统上的单写者语义。
  */
 export async function acquireLease(paths: PuddingTeamsPaths): Promise<() => Promise<void>> {
-	const file = path.join(paths.runtime, "backend.lease");
-	await mkdir(paths.runtime, { recursive: true });
+	const directory = path.join(paths.runtime, "backend.leases");
+	await mkdir(directory, { recursive: true });
 	const payload: LeasePayload = { pid: process.pid, startedAt: new Date().toISOString() };
-	for (let attempt = 0; attempt < 2; attempt++) {
-		try {
-			const handle = await open(file, "wx");
-			try {
-				await handle.writeFile(JSON.stringify(payload) + "\n", "utf-8");
-			} finally {
-				await handle.close();
-			}
-			return async () => {
-				await rm(file, { force: true });
-			};
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-			const raw = await readFile(file, "utf-8").catch(() => "");
-			let pid: number | undefined;
-			try {
-				const parsed = JSON.parse(raw) as Partial<LeasePayload>;
-				if (typeof parsed.pid === "number") pid = parsed.pid;
-			} catch {
-				pid = undefined;
-			}
-			if (pid !== undefined && processAlive(pid)) {
+	const legacyFile = path.join(paths.runtime, "backend.lease");
+	try {
+		await access(legacyFile);
+		throw new Error(`检测到旧版后端 lease，无法确认是否仍在写入，拒绝启动：${legacyFile}`);
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+	}
+	const filename = `${process.pid}-${randomUUID()}.json`;
+	const file = path.join(directory, filename);
+	const handle = await open(file, "wx", 0o600);
+	try {
+		await handle.writeFile(JSON.stringify(payload) + "\n", "utf-8");
+	} catch (err) {
+		await rm(file, { force: true });
+		throw err;
+	} finally {
+		await handle.close();
+	}
+	try {
+		for (const candidate of await readdir(directory)) {
+			if (candidate === filename) continue;
+			const match = /^(\d+)-[0-9a-f-]+\.json$/.exec(candidate);
+			if (!match) throw new Error(`无法识别后端 lease：${candidate}`);
+			const pid = Number(match[1]);
+			if (!Number.isSafeInteger(pid) || pid < 1) throw new Error(`无效后端 lease：${candidate}`);
+			if (processAlive(pid)) {
 				throw new Error(`另一个 PuddingTeams 后端正在运行（pid ${pid}），同一数据目录拒绝第二个实例：${paths.home}`);
 			}
-			// stale lease：回收后重试 O_EXCL 创建。
-			await rm(file, { force: true });
+			await rm(path.join(directory, candidate), { force: true });
 		}
+	} catch (err) {
+		await rm(file, { force: true });
+		throw err;
 	}
-	throw new Error(`无法获取后端 lease：${file}`);
+	return async () => { await rm(file, { force: true }); };
 }

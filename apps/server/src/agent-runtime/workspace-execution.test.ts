@@ -252,6 +252,60 @@ test("promotion detects a target change after the workspace fingerprint check", 
 	}
 });
 
+test("promotion preserves an external replacement and the original backup after rename", async () => {
+	const root = await gitRepo();
+	const state = await temp("pt-execution-state-");
+	let backupPath = "";
+	try {
+		const coordinator = new WorkspaceExecutionCoordinator(state, {
+			promotionInstallCheckpoint: async (relative, backup) => {
+				assert.equal(relative, "tracked.txt");
+				backupPath = backup;
+				await writeFile(path.join(root, relative), "external replacement\n");
+			},
+		});
+		await coordinator.init();
+		const scope = await coordinator.begin({ workspacePath: root, workspaceId: "ws-install-race", mode: "isolated_worktree", delegationId: "d-race" });
+		await writeFile(path.join(scope.executionCwd, "tracked.txt"), "worker\n");
+		const changes = await coordinator.capture(scope.id, scope.ownerToken);
+		const result = await coordinator.promote(scope.id, changes.id, scope.ownerToken);
+		assert.equal(result.promotionState, "conflict");
+		assert.equal((await coordinator.get(scope.id))?.state, "fenced");
+		assert.equal(await readFile(path.join(root, "tracked.txt"), "utf8"), "external replacement\n");
+		assert.equal(await readFile(backupPath, "utf8"), "base\n");
+	} finally {
+		await rm(root, { recursive: true, force: true });
+		await rm(state, { recursive: true, force: true });
+	}
+});
+
+test("promotion restores the original when installation fails after rename without another writer", async () => {
+	const root = await gitRepo();
+	const state = await temp("pt-execution-state-");
+	let backupPath = "";
+	try {
+		let executionRoot = "";
+		const coordinator = new WorkspaceExecutionCoordinator(state, {
+			promotionInstallCheckpoint: async (_relative, backup) => {
+				backupPath = backup;
+				await rm(path.join(executionRoot, "tracked.txt"));
+			},
+		});
+		await coordinator.init();
+		const scope = await coordinator.begin({ workspacePath: root, workspaceId: "ws-install-failure", mode: "isolated_worktree", delegationId: "d-failure" });
+		executionRoot = scope.executionCwd;
+		await writeFile(path.join(executionRoot, "tracked.txt"), "worker\n");
+		const changes = await coordinator.capture(scope.id, scope.ownerToken);
+		const result = await coordinator.promote(scope.id, changes.id, scope.ownerToken);
+		assert.equal(result.promotionState, "conflict");
+		assert.equal(await readFile(path.join(root, "tracked.txt"), "utf8"), "base\n");
+		await assert.rejects(() => readFile(backupPath));
+	} finally {
+		await rm(root, { recursive: true, force: true });
+		await rm(state, { recursive: true, force: true });
+	}
+});
+
 test("shared read-only detects mutation and rejects an unenforced admission", async () => {
 	const root = await temp("pt-execution-readonly-");
 	const state = await temp("pt-execution-state-");

@@ -2,6 +2,8 @@ import { spawn } from "node:child_process";
 import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
 
 type AuthMode = "auto" | "local" | "isolated";
 
@@ -46,6 +48,7 @@ interface ConnectionContext {
 interface ConnectionAction {
 	id: string;
 	label: string;
+	kind?: "authorization";
 	description?: string;
 	confirmation?: { title: string; description: string; confirmLabel: string };
 }
@@ -58,6 +61,7 @@ interface ConnectionStatus {
 	version?: string;
 	accountName?: string;
 	identity?: string;
+	userAuthorization?: "authorized" | "expired" | "missing";
 	message?: string;
 	actions?: ConnectionAction[];
 	checkedAt: string;
@@ -152,10 +156,11 @@ function prependPath(env: NodeJS.ProcessEnv, dir: string): NodeJS.ProcessEnv {
 	return next;
 }
 
-function runCommand(command: string, args: string[], env: NodeJS.ProcessEnv, timeoutMs = 120_000): Promise<CommandResult> {
+function runCommand(command: string, args: string[], env: NodeJS.ProcessEnv, timeoutMs = 120_000, options: { cwd?: string; signal?: AbortSignal } = {}): Promise<CommandResult> {
 	return new Promise((resolve) => {
 		const child = spawn(command, args, {
 			env,
+			...options,
 			stdio: ["ignore", "pipe", "pipe"],
 			shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(command),
 		});
@@ -558,6 +563,7 @@ async function listConnections(ctx: ConnectionContext): Promise<ConnectionStatus
 		LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1",
 	};
 	const description = source === "local" ? "本机飞书账号连接" : "平台安装的飞书账号连接";
+	const authorizeAction: ConnectionAction = { id: "authorize-user", kind: "authorization", label: "用户授权", description: "恢复已有用户授权；首次授权按飞书官方默认业务范围申请，具体权限由用户在飞书授权页确认" };
 	const versionResult = await runCommand(cliPath, ["--version"], env, 5_000);
 	const version = cliVersion(versionResult);
 	const authResult = await runCommand(cliPath, ["auth", "status", "--json", "--verify"], env, 8_000);
@@ -569,6 +575,7 @@ async function listConnections(ctx: ConnectionContext): Promise<ConnectionStatus
 			state: authResult.code === 124 ? "error" : "disconnected",
 			...(version ? { version } : {}),
 			message: authResult.code === 124 ? "登录状态检查超时，请检查网络后重试" : "尚未登录或登录已失效",
+			actions: [authorizeAction],
 			checkedAt,
 		}];
 	}
@@ -588,6 +595,7 @@ async function listConnections(ctx: ConnectionContext): Promise<ConnectionStatus
 				state: "disconnected",
 				...(version ? { version } : {}),
 				message: "登录凭证验证未通过",
+				actions: [authorizeAction],
 				checkedAt,
 			}];
 		}
@@ -595,6 +603,8 @@ async function listConnections(ctx: ConnectionContext): Promise<ConnectionStatus
 		const identity = status.identity === "bot" ? "机器人身份" : status.identity === "user" || user ? "用户身份" : undefined;
 		const identityStatus = typeof user?.status === "string" ? user.status : undefined;
 		const tokenStatus = typeof user?.tokenStatus === "string" ? user.tokenStatus : undefined;
+		const userAuthorization = tokenStatus === "expired" || identityStatus === "needs_refresh" ? "expired"
+			: tokenStatus === "valid" || (identityStatus === "active" && tokenStatus !== "missing") ? "authorized" : "missing";
 		return [{
 			id: "default",
 			name: "飞书 CLI",
@@ -603,7 +613,9 @@ async function listConnections(ctx: ConnectionContext): Promise<ConnectionStatus
 			...(version ? { version } : {}),
 			...(typeof user?.userName === "string" ? { accountName: user.userName } : {}),
 			...(identity ? { identity } : {}),
-			message: tokenStatus === "valid" || identityStatus === "active" ? "登录状态有效" : "已登录",
+			userAuthorization,
+			actions: [{ ...authorizeAction, label: userAuthorization === "authorized" || userAuthorization === "expired" ? "重新授权" : "用户授权" }],
+			message: userAuthorization === "authorized" ? "登录状态有效" : userAuthorization === "expired" ? "用户授权已过期；机器人连接不代表个人日历可访问" : "用户尚未授权；机器人连接不代表个人日历可访问",
 			checkedAt,
 		}];
 	} catch {
@@ -641,6 +653,118 @@ async function runConnectionAction(connectionId: string, actionId: string, ctx: 
 	return pending;
 }
 
+interface AuthorizationSession {
+	id: string;
+	state: "pending" | "completed" | "failed" | "expired" | "cancelled";
+	verificationUrl?: string;
+	qrCodeDataUrl?: string;
+	expiresAt: string;
+	message?: string;
+}
+
+interface PendingAuthorization {
+	view: AuthorizationSession;
+	key: string;
+	deviceCode?: string;
+	cliPath: string;
+	env: NodeJS.ProcessEnv;
+	controller: AbortController;
+	polling: boolean;
+}
+const authorizations = new Map<string, PendingAuthorization>();
+const authorizationStarts = new Map<string, Promise<AuthorizationSession>>();
+
+function authorizationKey(connectionId: string, ctx: ConnectionContext): string {
+	if (connectionId !== "default") throw new Error("飞书连接不存在");
+	return canonical(ctx.stateDir);
+}
+
+function finishAuthorization(session: PendingAuthorization, state: AuthorizationSession["state"], message: string): void {
+	if (session.view.state !== "pending") return;
+	session.view = { id: session.view.id, state, expiresAt: session.view.expiresAt, message };
+	session.deviceCode = undefined;
+	session.controller.abort();
+}
+
+/** 官方 CLI 管理凭证；平台只保留本次流程的临时设备码，不另建 token 存储。 */
+const authorization = {
+	async begin(connectionId: string, actionId: string, ctx: ConnectionContext): Promise<AuthorizationSession> {
+		const key = authorizationKey(connectionId, ctx);
+		if (actionId !== "authorize-user") throw new Error("不支持的授权动作");
+		const starting = authorizationStarts.get(key);
+		if (starting) return starting;
+		const pending = (async () => {
+			for (const session of authorizations.values()) {
+				if (session.key === key) finishAuthorization(session, "cancelled", "已重新发起授权");
+			}
+			const { cliPath } = await findAvailableCli(ctx.env, ctx.stateDir);
+			if (!cliPath) throw new Error("请先安装飞书 CLI");
+			const env = { ...prependPath(ctx.env, path.dirname(cliPath)), LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1", LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1" };
+			const current = await runCommand(cliPath, ["auth", "status", "--json"], env, 5_000);
+			let scope: string | undefined;
+			if (current.code === 0) {
+				try {
+					const status = JSON.parse(current.stdout) as { identities?: { user?: { scope?: unknown } } };
+					const existing = status.identities?.user?.scope;
+					if (typeof existing === "string") scope = existing.trim() || undefined;
+					else if (Array.isArray(existing) && existing.every(item => typeof item === "string")) scope = existing.join(" ").trim() || undefined;
+				} catch { throw new Error("无法确认已有授权范围，请检查 CLI 配置后重试"); }
+			} else if (current.code === 124) throw new Error("读取授权范围超时，请重试");
+			const result = await runCommand(cliPath, ["auth", "login", ...(scope ? ["--scope", scope] : ["--recommend"]), "--no-wait", "--json"], env, 20_000);
+			if (result.code !== 0) throw new Error(result.code === 124 ? "获取授权入口超时，请检查网络后重试" : "无法发起用户授权，请确认 CLI 已配置飞书应用且允许用户登录");
+			let data: { verification_url?: unknown; device_code?: unknown; expires_in?: unknown };
+			try { data = JSON.parse(result.stdout); } catch { throw new Error("无法读取飞书授权入口，请检查官方 CLI 版本"); }
+			if (typeof data.verification_url !== "string" || typeof data.device_code !== "string" || !data.device_code) throw new Error("飞书未返回有效授权入口");
+			const url = new URL(data.verification_url);
+			if (url.protocol !== "https:" || url.username || url.password || !/(^|\.)(feishu\.cn|larksuite\.com)$/.test(url.hostname)) throw new Error("飞书返回了非官方授权地址");
+			const ttl = typeof data.expires_in === "number" && Number.isFinite(data.expires_in) && data.expires_in > 0 ? Math.min(data.expires_in, 600) * 1000 : 240_000;
+			const expiresAt = new Date(Date.now() + ttl).toISOString();
+			const qrDir = await mkdtemp(path.join(tmpdir(), "pt-lark-auth-"));
+			let qrCodeDataUrl: string;
+			try {
+				const qr = await runCommand(cliPath, ["auth", "qrcode", data.verification_url, "--output", "authorization.png"], env, 5_000, { cwd: qrDir });
+				if (qr.code !== 0) throw new Error("无法生成授权二维码，请重试或更新官方 CLI");
+				const png = await readFile(path.join(qrDir, "authorization.png"));
+				if (png.length > 1024 * 1024 || !png.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) throw new Error("授权二维码格式无效");
+				qrCodeDataUrl = `data:image/png;base64,${png.toString("base64")}`;
+			} finally { await rm(qrDir, { recursive: true, force: true }); }
+			const view: AuthorizationSession = { id: randomUUID(), state: "pending", verificationUrl: data.verification_url, qrCodeDataUrl, expiresAt, message: "等待用户授权" };
+			const session: PendingAuthorization = { view, key, deviceCode: data.device_code, cliPath, env, controller: new AbortController(), polling: false };
+			authorizations.set(view.id, session);
+			setTimeout(() => finishAuthorization(session, "expired", "授权入口已过期，请重新发起"), Math.max(0, Date.parse(expiresAt) - Date.now())).unref();
+			setTimeout(() => authorizations.delete(view.id), ttl + 60_000).unref();
+			return { ...view };
+		})().finally(() => authorizationStarts.delete(key));
+		authorizationStarts.set(key, pending);
+		return pending;
+	},
+	async status(connectionId: string, sessionId: string, ctx: ConnectionContext): Promise<AuthorizationSession | undefined> {
+		const session = authorizations.get(sessionId);
+		if (!session || session.key !== authorizationKey(connectionId, ctx)) return undefined;
+		if (session.view.state === "pending" && Date.parse(session.view.expiresAt) <= Date.now()) finishAuthorization(session, "expired", "授权入口已过期，请重新发起");
+		// 前端已拿到并展示链接后才启动官方等待流程；请求立即返回，不阻塞页面。
+		if (session.view.state === "pending" && !session.polling) {
+			session.polling = true;
+			void runCommand(session.cliPath, ["auth", "login", "--device-code", session.deviceCode!, "--json"], session.env, Math.max(1, Date.parse(session.view.expiresAt) - Date.now()), { signal: session.controller.signal })
+				.then(async (result) => {
+					if (session.view.state !== "pending") return;
+					if (result.code !== 0) {
+						finishAuthorization(session, result.code === 124 ? "expired" : "failed", result.code === 124 ? "授权入口已过期，请重新发起" : "授权未完成或被拒绝，请重新发起");
+						return;
+					}
+					const [connection] = await listConnections(ctx);
+					finishAuthorization(session, connection?.userAuthorization === "authorized" ? "completed" : "failed", connection?.userAuthorization === "authorized" ? "用户授权成功，登录状态已更新" : "授权已返回，但用户凭证未通过验证，请重新检查");
+				})
+				.catch(() => finishAuthorization(session, "failed", "授权确认失败，请重试"));
+		}
+		return { ...session.view };
+	},
+	async cancel(connectionId: string, sessionId: string, ctx: ConnectionContext): Promise<void> {
+		const session = authorizations.get(sessionId);
+		if (session?.key === authorizationKey(connectionId, ctx)) finishAuthorization(session, "cancelled", "已停止等待授权");
+	},
+};
+
 export const extension = {
 	manifest: {
 		id: "lark-cli",
@@ -653,11 +777,12 @@ export const extension = {
 	register(_ctx: CapabilityRegistration) {},
 	listConnections,
 	runConnectionAction,
+	authorization,
 	runtime: {
 		resolveSession: resolveRuntime,
 		probe: probeRuntime,
 	},
 };
 
-export { exportOfficialSkills, findLocalCli, listConnections, parseConfig, probeRuntime, resolveRuntime, runConnectionAction };
+export { authorization, exportOfficialSkills, findLocalCli, listConnections, parseConfig, probeRuntime, resolveRuntime, runConnectionAction };
 export default extension;

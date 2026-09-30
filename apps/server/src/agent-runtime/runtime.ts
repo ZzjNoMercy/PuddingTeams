@@ -32,6 +32,10 @@ import type {
 } from "./types.js";
 import { workspaceHandoffNote } from "./workspace-result-context.js";
 import { redactText, redactValue } from "./redaction.js";
+import { issueCompileSandbox } from "../knowledge/compile-sandbox.js";
+import { fingerprintCompileSnapshot } from "../knowledge/compile-snapshot.js";
+import type { CompileJobStore } from "../knowledge/compile-jobs.js";
+import type { CompileJob } from "../knowledge/contracts.js";
 
 export interface DelegateInput {
 	windowId: string;
@@ -40,7 +44,8 @@ export interface DelegateInput {
 	managerSessionId: string;
 	managerToolCallId?: string;
 	contractHash?: string;
-	purpose?: "execution" | "verification";
+	purpose?: "execution" | "verification" | "knowledge_compile";
+	compileJobId?: string;
 	verificationId?: string;
 	verifiesSubmissionId?: string;
 	environmentProfileId?: string;
@@ -60,6 +65,8 @@ export interface DelegateInput {
 	completionBoundary?: string;
 	agentId: string;
 	agentRevision: number;
+	/** Internal Pi session location snapshot; null selects the platform default. */
+	workerSessionDir?: string | null;
 	message: string;
 	/** "run" 新开 worker session；"continue" 续接 window 记录的 session。 */
 	mode: "run" | "continue";
@@ -98,6 +105,15 @@ export interface RespondOutcome {
 export interface InteractionTTL {
 	/** 默认 24h；受上游更短 TTL 限制。 */
 	ttlMs: number;
+}
+
+/** Host-owned callbacks; an Agent/Manager never supplies these through a route. */
+export interface CompileAdmission {
+	jobs: CompileJobStore;
+	/** Must attest this exact instance against the currently loaded first-party factory. */
+	attestCompilerDriver: (job: CompileJob, driver: AgentDriver) => Promise<string | undefined>;
+	authorizeJob: (job: CompileJob) => Promise<void>;
+	validateCandidate: (job: CompileJob, outcome: RuntimeOutcome) => Promise<string>;
 }
 
 /** 同一 Session 已有 active/waiting Run 时的 409 语义冲突。 */
@@ -168,6 +184,7 @@ export class AgentRuntime {
 		/** Append-only worker activity timeline (optional in isolated tests). */
 		private readonly timeline?: DelegationTimelineStore,
 		private readonly workspaceExecution?: WorkspaceExecutionCoordinator,
+		private readonly compileAdmission?: CompileAdmission,
 	) {
 		this.broker = new InteractionBroker(delegations);
 	}
@@ -381,6 +398,103 @@ export class AgentRuntime {
 	}
 
 	async delegate(input: DelegateInput, ctx: InvocationContext): Promise<RuntimeOutcome> {
+		// Only the platform CompileJob coordinator may eventually issue this authority.
+		// A normal Manager/Invoker call cannot turn a worker into a protected compiler
+		// by supplying an InvocationContext field, even if the Driver accepts it.
+		if (ctx.protectedCompile) throw new Error("protected compile requires a platform CompileJob admission");
+		if (input.purpose !== undefined && input.purpose !== "execution" && input.purpose !== "verification") {
+			throw new Error("unsupported delegation purpose");
+		}
+		return this.delegateInternal(input, ctx);
+	}
+
+	/** The only Runtime entry for a protected local compiler. Authority is loaded
+	 * from the durable Job, checked by the host, and reissued before Driver start. */
+	async runCompileJob(jobId: string): Promise<RuntimeOutcome> {
+		const admission = this.compileAdmission;
+		if (!admission) throw new Error("CompileJob admission is not configured");
+		const job = await admission.jobs.get(jobId);
+		if (!job || job.status !== "queued") throw new Error("CompileJob is not queued");
+		if (job.compilerRef !== "@puddingteams/connector-codex") {
+			throw new Error("CompileJob compiler package is not trusted");
+		}
+		await admission.authorizeJob(job);
+		const driver = await this.resolveDriver(job.agentId);
+		if (!driver || driver.id !== "codex" || (await driver.capabilities()).transport !== "spawn") {
+			throw new Error("CompileJob requires the reviewed local Codex Driver");
+		}
+		const assertCompilerDriver = async () => {
+			if (await admission.attestCompilerDriver(job, driver) !== job.compilerPackageSha256) {
+				throw new Error("CompileJob resolved Driver is not the reviewed loaded package");
+			}
+		};
+		await assertCompilerDriver();
+		await admission.jobs.claim(job.id);
+		const assertFrozenSource = async () => {
+			const actual = await fingerprintCompileSnapshot(job.sourceSnapshotRoot);
+			if (actual !== job.sourceSnapshotHash) throw new Error("CompileJob source snapshot changed");
+		};
+		let outcome: RuntimeOutcome;
+		try {
+			await assertFrozenSource();
+			const protectedCompile = await issueCompileSandbox({
+				jobId: job.id, sourceSnapshotRoot: job.sourceSnapshotRoot, stagingRoot: job.stagingRoot,
+				privateRoot: job.privateRoot, commandPath: job.commandPath, commandSha256: job.commandSha256,
+			});
+			outcome = await this.delegateInternal({
+				windowId: `knowledge:${job.id}`, cwdSnapshot: job.stagingRoot, managerSessionId: `knowledge:${job.id}`,
+				purpose: "knowledge_compile", compileJobId: job.id, agentId: job.agentId, agentRevision: job.agentRevision,
+				message: job.task, mode: "run", requestId: job.operationId, driver,
+				beforeDriverStart: async (delegation) => {
+					await assertFrozenSource();
+					await admission.authorizeJob(job);
+					await assertCompilerDriver();
+					await admission.jobs.bindDelegation(job.id, delegation.id);
+				},
+			}, { cwd: job.stagingRoot, env: protectedCompile.env, protectedCompile });
+		} catch (error) {
+			await admission.jobs.finish(job.id, "failed", { failureCode: error instanceof Error && error.message.includes("source snapshot") ? "source_snapshot_changed" : "runtime_start_failed" });
+			throw error;
+		}
+		if (outcome.status !== "completed") {
+			await admission.jobs.finish(job.id, "failed", { failureCode: outcome.result.status === "failed" ? outcome.result.errorCode ?? "worker_failed" : "worker_needs_input" });
+			return outcome;
+		}
+		let failureCode = "candidate_validation_failed";
+		try {
+			await assertFrozenSource();
+			failureCode = "compiler_package_changed";
+			await assertCompilerDriver();
+			// Binding, trust, Agent and accepted-source authority can change while
+			// the Driver runs. A successful model response cannot retain old access.
+			failureCode = "compile_authorization_changed";
+			await admission.authorizeJob(job);
+			failureCode = "candidate_validation_failed";
+			const candidateBatchId = await admission.validateCandidate(job, outcome);
+			await assertFrozenSource();
+			failureCode = "compiler_package_changed";
+			await assertCompilerDriver();
+			// Validation itself may take time; recheck before publishing the Job's
+			// candidate-ready state.
+			failureCode = "compile_authorization_changed";
+			await admission.authorizeJob(job);
+			failureCode = "candidate_validation_failed";
+			await admission.jobs.finish(job.id, "candidate_ready", { candidateBatchId });
+		} catch (error) {
+			await admission.jobs.finish(job.id, "failed", { failureCode: error instanceof Error && error.message.includes("source snapshot") ? "source_snapshot_changed" : failureCode });
+			throw error;
+		}
+		return outcome;
+	}
+
+	private async delegateInternal(input: DelegateInput, ctx: InvocationContext): Promise<RuntimeOutcome> {
+		if (input.purpose === "knowledge_compile") {
+			if (!input.compileJobId || !ctx.protectedCompile || ctx.protectedCompile.jobId !== input.compileJobId || input.mode !== "run" || input.sessionHandle) {
+				throw new Error("invalid CompileJob Runtime boundary");
+			}
+		} else if (ctx.protectedCompile || input.compileJobId) {
+			throw new Error("CompileJob authority cannot enter an ordinary delegation");
+		}
 		const driver = input.driver ?? (await this.resolveDriver(input.agentId));
 		if (!driver) throw new Error(`agent not found or no driver: ${input.agentId}`);
 		const driverCapabilities = await driver.capabilities();
@@ -421,6 +535,7 @@ export class AgentRuntime {
 			managerSessionId: input.managerSessionId,
 			managerToolCallId: input.managerToolCallId,
 			purpose: input.purpose ?? "execution",
+			compileJobId: input.compileJobId,
 			verificationId: input.verificationId,
 			verifiesSubmissionId: input.verifiesSubmissionId,
 			environmentProfileId: input.environmentProfileId,
@@ -440,8 +555,9 @@ export class AgentRuntime {
 			evidenceRequirements: input.evidenceRequirements,
 			completionBoundary: input.completionBoundary,
 			agentId: input.agentId,
-			agentRevision: input.agentRevision,
+				agentRevision: input.agentRevision,
 				driverId: driver.id,
+				...(driver.id === "pi" ? { workerSessionDir: input.workerSessionDir ?? null } : {}),
 				driverTransport: driverCapabilities.transport,
 				workspaceCapabilities: driverCapabilities.workspace,
 				capabilityFingerprint: fingerprint,
@@ -578,7 +694,7 @@ export class AgentRuntime {
 				const blocked: Exclude<NormalizedResult, NeedsInputResult> = {
 					agentId: input.agentId,
 					status: "blocked",
-					errorCode: "replacement_reservation_failed",
+					errorCode: input.purpose === "knowledge_compile" ? "compile_admission_failed" : "replacement_reservation_failed",
 					error: error instanceof Error ? error.message : String(error),
 					recoverable: true,
 				};
@@ -664,7 +780,7 @@ export class AgentRuntime {
 				let restart = false;
 				for await (const event of events) {
 					await markWorkerStarted();
-					if (!staleRetried && knownSession && input.mode !== "run" && isStaleSessionFailure(event)) {
+					if (!staleRetried && input.purpose !== "knowledge_compile" && knownSession && input.mode !== "run" && isStaleSessionFailure(event)) {
 						staleRetried = true;
 						restart = true;
 						this.releaseSession(sessionHandle ?? knownSession, delegation.id);
@@ -835,6 +951,13 @@ export class AgentRuntime {
 				return { terminal: false, outcome: undefined as unknown as RuntimeOutcome };
 			}
 			case "input_required": {
+				if (delegation.purpose === "knowledge_compile") {
+					const failed: NormalizedResult = { agentId: delegation.agentId, status: "failed", errorCode: "compile_interaction_forbidden",
+						error: "knowledge compiler cannot request an interactive approval", recoverable: false };
+					const transition = await this.sealTerminal(delegation, ["running", "reconciling"], "reported_failed", failed, ctx);
+					if (transition.applied) await this.recordBoundary(delegation, { type: "failed", result: failed });
+					return { terminal: true, outcome: { status: "failed", result: failed, delegation: transition.record ?? delegation } };
+				}
 				const publicResult = redactValue(event.result);
 				// C1/H1：runHandle/sessionHandle 只可能出现在 boundary result 里
 				// （真实 driver 的 started 事件不带这些），必须从这里落盘，否则
@@ -973,7 +1096,6 @@ export class AgentRuntime {
 					name: artifact.name,
 					path: absolute,
 					kind: artifact.kind,
-					size: artifact.size,
 					origin: artifact.origin,
 					producer: delegation.agentId,
 					delegationId: delegation.id,
@@ -1172,6 +1294,7 @@ export class AgentRuntime {
 			completionBoundary: delegation.completionBoundary,
 			agentId: delegation.agentId,
 			agentRevision: delegation.agentRevision,
+			workerSessionDir: delegation.workerSessionDir,
 			message: delegation.task ?? "",
 			mode: delegation.operation,
 			sessionHandle: delegation.sessionHandle,
@@ -2214,6 +2337,11 @@ export class AgentRuntime {
 	 */
 	isDelegationActive(delegationId: string): boolean {
 		return this.activeDelegations.has(delegationId);
+	}
+
+	/** Guard a shared Pi worker Session stream against a later Delegation. */
+	isSessionOwnedByDelegation(sessionHandle: string, delegationId: string): boolean {
+		return this.activeRuns.get(sessionHandle) === delegationId;
 	}
 
 	/** 列出窗口下的 interactions（审批卡列表对账，H3）。 */

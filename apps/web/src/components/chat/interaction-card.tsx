@@ -1,13 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowRightLeftIcon, CheckIcon, ExternalLinkIcon, ShieldAlertIcon, XIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { cancelInteraction, getInteraction, submitInteractionResponse } from "@/lib/api";
+import type { InteractionRequestView, InteractionView } from "@/lib/api";
 import { useAgentLabel } from "@/lib/avatars";
+import { answerFor, buildInteractionResponses, canApproveRequests, choicesFor, selectedScopeFor } from "./interaction-response";
 import { WorkerAvatar } from "./worker-avatar";
 
 type CardStatus = "pending" | "busy" | "approved" | "rejected" | "expired" | "failed" | "replaced";
@@ -80,6 +82,9 @@ export function InteractionCard({
 	// props 里的 revision 只是首渲染快照。
 	const [liveRevision, setLiveRevision] = useState<number | undefined>(revision);
 	const [liveKind, setLiveKind] = useState<"permission" | "question" | "confirmation">(kind ?? "permission");
+	const [liveRequests, setLiveRequests] = useState<InteractionRequestView[]>(requests ?? []);
+	const [syncedInteractionId, setSyncedInteractionId] = useState<string | null>(null);
+	const syncedRevision = useRef<{ id: string; revision: number } | null>(null);
 	// Goal identity is authoritative on the Delegation. Historical/mirrored cards
 	// may predate the goalId projection, so refresh it together with the
 	// interaction instead of trusting only the message snapshot.
@@ -97,17 +102,25 @@ export function InteractionCard({
 	const [replacementLabel, setReplacementLabel] = useState<string>();
 	const [replacementFailed, setReplacementFailed] = useState(false);
 	const platformAdmission = liveSource === "platform_policy";
-	const reqs = requests ?? [];
-	const firstReq = reqs[0];
-	// M4：授权范围从服务端 options 派生，去掉 "reject"（那是动作不是范围），
-	// 默认取第一个合法范围，避免 options 不含 "once" 时 409。
-	// 兜底选项对齐 puddingclaw deploy-cli 的 respond 校验（仅 once|session）。
-	const allowedScopes = liveKind === "permission"
-		? (firstReq?.options?.length ? firstReq.options : ["once", "session"]).filter((s) => s !== "reject")
-		: [];
-	const businessOptions = liveKind === "permission" ? [] : (firstReq?.options ?? []).filter((option) => option !== "reject");
-	const [scope, setScope] = useState<string>(allowedScopes[0] ?? "once");
-	const [answer, setAnswer] = useState("");
+	const reqs = liveRequests;
+	const [scopeByRequest, setScopeByRequest] = useState<Record<string, string>>({});
+	const [valueByRequest, setValueByRequest] = useState<Record<string, string>>({});
+	const canApprove = canApproveRequests(reqs);
+	const canAnswer = reqs.length > 0 && reqs.every((request) => answerFor(request, valueByRequest).length > 0);
+	const canConfirm = reqs.length > 0 && reqs.every((request) => choicesFor(request).length === 0 || answerFor(request, valueByRequest).length > 0);
+	const requestsReady = Boolean(interactionId && syncedInteractionId === interactionId);
+	const interactionBusy = busy || status === "busy";
+	const adoptQuestionSet = useCallback((interaction: InteractionView) => {
+		if (syncedRevision.current?.id !== interaction.id || syncedRevision.current.revision !== interaction.revision) {
+			setScopeByRequest({});
+			setValueByRequest({});
+		}
+		syncedRevision.current = { id: interaction.id, revision: interaction.revision };
+		setLiveRevision(interaction.revision);
+		setLiveKind(interaction.kind);
+		setLiveRequests(interaction.requests);
+		setSyncedInteractionId(interaction.id);
+	}, []);
 
 	// 对账：有 interactionId 时以服务端为准，刷新/重放后恢复状态。
 	useEffect(() => {
@@ -118,8 +131,7 @@ export function InteractionCard({
 			try {
 				const { interaction, delegation } = await getInteraction(interactionId);
 				if (cancelled) return;
-				setLiveRevision(interaction.revision);
-				setLiveKind(interaction.kind);
+				adoptQuestionSet(interaction);
 				setLiveGoalId(delegation?.goalId ?? goalId);
 				setLiveSource(interaction.source);
 				setLiveWorkerStarted(delegation?.workerStarted ?? false);
@@ -175,11 +187,11 @@ export function InteractionCard({
 			cancelled = true;
 			if (timer) clearTimeout(timer);
 		};
-	}, [goalId, interactionId]);
+	}, [adoptQuestionSet, goalId, interactionId]);
 
 	const submit = useCallback(
 		async (action: "approve" | "reject" | "answer" | "confirm", chosenScope?: string, value?: unknown) => {
-			if (!interactionId) return;
+			if (!interactionId || !requestsReady || interactionBusy) return;
 			setBusy(true);
 			try {
 				const outcome = (await submitInteractionResponse(interactionId, {
@@ -187,12 +199,7 @@ export function InteractionCard({
 					revision: liveRevision ?? revision ?? 0,
 					...(liveGoalId ? { expectedGoalId: liveGoalId } : {}),
 					...(windowId ? { windowId } : {}),
-					responses: (requests ?? []).map((r) => ({
-						requestId: r.requestId,
-						action,
-						scope: action === "approve" ? chosenScope ?? scope : undefined,
-						value,
-					})),
+					responses: buildInteractionResponses(liveRequests, liveKind, action, scopeByRequest, valueByRequest, chosenScope, value),
 				})) as { outcome?: { status?: string; result?: { error?: string } } };
 				const status = outcome?.outcome?.status;
 				if (status === "replaced") {
@@ -222,10 +229,11 @@ export function InteractionCard({
 				if (status === "needs_input") {
 					// 多轮审批：worker 又提了新问题（同 id、revision+1），
 					// 不能显示"已批准"，重新对账回到 pending 等用户再操作。
+					setSyncedInteractionId(null);
 					toast("已提交，worker 需要进一步审批");
 					getInteraction(interactionId)
 						.then(({ interaction }) => {
-							setLiveRevision(interaction.revision);
+							adoptQuestionSet(interaction);
 							setStatus(interaction.status === "pending" ? "pending" : (interaction.status as CardStatus));
 						})
 						.catch(() => undefined);
@@ -235,11 +243,12 @@ export function InteractionCard({
 				if (platformAdmission && action !== "reject") setLiveWorkerStarted(true);
 				toast.success(action === "reject" ? "已拒绝该请求" : "已批准");
 			} catch (err) {
+				setSyncedInteractionId(null);
 				toast.error(err instanceof Error ? err.message : String(err));
 				// 409 等错误后重新对账，避免状态卡死。
 				getInteraction(interactionId)
 					.then(({ interaction }) => {
-						setLiveRevision(interaction.revision);
+						adoptQuestionSet(interaction);
 						setReplacementCandidates(interaction.replacementCandidates ?? []);
 						setReplacementCandidatesLoaded(true);
 						if (interaction.application?.status === "failed") {
@@ -252,7 +261,7 @@ export function InteractionCard({
 				setBusy(false);
 			}
 		},
-		[interactionId, liveGoalId, liveRevision, platformAdmission, replacementCandidates, revision, requests, scope, windowId],
+		[adoptQuestionSet, interactionBusy, interactionId, liveGoalId, liveKind, liveRequests, liveRevision, platformAdmission, replacementCandidates, requestsReady, revision, scopeByRequest, valueByRequest, windowId],
 	);
 
 	const cancel = useCallback(async () => {
@@ -323,7 +332,7 @@ export function InteractionCard({
 						</p>
 					</div>
 				) : workerStarted === false ? <p className="text-xs text-muted-foreground">Worker 尚未启动</p> : null}
-				{reqs.map((r) => (
+				{(requestsReady ? reqs : []).map((r) => (
 					<div key={r.requestId} className="flex flex-col gap-1">
 						<p className="text-sm whitespace-pre-wrap">{r.prompt}</p>
 						{(r.command || r.path || r.risk) && !compact ? (
@@ -333,43 +342,39 @@ export function InteractionCard({
 									.join("\n")}
 							</pre>
 						) : null}
-					</div>
-				))}
-
-				{!resolved && !statusHint?.includes("conflict") ? (
-					<>
-						{!platformAdmission && businessOptions.length > 0 && status !== "busy" ? (
-							<div className="flex flex-wrap gap-2" role="group" aria-label="可选回答">
-								{businessOptions.map((option) => (
-									<Button key={option} type="button" size="sm" variant="outline" disabled={busy} onClick={() => void submit(liveKind === "confirmation" ? "confirm" : "answer", undefined, option)}>
-										{option}
-									</Button>
-								))}
-							</div>
-						) : null}
-						{!platformAdmission && liveKind === "question" && businessOptions.length === 0 && status !== "busy" ? (
-							<div className="flex gap-2">
-								<Input value={answer} onChange={(event) => setAnswer(event.target.value)} placeholder="输入给 Worker 的回答" aria-label="给 Worker 的回答" />
-								<Button type="button" size="sm" disabled={busy || !answer.trim()} onClick={() => void submit("answer", undefined, answer.trim())}>提交回答</Button>
-							</div>
-						) : null}
-						{!platformAdmission && liveKind === "permission" && allowedScopes.length > 1 && status !== "busy" ? (
-							<div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+						{!resolved && !platformAdmission && liveKind === "permission" && choicesFor(r).length > 1 ? (
+							<div className="flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground" role="group" aria-label={`${r.prompt} 的授权范围`}>
 								<span>授权范围：</span>
-								{allowedScopes.map((s) => (
-									<button
-										key={s}
-										type="button"
-										onClick={() => setScope(s)}
-										className={`rounded-full px-2 py-0.5 ${
-											scope === s ? "bg-foreground text-background" : "bg-muted hover:bg-accent"
-										}`}
-									>
-										{s === "once" ? "仅本次" : s === "run" ? "本次任务" : s === "session" ? "本次会话" : s}
+								{choicesFor(r).map((choice) => (
+									<button key={choice} type="button" disabled={interactionBusy} onClick={() => setScopeByRequest((current) => ({ ...current, [r.requestId]: choice }))}
+										className={`rounded-full px-2 py-0.5 ${selectedScopeFor(r, scopeByRequest) === choice ? "bg-foreground text-background" : "bg-muted hover:bg-accent"}`}>
+										{choice === "once" ? "仅本次" : choice === "run" ? "本次任务" : choice === "session" ? "本次会话" : choice}
 									</button>
 								))}
 							</div>
 						) : null}
+						{!resolved && !platformAdmission && liveKind !== "permission" && choicesFor(r).length > 0 ? (
+							<div className="flex flex-wrap gap-2" role="group" aria-label={`${r.prompt} 的可选回答`}>
+								{choicesFor(r).map((choice) => (
+									<Button key={choice} type="button" size="sm" variant={answerFor(r, valueByRequest) === choice ? "secondary" : "outline"}
+										disabled={interactionBusy} onClick={() => setValueByRequest((current) => ({ ...current, [r.requestId]: choice }))}>
+										{choice}
+									</Button>
+								))}
+							</div>
+						) : null}
+						{!resolved && !platformAdmission && liveKind === "question" && choicesFor(r).length === 0 ? (
+							<Input value={valueByRequest[r.requestId] ?? ""} disabled={interactionBusy} onChange={(event) => setValueByRequest((current) => ({ ...current, [r.requestId]: event.target.value }))}
+								placeholder="输入给 Worker 的回答" aria-label={`${r.prompt} 的回答`} />
+						) : null}
+					</div>
+				))}
+
+				{!resolved && !statusHint?.includes("conflict") && !requestsReady ? (
+					<p className="text-xs text-muted-foreground">正在核对审批状态，暂不能提交…</p>
+				) : !resolved && !statusHint?.includes("conflict") ? (
+					<>
+						{!platformAdmission && liveKind === "permission" && !canApprove ? <p className="text-xs text-muted-foreground">当前请求未提供可批准的授权范围。</p> : null}
 						{platformAdmission && !replacementMode && replacementCandidatesLoaded && replacementCandidates.length === 0 && status !== "failed" ? (
 							<p className="text-xs text-muted-foreground">当前没有其它声明了强制只读能力的可用 Worker。</p>
 						) : null}
@@ -390,31 +395,34 @@ export function InteractionCard({
 									))}
 								</div>
 								<div className="mt-2 flex items-center gap-2">
-									<Button type="button" size="sm" disabled={busy || !selectedReplacement} onClick={() => void submit("approve", "select_another_worker", selectedReplacement)}>
+									<Button type="button" size="sm" disabled={interactionBusy || !selectedReplacement} onClick={() => void submit("approve", "select_another_worker", selectedReplacement)}>
 										<ArrowRightLeftIcon className="size-3.5" />
 										确认改派
 									</Button>
-									<Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => setReplacementMode(false)}>返回</Button>
+									<Button type="button" size="sm" variant="ghost" disabled={interactionBusy} onClick={() => setReplacementMode(false)}>返回</Button>
 								</div>
 							</div>
 						) : (
 						<div className="flex items-center gap-2">
 							{platformAdmission && status !== "failed" ? (
-								<Button type="button" size="sm" disabled={busy} onClick={() => void submit("approve", "proceed_with_worker")}>
+								<Button type="button" size="sm" disabled={interactionBusy} onClick={() => void submit("approve", "proceed_with_worker")}>
 									{busy ? null : <CheckIcon className="size-3.5" />}
 									继续使用
 								</Button>
 							) : liveKind === "permission" && status !== "failed" ? (
-								<Button type="button" size="sm" disabled={busy} onClick={() => void submit("approve", scope)}>
+								<Button type="button" size="sm" disabled={interactionBusy || !canApprove} onClick={() => void submit("approve")}>
 									{busy ? null : <CheckIcon className="size-3.5" />}
 									允许
 								</Button>
 							) : null}
-							{!platformAdmission && liveKind === "confirmation" && businessOptions.length === 0 && status !== "failed" ? (
-								<Button type="button" size="sm" disabled={busy} onClick={() => void submit("confirm")}>确认</Button>
+							{!platformAdmission && liveKind === "question" && status !== "failed" ? (
+								<Button type="button" size="sm" disabled={interactionBusy || !canAnswer} onClick={() => void submit("answer")}>提交回答</Button>
+							) : null}
+							{!platformAdmission && liveKind === "confirmation" && status !== "failed" ? (
+								<Button type="button" size="sm" disabled={interactionBusy || !canConfirm} onClick={() => void submit("confirm")}>确认</Button>
 							) : null}
 							{platformAdmission && status !== "failed" && replacementCandidates.length > 0 ? (
-								<Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => setReplacementMode(true)}>
+								<Button type="button" size="sm" variant="outline" disabled={interactionBusy} onClick={() => setReplacementMode(true)}>
 									<ArrowRightLeftIcon className="size-3.5" />
 									换 Worker
 								</Button>
@@ -423,7 +431,7 @@ export function InteractionCard({
 								type="button"
 								size="sm"
 								variant="outline"
-								disabled={busy}
+								disabled={interactionBusy}
 							onClick={() => void (status === "failed" && platformAdmission ? cancel() : submit("reject"))}
 							>
 								<XIcon className="size-3.5" />
@@ -435,7 +443,7 @@ export function InteractionCard({
 									size="sm"
 									variant="ghost"
 									className="ml-auto text-xs text-muted-foreground"
-									disabled={busy}
+									disabled={interactionBusy}
 									onClick={() => void cancel()}
 								>
 									取消

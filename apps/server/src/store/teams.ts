@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { copyFile, mkdir, open, readFile, realpath, writeFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { CredentialsStore } from "./credentials.js";
@@ -8,6 +8,62 @@ import { ensureHandoffGuidance } from "../agent-runtime/handoff.js";
 import type { AgentCapabilityBinding, AgentConnectorBinding } from "../agent-runtime/extensions.js";
 import { WorkspaceStore, type WorkspaceTrust } from "./workspaces.js";
 import type { ManagerCodeSearchProvider, WorkerCodeSearchOverride } from "../pi-bridge/code-search.js";
+
+export class AgentRemovalRequiresDisabledError extends Error {
+	constructor(name: string) {
+		super(`agent「${name}」仍处于启用状态；请先停用，再删除`);
+		this.name = "AgentRemovalRequiresDisabledError";
+	}
+}
+
+export class WindowSessionCleanupError extends Error {
+	constructor(readonly sessionId: string, writeError: unknown, cleanupError: unknown) {
+		super("房间写入失败，且新 Session 清理失败；请重启服务后核对会话", { cause: new AggregateError([writeError, cleanupError]) });
+		this.name = "WindowSessionCleanupError";
+	}
+}
+
+export class RoomCreationOperationConflictError extends Error {
+	constructor() {
+		super("同一 Idempotency-Key 已用于不同的群聊创建请求");
+		this.name = "RoomCreationOperationConflictError";
+	}
+}
+
+export class RoomCreationOperationGoneError extends Error {
+	constructor() {
+		super("此操作创建的群聊已删除；请核对房间列表，重新发起需使用新的操作键");
+		this.name = "RoomCreationOperationGoneError";
+	}
+}
+
+export class RoomWorkerUnavailableError extends Error {
+	constructor(member: string) {
+		super(`worker not found: ${member}`);
+		this.name = "RoomWorkerUnavailableError";
+	}
+}
+
+export class RoomWorkspaceUnavailableError extends Error {
+	constructor(error: unknown) {
+		super(error instanceof Error ? error.message : String(error), { cause: error });
+		this.name = "RoomWorkspaceUnavailableError";
+	}
+}
+
+export class RoomSourceUnavailableError extends Error {
+	constructor() {
+		super("来源房间已删除；请回到对话列表重新选择");
+		this.name = "RoomSourceUnavailableError";
+	}
+}
+
+export class RoomSourceChangedError extends Error {
+	constructor() {
+		super("来源房间配置已变化；请刷新房间后重新发起");
+		this.name = "RoomSourceChangedError";
+	}
+}
 
 export interface CommandInvoke {
 	type: "command";
@@ -139,6 +195,8 @@ export interface AgentConfig {
 	avatar?: string;
 	/** pinned 内置条目（manager）：不可删除、不可禁用。 */
 	pinned?: boolean;
+	/** Host-managed identity. A custom worker cannot acquire this via its name. */
+	builtinId?: "wiki";
 	/** manager 条目的可编辑配置（§10.5）。 */
 	manager?: PiManagerSettings;
 	/** 仅 pinned manager 或 connectorId=pi 的 worker 使用。 */
@@ -150,6 +208,12 @@ export interface AgentConfig {
 	 * manager Session 据此判断自身装配是否陈旧（runtimeDirty）。
 	 */
 	extensionRevision?: number;
+	/** Run/Worker Session identity; enable/disable alone does not invalidate a kept Run. */
+	runConfigRevision?: number;
+}
+
+export function agentRunConfigRevision(agent: Pick<AgentConfig, "extensionRevision" | "runConfigRevision">): number {
+	return agent.runConfigRevision ?? agent.extensionRevision ?? 0;
 }
 
 export type WindowType = "solo" | "direct" | "group";
@@ -220,6 +284,21 @@ export interface WindowConfig {
 	/** Solo only: pinned singleton, never deletable. */
 	pinned?: boolean;
 	createdAt: string;
+	/** API group creation identity, persisted atomically with the Room. */
+	creationOperationId?: string;
+	creationRequestHash?: string;
+}
+
+export type RoomSourceSnapshot = Pick<WindowConfig, "id" | "type" | "members" | "name" | "prompt" | "workspaceId" | "cwdSnapshot">;
+
+function assertRoomSourceUnchanged(windows: Record<string, WindowConfig>, expected: RoomSourceSnapshot): void {
+	const current = windows[expected.id];
+	if (!current) throw new RoomSourceUnavailableError();
+	if (current.type !== expected.type || current.name !== expected.name || current.prompt !== expected.prompt ||
+		current.workspaceId !== expected.workspaceId || current.cwdSnapshot !== expected.cwdSnapshot ||
+		current.members.length !== expected.members.length || current.members.some((member, index) => member !== expected.members[index])) {
+		throw new RoomSourceChangedError();
+	}
 }
 
 interface TeamsFile {
@@ -227,6 +306,8 @@ interface TeamsFile {
 	agents: AgentConfig[];
 	/** 永不复用的历史 Agent id；保留 Window/Session/Run 审计时的身份隔离栅栏。 */
 	retiredAgentIds: string[];
+	/** Internal commit marker for encrypted binding transactions, persisted with the binding. */
+	credentialCommitIds?: Record<string, string>;
 }
 
 function windowContextKey(workspaceId: string | undefined, cwdSnapshot: string): string {
@@ -276,6 +357,8 @@ function contextContainingSession(
 interface WindowsFile {
 	version: number;
 	windows: Record<string, WindowConfig>;
+	/** A deleted Room must not release its old creation key for replay. */
+	retiredCreationOperations?: Record<string, string>;
 }
 
 const WINDOWS_FILE_VERSION = 2;
@@ -390,6 +473,13 @@ export const DEFAULT_TEAMS: AgentConfig[] = [
 		manager: {},
 	},
 	{
+		name: "wiki", builtinId: "wiki", displayName: "Wiki 管理员",
+		description: "检索知识库、整理用户素材并生成待审核候选；用户审核后由平台发布。知识库独立于工作目录。",
+		connector: { extensionId: "pi", connectorId: "pi", transport: "sdk", config: {} },
+		enabled: true, extensionRevision: 1, runConfigRevision: 1,
+		responsibility: { domain: "知识库管理", owns: ["知识检索与证据问答", "知识库素材整理与变更候选"], excludes: ["自行批准或写入正式知识库"], escalateWhen: ["来源冲突或同名实体无法判定"] },
+	},
+	{
 		// 首装内置 Designer：继承平台默认模型，不烤入开发机上的 provider、
 		// skills 或 systemPrompt，确保换一台电脑也能安全创建并继续配置。
 		name: "pi-b",
@@ -430,37 +520,7 @@ export const DEFAULT_TEAMS: AgentConfig[] = [
 		enabled: true,
 		extensionRevision: 1,
 	},
-	{
-		// 决策 20：旧结构直接替换——PuddingClaw 以第一方 Connector binding 接入。
-		// 2026-08-17：种子不再预置描述与 capabilities——那是给 manager 的路由
-		// 材料，必须由用户在前台按需填写，源码/connector 包不替用户做决定。
-		name: "puddingclaw",
-		description: "",
-		connector: {
-			extensionId: "puddingclaw",
-			connectorId: "puddingclaw",
-			transport: "spawn",
-			config: { command: "puddingclaw" },
-		},
-		enabled: true,
-		extensionRevision: 1,
-	},
-	{
-		// 双传输打样：默认展示一个直连 Headless NDJSON 的 HTTP Worker，便于
-		// 前端验证它与 CLI spawn 的房间进度一致。默认禁用，避免 manager 在
-		// 用户尚未确认 Backend 地址前把真实委托路由到测试实例。
-		name: "puddingclaw-http",
-		displayName: "PuddingClaw HTTP",
-		description: "",
-		connector: {
-			extensionId: "puddingclaw",
-			connectorId: "puddingclaw",
-			transport: "http",
-			config: { endpoint: "http://127.0.0.1:8888" },
-		},
-		enabled: false,
-		extensionRevision: 1,
-	},
+
 ];
 
 // ---- avatars (§11) ----
@@ -513,18 +573,29 @@ export interface TeamsStoreDirs {
 	assets: string;
 	/** 平台管理项目（managed workspace）根目录。 */
 	managedWorkspaces: string;
-	/** 随 App 发布的只读资源目录；首装时复制需要独立头像的内置 Worker 资源。 */
+	/** 随 App 发布的只读资源目录；提供内置角色默认头像及首装资源。 */
 	bundledAssets?: string;
 }
 
 export class TeamsStore {
 	private agentsPromise: Promise<AgentConfig[]> | null = null;
 	private retiredAgentIds = new Set<string>();
+	private credentialCommitIds: Record<string, string> = {};
+	private persistenceUncertain = false;
+	/** A rename may have committed even though its directory sync failed. */
+	durabilityUncertain(): boolean { return this.persistenceUncertain; }
 	private windowsPromise: Promise<WindowsFile> | null = null;
 	private readonly agentsFile: string;
 	private readonly windowsFile: string;
+	private readonly roomCreationJournalFile: string;
 	/** Serializes all registry/window mutations in this process. */
 	private queue: Promise<unknown> = Promise.resolve();
+	/** One-process Agent admission/disable boundary; held only until a Run is durably created. */
+	private readonly agentRunAdmission = new Map<string, Promise<void>>();
+	/** Agent/Extension/MCP 目录跨文件对账失败时，阻断新接单直到恢复。 */
+	private readonly blockedAgentAdmissions = new Set<string>();
+	/** Orders Agent binding membership with Extension and MCP directory writes. */
+	private agentCatalogMutation: Promise<void> = Promise.resolve();
 	/** Agent/窗口成员变化监听器（Phase 4：PiSessionStore 用它做立即撤权）。 */
 	private changeListeners = new Set<() => void>();
 	readonly workspaces: WorkspaceStore;
@@ -546,6 +617,48 @@ export class TeamsStore {
 		}
 	}
 
+	async withAgentRunAdmission<T>(name: string, action: () => Promise<T>): Promise<T> {
+		const previous = this.agentRunAdmission.get(name) ?? Promise.resolve();
+		let release!: () => void;
+		const current = new Promise<void>((resolve) => { release = resolve; });
+		this.agentRunAdmission.set(name, current);
+		await previous;
+		try {
+			if (this.blockedAgentAdmissions.has(name)) throw new Error(`Agent「${name}」的 Extension 变更仍待对账，拒绝接单`);
+			return await action();
+		}
+		finally {
+			release();
+			if (this.agentRunAdmission.get(name) === current) this.agentRunAdmission.delete(name);
+		}
+	}
+
+	setAgentAdmissionsBlocked(names: Iterable<string>, blocked: boolean): void {
+		for (const name of names) {
+			if (blocked) this.blockedAgentAdmissions.add(name);
+			else this.blockedAgentAdmissions.delete(name);
+		}
+	}
+
+	withAgentRunAdmissions<T>(names: Iterable<string>, action: () => Promise<T>): Promise<T> {
+		const ids = [...new Set(names)].sort();
+		const enter = (index: number): Promise<T> => index >= ids.length
+			? action()
+			: this.withAgentRunAdmission(ids[index]!, () => enter(index + 1));
+		return enter(0);
+	}
+
+	/** Agent 引用的 MCP 与 Extension 目录共用顺序门禁，先于 Agent 接单门禁取得。 */
+	async withAgentCatalogMutation<T>(action: () => Promise<T>): Promise<T> {
+		const previous = this.agentCatalogMutation;
+		let release!: () => void;
+		const current = new Promise<void>((resolve) => { release = resolve; });
+		this.agentCatalogMutation = current;
+		await previous;
+		try { return await action(); }
+		finally { release(); }
+	}
+
 	constructor(
 		private readonly dirs: TeamsStoreDirs,
 		private readonly cwd: string,
@@ -554,6 +667,7 @@ export class TeamsStore {
 	) {
 		this.agentsFile = path.join(dirs.state, "agents.json");
 		this.windowsFile = path.join(dirs.state, "windows.json");
+		this.roomCreationJournalFile = path.join(dirs.state, "room-creation-journal.json");
 		this.workspaces = new WorkspaceStore(dirs.state, dirs.managedWorkspaces);
 	}
 
@@ -577,10 +691,22 @@ export class TeamsStore {
 			await this.writeAgents(defaults, []);
 		}
 		const agents = await this.loadAgentsFile();
+		if (!agents.some((agent) => agent.builtinId === "wiki") && !this.retiredAgentIds.has("wiki")) {
+			// Register the managed resource in existing development state as well as
+			// fresh installs. Never take over a same-named custom Agent.
+			if (!agents.some((agent) => agent.name === "wiki")) {
+				agents.push(structuredClone(DEFAULT_TEAMS.find((agent) => agent.builtinId === "wiki")!));
+				await this.writeAgents(agents);
+			}
+		}
 		const manager = agents.find((agent) => agent.name === MANAGER_AGENT_NAME);
 		if (!manager || !manager.pinned || manager.invoke?.type !== "pi") {
 			throw new Error("agents.json uses pre-P3 data; pinned manager is required, clear development data");
 		}
+		await this.credentials?.recoverBindingTransaction((name, id) => this.credentialCommitIds[name] === id);
+		// An Agent delete may have committed its tombstone before secret cleanup failed.
+		// Retired IDs cannot be reused, so this replay is safe and idempotent.
+		await this.credentials?.removeRetiredAgentSecrets(this.retiredAgentIds);
 		// Workspace selection is optional. When present it must be a non-empty
 		// identity; absence is the intentional legacy/default-cwd chat mode.
 		const loadedWindows = await this.loadWindowsFile();
@@ -600,6 +726,11 @@ export class TeamsStore {
 	private async validateWindowsFile(windows: WindowsFile): Promise<void> {
 		const sessionOwners = new Map<string, string>();
 		const directIdentities = new Map<string, string>();
+		const creationOperations = new Set<string>();
+		if (windows.retiredCreationOperations !== undefined && (!recordValue(windows.retiredCreationOperations) ||
+			Object.entries(windows.retiredCreationOperations).some(([key, hash]) => !key || typeof hash !== "string" || !/^[0-9a-f]{64}$/.test(hash)))) {
+			throw new Error("windows.json has invalid retired creation operations");
+		}
 		for (const window of Object.values(windows.windows)) {
 			if (
 				(window.workspaceId !== undefined && (typeof window.workspaceId !== "string" || !window.workspaceId)) ||
@@ -613,6 +744,14 @@ export class TeamsStore {
 				Array.isArray(window.parkedContexts)
 			) {
 				throw new Error(`window "${window.id ?? "unknown"}" has invalid workspace-history data`);
+			}
+			if (window.creationOperationId !== undefined || window.creationRequestHash !== undefined) {
+				if (window.type !== "group" || typeof window.creationOperationId !== "string" || !window.creationOperationId ||
+					typeof window.creationRequestHash !== "string" || !/^[0-9a-f]{64}$/.test(window.creationRequestHash) ||
+					creationOperations.has(window.creationOperationId) || Object.hasOwn(windows.retiredCreationOperations ?? {}, window.creationOperationId)) {
+					throw new Error(`window "${window.id}" has invalid creation operation`);
+				}
+				creationOperations.add(window.creationOperationId);
 			}
 			const contexts = [
 				{ key: windowContextKey(window.workspaceId, window.cwdSnapshot), context: activeWindowContext(window), active: true },
@@ -693,7 +832,11 @@ export class TeamsStore {
 
 	/** Run `fn` after all previously queued mutations, so they execute in order. */
 	private serialize<T>(fn: () => Promise<T>): Promise<T> {
-		const run = this.queue.then(fn, fn);
+		const guarded = () => {
+			if (this.persistenceUncertain) throw new Error("Teams registry durability uncertain; restart for recovery");
+			return fn();
+		};
+		const run = this.queue.then(guarded, guarded);
 		this.queue = run.then(
 			() => undefined,
 			() => undefined,
@@ -704,8 +847,29 @@ export class TeamsStore {
 	private async writeJsonFile(file: string, data: unknown): Promise<void> {
 		await mkdir(path.dirname(file), { recursive: true });
 		const tmp = `${file}.${randomUUID().slice(0, 8)}.tmp`;
-		await writeFile(tmp, JSON.stringify(data, null, 2) + "\n", "utf-8");
-		await rename(tmp, file);
+		let handle: Awaited<ReturnType<typeof open>> | undefined;
+		try {
+			handle = await open(tmp, "wx", 0o600);
+			await handle.writeFile(JSON.stringify(data, null, 2) + "\n");
+			await handle.sync();
+			await handle.close();
+			handle = undefined;
+			await rename(tmp, file);
+		} catch (error) {
+			await handle?.close().catch(() => undefined);
+			await unlink(tmp).catch(() => undefined);
+			throw error;
+		}
+		let directory: Awaited<ReturnType<typeof open>> | undefined;
+		try {
+			directory = await open(path.dirname(file), "r");
+			await directory.sync();
+		}
+		catch (error) {
+			this.persistenceUncertain = true;
+			throw error;
+		}
+		finally { await directory?.close(); }
 	}
 
 	// ---- agents registry ----
@@ -720,6 +884,12 @@ export class TeamsStore {
 			if (parsed.retiredAgentIds.some((id) => typeof id !== "string" || !SAFE_AGENT_NAME.test(id))) {
 				throw new Error("agents.json has invalid retiredAgentIds");
 			}
+			if (parsed.credentialCommitIds !== undefined &&
+				(typeof parsed.credentialCommitIds !== "object" || parsed.credentialCommitIds === null ||
+				Array.isArray(parsed.credentialCommitIds) ||
+				Object.entries(parsed.credentialCommitIds).some(([name, id]) => !SAFE_AGENT_NAME.test(name) || typeof id !== "string" || !id))) {
+				throw new Error("agents.json has invalid credentialCommitIds");
+			}
 			if (parsed.agents.some((agent) => !agent || typeof agent.name !== "string" || !SAFE_AGENT_NAME.test(agent.name))) {
 				throw new Error("agents.json has an invalid Agent id");
 			}
@@ -731,6 +901,7 @@ export class TeamsStore {
 				throw new Error("agents.json reuses a retired Agent id");
 			}
 			this.retiredAgentIds = retired;
+			this.credentialCommitIds = parsed.credentialCommitIds ?? {};
 			return parsed.agents;
 		} catch (err: unknown) {
 			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
@@ -748,7 +919,11 @@ export class TeamsStore {
 		return this.agentsPromise;
 	}
 
-	private async writeAgents(agents: AgentConfig[], retiredAgentIds: Iterable<string> = this.retiredAgentIds): Promise<void> {
+	private async writeAgents(
+		agents: AgentConfig[],
+		retiredAgentIds: Iterable<string> = this.retiredAgentIds,
+		credentialCommit?: { name: string; id: string },
+	): Promise<void> {
 		const retired = [...new Set(retiredAgentIds)].sort();
 		const activeIds = agents.map((agent) => agent.name);
 		if (activeIds.some((id) => !SAFE_AGENT_NAME.test(id)) || retired.some((id) => !SAFE_AGENT_NAME.test(id))) {
@@ -757,8 +932,11 @@ export class TeamsStore {
 		if (new Set(activeIds).size !== activeIds.length) throw new Error("refusing to persist duplicate Agent ids");
 		const retiredSet = new Set(retired);
 		if (activeIds.some((id) => retiredSet.has(id))) throw new Error("refusing to reuse a retired Agent id");
-		await this.writeJsonFile(this.agentsFile, { version: 2, agents, retiredAgentIds: retired } satisfies TeamsFile);
+		const commitIds = { ...this.credentialCommitIds };
+		if (credentialCommit) commitIds[credentialCommit.name] = credentialCommit.id;
+		await this.writeJsonFile(this.agentsFile, { version: 2, agents, retiredAgentIds: retired, credentialCommitIds: commitIds } satisfies TeamsFile);
 		this.retiredAgentIds = new Set(retired);
+		this.credentialCommitIds = commitIds;
 		this.agentsPromise = Promise.resolve(agents);
 	}
 
@@ -769,6 +947,12 @@ export class TeamsStore {
 
 	async getAgent(name: string): Promise<AgentConfig | undefined> {
 		return (await this.agents()).find((a) => a.name === name);
+	}
+
+	async credentialTransactionCommitted(name: string, id: string): Promise<boolean> {
+		if (this.persistenceUncertain) throw new Error("Teams registry durability uncertain; restart for recovery");
+		await this.agents();
+		return this.credentialCommitIds[name] === id;
 	}
 
 	/** 当前或历史使用过的 Agent id；创建路径据此避免身份复用。 */
@@ -836,7 +1020,7 @@ export class TeamsStore {
 
 	async upsertAgent(
 		input: AgentConfig,
-		options: { createOnly?: boolean; generateUniqueName?: boolean } = {},
+		options: { createOnly?: boolean; generateUniqueName?: boolean; expectedRevision?: number } = {},
 	): Promise<AgentConfig> {
 		const agent: AgentConfig = {
 			enabled: true,
@@ -944,6 +1128,9 @@ export class TeamsStore {
 				);
 			}
 			const idx = agents.findIndex((a) => a.name === agent.name);
+			if (options.expectedRevision !== undefined && (idx < 0 || (agents[idx]!.extensionRevision ?? 0) !== options.expectedRevision)) {
+				throw new Error("Agent configuration changed during binding update; retry");
+			}
 			if (idx < 0 && this.retiredAgentIds.has(agent.name)) {
 				throw new Error(`agent id「${agent.name}」已退役，不可复用`);
 			}
@@ -953,7 +1140,14 @@ export class TeamsStore {
 			// Extension 配置版本递增（§3.3.5）：旧配置保留的 extensionRevision
 			// 在基础上 +1，manager Session 据此发现装配陈旧。
 			const prev = idx >= 0 ? agents[idx] : undefined;
+			if (prev?.builtinId === "wiki") {
+				if (agent.connector?.connectorId !== "pi" || agent.connector.transport !== "sdk") throw new Error("Wiki 管理员必须使用 pi SDK");
+				agent.builtinId = "wiki";
+			} else {
+				delete agent.builtinId;
+			}
 			agent.extensionRevision = (prev?.extensionRevision ?? 0) + 1;
+			agent.runConfigRevision = agent.extensionRevision;
 			if (idx >= 0) agents[idx] = agent;
 			else agents.push(agent);
 			await this.writeAgents(agents);
@@ -1002,7 +1196,9 @@ export class TeamsStore {
 			copy.displayName = nextDisplayName;
 			copy.enabled = false;
 			copy.extensionRevision = 1;
+			copy.runConfigRevision = 1;
 			delete copy.pinned;
+			delete copy.builtinId;
 			delete copy.manager;
 			delete copy.avatar;
 			// env 是任意进程环境变量，可能含未迁入 CredentialsStore 的旧凭证。
@@ -1031,12 +1227,15 @@ export class TeamsStore {
 		return duplicated!;
 	}
 
-	async removeAgent(name: string): Promise<boolean> {
+	async removeAgent(name: string, requireDisabled = false): Promise<boolean> {
 		const existing = await this.getAgent(name);
 		if (existing?.pinned) throw new Error(`agent「${name}」是 pinned 内置 Agent，不可删除`);
 		let removed = false;
 		await this.serialize(async () => {
 			const agents = await this.loadAgentsFile();
+			const current = agents.find((agent) => agent.name === name);
+			if (current?.pinned) throw new Error(`agent「${name}」是 pinned 内置 Agent，不可删除`);
+			if (current && requireDisabled && current.enabled !== false) throw new AgentRemovalRequiresDisabledError(name);
 			const next = agents.filter((a) => a.name !== name);
 			removed = next.length !== agents.length;
 			if (removed) await this.writeAgents(next, new Set([...this.retiredAgentIds, name]));
@@ -1047,14 +1246,17 @@ export class TeamsStore {
 		return removed;
 	}
 
-	async setEnabled(name: string, enabled: boolean): Promise<AgentConfig> {
+	async setEnabled(name: string, enabled: boolean, expectedRevision?: number): Promise<AgentConfig> {
 		let updated: AgentConfig | undefined;
 		await this.serialize(async () => {
 			const agents = await this.loadAgentsFile();
 			const idx = agents.findIndex((a) => a.name === name);
 			if (idx < 0) throw new Error(`agent not found: ${name}`);
+			if (expectedRevision !== undefined && (agents[idx]!.extensionRevision ?? 0) !== expectedRevision) {
+				throw new Error("Agent configuration changed during binding update; retry");
+			}
 			if (agents[idx]!.pinned && !enabled) throw new Error(`agent「${name}」是 pinned 内置 Agent，不可禁用`);
-			agents[idx] = { ...agents[idx]!, enabled, extensionRevision: (agents[idx]!.extensionRevision ?? 0) + 1 };
+			agents[idx] = { ...agents[idx]!, enabled, extensionRevision: (agents[idx]!.extensionRevision ?? 0) + 1, runConfigRevision: agentRunConfigRevision(agents[idx]!) };
 			updated = agents[idx];
 			await this.writeAgents(agents);
 		});
@@ -1065,24 +1267,32 @@ export class TeamsStore {
 	// ---- Connector / Capability 绑定（§10.1 管理 API 的存储层） ----
 
 	/** 通用 Agent 字段变更：统一处理持久化、extensionRevision 递增与变更通知。 */
-	private async mutateAgent(name: string, mutate: (agent: AgentConfig) => AgentConfig): Promise<AgentConfig> {
+	private async mutateAgent(
+		name: string,
+		mutate: (agent: AgentConfig) => AgentConfig,
+		transaction?: { expectedRevision: number; id?: string },
+	): Promise<AgentConfig> {
 		let updated: AgentConfig | undefined;
 		await this.serialize(async () => {
 			const agents = await this.loadAgentsFile();
 			const idx = agents.findIndex((a) => a.name === name);
 			if (idx < 0) throw new Error(`agent not found: ${name}`);
+			if (transaction && (agents[idx]!.extensionRevision ?? 0) !== transaction.expectedRevision) {
+				throw new Error("Agent configuration changed during binding update; retry");
+			}
 			const next = mutate({ ...agents[idx]! });
 			next.extensionRevision = (agents[idx]!.extensionRevision ?? 0) + 1;
+			next.runConfigRevision = next.extensionRevision;
 			agents[idx] = next;
 			updated = next;
-			await this.writeAgents(agents);
+			await this.writeAgents(agents, this.retiredAgentIds, transaction?.id ? { name, id: transaction.id } : undefined);
 		});
 		this.emitChange();
 		return updated!;
 	}
 
 	/** 设置/更换 Connector 绑定（§10.1 基础接入；secret 明文不落这里）。 */
-	async setConnectorBinding(name: string, connector: AgentConnectorBinding | undefined): Promise<AgentConfig> {
+	async setConnectorBinding(name: string, connector: AgentConnectorBinding | undefined, transaction?: { expectedRevision: number; id?: string }): Promise<AgentConfig> {
 		const agent = await this.getAgent(name);
 		if (!agent) throw new Error(`agent not found: ${name}`);
 		if (agent.pinned) throw new Error(`agent「${name}」是 pinned 内置 Agent，不绑定 Connector`);
@@ -1101,11 +1311,11 @@ export class TeamsStore {
 			if (connector) a.connector = connector;
 			else delete a.connector;
 			return a;
-		});
+		}, transaction);
 	}
 
 	/** 新增 Capability Extension 绑定。 */
-	async addCapabilityBinding(name: string, binding: Omit<AgentCapabilityBinding, "id"> & { id?: string }): Promise<AgentConfig> {
+	async addCapabilityBinding(name: string, binding: Omit<AgentCapabilityBinding, "id"> & { id?: string }, transaction?: { expectedRevision: number; id?: string }): Promise<AgentConfig> {
 		const agent = await this.getAgent(name);
 		if (!agent) throw new Error(`agent not found: ${name}`);
 		if (!binding.extensionId?.trim() || !binding.capabilityId?.trim()) {
@@ -1126,7 +1336,7 @@ export class TeamsStore {
 			list.push(full);
 			a.capabilityExtensions = list;
 			return a;
-		});
+		}, transaction);
 	}
 
 	/** 更新 Capability Extension 绑定（enabled/config/activation/versionPin/secretRefs）。 */
@@ -1134,6 +1344,7 @@ export class TeamsStore {
 		name: string,
 		bindingId: string,
 		patch: Partial<Omit<AgentCapabilityBinding, "id" | "extensionId" | "capabilityId">>,
+		transaction?: { expectedRevision: number; id?: string },
 	): Promise<AgentConfig> {
 		return this.mutateAgent(name, (a) => {
 			const list = [...(a.capabilityExtensions ?? [])];
@@ -1150,21 +1361,21 @@ export class TeamsStore {
 			};
 			a.capabilityExtensions = list;
 			return a;
-		});
+		}, transaction);
 	}
 
 	/** 移除 Capability Extension 绑定（保留安装包本身）。 */
-	async removeCapabilityBinding(name: string, bindingId: string): Promise<AgentConfig> {
+	async removeCapabilityBinding(name: string, bindingId: string, transaction?: { expectedRevision: number; id?: string }): Promise<AgentConfig> {
 		return this.mutateAgent(name, (a) => {
 			const list = (a.capabilityExtensions ?? []).filter((b) => b.id !== bindingId);
 			if (list.length === (a.capabilityExtensions ?? []).length) throw new Error(`binding not found: ${bindingId}`);
 			a.capabilityExtensions = list;
 			return a;
-		});
+		}, transaction);
 	}
 
 	/** 整体替换一个 Pi Agent 的 MCP Server 选择；Server 存在性由路由层校验。 */
-	async setMcpServerIds(name: string, serverIds: string[]): Promise<AgentConfig> {
+	async setMcpServerIds(name: string, serverIds: string[], expectedRevision: number): Promise<AgentConfig> {
 		const agent = await this.getAgent(name);
 		if (!agent) throw new Error(`agent not found: ${name}`);
 		if (!agent.pinned && agent.connector?.connectorId !== "pi") {
@@ -1175,7 +1386,7 @@ export class TeamsStore {
 			if (normalized.length) current.mcpServerIds = normalized;
 			else delete current.mcpServerIds;
 			return current;
-		});
+		}, { expectedRevision });
 	}
 
 	// ---- pinned manager（§10.5） ----
@@ -1187,8 +1398,8 @@ export class TeamsStore {
 	}
 
 	/** 校验并归一化 manager 可编辑配置。 */
-	private validateManagerSettings(input: Record<string, unknown>): PiManagerSettings {
-		const out: PiManagerSettings = {};
+	private validateManagerSettings(input: Record<string, unknown>): Omit<Partial<PiManagerSettings>, "model" | "thinkingLevel"> & { model?: string | null; thinkingLevel?: PiManagerSettings["thinkingLevel"] | null } {
+		const out: Omit<Partial<PiManagerSettings>, "model" | "thinkingLevel"> & { model?: string | null; thinkingLevel?: PiManagerSettings["thinkingLevel"] | null } = {};
 		if (input.codeSearch !== undefined) {
 			if (!["off", "builtin", "fff"].includes(input.codeSearch as string)) {
 				throw new Error("manager.codeSearch 必须是 off | builtin | fff");
@@ -1196,8 +1407,11 @@ export class TeamsStore {
 			out.codeSearch = input.codeSearch as ManagerCodeSearchProvider;
 		}
 		if (input.model !== undefined) {
-			if (typeof input.model !== "string" || !input.model.trim()) throw new Error("manager.model 必须是非空字符串");
-			out.model = input.model.trim();
+			if (input.model === null) out.model = null;
+			else {
+				if (typeof input.model !== "string" || !input.model.trim()) throw new Error("manager.model 必须是非空字符串或 null");
+				out.model = input.model.trim();
+			}
 		}
 		for (const key of ["builtinTools", "noExtensions"] as const) {
 			if (input[key] !== undefined) {
@@ -1207,10 +1421,11 @@ export class TeamsStore {
 		}
 		if (input.thinkingLevel !== undefined) {
 			const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-			if (!levels.includes(input.thinkingLevel as string)) {
+			if (input.thinkingLevel === null) out.thinkingLevel = null;
+			else if (!levels.includes(input.thinkingLevel as string)) {
 				throw new Error(`manager.thinkingLevel 必须是 ${levels.join(" | ")}`);
 			}
-			out.thinkingLevel = input.thinkingLevel as PiManagerSettings["thinkingLevel"];
+			else out.thinkingLevel = input.thinkingLevel as PiManagerSettings["thinkingLevel"];
 		}
 		return out;
 	}
@@ -1219,7 +1434,7 @@ export class TeamsStore {
 	 * 更新 pinned manager 的可编辑配置（§10.5）：描述 + manager settings 合并
 	 * （patch 中未出现的 settings 键保持不变；prompt 传空串清除）。
 	 */
-	async updateManager(patch: { description?: string; displayName?: string | null; manager?: Record<string, unknown>; responsibility?: AgentResponsibilityProfile | null; piResources?: PiResourceConfig | null }): Promise<AgentConfig> {
+	async updateManager(patch: { description?: string; displayName?: string | null; manager?: Record<string, unknown>; responsibility?: AgentResponsibilityProfile | null; piResources?: PiResourceConfig | null }, expectedRevision?: number): Promise<AgentConfig> {
 		const agent = await this.getManager();
 		if (!agent) throw new Error(`pinned manager 不存在：${MANAGER_AGENT_NAME}`);
 		const settings = patch.manager !== undefined ? this.validateManagerSettings(patch.manager) : undefined;
@@ -1241,22 +1456,52 @@ export class TeamsStore {
 				else delete a.piResources;
 			}
 			if (settings) {
-				// 合并语义：patch 中出现的键覆盖（false/空串也是有意义的值），
-				// 未出现的键保持不变。
+				// 键级合并；model/thinkingLevel 显式 null 清除，缺席保留旧值。
 				const current = { ...(a.manager ?? {}) };
 				for (const [key, value] of Object.entries(settings)) {
-					(current as Record<string, unknown>)[key] = value;
+					if (value === null) delete (current as Record<string, unknown>)[key];
+					else (current as Record<string, unknown>)[key] = value;
 				}
 				a.manager = current;
 			}
 			return a;
-		});
+		}, expectedRevision === undefined ? undefined : { expectedRevision });
 	}
 
 	// ---- avatars (§11) ----
 
 	private avatarsDir(): string {
 		return path.join(this.dirs.assets, "avatars");
+	}
+
+	private builtinAvatarPath(agent: AgentConfig): string | undefined {
+		return agent.builtinId === "wiki" && this.dirs.bundledAssets
+			? path.join(this.dirs.bundledAssets, "wiki-fox.png")
+			: undefined;
+	}
+
+	/** Role-specific defaults belong to the host, not the shared pi Connector. */
+	builtinAvatarRevision(agent: AgentConfig): string | undefined {
+		const file = this.builtinAvatarPath(agent);
+		if (!file) return undefined;
+		try {
+			const stat = statSync(file);
+			return `${stat.mtimeMs}-${stat.size}`;
+		} catch (err: unknown) {
+			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+			return undefined;
+		}
+	}
+
+	async readBuiltinAvatar(agent: AgentConfig): Promise<{ buf: Buffer; mime: string } | null> {
+		const file = this.builtinAvatarPath(agent);
+		if (!file) return null;
+		try {
+			return { buf: await readFile(file), mime: "image/png" };
+		} catch (err: unknown) {
+			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+			return null;
+		}
 	}
 
 	/** Remove any existing avatar files for `name` (all whitelisted extensions). */
@@ -1337,7 +1582,7 @@ export class TeamsStore {
 		try {
 			const raw = await readFile(this.windowsFile, "utf-8");
 			const parsed = JSON.parse(raw) as Partial<WindowsFile>;
-			return { version: typeof parsed.version === "number" ? parsed.version : 1, windows: parsed.windows ?? {} };
+			return { version: typeof parsed.version === "number" ? parsed.version : 1, windows: parsed.windows ?? {}, retiredCreationOperations: parsed.retiredCreationOperations };
 		} catch (err: unknown) {
 			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
 			// 决策 20：无兼容、无历史数据迁移。旧 rooms.json 直接忽略。
@@ -1358,6 +1603,61 @@ export class TeamsStore {
 		this.windowsPromise = Promise.resolve(data);
 	}
 
+	private async readRoomCreationJournal(): Promise<Record<string, { createdAt: string }>> {
+		try {
+			const parsed: unknown = JSON.parse(await readFile(this.roomCreationJournalFile, "utf8"));
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
+				(parsed as { version?: unknown }).version !== 1 ||
+				!(parsed as { pending?: unknown }).pending ||
+				typeof (parsed as { pending: unknown }).pending !== "object" ||
+				Array.isArray((parsed as { pending: unknown }).pending)) {
+				throw new Error("room creation journal is invalid");
+			}
+			const pending = (parsed as { pending: Record<string, unknown> }).pending;
+			if (Object.entries(pending).some(([id, value]) =>
+				!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id) ||
+				!value || typeof value !== "object" || Array.isArray(value) ||
+				typeof (value as { createdAt?: unknown }).createdAt !== "string")) {
+				throw new Error("room creation journal has invalid pending Sessions");
+			}
+			return pending as Record<string, { createdAt: string }>;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+			throw error;
+		}
+	}
+
+	private async reserveRoomCreation(sessionId: string): Promise<void> {
+		const pending = await this.readRoomCreationJournal();
+		if (Object.hasOwn(pending, sessionId)) throw new Error(`room Session already reserved: ${sessionId}`);
+		pending[sessionId] = { createdAt: new Date().toISOString() };
+		await this.writeJsonFile(this.roomCreationJournalFile, { version: 1, pending });
+	}
+
+	private async settleRoomCreation(sessionId: string): Promise<void> {
+		const pending = await this.readRoomCreationJournal();
+		if (!Object.hasOwn(pending, sessionId)) return;
+		delete pending[sessionId];
+		await this.writeJsonFile(this.roomCreationJournalFile, { version: 1, pending });
+	}
+
+	/** Call before opening HTTP routes: only journaled, unowned Sessions are removed. */
+	async reconcileRoomCreations(removeSession: (id: string) => Promise<unknown>): Promise<{ kept: number; removed: number }> {
+		return this.serialize(async () => {
+			let kept = 0;
+			let removed = 0;
+			const pending = await this.readRoomCreationJournal();
+			const windows = Object.values((await this.loadWindowsFile()).windows);
+			for (const sessionId of Object.keys(pending)) {
+				const owned = windows.some((window) => Boolean(contextContainingSession(window, sessionId)));
+				if (owned) kept++;
+				else { await removeSession(sessionId); removed++; }
+				await this.settleRoomCreation(sessionId);
+			}
+			return { kept, removed };
+		});
+	}
+
 	/** All window configs. */
 	async listWindows(): Promise<WindowConfig[]> {
 		return Object.values((await this.windowsFileData()).windows);
@@ -1372,7 +1672,9 @@ export class TeamsStore {
 		workspaceId?: string,
 	): Promise<{ workspaceId?: string; cwdSnapshot: string; trust?: WorkspaceTrust }> {
 		if (!workspaceId) return { cwdSnapshot: this.defaultCwdSnapshot };
-		const workspace = await this.workspaces.require(workspaceId);
+		let workspace;
+		try { workspace = await this.workspaces.require(workspaceId); }
+		catch (error) { throw new RoomWorkspaceUnavailableError(error); }
 		return { workspaceId, cwdSnapshot: workspace.canonicalPath, trust: workspace.trust };
 	}
 
@@ -1458,17 +1760,20 @@ export class TeamsStore {
 	async ensureDirectWindow(
 		member: string,
 		workspaceId: string | undefined,
-		createSession: () => Promise<{ id: string }>,
-		opts: { name?: string; prompt?: string; cwdSnapshot?: string } = {},
+		createSession: (reservedId?: string) => Promise<{ id: string }>,
+		opts: { name?: string; prompt?: string; cwdSnapshot?: string; requireEnabledMember?: boolean; rollbackSession?: (id: string) => Promise<unknown>; journalSession?: boolean; sourceSnapshot?: RoomSourceSnapshot } = {},
 	): Promise<WindowConfig> {
 		const context = workspaceId
 			? await this.contextForWorkspace(workspaceId)
 			: { cwdSnapshot: opts.cwdSnapshot ?? this.defaultCwdSnapshot };
 		if ((await realpath(context.cwdSnapshot).catch(() => undefined)) !== context.cwdSnapshot) {
-			throw new Error(`窗口运行目录已失效或身份已变化：${context.cwdSnapshot}`);
+			const error = new Error(`窗口运行目录已失效或身份已变化：${context.cwdSnapshot}`);
+			throw workspaceId ? new RoomWorkspaceUnavailableError(error) : error;
 		}
 		return this.serialize(async () => {
 			const data = await this.loadWindowsFile();
+			if (opts.sourceSnapshot) assertRoomSourceUnchanged(data.windows, opts.sourceSnapshot);
+			if (opts.requireEnabledMember) await this.assertRoomMembersAvailable([member]);
 			const existing = Object.values(data.windows).find(
 				(w) =>
 					w.type === "direct" &&
@@ -1477,7 +1782,7 @@ export class TeamsStore {
 					w.cwdSnapshot === context.cwdSnapshot,
 			);
 			if (existing) return existing;
-			const created = await createSession();
+			const created = await this.createRoomSession(createSession, opts.journalSession === true, opts.rollbackSession);
 			const window: WindowConfig = {
 				id: randomUUID(),
 				type: "direct",
@@ -1493,9 +1798,67 @@ export class TeamsStore {
 				createdAt: new Date().toISOString(),
 			};
 			data.windows[window.id] = window;
-			await this.writeWindows(data);
+			try {
+				await this.writeWindows(data);
+			} catch (error) {
+				await this.rollbackUncommittedWindowSession(created.id, opts.rollbackSession, error, created.reservedId);
+				throw error;
+			}
+			if (created.reservedId) await this.settleRoomCreation(created.reservedId).catch((error) => {
+				if (this.persistenceUncertain) throw error;
+			});
 			return window;
 		});
+	}
+
+	private async createRoomSession(
+		create: (reservedId?: string) => Promise<{ id: string }>,
+		journal: boolean,
+		rollback?: (id: string) => Promise<unknown>,
+	): Promise<{ id: string; reservedId?: string }> {
+		const reservedId = journal ? randomUUID() : undefined;
+		if (reservedId) await this.reserveRoomCreation(reservedId);
+		let createdId: string | undefined = reservedId;
+		try {
+			const created = await create(reservedId);
+			createdId = created.id;
+			if (reservedId && created.id !== reservedId) throw new Error("created Session id differs from durable room reservation");
+			return { id: created.id, ...(reservedId ? { reservedId } : {}) };
+		} catch (error) {
+			if (reservedId && rollback && !this.persistenceUncertain) {
+				try { await rollback(createdId!); }
+				catch (cleanupError) { throw new WindowSessionCleanupError(createdId!, error, cleanupError); }
+				await this.settleRoomCreation(reservedId);
+			}
+			throw error;
+		}
+	}
+
+	private async rollbackUncommittedWindowSession(
+		sessionId: string,
+		rollback: ((id: string) => Promise<unknown>) | undefined,
+		writeError: unknown,
+		reservedId?: string,
+	): Promise<void> {
+		// Directory fsync can fail after rename: the window may already point to
+		// this Session. Keep it for restart reconciliation in that uncertain case.
+		if (this.persistenceUncertain || !rollback) return;
+		try {
+			await rollback(sessionId);
+		} catch (cleanupError) {
+			throw new WindowSessionCleanupError(sessionId, writeError, cleanupError);
+		}
+		if (reservedId) await this.settleRoomCreation(reservedId);
+	}
+
+	private async assertRoomMembersAvailable(members: string[]): Promise<void> {
+		const agents = new Map((await this.loadAgentsFile()).map((agent) => [agent.name, agent]));
+		for (const member of members) {
+			const agent = agents.get(member);
+			if (!agent) throw new RoomWorkerUnavailableError(member);
+			if (agent.pinned) throw new Error(`「${member}」是内置 manager，不能作为窗口成员`);
+			if (agent.enabled === false) throw new Error(`worker「${member}」已停用，不能发起新对话`);
+		}
 	}
 
 	/**
@@ -1545,6 +1908,17 @@ export class TeamsStore {
 		});
 	}
 
+	async findGroupByCreationOperation(key: string, requestHash: string): Promise<WindowConfig | undefined> {
+		return this.serialize(async () => {
+			const data = await this.loadWindowsFile();
+			const retired = data.retiredCreationOperations?.[key];
+			if (retired) throw retired === requestHash ? new RoomCreationOperationGoneError() : new RoomCreationOperationConflictError();
+			const existing = Object.values(data.windows).find((window) => window.creationOperationId === key);
+			if (existing && existing.creationRequestHash !== requestHash) throw new RoomCreationOperationConflictError();
+			return existing;
+		});
+	}
+
 	/** Create a new window bound to a fresh pi session. Direct dedup is the
 	 * caller's job (findDirectWindow) so a dedup hit never creates a session. */
 	async createWindow(opts: {
@@ -1554,18 +1928,41 @@ export class TeamsStore {
 		cwdSnapshot?: string;
 		name?: string;
 		prompt?: string;
-		sessionId: string;
-	}): Promise<WindowConfig> {
-		const { type, members, workspaceId, cwdSnapshot, name, prompt, sessionId } = opts;
+		requireEnabledMembers?: boolean;
+		journalSession?: boolean;
+		creationOperation?: { key: string; requestHash: string };
+		sourceSnapshot?: RoomSourceSnapshot;
+	} & ({ sessionId: string; createSession?: never; rollbackSession?: never } | {
+		sessionId?: never;
+		createSession: (reservedId?: string) => Promise<{ id: string }>;
+		rollbackSession?: (id: string) => Promise<unknown>;
+	})): Promise<WindowConfig> {
+		const { type, members, workspaceId, cwdSnapshot, name, prompt } = opts;
 		if (type === "solo") throw new Error("solo 窗口由系统创建，不能手动发起");
 		// §5.2：Direct 只有平台固定 relay，拒绝自定义协作提示词。
 		if (type === "direct" && prompt?.trim()) throw new Error("单聊窗口不支持自定义协作提示词（固定 relay）");
-		const context = await this.contextForWorkspace(workspaceId);
-		if (cwdSnapshot !== undefined && cwdSnapshot !== context.cwdSnapshot) {
-			throw new Error("Window cwdSnapshot does not match its context");
-		}
 		return this.serialize(async () => {
 			const data = await this.loadWindowsFile();
+			if (opts.creationOperation) {
+				if (type !== "group") throw new Error("only group windows can have a creation operation");
+				const retired = data.retiredCreationOperations?.[opts.creationOperation.key];
+				if (retired) throw retired === opts.creationOperation.requestHash ? new RoomCreationOperationGoneError() : new RoomCreationOperationConflictError();
+				const existing = Object.values(data.windows).find((window) => window.creationOperationId === opts.creationOperation!.key);
+				if (existing) {
+					if (existing.creationRequestHash !== opts.creationOperation.requestHash) throw new RoomCreationOperationConflictError();
+					return existing;
+				}
+			}
+			if (opts.sourceSnapshot) assertRoomSourceUnchanged(data.windows, opts.sourceSnapshot);
+			const context = await this.contextForWorkspace(workspaceId);
+			if (cwdSnapshot !== undefined && cwdSnapshot !== context.cwdSnapshot) {
+				throw new Error("Window cwdSnapshot does not match its context");
+			}
+			if (opts.requireEnabledMembers) await this.assertRoomMembersAvailable(members);
+			const created = opts.createSession
+				? await this.createRoomSession(opts.createSession, opts.journalSession === true, opts.rollbackSession)
+				: { id: opts.sessionId! };
+			const sessionId = created.id;
 			const window: WindowConfig = {
 				id: randomUUID(),
 				type,
@@ -1578,9 +1975,18 @@ export class TeamsStore {
 				workspaceId,
 				cwdSnapshot: context.cwdSnapshot,
 				createdAt: new Date().toISOString(),
+				...(opts.creationOperation ? { creationOperationId: opts.creationOperation.key, creationRequestHash: opts.creationOperation.requestHash } : {}),
 			};
 			data.windows[window.id] = window;
-			await this.writeWindows(data);
+			try {
+				await this.writeWindows(data);
+			} catch (error) {
+				if (opts.createSession) await this.rollbackUncommittedWindowSession(sessionId, opts.rollbackSession, error, created.reservedId);
+				throw error;
+			}
+			if (created.reservedId) await this.settleRoomCreation(created.reservedId).catch((error) => {
+				if (this.persistenceUncertain) throw error;
+			});
 			return window;
 		});
 	}
@@ -1604,6 +2010,13 @@ export class TeamsStore {
 			}
 			if (patch.members !== undefined) {
 				const members = [...new Set(patch.members)];
+				const agents = new Map((await this.loadAgentsFile()).map((agent) => [agent.name, agent]));
+				for (const member of members) {
+					const agent = agents.get(member);
+					if (!agent) throw new Error(`worker not found: ${member}`);
+					if (agent.pinned) throw new Error(`「${member}」是内置 manager，不能作为窗口成员`);
+					if (agent.enabled === false) throw new Error(`worker「${member}」已停用，不能加入对话`);
+				}
 				if (w.type === "solo") {
 					if (members.length > 0) throw new Error("solo 窗口不能添加成员");
 					w.members = [];
@@ -1705,6 +2118,10 @@ export class TeamsStore {
 			if (!w) return;
 			if (w.pinned) throw new Error("solo 窗口不可删除");
 			sessionIds.push(...w.sessions, ...Object.values(w.parkedContexts).flatMap((context) => context.sessions));
+			if (w.creationOperationId && w.creationRequestHash) {
+				data.retiredCreationOperations ??= {};
+				data.retiredCreationOperations[w.creationOperationId] = w.creationRequestHash;
+			}
 			delete data.windows[id];
 			await this.writeWindows(data);
 		});
@@ -1841,7 +2258,7 @@ export class TeamsStore {
 			// repopulate the new conversation with its old opaque session handle.
 			if (target.workspaceId !== workspaceId || (await this.workspaceFor(target.id)) !== cwdSnapshot) return;
 			const currentAgent = (await this.loadAgentsFile()).find((agent) => agent.name === worker);
-			if (!currentAgent || (currentAgent.extensionRevision ?? 0) !== agentRevision) return;
+			if (!currentAgent || agentRunConfigRevision(currentAgent) !== agentRevision) return;
 			// Rebuild only from Session ids still owned by this Window. Besides pruning
 			// deleted sessions, this directly replaces the old Window-flat shape.
 			const bindings = owner.found.context.workerBindings ?? {};
@@ -1870,6 +2287,7 @@ export class TeamsStore {
 			const agent = agents.find((item) => item.name === name);
 			if (!agent) throw new Error(`agent not found: ${name}`);
 			agent.extensionRevision = (agent.extensionRevision ?? 0) + 1;
+			agent.runConfigRevision = agent.extensionRevision;
 			await this.writeAgents(agents);
 			return agent.extensionRevision;
 		});
@@ -1899,6 +2317,10 @@ export class TeamsStore {
 		}
 		const args = invoke.probeArgs ?? ["doctor", "--json"];
 		const secrets = this.credentials ? await this.credentials.getSecrets(agent.name) : {};
+		const current = await this.getAgent(name);
+		if (!current || (current.extensionRevision ?? 0) !== (agent.extensionRevision ?? 0)) {
+			throw new Error(`agent「${name}」配置在读取密钥时发生变化，请重试`);
+		}
 		const env = { ...process.env, ...(agent.env ?? {}), ...secrets };
 		const { exitCode, stdout, stderr, timedOut, spawnError } = await spawnWorker({
 			command: invoke.command,

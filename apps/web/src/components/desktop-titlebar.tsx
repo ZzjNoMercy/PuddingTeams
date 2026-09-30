@@ -15,7 +15,8 @@ function persistedSidebarHidden(): boolean {
 function applySidebarHidden(hidden: boolean): void {
 	if (hidden) document.documentElement.dataset.sidebar = "hidden";
 	else delete document.documentElement.dataset.sidebar;
-	window.localStorage.setItem(SIDEBAR_STORAGE_KEY, hidden ? "1" : "0");
+	try { window.localStorage.setItem(SIDEBAR_STORAGE_KEY, hidden ? "1" : "0"); }
+	catch { /* The current page still reflects the user's choice. */ }
 	window.dispatchEvent(new Event(SIDEBAR_CHANGE_EVENT));
 }
 
@@ -24,12 +25,20 @@ function subscribeSidebarChange(callback: () => void): () => void {
 	return () => window.removeEventListener(SIDEBAR_CHANGE_EVENT, callback);
 }
 
+export function useAppSidebarHidden(): boolean {
+	return useSyncExternalStore(subscribeSidebarChange, persistedSidebarHidden, () => false);
+}
+
+export function toggleAppSidebar(): void {
+	applySidebarHidden(!persistedSidebarHidden());
+}
+
 /**
  * Electron macOS 专用标题栏。原生交通灯占据左侧安全区，应用操作从其后开始；
  * 浏览器中保持隐藏，不改变 Web 版现有的信息层级。
  */
 export function DesktopTitlebar() {
-	const sidebarHidden = useSyncExternalStore(subscribeSidebarChange, persistedSidebarHidden, () => false);
+	const sidebarHidden = useAppSidebarHidden();
 
 	useEffect(() => {
 		for (const shell of document.querySelectorAll<HTMLElement>("[data-app-sidebar-shell]")) {
@@ -44,8 +53,7 @@ export function DesktopTitlebar() {
 	}, [sidebarHidden]);
 
 	const toggleSidebar = useCallback(() => {
-		const next = document.documentElement.dataset.sidebar !== "hidden";
-		applySidebarHidden(next);
+		toggleAppSidebar();
 	}, []);
 
 	useEffect(() => {

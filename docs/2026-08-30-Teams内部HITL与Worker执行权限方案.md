@@ -819,3 +819,30 @@ Worker 有效能力接口只返回安全摘要和来源，不返回 secret、完
 - Worker 管理页展示的是运行时有效能力，不是用户自报标签；
 - Teams 准入授权不会伪装成 Worker 权限，也不会改写 Goal 冻结契约；
 - 刷新、重启、并发响应和配置漂移后，Teams 仍能诚实回答“谁批准了什么、哪个 Worker 是否已经启动、实际按什么边界执行”。
+
+## 17. Wiki 审核域：编译 Job、审核确认与发布执行的权限语义（M3+M4，2026-09-28 补记）
+
+知识库 Wiki 的“编译 → 人工审核 → 发布”是一个独立于房间 admission 的 HITL 域。三段各自的认证与权限语义如下，互不冒充。
+
+### 17.1 编译 Job（受保护 Worker 执行）
+
+- 认证：CompileJob（SQLite 单写者事务）是唯一权威载体，创建时冻结 bindingRevision / trustRevision / rootIdentity / 来源 acceptanceId 集 / 来源快照哈希 / 编译器包摘要 / CLI 文件摘要；`operationId` 幂等，同键不同语义 409。
+- 权限语义：Worker 拿到的是**物化的只读来源快照**（平台对象库按 acceptanceId 取出，0711 权限、模式 0700 目录），永远不是活库路径；只允许写自己的 staging；任务文本中的平台约定段由 Job 字段构成，Worker/用户指令不能覆盖；seatbelt profile（deny default）只放行来源/staging/per-job home/tmp 与受审 CLI 文件，网络默认全断。
+- 已交付面：Job 账本、来源物化与复核、staging fail-closed 扫描、候选批次由宿主 `validateCandidate` 组装（Worker 输出从不直接成为候选）、批次身份派生自 Job（`compile-candidate:<jobId>`）。
+- **不宣称**：T03 只完成受控模型通道原型与对抗矩阵证据；T43（编译环境准入与绕过攻击全量落地）未完成——`runCompileJob` 当前不挂 `modelChannel`，受保护 profile 下 Worker 无网络且无 `~/.codex` 凭证，**真实模型编译在受保护通道接入前不可用**（2026-09-28 实证：native codex 0.158.0 在沙箱内 `failed to load configuration / Failed to synchronize managed preferences`，如实记为未闭合项）；P12（无限权限 Worker 的真实边界攻击矩阵）不宣称。T33 只依赖 T03/T31 的部分结论，ReviewStore 本身已交付并有测试。
+
+### 17.2 审核确认（T33，已交付）
+
+- 认证：审核决定绑定操作者宿主身份（actorId）+ 四元组（batchId、账本代际、manifestHash、reviewedFiles 恰好全覆盖），`assertReviewMatchesBatch` 结构校验 + ReviewStore 事务内代际/哈希双匹配；`operationId` 幂等回放不重复触发发布。
+- 权限语义：**Agent 无权确认**——审核 API 只接受本地宿主身份，服务端不存在任何 Agent 可调用的 confirm 通道；前端“全部查看才解锁确认”是体验门禁，不是授权依据（P04 的伪造 seen 由服务端四元组兜底拒绝）。候选一字变化 → manifestHash 变 → 旧确认自然失效；同 id 新 manifest 进新代际，旧代际确认全部作废。审核窗 24h，超期在读取时收敛为 conflict（lazy expire），只能重新编译再审。
+- 读后转正：compile candidate 首次进入审核面即落 ReviewStore 为 pending_review（revision 1）。
+
+### 17.3 发布执行（T40/T42/T44，已交付）
+
+- 认证：publisher 只消费 ReviewStore 已决快照（approved + decision 四元组匹配），不认任何其他来源的“已确认”声明。
+- 权限语义：写前全量基线预读（任一目标磁盘偏离审核基线即整批中止，未写任何字节）；create 不覆盖已存在目标；逐文件 before-image → write → verify receipt 进 publish journal（持久幂等键）；崩溃留下 queued/running/unknown 操作，启动时 `reconcileInterrupted` 对账；依赖组完整成功才回写采纳账本并重建检索索引。
+- **已知限制**：decide 落账与 publisher 调用之间存在崩溃窗——若进程在决定落账后、journal begin 前退出，批次停留 approved 且无操作记录，重启对账看不到它；同 operationId 回放按幂等短路、不会重触发发布，新 operationId 又因已有决定被拒。该窗口当前需要人工介入（后续切片应加 approved-滞留对账）。managed-wiki（`publish=false`）发布形态归 W6，本轮不宣称。
+
+### 17.4 与房间 admission 的边界
+
+Wiki 审核域不复用房间 admission Interaction：编译 Worker 在受保护 profile 里没有发起权限请求的运行时通道（无网络、无写外部能力），所有“是否允许”的决定都在编译前（来源集、Agent、任务）与发布前（人工审核批次）两个静态闸口完成。两个域共享的只有原则：HITL 的产品与安全所有权属于平台，Worker 自述一律不作为授权依据。

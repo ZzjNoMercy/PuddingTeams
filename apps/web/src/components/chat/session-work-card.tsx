@@ -76,6 +76,7 @@ export function SessionWorkCard({
 	const [activityError, setActivityError] = useState<string>();
 	const [supersedeSource, setSupersedeSource] = useState<SessionWorkState>();
 	const requestSequence = useRef(0);
+	const activityRequestSequence = useRef(0);
 	const viewedGoalRef = useRef<string | undefined>(undefined);
 	const autoOpenedWorkItems = useRef(new Set<string>());
 	const autoOpenStartedWorkItem = useCallback((state: SessionWorkState | null, currentGoalId: string | null) => {
@@ -116,7 +117,6 @@ export function SessionWorkCard({
 			setDelegations(result.delegations);
 			autoOpenStartedWorkItem(result.workState, result.activeGoalId);
 			setGoalLoadError(undefined);
-			setAutoFocusWorkItemId(undefined);
 			setGoalLoading(false);
 		} catch (error) {
 			if (requestId === requestSequence.current) {
@@ -128,13 +128,17 @@ export function SessionWorkCard({
 	}, [autoOpenStartedWorkItem, onGoalStateChange, sessionId]);
 
 	const refreshActivity = useCallback(async () => {
+		const requestId = ++activityRequestSequence.current;
 		try {
-			setActivityItems(await fetchRoomDelegationProcesses(roomId, sessionId));
+			const items = await fetchRoomDelegationProcesses(roomId, sessionId);
+			if (requestId !== activityRequestSequence.current) return;
+			setActivityItems(items);
 			setActivityError(undefined);
 		} catch (error) {
+			if (requestId !== activityRequestSequence.current) return;
 			setActivityError(error instanceof Error ? error.message : String(error));
 		} finally {
-			setActivityLoading(false);
+			if (requestId === activityRequestSequence.current) setActivityLoading(false);
 		}
 	}, [roomId, sessionId]);
 
@@ -152,31 +156,44 @@ export function SessionWorkCard({
 
 	useEffect(() => {
 		let cancelled = false;
-		const initial = setTimeout(() => {
-			void refresh()
-				.catch((err: unknown) => {
-					if (!cancelled) toast.error(err instanceof Error ? err.message : String(err));
-				})
-				.finally(() => {
-					if (!cancelled) {
-						setLoading(false);
-					}
-				});
-		}, 0);
-		const timer = setInterval(() => void refresh().catch(() => undefined), 2500);
+		let first = true;
+		let timer: ReturnType<typeof setTimeout>;
+		const poll = async () => {
+			try {
+				await refresh();
+			} catch (err) {
+				if (!cancelled && first) toast.error(err instanceof Error ? err.message : String(err));
+			} finally {
+				if (!cancelled) {
+					if (first) setLoading(false);
+					first = false;
+					timer = setTimeout(() => void poll(), 2500);
+				}
+			}
+		};
+		timer = setTimeout(() => void poll(), 0);
 		return () => {
 			cancelled = true;
-			clearTimeout(initial);
-			clearInterval(timer);
+			requestSequence.current += 1;
+			clearTimeout(timer);
 		};
 	}, [refresh]);
 
 	useEffect(() => {
-		const initial = setTimeout(() => void refreshActivity(), 0);
-		const timer = setInterval(() => void refreshActivity(), 2500);
+		let cancelled = false;
+		let timer: ReturnType<typeof setTimeout>;
+		const poll = async () => {
+			try {
+				await refreshActivity();
+			} finally {
+				if (!cancelled) timer = setTimeout(() => void poll(), 2500);
+			}
+		};
+		timer = setTimeout(() => void poll(), 0);
 		return () => {
-			clearTimeout(initial);
-			clearInterval(timer);
+			cancelled = true;
+			activityRequestSequence.current += 1;
+			clearTimeout(timer);
 		};
 	}, [refreshActivity]);
 
@@ -227,6 +244,7 @@ export function SessionWorkCard({
 			setActiveGoalId(next.goalId);
 			viewedGoalRef.current = undefined;
 			setViewedGoalId(undefined);
+			setAutoFocusWorkItemId(undefined);
 			setGoalLoading(false);
 			setGoalLoadError(undefined);
 			setGoals((previous) => [{ goalId: next.goalId, goal: next.goal, status: next.status, executionStatus: next.execution.status, pending: 0, running: false, createdAt: next.createdAt, updatedAt: next.updatedAt }, ...previous.filter((item) => item.goalId !== next.goalId).map((item) => superseded && item.goalId === superseded.previous.goalId ? { ...item, status: superseded.previous.status, executionStatus: superseded.previous.execution.status, pending: 0, running: false, updatedAt: superseded.previous.updatedAt } : item)]);
@@ -247,6 +265,7 @@ export function SessionWorkCard({
 		requestSequence.current += 1;
 		viewedGoalRef.current = goalId;
 		setViewedGoalId(goalId);
+		setAutoFocusWorkItemId(undefined);
 		setGoalLoading(true);
 		setGoalLoadError(undefined);
 		setAnswerById({});

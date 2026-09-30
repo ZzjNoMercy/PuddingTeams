@@ -2,12 +2,13 @@ import { contextBridge, ipcRenderer } from "electron";
 
 /**
  * 桌面宿主 bridge（白名单 IPC）：web 渲染进程通过 window.puddingteams 使用
- * 原生能力（系统目录选择器、Finder 显示、外部链接）。禁止直接暴露 ipcRenderer。
+ * 原生能力（系统目录选择器、Finder 显示、外部链接、在 Obsidian 中打开）。禁止直接暴露 ipcRenderer。
  */
 const IPC = {
 	pickDirectory: "puddingteams:pick-directory",
 	revealInFinder: "puddingteams:reveal-in-finder",
 	openExternal: "puddingteams:open-external",
+	openInObsidian: "puddingteams:open-in-obsidian",
 } as const;
 
 const desktopPlatform = process.platform;
@@ -29,4 +30,5 @@ contextBridge.exposeInMainWorld("puddingteams", {
 	pickDirectory: (initialPath?: string) => ipcRenderer.invoke(IPC.pickDirectory, initialPath),
 	revealInFinder: (targetPath: string) => ipcRenderer.invoke(IPC.revealInFinder, targetPath),
 	openExternal: (url: string) => ipcRenderer.invoke(IPC.openExternal, url),
+	openInObsidian: (uri: string) => ipcRenderer.invoke(IPC.openInObsidian, uri),
 });

@@ -1,0 +1,12 @@
+{
+  "name": "@puddingteams/capability-web-research",
+  "version": "1.0.0",
+  "description": "Public-web search and page reading, with host-independent core and Pi adapter",
+  "type": "module",
+  "license": "MIT",
+  "exports": {".": "./index.mjs", "./pi": "./pi/index.mjs"},
+  "files": ["index.mjs", "core", "pi", "README.md"],
+  "pi": {"extensions": ["./pi/index.mjs"]},
+  "scripts": {"test": "node --test core/*.test.mjs"},
+  "peerDependencies": {"@earendil-works/pi-coding-agent": ">=0.84.4 <0.85.0"}
+}

@@ -18,6 +18,7 @@ export function registerWorkerProcessRoutes(
 		cancel: (delegationId: string, signal?: AbortSignal) => Promise<void>;
 		reconcile?: (delegationId: string) => Promise<{ executionState: string }>;
 		takeover?: (delegationId: string, rationale: string) => Promise<{ executionState: string }>;
+		isSessionOwner?: (sessionHandle: string, delegationId: string) => boolean;
 	},
 	workStates?: WorkStateStore,
 ): void {
@@ -110,16 +111,22 @@ export function registerWorkerProcessRoutes(
 		}),
 	);
 
-	app.get<{ Params: { id: string } }>("/api/delegations/:id/process/messages", async (req, reply) => {
+	app.get<{ Params: { id: string }; Querystring: { scope?: string } }>("/api/delegations/:id/process/messages", async (req, reply) => {
+		if (req.query.scope !== undefined && req.query.scope !== "delegation" && req.query.scope !== "full") {
+			return reply.code(400).send({ error: "invalid worker process scope" });
+		}
 		const info = await service.resolve(req.params.id);
 		if (!info) return reply.code(404).send({ error: "delegation not found" });
 		if (!info.sessionHandle) return reply.code(404).send({ error: "worker session not started" });
 		if (info.view !== "session") return reply.code(409).send({ error: "delegation uses activity timeline" });
-		const messages = await service.messages(info.agentId, info.sessionHandle);
-		if (!messages) return reply.code(404).send({ error: "worker session not found" });
+		const allMessages = await service.messages(info.delegationId, info.sessionHandle);
+		if (!allMessages) return reply.code(404).send({ error: "worker session not found" });
+		const scoped = req.query.scope !== "full";
+		const messages = scoped ? await service.scopedMessages(info, allMessages) : allMessages;
+		if (!messages) return reply.code(409).send({ error: "单次委托的消息归属无法确认，请核对完整会话" });
 		return {
 			messages,
-			live: info.live,
+			live: scoped ? info.live && (controls?.isSessionOwner?.(info.sessionHandle, info.delegationId) ?? false) : info.live,
 			agentId: info.agentId,
 			executionState: info.executionState,
 			createdAt: info.createdAt,
@@ -180,7 +187,7 @@ export function registerWorkerProcessRoutes(
 		},
 	);
 
-	app.get<{ Params: { id: string } }>(
+	app.get<{ Params: { id: string }; Querystring: { scope?: string } }>(
 		"/api/delegations/:id/process/ws",
 		{ websocket: true },
 		async (socket, req) => {
@@ -198,24 +205,53 @@ export function registerWorkerProcessRoutes(
 				socket.close(1008, "origin not allowed");
 				return;
 			}
+			if (req.query.scope !== undefined && req.query.scope !== "delegation" && req.query.scope !== "full") {
+				socket.close(1008, "invalid worker process scope");
+				return;
+			}
 
 			const info = await service.resolve(req.params.id);
 			if (!info || info.view !== "session" || !info.sessionHandle) {
 				socket.close(4404, "delegation not found");
 				return;
 			}
-			socket.send(JSON.stringify({ type: "session_ready", sessionId: info.sessionHandle }));
-			const unsubscribe = service.subscribeLive(info.sessionHandle, (event) => {
+			const scoped = req.query.scope !== "full";
+			const owner = () => !scoped || (controls?.isSessionOwner?.(info.sessionHandle!, info.delegationId) ?? false);
+			if (!owner()) {
+				socket.send(JSON.stringify({ type: "worker_offline" }));
+				socket.close();
+				return;
+			}
+			let stopped = false;
+			let cleaned = false;
+			let ownerTimer: ReturnType<typeof setInterval> | undefined;
+			let unsubscribe: (() => void) | undefined;
+			const cleanup = () => { if (cleaned) return; cleaned = true; if (ownerTimer) clearInterval(ownerTimer); unsubscribe?.(); };
+			const stop = () => {
+				if (stopped) return;
+				stopped = true;
+				if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ type: "worker_offline" }));
+				cleanup();
+				socket.close();
+			};
+			unsubscribe = service.subscribeLive(info.sessionHandle, (event) => {
+				if (!owner()) { stop(); return; }
 				const payload = serializePiEvent(event);
 				if (payload && socket.readyState === socket.OPEN) socket.send(payload);
 			});
 			if (!unsubscribe) {
 				// 非 live：前端只展示历史，给个明确信号免得空等流式。
 				socket.send(JSON.stringify({ type: "worker_offline" }));
+				socket.close();
 				return;
 			}
-			socket.on("close", () => unsubscribe());
-			socket.on("error", () => unsubscribe());
+			if (stopped) { unsubscribe(); return; }
+			if (socket.readyState !== socket.OPEN) { unsubscribe(); return; }
+			socket.on("close", cleanup);
+			socket.on("error", cleanup);
+			if (!owner()) { stop(); return; }
+			if (scoped) ownerTimer = setInterval(() => { if (!owner()) stop(); }, 500);
+			socket.send(JSON.stringify({ type: "session_ready", sessionId: info.sessionHandle }));
 		},
 	);
 }

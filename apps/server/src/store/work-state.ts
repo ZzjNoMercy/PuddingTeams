@@ -149,6 +149,8 @@ export interface GoalExecution {
 	epoch: number;
 	status: GoalExecutionStatus;
 	interruption?: GoalInterruption;
+	/** Orphans already projected while a Workspace acceptance was frozen. */
+	reconciledRestartDelegationIds?: string[];
 	resumeLease?: { ownerId: string; token: string; expiresAt: string };
 }
 export interface WorkItemSubmission {
@@ -492,6 +494,14 @@ export class WorkStateStore {
 		if (state.revision !== revision) throw new WorkStateConflictError(state, revision);
 		if (epoch !== undefined && state.execution.epoch !== epoch) throw new WorkStateOperationConflictError("Goal execution epoch 已变化", "stale_goal_state");
 	}
+	private assertNoPendingSettlement(state: SessionWorkState): void {
+		const pending = this.pendingSettlementItem(state);
+		if (pending) throw new WorkStateOperationConflictError(`WorkItem ${pending.id} 的 Workspace 提升正在结算，请完成或恢复该 Submission 后再改变 Goal`, "stale_goal_state");
+	}
+	private pendingSettlementItem(state: SessionWorkState): WorkItem | undefined {
+		return Object.values(state.plan?.items ?? {}).find((item) =>
+			item.submissions.some((submission) => submission.acceptanceIntent && !submission.review));
+	}
 	private reviewTarget(
 		state: SessionWorkState,
 		workItemId: string,
@@ -686,6 +696,7 @@ export class WorkStateStore {
 			const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "update_goal", payload, goalId);
 			if (replay) return replay;
 			this.current(state, expectedRevision, expectedEpoch, goalId);
+			this.assertNoPendingSettlement(state);
 			const goal = patch.goal === undefined ? state.goal : requiredText(patch.goal, "goal");
 			const boundary = patch.completionBoundary === undefined ? state.completionBoundary : requiredText(patch.completionBoundary, "completionBoundary");
 			const currentBrief = patch.currentBrief === undefined ? state.currentBrief : (patch.currentBrief.trim() ? requiredText(patch.currentBrief, "currentBrief") : "");
@@ -728,7 +739,7 @@ export class WorkStateStore {
 		input: {
 			title?: string;
 			upsertItems: Array<{ id?: string; title: string; description?: string; assignedAgentId?: string; dependsOn?: string[]; acceptanceCriteria: string[]; sourceGoalCriteria?: string[]; verificationPolicy?: Partial<WorkItemVerificationPolicy>; workspaceExecutionClass?: WorkspaceExecutionClass; workspaceExecutionPolicy?: Partial<WorkspaceExecutionPolicy> }>;
-			removeItemIds?: string[]; cancelItemIds?: string[]; reopenItemIds?: string[]; reason: string;
+			removeItemIds?: string[]; cancelItemIds?: string[]; reopenItemIds?: string[]; confirmGoalCoverage?: boolean; reason: string;
 		},
 		operationId: string, expectedEpoch?: number, expectedGoalId?: string,
 	): Promise<SessionWorkState> {
@@ -741,7 +752,9 @@ export class WorkStateStore {
 			const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "update_work_plan", payload, goalId);
 			if (replay) return replay;
 			this.current(state, expectedRevision, expectedEpoch, goalId);
+			this.assertNoPendingSettlement(state);
 			const reason = requiredText(input.reason, "reason");
+			if (state.plan?.needsReconcile && input.confirmGoalCoverage !== true) throw new Error("Goal 契约已变化，更新 WorkPlan 前必须显式确认覆盖当前 Goal");
 			const timestamp = now();
 			const plan: GoalWorkPlan = state.plan ? copy(state.plan) : { id: randomUUID(), coveredGoalRevision: state.goalRevision, needsReconcile: false, revision: 0, items: {}, createdAt: timestamp, updatedAt: timestamp };
 			const allowedRefs = new Set(goalCriterionRefs(state).map((item) => item.id));
@@ -931,9 +944,17 @@ export class WorkStateStore {
 			if (!state?.plan) throw new Error("WorkPlan 不存在");
 			if (state.status !== "active") throw new WorkStateOperationConflictError("历史 Goal 的 Delegation 只保留审计", "stale_goal_state");
 			if (state.execution.epoch !== input.goalEpoch) throw new WorkStateOperationConflictError("旧 epoch Delegation 只保留审计", "stale_goal_state");
+			if (input.delegationStatus === "failed" && state.execution.reconciledRestartDelegationIds?.includes(input.delegationId)) {
+				this.commit(data, sessionId, operationId, input.goalEpoch, "delegation_boundary", input, state, state.revision, state.goalId);
+				await this.write(data);
+				return copy(state);
+			}
 			const plan = copy(state.plan);
 			const item = plan.items[input.workItemId];
 			if (!item) throw new Error("WorkItem 不存在");
+			if (item.submissions.some((submission) => submission.acceptanceIntent && !submission.review)) {
+				throw new WorkStateOperationConflictError("当前 WorkItem 正在结算 Workspace 提升，迟到的 Delegation 不能改写它", "stale_goal_state");
+			}
 			if (["accepted", "cancelled"].includes(item.status)) {
 				// Startup reconciliation and late terminal callbacks are allowed to
 				// observe an already-final WorkItem, but can never regress acceptance.
@@ -1199,12 +1220,21 @@ export class WorkStateStore {
 			const goalId = expectedGoalId ?? state.goalId;
 			const replay = this.replay<SessionWorkState>(data, sessionId, operationId, "workspace_promotion", payload, goalId);
 			if (replay) return replay;
-			this.current(state, expectedRevision, expectedEpoch, goalId);
+			if (!Number.isInteger(expectedRevision) || expectedRevision < 0 || expectedRevision > state.revision ||
+				state.goalId !== goalId || expectedEpoch !== undefined && state.execution.epoch !== expectedEpoch) {
+				throw new WorkStateConflictError(state, expectedRevision, "Workspace 提升所属 Goal/epoch 已变化");
+			}
 			const next = copy(state);
 			const item = next.plan!.items[workItemId];
 			if (!item || item.status !== "submitted") throw new Error("只有 submitted WorkItem 可以结算 change-set");
 			const submission = [...item.submissions].reverse().find((entry) => !entry.review);
 			if (!submission?.workspaceChangeSetId || submission.workspaceChangeSetId !== changeSet.id || changeSet.executionScopeId !== submission.executionReceipt?.workspaceExecutionScopeId) throw new Error("WorkspaceChangeSet 与当前 Submission/Receipt 不匹配");
+			if (!submission.acceptanceIntent) throw new Error("Workspace 提升前缺少已冻结的 Manager accepted 意图");
+			if (stable(submission.workspaceChangeSet) === stable(changeSet)) {
+				this.commit(data, sessionId, operationId, next.execution.epoch, "workspace_promotion", payload, next, next.revision, state.goalId);
+				await this.write(data);
+				return copy(next);
+			}
 			submission.workspaceChangeSet = copy(changeSet);
 			item.updatedAt = now(); next.plan!.updatedAt = item.updatedAt; next.plan!.revision += 1; next.revision += 1; next.updatedAt = item.updatedAt;
 			data.states[state.goalId] = next;
@@ -1231,6 +1261,16 @@ export class WorkStateStore {
 			const plan = copy(state.plan);
 			const item = plan.items[workItemId]!;
 			const submission = item.submissions.find((entry) => entry.id === target.submission.id)!;
+			if (submission.acceptanceIntent) {
+				const intent = submission.acceptanceIntent;
+				const sameEvidence = stable(intent.evidenceRefs) === stable(strings(input.evidenceRefs ?? [], "evidenceRefs"));
+				const promotion = submission.workspaceChangeSet?.promotionState;
+				const conflictSummary = `${intent.summary}\nWorkspace change-set 提升为 ${promotion}；已保留隔离 worktree/diff。`;
+				const normalizedSummary = requiredText(input.summary, "summary");
+				const matchesIntent = input.verdict === "accepted" && normalizedSummary === intent.summary && sameEvidence;
+				const matchesFailedPromotion = input.verdict === "blocked" && (promotion === "conflict" || promotion === "failed") && normalizedSummary === conflictSummary && sameEvidence;
+				if (!matchesIntent && !matchesFailedPromotion) throw new Error("当前 Submission 已冻结 Manager accepted 意图，不允许返修或改写验收结论");
+			}
 			if (input.verdict === "accepted") this.assertSubmissionCanAccept(state, plan, item, submission, input.evidenceRefs ?? []);
 			const timestamp = now();
 			submission.review = {
@@ -1364,6 +1404,7 @@ export class WorkStateStore {
 				if (replay) return replay;
 			}
 			this.current(state, expectedRevision, undefined, goalId);
+			this.assertNoPendingSettlement(state);
 			const timestamp = now();
 			const reason = requiredText(input.reason, "reason");
 			const abandonment: GoalAbandonment = {
@@ -1420,6 +1461,7 @@ export class WorkStateStore {
 				if (replay) return replay;
 			}
 			this.current(state, expectedRevision, undefined, goalId);
+			this.assertNoPendingSettlement(state);
 			const timestamp = now();
 			const replacementGoalId = randomUUID();
 			const reason = requiredText(input.reason, "reason");
@@ -1471,6 +1513,26 @@ export class WorkStateStore {
 				if (replay) return replay;
 			}
 			this.current(state, expectedRevision, undefined, goalId);
+			if (input.kind === "server_restart" && this.pendingSettlementItem(state)) {
+				// Runtime has already persisted the orphan's failed(server_restart) fact,
+				// and startup reconciliation projected its WorkItem boundary before
+				// reaching this command. Advancing the Goal epoch here would strand a
+				// frozen accepted intent after its Workspace side effect. Record the
+				// handled Delegation IDs in the Goal itself (not just the prunable operation
+				// ledger), keeping the failed sibling in revision and W1 resumable.
+				const timestamp = now();
+				const next: SessionWorkState = {
+					...state,
+					execution: { ...state.execution, reconciledRestartDelegationIds: [...new Set([...(state.execution.reconciledRestartDelegationIds ?? []), ...input.delegationIds])] },
+					revision: state.revision + 1, updatedAt: timestamp,
+				};
+				data.states[state.goalId] = next;
+				this.event(data, { id: `restart-settlement:${state.goalId}:${input.fingerprint}`, goalId: state.goalId, sessionId, epoch: next.execution.epoch, kind: "goal_changed", payload: { action: "restart_failure_projected_during_settlement", delegationIds: input.delegationIds, revision: next.revision } });
+				this.commit(data, sessionId, operationId, next.execution.epoch, "interrupt_goal", payload, next, next.revision, state.goalId);
+				await this.write(data);
+				return copy(next);
+			}
+			this.assertNoPendingSettlement(state);
 			if (state.execution.interruption?.fingerprint === input.fingerprint) return copy(state);
 			const epoch = state.execution.epoch + 1;
 			const interruption: GoalInterruption = { id: randomUUID(), kind: input.kind, fingerprint: requiredText(input.fingerprint, "fingerprint"), delegationIds: strings(input.delegationIds, "delegationIds"), interruptedAt: now() };
@@ -1531,12 +1593,12 @@ export class WorkStateStore {
 	}
 	async reconcileDelegations(delegations: Array<{
 		id: string; managerSessionId: string; goalId?: string; workItemId?: string; goalEpoch?: number;
-		purpose?: "execution" | "verification";
+		purpose?: "execution" | "verification" | "knowledge_compile";
 		executionState: "admitted" | "waiting_admission" | "running" | "waiting_input" | "reported_completed" | "reported_failed" | "cancel_requested" | "reconciling" | "cancelled" | "observation_lost"; revision: number; updatedAt: string;
 		receipt?: ExecutionReceipt;
 		result?: unknown;
 	}>): Promise<{ projected: number; interrupted: number }> {
-		const executionDelegations = delegations.filter((item) => item.purpose !== "verification");
+		const executionDelegations = delegations.filter((item) => item.purpose === undefined || item.purpose === "execution");
 		let projected = 0;
 		for (const item of executionDelegations) {
 			// Verification Delegations are evidence producers for an existing
@@ -1577,8 +1639,9 @@ export class WorkStateStore {
 			const ids = items.filter((item) => item.goalId === state.goalId && item.goalEpoch === state.execution.epoch).map((item) => item.id).sort();
 			if (!ids.length) continue;
 			const fingerprint = `server_restart:${hash(ids)}`;
-			await this.interruptGoal(sessionId, state.revision, { kind: "server_restart", fingerprint, delegationIds: ids }, `reconcile:${fingerprint}`, state.goalId);
-			interrupted++;
+			if (ids.every((id) => state.execution.reconciledRestartDelegationIds?.includes(id))) continue;
+			const after = await this.interruptGoal(sessionId, state.revision, { kind: "server_restart", fingerprint, delegationIds: ids }, `reconcile:${fingerprint}`, state.goalId);
+			if (after.execution.epoch !== state.execution.epoch) interrupted++;
 		}
 		for (const item of executionDelegations) {
 			if (item.executionState !== "observation_lost" || item.goalEpoch === undefined) continue;
@@ -1598,6 +1661,7 @@ export class WorkStateStore {
 	async removeSession(sessionId: string): Promise<void> {
 		await this.serialize(async () => {
 			const data = await this.load();
+			for (const state of Object.values(data.states)) if (state.sessionId === sessionId) this.assertNoPendingSettlement(state);
 			for (const [goalId, state] of Object.entries(data.states)) if (state.sessionId === sessionId) delete data.states[goalId];
 			for (const [id, item] of Object.entries(data.decisions)) if (item.sessionId === sessionId) delete data.decisions[id];
 			for (const [id, item] of Object.entries(data.operations)) if (item.sessionId === sessionId) delete data.operations[id];

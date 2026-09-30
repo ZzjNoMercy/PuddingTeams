@@ -15,6 +15,8 @@ export class DriverRegistry {
 	private readonly drivers = new Map<string, AgentDriver>();
 	private readonly factories = new Map<string, DriverFactory>();
 	private readonly owners = new Map<string, string>();
+	private readonly factoryEpochs = new Map<string, symbol>();
+	private readonly instanceOrigins = new WeakMap<AgentDriver, { connectorId: string; ownerId: string; epoch: symbol }>();
 
 	register(driver: AgentDriver, ownerId = driver.id): void {
 		this.drivers.set(driver.id, driver);
@@ -25,11 +27,13 @@ export class DriverRegistry {
 	registerFactory(connectorId: string, factory: DriverFactory, ownerId = connectorId): void {
 		this.factories.set(connectorId, factory);
 		this.owners.set(connectorId, ownerId);
+		this.factoryEpochs.set(connectorId, Symbol(connectorId));
 	}
 
 	/** Unregister（Connector 卸载/更新时由宿主调用）。 */
 	unregister(id: string): boolean {
 		this.factories.delete(id);
+		this.factoryEpochs.delete(id);
 		this.owners.delete(id);
 		return this.drivers.delete(id);
 	}
@@ -47,8 +51,21 @@ export class DriverRegistry {
 	): AgentDriver | undefined {
 		if (ownerId !== undefined && this.owners.get(connectorId) !== ownerId) return undefined;
 		const factory = this.factories.get(connectorId);
-		if (factory) return factory(config, transport);
+		if (factory) {
+			const driver = factory(config, transport);
+			const epoch = this.factoryEpochs.get(connectorId);
+			const owner = this.owners.get(connectorId);
+			if (epoch && owner) this.instanceOrigins.set(driver, { connectorId, ownerId: owner, epoch });
+			return driver;
+		}
 		return this.drivers.get(connectorId);
+	}
+
+	/** A replacement registration invalidates every instance from the old factory. */
+	isCurrentFactoryInstance(connectorId: string, ownerId: string, factory: DriverFactory, driver: AgentDriver): boolean {
+		const origin = this.instanceOrigins.get(driver);
+		return this.factories.get(connectorId) === factory && this.owners.get(connectorId) === ownerId &&
+			origin?.connectorId === connectorId && origin.ownerId === ownerId && origin.epoch === this.factoryEpochs.get(connectorId);
 	}
 
 	list(): AgentDriver[] {

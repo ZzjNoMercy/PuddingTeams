@@ -382,6 +382,67 @@ test("启动对账: reconciling/waiting_input/waiting_admission 都投影为活�
 	assert.ok((current?.revision ?? 0) > planned.revision);
 });
 
+test("启动对账: W1 提升意图冻结时 W2 重启失败不阻断启动，且 W1 仍可结算", async () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "pt-work-reconcile-settlement-"));
+	const store = new WorkStateStore(dir);
+	await store.init();
+	const goal = await store.create({ sessionId: "settlement-restart", goal: "交付两个任务", completionBoundary: "两个任务完成" });
+	const planned = await store.updatePlan("settlement-restart", goal.revision, {
+		upsertItems: [
+			{ id: "W1", title: "写入文件", acceptanceCriteria: ["文件存在"], workspaceExecutionClass: "git_write" },
+			{ id: "W2", title: "独立任务", acceptanceCriteria: ["结果可读"] },
+		], reason: "建立两个互不依赖的工作项",
+	}, "plan-settlement-restart", goal.execution.epoch, goal.goalId);
+	const first = planned.plan!.items.W1!;
+	const receipt = { ...sealedReceipt(planned, first, "D-W1"), workspaceExecutionScopeId: "scope-W1" };
+	const changeSet = {
+		id: "cs-W1", executionScopeId: "scope-W1", delegationIds: ["D-W1"], mode: "isolated_worktree" as const,
+		baselineFingerprint: "base", outputFingerprint: "out", changedPaths: ["result.txt"],
+		promotionState: "pending" as const, createdAt: new Date().toISOString(),
+	};
+	const submitted = await store.noteDelegation("settlement-restart", {
+		goalId: goal.goalId, workItemId: "W1", delegationId: "D-W1", delegationStatus: "completed", goalEpoch: 1,
+		executionReceipt: receipt, workspaceChangeSet: changeSet,
+	}, "submit-W1");
+	const running = await store.noteDelegation("settlement-restart", {
+		goalId: goal.goalId, workItemId: "W2", delegationId: "D-W2", delegationStatus: "running", goalEpoch: 1,
+	}, "run-W2");
+	const intended = await store.recordAcceptanceIntent("settlement-restart", "W1", running.revision, {
+		...reviewTarget(running, "W1"), summary: "W1 文件已检查", evidenceRefs: ["delegation:D-W1"],
+	}, "intent-W1", 1, goal.goalId);
+	const restartFailure = {
+		id: "D-W2", managerSessionId: "settlement-restart", goalId: goal.goalId, workItemId: "W2", goalEpoch: 1,
+		executionState: "reported_failed" as const, revision: 2, updatedAt: new Date().toISOString(), result: { errorCode: "server_restart" },
+	};
+	const reopened = new WorkStateStore(dir);
+	await reopened.init();
+	const outcome = await reopened.reconcileDelegations([restartFailure]);
+	assert.deepEqual(outcome, { projected: 1, interrupted: 0 });
+	const reconciled = (await reopened.getActive("settlement-restart"))!;
+	assert.equal(reconciled.execution.epoch, intended.execution.epoch);
+	assert.deepEqual(reconciled.execution.reconciledRestartDelegationIds, ["D-W2"]);
+	assert.equal(reconciled.plan?.items.W2?.status, "revision");
+	assert.equal(reconciled.plan?.items.W1?.submissions[0]?.acceptanceIntent?.summary, "W1 文件已检查");
+	const promoted = await reopened.recordWorkspaceChangeSet("settlement-restart", "W1", intended.revision,
+		{ ...changeSet, promotionState: "applied", promotedAt: new Date().toISOString() }, "promote-W1", 1, goal.goalId);
+	const accepted = await reopened.reviewWorkItem("settlement-restart", "W1", promoted.revision, {
+		...reviewTarget(promoted, "W1"), verdict: "accepted", summary: "W1 文件已检查", evidenceRefs: ["delegation:D-W1"],
+	}, "review-W1", 1, goal.goalId);
+	assert.equal(accepted.plan?.items.W1?.status, "accepted");
+	assert.equal(accepted.plan?.items.W2?.status, "revision");
+	const reopenedAgain = new WorkStateStore(dir);
+	await reopenedAgain.init();
+	const second = await reopenedAgain.reconcileDelegations([restartFailure]);
+	assert.deepEqual(second, { projected: 1, interrupted: 0 });
+	const afterSecond = (await reopenedAgain.getActive("settlement-restart"))!;
+	assert.equal(afterSecond.execution.epoch, 1);
+	assert.equal(afterSecond.revision, accepted.revision, "重启回放不能再次改写 W2 或全局修订号");
+	const lateReplay = await reopenedAgain.noteDelegation("settlement-restart", {
+		goalId: goal.goalId, workItemId: "W2", delegationId: "D-W2", delegationStatus: "failed", goalEpoch: 1,
+	}, "late-restart-replay-with-new-operation");
+	assert.equal(lateReplay.revision, accepted.revision, "操作账本清理后仍由 Goal 内已处理 ID 阻止重复投影");
+});
+
 test("启动对账: verification Delegation 只提供证据，不得被重放为执行 Submission", async () => {
 	const store = new WorkStateStore(mkdtempSync(path.join(tmpdir(), "pt-work-reconcile-verification-")));
 	await store.init();
@@ -680,14 +741,36 @@ test("Goal v5: Goal 契约变化后 WorkPlan 必须逐项对账新条件引用",
 	assert.equal(changed.status, "active");
 	await assert.rejects(() => store.updatePlan("contract", changed.revision, {
 		upsertItems: [], reason: "错误地直接确认覆盖",
-	}, "stale-plan"), /尚未对账当前 Goal 条件/);
+	}, "stale-plan"), /必须显式确认覆盖当前 Goal/);
+	await assert.rejects(() => store.updatePlan("contract", changed.revision, {
+		upsertItems: [], confirmGoalCoverage: true, reason: "只确认但仍保留旧条件引用",
+	}, "stale-refs"), /尚未对账当前 Goal 条件/);
 	const reconciled = await store.updatePlan("contract", changed.revision, {
 		upsertItems: [{ id: "W1", title: "执行", acceptanceCriteria: ["满足新条件"], sourceGoalCriteria: ["goal:2:1"] }],
-		reason: "按新 Goal 条件重建验收映射",
+		confirmGoalCoverage: true, reason: "按新 Goal 条件重建验收映射",
 	}, "reconciled-plan");
 	assert.equal(reconciled.plan?.coveredGoalRevision, 2);
 	assert.equal(reconciled.plan?.needsReconcile, false);
 	assert.deepEqual(reconciled.plan?.items.W1?.sourceGoalCriteria, ["goal:2:1"]);
+});
+
+test("Goal 修订后无条件引用的 WorkPlan 也须显式确认覆盖", async () => {
+	const store = new WorkStateStore(mkdtempSync(path.join(tmpdir(), "pt-goal-reconcile-unmapped-")));
+	await store.init();
+	const goal = await store.create({ sessionId: "unmapped", goal: "交付", completionBoundary: "旧条件", operationId: "create" });
+	const planned = await store.updatePlan("unmapped", goal.revision, {
+		upsertItems: [{ id: "W1", title: "执行", acceptanceCriteria: ["交付结果"] }], reason: "建立计划",
+	}, "plan");
+	const changed = await store.update("unmapped", planned.revision, { completionBoundary: "新条件" }, "goal-change");
+	await assert.rejects(() => store.updatePlan("unmapped", changed.revision, {
+		upsertItems: [], reason: "空更新",
+	}, "no-confirm"), /必须显式确认覆盖当前 Goal/);
+	assert.equal((await store.getActive("unmapped"))?.plan?.needsReconcile, true);
+	const confirmed = await store.updatePlan("unmapped", changed.revision, {
+		upsertItems: [], confirmGoalCoverage: true, reason: "已逐项检查 W1 的交付结果仍覆盖新条件",
+	}, "confirm");
+	assert.equal(confirmed.plan?.needsReconcile, false);
+	assert.equal(confirmed.plan?.coveredGoalRevision, changed.goalRevision);
 });
 
 test("Goal v5: Goal 创建 operationId 不得跨 Session 重复生效", async () => {

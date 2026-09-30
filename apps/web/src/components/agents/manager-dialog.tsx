@@ -1,16 +1,17 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import Link from "next/link";
 import { LoaderIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Dialog, DialogBody, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { listModels, updateManager } from "@/lib/api";
-import { agentDisplayName, type AgentConfig, type MutationResponse, type PiManagerSettings } from "@/lib/types";
+import { ApiConflictError, listAgents, updateManager } from "@/lib/api";
+import { useModelCatalog } from "@/lib/model-catalog";
+import { agentDisplayName, type AgentConfig, type MutationResponse, type PiManagerSettings, type PiManagerSettingsPatch } from "@/lib/types";
 import { AffectedNote, AvatarEditor } from "@/components/agents/form-parts";
 
 /**
@@ -19,16 +20,6 @@ import { AffectedNote, AvatarEditor } from "@/components/agents/form-parts";
  * 系统提示词、内置工具开关、资源加载开关、thinking level。
  * 合并语义：只提交用户改过的键，未提交的键服务端保持不变。
  */
-
-const THINKING_LEVELS: Array<NonNullable<PiManagerSettings["thinkingLevel"]>> = [
-	"off",
-	"minimal",
-	"low",
-	"medium",
-	"high",
-	"xhigh",
-	"max",
-];
 
 const splitProfileList = (value: string): string[] =>
 	[...new Set(value.split(/[\n,，]/).map((item) => item.trim()).filter(Boolean))];
@@ -84,8 +75,10 @@ export function ManagerDialog({
 	const [thinkingLevel, setThinkingLevel] = useState<PiManagerSettings["thinkingLevel"] | "default">(
 		settings.thinkingLevel ?? "default",
 	);
-	const [modelOptions, setModelOptions] = useState<string[]>([]);
 	const [saving, setSaving] = useState(false);
+	const [draftRevision, setDraftRevision] = useState(agent.extensionRevision ?? 0);
+	const [conflict, setConflict] = useState(false);
+	const [reloading, setReloading] = useState(false);
 	const [lastMutation, setLastMutation] = useState<MutationResponse | null>(null);
 
 	// 渲染期间随 Agent 变化重置表单。
@@ -103,16 +96,20 @@ export function ManagerDialog({
 		setBuiltinTools(s.builtinTools ?? true);
 		setNoExtensions(s.noExtensions ?? false);
 		setThinkingLevel(s.thinkingLevel ?? "default");
+		setDraftRevision(agent.extensionRevision ?? 0);
+		setConflict(false);
 	}
 
-	useEffect(() => {
-		// 模型候选（"provider/modelId"），仅作 datalist 提示，不强制选择。
-		listModels()
-			.then((models) => setModelOptions(models.map((m) => m.id)))
-			.catch(() => undefined);
-	}, []);
+	// 模型候选（"provider/modelId"），仅作 datalist 提示，不强制选择。
+	const catalog = useModelCatalog();
+	const modelOptions = (catalog.models ?? []).map((m) => m.id);
+	// 档位跟随所选模型（与 composer 同一份 thinkingLevels map）；未选定模型时回退全集。
+	const levels = catalog.levelsFor(model.trim());
+	const graded = catalog.gradedFor(model.trim());
+	const selectedLevel = thinkingLevel === "default" ? "" : thinkingLevel ?? "";
 
 	const handleSave = async () => {
+		if (conflict) return;
 		setSaving(true);
 		try {
 			const hasResponsibility = Boolean(identity.trim() || domain.trim() || owns.trim() || excludes.trim() || escalateWhen.trim());
@@ -127,26 +124,44 @@ export function ManagerDialog({
 					}
 				: null;
 			// 合并语义：提交表单全量键（false/空串也是有意义的值；空串 prompt = 清除）。
-			const manager: Partial<PiManagerSettings> = {
+			const manager: PiManagerSettingsPatch = {
 				builtinTools,
 				noExtensions,
+				model: model.trim() || null,
+				thinkingLevel: thinkingLevel === "default" ? null : thinkingLevel,
 			};
-			if (model.trim()) manager.model = model.trim();
-			if (thinkingLevel !== "default") manager.thinkingLevel = thinkingLevel;
-			const res = await updateManager({ description: description.trim(), manager, responsibility });
+			const res = await updateManager({ expectedRevision: draftRevision, description: description.trim(), manager, responsibility });
 			setLastMutation(res);
+			setDraftRevision(res.revision);
 			onAgentChanged(res.agent);
 			toast.success("manager 配置已保存（新建/重开会话生效；thinking level 运行时即改）");
 		} catch (err) {
+			if (err instanceof ApiConflictError) setConflict(true);
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
 			setSaving(false);
 		}
 	};
 
+	const reloadAfterConflict = async () => {
+		setReloading(true);
+		try {
+			const latest = (await listAgents()).find((item) => item.name === agent.name);
+			if (!latest) throw new Error("Manager 已不存在");
+			onAgentChanged(latest);
+			setDraftRevision(latest.extensionRevision ?? 0);
+			setConflict(false);
+			toast.success("已读取最新 Manager 配置，可以重新编辑");
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		} finally {
+			setReloading(false);
+		}
+	};
+
 	return (
 		<Dialog open={open} onOpenChange={onOpenChange}>
-			<DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
+			<DialogContent className="flex max-h-[85vh] flex-col overflow-hidden sm:max-w-2xl">
 				<DialogHeader>
 					<DialogTitle>管理「{agentDisplayName(agent)}」</DialogTitle>
 					<DialogDescription>
@@ -154,6 +169,7 @@ export function ManagerDialog({
 					</DialogDescription>
 				</DialogHeader>
 
+				<DialogBody className="space-y-4">
 				<AvatarEditor agent={agent} onUpdated={onAgentChanged} />
 
 				<label className="flex flex-col gap-1 text-sm">
@@ -211,20 +227,25 @@ export function ManagerDialog({
 					/>
 					<ToggleRow label="不加载 Pi 原生插件" checked={noExtensions} onChange={setNoExtensions} />
 					<label className="flex flex-col gap-1 text-sm">
-						<span className="text-muted-foreground">thinking level（运行时即改）</span>
+						<span className="text-muted-foreground">thinking level（新建/重开 Session 生效）</span>
 						<Select value={thinkingLevel} onValueChange={(v) => setThinkingLevel(v as typeof thinkingLevel)}>
 							<SelectTrigger className="w-full">
 								<SelectValue />
 							</SelectTrigger>
 							<SelectContent>
 								<SelectItem value="default">默认（不设置）</SelectItem>
-								{THINKING_LEVELS.map((level) => (
+								{/* 已存档位不再被新模型支持时必须仍可见可改。 */}
+								{selectedLevel && !levels.includes(selectedLevel) ? <SelectItem value={selectedLevel}>{selectedLevel}（当前模型不支持）</SelectItem> : null}
+								{levels.filter((level) => level !== selectedLevel).map((level) => (
 									<SelectItem key={level} value={level}>
 										{level}
 									</SelectItem>
 								))}
 							</SelectContent>
 						</Select>
+						<span className="text-xs text-muted-foreground/70">
+							{graded ? "档位取自所选模型的 pi 原生映射；各 provider 的实际强度语义以服务商文档为准。" : "该模型只支持思考开/关，各档在链路上无差别。"}
+						</span>
 					</label>
 				</div>
 
@@ -239,9 +260,10 @@ export function ManagerDialog({
 				</div>
 
 				{lastMutation ? <AffectedNote affected={lastMutation.affectedSessions} /> : null}
+				{conflict ? <div role="alert" className="rounded-md border border-amber-500 p-3 text-sm">Manager 配置已变化。当前表单仍保留；请先核对，再读取最新配置。<Button type="button" size="sm" variant="outline" className="ml-3" disabled={reloading} onClick={() => void reloadAfterConflict()}>读取最新配置（丢弃当前输入）</Button></div> : null}
 
 				<div className="flex items-center gap-2">
-					<Button type="button" size="sm" disabled={saving} onClick={() => void handleSave()}>
+					<Button type="button" size="sm" disabled={saving || conflict} onClick={() => void handleSave()}>
 						{saving ? <LoaderIcon className="size-3.5 animate-spin" /> : null}
 						保存
 					</Button>
@@ -249,6 +271,7 @@ export function ManagerDialog({
 						关闭
 					</Button>
 				</div>
+				</DialogBody>
 			</DialogContent>
 		</Dialog>
 	);

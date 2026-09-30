@@ -52,7 +52,8 @@ export class WorkerProcessService {
 		const d = await this.delegations.getDelegation(delegationId);
 		if (!d) return undefined;
 		const agent = await this.teams.getAgent(d.agentId);
-		const view = d.sessionHandle && (agent?.connector?.connectorId === "pi" || !agent) ? "session" : "timeline";
+		const piDriver = d.driverId === "pi" || (!d.driverId && (agent?.connector?.connectorId === "pi" || !agent));
+		const view = d.sessionHandle && piDriver ? "session" : "timeline";
 		return {
 			delegationId: d.id,
 			managerSessionId: d.managerSessionId,
@@ -147,22 +148,22 @@ export class WorkerProcessService {
 		return this.timelines.subscribeFrom(delegationId, afterSeq, listener);
 	}
 
-	/** Agent 可在 Connector config 里覆盖 sessionDir（与 pi-driver 装配一致）。 */
-	private async sessionDirFor(agentId: string): Promise<string> {
-		const agent = await this.teams.getAgent(agentId);
-		const configured = agent?.connector?.config?.sessionDir;
-		return typeof configured === "string" && configured.trim() ? configured.trim() : this.defaultSessionDir;
-	}
-
 	/**
 	 * 会话消息历史：live 命中用内存会话（含未落盘的流式尾部）；否则从 JSONL
 	 * 当前分支读 message 条目。返回 pi AgentMessage[]（与 manager 会话的
 	 * /messages 同形）。会话不存在返回 undefined。
 	 */
-	async messages(agentId: string, handle: string): Promise<unknown[] | undefined> {
+	async messages(delegationId: string, handle: string): Promise<unknown[] | undefined> {
 		const live = liveWorkerSession(handle);
-		if (live) return live.messages;
-		const dir = await this.sessionDirFor(agentId);
+		if (live?.isStreaming) return [...live.messages];
+		if (live) {
+			return live.sessionManager.getBranch()
+				.filter((entry) => entry.type === "message")
+				.map((entry) => entry.message);
+		}
+		const delegation = await this.delegations.getDelegation(delegationId);
+		if (!delegation || delegation.sessionHandle !== handle || (delegation.driverId && delegation.driverId !== "pi")) return undefined;
+		const dir = delegation.workerSessionDir ?? this.defaultSessionDir;
 		const info = (await SessionManager.listAll(dir)).find((s) => s.id === handle);
 		if (!info) return undefined;
 		const sm = SessionManager.open(info.path, dir);
@@ -170,6 +171,34 @@ export class WorkerProcessService {
 			.getBranch()
 			.filter((entry) => entry.type === "message")
 			.map((entry) => (entry as { message: unknown }).message);
+	}
+
+	/** A Pi Session can contain several Delegations; unknown timestamps are not attributable. */
+	async scopedMessages(info: WorkerProcessInfo, messages: unknown[]): Promise<unknown[] | undefined> {
+		if (!info.sessionHandle) return undefined;
+		// The live AgentSession can append while the delegation index is loading.
+		// Fix the message set before awaiting the index so a later Run cannot enter
+		// an earlier request through a shared mutable array reference.
+		const snapshot = [...messages];
+		const start = Date.parse(info.createdAt);
+		if (!Number.isFinite(start)) return undefined;
+		const sealedAt = info.receipt?.sealedAt ? Date.parse(info.receipt.sealedAt) : NaN;
+		if (info.receipt?.sealedAt && !Number.isFinite(sealedAt)) return undefined;
+		const peers = await this.delegations.listDelegations();
+		const peerStarts = peers
+			.filter((candidate) => candidate.id !== info.delegationId && candidate.agentId === info.agentId && candidate.sessionHandle === info.sessionHandle)
+			.map((candidate) => Date.parse(candidate.createdAt));
+		if (peerStarts.some((timestamp) => !Number.isFinite(timestamp) || timestamp === start)) return undefined;
+		const nextStarts = peerStarts.filter((timestamp) => timestamp > start);
+		const end = Math.min(Number.isFinite(sealedAt) ? sealedAt + 1 : Infinity, ...nextStarts);
+		if (snapshot.some((message) => {
+			const timestamp = (message as { timestamp?: unknown } | null)?.timestamp;
+			return typeof timestamp !== "number" || !Number.isFinite(timestamp);
+		})) return undefined;
+		return snapshot.filter((message) => {
+			const timestamp = (message as { timestamp: number }).timestamp;
+			return timestamp >= start && timestamp < end;
+		});
 	}
 
 	/** 仅 live 会话可订阅实时事件；非 live 返回 undefined（前端只展示历史）。 */

@@ -15,7 +15,7 @@ import {
 	type InlineExtension,
 } from "@earendil-works/pi-coding-agent";
 import { readFile, realpath, unlink } from "node:fs/promises";
-import { existsSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { agentDisplayName, MANAGER_AGENT_NAME } from "../store/teams.js";
 import type { PiManagerSettings, PiResourceConfig, TeamsStore } from "../store/teams.js";
 import type { WorkStateStore } from "../store/work-state.js";
@@ -74,6 +74,8 @@ export interface SessionSummary {
 	active: boolean;
 	/** 会话当前模型的 opaque ref（`${provider}/${modelId}`），取自最后一条 model_change。 */
 	model?: string;
+	/** 会话当前 thinking level，取自最后一条 thinking_level_change。 */
+	thinkingLevel?: string;
 }
 
 export interface ModelSummary {
@@ -82,6 +84,13 @@ export interface ModelSummary {
 	name: string;
 	provider: string;
 	reasoning: boolean;
+	/** 该模型支持的 thinking 档位（`thinkingLevelMap` 归一化后的可用集）；非推理模型为 ["off"]。 */
+	thinkingLevels: string[];
+	/**
+	 * 档位是否真正分级：选不同档位会改变上游请求。若为 false，说明该模型只支持
+	 * 思考开/关，菜单上的多档在链路上无差别，UI 需如实告知而非暗示强度刻度。
+	 */
+	thinkingGraded: boolean;
 	contextWindow: number;
 	maxTokens: number;
 }
@@ -131,6 +140,15 @@ interface CapturedToolExecution {
 }
 
 type PiModel = NonNullable<CreateAgentSessionOptions["model"]>;
+
+/** pi SDK 归一化思考档位；与 manager.thinkingLevel / JSONL thinking_level_change 同域。 */
+type PiThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+const PI_THINKING_LEVELS: readonly PiThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+function isPiThinkingLevel(value: unknown): value is PiThinkingLevel {
+	return typeof value === "string" && (PI_THINKING_LEVELS as readonly string[]).includes(value);
+}
 
 /** 纯展示 custom message 等待 run 落定的上限（超时降级 nextTurn）。 */
 
@@ -248,6 +266,12 @@ export class PiSessionStore {
 	private assembledManaged = new Map<string, Set<string>>();
 	/** 配置变化标记（§3.3.5）：Session 空闲时重建 ResourceLoader/AgentSession。 */
 	private runtimeDirty = new Set<string>();
+	/** 装配跨越配置变更时重试，避免尚未进入 active 的实例漏掉撤权。 */
+	private configEpoch = 0;
+	/** 会话级 thinking level（用户对该 Session 的显式选择，§10.6 thinking binding）：
+	 *  manager 配置变更不得广播覆盖。session.setThinkingLevel 已把档位写进
+	 *  JSONL，重启后由 preferRecordedThinkingLevel 恢复。 */
+	private thinkingOverrides = new Map<string, PiThinkingLevel>();
 	/** 长生命周期事件订阅（WS 推送）：挂在 store 上而非单个 AgentSession
 	 *  实例——runtimeDirty 空闲重建会换掉实例，实例级 subscribe 会静默断流
 	 *  （socket 还连着，事件却发到了已 dispose 的旧实例）。 */
@@ -308,6 +332,10 @@ export class PiSessionStore {
 			});
 		}
 	}
+	private knowledgeRuntime: import("../knowledge/runtime-service.js").KnowledgeRuntimeService | undefined;
+	setKnowledgeRuntime(service: import("../knowledge/runtime-service.js").KnowledgeRuntimeService): void { this.knowledgeRuntime = service; }
+	private webResearchExtension?: (agentId: string) => InlineExtension;
+	setWebResearchExtension(factory: (agentId: string) => InlineExtension): void { this.webResearchExtension = factory; }
 
 	/**
 	 * System-prompt shaping for a window's manager sessions（提示词管理方案 §5）：
@@ -395,6 +423,7 @@ export class PiSessionStore {
 			});
 		}
 		const guidance = PiSessionStore.resolveGuidance(ctx);
+		if (this.webResearchExtension && (!ctx || ctx.type === "solo")) factories.push(this.webResearchExtension((await this.teamsStore?.getManager())?.name ?? "manager"));
 		// 信任门（§7.2/§6.3）：服务端按窗口 workspaceId 计算三类放行，
 		// 与 manager 自己的资源开关取与；无 workspaceId = 全关。
 		const workspaceAccess = this.teamsStore
@@ -443,7 +472,7 @@ export class PiSessionStore {
 			cwd,
 			agentDir,
 			settingsManager: SettingsManager.create(cwd, agentDir),
-			extensionFactories: factories,
+			extensionFactories: [...factories, ...(this.knowledgeRuntime ? [this.knowledgeRuntime.managerExtension(getSessionId)] : [])],
 			...piResourceLoaderOptions(sessionResources, cwd, agentDir, workspaceAccess),
 			// noExtensions 只控制 pi-native Extension；平台 inline core/delegation
 			// factories 不受影响。Skills/templates/context 全部由 piResources 决定。
@@ -467,6 +496,9 @@ export class PiSessionStore {
 		/** open() 重开已有会话：模型以 JSONL 最后一条 model_change 为准，
 		 *  不用 manager 默认模型覆盖用户的选择。 */
 		preferRecordedModel?: boolean;
+		/** open() 重开已有会话：thinking level 以 JSONL 最后一条
+		 *  thinking_level_change 为准，不用 manager 默认档位覆盖（§10.6）。 */
+		preferRecordedThinkingLevel?: boolean;
 	}): Promise<AgentSession> {
 		const settings = await this.managerSettings();
 		const resources = await this.managerResources();
@@ -501,12 +533,15 @@ export class PiSessionStore {
 				return undefined;
 			});
 		}
+		// thinking level 与模型同构（§10.6 binding）：默认档位只喂新建会话；
+		// 重开已有会话必须不传，让 SDK 从 JSONL thinking_level_change 恢复。
+		const thinkingLevel = opts.preferRecordedThinkingLevel ? undefined : settings?.thinkingLevel;
 		const { session } = await createAgentSession({
 			cwd: opts.cwd,
 			sessionManager: opts.sessionManager,
 			...(model ? { model } : {}),
 			modelRuntime: await this.runtime(),
-			...(settings?.thinkingLevel ? { thinkingLevel: settings.thinkingLevel } : {}),
+			...(thinkingLevel ? { thinkingLevel } : {}),
 			resourceLoader: loader,
 			noTools: "builtin" as const,
 			excludeTools: ["bash", "edit", "write"],
@@ -518,6 +553,7 @@ export class PiSessionStore {
 		// hosts must bind them explicitly so session_start receives this Session's
 		// cwd (FFF uses it as the index root).
 		await session.bindExtensions({ mode: "rpc" });
+		this.knowledgeRuntime?.guardManagerSession(session);
 		// Stop at the completed tool batch, after toolResults/cards are persisted.
 		// Aborting the Session here would also signal in-flight Worker operations;
 		// a human wait must preserve the pending Interaction and its original Run.
@@ -625,12 +661,15 @@ export class PiSessionStore {
 	 * 立即撤权（§3.3.6）：配置变化后，活跃会话里不再允许的工具立刻从
 	 * active tools 移除（新增 Agent 的工具要等空闲重建才会出现）；所有活跃
 	 * 会话标记 runtimeDirty，下次空闲 open 时彻底重建。
-	 * §10.5：manager 的 thinking level 是运行时即改项，这里同步应用到
-	 * 所有活跃会话。
+	 * §10.5/§10.6：manager 的 thinking level 是运行时即改项，但只刷新**没有
+	 * 会话级选择**的会话；thinkingOverrides 里的 Session 跳过，清除配置
+	 * （null）时按 SDK 默认链（per-model override → 全局默认 → medium）
+	 * 回退，不允许 `if (level && ...)` 判空吃掉清除语义。
 	 */
 	private async revokeChangedTools(): Promise<void> {
+		this.configEpoch++;
 		if (!this.teamsStore) return;
-		const thinkingLevel = (await this.managerSettings())?.thinkingLevel;
+		const settings = await this.managerSettings();
 		for (const [id, session] of this.active) {
 			const ctx = await this.windowContextOf(id);
 			const plan = await planManagerTools(this.teamsStore, this.catalog, ctx);
@@ -638,11 +677,24 @@ export class PiSessionStore {
 			const active = session.getActiveToolNames();
 			const next = active.filter((n) => !assembled.has(n) || plan.active.has(n));
 			if (next.length !== active.length) session.setActiveToolsByName(next);
-			if (thinkingLevel && session.thinkingLevel !== thinkingLevel) {
-				session.setThinkingLevel(thinkingLevel);
+			if (!this.thinkingOverrides.has(id)) {
+				const fallback = this.sdkDefaultThinkingLevel(session);
+				const target = (settings?.thinkingLevel ?? fallback) as PiThinkingLevel;
+				if (target && session.thinkingLevel !== target) {
+					session.setThinkingLevel(target);
+				}
 			}
 			this.runtimeDirty.add(id);
 		}
+	}
+
+	/** 该 Session 在 SDK 默认链下的 thinking level（不含 manager 配置）。 */
+	private sdkDefaultThinkingLevel(session: AgentSession): PiThinkingLevel {
+		const model = session.model as PiModel | undefined;
+		const settingsManager = session.settingsManager;
+		const perModel = model ? settingsManager?.getModelThinkingLevel(model.provider, model.id) : undefined;
+		const resolved = perModel ?? settingsManager?.getDefaultThinkingLevel() ?? "medium";
+		return isPiThinkingLevel(resolved) ? resolved : "medium";
 	}
 
 	/**
@@ -655,6 +707,7 @@ export class PiSessionStore {
 
 	/** Extension 包更新/卸载后，所有活跃会话空闲时重建装配。 */
 	markAllDirty(): void {
+		this.configEpoch++;
 		for (const id of this.active.keys()) this.runtimeDirty.add(id);
 	}
 
@@ -721,9 +774,60 @@ export class PiSessionStore {
 			name: model.name,
 			provider: model.provider,
 			reasoning: model.reasoning,
+			thinkingLevels: PiSessionStore.supportedThinkingLevels(model),
+			thinkingGraded: PiSessionStore.thinkingGraded(model),
 			contextWindow: model.contextWindow,
 			maxTokens: model.maxTokens,
 		};
+	}
+
+	/** 与 pi-ai getSupportedThinkingLevels 同规则：null=禁用；xhigh/max 须显式声明；非推理=仅 off。 */
+	private static supportedThinkingLevels(model: PiModel): string[] {
+		if (!model.reasoning) return ["off"];
+		const map = (model as { thinkingLevelMap?: Record<string, string | null> }).thinkingLevelMap;
+		return PI_THINKING_LEVELS.filter((level) => {
+			const mapped = map?.[level];
+			if (mapped === null) return false;
+			if (level === "xhigh" || level === "max") return mapped !== undefined;
+			return true;
+		});
+	}
+
+	/**
+	 * 档位是否真正分级：把每个非 off 档位经 clamp 归一后，映射到该 api 实际会
+	 * 发出的字段（effort 值），去重后多于一种即为分级。
+	 *
+	 * 判定复刻 pi-ai adapter 的出参逻辑（openai-completions 的
+	 * zai/qwen/deepseek 三个方言都受 `compat.supportsReasoningEffort` 门控），
+	 * 不发请求即可得出结论。仅用于 UI 如实标注，不参与请求构造。
+	 */
+	private static thinkingGraded(model: PiModel): boolean {
+		if (!model.reasoning) return false;
+		const compat = (model as { compat?: Record<string, unknown> }).compat ?? {};
+		const map = (model as { thinkingLevelMap?: Record<string, string | null> }).thinkingLevelMap;
+		const levels = PiSessionStore.supportedThinkingLevels(model);
+		const onLevels = levels.filter((level) => PiSessionStore.clampLevel(level, levels) !== "off");
+		if (onLevels.length === 0) return false;
+		// 只在受 supportsReasoningEffort 门控的方言上，档位才可能落到线上字段。
+		const gated = compat.thinkingFormat === "zai" || compat.thinkingFormat === "qwen" || compat.thinkingFormat === "deepseek";
+		const effective = onLevels.map((level) => {
+			const eff = PiSessionStore.clampLevel(level, levels);
+			return gated && compat.supportsReasoningEffort !== true ? "on" : String(map?.[eff] ?? eff);
+		});
+		return new Set(effective).size > 1;
+	}
+
+	/** 在给定可用集合内钳制到最近档（与 pi-ai clampThinkingLevel 同序：先向上再向下）。 */
+	private static clampLevel(level: string, available: string[]): string {
+		if (available.includes(level)) return level;
+		const index = PI_THINKING_LEVELS.indexOf(level as PiThinkingLevel);
+		for (let i = index; i < PI_THINKING_LEVELS.length; i++) {
+			if (available.includes(PI_THINKING_LEVELS[i]!)) return PI_THINKING_LEVELS[i]!;
+		}
+		for (let i = index - 1; i >= 0; i--) {
+			if (available.includes(PI_THINKING_LEVELS[i]!)) return PI_THINKING_LEVELS[i]!;
+		}
+		return available[0] ?? "off";
 	}
 
 	/** Models the user can pick: available (auth configured), else full catalog. */
@@ -765,6 +869,11 @@ export class PiSessionStore {
 		return (await this.runtime()).getProvider(providerId) !== undefined;
 	}
 
+	/** Check the selected model before accepting a new work's first message. */
+	async hasModelAuth(providerId: string): Promise<boolean> {
+		return (await this.runtime()).hasConfiguredAuth(providerId);
+	}
+
 	/**
 	 * Store a provider API key: in-memory runtime override (no network
 	 * validation in the SDK — the key is trusted as-is) plus durable in the
@@ -776,11 +885,20 @@ export class PiSessionStore {
 	 */
 	async setProviderKey(providerId: string, apiKey: string): Promise<{ availableCount: number }> {
 		const rt = await this.runtime();
-		await rt.setRuntimeApiKey(providerId, apiKey);
-		await PiSessionStore.credentialsOf(rt).modify(providerId, async () => ({
-			type: "api_key",
-			key: apiKey,
-		}));
+		try {
+			await rt.setRuntimeApiKey(providerId, apiKey);
+			await PiSessionStore.credentialsOf(rt).modify(providerId, async () => ({
+				type: "api_key",
+				key: apiKey,
+			}));
+		} catch (err) {
+			// SDK 先安装运行时 override；若持久写入失败，不能让本进程继续
+			// 使用一个重启后就会消失、而页面又收到失败响应的新 key。
+			await rt.removeRuntimeApiKey(providerId).catch((cleanupErr: unknown) => {
+				this.debugLog?.(`Provider key 失败清理运行时 override：${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`);
+			});
+			throw err;
+		}
 		const availableCount = (await rt.getAvailable(providerId)).length;
 		// 自愈不阻断写 key 的主流程。
 		await this.healPlaceholderModelSessions(providerId).catch((err: unknown) => {
@@ -832,18 +950,32 @@ export class PiSessionStore {
 		await rt.removeRuntimeApiKey(providerId);
 	}
 
+	/** Preserve the exact credential shape for same-process Provider deletion compensation. */
+	async snapshotProviderCredential(providerId: string): Promise<unknown> {
+		return PiSessionStore.credentialsOf(await this.runtime()).read(providerId);
+	}
+
+	async restoreProviderCredential(providerId: string, credential: unknown): Promise<void> {
+		const rt = await this.runtime();
+		if (credential === undefined) await PiSessionStore.credentialsOf(rt).delete(providerId);
+		else await PiSessionStore.credentialsOf(rt).modify(providerId, async () => credential);
+		await rt.removeRuntimeApiKey(providerId);
+	}
+
 	/**
 	 * Access the runtime's credential overlay. `ModelRuntime.credentials` is
 	 * not part of the public type surface, but it is the only write path that
 	 * keeps auth.json and AuthStorage's cache coherent (see setProviderKey).
 	 */
 	private static credentialsOf(rt: ModelRuntime): {
+		read(providerId: string): Promise<unknown>;
 		modify(providerId: string, fn: (current: unknown) => Promise<unknown>): Promise<unknown>;
 		delete(providerId: string): Promise<void>;
 	} {
 		return (
 			rt as unknown as {
 				credentials: {
+					read(providerId: string): Promise<unknown>;
 					modify(providerId: string, fn: (current: unknown) => Promise<unknown>): Promise<unknown>;
 					delete(providerId: string): Promise<void>;
 				};
@@ -867,17 +999,24 @@ export class PiSessionStore {
 	async create(
 		modelRef?: string,
 		window?: ManagerWindowContext,
+		sessionId?: string,
 	): Promise<SessionSummary> {
+		if (sessionId && (await this.list()).some((item) => item.id === sessionId)) {
+			throw new Error(`Session already exists: ${sessionId}`);
+		}
 		const model = modelRef ? await this.resolveModel(modelRef) : undefined;
 		const cwd = window?.cwd ?? this.cwd;
 		const binding: { sessionId: string } = { sessionId: "" };
-		const session = await this.assembleSession({
-			sessionManager: SessionManager.create(cwd, this.sessionDir),
-			model,
-			ctx: window,
-			cwd,
-			getSessionId: () => binding.sessionId,
-		});
+		const sessionManager = SessionManager.create(cwd, this.sessionDir, sessionId ? { id: sessionId } : undefined);
+		let session: AgentSession | undefined;
+		for (let attempt = 0; attempt < 4; attempt++) {
+			const epoch = this.configEpoch;
+			const candidate = await this.assembleSession({ sessionManager, model, ctx: window, cwd, getSessionId: () => binding.sessionId });
+			if (epoch === this.configEpoch) { session = candidate; break; }
+			candidate.dispose();
+			this.assembledManaged.delete(candidate.sessionId);
+		}
+		if (!session) throw new Error("Manager 配置在会话装配期间持续变化，请重试");
 		binding.sessionId = session.sessionId;
 		const summary = await this.summarize(session);
 		// A newly created Session is already a durable product identity even before
@@ -908,6 +1047,9 @@ export class PiSessionStore {
 				model: this.active.has(info.id)
 					? PiSessionStore.modelRefOf(this.active.get(info.id)!)
 					: await PiSessionStore.modelRefOfFile(info.path),
+				thinkingLevel: this.active.has(info.id)
+					? PiSessionStore.thinkingLevelOf(this.active.get(info.id)!)
+					: await PiSessionStore.thinkingLevelOfFile(info.path),
 			})),
 		);
 		const byId = new Map(summaries.map((summary) => [summary.id, summary]));
@@ -927,6 +1069,7 @@ export class PiSessionStore {
 				modifiedAt: new Date().toISOString(),
 				active: true,
 				model: PiSessionStore.modelRefOf(session),
+				thinkingLevel: PiSessionStore.thinkingLevelOf(session),
 			});
 		}
 		return summaries;
@@ -949,6 +1092,31 @@ export class PiSessionStore {
 				const parsed = JSON.parse(line) as { type?: string; provider?: string; modelId?: string };
 				if (parsed.type === "model_change" && parsed.provider && parsed.modelId) {
 					return `${parsed.provider}/${parsed.modelId}`;
+				}
+			}
+		} catch {
+			// 读取失败不影响列表主流程。
+		}
+		return undefined;
+	}
+
+	/** 存活会话的当前 thinking level。 */
+	private static thinkingLevelOf(session: AgentSession): string | undefined {
+		const level = session.thinkingLevel;
+		return typeof level === "string" && level ? level : undefined;
+	}
+
+	/** 磁盘会话的当前 thinking level：JSONL 最后一条 thinking_level_change（best-effort）。 */
+	private static async thinkingLevelOfFile(sessionFile: string): Promise<string | undefined> {
+		try {
+			const content = await readFile(sessionFile, "utf8");
+			const lines = content.split("\n");
+			for (let i = lines.length - 1; i >= 0; i--) {
+				const line = lines[i]!;
+				if (!line.includes('"thinking_level_change"')) continue;
+				const parsed = JSON.parse(line) as { type?: string; thinkingLevel?: string };
+				if (parsed.type === "thinking_level_change" && typeof parsed.thinkingLevel === "string" && parsed.thinkingLevel) {
+					return parsed.thinkingLevel;
 				}
 			}
 		} catch {
@@ -1001,16 +1169,51 @@ export class PiSessionStore {
 					return undefined;
 				})
 			: undefined;
-		const session = await this.assembleSession({
-			sessionManager,
-			model: recordedModel,
-			ctx,
-			cwd,
-			getSessionId: () => id,
-			preferRecordedModel: true,
-		});
+		let session: AgentSession | undefined;
+		for (let attempt = 0; attempt < 4; attempt++) {
+			const epoch = this.configEpoch;
+			const candidate = await this.assembleSession({
+				sessionManager, model: recordedModel, ctx, cwd, getSessionId: () => id, preferRecordedModel: true, preferRecordedThinkingLevel: true,
+			});
+			if (epoch === this.configEpoch) { session = candidate; break; }
+			candidate.dispose();
+			this.assembledManaged.delete(candidate.sessionId);
+		}
+		if (!session) throw new Error("Manager 配置在会话装配期间持续变化，请重试");
 		this.active.set(session.sessionId, session);
+		// §10.6：重启后恢复会话级 thinking 选择。SDK 恢复的是 JSONL 落盘档位，
+		// 与「manager 默认档位按当前模型 clamp 后」不一致即视为用户选择，
+		// 登记 thinkingOverrides——否则进程重启后 thinkingOverrides 为空，
+		// 下一次 manager 配置变更会把用户的选择广播覆盖掉。
+		await this.registerThinkingOverrideIfDiverged(id, session);
 		return session;
+	}
+
+	/** 落盘档位与默认链不一致时登记会话级 thinking 选择（best-effort 发散判定）。 */
+	private async registerThinkingOverrideIfDiverged(id: string, session: AgentSession): Promise<void> {
+		if (this.thinkingOverrides.has(id)) return;
+		const recorded = PiSessionStore.thinkingLevelOf(session);
+		if (!recorded || !isPiThinkingLevel(recorded)) return;
+		const settings = await this.managerSettings();
+		const expectedDefault: PiThinkingLevel = settings?.thinkingLevel ?? this.sdkDefaultThinkingLevel(session);
+		const expected = PiSessionStore.clampThinkingLevel(session, expectedDefault);
+		if (recorded !== expected) this.thinkingOverrides.set(id, recorded);
+	}
+
+	/** 与 pi-ai clampThinkingLevel 同序：可用集合内先向上、再向下取最近可用档。 */
+	private static clampThinkingLevel(session: AgentSession, level: PiThinkingLevel): PiThinkingLevel {
+		const available = session.getAvailableThinkingLevels().filter(isPiThinkingLevel);
+		if (available.length === 0 || available.includes(level)) return available.includes(level) ? level : (available[0] ?? "off");
+		const requestedIndex = PI_THINKING_LEVELS.indexOf(level);
+		for (let i = requestedIndex; i < PI_THINKING_LEVELS.length; i++) {
+			const candidate = PI_THINKING_LEVELS[i]!;
+			if (available.includes(candidate)) return candidate;
+		}
+		for (let i = requestedIndex - 1; i >= 0; i--) {
+			const candidate = PI_THINKING_LEVELS[i]!;
+			if (available.includes(candidate)) return candidate;
+		}
+		return available[0] ?? "off";
 	}
 
 	private pendingToolCalls(session: AgentSession): Array<{ id: string; name: string }> {
@@ -1238,6 +1441,31 @@ export class PiSessionStore {
 		return PiSessionStore.summarizeModel(model);
 	}
 
+	/**
+	 * Switch the thinking level of a live session（§10.6 thinking binding 的会话级层）。
+	 * SDK 会写 thinking_level_change 持久化并 clamp 到当前模型能力；平台记录
+	 * thinkingOverrides，使后续 manager 配置变更不再广播覆盖该 Session。
+	 * 返回会话实际生效的档位（clamp 后的值）。
+	 */
+	async setThinkingLevel(id: string, level: string): Promise<string> {
+		await this.requireActiveContext(id);
+		if (!isPiThinkingLevel(level)) {
+			throw new Error(`thinkingLevel 必须是 ${PI_THINKING_LEVELS.join(" | ")}`);
+		}
+		const session = await this.open(id);
+		session.setThinkingLevel(level);
+		this.thinkingOverrides.set(id, level);
+		return PiSessionStore.thinkingLevelOf(session) ?? level;
+	}
+
+	/** 会话当前 thinking level（会话级真值，composer 用；内存会话优先，磁盘回退 JSONL）。 */
+	async thinkingLevelOf(id: string): Promise<string | undefined> {
+		const session = this.active.get(id);
+		if (session) return PiSessionStore.thinkingLevelOf(session);
+		const info = (await SessionManager.listAll(this.sessionDir)).find((s) => s.id === id);
+		return info ? PiSessionStore.thinkingLevelOfFile(info.path) : undefined;
+	}
+
 	/** 当前 manager Session 真实装配的 Skill 命令；与 pi 的 /skill:name 展开清单同源。 */
 	async listSkillCommands(id: string): Promise<SessionSkillCommand[]> {
 		const session = await this.open(id);
@@ -1444,6 +1672,102 @@ export class PiSessionStore {
 		} catch (err) {
 			this.debugLog?.(`sendCustomMessage failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
+	}
+
+	/** Audit-only metadata; never sent to a model or rendered as a chat message. */
+	async workerRuntimeModel(id: string): Promise<import("../agent-runtime/types.js").RuntimeModelSettings> {
+		const session = await this.open(id);
+		if (!session.sessionFile || !existsSync(session.sessionFile)) return {};
+		const branchIds = new Set(session.sessionManager.getBranch().map((entry) => entry.id));
+		for (const line of readFileSync(session.sessionFile, "utf8").split("\n").reverse()) {
+			if (!line) continue;
+			const entry = JSON.parse(line) as { id: string; type: string; customType?: string; data?: { model?: unknown; effort?: unknown } };
+			if (entry.type !== "custom" || entry.customType !== "pudding:worker-runtime-model" || !branchIds.has(entry.id)) continue;
+			return { ...(typeof entry.data?.model === "string" ? { model: entry.data.model } : {}), ...(typeof entry.data?.effort === "string" ? { effort: entry.data.effort } : {}) };
+		}
+		return {};
+	}
+
+	async setWorkerRuntimeModel(id: string, settings: import("../agent-runtime/types.js").RuntimeModelSettings): Promise<void> {
+		const session = await this.open(id);
+		await this.ensureSessionFile(id);
+		if (!session.sessionFile || !existsSync(session.sessionFile)) throw new Error("会话文件不可用，不能保存模型设置");
+		const entryId = session.sessionManager.appendCustomEntry("pudding:worker-runtime-model", { ...settings });
+		if (!session.sessionFile) throw new Error("会话设置未落盘");
+		const descriptor = openSync(session.sessionFile, "r");
+		try {
+			fsyncSync(descriptor);
+			if (!readFileSync(session.sessionFile, "utf8").split("\n").some((line) => {
+				try { return (JSON.parse(line) as { id?: string }).id === entryId; } catch { return false; }
+			})) throw new Error("会话设置未落盘");
+		} finally { closeSync(descriptor); }
+	}
+
+	/** Direct user/assignment cards are admission facts: never swallow or accept a memory-only write. */
+	async sendCustomMessageDurable(
+		id: string,
+		message: { customType: string; content: string; details: Record<string, unknown> & { operationId: string } },
+	): Promise<void> {
+		const session = await this.open(id);
+		const priorIds = new Set(session.sessionManager.getBranch().map((entry) => entry.id));
+		await this.deliverCustomMessage(id, message, { triggerTurn: false });
+		await this.ensureSessionFile(id);
+		const entry = session.sessionManager.getBranch().find((item) =>
+			item.type === "custom_message" && !priorIds.has(item.id) &&
+			item.display !== false && item.customType === message.customType && item.content === message.content &&
+			(item.details as { operationId?: string } | undefined)?.operationId === message.details.operationId);
+		if (!entry || !session.sessionFile) throw new Error("direct 消息卡未写入 Session，不能确认接收");
+		const descriptor = openSync(session.sessionFile, "r");
+		try {
+			fsyncSync(descriptor);
+			const persisted = readFileSync(session.sessionFile, "utf8").split("\n").some((line) => {
+				if (!line) return false;
+				try {
+					const item = JSON.parse(line) as { id?: string; type?: string; display?: boolean; customType?: string; content?: string; details?: { operationId?: string } };
+					return item.id === entry.id && item.type === "custom_message" && item.customType === message.customType &&
+						item.display !== false && item.content === message.content && item.details?.operationId === message.details.operationId;
+				} catch { return false; }
+			});
+			if (!persisted) throw new Error("direct 消息卡未写入 JSONL，不能确认接收");
+		} finally { closeSync(descriptor); }
+	}
+
+	/** Bind a persisted pi user entry to the ordinary-message reservation after admission. */
+	async appendMessageAdmission(
+		id: string,
+		facts: { operationId: string; requestHash: string; contextHash: string; userEntryId: string },
+	): Promise<void> {
+		const session = await this.open(id);
+		if (!session.sessionFile) throw new Error("会话记录未落盘，不能写入消息接收凭据");
+		const userPersisted = readFileSync(session.sessionFile, "utf8").split("\n").some((line) => {
+			if (!line) return false;
+			try {
+				const entry = JSON.parse(line) as { id?: string; type?: string; message?: { role?: string } };
+				return entry.id === facts.userEntryId && entry.type === "message" && entry.message?.role === "user";
+			} catch { return false; }
+		});
+		if (!userPersisted) throw new Error("本次 user 未落盘，不能写入消息接收凭据");
+		const priorIds = new Set(session.sessionManager.getBranch().map((entry) => entry.id));
+		this.appendProjectionToSession(session, { customType: "pudding:message_admission", content: "", details: facts });
+		await this.ensureSessionFile(id);
+		const marker = session.sessionManager.getBranch().find((entry) =>
+			entry.type === "custom_message" && !priorIds.has(entry.id) && entry.customType === "pudding:message_admission" &&
+			(entry.details as { operationId?: string } | undefined)?.operationId === facts.operationId);
+		if (!marker) throw new Error("消息接收凭据未进入会话记录");
+		const descriptor = openSync(session.sessionFile, "r");
+		try {
+			fsyncSync(descriptor);
+			const persisted = readFileSync(session.sessionFile, "utf8").split("\n").some((line) => {
+				if (!line) return false;
+				try {
+					const entry = JSON.parse(line) as { id?: string; type?: string; customType?: string; display?: boolean; details?: typeof facts };
+					return entry.id === marker.id && entry.type === "custom_message" && entry.customType === "pudding:message_admission" &&
+						entry.display === false && entry.details?.operationId === facts.operationId && entry.details.requestHash === facts.requestHash &&
+						entry.details.contextHash === facts.contextHash && entry.details.userEntryId === facts.userEntryId;
+				} catch { return false; }
+			});
+			if (!persisted) throw new Error("消息接收凭据未落盘，不能确认接收");
+		} finally { closeSync(descriptor); }
 	}
 
 	/**
@@ -1785,6 +2109,7 @@ export class PiSessionStore {
 			modifiedAt: new Date().toISOString(),
 			active: true,
 			model: PiSessionStore.modelRefOf(session),
+			thinkingLevel: PiSessionStore.thinkingLevelOf(session),
 		};
 	}
 

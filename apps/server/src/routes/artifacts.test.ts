@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import Fastify from "fastify";
@@ -34,7 +34,8 @@ test("GET /api/artifacts 按 windowId/delegationId 过滤", async () => {
 	const { app, store, dir } = await makeStack();
 	const file = path.join(dir, "a.md");
 	writeFileSync(file, "a");
-	await store.register({ ...project(dir), name: "a.md", path: file, origin: "push", producer: "puddingclaw", delegationId: "d1", windowId: "w1" });
+	const first = await store.register({ ...project(dir), name: "a.md", path: file, origin: "push", producer: "puddingclaw", delegationId: "d1", windowId: "w1" });
+	assert.equal(first.size, 1, "列表大小以冻结副本为准，不沿用调用方的源文件大小");
 	await store.register({ ...project(dir), name: "b.md", path: file, origin: "push", producer: "puddingclaw", delegationId: "d2", windowId: "w2" });
 
 	const all = await app.inject({ method: "GET", url: "/api/artifacts" });
@@ -55,16 +56,56 @@ test("GET /api/artifacts/:id/content 下载冻结版本并返回 SHA-256", async
 	const file = path.join(dir, "报告.md");
 	writeFileSync(file, "交付内容");
 	const rec = await store.register({ ...project(dir), name: "报告.md", path: file, origin: "push", producer: "puddingclaw", delegationId: "d1", windowId: "w1" });
+	assert.equal(statSync(rec.snapshotPath).mode & 0o222, 0, "登记后的冻结 blob 不可写");
 
 	const res = await app.inject({ method: "GET", url: `/api/artifacts/${rec.id}/content` });
 	assert.equal(res.statusCode, 200);
 	assert.equal(res.body, "交付内容");
 	assert.equal(res.headers["x-content-sha256"], rec.contentHash);
 	assert.ok(encodeURIComponent("报告.md") !== "报告.md" && res.headers["content-disposition"]?.toString().includes(encodeURIComponent("报告.md")));
+	chmodSync(rec.snapshotPath, 0o644);
+	writeFileSync(rec.snapshotPath, "已篡改的下载内容");
+	const corrupted = await app.inject({ method: "GET", url: `/api/artifacts/${rec.id}/content` });
+	assert.equal(corrupted.statusCode, 409);
+	assert.equal(corrupted.headers["x-content-sha256"], undefined, "未验证的下载不能宣称登记哈希");
+	const browserError = await app.inject({ method: "GET", url: `/api/artifacts/${rec.id}/content`, headers: { accept: "text/html,application/xhtml+xml" } });
+	assert.equal(browserError.statusCode, 409);
+	assert.match(browserError.headers["content-type"]?.toString() ?? "", /^text\/plain/);
+	assert.match(browserError.body, /无法下载/);
+	assert.equal(browserError.headers["content-disposition"], undefined, "错误不能被浏览器当作附件保存");
 
 	const missing = await app.inject({ method: "GET", url: "/api/artifacts/nope/content" });
 	assert.equal(missing.statusCode, 404, "未登记的 id 一律 404，无任意路径读取面");
 
+	await app.close();
+});
+
+test("GET /api/artifacts/:id/preview 只返回完整且校验通过的小文本，超限不伪装截断", async () => {
+	const { app, store, dir } = await makeStack();
+	const smallPath = path.join(dir, "small.md");
+	writeFileSync(smallPath, "完整预览");
+	const small = await store.register({ ...project(dir), name: "small.md", path: smallPath, origin: "push", producer: "worker", delegationId: "d1", windowId: "w1" });
+	const preview = await app.inject({ method: "GET", url: `/api/artifacts/${small.id}/preview` });
+	assert.equal(preview.statusCode, 200, preview.body);
+	assert.equal(preview.body, "完整预览");
+	const largePath = path.join(dir, "large.md");
+	writeFileSync(largePath, Buffer.alloc(2 * 1024 * 1024 + 1, 0x61));
+	const large = await store.register({ ...project(dir), name: "large.md", path: largePath, origin: "push", producer: "worker", delegationId: "d1", windowId: "w1" });
+	const oversized = await app.inject({ method: "GET", url: `/api/artifacts/${large.id}/preview` });
+	assert.equal(oversized.statusCode, 413);
+	assert.match(oversized.json().error, /下载或用系统打开完整文件/);
+	const fullDownload = await app.inject({ method: "GET", url: `/api/artifacts/${large.id}/content` });
+	assert.equal(fullDownload.statusCode, 200);
+	assert.equal(fullDownload.body.length, 2 * 1024 * 1024 + 1, "预览上限不能截断完整下载");
+	const binaryPath = path.join(dir, "image.png");
+	writeFileSync(binaryPath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+	const binary = await store.register({ ...project(dir), name: "image.png", path: binaryPath, origin: "push", producer: "worker", delegationId: "d1", windowId: "w1" });
+	const unsupported = await app.inject({ method: "GET", url: `/api/artifacts/${binary.id}/preview` });
+	assert.equal(unsupported.statusCode, 415);
+	chmodSync(small.snapshotPath, 0o644);
+	writeFileSync(small.snapshotPath, "修改后的字节");
+	const changed = await app.inject({ method: "GET", url: `/api/artifacts/${small.id}/preview` });
+	assert.equal(changed.statusCode, 409);
 	await app.close();
 });
 
@@ -113,6 +154,12 @@ test("POST /api/artifacts/:id/open 用原文件名打开冻结的只读副本", 
 	assert.equal(path.basename(opened[0]!), "市场分析.xlsx");
 	assert.equal(await import("node:fs/promises").then(({ readFile }) => readFile(opened[0]!, "utf8")), "frozen bytes");
 	assert.equal((await import("node:fs/promises").then(({ stat }) => stat(opened[0]!))).mode & 0o222, 0);
+
+	chmodSync(rec.snapshotPath, 0o644);
+	writeFileSync(rec.snapshotPath, "tampered bytes");
+	const tampered = await app.inject({ method: "POST", url: `/api/artifacts/${rec.id}/open` });
+	assert.equal(tampered.statusCode, 409);
+	assert.equal(opened.length, 1, "哈希不匹配的冻结 blob 不能交给系统应用");
 
 	const outside = path.join(dir, "outside.xlsx");
 	writeFileSync(outside, "secret");

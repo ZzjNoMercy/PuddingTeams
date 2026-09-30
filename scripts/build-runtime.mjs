@@ -118,6 +118,7 @@ const FIRST_PARTY = [
 	path.join("extensions", "connectors", "codex"),
 	path.join("extensions", "connectors", "claude-code"),
 	path.join("extensions", "capabilities", "lark-cli"),
+	path.join("extensions", "capabilities", "web-research"),
 ];
 for (const rel of FIRST_PARTY) {
 	const dest = path.join(RUNTIME, rel);

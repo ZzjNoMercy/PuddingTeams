@@ -50,7 +50,7 @@ async function makeStack() {
 			return { executionState: "cancelled" };
 		},
 	}, workStates);
-	return { app, delegations, timelines, workerSessions, workStates, dir, cancellations, reconciliations, takeovers };
+	return { app, service, delegations, timelines, workerSessions, workStates, dir, cancellations, reconciliations, takeovers };
 }
 
 /** 造一个落盘的 worker 会话（user + assistant 两条消息），返回 sessionId。 */
@@ -236,7 +236,7 @@ test("已结束委托：从 JSONL 回放 worker 会话历史，live=false", asyn
 		trustProjection: { execution: "observation_lost", verification: "not_required", settlement: "not_required" },
 	});
 
-	const res = await app.inject({ method: "GET", url: `/api/delegations/${d.id}/process/messages` });
+	const res = await app.inject({ method: "GET", url: `/api/delegations/${d.id}/process/messages?scope=full` });
 	assert.equal(res.statusCode, 200, res.body);
 	const body = res.json();
 	assert.equal(body.live, false);
@@ -244,6 +244,31 @@ test("已结束委托：从 JSONL 回放 worker 会话历史，live=false", asyn
 	assert.equal(body.messages.length, 2);
 	assert.equal(body.messages[0].role, "user");
 	assert.equal(body.messages[1].role, "assistant");
+	await app.close();
+});
+
+test("Pi 历史按委托时的 Driver 与 sessionDir 回放，不按 Agent 当前配置解释", async () => {
+	const { app, delegations, dir } = await makeStack();
+	const originalDir = path.join(dir, "original-pi-sessions");
+	const handle = makeWorkerSession(originalDir, dir);
+	// 当前 Agent 名称指向非 Pi Connector；旧委托仍以准入时的事实为准。
+	const d = await delegations.createDelegation({
+		cwdSnapshot: dir,
+		windowId: "w1",
+		managerSessionId: "s1",
+		agentId: "codex",
+		agentRevision: 0,
+		driverId: "pi",
+		workerSessionDir: originalDir,
+		operation: "run",
+	});
+	await delegations.updateDelegation(d.id, { sessionHandle: handle });
+	const info = await app.inject({ method: "GET", url: `/api/delegations/${d.id}/process` });
+	assert.equal(info.statusCode, 200, info.body);
+	assert.equal(info.json().view, "session");
+	const messages = await app.inject({ method: "GET", url: `/api/delegations/${d.id}/process/messages?scope=full` });
+	assert.equal(messages.statusCode, 200, messages.body);
+	assert.equal(messages.json().messages.length, 2);
 	await app.close();
 });
 
@@ -261,6 +286,66 @@ test("委托尚无 sessionHandle（worker 未启动）：messages 404", async ()
 	const res = await app.inject({ method: "GET", url: `/api/delegations/${d.id}/process/messages` });
 	assert.equal(res.statusCode, 404);
 	assert.deepEqual(res.json(), { error: "worker session not started" });
+	await app.close();
+});
+
+test("同一 Pi Session 续接时，单次消息端点不返回后续委托正文", async () => {
+	const { app, service, delegations, workerSessions, dir } = await makeStack();
+	const session = SessionManager.create(dir, workerSessions);
+	const first = await delegations.createDelegation({ cwdSnapshot: dir, windowId: "w1", managerSessionId: "s1", agentId: "pi-worker", agentRevision: 0, operation: "run" });
+	await delegations.updateDelegation(first.id, { sessionHandle: session.getSessionId() });
+	session.appendMessage({ role: "user", content: "第一次委托", timestamp: Math.max(Date.now(), Date.parse(first.createdAt)) } as never);
+	// 原生 SessionManager 直到首条 assistant 消息才建立可被 listAll() 发现的文件。
+	session.appendMessage({
+		role: "assistant",
+		content: [{ type: "text", text: "第一次回复" }],
+		api: "openai",
+		provider: "openai",
+		model: "fake",
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: "stop",
+		timestamp: Date.now(),
+	} as never);
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	const second = await delegations.createDelegation({ cwdSnapshot: dir, windowId: "w1", managerSessionId: "s1", agentId: "pi-worker", agentRevision: 0, operation: "continue" });
+	await delegations.updateDelegation(second.id, { sessionHandle: session.getSessionId() });
+	session.appendMessage({ role: "user", content: "第二次委托", timestamp: Math.max(Date.now(), Date.parse(second.createdAt)) } as never);
+	const firstScope = await app.inject({ method: "GET", url: `/api/delegations/${first.id}/process/messages?scope=delegation` });
+	const secondScope = await app.inject({ method: "GET", url: `/api/delegations/${second.id}/process/messages?scope=delegation` });
+	const full = await app.inject({ method: "GET", url: `/api/delegations/${first.id}/process/messages?scope=full` });
+	const defaultScope = await app.inject({ method: "GET", url: `/api/delegations/${first.id}/process/messages` });
+	const invalidScope = await app.inject({ method: "GET", url: `/api/delegations/${first.id}/process/messages?scope=unknown` });
+	const emptyScope = await app.inject({ method: "GET", url: `/api/delegations/${first.id}/process/messages?scope=` });
+	assert.equal(firstScope.statusCode, 200, firstScope.body);
+	assert.equal(secondScope.statusCode, 200, secondScope.body);
+	assert.deepEqual(defaultScope.json().messages, firstScope.json().messages, "缺省范围不得扩大到完整会话");
+	assert.equal(invalidScope.statusCode, 400, invalidScope.body);
+	assert.equal(emptyScope.statusCode, 400, emptyScope.body);
+	const messageTexts = (response: typeof firstScope) => (response.json().messages as Array<{ content: string | Array<{ type: string; text?: string }> }>).map((message) =>
+		typeof message.content === "string" ? message.content : message.content.filter((part) => part.type === "text").map((part) => part.text).join(""));
+	assert.deepEqual(messageTexts(firstScope), ["第一次委托", "第一次回复"]);
+	assert.deepEqual(messageTexts(secondScope), ["第二次委托"]);
+	assert.deepEqual(messageTexts(full), ["第一次委托", "第一次回复", "第二次委托"]);
+	const firstInfo = await service.resolve(first.id);
+	assert.ok(firstInfo);
+	assert.equal(await service.scopedMessages(firstInfo, [{ role: "user", content: "缺时间戳" }]), undefined, "不能把归属不明的消息报告为空历史");
+	assert.equal(await service.scopedMessages({ ...firstInfo, createdAt: second.createdAt }, []), undefined, "同毫秒的两次委托不能伪报为空历史");
+	const listDelegations = delegations.listDelegations.bind(delegations);
+	let releaseList!: () => void;
+	let enteredList!: () => void;
+	const listEntered = new Promise<void>((resolve) => { enteredList = resolve; });
+	const listPaused = new Promise<void>((resolve) => { releaseList = resolve; });
+	delegations.listDelegations = async (...args) => {
+		enteredList();
+		await listPaused;
+		return listDelegations(...args);
+	};
+	const liveLikeMessages = [{ role: "user", content: "请求开始时已有", timestamp: Date.parse(first.createdAt) }];
+	const pendingScope = service.scopedMessages(firstInfo, liveLikeMessages);
+	await listEntered;
+	liveLikeMessages.push({ role: "user", content: "索引读取期间追加", timestamp: Date.parse(first.createdAt) });
+	releaseList();
+	assert.deepEqual((await pendingScope)?.map((message) => (message as { content: string }).content), ["请求开始时已有"]);
 	await app.close();
 });
 

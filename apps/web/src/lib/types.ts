@@ -9,14 +9,53 @@ export interface SessionSummary {
 	active: boolean;
 }
 
+export interface ManagerWorkIndexItem {
+	sessionId: string;
+	title: string;
+	firstMessage: string;
+	workspaceId: string | null;
+	workspaceName: string;
+	modifiedAt: string;
+	active: boolean;
+}
+
 export interface ModelSummary {
 	/** Opaque reference: `${provider}/${modelId}` — pass back to set/create. */
 	id: string;
 	name: string;
 	provider: string;
 	reasoning?: boolean;
+	/** 该模型支持的 thinking 档位（归一化）；非推理模型为 ["off"]。 */
+	thinkingLevels?: string[];
+	/**
+	 * 档位是否真正分级。false 表示该模型只支持思考开/关——菜单上的多档在链路上
+	 * 无差别，UI 须如实告知，不能暗示强度刻度。
+	 */
+	thinkingGraded?: boolean;
 	contextWindow?: number;
 	maxTokens?: number;
+}
+
+/** 会话级 thinking level 取值域；与服务端归一化档位一致。 */
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/**
+ * 归一化档位的**唯一来源**（顺序即展示顺序）。与 `pi-ai` 的
+ * `EXTENDED_THINKING_LEVELS`、服务端 `teams.ts` 校验枚举、pi Connector
+ * `configSchema` enum 必须一致——历史上这几处各写一份且长度不一（Connector
+ * schema 少了 `max`），导致 manager 表单与 worker 表单给出不同选项。
+ *
+ * 某个模型**实际可选**的档位由 `ModelSummary.thinkingLevels` 决定（来自各模型
+ * `thinkingLevelMap`，并经平台能力表修正）；本数组只是「未选定模型 / 目录未就绪」
+ * 时的回退全集，不得当作某模型的能力声明。
+ */
+export const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/** 选定模型后的可选档位：目录命中用模型的 map，否则回退全集。 */
+export function thinkingLevelsFor(model: { thinkingLevels?: string[]; reasoning?: boolean } | undefined | null): string[] {
+	if (!model) return [...THINKING_LEVELS];
+	if (model.reasoning === false) return ["off"];
+	return model.thinkingLevels?.length ? [...model.thinkingLevels] : [...THINKING_LEVELS];
 }
 
 export interface ProviderSummary {
@@ -37,6 +76,7 @@ export interface ViewerIdentity {
 		id: string;
 		username: string;
 		displayName: string;
+		avatarVersion?: number;
 	};
 	tenant: {
 		id: string;
@@ -50,6 +90,7 @@ export interface CustomModelInput {
 	id: string;
 	name?: string;
 	reasoning?: boolean;
+	vision?: boolean;
 	contextWindow?: number;
 	maxTokens?: number;
 }
@@ -90,6 +131,7 @@ export interface PiUserMessage {
 	role: "user";
 	content: string | PiContentBlock[];
 	timestamp?: number;
+	puddingMessageId?: string;
 }
 
 /** pi assistant 消息上的逐轮用量（provider 返回、pi-ai 归一化）；cost 由 pi 按模型价目表换算。 */
@@ -106,6 +148,7 @@ export interface PiUsage {
 export interface PiAssistantMessage {
 	role: "assistant";
 	content: PiContentBlock[];
+	puddingMessageId?: string;
 	provider?: string;
 	model?: string;
 	stopReason?: string;
@@ -194,11 +237,14 @@ export interface ModelErrorPresentation {
 export interface ChatMessage {
 	id: string;
 	role: ChatMessageRole;
+	puddingMessageId?: string;
 	content: string;
 	thinking?: string;
 	toolCalls: ToolCallView[];
 	timestamp: number;
 	streaming: boolean;
+	/** Pi terminal marker; absent on a live history overlay that can still receive updates. */
+	piStopReason?: string;
 	error?: boolean;
 	/** User-facing provider failure copy, kept structured so retries can share one compact card. */
 	modelError?: ModelErrorPresentation;
@@ -248,6 +294,7 @@ export interface DriverConfigOption {
 	label: string;
 	description?: string;
 	isDefault?: boolean;
+	effortLevels?: string[];
 }
 
 export interface ConnectorContribution {
@@ -327,10 +374,12 @@ export interface ExtensionConnectionStatus {
 	version?: string;
 	accountName?: string;
 	identity?: string;
+	userAuthorization?: "authorized" | "expired" | "missing";
 	message?: string;
 	actions?: Array<{
 		id: string;
 		label: string;
+		kind?: "authorization";
 		description?: string;
 		confirmation?: {
 			title: string;
@@ -339,6 +388,15 @@ export interface ExtensionConnectionStatus {
 		};
 	}>;
 	checkedAt: string;
+}
+
+export interface ExtensionAuthorizationSession {
+	id: string;
+	state: "pending" | "completed" | "failed" | "expired" | "cancelled";
+	verificationUrl?: string;
+	qrCodeDataUrl?: string;
+	expiresAt: string;
+	message?: string;
 }
 
 /** Agent 的 Connector 绑定（§10）；secret 明文只进 CredentialsStore。 */
@@ -372,6 +430,12 @@ export interface PiManagerSettings {
 	noExtensions?: boolean;
 	thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 }
+
+/** Manager 键级更新：null 显式删除这两个可选运行设置。 */
+export type PiManagerSettingsPatch = Omit<Partial<PiManagerSettings>, "model" | "thinkingLevel"> & {
+	model?: string | null;
+	thinkingLevel?: PiManagerSettings["thinkingLevel"] | null;
+};
 
 export interface PiResourceConfig {
 	systemPrompt?: string;
@@ -470,6 +534,8 @@ export interface AgentResponsibilityProfile {
 }
 
 export interface AgentConfig {
+	/** Host-owned knowledge curator role; not an arbitrary user Agent classification. */
+	builtinId?: "wiki";
 	codeSearch?: "inherit" | "builtin" | "fff";
 	/** 不可变内部 id（委托工具名 agent_<id>__delegate、URL 参数、存储键）。创建后不可改。 */
 	name: string;
@@ -488,8 +554,10 @@ export interface AgentConfig {
 	responsibility?: AgentResponsibilityProfile;
 	/** Avatar file name under server `.teams/avatars/` (§11); absent = default. */
 	avatar?: string;
-	/** server 装饰字段：未上传头像但 connector 声明了包内默认头像（§11）。 */
+	/** server 装饰字段：存在宿主或 Connector 默认头像，上传后仍保留（§11）。 */
 	hasDefaultAvatar?: boolean;
+	/** 宿主默认头像资源版本，用于默认图片更新时自动绕过旧浏览器缓存。 */
+	defaultAvatarRevision?: string;
 	/** pinned 内置条目（manager）：不可删除、不可禁用。 */
 	pinned?: boolean;
 	/** manager 条目的可编辑配置（§10.5）。 */
@@ -621,13 +689,15 @@ export interface MutationResponse {
 	revision: number;
 	affectedSessions: AffectedSessions;
 	securityWarnings?: string[];
+	credentialsCleanup?: "pending";
+	commitState?: "committed_readback";
 }
 
 /** 启停/卸载 409 冲突里的进行中 Run 摘要。 */
 export interface ConflictRun {
 	delegationId: string;
 	agentId?: string;
-	status: string;
+	executionState: string;
 	windowId: string;
 	managerSessionId?: string;
 }
@@ -641,6 +711,8 @@ export interface RoomSession {
 	active: boolean;
 	/** 会话当前模型 ref（`${provider}/${modelId}`）；composer 选择器以此为准。 */
 	model?: string;
+	/** 会话当前 thinking level（§10.6），composer 思考强度选择器以此为准。 */
+	thinkingLevel?: string;
 }
 
 export type SessionWorkStatus = "active" | "resolved" | "cancelled" | "superseded";
@@ -963,6 +1035,13 @@ export interface RoomSummary {
 	name: string;
 	firstMessage: string;
 	modifiedAt: string;
+	/** Last durable business activity across all Sessions, independent of active Session. */
+	lastActivityAt: string | null;
+	lastMessagePreview: string;
+	activitySessionId: string | null;
+	activityRevision: number;
+	readRevision: number;
+	hasUnreadActivity: boolean;
 	members: AgentConfig[];
 	/** pi sessions belonging to this window (newest first). */
 	sessions: RoomSession[];

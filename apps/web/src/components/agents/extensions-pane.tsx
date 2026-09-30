@@ -20,6 +20,7 @@ import {
 	listExtensionConnections,
 	listMcpServers,
 	listSkillLibrary,
+	listTemplateLibrary,
 	pickWorkspaceDirectory,
 	runExtensionConnectionAction,
 	setDeveloperMode,
@@ -31,6 +32,8 @@ import { ClipboardSafeStreamdown } from "@/components/ai-elements/streamdown";
 import { ManagerAvatar, WorkerAvatar } from "@/components/chat/worker-avatar";
 import { SkillImportDialog } from "@/components/skills/skill-import-dialog";
 import { McpServersView } from "@/components/agents/mcp-servers-view";
+import { TemplateLibraryView } from "@/components/agents/template-library-view";
+import { ConnectionAuthorizationDialog } from "@/components/agents/connection-authorization-dialog";
 
 /**
  * Extension 接入目录（§10.1）：kind=connector 与 kind=capability 分开的目录
@@ -38,7 +41,8 @@ import { McpServersView } from "@/components/agents/mcp-servers-view";
  * 如实展示引用它的 agents / 进行中 runs。
  */
 
-type ExtensionView = "skills" | "mcp" | "plugins" | "connections";
+type ExtensionView = "skills" | "templates" | "mcp" | "plugins" | "connections";
+type PluginKindFilter = "all" | "connector" | "capability";
 
 type ExtensionTabCounts = Record<ExtensionView, number | null>;
 
@@ -51,7 +55,7 @@ function ManagedMcpPluginRow({ version }: { version: string | null }) {
 			<div className="ops-extension-icon capability"><PackageIcon className="size-5" /></div>
 			<div className="min-w-0">
 				<div className="flex min-w-0 items-baseline gap-2">
-					<div className="truncate text-sm font-semibold">MCP</div>
+					<div className="truncate text-sm font-medium">MCP</div>
 					<code className="truncate font-mono text-[11px] text-muted-foreground">pi-mcp-adapter</code>
 				</div>
 				<p className="mt-1 truncate text-xs text-muted-foreground">为 Pi Agent 提供 MCP Server 支持</p>
@@ -127,11 +131,17 @@ type ExtensionConnectionAction = NonNullable<ExtensionConnectionStatus["actions"
 function EntryCard({
 	entry,
 	connection,
+	catalogUnconfirmed,
+	connectionChecking,
+	connectionError,
 	onChanged,
 	onConnectionAction,
 }: {
 	entry: CatalogEntry;
 	connection?: ExtensionConnectionStatus;
+	catalogUnconfirmed: boolean;
+	connectionChecking: boolean;
+	connectionError: string | null;
 	onChanged: () => void;
 	onConnectionAction: (connection: ExtensionConnectionStatus, action: ExtensionConnectionAction) => void;
 }) {
@@ -144,6 +154,7 @@ function EntryCard({
 	const [confirmUninstall, setConfirmUninstall] = useState(false);
 	const [conflict, setConflict] = useState<{ message: string; agents: string[]; runs: ConflictRun[] } | null>(null);
 	const [busy, setBusy] = useState(false);
+	const busyRef = useRef(false);
 	const isLarkCli = manifest.kind === "capability" && manifest.capability.id === "lark-cli";
 	const description = manifest.kind === "connector"
 		? `连接 ${manifest.connector.displayName}，通过 ${manifest.connector.defaultTransport} 运行`
@@ -169,11 +180,13 @@ function EntryCard({
 	};
 
 	const handleUpdate = async () => {
+		if (catalogUnconfirmed || busyRef.current || (entry.origin === "user" && !updatePath.trim())) return;
+		busyRef.current = true;
 		setBusy(true);
 		try {
 			await updateExtension(manifest.id, {
 				...(updatePath.trim() ? { path: updatePath.trim() } : {}),
-				...(updatePin.trim() ? { versionPin: updatePin.trim() } : {}),
+				versionPin: updatePin.trim(),
 			});
 			toast.success(`「${manifest.id}」已更新`);
 			setUpdateOpen(false);
@@ -181,11 +194,14 @@ function EntryCard({
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
+			busyRef.current = false;
 			setBusy(false);
 		}
 	};
 
 	const handleUninstall = async () => {
+		if (catalogUnconfirmed || busyRef.current) return;
+		busyRef.current = true;
 		setBusy(true);
 		try {
 			await uninstallExtension(manifest.id);
@@ -200,6 +216,7 @@ function EntryCard({
 				toast.error(err instanceof Error ? err.message : String(err));
 			}
 		} finally {
+			busyRef.current = false;
 			setBusy(false);
 		}
 	};
@@ -212,7 +229,7 @@ function EntryCard({
 				</div>
 				<div className="min-w-0">
 					<div className="flex min-w-0 items-baseline gap-2">
-						<div className="truncate text-sm font-semibold">{manifest.displayName}</div>
+						<div className="truncate text-sm font-medium">{manifest.displayName}</div>
 						<code className="truncate font-mono text-[11px] text-muted-foreground">{manifest.id}</code>
 					</div>
 					<p className="mt-1 truncate text-xs text-muted-foreground" title={description}>{description}</p>
@@ -223,7 +240,7 @@ function EntryCard({
 				</div>
 				<div className="flex items-center gap-2">
 					{connection && cliInstallAction ? (
-						<Button type="button" size="sm" onClick={() => onConnectionAction(connection, cliInstallAction)}>
+						<Button type="button" size="sm" disabled={connectionChecking || Boolean(connectionError)} onClick={() => onConnectionAction(connection, cliInstallAction)}>
 							安装 CLI
 						</Button>
 					) : null}
@@ -271,9 +288,9 @@ function EntryCard({
 								<div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border/70 bg-muted/35 px-4 py-3">
 									<div className="min-w-0">
 										<div className="text-sm font-medium">{connection ? (connection.state === "unavailable" ? "尚未安装飞书 CLI" : `飞书 CLI ${connection.version ? `v${connection.version}` : "已安装"}`) : "正在检查飞书 CLI…"}</div>
-										<p className="mt-1 text-xs text-muted-foreground">{connection?.message ?? "探测只读取状态，不会自动安装或更新。"}</p>
+										<p className="mt-1 text-xs text-muted-foreground">{connectionError ? `连接检查失败：${connectionError}。请在「连接状态」重新检查。` : connectionChecking ? "正在重新检查连接状态…" : connection?.message ?? "探测只读取状态，不会自动安装或更新。"}</p>
 									</div>
-									{connection && cliInstallAction ? <Button type="button" size="sm" onClick={() => { setDetailsOpen(false); onConnectionAction(connection, cliInstallAction); }}>安装飞书 CLI</Button> : null}
+									{connection && cliInstallAction ? <Button type="button" size="sm" disabled={connectionChecking || Boolean(connectionError)} onClick={() => { setDetailsOpen(false); onConnectionAction(connection, cliInstallAction); }}>安装飞书 CLI</Button> : null}
 								</div>
 							</section>
 						) : null}
@@ -318,28 +335,28 @@ function EntryCard({
 
 					<DialogFooter className="extension-detail-footer">
 						<div>
-							{entry.origin === "local-link" || entry.origin === "user" ? <Button type="button" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => { setDetailsOpen(false); setConfirmUninstall(true); }}><TrashIcon className="size-3.5" />卸载</Button> : null}
+							{entry.origin === "local-link" || entry.origin === "user" ? <Button type="button" variant="ghost" className="text-destructive hover:text-destructive" disabled={catalogUnconfirmed} onClick={() => { setDetailsOpen(false); setConfirmUninstall(true); }}><TrashIcon className="size-3.5" />卸载</Button> : null}
 						</div>
 						<div className="extension-detail-actions">
-							{entry.origin === "local-link" || entry.origin === "user" ? <Button type="button" variant="outline" onClick={() => { setDetailsOpen(false); setUpdatePin(entry.versionPin ?? ""); setUpdateOpen(true); }}>更新</Button> : null}
+							{entry.origin === "local-link" || entry.origin === "user" ? <Button type="button" variant="outline" disabled={catalogUnconfirmed} onClick={() => { setDetailsOpen(false); setUpdatePath(""); setUpdatePin(entry.versionPin ?? ""); setUpdateOpen(true); }}>更新</Button> : null}
 							<Button type="button" variant="ghost" onClick={() => setDetailsOpen(false)}>关闭</Button>
-							<Button type="button" disabled={!entry.loaded} onClick={openAgentList}>去智能体绑定<ArrowRightIcon className="size-3.5" /></Button>
+							<Button type="button" disabled={!entry.loaded || catalogUnconfirmed} onClick={openAgentList}>去智能体绑定<ArrowRightIcon className="size-3.5" /></Button>
 						</div>
 					</DialogFooter>
 				</DialogContent>
 			</Dialog>
 
 			{/* 更新对话框 */}
-			<Dialog open={updateOpen} onOpenChange={setUpdateOpen}>
+			<Dialog open={updateOpen} onOpenChange={(open) => { if (!open && busyRef.current) return; setUpdateOpen(open); }}>
 				<DialogContent>
 					<DialogHeader>
 						<DialogTitle>更新「{manifest.id}」</DialogTitle>
 						<DialogDescription>
-							本地链接从原路径（或指定新路径）重读；用户包必须指定新来源目录重新复制。固定版本时新版本必须与 pin 一致。
+							本地链接可从原路径重读；用户包必须指定新来源目录重新复制。固定版本时新版本必须与 pin 一致，清空固定版本可解除限制。
 						</DialogDescription>
 					</DialogHeader>
 					<label className="flex flex-col gap-1 text-sm">
-						<span className="text-muted-foreground">扩展目录路径（留空 = 原安装路径）</span>
+							<span className="text-muted-foreground">扩展目录路径（{entry.origin === "user" ? "用户包更新必填" : "留空 = 原安装路径"}）</span>
 						<Input value={updatePath} onChange={(e) => setUpdatePath(e.target.value)} className="font-mono text-xs" />
 					</label>
 					<label className="flex flex-col gap-1 text-sm">
@@ -347,10 +364,10 @@ function EntryCard({
 						<Input value={updatePin} onChange={(e) => setUpdatePin(e.target.value)} placeholder="如 0.9.1" className="font-mono text-xs" />
 					</label>
 					<DialogFooter>
-						<Button type="button" variant="ghost" onClick={() => setUpdateOpen(false)}>
+						<Button type="button" variant="ghost" disabled={busy} onClick={() => setUpdateOpen(false)}>
 							取消
 						</Button>
-						<Button type="button" disabled={busy} onClick={() => void handleUpdate()}>
+						<Button type="button" disabled={busy || catalogUnconfirmed || (entry.origin === "user" && !updatePath.trim())} onClick={() => void handleUpdate()}>
 							{busy ? <LoaderIcon className="size-3.5 animate-spin" /> : null}
 							更新
 						</Button>
@@ -359,7 +376,7 @@ function EntryCard({
 			</Dialog>
 
 			{/* 卸载确认 */}
-			<Dialog open={confirmUninstall} onOpenChange={setConfirmUninstall}>
+			<Dialog open={confirmUninstall} onOpenChange={(open) => { if (!open && busyRef.current) return; setConfirmUninstall(open); }}>
 				<DialogContent>
 					<DialogHeader>
 						<DialogTitle>卸载「{manifest.id}」</DialogTitle>
@@ -368,10 +385,10 @@ function EntryCard({
 						</DialogDescription>
 					</DialogHeader>
 					<DialogFooter>
-						<Button type="button" variant="ghost" onClick={() => setConfirmUninstall(false)}>
+						<Button type="button" variant="ghost" disabled={busy} onClick={() => setConfirmUninstall(false)}>
 							取消
 						</Button>
-						<Button type="button" variant="destructive" disabled={busy} onClick={() => void handleUninstall()}>
+						<Button type="button" variant="destructive" disabled={busy || catalogUnconfirmed} onClick={() => void handleUninstall()}>
 							卸载
 						</Button>
 					</DialogFooter>
@@ -400,7 +417,7 @@ function EntryCard({
 							<span className="text-sm text-muted-foreground">进行中的 Run：</span>
 							{conflict.runs.map((run) => (
 								<div key={run.delegationId} className="font-mono text-xs text-muted-foreground">
-									{run.delegationId} · {run.agentId ?? "—"} · {run.status} · 窗口 {run.windowId}
+									{run.delegationId} · {run.agentId ?? "—"} · {run.executionState} · 窗口 {run.windowId}
 								</div>
 							))}
 						</div>
@@ -416,17 +433,20 @@ function EntryCard({
 	);
 }
 
-function SkillsLibraryView() {
+function SkillsLibraryView({ onCountChange, onLoadError, importOpen, setImportOpen }: { onCountChange: (count: number) => void; onLoadError: (message: string) => void; importOpen: boolean; setImportOpen: (open: boolean) => void }) {
 	const router = useRouter();
 	const [skills, setSkills] = useState<SkillEntry[] | null>(null);
+	const [loading, setLoading] = useState(true);
+	const [loadError, setLoadError] = useState<string | null>(null);
 	const [query, setQuery] = useState("");
 	const [importPath, setImportPath] = useState("");
-	const [importOpen, setImportOpen] = useState(false);
 	const [importing, setImporting] = useState(false);
 	const [previewSkill, setPreviewSkill] = useState<SkillEntry | null>(null);
 	const [previewDocument, setPreviewDocument] = useState<SkillDocument | null>(null);
 	const [previewAgents, setPreviewAgents] = useState<AgentConfig[] | null>(null);
+	const [previewAgentsError, setPreviewAgentsError] = useState<string | null>(null);
 	const [previewError, setPreviewError] = useState<string | null>(null);
+	const skillsRequest = useRef(0);
 	const previewRequest = useRef(0);
 	const filteredSkills = useMemo(() => {
 		if (!skills) return null;
@@ -437,17 +457,31 @@ function SkillsLibraryView() {
 	}, [query, skills]);
 
 	const refresh = useCallback(async () => {
+		const requestId = ++skillsRequest.current;
+		setLoading(true);
+		setLoadError(null);
 		try {
 			const { skills: nextSkills } = await listSkillLibrary();
+			if (requestId !== skillsRequest.current) return;
 			setSkills(nextSkills);
+			onCountChange(nextSkills.length);
 		} catch (err) {
-			toast.error(err instanceof Error ? err.message : String(err));
+			if (requestId !== skillsRequest.current) return;
+			const message = err instanceof Error ? err.message : String(err);
+			setLoadError(message);
+			onLoadError(message);
+		} finally {
+			if (requestId === skillsRequest.current) setLoading(false);
 		}
-	}, []);
+	}, [onCountChange, onLoadError]);
 
 	useEffect(() => {
 		const timer = window.setTimeout(() => void refresh(), 0);
-		return () => window.clearTimeout(timer);
+		return () => {
+			window.clearTimeout(timer);
+			skillsRequest.current += 1;
+			previewRequest.current += 1;
+		};
 	}, [refresh]);
 
 	const importSkill = async () => {
@@ -494,6 +528,7 @@ function SkillsLibraryView() {
 		setPreviewSkill(skill);
 		setPreviewDocument(null);
 		setPreviewAgents(null);
+		setPreviewAgentsError(null);
 		setPreviewError(null);
 		const [documentResult, agentsResult] = await Promise.allSettled([
 			getSkillResource(skill.name),
@@ -502,9 +537,8 @@ function SkillsLibraryView() {
 		if (requestId !== previewRequest.current) return;
 		if (documentResult.status === "fulfilled") setPreviewDocument(documentResult.value);
 		else setPreviewError(documentResult.reason instanceof Error ? documentResult.reason.message : String(documentResult.reason));
-		setPreviewAgents(agentsResult.status === "fulfilled"
-			? agentsResult.value.filter((agent) => agent.piResources?.enabledSkills?.includes(skill.name))
-			: []);
+		if (agentsResult.status === "fulfilled") setPreviewAgents(agentsResult.value.filter((agent) => agent.piResources?.enabledSkills?.includes(skill.name)));
+		else setPreviewAgentsError(agentsResult.reason instanceof Error ? agentsResult.reason.message : String(agentsResult.reason));
 	};
 
 	const closePreview = () => {
@@ -512,6 +546,7 @@ function SkillsLibraryView() {
 		setPreviewSkill(null);
 		setPreviewDocument(null);
 		setPreviewAgents(null);
+		setPreviewAgentsError(null);
 		setPreviewError(null);
 	};
 
@@ -527,12 +562,18 @@ function SkillsLibraryView() {
 						<SearchIcon className="size-4" />
 						<Input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索 Skills" aria-label="搜索 Skills" />
 					</label>
-					<Button type="button" size="sm" onClick={() => setImportOpen(true)}><UploadIcon className="size-3.5" />导入 Skill</Button>
+					<Button type="button" size="sm" className="ops-library-import" onClick={() => setImportOpen(true)}><UploadIcon className="size-3.5" />导入 Skill</Button>
 				</div>
 			</div>
-			{skills === null ? (
+			{loadError ? (
+				<div role="alert" className="flex items-center justify-between gap-4 rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm">
+					<span>Skills 资源库读取失败：{loadError}{skills ? "；下方显示上次读取的结果。" : ""}</span>
+					<Button type="button" size="sm" variant="outline" disabled={loading} onClick={() => void refresh()}><RefreshCwIcon className="size-4" />重试</Button>
+				</div>
+			) : null}
+			{loading && skills === null ? (
 				<div className="flex items-center justify-center gap-2 pt-12 text-sm text-muted-foreground"><LoaderIcon className="size-4 animate-spin" />加载中…</div>
-			) : skills.length === 0 ? (
+			) : skills === null ? null : skills.length === 0 ? (
 				<div className="ops-empty-state"><div className="text-sm font-medium">资源库还没有 Skill</div><p className="mt-2 text-sm text-muted-foreground">导入包含 SKILL.md 的目录或 zip 文件后，会在这里统一查看。</p></div>
 			) : filteredSkills && filteredSkills.length === 0 ? (
 				<div className="ops-empty-state"><div className="text-sm font-medium">没有匹配的 Skill</div><p className="mt-2 text-sm text-muted-foreground">试试 Skill 名称或描述中的关键词。</p></div>
@@ -595,7 +636,9 @@ function SkillsLibraryView() {
 
 							<section className="skill-preview-aside-section">
 								<div className="skill-preview-aside-heading"><span className="skill-preview-aside-label">启用范围</span>{previewAgents !== null ? <span>{previewAgents.length} 个 Agent</span> : null}</div>
-								{previewAgents === null ? (
+								{previewAgentsError ? (
+									<p role="alert" className="skill-preview-aside-empty text-destructive">启用范围读取失败：{previewAgentsError}</p>
+								) : previewAgents === null ? (
 									<div className="skill-preview-agent-loading"><LoaderIcon className="size-3.5 animate-spin" />正在检查…</div>
 								) : previewAgents.length > 0 ? (
 									<div className="skill-preview-agent-list">{previewAgents.map((agent) => <div key={agent.name} className="skill-preview-agent"><span>{agent.pinned ? <ManagerAvatar size={24} /> : <WorkerAvatar name={agent.name} size={24} />}</span><span className="truncate">{agentDisplayName(agent)}</span></div>)}</div>
@@ -661,11 +704,13 @@ const CONNECTION_STATE_META: Record<ExtensionConnectionStatus["state"], { label:
 function ConnectionsView({
 	connections,
 	loading,
+	error,
 	onRefresh,
 	onAction,
 }: {
 	connections: ExtensionConnectionStatus[] | null;
 	loading: boolean;
+	error: string | null;
 	onRefresh: () => void;
 	onAction: (connection: ExtensionConnectionStatus, action: ExtensionConnectionAction) => void;
 }) {
@@ -673,7 +718,7 @@ function ConnectionsView({
 		<div className="py-8">
 			<div className="mb-5 flex items-end justify-between gap-5">
 				<div>
-					<h2 className="text-base font-semibold tracking-tight">连接状态</h2>
+					<h2 className="text-base font-medium tracking-tight">连接状态</h2>
 					<p className="mt-1 text-xs text-muted-foreground">查看插件连接的外部系统与当前账号状态</p>
 				</div>
 				<Button type="button" size="sm" variant="outline" disabled={loading} onClick={onRefresh}>
@@ -682,17 +727,24 @@ function ConnectionsView({
 				</Button>
 			</div>
 
-			{connections === null ? (
+			{error ? (
+				<div role="alert" className="ops-empty-state mx-auto mt-16 max-w-xl">
+					<div className="text-sm font-medium">连接状态检查失败</div>
+					<p className="mt-2 text-sm text-muted-foreground">{error}{connections ? "。下方保留上次检查结果；请重新检查后再操作。" : ""}</p>
+					<Button type="button" size="sm" variant="outline" className="mt-4" disabled={loading} onClick={onRefresh}>重新检查</Button>
+				</div>
+			) : null}
+			{connections === null && !error ? (
 				<div className="flex items-center justify-center gap-2 pt-20 text-sm text-muted-foreground">
 					<LoaderIcon className="size-4 animate-spin" />
 					正在检查连接…
 				</div>
-			) : connections.length === 0 ? (
+			) : connections?.length === 0 && !error ? (
 				<div className="ops-empty-state mx-auto mt-16 max-w-xl">
 					<div className="text-sm font-medium">还没有可检查的连接</div>
 					<p className="mt-2 text-sm text-muted-foreground">安装支持连接状态的插件后，会统一显示在这里。</p>
 				</div>
-			) : (
+			) : connections?.length ? (
 				<div className="grid gap-3 md:grid-cols-2">
 					{connections.map((connection) => {
 						const meta = CONNECTION_STATE_META[connection.state];
@@ -709,7 +761,7 @@ function ConnectionsView({
 									</div>
 									<div className="min-w-0 flex-1">
 										<div className="flex flex-wrap items-center gap-2">
-											<h3 className="text-sm font-semibold">{connection.name}</h3>
+											<h3 className="text-sm font-medium">{connection.name}</h3>
 											<span className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium ${meta.className}`}>
 												<span className={`size-1.5 rounded-full ${meta.dot}`} />
 												{statusLabel}
@@ -717,19 +769,20 @@ function ConnectionsView({
 										</div>
 										<p className="mt-1 text-xs text-muted-foreground">{connection.description ?? connection.extensionName}</p>
 									</div>
-									<span className="text-[11px] text-muted-foreground">{checkedLabel}</span>
+									<span className="text-[11px] text-muted-foreground">{error ? `上次检查：${checkedLabel}` : checkedLabel}</span>
 								</div>
 
 								<div className="mt-4 grid grid-cols-2 gap-3 border-t border-border/70 pt-4 xl:grid-cols-3">
 									<div><div className="text-[11px] text-muted-foreground">账号</div><div className="mt-1 text-sm font-medium">{connection.accountName ?? "—"}</div></div>
 									<div><div className="text-[11px] text-muted-foreground">身份</div><div className="mt-1 text-sm font-medium">{connection.identity ?? "—"}</div></div>
 									<div><div className="text-[11px] text-muted-foreground">CLI 版本</div><div className="mt-1 font-mono text-sm">{connection.version ? `v${connection.version}` : "—"}</div></div>
+									{connection.userAuthorization ? <div><div className="text-[11px] text-muted-foreground">用户授权</div><div className={`mt-1 text-sm font-medium ${connection.userAuthorization === "authorized" ? "text-emerald-700 dark:text-emerald-300" : "text-amber-700 dark:text-amber-300"}`}>{connection.userAuthorization === "authorized" ? "已授权" : connection.userAuthorization === "expired" ? "已过期" : "未授权"}</div></div> : null}
 								</div>
 								{connection.message ? <p className="mt-3 text-xs text-muted-foreground">{connection.message}</p> : null}
 								{connection.actions?.length ? (
 									<div className="mt-4 flex flex-wrap gap-2 border-t border-border/70 pt-4">
 										{connection.actions.map((action) => (
-											<Button key={action.id} type="button" size="sm" onClick={() => onAction(connection, action)}>{action.label}</Button>
+											<Button key={action.id} type="button" size="sm" disabled={loading || Boolean(error)} onClick={() => onAction(connection, action)}>{action.label}</Button>
 										))}
 									</div>
 								) : null}
@@ -737,52 +790,91 @@ function ConnectionsView({
 						);
 					})}
 				</div>
-			)}
+			) : null}
 		</div>
 	);
 }
 
 export function ExtensionsPane() {
-	// tab 由 URL 查询参数驱动（/extensions?tab=skills|mcp|plugins|connections）：刷新、
-	// 浏览器前进/后退都保持当前分类；静态导出不能用动态段，与
+	// tab 由 URL 查询参数驱动（/extensions?tab=skills|templates|mcp|plugins|connections）：刷新、
+	// 浏览器前进/后退都保持当前分类；无参数时按冻结原型进入 Skills。
+	// 静态导出不能用动态段，与
 	// /agents/config?name= 同一约定。
 	const searchParams = useSearchParams();
 	const router = useRouter();
 	const pathname = usePathname();
 	const rawTab = searchParams.get("tab");
-	const view: ExtensionView = rawTab === "skills" || rawTab === "mcp" || rawTab === "plugins" || rawTab === "connections" ? rawTab : "plugins";
-	const setView = (key: ExtensionView) => router.replace(`${pathname}?tab=${key}`, { scroll: false });
+	const view: ExtensionView = rawTab === "skills" || rawTab === "templates" || rawTab === "mcp" || rawTab === "plugins" || rawTab === "connections" ? rawTab : "skills";
+	const setView = (key: ExtensionView) => {
+		if (key !== view) router.push(`${pathname}?tab=${key}`, { scroll: false });
+	};
 	const [entries, setEntries] = useState<CatalogEntry[] | null>(null);
+	const [pluginError, setPluginError] = useState<string | null>(null);
+	const pluginRequestId = useRef(0);
+	const [skillsError, setSkillsError] = useState<string | null>(null);
+	const skillsViewLoaded = useRef(false);
+	const [templatesError, setTemplatesError] = useState<string | null>(null);
+	const templatesViewLoaded = useRef(false);
 	const [mcpAdapterVersion, setMcpAdapterVersion] = useState<string | null>(null);
+	const [mcpError, setMcpError] = useState<string | null>(null);
+	const mcpViewLoaded = useRef(false);
 	const [query, setQuery] = useState("");
+	const [pluginKind, setPluginKind] = useState<PluginKindFilter>("all");
 	const [installPath, setInstallPath] = useState("");
 	const [installPin, setInstallPin] = useState("");
 	const [installCopy, setInstallCopy] = useState(false);
 	const [installing, setInstalling] = useState(false);
+	const installingRef = useRef(false);
 	const [installOpen, setInstallOpen] = useState(false);
 	const [developerMode, setDeveloperModeState] = useState(false);
 	const [developerModeLoaded, setDeveloperModeLoaded] = useState(false);
 	const [developerWarningOpen, setDeveloperWarningOpen] = useState(false);
+	const [importOpen, setImportOpen] = useState(false);
 	// 慢接口（尤其连接探测）完成前优先展示上次已知数量，避免刷新时徽标
 	// 消失和 Tab 文案位移。首次无缓存时仍保留一个固定尺寸的加载徽标。
 	const [tabCounts, setTabCounts] = useState<ExtensionTabCounts>({
 		skills: null,
+		templates: null,
 		mcp: null,
 		plugins: null,
 		connections: null,
 	});
 	const [connections, setConnections] = useState<ExtensionConnectionStatus[] | null>(null);
 	const [connectionsLoading, setConnectionsLoading] = useState(false);
+	const [connectionsError, setConnectionsError] = useState<string | null>(null);
+	const connectionsRequestId = useRef(0);
 	const [pendingConnectionAction, setPendingConnectionAction] = useState<{
 		connection: ExtensionConnectionStatus;
 		action: ExtensionConnectionAction;
 	} | null>(null);
 	const [connectionActionBusy, setConnectionActionBusy] = useState(false);
+	const [authorizationAction, setAuthorizationAction] = useState<{ connection: ExtensionConnectionStatus; actionId: string } | null>(null);
+	const onConnectionAction = (connection: ExtensionConnectionStatus, action: ExtensionConnectionAction) => {
+		if (action.kind === "authorization") setAuthorizationAction({ connection, actionId: action.id });
+		else setPendingConnectionAction({ connection, action });
+	};
 	const updateTabCount = useCallback((key: ExtensionView, value: number) => {
 		setTabCounts((current) => current[key] === value ? current : { ...current, [key]: value });
 		persistTabCount(key, value);
 	}, []);
-	const updateMcpCount = useCallback((count: number) => updateTabCount("mcp", count), [updateTabCount]);
+	const updateMcpCount = useCallback((count: number) => {
+		mcpViewLoaded.current = true;
+		setMcpError(null);
+		updateTabCount("mcp", count);
+	}, [updateTabCount]);
+	const reportMcpError = useCallback((message: string) => setMcpError(message), []);
+	const updateSkillsCount = useCallback((count: number) => {
+		skillsViewLoaded.current = true;
+		setSkillsError(null);
+		updateTabCount("skills", count);
+	}, [updateTabCount]);
+	const reportSkillsError = useCallback((message: string) => setSkillsError(message), []);
+	const updateTemplatesCount = useCallback((count: number) => {
+		templatesViewLoaded.current = true;
+		setTemplatesError(null);
+		updateTabCount("templates", count);
+	}, [updateTabCount]);
+	const reportTemplatesError = useCallback((message: string) => setTemplatesError(message), []);
 
 	// 静态预渲染的首个 state 不含 localStorage；hydration 会复用它而不会重跑
 	// lazy initializer。绘制前补入缓存，避免用户看到一段时间的空计数。
@@ -791,7 +883,7 @@ export function ExtensionsPane() {
 		setTabCounts((current) => {
 			const next = { ...current };
 			let changed = false;
-			for (const key of ["skills", "mcp", "plugins", "connections"] as const) {
+			for (const key of ["skills", "templates", "mcp", "plugins", "connections"] as const) {
 				if (next[key] === null && cached[key] !== undefined) {
 					next[key] = cached[key]!;
 					changed = true;
@@ -803,45 +895,66 @@ export function ExtensionsPane() {
 	const filteredEntries = useMemo(() => {
 		if (!entries) return null;
 		const needle = query.trim().toLowerCase();
-		if (!needle) return entries;
 		return entries.filter((entry) => {
+			if (pluginKind !== "all" && entry.manifest.kind !== pluginKind) return false;
+			if (!needle) return true;
 			const contribution = entry.manifest.kind === "connector" ? entry.manifest.connector : entry.manifest.capability;
 			return [entry.manifest.displayName, entry.manifest.id, contribution.displayName, contribution.id]
 				.some((value) => value.toLowerCase().includes(needle));
 		});
-	}, [entries, query]);
+	}, [entries, pluginKind, query]);
 	const mcpAdapterMatches = useMemo(() => {
 		const needle = query.trim().toLowerCase();
 		return !needle || ["mcp", "pi-mcp-adapter", "mcp server"].some((value) => value.includes(needle));
 	}, [query]);
+	const showMcpAdapter = pluginKind !== "connector" && mcpAdapterMatches;
 
 	const refreshPlugins = useCallback(() => {
-		Promise.all([listExtensionCatalog("connector"), listExtensionCatalog("capability")])
-			.then(([connectors, capabilities]) => {
-				const nextEntries = [...connectors, ...capabilities];
-				setEntries(nextEntries);
-				updateTabCount("plugins", nextEntries.length + 1);
-			})
-			.catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)));
+		const requestId = ++pluginRequestId.current;
+		void Promise.allSettled([listExtensionCatalog("connector"), listExtensionCatalog("capability")])
+			.then(([connectorResult, capabilityResult]) => {
+				if (requestId !== pluginRequestId.current) return;
+				const failures = [
+					...(connectorResult.status === "rejected" ? [`Connector：${connectorResult.reason instanceof Error ? connectorResult.reason.message : String(connectorResult.reason)}`] : []),
+					...(capabilityResult.status === "rejected" ? [`Capability：${capabilityResult.reason instanceof Error ? capabilityResult.reason.message : String(capabilityResult.reason)}`] : []),
+				];
+				setEntries((current) => connectorResult.status === "rejected" && capabilityResult.status === "rejected" && current === null ? null : [
+					...(connectorResult.status === "fulfilled" ? connectorResult.value : current?.filter((entry) => entry.manifest.kind === "connector") ?? []),
+					...(capabilityResult.status === "fulfilled" ? capabilityResult.value : current?.filter((entry) => entry.manifest.kind === "capability") ?? []),
+				]);
+				setPluginError(failures.length ? failures.join("；") : null);
+				if (connectorResult.status === "fulfilled" && capabilityResult.status === "fulfilled") updateTabCount("plugins", connectorResult.value.length + capabilityResult.value.length + 1);
+				else setTabCounts((current) => ({ ...current, plugins: null }));
+			});
 	}, [updateTabCount]);
 
 	const refreshConnections = useCallback(() => {
+		const requestId = ++connectionsRequestId.current;
 		setConnectionsLoading(true);
+		setConnectionsError(null);
 		listExtensionConnections()
 			.then((nextConnections) => {
+				if (requestId !== connectionsRequestId.current) return;
 				setConnections(nextConnections);
+				setConnectionsError(null);
 				updateTabCount("connections", nextConnections.length);
 			})
 			.catch((err: unknown) => {
-				setConnections([]);
-				updateTabCount("connections", 0);
-				toast.error(err instanceof Error ? err.message : String(err));
+				if (requestId !== connectionsRequestId.current) return;
+				setConnectionsError(err instanceof Error ? err.message : String(err));
+				setTabCounts((current) => ({ ...current, connections: null }));
 			})
-			.finally(() => setConnectionsLoading(false));
+			.finally(() => { if (requestId === connectionsRequestId.current) setConnectionsLoading(false); });
 	}, [updateTabCount]);
 
 	const executeConnectionAction = async () => {
 		if (!pendingConnectionAction) return;
+		if (connectionsLoading || connectionsError) {
+			toast.error("连接状态尚未确认，请重新检查后再执行操作");
+			return;
+		}
+		connectionsRequestId.current += 1;
+		setConnectionsLoading(false);
 		setConnectionActionBusy(true);
 		try {
 			const updated = await runExtensionConnectionAction(
@@ -849,6 +962,7 @@ export function ExtensionsPane() {
 				pendingConnectionAction.action.id,
 			);
 			setConnections((current) => current?.map((item) => item.id === updated.id ? updated : item) ?? [updated]);
+			setConnectionsError(null);
 			toast.success(`${pendingConnectionAction.action.label}已完成`);
 			setPendingConnectionAction(null);
 		} catch (err) {
@@ -864,28 +978,54 @@ export function ExtensionsPane() {
 		void refreshPlugins();
 		listMcpServers()
 			.then((catalog) => {
-				setMcpAdapterVersion(catalog.adapter.version);
-				updateTabCount("mcp", catalog.servers.length);
-			})
-			.catch(() => updateTabCount("mcp", 0));
-		listExtensionConnections()
-			.then((nextConnections) => {
-				setConnections(nextConnections);
-				updateTabCount("connections", nextConnections.length);
+				if (!mcpViewLoaded.current) {
+					setMcpAdapterVersion(catalog.adapter.version);
+					setMcpError(null);
+					updateTabCount("mcp", catalog.servers.length);
+				}
 			})
 			.catch((err: unknown) => {
-				setConnections([]);
-				updateTabCount("connections", 0);
-				toast.error(err instanceof Error ? err.message : String(err));
+				if (!mcpViewLoaded.current) {
+					setMcpError(err instanceof Error ? err.message : String(err));
+					setTabCounts((current) => ({ ...current, mcp: null }));
+				}
 			});
-	}, [refreshPlugins, updateTabCount]);
+		const connectionsTimer = setTimeout(refreshConnections, 0);
+		return () => clearTimeout(connectionsTimer);
+	}, [refreshPlugins, refreshConnections, updateTabCount]);
 
 	// 挂载即拉一次（tab 徽标要在进入 skills 视图前就有数），此后每次
 	// 切到 skills 视图重新对齐。
 	useEffect(() => {
 		listSkillLibrary()
-			.then(({ skills }) => updateTabCount("skills", skills.length))
-			.catch(() => undefined);
+			.then(({ skills }) => {
+				if (!skillsViewLoaded.current) {
+					setSkillsError(null);
+					updateTabCount("skills", skills.length);
+				}
+			})
+			.catch((err: unknown) => {
+				if (!skillsViewLoaded.current) {
+					setSkillsError(err instanceof Error ? err.message : String(err));
+					setTabCounts((current) => ({ ...current, skills: null }));
+				}
+			});
+	}, [updateTabCount, view]);
+
+	useEffect(() => {
+		let active = true;
+		listTemplateLibrary().then(({ templates }) => {
+			if (active && !templatesViewLoaded.current) {
+				setTemplatesError(null);
+				updateTabCount("templates", templates.length);
+			}
+		}).catch((err: unknown) => {
+			if (active && !templatesViewLoaded.current) {
+				setTemplatesError(err instanceof Error ? err.message : String(err));
+				setTabCounts(current => ({ ...current, templates: null }));
+			}
+		});
+		return () => { active = false; };
 	}, [updateTabCount, view]);
 
 	useEffect(() => {
@@ -907,7 +1047,8 @@ export function ExtensionsPane() {
 	};
 
 	const handleInstall = async () => {
-		if (!installPath.trim()) return;
+		if (!installPath.trim() || pluginError || entries === null || installingRef.current) return;
+		installingRef.current = true;
 		setInstalling(true);
 		try {
 			const entry = await installExtension({
@@ -921,11 +1062,17 @@ export function ExtensionsPane() {
 			setInstallCopy(false);
 			setInstallOpen(false);
 			// 安装的 kind 由 manifest 决定；插件视图统一展示 Connector 与 Capability。
-			setView("plugins");
+			router.replace(`${pathname}?tab=plugins`, { scroll: false });
 			refreshPlugins();
 		} catch (err) {
-			toast.error(err instanceof Error ? err.message : String(err));
+			if (err instanceof TypeError) {
+				toast.warning("安装请求结果未确认；请先核对插件列表，再决定是否重试");
+				refreshPlugins();
+			} else {
+				toast.error(err instanceof Error ? err.message : String(err));
+			}
 		} finally {
+			installingRef.current = false;
 			setInstalling(false);
 		}
 	};
@@ -938,33 +1085,35 @@ export function ExtensionsPane() {
 					开发者模式已开启：本地插件代码与服务端同进程执行，拥有当前用户权限。
 				</div>
 			) : null}
-			<header className="ops-page-header">
+			<header className="ops-page-header ops-extensions-header">
 				<div>
 					<h1 className="ops-page-title">扩展</h1>
-					<p className="ops-page-subtitle">统一管理 Skills、MCP、插件和连接状态</p>
+					<p className="ops-page-subtitle">统一管理 Skills、提示词模板、MCP、插件和连接状态</p>
 				</div>
 				<div className="flex items-center gap-2">
 					<Button
 						type="button"
 						size="sm"
 						variant={developerMode ? "secondary" : "outline"}
-						disabled={!developerModeLoaded}
+						disabled={!developerModeLoaded || installing}
 						onClick={() => developerMode ? void applyDeveloperMode(false) : setDeveloperWarningOpen(true)}
 					>
 						<ShieldAlertIcon className="size-4" />
 						开发者模式{developerMode ? "：开" : "：关"}
 					</Button>
 					{developerMode && view === "plugins" ? (
-						<Button type="button" size="sm" onClick={() => setInstallOpen(true)}>
+						<Button type="button" size="sm" disabled={entries === null || Boolean(pluginError)} onClick={() => setInstallOpen(true)}>
 							<PackageIcon className="size-4" />
 							安装本地插件
 						</Button>
 					) : null}
+					{view === "skills" ? <Button type="button" size="sm" className="ops-mobile-skill-import" onClick={() => setImportOpen(true)}><UploadIcon className="size-3.5" />导入 Skill</Button> : null}
 				</div>
 			</header>
 			<nav className="ops-tabs px-7" role="tablist" aria-label="扩展类型">
 				{([
 					["skills", "Skills", "任务方法与工作流"],
+					["templates", "提示词模板", "可复用的提示词内容"],
 					["mcp", "MCP", "外部工具、数据与服务"],
 					["plugins", "插件", "连接插件与能力插件"],
 					["connections", "连接状态", "外部系统与账号登录状态"],
@@ -979,11 +1128,11 @@ export function ExtensionsPane() {
 					>
 						<span>{label}</span>
 						<span
-							className={`tab-count ${tabCounts[key] === null ? "is-loading" : ""}`}
+							className={`tab-count ${(key === "plugins" && pluginError) || (key === "connections" && connectionsError) || (key === "mcp" && mcpError) || (key === "skills" && skillsError) || (key === "templates" && templatesError) ? "text-destructive" : tabCounts[key] === null ? "is-loading" : ""}`}
 							data-count-key={key}
 							suppressHydrationWarning
 						>
-							{tabCounts[key]}
+							{(key === "plugins" && pluginError) || (key === "connections" && connectionsError) || (key === "mcp" && mcpError) || (key === "skills" && skillsError) || (key === "templates" && templatesError) ? "!" : tabCounts[key]}
 						</span>
 						<span className="sr-only">{description}</span>
 					</button>
@@ -991,16 +1140,25 @@ export function ExtensionsPane() {
 			</nav>
 			<div className="ops-page-scroll mx-auto w-full max-w-[1180px] flex-1 overflow-y-auto px-7 pb-10">
 				{view === "skills" ? (
-					<SkillsLibraryView />
+					<SkillsLibraryView onCountChange={updateSkillsCount} onLoadError={reportSkillsError} importOpen={importOpen} setImportOpen={setImportOpen} />
+				) : view === "templates" ? (
+					<TemplateLibraryView onCountChange={updateTemplatesCount} onLoadError={reportTemplatesError} />
 				) : view === "mcp" ? (
-					<McpServersView onCountChange={updateMcpCount} />
+					<McpServersView onCountChange={updateMcpCount} onLoadError={reportMcpError} />
 				) : view === "connections" ? (
 					<ConnectionsView
 						connections={connections}
 						loading={connectionsLoading}
+						error={connectionsError}
 						onRefresh={refreshConnections}
-						onAction={(connection, action) => setPendingConnectionAction({ connection, action })}
+						onAction={onConnectionAction}
 					/>
+				) : pluginError && entries === null ? (
+					<div role="alert" className="ops-empty-state mx-auto mt-16 max-w-xl">
+						<div className="text-sm font-medium">插件目录加载失败</div>
+						<p className="mt-2 text-sm text-muted-foreground">{pluginError}</p>
+						<Button type="button" size="sm" variant="outline" className="mt-4" onClick={refreshPlugins}><RefreshCwIcon className="size-4" />重新加载</Button>
+					</div>
 				) : entries === null ? (
 					<div className="flex items-center justify-center gap-2 pt-20 text-sm text-muted-foreground">
 						<LoaderIcon className="size-4 animate-spin" />
@@ -1008,23 +1166,34 @@ export function ExtensionsPane() {
 					</div>
 				) : (
 					<div className="py-8">
+						{pluginError ? <div role="alert" className="mb-5 rounded-xl border border-destructive/25 bg-destructive/5 p-4 text-xs text-destructive"><strong>插件目录不完整</strong><p className="mt-1">{pluginError}。下方可能包含上次成功读取的条目；重新加载确认前仅供查看。</p><Button type="button" size="sm" variant="outline" className="mt-3" onClick={refreshPlugins}><RefreshCwIcon className="size-3.5" />重新加载</Button></div> : null}
 						<div className="mb-5 flex items-end justify-between gap-5">
-							<div><h2 className="text-base font-semibold tracking-tight">插件</h2><p className="mt-1 text-xs text-muted-foreground">扩充智能体的连接方式与运行能力</p></div>
+							<div><h2 className="text-base font-medium tracking-tight">插件</h2><p className="mt-1 text-xs text-muted-foreground">扩充智能体的连接方式与运行能力</p></div>
 							<label className="ops-extension-search"><SearchIcon className="size-4" /><Input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索插件" aria-label="搜索插件" /></label>
 						</div>
-						{mcpAdapterMatches || (filteredEntries && filteredEntries.length > 0) ? <div className="ops-extension-list">
-							{mcpAdapterMatches ? <ManagedMcpPluginRow version={mcpAdapterVersion} /> : null}
+						<div className="ops-plugin-filters" role="group" aria-label="插件类型">
+							{([ ["all", "全部"], ["connector", "连接插件"], ["capability", "能力插件"] ] as const).map(([kind, label]) => (
+								<button key={kind} type="button" className="ops-plugin-filter" aria-pressed={pluginKind === kind} onClick={() => setPluginKind(kind)}>{label}</button>
+							))}
+						</div>
+						{showMcpAdapter || (filteredEntries && filteredEntries.length > 0) ? <div className="ops-extension-list">
+							{showMcpAdapter ? <ManagedMcpPluginRow version={mcpAdapterVersion} /> : null}
 							{(filteredEntries ?? []).map((entry) => <EntryCard
 								key={entry.manifest.id}
 								entry={entry}
+								catalogUnconfirmed={Boolean(pluginError)}
 								connection={connections?.find((connection) => connection.extensionId === entry.manifest.id)}
+								connectionChecking={connectionsLoading}
+								connectionError={connectionsError}
 								onChanged={refreshPlugins}
-								onConnectionAction={(connection, action) => setPendingConnectionAction({ connection, action })}
+								onConnectionAction={onConnectionAction}
 							/>)}
 						</div> : <div className="ops-empty-state"><div className="text-sm font-medium">没有匹配的插件</div><p className="mt-2 text-sm text-muted-foreground">试试插件名称、标识或能力名称。</p></div>}
 					</div>
 				)}
 			</div>
+
+			{authorizationAction ? <ConnectionAuthorizationDialog connection={authorizationAction.connection} actionId={authorizationAction.actionId} onClose={() => setAuthorizationAction(null)} onCompleted={refreshConnections} /> : null}
 
 			<Dialog
 				open={pendingConnectionAction !== null}
@@ -1045,7 +1214,7 @@ export function ExtensionsPane() {
 					) : null}
 					<DialogFooter>
 						<Button type="button" variant="ghost" disabled={connectionActionBusy} onClick={() => setPendingConnectionAction(null)}>取消</Button>
-						<Button type="button" disabled={connectionActionBusy} onClick={() => void executeConnectionAction()}>
+						<Button type="button" disabled={connectionActionBusy || connectionsLoading || Boolean(connectionsError)} onClick={() => void executeConnectionAction()}>
 							{connectionActionBusy ? <LoaderIcon className="size-3.5 animate-spin" /> : null}
 							{connectionActionBusy ? "正在安装" : pendingConnectionAction?.action.confirmation?.confirmLabel ?? "继续"}
 						</Button>
@@ -1054,7 +1223,7 @@ export function ExtensionsPane() {
 			</Dialog>
 
 			{/* 安装对话框：从本地目录读取 pudding-extension.json */}
-			<Dialog open={installOpen} onOpenChange={setInstallOpen}>
+			<Dialog open={installOpen} onOpenChange={(open) => { if (!open && installingRef.current) return; setInstallOpen(open); }}>
 				<DialogContent>
 					<DialogHeader>
 						<DialogTitle>安装插件</DialogTitle>
@@ -1066,21 +1235,22 @@ export function ExtensionsPane() {
 						<span className="text-muted-foreground">插件目录路径（服务端本机路径）</span>
 						<Input
 							value={installPath}
+							disabled={installing}
 							onChange={(e) => setInstallPath(e.target.value)}
 							placeholder="/abs/path/to/extension"
 							className="font-mono text-xs"
 						/>
 					</label>
 					<label className="flex items-center gap-2 text-sm">
-						<input type="checkbox" checked={installCopy} onChange={(e) => setInstallCopy(e.target.checked)} />
+						<input type="checkbox" checked={installCopy} disabled={installing} onChange={(e) => setInstallCopy(e.target.checked)} />
 						<span className="text-muted-foreground">复制安装（用户包，不随源目录变化）</span>
 					</label>
 					<label className="flex flex-col gap-1 text-sm">
 						<span className="text-muted-foreground">固定版本（可选）</span>
-						<Input value={installPin} onChange={(e) => setInstallPin(e.target.value)} placeholder="如 0.9.1" className="font-mono text-xs" />
+						<Input value={installPin} disabled={installing} onChange={(e) => setInstallPin(e.target.value)} placeholder="如 0.9.1" className="font-mono text-xs" />
 					</label>
 					<DialogFooter>
-						<Button type="button" variant="ghost" onClick={() => setInstallOpen(false)}>
+						<Button type="button" variant="ghost" disabled={installing} onClick={() => setInstallOpen(false)}>
 							取消
 						</Button>
 						<Button type="button" disabled={installing || !installPath.trim()} onClick={() => void handleInstall()}>

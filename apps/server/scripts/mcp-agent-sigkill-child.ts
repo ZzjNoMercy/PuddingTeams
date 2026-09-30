@@ -1,0 +1,27 @@
+import path from "node:path";
+import { CredentialsStore } from "../src/store/credentials.js";
+import { ExtensionMutationJournal } from "../src/store/extension-mutation-journal.js";
+import { McpServerStore } from "../src/store/mcp-servers.js";
+import { TeamsStore } from "../src/store/teams.js";
+import { ensurePaths, resolvePuddingTeamsPaths } from "../src/paths.js";
+
+const home = process.argv[2];
+if (!home) throw new Error("home required");
+const paths = resolvePuddingTeamsPaths({ PUDDINGTEAMS_HOME: home });
+await ensurePaths(paths);
+const credentials = new CredentialsStore(paths.secrets);
+await credentials.init();
+const mcpCredentials = new CredentialsStore(path.join(paths.secrets, "mcp"));
+await mcpCredentials.init();
+const mcpServers = new McpServerStore(paths.config, mcpCredentials);
+const teams = new TeamsStore({ state: paths.state, assets: paths.assets, managedWorkspaces: paths.managedWorkspaces }, paths.unscopedWorkspace, 900_000, credentials);
+await teams.init();
+await mcpServers.create({ id: "docs", displayName: "Old", definition: { command: "echo", env: { API_TOKEN: "${API_TOKEN}" } }, secrets: { API_TOKEN: "old-token" } });
+const agent = await teams.getAgent("pi-b");
+if (!agent) throw new Error("pi-b missing");
+await teams.setMcpServerIds("pi-b", ["docs"], agent.extensionRevision ?? 0);
+const journal = new ExtensionMutationJournal(path.join(paths.state, "mcp-mutation-pending.json"), "MCP");
+await journal.begin(["pi-b"]);
+await mcpServers.update("docs", { displayName: "New", definition: { command: "echo", env: { API_TOKEN: "${API_TOKEN}" } }, secrets: { API_TOKEN: "new-token" } });
+process.kill(process.pid, "SIGKILL");
+throw new Error("SIGKILL did not stop process");

@@ -136,6 +136,7 @@ function truncate(s: string, max: number): string {
 }
 
 export const CLAUDE_CODE_CAPABILITIES: DriverCapabilities = {
+	runtimeModel: { effortLevels: ["low", "medium", "high", "xhigh", "max"] },
 	operations: ["run", "continue", "cancel"],
 	interactionKinds: [],
 	progress: "stream",

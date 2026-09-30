@@ -8,8 +8,11 @@ import { config } from "./config.js";
 import { acquireLease, ensurePaths, puddingTeamsHomeId, resolvePuddingTeamsPaths } from "./paths.js";
 import { PiSessionStore } from "./pi-bridge/session-store.js";
 import { CredentialsStore } from "./store/credentials.js";
+import { WebResearchSettings, registerWebResearchSettingsRoutes, webResearchTarget } from "./network/web-research.js";
 import { TeamsStore } from "./store/teams.js";
+import { ExtensionMutationJournal } from "./store/extension-mutation-journal.js";
 import { registerChatRoutes } from "./routes/chat.js";
+import { ProviderDeletionCoordinator } from "./pi-bridge/provider-deletion.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
 import { registerIdentityRoutes } from "./routes/identity.js";
 import { registerProvidersRoutes } from "./routes/providers.js";
@@ -42,9 +45,47 @@ import { DelegationTimelineStore } from "./agent-runtime/delegation-timeline-sto
 import { WorkspaceExecutionCoordinator } from "./agent-runtime/workspace-execution.js";
 import { UploadStore } from "./store/uploads.js";
 import { configureSharedModelRuntime } from "./pi-bridge/model-runtime.js";
+import { applyThinkingCapabilityOverrides } from "./pi-bridge/custom-providers.js";
+import { toModelOverrideEntries } from "./pi-bridge/thinking-capabilities.js";
 import { verifyWorkItemSubmission } from "./pi-bridge/agent-extensions.js";
 import { registerWebStatic } from "./web-static.js";
 import { McpServerStore } from "./store/mcp-servers.js";
+import { MessageSubmissionOperations } from "./store/message-submission-operations.js";
+import { KnowledgeBindingRegistry } from "./knowledge/bindings.js";
+import { KnowledgeAcceptanceStore } from "./knowledge/acceptance.js";
+import { KnowledgeObjectStore } from "./knowledge/objects.js";
+import { KnowledgeObservationService } from "./knowledge/observation.js";
+import { KnowledgeSearchIndex } from "./knowledge/search-index.js";
+import { KnowledgeProbeStore } from "./knowledge/probes.js";
+import { KnowledgePlanStore } from "./knowledge/plans.js";
+import { CompileJobStore } from "./knowledge/compile-jobs.js";
+import { createCompileAdmission } from "./knowledge/compile-admission.js";
+import { syncCandidateBatches } from "./knowledge/wiki/candidate-sync.js";
+import { ReviewStore } from "./knowledge/wiki/review-store.js";
+import { PublishJournal } from "./knowledge/wiki/publish-journal.js";
+import { MarkdownWikiPublisher } from "./knowledge/wiki/publisher-markdown.js";
+import { ContactsProjection } from "./knowledge/contacts.js";
+import { registerContactsRoutes } from "./routes/contacts.js";
+import { registerKnowledgeRoutes } from "./routes/knowledge.js";
+import { MemorySetupService } from "./knowledge/memory-setup.js";
+import { registerCalendarRoutes } from "./routes/calendar.js";
+import { CalendarStore } from "./calendar/store.js";
+import { registerWikiRoutes, resolveCodexCompileCommand } from "./routes/wiki.js";
+import { localViewerIdentity } from "./routes/identity.js";
+import { KnowledgeSelectionStore } from "./knowledge/selections.js";
+import { KnowledgeRuntimeService } from "./knowledge/runtime-service.js";
+import { CuratorJobStore, WikiCuratorService } from "./knowledge/curator-jobs.js";
+import { KnowledgeSourceStore } from "./knowledge/sources.js";
+import { ChatKnowledgeIntake } from "./knowledge/chat-intake.js";
+import { directTaskId } from "./agent-runtime/direct-dispatch.js";
+import { registerWikiCuratorRoutes } from "./routes/wiki-curator.js";
+import { ReadLaterStore } from "./read-later/store.js";
+import { ReadLaterCaptureService } from "./read-later/capture-service.js";
+import { ReadLaterPromoter } from "./read-later/promote.js";
+import { withReadLater } from "./read-later/tool.js";
+import { registerReadLaterRoutes } from "./routes/read-later.js";
+import { WikiRevisionService } from "./knowledge/wiki/revision-service.js";
+import { KnowledgeHistoryStore } from "./knowledge/history-store.js";
 
 // Electron 只需要该变量让自身二进制以 Node 模式启动 server。进入 server 后
 // 立即删除，避免 Connector/Worker 子进程继续继承 Electron 专用开关。
@@ -84,9 +125,21 @@ await credentials.init();
 const mcpCredentials = new CredentialsStore(path.join(paths.secrets, "mcp"));
 await mcpCredentials.init();
 const mcpServers = new McpServerStore(paths.config, mcpCredentials);
+await mcpServers.recoverSecretTransaction();
 // Provider key 与 pi CLI 解耦（§10.6）：平台凭证落到 <home>/secrets/auth.json，
 // 不读写 pi 全局 agentDir 的 auth.json。必须先于任何 sharedModelRuntime 使用。
 configureSharedModelRuntime({ authPath: path.join(paths.secrets, "auth.json") });
+// 思考强度能力补丁：把平台声明的 modelOverrides 合入 pi 的 models.json 顶层覆盖层，
+// 修正上游目录与官方 API 文档不一致的模型（见 thinking-capabilities.ts）。必须先于
+// 任何 sharedModelRuntime 使用。写入失败不阻断启动——退回上游目录行为仍是可用的。
+try {
+	const patched = await applyThinkingCapabilityOverrides(toModelOverrideEntries());
+	if (patched.changed > 0) {
+		console.warn(`[thinking] 已按平台能力声明修正 ${patched.changed} 个模型的思考强度目录项`);
+	}
+} catch (error) {
+	console.warn(`[thinking] 思考强度能力补丁未生效，将使用 pi 上游目录：${error instanceof Error ? error.message : String(error)}`);
+}
 const teams = new TeamsStore(
 	{
 		state: paths.state,
@@ -159,6 +212,52 @@ await extensionRegistry.installOrUpdateFromDir(path.join(REPO_CONNECTORS_DIR, "c
 await extensionRegistry.installOrUpdateFromDir(path.join(REPO_CONNECTORS_DIR, "claude-code"));
 await extensionRegistry.installOrUpdateFromDir(path.join(REPO_CAPABILITIES_DIR, "lark-cli"));
 const capabilityStateRoot = path.join(paths.secrets, "capabilities");
+const compileJobs = new CompileJobStore(paths.knowledgeState);
+const reviewStore = new ReviewStore(paths.knowledgeReviews);
+const knowledgeRegistry = new KnowledgeBindingRegistry(paths.knowledgeState);
+const knowledgeObjects = new KnowledgeObjectStore(paths.knowledgeObjects);
+const knowledgeHistory = new KnowledgeHistoryStore(paths.knowledgeState);
+const knowledgeAcceptance = new KnowledgeAcceptanceStore(paths.knowledgeAcceptance, knowledgeHistory);
+await knowledgeAcceptance.recoverHistory();
+const publishJournal = new PublishJournal(paths.knowledgeOperations);
+const knowledgeSearchIndex = new KnowledgeSearchIndex(paths.knowledgeCache, knowledgeObjects);
+const knowledgeObservation = new KnowledgeObservationService(knowledgeAcceptance, { objects: knowledgeObjects, journal: publishJournal, searchIndex: knowledgeSearchIndex });
+const knowledgeProbes = new KnowledgeProbeStore();
+const knowledgePlans = new KnowledgePlanStore(paths.knowledgePlans);
+const memorySetup = new MemorySetupService(paths.knowledgeState, { registry: knowledgeRegistry,
+	probes: knowledgeProbes, plans: knowledgePlans, acceptance: knowledgeAcceptance, objects: knowledgeObjects });
+const knowledgeSelections = new KnowledgeSelectionStore(paths.knowledgeState, knowledgeRegistry, async (ownerId) => {
+	const memory = await memorySetup.status(ownerId);
+	return memory.status === "configured" ? [memory.binding.id] : [];
+});
+const knowledgeRuntime = new KnowledgeRuntimeService({ bindings: knowledgeRegistry, acceptance: knowledgeAcceptance,
+	objects: knowledgeObjects, observation: knowledgeObservation, selections: knowledgeSelections, teams, stateDir: paths.knowledgeState, cacheDir: paths.knowledgeCache });
+const curatorJobs = new CuratorJobStore(paths.knowledgeState);
+const knowledgeSources = new KnowledgeSourceStore({ stateDir: paths.knowledgeState, objects: knowledgeObjects });
+const chatKnowledgeIntakes = new ChatKnowledgeIntake({ stateDir: paths.knowledgeState, sources: knowledgeSources });
+const wikiCurator = new WikiCuratorService({ jobs: curatorJobs, bindings: knowledgeRegistry, acceptance: knowledgeAcceptance,
+	objects: knowledgeObjects, reviews: reviewStore, runtime: knowledgeRuntime, teams, cacheDir: paths.knowledgeCache, sources: knowledgeSources,
+	notify: async (job) => {
+		if (!job.origin || !await teams.contextForSession(job.origin.sessionId)) return;
+		await store.appendCustomMessageIfAbsent(job.origin.sessionId, `wiki-curator:${job.id}:${job.status}`, {
+			customType: "pudding:knowledge_job",
+			content: job.status === "pending_review" ? "知识库候选已生成，等待你审核；正式知识库尚未修改。" :
+				job.status === "no_changes" ? "知识整理完成，无需修改知识库。" : `知识整理需要处理：${job.failureCode ?? job.status}`,
+			details: { jobId: job.id, bindingId: job.targetBindingId, batchId: job.candidateBatchId, status: job.status },
+		}, { triggerTurn: false });
+	} });
+const wikiRevisions = new WikiRevisionService({ curator: wikiCurator, jobs: curatorJobs, reviews: reviewStore, bindings: knowledgeRegistry, objects: knowledgeObjects, publications: publishJournal });
+// T40/T42/T44：发布操作日志 + Markdown 发布器（检索索引为派生缓存，提前构造供发布回写后重建）。
+const wikiPublisher = new MarkdownWikiPublisher({
+	bindings: knowledgeRegistry,
+	reviews: reviewStore,
+	journal: publishJournal,
+	acceptance: knowledgeAcceptance,
+	observation: knowledgeObservation,
+	objects: knowledgeObjects,
+	searchIndex: knowledgeSearchIndex,
+	operationsDir: paths.knowledgeOperations,
+});
 const runtime: AgentRuntime = new AgentRuntime(
 	delegations,
 	interactionSecrets,
@@ -167,6 +266,8 @@ const runtime: AgentRuntime = new AgentRuntime(
 	artifacts,
 	delegationTimelines,
 	workspaceExecution,
+	createCompileAdmission({ jobs: compileJobs, bindings: knowledgeRegistry, acceptance: knowledgeAcceptance,
+		observation: knowledgeObservation, objects: knowledgeObjects, teams, extensions: extensionRegistry }),
 );
 runtime.setWorkspaceOwnerClosedResolver((owner) => isWorkspaceOwnerClosed(workStates, owner));
 const invoker = new AgentInvoker(
@@ -196,6 +297,52 @@ const store = new PiSessionStore(
 	fffStateRoot,
 	mcpServers,
 );
+store.setKnowledgeRuntime(knowledgeRuntime);
+const readLaterStore = new ReadLaterStore(path.join(paths.state, "read-later"));
+const readLaterCapture = new ReadLaterCaptureService(readLaterStore);
+const readLaterPromoter = new ReadLaterPromoter({ store: readLaterStore, capture: readLaterCapture, sources: knowledgeSources, curator: wikiCurator, bindings: knowledgeRegistry, teams });
+knowledgeRuntime.setChatIntake(async (session) => { await store.ensureSessionFile(session.sessionId); await chatKnowledgeIntakes.admitManager(session); },
+	(sessionId, prompt, images) => chatKnowledgeIntakes.observeExecution(sessionId, prompt, images));
+const webResearchCredentials = new CredentialsStore(path.join(paths.secrets, "web-research"));
+await webResearchCredentials.init();
+const webResearch = new WebResearchSettings(webResearchCredentials, async (provider) => {
+	const credential = await store.snapshotProviderCredential(provider === "grok" ? "xai" : provider) as { type?: string; key?: string } | undefined;
+	return credential?.type === "api_key" ? credential.key : undefined;
+}, undefined, {
+  targets: async () => (await teams.listAgents()).map(webResearchTarget),
+  onAccessChanged: () => store.markAllDirty(),
+});
+store.setWebResearchExtension(agentId => webResearch.extension(agentId));
+invoker.setWebResearchExtension(agentId => webResearch.extension(agentId), agentId => webResearch.accessFingerprint(agentId), agentId => webResearch.tools(agentId));
+invoker.setKnowledgeRuntime(async (agent, ctx, _message) => {
+	const delegation = ctx.delegationId ? await runtime.getDelegation(ctx.delegationId) : undefined;
+	const sessionId = delegation?.managerSessionId;
+	const surface = await knowledgeRuntime.forSession(sessionId ?? "");
+	const scope = sessionId ? await knowledgeRuntime.scopeForSession(sessionId) : undefined;
+	const memory = await memorySetup.status(localViewerIdentity().user.id);
+	const defaultMemory = memory.status === "configured" ? { bindingId: memory.binding.id, assertCurrent: async () => {
+		const current = await memorySetup.status(localViewerIdentity().user.id);
+		if (current.status !== "configured" || current.binding.id !== memory.binding.id) throw new Error("默认 memory 已变化，请重新开始本轮");
+	} } : undefined;
+	const curatedSurface = scope ? wikiCurator.workerSurface(surface, { ...scope, operationId: ctx.operationId ?? ctx.delegationId ?? scope.sessionId,
+		resolveSources: async () => chatKnowledgeIntakes.resolve(await store.open(scope.sessionId), scope.ownerId,
+			delegation?.operationId && delegation.managerToolCallId === directTaskId(delegation.operationId) ? { operationId: delegation.operationId } : { toolCallId: delegation?.managerToolCallId }) }, agent.builtinId, defaultMemory) : surface;
+	return agent.builtinId === "wiki" ? curatedSurface : withReadLater(curatedSurface, localViewerIdentity().user.id, readLaterStore, readLaterCapture);
+});
+const extensionMutationJournal = new ExtensionMutationJournal(path.join(paths.state, "extension-mutation-pending.json"));
+const recoveredExtensionAgents = await extensionMutationJournal.recover(async (name) => {
+	if (await teams.getAgent(name)) await teams.bumpAgentRevision(name);
+}, async () => { await store.syncAgentConfigChange(); });
+if (recoveredExtensionAgents.length > 0) app.log.warn({ agents: recoveredExtensionAgents }, "reconciled interrupted Extension mutation before opening routes");
+const mcpMutationJournal = new ExtensionMutationJournal(path.join(paths.state, "mcp-mutation-pending.json"), "MCP");
+const recoveredMcpAgents = await mcpMutationJournal.recover(async (name) => {
+	if (await teams.getAgent(name)) await teams.bumpAgentRevision(name);
+}, async () => { await store.syncAgentConfigChange(); });
+if (recoveredMcpAgents.length > 0) app.log.warn({ agents: recoveredMcpAgents }, "reconciled interrupted MCP mutation before opening routes");
+const recoveredRoomCreations = await teams.reconcileRoomCreations((id) => store.remove(id));
+if (recoveredRoomCreations.kept || recoveredRoomCreations.removed) {
+	app.log.info(recoveredRoomCreations, "reconciled pending room Session creations before opening routes");
+}
 invoker.setManagerSender((managerSessionId, message, options) =>
 	store.sendCustomMessage(managerSessionId, message, options),
 );
@@ -265,13 +412,13 @@ invoker.setReplacementWindowResolver(async (delegation, agent) => {
 	const window = await teams.ensureDirectWindow(
 		agent.name,
 		delegation.workspaceId,
-		() => store.create(undefined, {
+		(reservedId) => store.create(undefined, {
 			type: "direct",
 			members: [agent.name],
 			workspaceId: delegation.workspaceId,
 			cwd: delegation.cwdSnapshot,
-		}),
-		{ cwdSnapshot: delegation.cwdSnapshot },
+		}, reservedId),
+		{ cwdSnapshot: delegation.cwdSnapshot, requireEnabledMember: true, rollbackSession: (id) => store.remove(id), journalSession: true },
 	);
 	return window.id;
 });
@@ -307,6 +454,15 @@ invoker.setReplacementStateGuard(async (original, replacement, agent, replacemen
 // 已确认的本地中断补写 manager 会话——有真实工具调用的补合成 toolResult
 // （manager 下次运行能看到失败原因并重新决策）；direct 直派链路（
 // managerToolCallId 是 taskId、会话里没有 toolCall）改补一张失败结果卡。
+// A local compiler from a previous process must never retain authority to
+// promote its staging tree. Fence the durable Job before normal Run recovery.
+const interruptedCompileJobs = await compileJobs.failInterrupted();
+if (interruptedCompileJobs.length > 0) app.log.warn({ count: interruptedCompileJobs.length }, "fenced interrupted knowledge compile jobs");
+const syncedWikiCandidates = await syncCandidateBatches({ jobs: compileJobs, reviews: reviewStore });
+if (syncedWikiCandidates.unavailable.length > 0) app.log.warn(syncedWikiCandidates, "wiki candidate promotion requires repair");
+// 发布对账包含 approve 落账后、journal 创建前的崩溃空窗。
+const reconciledPublications = await wikiPublisher.reconcileInterrupted();
+if (reconciledPublications.length > 0) app.log.warn({ count: reconciledPublications.length }, "reconciled interrupted wiki publish operations");
 const reconciledOrphans = await runtime.reconcileOrphanedRuns(async (orphan, result) => {
 	await reconcileWorkAndScheduleVerification();
 	if (!orphan.managerToolCallId) return;
@@ -551,15 +707,22 @@ await teams.ensureSoloWindow(
 	},
 	async (id) => store.isOpen(id) || (await store.list()).some((s) => s.id === id),
 );
+const providerDeletion = new ProviderDeletionCoordinator(path.join(paths.secrets, "provider-deletion-journal.json"), store);
 await registerChatRoutes(app, store, teams, workStates, uploads, invoker, {
 	dataHomeId: puddingTeamsHomeId(paths.home),
-});
-registerIdentityRoutes(app);
+	...(process.env.PUDDINGTEAMS_RUN_ID ? { runId: process.env.PUDDINGTEAMS_RUN_ID } : {}),
+}, providerDeletion, new MessageSubmissionOperations(path.join(paths.state, "message-submission-operations")), chatKnowledgeIntakes);
+registerIdentityRoutes(app, localViewerIdentity, paths);
+registerWebResearchSettingsRoutes(app, webResearch);
+registerCalendarRoutes(app, new CalendarStore(paths.calendarState));
 await registerSettingsRoutes(app, defaultCwd, productSettings, workStates, (settings) => {
 	store.markAllDirty();
 	workspaceExecution.configure({ leaseTimeoutMs: settings.harness.workspaceExecution.leaseTimeoutMs });
+}, async (name) => {
+	const agent = await teams.getAgent(name);
+	return !!agent && !agent.pinned && agent.enabled !== false;
 });
-await registerProvidersRoutes(app, store);
+await registerProvidersRoutes(app, store, providerDeletion);
 await registerAgentsRoutes(app, teams, {
 	credentials,
 	runtime,
@@ -568,6 +731,7 @@ await registerAgentsRoutes(app, teams, {
 	sessions: store,
 	capabilityStateRoot,
 	mcpServers,
+	agentCreationStatePath: path.join(paths.state, "agent-creation-operations.json"),
 });
 await registerExtensionsRoutes(app, {
 	registry: extensionRegistry,
@@ -577,12 +741,63 @@ await registerExtensionsRoutes(app, {
 	settings: productSettings,
 	capabilityStateRoot,
 	mcpServers,
+	mutationJournal: extensionMutationJournal,
+	mcpMutationJournal,
 });
 registerResourcesRoutes(app);
 registerWorkspacesRoutes(app, teams.workspaces, undefined, store);
+// Teams 2.0 知识库 M2：绑定注册表 + 采纳账本 + 内容寻址快照库 + 观察服务 + 检索索引 + 接入探测/计划。
+registerContactsRoutes(app, new ContactsProjection({ bindings: knowledgeRegistry, objects: knowledgeObjects, acceptance: knowledgeAcceptance, observation: knowledgeObservation, searchIndex: knowledgeSearchIndex }));
+registerKnowledgeRoutes(app, knowledgeRegistry, {
+	memorySetup,
+	reviews: reviewStore,
+	objects: knowledgeObjects,
+	acceptance: knowledgeAcceptance,
+	observation: knowledgeObservation,
+	searchIndex: knowledgeSearchIndex,
+	probes: knowledgeProbes,
+	plans: knowledgePlans,
+	selections: knowledgeSelections,
+	history: knowledgeHistory,
+});
+// T30/T31 W1：知识库编译生产入口。取消复用 Runtime 的 Delegation 取消机制。
+registerWikiRoutes(app, {
+	jobs: compileJobs,
+	bindings: knowledgeRegistry,
+	acceptance: knowledgeAcceptance,
+	observation: knowledgeObservation,
+	objects: knowledgeObjects,
+	teams,
+	resolveDriver: (agentId) => invoker.driverFor(agentId),
+	attestCompiler: (driver) => extensionRegistry.attestBundledDriver("codex", driver),
+	resolveCommand: () => resolveCodexCompileCommand(),
+	runCompileJob: async (jobId) => {
+		const result = await runtime.runCompileJob(jobId);
+		const sync = await syncCandidateBatches({ jobs: compileJobs, reviews: reviewStore });
+		if (sync.unavailable.length > 0) app.log.warn(sync, "wiki candidate promotion requires repair");
+		return result;
+	},
+	cancelDelegation: (delegationId, ctx) => runtime.cancel(delegationId, ctx),
+	compileRoot: path.join(paths.knowledgeCache, "compile"),
+	reviews: reviewStore,
+	// T40/T42/T44：真发布挂载点（按 binding 串行，组提交后回写账本并重建索引）。
+	publisher: wikiPublisher,
+	publications: publishJournal,
+	revisions: wikiRevisions,
+});
+await knowledgeObservation.startAll(knowledgeRegistry, localViewerIdentity().user.id);
+registerWikiCuratorRoutes(app, { service: wikiCurator, jobs: curatorJobs, reviews: reviewStore, objects: knowledgeObjects, bindings: knowledgeRegistry, teams, revisions: wikiRevisions });
+registerReadLaterRoutes(app, { store: readLaterStore, capture: readLaterCapture, promoter: readLaterPromoter });
+app.addHook("onClose", async () => { await readLaterCapture.close(); });
+readLaterCapture.start();
+await wikiCurator.recover();
+await wikiRevisions.recover();
 await registerRoomsRoutes(app, store, teams, invoker, workStates, {
 	attachmentRoot: paths.uploads,
+	uploads,
 	productSettings,
+	activityStatePath: path.join(paths.state, "room-activity.json"),
+	sessionCreationStatePath: path.join(paths.state, "session-creation-operations.json"),
 });
 await registerInteractionsRoutes(app, runtime, invoker, teams, workStates);
 registerArtifactsRoutes(app, artifacts);
@@ -590,6 +805,7 @@ registerRuntimeFilesRoutes(app, delegations, workspaceExecution);
 registerWorkStateRoutes(app, workStates, teams, store, runtime, productSettings);
 registerWorkerProcessRoutes(app, new WorkerProcessService(delegations, teams, paths.workerSessions, delegationTimelines), {
 	cancel: (delegationId, signal) => invoker.cancel(delegationId, signal),
+	isSessionOwner: (sessionHandle, delegationId) => runtime.isSessionOwnedByDelegation(sessionHandle, delegationId),
 	reconcile: async (delegationId) => {
 		const record = await invoker.reconcileDelegation(delegationId, async () => {
 			await reconcileWorkAndScheduleVerification();
@@ -643,6 +859,7 @@ async function shutdown(): Promise<void> {
 	clearInterval(goalOutboxTimer);
 	clearInterval(admissionExpiryTimer);
 	clearInterval(replacementOutcomeTimer);
+	knowledgeObservation.stop();
 	await goalOutboxDrain;
 	await store.disposeAll();
 	await app.close();

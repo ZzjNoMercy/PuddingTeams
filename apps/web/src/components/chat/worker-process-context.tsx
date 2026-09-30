@@ -3,7 +3,7 @@
 import { createContext, useContext, type ReactNode } from "react";
 
 type WorkerProcessContextValue = {
-	openWorkerProcess: (delegationId: string) => void;
+	openWorkerProcess: (delegationId: string, fullSession?: boolean) => void;
 	renderInlineProcess?: (delegationId: string, fallback?: string) => ReactNode;
 };
 

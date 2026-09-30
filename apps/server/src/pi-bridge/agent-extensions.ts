@@ -18,6 +18,7 @@ import type { LargeWorkerResultStore } from "../store/large-worker-result.js";
 import type { ProductSettingsStore } from "../store/product-settings.js";
 import { ENVIRONMENT_OBSERVATION_REF, bindEnvironmentObservations, buildVerificationPrompt, parseVerificationOutput, type VerificationReviewInput } from "../agent-runtime/verification-review.js";
 import { managerHumanWait, MANAGER_HUMAN_WAIT_INSTRUCTION } from "./manager-human-wait.js";
+import { settleWorkItemReview } from "../agent-runtime/work-item-settlement.js";
 
 /**
  * Phase 4：manager Session 的 Extension 装配（方案 §3.3）。
@@ -343,6 +344,7 @@ const UpdateWorkPlanParams = Type.Object({
 	removeItemIds: Type.Optional(Type.Array(Type.String())),
 	cancelItemIds: Type.Optional(Type.Array(Type.String(), { description: "保留审计历史但取消的 WorkItem；活动委托必须先中断，非取消项不能继续依赖它。" })),
 	reopenItemIds: Type.Optional(Type.Array(Type.String(), { description: "阻塞原因已解除后，把 blocked WorkItem 重新置为 revision 以便新 attempt。" })),
+	confirmGoalCoverage: Type.Optional(Type.Boolean({ description: "仅在 Goal 契约修订且 WorkPlan 标记 needsReconcile 时填 true；先逐项检查新版完成条件是否仍由 WorkPlan 覆盖，并在 reason 中说明更新或确认依据。" })),
 	reason: Type.String(),
 });
 
@@ -976,6 +978,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 						removeItemIds: params.removeItemIds,
 						cancelItemIds: params.cancelItemIds,
 						reopenItemIds: params.reopenItemIds,
+						confirmGoalCoverage: params.confirmGoalCoverage,
 						reason: params.reason,
 					},
 					toolCallId,
@@ -1027,49 +1030,16 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 				await assertManagerNotWaiting(deps);
 				if (!deps.workStates) throw new Error("Session Work State 未启用");
 				throwIfAborted(signal);
-				let revision = params.expectedRevision;
-				let effectiveVerdict = params.verdict;
-				let effectiveSummary = params.summary;
-				const goalSnapshot = await deps.workStates.getActive(deps.getSessionId());
-				if (!goalSnapshot || goalSnapshot.goalId !== params.goalId) throw new Error("当前 Goal 已变化，请重新读取目标状态后再验收");
-				if (goalSnapshot.execution.epoch !== params.expectedEpoch) throw new WorkStateConflictError(goalSnapshot, params.expectedRevision, `验收所属 execution epoch 已变化（本次传入 ${params.expectedEpoch}，当前 ${goalSnapshot.execution.epoch}）`);
-				if (params.verdict === "accepted") {
-					const current = goalSnapshot;
-					if (!current.plan) throw new Error("WorkPlan 不存在");
-					const item = current.plan.items[params.workItemId];
-					const submission = item?.submissions.find((entry) => entry.id === params.expectedSubmissionId && !entry.review);
-					if (!item || item.status !== "submitted" || item.revision !== params.expectedWorkItemRevision || !submission) {
-						const pending = item ? [...item.submissions].reverse().find((entry) => !entry.review) : undefined;
-						throw new WorkStateConflictError(current, params.expectedRevision, `验收目标已变化（WorkItem ${params.workItemId} 当前 itemRevision=${item?.revision ?? "无"}、submissionId=${pending?.id ?? "无"}）`);
-					}
-					const isolatedChangeSet = submission?.workspaceChangeSet?.mode === "isolated_worktree";
-					if ((item?.workspaceExecutionPolicy.mode === "isolated_worktree" && item.workspaceExecutionPolicy.promoteOnAcceptance) || isolatedChangeSet) {
-						const intentState = await deps.workStates.recordAcceptanceIntent(
-							deps.getSessionId(), params.workItemId, revision,
-							{ expectedWorkItemRevision: params.expectedWorkItemRevision, expectedSubmissionId: params.expectedSubmissionId, summary: params.summary, evidenceRefs: params.evidenceRefs }, `${toolCallId}:acceptance-intent`, params.expectedEpoch, current.goalId,
-						);
-						revision = intentState.revision;
-						const scopeId = submission?.executionReceipt?.workspaceExecutionScopeId;
-						const changeSetId = submission?.workspaceChangeSetId;
-						if (!scopeId || !changeSetId) throw new Error("isolated_worktree Submission 缺少可提升 change-set");
-						const promoted = await deps.invoker.promoteWorkspaceChangeSet(scopeId, changeSetId);
-						const promotedState = await deps.workStates.recordWorkspaceChangeSet(
-							deps.getSessionId(), params.workItemId, revision, promoted, `${toolCallId}:promotion`, current.execution.epoch, current.goalId,
-						);
-						revision = promotedState.revision;
-						if (promoted.promotionState !== "applied") {
-							effectiveVerdict = "blocked";
-							effectiveSummary = `${params.summary}\nWorkspace change-set 提升为 ${promoted.promotionState}；已保留隔离 worktree/diff。`;
-						}
-					}
-				}
-				const state = await deps.workStates.reviewWorkItem(
-					deps.getSessionId(), params.workItemId, revision,
-					{ expectedWorkItemRevision: params.expectedWorkItemRevision, expectedSubmissionId: params.expectedSubmissionId, verdict: effectiveVerdict, summary: effectiveSummary, evidenceRefs: params.evidenceRefs },
-					`${toolCallId}:review`,
-					params.expectedEpoch,
-					params.goalId,
-				);
+				const { state, verdict: effectiveVerdict } = await settleWorkItemReview({
+					workStates: deps.workStates, sessionId: deps.getSessionId(), goalId: params.goalId,
+					workItemId: params.workItemId, expectedRevision: params.expectedRevision,
+					expectedEpoch: params.expectedEpoch, review: {
+						expectedWorkItemRevision: params.expectedWorkItemRevision,
+						expectedSubmissionId: params.expectedSubmissionId,
+						verdict: params.verdict, summary: params.summary, evidenceRefs: params.evidenceRefs,
+					}, operationId: toolCallId,
+					promoteWorkspaceChangeSet: (scopeId, changeSetId) => deps.invoker.promoteWorkspaceChangeSet(scopeId, changeSetId),
+				});
 				const reviewedSubmission = state.plan?.items[params.workItemId]?.submissions.find((entry) => entry.id === params.expectedSubmissionId);
 				const reviewed = reviewedSubmission?.review;
 				const alignmentAudit = reviewed?.rebasedFromRevision === undefined ? reviewedSubmission?.acceptanceIntent : reviewed;
@@ -1368,17 +1338,10 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 				}
 				const members = memberAgents.map((a) => a.name);
 				const memberLabels = memberAgents.map((a) => agentDisplayName(a));
-				// 与 rooms.ts 建房链路一致：先建 manager Session，再落窗口记录。
+				// 成员复核、Session 创建与窗口写入在同一存储队列中，避免启停交错。
 				const owner = await deps.store.windowForSession(deps.getSessionId());
 				const cwd = ctx.cwd ?? (owner ? await deps.store.workspaceFor(owner.id) : undefined);
 				if (!cwd) throw new Error("无法解析当前窗口的运行目录，不能建群聊");
-				const created = await deps.sessions.create(undefined, {
-					type: "group",
-					members,
-					prompt: params.prompt,
-					workspaceId: ctx.workspaceId,
-					cwd,
-				});
 				const window = await deps.store.createWindow({
 					type: "group",
 					members,
@@ -1386,17 +1349,26 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 					cwdSnapshot: cwd,
 					name: params.name,
 					prompt: params.prompt,
-					sessionId: created.id,
+					requireEnabledMembers: true,
+					journalSession: true,
+					createSession: (reservedId) => deps.sessions.create(undefined, {
+						type: "group",
+						members,
+						prompt: params.prompt,
+						workspaceId: ctx.workspaceId,
+						cwd,
+					}, reservedId),
+					rollbackSession: (id) => deps.sessions.remove(id),
 				});
 				// fire-and-forget 开跑（chat.ts 首发消息同款）：房间 manager 在自己
 				// 窗口里干活，本工具不等执行结果；标题异步生成。
 				void deps.sessions
-					.open(created.id)
+					.open(window.activeSession)
 					.then((session) => session.prompt(params.task))
 					.catch((err: unknown) =>
 						deps.log?.(`create_group_window 首发任务失败: ${err instanceof Error ? err.message : String(err)}`),
 					);
-				void deps.sessions.generateSessionTitle(created.id, params.task).catch(() => undefined);
+				void deps.sessions.generateSessionTitle(window.activeSession, params.task).catch(() => undefined);
 				const displayName = window.name ?? memberLabels.join("、");
 				return {
 					content: [
@@ -1502,13 +1474,11 @@ async function resolveDirectWindowForDelegation(
 	workspaceId: string | undefined,
 	cwd: string,
 ): Promise<WindowConfig> {
-	const exact = await deps.store.findDirectWindow(agentName, workspaceId, cwd);
-	if (exact) return exact;
 	return deps.store.ensureDirectWindow(
 		agentName,
 		workspaceId,
-		() => deps.sessions.create(undefined, { type: "direct", members: [agentName], workspaceId, cwd }),
-		{ cwdSnapshot: cwd },
+		(reservedId) => deps.sessions.create(undefined, { type: "direct", members: [agentName], workspaceId, cwd }, reservedId),
+		{ cwdSnapshot: cwd, requireEnabledMember: true, rollbackSession: (id) => deps.sessions.remove(id), journalSession: true },
 	);
 }
 

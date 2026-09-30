@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import type { ServerEntry } from "pi-mcp-adapter";
 import type { CredentialsStore } from "./credentials.js";
@@ -9,6 +9,14 @@ const SECRET_KEY = /^[A-Z][A-Z0-9_]*$/;
 const SECRET_REFERENCE = /\$\{[A-Z][A-Z0-9_]*\}/;
 const SENSITIVE_HEADER = /^(?:authorization|cookie|proxy-authorization|x-api-key|api-key)$/i;
 const SENSITIVE_ENV_KEY = /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASS|API_KEY|PRIVATE_KEY|ACCESS_KEY)(?:$|_)/i;
+
+export class McpCatalogRecoveryRequiredError extends Error {
+	readonly statusCode = 503;
+	constructor() {
+		super("MCP Server Catalog 提交状态未知，需重启对账");
+		this.name = "McpCatalogRecoveryRequiredError";
+	}
+}
 
 export interface McpServerRecord {
 	id: string;
@@ -23,6 +31,7 @@ export interface McpServerRecord {
 interface McpServersFile {
 	version: 1;
 	servers: McpServerRecord[];
+	lastSecretTransactionId?: string;
 }
 
 export interface McpServerInput {
@@ -158,13 +167,18 @@ function interpolateSecrets(value: string, secrets: Record<string, string>): str
 export class McpServerStore {
 	private readonly file: string;
 	private queue: Promise<unknown> = Promise.resolve();
+	private durabilityUnknown = false;
 
 	constructor(configDir: string, private readonly secrets: CredentialsStore) {
 		this.file = path.join(configDir, "mcp-servers.json");
 	}
 
 	private serialize<T>(fn: () => Promise<T>): Promise<T> {
-		const run = this.queue.then(fn, fn);
+		const guarded = () => {
+			if (this.durabilityUnknown) throw new McpCatalogRecoveryRequiredError();
+			return fn();
+		};
+		const run = this.queue.then(guarded, guarded);
 		this.queue = run.then(() => undefined, () => undefined);
 		return run;
 	}
@@ -173,6 +187,9 @@ export class McpServerStore {
 		try {
 			const parsed = JSON.parse(await readFile(this.file, "utf-8")) as Partial<McpServersFile>;
 			if (parsed.version !== 1 || !Array.isArray(parsed.servers)) throw new Error("mcp-servers.json 结构无效");
+			if (parsed.lastSecretTransactionId !== undefined && (typeof parsed.lastSecretTransactionId !== "string" || !parsed.lastSecretTransactionId)) {
+				throw new Error("mcp-servers.json 事务标记无效");
+			}
 			const servers = parsed.servers.map((value, index) => {
 				if (!value || typeof value !== "object") throw new Error(`mcp-servers.json servers[${index}] 结构无效`);
 				const server = value as Partial<McpServerRecord>;
@@ -193,7 +210,7 @@ export class McpServerStore {
 					updatedAt: server.updatedAt,
 				};
 			});
-			return { version: 1, servers };
+			return { version: 1, servers, ...(parsed.lastSecretTransactionId ? { lastSecretTransactionId: parsed.lastSecretTransactionId } : {}) };
 		} catch (err: unknown) {
 			if ((err as NodeJS.ErrnoException).code === "ENOENT") return { version: 1, servers: [] };
 			throw err;
@@ -201,13 +218,92 @@ export class McpServerStore {
 	}
 
 	private async write(data: McpServersFile): Promise<void> {
-		await mkdir(path.dirname(this.file), { recursive: true });
+		const directory = path.dirname(this.file);
+		await mkdir(directory, { recursive: true });
 		const temp = `${this.file}.${randomUUID().slice(0, 8)}.tmp`;
-		await writeFile(temp, `${JSON.stringify(data, null, 2)}\n`, "utf-8");
-		await rename(temp, this.file);
+		let handle: Awaited<ReturnType<typeof open>> | undefined;
+		let renamed = false;
+		try {
+			handle = await open(temp, "wx", 0o600);
+			await handle.writeFile(`${JSON.stringify(data, null, 2)}\n`);
+			await handle.sync();
+			await handle.close();
+			handle = undefined;
+			await rename(temp, this.file);
+			renamed = true;
+			await this.syncCatalogDirectory(directory);
+		} catch (error) {
+			if (handle) await handle.close().catch(() => undefined);
+			await unlink(temp).catch(() => undefined);
+			// rename 后同步失败时不能用可见字节判定持久提交。
+			if (renamed) {
+				this.durabilityUnknown = true;
+				throw new McpCatalogRecoveryRequiredError();
+			}
+			throw error;
+		}
+	}
+
+	private async syncCatalogDirectory(directory: string): Promise<void> {
+		const dir = await open(directory, "r");
+		try { await dir.sync(); }
+		finally { await dir.close(); }
+	}
+
+	/** Startup must reconcile the encrypted secret transaction before serving requests. */
+	async recoverSecretTransaction(): Promise<void> {
+		await this.secrets.recoverBindingTransaction(async (_id, transactionId) =>
+			(await this.read()).lastSecretTransactionId === transactionId);
+		this.durabilityUnknown = false;
+	}
+
+	/** Include the commit marker so a secret-only update differs from its predecessor. */
+	async mutationFingerprint(): Promise<string> {
+		if (this.durabilityUnknown) throw new McpCatalogRecoveryRequiredError();
+		await this.secrets.assertReady();
+		let bytes: Buffer;
+		try { bytes = await readFile(this.file); }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			bytes = Buffer.alloc(0);
+		}
+		return createHash("sha256").update(bytes).digest("hex");
+	}
+
+	private async applyCatalogChange<T>(
+		id: string,
+		changes: Record<string, string>,
+		build: (secretKeys: string[]) => { data: McpServersFile; result: T },
+	): Promise<T> {
+		for (const [key, value] of Object.entries(changes)) {
+			if (!SECRET_KEY.test(key)) throw new Error(`secret key「${key}」必须是 UPPER_SNAKE`);
+			if (typeof value !== "string") throw new Error(`secret「${key}」必须是字符串`);
+		}
+		const before = await this.secrets.getSecrets(id);
+		const after = { ...before };
+		for (const [key, value] of Object.entries(changes)) {
+			if (value === "") delete after[key];
+			else after[key] = value;
+		}
+		const { result } = await this.secrets.transactBinding(
+			id, changes, before,
+			async (transactionId) => {
+				const built = build(Object.keys(after).sort());
+				if (transactionId) built.data.lastSecretTransactionId = transactionId;
+				await this.write(built.data);
+				return built.result;
+			},
+			async (transactionId) => {
+				if (this.durabilityUnknown) throw new McpCatalogRecoveryRequiredError();
+				return (await this.read()).lastSecretTransactionId === transactionId;
+			},
+		);
+		return result;
 	}
 
 	async list(): Promise<McpServerRecord[]> {
+		if (this.durabilityUnknown) throw new McpCatalogRecoveryRequiredError();
+		await this.secrets.assertReady();
 		return (await this.read()).servers.map((server) => structuredClone(server));
 	}
 
@@ -234,27 +330,17 @@ export class McpServerStore {
 		};
 	}
 
-	private async applySecrets(id: string, input: Record<string, string> | undefined): Promise<string[]> {
-		if (input !== undefined) {
-			for (const [key, value] of Object.entries(input)) {
-				if (!SECRET_KEY.test(key)) throw new Error(`secret key「${key}」必须是 UPPER_SNAKE`);
-				if (typeof value !== "string") throw new Error(`secret「${key}」必须是字符串`);
-			}
-			await this.secrets.setSecrets(id, input);
-		}
-		return (await this.secrets.listConfigured(id)).sort();
-	}
-
 	async create(input: McpServerInput): Promise<McpServerRecord> {
 		return this.serialize(async () => {
 			const data = await this.read();
 			if (data.servers.some((server) => server.id === input.id?.trim())) throw new Error(`MCP Server 已存在：${input.id}`);
 			const record = this.normalizeInput(input);
-			record.secretKeys = await this.applySecrets(record.id, input.secrets);
-			data.servers.push(record);
-			data.servers.sort((a, b) => a.displayName.localeCompare(b.displayName));
-			await this.write(data);
-			return structuredClone(record);
+			return this.applyCatalogChange(record.id, input.secrets ?? {}, (secretKeys) => {
+				record.secretKeys = secretKeys;
+				data.servers.push(record);
+				data.servers.sort((a, b) => a.displayName.localeCompare(b.displayName));
+				return { data, result: structuredClone(record) };
+			});
 		});
 	}
 
@@ -264,11 +350,12 @@ export class McpServerStore {
 			const index = data.servers.findIndex((server) => server.id === id);
 			if (index < 0) throw new Error(`MCP Server 不存在：${id}`);
 			const record = this.normalizeInput({ ...input, id }, data.servers[index]);
-			record.secretKeys = await this.applySecrets(id, input.secrets);
-			data.servers[index] = record;
-			data.servers.sort((a, b) => a.displayName.localeCompare(b.displayName));
-			await this.write(data);
-			return structuredClone(record);
+			return this.applyCatalogChange(id, input.secrets ?? {}, (secretKeys) => {
+				record.secretKeys = secretKeys;
+				data.servers[index] = record;
+				data.servers.sort((a, b) => a.displayName.localeCompare(b.displayName));
+				return { data, result: structuredClone(record) };
+			});
 		});
 	}
 
@@ -277,9 +364,10 @@ export class McpServerStore {
 			const data = await this.read();
 			const next = data.servers.filter((server) => server.id !== id);
 			if (next.length === data.servers.length) return false;
-			await this.write({ version: 1, servers: next });
-			await this.secrets.removeAgentSecrets(id);
-			return true;
+			const before = await this.secrets.getSecrets(id);
+			return this.applyCatalogChange(id, Object.fromEntries(Object.keys(before).map((key) => [key, ""])), () => ({
+				data: { ...data, servers: next }, result: true,
+			}));
 		});
 	}
 

@@ -1,7 +1,8 @@
 "use client";
 
 import { createContext, type ComponentProps, type ReactNode, useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { CheckIcon, ChevronDownIcon, ChevronRightIcon, CircleAlertIcon, CopyIcon, ExternalLinkIcon, FilePenIcon, FileSearchIcon, FileTextIcon, FolderIcon, ListTreeIcon, RotateCcwIcon, SquareIcon, SquareTerminalIcon, UserPlusIcon, UsersIcon, WrenchIcon } from "lucide-react";
+import Link from "next/link";
+import { CheckIcon, ChevronDownIcon, ChevronRightIcon, CircleAlertIcon, ClipboardCheckIcon, CopyIcon, ExternalLinkIcon, FilePenIcon, FileSearchIcon, FileTextIcon, FolderIcon, ListTreeIcon, RotateCcwIcon, SquareIcon, SquareTerminalIcon, UserPlusIcon, UsersIcon, WrenchIcon } from "lucide-react";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
 	Message as AiMessage,
@@ -240,6 +241,7 @@ const WORKER_STATUS_LABEL: Record<string, string> = {
 	completed: "完成",
 	needs_input: "等待审批",
 	cancelled: "已取消",
+	observation_lost: "失去观测 · 效果未知",
 	failed: "失败",
 	// 历史卡：direct 镜像在失败时写过 vocab 外的 "error"（agent-extensions soloMeta），
 	// 新数据已统一 failed，这里仅为兼容旧会话记录。
@@ -490,7 +492,7 @@ function WorkerTaskEntry({
 
 	const inlineId = (processDetails as { delegationId?: string } | undefined)?.delegationId;
 	const inlineProcess = inlineId ? renderInlineProcess?.(inlineId, result) : null;
-	if (inlineProcess) return <div className="w-full min-w-0">{inlineProcess}{actions}{children}</div>;
+	if (inlineProcess) return <div className="w-full min-w-0">{actions ? <div className="mb-2 flex justify-end" role="group" aria-label="Worker 任务操作">{actions}</div> : null}{inlineProcess}{children}</div>;
 
 	if (finished) {
 		return (
@@ -873,6 +875,9 @@ function CustomMessageEntry({
 	const details = message.details as
 		| {
 				worker?: string;
+				jobId?: string;
+				bindingId?: string;
+				batchId?: string;
 				status?: string;
 				taskId?: string;
 				from?: string;
@@ -890,6 +895,13 @@ function CustomMessageEntry({
 				requests?: Array<{ requestId: string; prompt: string; command?: string; path?: string; risk?: string; options?: string[] }>;
 		  }
 		| undefined;
+
+	if (message.customType === "pudding:knowledge_job") {
+		const status = details?.status ?? "";
+		const labels: Record<string, string> = { queued: "正在排队", running: "正在整理", pending_review: "候选已生成", no_changes: "没有文件变更", needs_attention: "需要补充来源", failed: "整理失败", cancelled: "已取消" };
+		const failed = status === "failed" || status === "needs_attention";
+		return <div className="w-full rounded-xl border border-border bg-muted/30 px-4 py-3"><div className="flex flex-wrap items-center gap-2"><ClipboardCheckIcon size={16} className={failed ? "text-amber-600 dark:text-amber-400" : "text-primary"} /><strong className="text-sm font-medium">Wiki 管理员</strong><Badge variant={failed ? "outline" : "secondary"}>{labels[status] ?? "整理记录"}</Badge></div><p className="mt-2 whitespace-pre-wrap text-sm text-muted-foreground">{message.content}</p>{details?.batchId ? <Link href={`/knowledge/review?batch=${encodeURIComponent(details.batchId)}`} className="mt-3 inline-flex items-center gap-1.5 text-sm text-primary hover:underline">查看固定候选并审核<ChevronRightIcon size={14} /></Link> : details?.bindingId ? <Link href={`/knowledge?vault=${encodeURIComponent(details.bindingId)}`} className="mt-3 inline-flex items-center gap-1.5 text-sm text-primary hover:underline">打开知识库<ChevronRightIcon size={14} /></Link> : null}</div>;
+	}
 
 	// direct 直派（§5.2）：用户发言以普通用户气泡呈现。
 	if (message.customType === "pudding:user_message") {
@@ -1008,6 +1020,8 @@ function CustomMessageEntry({
 					? "审批已拒绝，任务已取消。"
 					: details?.status === "failed"
 						? "审批已批准，但任务执行失败。"
+						: details?.status === "observation_lost"
+							? "已停止等待审批；尚未确认上游任务终止，请先对账。"
 						: "审批已处理。";
 		return <p className="text-xs text-muted-foreground">{text}</p>;
 	}

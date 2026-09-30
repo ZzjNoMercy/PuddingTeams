@@ -9,6 +9,7 @@ import { HarnessSettingsPanel } from "./harness-settings";
 
 export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
 	const [section, setSection] = useState<"appearance" | "providers" | "harness">("appearance");
+	const [harnessVisited, setHarnessVisited] = useState(false);
 	const sectionKicker = section === "appearance" ? "APPEARANCE" : section === "providers" ? "PROVIDERS" : "HARNESS";
 
 	return (
@@ -22,7 +23,7 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
 					<div>
 						<p className="settings-kicker" aria-live="polite">{sectionKicker}</p>
 						<DialogTitle className="settings-title">设置</DialogTitle>
-						<DialogDescription className="sr-only">调整界面外观和模型 Provider。</DialogDescription>
+						<DialogDescription className="sr-only">调整界面外观和模型设置。</DialogDescription>
 					</div>
 					<DialogClose asChild>
 						<button type="button" className="settings-close" aria-label="关闭设置">
@@ -41,7 +42,7 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
 							<PaletteIcon aria-hidden="true" />
 							<span><strong>外观</strong><small>主题与动态效果</small></span>
 						</button>
-						<button type="button" className="settings-nav-item" data-active={section === "harness" ? "true" : "false"} onClick={() => setSection("harness")}>
+						<button type="button" className="settings-nav-item" data-active={section === "harness" ? "true" : "false"} onClick={() => { setHarnessVisited(true); setSection("harness"); }}>
 							<BrainCircuitIcon aria-hidden="true" />
 							<span><strong>Harness</strong><small>上下文与恢复策略</small></span>
 						</button>
@@ -52,7 +53,7 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
 							onClick={() => setSection("providers")}
 						>
 							<ServerCogIcon aria-hidden="true" />
-							<span><strong>模型 Provider</strong><small>凭证与默认模型</small></span>
+							<span><strong>模型</strong><small>凭证与默认模型</small></span>
 						</button>
 					</nav>
 					<main className="settings-content">
@@ -66,22 +67,24 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
 									<AppearanceSettings />
 								</section>
 							</div>
-						) : section === "providers" ? (
+						) : null}
+						{section === "providers" ? (
 							<div className="settings-content-column">
 								<div className="settings-section-heading">
-									<h2 id="providers-heading">模型 Provider</h2>
+									<h2 id="providers-heading">模型</h2>
 									<p>管理模型凭证、可用模型与默认模型。</p>
 								</div>
 								<section className="settings-card settings-provider-card" aria-labelledby="providers-heading">
 									<ProviderSettings />
 								</section>
 							</div>
-						) : (
-							<div className="settings-content-column">
+						) : null}
+						{harnessVisited ? (
+							<div className="settings-content-column" hidden={section !== "harness"}>
 								<div className="settings-section-heading"><h2 id="harness-heading">Harness</h2><p>控制 Manager 上下文预算、Goal 激活与安全恢复。</p></div>
 								<HarnessSettingsPanel />
 							</div>
-						)}
+						) : null}
 					</main>
 				</div>
 			</DialogContent>

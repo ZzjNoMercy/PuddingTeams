@@ -1,38 +1,37 @@
 import type { FastifyInstance } from "fastify";
 import { AgentRuntime } from "../agent-runtime/runtime.js";
-import { AgentInvoker } from "../agent-runtime/invoker.js";
+import { AgentInvoker, type AgentInvokeResult } from "../agent-runtime/invoker.js";
 import { InteractionError } from "../agent-runtime/interaction-broker.js";
+import { redactText } from "../agent-runtime/redaction.js";
+import type { DelegationRecord, InteractionRecord } from "../agent-runtime/delegation-store.js";
 import { TeamsStore } from "../store/teams.js";
 import type { WorkStateStore } from "../store/work-state.js";
 
-/**
- * M3：浏览器只拿 interaction.id；runHandle/sessionHandle 是 worker 私有句柄，
- * 不在审批 API 响应里暴露（决策 4 的边界延伸）。
- */
-function stripHandles<T extends { runHandle?: string; sessionHandle?: string }>(outcome: T): Omit<T, "runHandle" | "sessionHandle"> {
-	const { runHandle: _run, sessionHandle: _session, ...rest } = outcome;
-	void _run;
-	void _session;
-	return rest;
+/** Keep Worker handles, arbitrary result meta and receipts off the public API. */
+function projectOutcome(outcome: AgentInvokeResult) {
+	return {
+		status: outcome.status,
+		delegationId: outcome.delegationId,
+		interactionId: outcome.interactionId,
+		waitingInput: outcome.waitingInput,
+		...(outcome.conflict ? { conflict: true } : {}),
+	};
+}
+
+/** The card needs only Goal identity and whether the Worker actually started. */
+function projectDelegation(delegation: DelegationRecord | undefined) {
+	if (!delegation) return undefined;
+	return {
+		goalId: delegation.goalId,
+		workerStarted: delegation.workerStarted,
+	};
 }
 
 /**
  * L4：浏览器只需 interaction 的公开投影——内部 providerStateRef / consumedRequestId
  * 是服务端实现细节，不下发。
  */
-function projectInteraction(interaction: {
-	id: string;
-	delegationId: string;
-	source: "worker" | "platform_policy";
-	kind: string;
-	requests: unknown[];
-	status: string;
-	revision: number;
-	expiresAt?: string;
-	policyContext?: unknown;
-	decision?: unknown;
-	application?: unknown;
-}) {
+function projectInteraction(interaction: InteractionRecord) {
 	return {
 		id: interaction.id,
 		delegationId: interaction.delegationId,
@@ -42,9 +41,21 @@ function projectInteraction(interaction: {
 		status: interaction.status,
 		revision: interaction.revision,
 		expiresAt: interaction.expiresAt,
-		...(interaction.policyContext ? { policySummary: interaction.policyContext } : {}),
-		...(interaction.decision ? { decision: interaction.decision } : {}),
-		...(interaction.application ? { application: interaction.application } : {}),
+		...(interaction.policyContext ? { policySummary: {
+			reasonCode: interaction.policyContext.reasonCode,
+			allowedActions: interaction.policyContext.allowedActions,
+			workerStarted: interaction.policyContext.workerStarted,
+		} } : {}),
+		...(interaction.decision ? { decision: {
+			chosenAction: interaction.decision.chosenAction,
+			replacementAgentId: interaction.decision.replacementAgentId,
+		} } : {}),
+		...(interaction.application ? { application: {
+			status: interaction.application.status,
+			failureCode: interaction.application.failureCode,
+			replacementAgentId: interaction.application.replacementAgentId,
+			replacementDelegationId: interaction.application.replacementDelegationId,
+		} } : {}),
 	};
 }
 
@@ -65,7 +76,8 @@ export function registerInteractionsRoutes(
 	// 列出某个窗口下的 pending 审批卡。
 	app.get<{ Querystring: { windowId?: string; sessionId?: string } }>("/api/interactions", async (req) => {
 		const { windowId, sessionId } = req.query;
-		let interactions = await runtime.listInteractions(windowId);
+		let interactions = (await runtime.listInteractions(windowId))
+			.filter((interaction) => interaction.status === "pending" || interaction.status === "responding");
 		if (sessionId) {
 			const pairs = await Promise.all(interactions.map(async (interaction) => ({
 				interaction,
@@ -91,7 +103,7 @@ export function registerInteractionsRoutes(
 				...projectInteraction(interaction),
 				replacementCandidates: await invoker.replacementCandidates(interaction.id),
 			},
-			delegation,
+			delegation: projectDelegation(delegation),
 		};
 	});
 
@@ -146,18 +158,21 @@ export function registerInteractionsRoutes(
 			);
 			// M1：失败/仍在处理的审批不返回 200，前端不能显示成「已批准」。
 			if (outcome.status === "failed" && (outcome.details as { errorCode?: string }).errorCode === "responding") {
-				return reply.code(409).send({ error: "该审批正在处理中，请稍候", code: "responding", outcome });
+				return reply.code(409).send({ error: "该审批正在处理中，请稍候", code: "responding", outcome: projectOutcome(outcome) });
 			}
 			if (outcome.status === "failed") {
-				return reply.code(502).send({ error: outcome.content ?? "审批处理失败", code: outcome.status, outcome });
+				return reply.code(502).send({ error: redactText(outcome.content || "审批处理失败"), code: outcome.status, outcome: projectOutcome(outcome) });
 			}
-			return { outcome: stripHandles(outcome) };
+			return { outcome: projectOutcome(outcome) };
 		} catch (err) {
 			if (err instanceof InteractionError) {
 				const status = err.code === "not_found" ? 404 : err.code === "not_pending" || err.code === "idempotency_conflict" ? 409 : 400;
 				return reply.code(status).send({ error: err.message, code: err.code });
 			}
-			return reply.code(500).send({ error: err instanceof Error ? err.message : String(err) });
+			if (err instanceof Error && err.message.includes("该审批所属项目未激活")) {
+				return reply.code(409).send({ error: err.message, code: "interaction_context_inactive" });
+			}
+			return reply.code(500).send({ error: redactText(err instanceof Error ? err.message : String(err)) });
 		}
 	});
 
@@ -177,7 +192,7 @@ export function registerInteractionsRoutes(
 			await invoker.cancel(delegation.id, undefined);
 			return { ok: true };
 		} catch (err) {
-			return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+			return reply.code(400).send({ error: redactText(err instanceof Error ? err.message : String(err)) });
 		}
 	});
 }

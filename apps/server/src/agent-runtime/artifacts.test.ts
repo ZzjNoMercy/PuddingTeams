@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { normalizePuddingClawJson } from "./normalize.js";
@@ -131,7 +131,7 @@ test("PuddingClawDriver：没有 delegationId 时不传 --export", async () => {
 	assert.ok(!readFileSync(capture, "utf-8").includes("--export"));
 });
 
-test("ArtifactStore：登记（size 缺省 stat 补齐）与按 windowId/delegationId 查询", async () => {
+test("ArtifactStore：登记冻结副本大小与按 windowId/delegationId 查询", async () => {
 	const dir = freshDir();
 	const file = path.join(dir, "report.md");
 	writeFileSync(file, "abc");
@@ -152,11 +152,10 @@ test("ArtifactStore：登记（size 缺省 stat 补齐）与按 windowId/delegat
 		workspaceId: "workspace-1",
 		cwdSnapshot: realpathSync(dir),
 	});
-	assert.equal(a.size, 3, "size 缺省时从文件 stat 补齐");
+	assert.equal(a.size, 3, "size 来自冻结副本实际字节");
 	const b = await store.register({
 		name: "out.csv",
 		path: file,
-		size: 99,
 		origin: "observe",
 		producer: "codex",
 		delegationId: "del-2",
@@ -164,13 +163,35 @@ test("ArtifactStore：登记（size 缺省 stat 补齐）与按 windowId/delegat
 		workspaceId: "workspace-1",
 		cwdSnapshot: realpathSync(dir),
 	});
+	assert.equal(b.size, 3, "第二次登记也以冻结副本实际字节为准");
 
 	assert.deepEqual(seen, [a.id, b.id], "每次登记都发 artifact.created");
 	assert.equal((await store.get(a.id))?.name, "report.md");
 	assert.equal((await store.list({ windowId: "win-1" })).length, 2);
 	assert.deepEqual((await store.list({ delegationId: "del-2" })).map((r) => r.id), [b.id]);
 	assert.equal((await store.list({ windowId: "win-2" })).length, 0);
+	const interrupted = await store.prepareDownload(a.id);
+	assert.ok(interrupted && existsSync(interrupted.filePath));
+	const restarted = new ArtifactStore(dir, path.join(dir, "blobs"));
+	await restarted.init();
+	assert.equal(existsSync(interrupted.filePath), false, "冷启动清理上次进程留下的下载副本");
+	assert.equal((await restarted.get(a.id))?.size, 3, "清理不影响已登记的冻结 blob");
 	off();
+});
+
+test("ArtifactStore：登记元数据写入失败时清理未登记的冻结 blob", async () => {
+	const dir = freshDir();
+	const file = path.join(dir, "report.md");
+	writeFileSync(file, "complete bytes");
+	writeFileSync(path.join(dir, "artifacts.json"), "{");
+	const blobsDir = path.join(dir, "blobs");
+	const store = new ArtifactStore(dir, blobsDir);
+	await store.init();
+	await assert.rejects(() => store.register({
+		name: "report.md", path: file, origin: "push", producer: "worker",
+		delegationId: "del-1", windowId: "win-1", cwdSnapshot: realpathSync(dir),
+	}), SyntaxError);
+	assert.deepEqual(readdirSync(blobsDir), [".downloads"], "没有记录的 blob 不留在冻结目录");
 });
 
 test("Runtime：Run 完成时把 CompletedResult.artifacts 登记进 ArtifactStore，DelegationRecord.result 带清单", async () => {

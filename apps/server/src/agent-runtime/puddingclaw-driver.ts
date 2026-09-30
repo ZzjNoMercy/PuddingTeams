@@ -501,8 +501,9 @@ export class PuddingClawDriver implements AgentDriver {
 			if (!terminal) {
 				return this.httpFailure(new HttpJsonlError("HTTP JSONL stream ended without a result event", "protocol_error"), requestPath);
 			}
-			ctx.onUpdate?.("worker 执行完成", { httpStatus: 200 });
-			return this.withHandoffPaths(normalizePuddingClawJson(terminal), ctx);
+			const event = normalizePuddingClawJson(terminal);
+			if (event.type === "completed") ctx.onUpdate?.("worker 执行完成", { httpStatus: 200 });
+			return this.withHandoffPaths(event, ctx);
 		}
 	}
 
@@ -586,7 +587,7 @@ export class PuddingClawDriver implements AgentDriver {
 			: rawLastLine;
 		if (lastLine !== undefined) {
 			const event = normalizePuddingClawJson(lastLine);
-			ctx.onUpdate?.("worker 执行完成", { exitCode: res.exitCode });
+			if (event.type === "completed") ctx.onUpdate?.("worker 执行完成", { exitCode: res.exitCode });
 			return this.withHandoffPaths(event, ctx);
 		}
 		// Fall back to the accumulated stdout as a single JSON.

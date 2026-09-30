@@ -41,6 +41,7 @@ async function collect(events: AsyncIterable<AgentEvent>): Promise<AgentEvent[]>
 test("P1: claude-code 能力诚实声明——run/continue/cancel、无 HITL、stream、spawn", async () => {
 	const driver = new ClaudeCodeDriver();
 	assert.deepEqual(await driver.capabilities(), {
+		runtimeModel: { effortLevels: ["low", "medium", "high", "xhigh", "max"] },
 		operations: ["run", "continue", "cancel"],
 		interactionKinds: [],
 		progress: "stream",

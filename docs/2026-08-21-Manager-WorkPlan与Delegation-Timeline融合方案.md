@@ -245,6 +245,8 @@ submitted --确认无法继续--> blocked
 - execution Delegation 的 `reported_completed` 只有在 sealed Receipt 与 WorkItem contract hash/revision/epoch 匹配时才自动生成 `WorkItemSubmission` 并推进到 `submitted`，**不会**自动 `accepted`；verification Delegation 不生成 Submission；
 - 高于 `manager_review` 的 WorkItem 必须有绑定当前 Submission/revision/epoch/inputFingerprint 的 `passed + clean` VerificationRecord，逐项满足全部 acceptance criteria 且引用白名单证据；
 - `isolated_worktree` 必须先原子冻结 `acceptanceIntent`，再精确提升 change-set；目标 baseline 漂移时改为 `blocked` 并保留 worktree/diff，不能覆盖用户或其他 Worker 修改；
+- Manager 工具与 Goal 抽屉的人类 WorkItem 验收入口共用同一结算流程。页面接受 Git 写 Submission 时也必须先冻结 accepted 意图、调用 Runtime 提升对应 scope/change-set、记录提升结果，最后才写入 accepted；提升返回 conflict/failed 时写入 blocked。相同 Submission 的同内容验收请求可重放，不得再次提升或重复验收。
+- `acceptanceIntent` 冻结后，当前 Submission 的改判、同一 WorkItem 的迟到 Delegation，以及会改变 Goal/计划契约的命令均须拒绝，直到提升结果与最终 review 持久化。其他 WorkItem 可继续推进；其引起的全局 state revision 变化不应使已冻结的提升结果失效，但 Goal、epoch、Submission 和 change-set 身份仍须逐一核对。提升后响应丢失时，`applied/conflict/failed` 终态可读取重放，不能重新修改主 Workspace。
 - `assignedAgentId=manager` 的工作项必须通过 `advance_manager_work_item` 明确记录 `in_progress → submitted`，再走同一个 `review_work_item` 验收门；WorkItem 一旦开始或产生 Submission 就禁止物理删除，只能取消并保留审计事实；
 - 只有 `accepted` 才满足下游 `dependsOn`；`submitted`、`completed`、`revision` 都不能解锁后继；
 - WorkPlan 全部非取消项 `accepted` 后只代表计划完成，Goal 仍需沿用现有 completion review 门禁才能 `resolved`。
@@ -552,6 +554,10 @@ Goal 是持久控制面，不是一个长时间内存进程。服务重启、Man
 
 显式“暂停 Goal”本身也是一条幂等命令：原子记录 interruption、提升 epoch、把执行态改成 `interrupted`，并向 outbox 写入当前活动 Delegation 的 cancel 请求。Driver cancel 只能 best-effort；旧 Worker 如果随后完成，其完整结果仍保存在原 Delegation，但由于 epoch 已过期不会自动生成 Submission。恢复时 Manager 可以显式“采纳该迟到结果”或创建新尝试，避免既丢结果又误把暂停后的副作用当成已验收事实。
 
+启动对账有一条例外：若同一 Goal 的 W1 已冻结 `acceptanceIntent`、正等待 Workspace 提升结果持久化，而 W2 因服务重启被 Runtime 记为 `failed(server_restart)`，先将 W2 投影为返修，并在 Goal 执行态持久记录这次已处理的 Delegation ID。此时不能提升 Goal epoch，否则会使 W1 已发生的提升副作用失去结算归属；重复启动不能再次中断或重复投影。W1 的同一 Submission 仍须按原 Goal/epoch/change-set 身份完成或阻塞结算，之后才可执行普通 Goal 中断命令。
+
+新建 Goal 即使尚无 Worker Run、执行态仍为 `idle`，页面也应提供“暂停”：这同样是对持续目标的显式控制。刷新后从同一 Store 回读 `interrupted`，再由“继续 Goal”进入 `recovering`；`recovering` 期间再次暂停仍以新的中断边界处理。
+
 “恢复 Goal”取得当前 epoch 的 resume lease，把执行态从 `interrupted → recovering → running/waiting_human`，不再次提升 epoch。同一 interruption fingerprint、interrupt operationId 或 resume operationId 的重放都必须返回原结果。
 
 暂停、废弃和更换是三种不同命令：
@@ -684,6 +690,7 @@ PuddingTeams 可以保证“本地 Goal 状态只应用一次”，但无法在�
 - Delegation cancel 与 Interaction respond/cancel 若属于 Goal，HTTP 请求也必须携带 `expectedGoalId` 并校验它仍是该 Session 的 active Goal；旧 Goal 入口只能查看历史；
 - 重启后由 `work-states.json + delegations.json + Session JSONL` 的结构化事实恢复，不从自然语言聊天文本猜测；
 - Goal revision 变化时 WorkPlan 标记 `needsReconcile:true`，Goal 回到 active 并阻止自动 resolved；Manager 必须显式更新验收条件或确认计划仍覆盖新 Goal。
+- `needsReconcile:true` 时，`update_work_plan` 必须携带 `confirmGoalCoverage:true`，并在 `reason` 中说明逐项更新或确认的依据；仅提交空更新不能解除待协调标记。原有 `sourceGoalCriteria` 若引用旧条件，仍须先改为当前 Goal 的稳定引用。
 
 ## 11. 分阶段落地
 

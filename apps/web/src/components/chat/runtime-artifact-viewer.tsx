@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, type ComponentProps } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
 import { BracesIcon, DownloadIcon, ExternalLinkIcon, FileIcon, FileSpreadsheetIcon, FileTextIcon, RefreshCwIcon, Table2Icon } from "lucide-react";
 import { ClipboardSafeStreamdown } from "@/components/ai-elements/streamdown";
 import { Loader } from "@/components/ai-elements/loader";
@@ -18,6 +18,7 @@ import {
 	type RuntimeFileItem,
 } from "@/lib/api";
 import { toast } from "sonner";
+import { parseDelimitedPreview } from "@/lib/delimited-preview";
 
 type ViewerKind = "runtime" | "artifacts";
 type PreviewKind = RuntimeFileItem["preview"];
@@ -58,29 +59,17 @@ function fileIcon(preview: PreviewKind) {
 	return FileIcon;
 }
 
-function parseDelimited(content: string, delimiter: string): string[][] {
-	const rows: string[][] = [];
-	let row: string[] = [];
-	let cell = "";
-	let quoted = false;
-	for (let index = 0; index < content.length && rows.length < 200; index += 1) {
-		const char = content[index]!;
-		if (char === '"') {
-			if (quoted && content[index + 1] === '"') { cell += '"'; index += 1; }
-			else quoted = !quoted;
-		} else if (char === delimiter && !quoted) {
-			row.push(cell); cell = "";
-		} else if ((char === "\n" || char === "\r") && !quoted) {
-			if (char === "\r" && content[index + 1] === "\n") index += 1;
-			row.push(cell); rows.push(row.slice(0, 30)); row = []; cell = "";
-		} else cell += char;
-	}
-	if ((cell || row.length) && rows.length < 200) { row.push(cell); rows.push(row.slice(0, 30)); }
-	return rows;
-}
-
 const safeMarkdownComponents = {
-	a: ({ href, children, ...props }: ComponentProps<"a">) => <a href={href} target="_blank" rel="noreferrer" {...props}>{children}</a>,
+	a: ({ href, children, ...props }: ComponentProps<"a">) => {
+		let safeHref: string | undefined;
+		try {
+			const url = href ? new URL(href) : null;
+			if (url && ["https:", "http:", "mailto:"].includes(url.protocol)) safeHref = url.href;
+		} catch { /* Relative and malformed links need an explicit workspace resolver. */ }
+		return safeHref
+			? <a {...props} href={safeHref} target="_blank" rel="noopener noreferrer">{children}</a>
+			: <span title="此链接不能在预览中打开；请下载或用系统打开完整文件">{children}</span>;
+	},
 	img: ({ alt }: ComponentProps<"img">) => <span className="runtime-file-blocked-image">[外部图片未自动加载：{alt || "无标题"}]</span>,
 };
 
@@ -106,9 +95,12 @@ function Preview({ item, content, loading, error }: { item: ViewerItem; content:
 		return <pre className="runtime-file-code">{formatted}</pre>;
 	}
 	if (item.preview === "csv") {
-		const rows = parseDelimited(content, item.extension === "tsv" ? "\t" : ",");
-		return rows.length ? (
-			<div className="runtime-file-table-wrap"><table><tbody>{rows.map((row, rowIndex) => <tr key={rowIndex}>{row.map((cell, cellIndex) => rowIndex === 0 ? <th key={cellIndex}>{cell}</th> : <td key={cellIndex}>{cell}</td>)}</tr>)}</tbody></table></div>
+		const preview = parseDelimitedPreview(content, item.extension === "tsv" ? "\t" : ",");
+		return preview.rows.length ? (
+			<div className="runtime-file-table-wrap">
+				{preview.truncatedRows || preview.truncatedColumns ? <p role="note" className="mb-2 text-xs text-muted-foreground">此处只预览前 200 行、每行前 30 列；请下载或用系统打开查看完整文件。</p> : null}
+				<table><tbody>{preview.rows.map((row, rowIndex) => <tr key={rowIndex}>{row.map((cell, cellIndex) => rowIndex === 0 ? <th key={cellIndex}>{cell}</th> : <td key={cellIndex}>{cell}</td>)}</tr>)}</tbody></table>
+			</div>
 		) : <div className="runtime-file-empty">文件为空</div>;
 	}
 	return <pre className="runtime-file-code">{content}</pre>;
@@ -123,15 +115,21 @@ export function RuntimeArtifactViewer({ delegationId, kind, live }: { delegation
 	const [content, setContent] = useState("");
 	const [contentLoading, setContentLoading] = useState(false);
 	const [contentError, setContentError] = useState<string | null>(null);
+	const [contentKey, setContentKey] = useState<string | null>(null);
+	const refreshRequestId = useRef(0);
+	const inFlightRequestId = useRef(0);
 
-	const refresh = useCallback(async () => {
+	const refresh = useCallback(async (force = false) => {
+		if (inFlightRequestId.current && !force) return;
+		const requestId = ++refreshRequestId.current;
+		inFlightRequestId.current = requestId;
 		try {
-			const next: ViewerItem[] = kind === "runtime"
-				? await fetchDelegationFiles(delegationId).then((result) => {
-					setScopeAvailable(result.scopeAvailable);
-					return result.files.map((item) => ({ ...item, id: item.path }));
-				})
-				: await fetchDelegationArtifacts(delegationId).then((records) => records.map((record) => ({
+			const runtimeResult = kind === "runtime" ? await fetchDelegationFiles(delegationId) : null;
+			const artifactRecords = kind === "artifacts" ? await fetchDelegationArtifacts(delegationId) : null;
+			if (requestId !== refreshRequestId.current) return;
+			const next: ViewerItem[] = runtimeResult
+				? runtimeResult.files.map((item) => ({ ...item, id: item.path }))
+				: (artifactRecords ?? []).map((record) => ({
 					id: record.id,
 					name: record.name,
 					path: record.name,
@@ -141,13 +139,17 @@ export function RuntimeArtifactViewer({ delegationId, kind, live }: { delegation
 					state: "available" as const,
 					preview: previewForName(record.name),
 					artifact: record,
-				})));
+				}));
+			if (runtimeResult) setScopeAvailable(runtimeResult.scopeAvailable);
 			setItems(next);
 			setSelectedId((current) => current && next.some((item) => item.id === current) ? current : next[0]?.id ?? null);
 			setError(null);
 		} catch (reason) {
-			setError(reason instanceof Error ? reason.message : String(reason));
-		} finally { setLoading(false); }
+			if (requestId === refreshRequestId.current) setError(reason instanceof Error ? reason.message : String(reason));
+		} finally {
+			if (requestId === refreshRequestId.current) setLoading(false);
+			if (requestId === inFlightRequestId.current) inFlightRequestId.current = 0;
+		}
 	}, [delegationId, kind]);
 
 	useEffect(() => {
@@ -158,14 +160,16 @@ export function RuntimeArtifactViewer({ delegationId, kind, live }: { delegation
 			void refresh();
 		}, 0);
 		const timer = live ? setInterval(() => void refresh(), 4000) : undefined;
-		return () => { clearTimeout(initial); if (timer) clearInterval(timer); };
+		return () => { clearTimeout(initial); if (timer) clearInterval(timer); refreshRequestId.current += 1; inFlightRequestId.current = 0; };
 	}, [live, refresh]);
 
 	const selected = useMemo(() => items.find((item) => item.id === selectedId) ?? null, [items, selectedId]);
+	const selectedContentKey = selected ? JSON.stringify([delegationId, kind, selected.id, selected.updatedAt, selected.size, selected.artifact?.contentHash]) : null;
 
 	useEffect(() => {
 		const controller = new AbortController();
 		const initial = setTimeout(() => {
+			setContentKey(selectedContentKey);
 			setContent("");
 			setContentError(null);
 			if (!selected || selected.state === "deleted" || selected.preview === "external") {
@@ -185,7 +189,7 @@ export function RuntimeArtifactViewer({ delegationId, kind, live }: { delegation
 			});
 		}, 0);
 		return () => { clearTimeout(initial); controller.abort(); };
-	}, [delegationId, kind, selected]);
+	}, [delegationId, kind, selected, selectedContentKey]);
 
 	const openSelected = async () => {
 		if (!selected || selected.state === "deleted") return;
@@ -201,12 +205,13 @@ export function RuntimeArtifactViewer({ delegationId, kind, live }: { delegation
 			<aside className="runtime-file-sidebar">
 				<div className="runtime-file-list-head">
 					<div><strong>{kind === "runtime" ? "运行文件" : "交付物"}</strong><span>{items.length}</span></div>
-					<button type="button" onClick={() => void refresh()} aria-label="刷新文件" title="刷新"><RefreshCwIcon /></button>
+					<button type="button" onClick={() => void refresh(true)} aria-label="刷新文件" title="刷新"><RefreshCwIcon /></button>
 				</div>
 				<p className="runtime-file-source-note">{kind === "runtime" ? "当前工作副本 · 相对入场 baseline" : "登记时冻结 · 内容哈希可验证"}</p>
 				<div className="runtime-file-list">
 					{loading && !items.length ? <div className="runtime-file-empty"><Loader size={13} />加载中…</div> : null}
 					{error && !items.length ? <div className="runtime-file-empty text-destructive">{error}</div> : null}
+					{error && items.length ? <div className="runtime-file-empty text-destructive" role="alert">刷新失败：{error}；以下是上次读取的列表。</div> : null}
 					{!loading && !error && !items.length ? <div className="runtime-file-empty">{kind === "runtime" && !scopeAvailable ? "这次委托没有可归属的执行工作区" : kind === "runtime" ? "这次执行尚未产生文件变更" : "这次委托没有登记交付物"}</div> : null}
 					{items.map((item) => {
 						const Icon = fileIcon(item.preview);
@@ -222,7 +227,7 @@ export function RuntimeArtifactViewer({ delegationId, kind, live }: { delegation
 					<header className="runtime-file-preview-head">
 						<div className="min-w-0"><strong>{selected.name}</strong><span title={selected.path}>{selected.path}</span></div>
 						<div className="runtime-file-actions">
-							{kind === "artifacts" ? <Button asChild size="sm" variant="outline"><a href={artifactContentUrl(selected.id)} download={selected.name}><DownloadIcon />下载</a></Button> : null}
+							{kind === "artifacts" ? <Button asChild size="sm" variant="outline"><a href={artifactContentUrl(selected.id)} target="_blank" rel="noopener noreferrer"><DownloadIcon />下载</a></Button> : null}
 							<Button size="sm" disabled={selected.state === "deleted"} onClick={() => void openSelected()}><ExternalLinkIcon />系统打开</Button>
 						</div>
 					</header>
@@ -231,7 +236,7 @@ export function RuntimeArtifactViewer({ delegationId, kind, live }: { delegation
 						{selected.updatedAt ? <span>{new Date(selected.updatedAt).toLocaleString()}</span> : null}
 						{selected.artifact ? <span title={selected.artifact.contentHash}>SHA-256 · {selected.artifact.contentHash.slice(0, 12)}…</span> : <span>工作副本会随执行变化</span>}
 					</div>
-					<div className="runtime-file-preview-body"><Preview item={selected} content={content} loading={contentLoading} error={contentError} /></div>
+						<div className="runtime-file-preview-body"><Preview item={selected} content={contentKey === selectedContentKey ? content : ""} loading={contentKey !== selectedContentKey || contentLoading} error={contentKey === selectedContentKey ? contentError : null} /></div>
 				</> : <div className="runtime-file-empty">从左侧选择一个文件</div>}
 			</section>
 		</div>

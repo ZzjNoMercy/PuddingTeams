@@ -1,15 +1,57 @@
 import type { FastifyInstance } from "fastify";
-import { TeamsStore, agentDisplayName, type AgentConfig, type WindowConfig, type WindowType } from "../store/teams.js";
+import { TeamsStore, WindowSessionCleanupError, RoomCreationOperationConflictError, RoomCreationOperationGoneError, RoomWorkerUnavailableError, RoomWorkspaceUnavailableError, RoomSourceUnavailableError, RoomSourceChangedError, agentDisplayName, type AgentConfig, type RoomSourceSnapshot, type WindowConfig, type WindowType } from "../store/teams.js";
 import { PiSessionStore } from "../pi-bridge/session-store.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import { isWorkspaceDirectoryAvailable, type WorkspaceSummary } from "../store/workspaces.js";
 import type { WorkerBinding } from "../store/teams.js";
 import { WorkStateOperationConflictError, type WorkStateStore } from "../store/work-state.js";
 import type { ProductSettingsStore } from "../store/product-settings.js";
-import { realpath, stat } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { openNativeFile } from "../platform/native-file-opener.js";
+import { compareRoomActivity, RoomActivityProjector } from "./room-activity.js";
+import { SessionCreationOperations } from "../store/session-creation-operations.js";
+import { createHash } from "node:crypto";
+import { localViewerIdentity } from "./identity.js";
+import { identifyUploads, type FirstMessagePathReference, type UploadInput, type UploadStore } from "../store/uploads.js";
+import { internalFirstWorkFreezeToken, isWithin, localPathReferences } from "./chat.js";
+
+class FirstWorkMessageConflictError extends Error {
+	constructor() {
+		super("此操作预约的 Session 已有不同的首条用户消息；请核对原工作，不能自动重发");
+		this.name = "FirstWorkMessageConflictError";
+	}
+}
+
+class DeletedWorkSessionError extends Error {
+	constructor(readonly sessionId: string) {
+		super("此操作原先预约的 Session 已删除；如需继续，请明确作为新工作发起");
+		this.name = "DeletedWorkSessionError";
+	}
+}
+
+function userMessageText(content: unknown): string {
+	if (typeof content === "string") return content.trim();
+	if (!Array.isArray(content)) return "";
+	return content.filter((part): part is { type: string; text: string } =>
+		Boolean(part && typeof part === "object" && part.type === "text" && typeof part.text === "string"))
+		.map((part) => part.text).join("\n").trim();
+}
+
+async function durableUserMessageText(sessionFile: string | undefined, entryId: string): Promise<string | null> {
+	if (!sessionFile) return null;
+	try {
+		for (const line of (await readFile(sessionFile, "utf8")).split("\n")) {
+			if (!line) continue;
+			try {
+				const entry = JSON.parse(line) as { id?: string; type?: string; message?: { role?: string; content?: unknown } };
+				if (entry.id === entryId) return entry.type === "message" && entry.message?.role === "user" ? userMessageText(entry.message.content) : null;
+			} catch { /* Ignore an incomplete final JSONL line. */ }
+		}
+	} catch { /* Missing or unreadable Session file is not evidence of acceptance. */ }
+	return null;
+}
 
 export interface RoomSessionSummary {
 	id: string;
@@ -20,6 +62,8 @@ export interface RoomSessionSummary {
 	active: boolean;
 	/** 会话当前模型 ref（`${provider}/${modelId}`），composer 选择器的真值来源。 */
 	model?: string;
+	/** 会话当前 thinking level（§10.6），composer 选择器的真值来源。 */
+	thinkingLevel?: string;
 }
 
 export interface RoomSummary {
@@ -28,6 +72,12 @@ export interface RoomSummary {
 	name: string;
 	firstMessage: string;
 	modifiedAt: string;
+	lastActivityAt: string | null;
+	lastMessagePreview: string;
+	activitySessionId: string | null;
+	activityRevision: number;
+	readRevision: number;
+	hasUnreadActivity: boolean;
 	members: AgentConfig[];
 	sessions: RoomSessionSummary[];
 	activeSession: string;
@@ -43,8 +93,6 @@ export interface RoomSummary {
 	workspace: WorkspaceSummary | null;
 }
 
-const TYPE_ORDER: Record<WindowType, number> = { solo: 0, direct: 1, group: 2 };
-
 function autoTitle(w: WindowConfig, members: AgentConfig[]): string {
 	if (w.type === "solo") return "与 pi manager 对话";
 	// 标题渲染显示名（缺省回退 id）；w.members 里是内部 id。
@@ -56,6 +104,7 @@ async function buildWindowSummary(
 	sessions: PiSessionStore,
 	teams: TeamsStore,
 	w: WindowConfig,
+	projector = new RoomActivityProjector(),
 ): Promise<RoomSummary> {
 	const list = await sessions.list();
 	const byId = new Map(list.map((s) => [s.id, s]));
@@ -71,7 +120,7 @@ async function buildWindowSummary(
 		? (await teams.workspaces.list()).find((item) => item.id === w.workspaceId)
 		: undefined;
 	if (w.workspaceId && !workspace) throw new Error(`workspace not found: ${w.workspaceId}`);
-	const activeInfo = byId.get(active);
+	const { activity, read } = await projector.projectWithReadStatus(w.id, ids.map((id) => ({ id, sessionFile: byId.get(id)?.sessionFile ?? "" })), localViewerIdentity().user.id);
 	const contextAvailable = workspace
 		? workspace.available && workspace.canonicalPath === w.cwdSnapshot
 		: await isWorkspaceDirectoryAvailable(w.cwdSnapshot, w.cwdSnapshot);
@@ -82,7 +131,12 @@ async function buildWindowSummary(
 		type: w.type,
 		name: w.name || autoTitle(w, members),
 		firstMessage: byId.get(ids[0]!)?.firstMessage ?? "",
-		modifiedAt: activeInfo?.modifiedAt ?? w.createdAt,
+		modifiedAt: activity.lastActivityAt ?? w.createdAt,
+		...activity,
+		activitySessionId: read.unreadSessionId ?? activity.activitySessionId,
+		lastMessagePreview: read.unreadPreview ?? activity.lastMessagePreview,
+		readRevision: read.readRevision,
+		hasUnreadActivity: read.hasUnreadActivity,
 		members,
 		sessions: ids.map((id) => {
 			const info = byId.get(id);
@@ -93,6 +147,7 @@ async function buildWindowSummary(
 				modifiedAt: info?.modifiedAt ?? "",
 				active: id === active,
 				model: info?.model,
+				thinkingLevel: info?.thinkingLevel,
 			};
 		}),
 		activeSession: active,
@@ -116,9 +171,17 @@ export function registerRoomsRoutes(
 		additionalRoots?: readonly string[];
 		/** Platform attachment root; access is narrowed to this window's Session subdirectories. */
 		attachmentRoot?: string;
+		uploads?: UploadStore;
 		productSettings?: ProductSettingsStore;
+		activityStatePath?: string;
+		sessionCreationStatePath?: string;
 	},
 ): void {
+	const activityProjector = new RoomActivityProjector(localFiles?.activityStatePath);
+	const sessionCreationOperations = localFiles?.sessionCreationStatePath
+		? new SessionCreationOperations(localFiles.sessionCreationStatePath) : null;
+	const pendingSessionCreations = new Map<string, Promise<Awaited<ReturnType<PiSessionStore["create"]>>>>();
+	const pendingNewWork = new Map<string, Promise<{ sessionId: string; accepted: boolean }>>();
 	const openLocalFile = localFiles?.open ?? openNativeFile;
 	const additionalFileRoots = localFiles?.additionalRoots ?? [];
 	const attachmentRoot = localFiles?.attachmentRoot;
@@ -176,12 +239,12 @@ export function registerRoomsRoutes(
 		const windows = await teams.listWindows();
 		for (const w of windows) await ensureWindowAlive(w);
 		const rooms: RoomSummary[] = [];
-		for (const w of windows) rooms.push(await buildWindowSummary(sessions, teams, w));
-		rooms.sort(
-			(a, b) =>
-				TYPE_ORDER[a.type] - TYPE_ORDER[b.type] ||
-				new Date(b.modifiedAt).getTime() - new Date(a.modifiedAt).getTime(),
-		);
+		for (const w of windows) rooms.push(await buildWindowSummary(sessions, teams, w, activityProjector));
+		const created = new Map(windows.map((w) => [w.id, w.createdAt]));
+		rooms.sort((a, b) => compareRoomActivity(
+			{ id: a.id, lastActivityAt: a.lastActivityAt, createdAt: created.get(a.id) ?? "" },
+			{ id: b.id, lastActivityAt: b.lastActivityAt, createdAt: created.get(b.id) ?? "" },
+		));
 		return { rooms, defaultCwdSnapshot: teams.defaultContextCwd() };
 	});
 
@@ -189,7 +252,57 @@ export function registerRoomsRoutes(
 		const w = await teams.getWindow(req.params.id);
 		if (!w) return reply.code(404).send({ error: "window not found" });
 		await ensureWindowAlive(w);
-		return { room: await buildWindowSummary(sessions, teams, w) };
+		return { room: await buildWindowSummary(sessions, teams, w, activityProjector) };
+	});
+
+	/** M1 search includes durable Manager work parked under other Workspaces. */
+	app.get<{ Params: { id: string } }>("/api/rooms/:id/work-index", async (req, reply) => {
+		if (req.params.id === "solo") await ensureSolo();
+		const room = await teams.getWindow(req.params.id);
+		if (!room || room.type !== "solo") return reply.code(404).send({ error: "Manager 工作台不存在" });
+		const [listed, workspaces] = await Promise.all([sessions.list(), teams.workspaces.list()]);
+		const byId = new Map(listed.map((session) => [session.id, session]));
+		const workspaceNames = new Map(workspaces.map((workspace) => [workspace.id, workspace.name]));
+		const contexts = [
+			{ workspaceId: room.workspaceId, sessions: room.sessions, active: true },
+			...Object.values(room.parkedContexts).map((context) => ({ workspaceId: context.workspaceId, sessions: context.sessions, active: false })),
+		];
+		const works = contexts.flatMap((context) => context.sessions.flatMap((id) => {
+			const session = byId.get(id);
+			const firstMessage = session?.firstMessage.trim();
+			if (!session || !firstMessage || firstMessage === "(no messages)" || firstMessage === "新对话") return [];
+			const name = session.name?.trim();
+			const title = name && name !== "(no messages)" && name !== "新对话" ? name : firstMessage;
+			return [{
+				sessionId: id,
+				title,
+				firstMessage,
+				workspaceId: context.workspaceId ?? null,
+				workspaceName: context.workspaceId ? workspaceNames.get(context.workspaceId) ?? "已移除项目" : "默认工作目录",
+				modifiedAt: session.modifiedAt,
+				active: context.active,
+			}];
+		}));
+		works.sort((a, b) => Date.parse(b.modifiedAt) - Date.parse(a.modifiedAt) || a.sessionId.localeCompare(b.sessionId));
+		return { works };
+	});
+
+	app.put<{ Params: { id: string }; Body: { activityRevision?: number; sessionId?: string } }>("/api/rooms/:id/read-watermark", async (req, reply) => {
+		const w = await teams.getWindow(req.params.id);
+		if (!w) return reply.code(404).send({ error: "window not found" });
+		if (!Number.isSafeInteger(req.body?.activityRevision) || (req.body?.activityRevision ?? -1) < 0) {
+			return reply.code(400).send({ error: "activityRevision 必须是非负整数" });
+		}
+		if (typeof req.body?.sessionId !== "string" || !w.sessions.includes(req.body.sessionId)) {
+			return reply.code(400).send({ error: "sessionId 必须属于该房间" });
+		}
+		try {
+			await buildWindowSummary(sessions, teams, w, activityProjector);
+			const { activityRevision, read } = await activityProjector.markReadWithStatus(w.id, localViewerIdentity().user.id, req.body.sessionId, req.body.activityRevision!);
+			return { readRevision: read.readRevision, activityRevision, hasUnreadActivity: read.hasUnreadActivity };
+		} catch (error) {
+			return reply.code(409).send({ error: error instanceof Error ? error.message : String(error) });
+		}
 	});
 
 	/** Open a file or directory referenced by chat markdown. Relative paths resolve from the
@@ -249,39 +362,60 @@ export function registerRoomsRoutes(
 			const type = req.body?.type;
 			const members = [...new Set(req.body?.members ?? [])];
 			const workspaceId = req.body?.workspaceId?.trim() || undefined;
+			const rawOperationKey = req.headers["idempotency-key"];
+			if (type === "group" && (typeof rawOperationKey !== "string" || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(rawOperationKey))) {
+				return reply.code(400).send({ error: "创建群聊需要有效的 Idempotency-Key", code: "room_operation_invalid" });
+			}
+			const creationOperation = type === "group" && typeof rawOperationKey === "string"
+				? { key: rawOperationKey, requestHash: createHash("sha256").update(JSON.stringify({
+					type, members: [...members].sort(), workspaceId: workspaceId ?? null,
+					name: req.body?.name?.trim() || null, prompt: req.body?.prompt?.trim() || null,
+				})).digest("hex") }
+				: undefined;
+			if (creationOperation) {
+				try {
+					const previous = await teams.findGroupByCreationOperation(creationOperation.key, creationOperation.requestHash);
+					if (previous) return { room: await buildWindowSummary(sessions, teams, previous, activityProjector), existed: true };
+				} catch (err) {
+					if (err instanceof RoomCreationOperationConflictError) return reply.code(409).send({ error: err.message, code: "room_operation_conflict" });
+					if (err instanceof RoomCreationOperationGoneError) return reply.code(409).send({ error: err.message, code: "room_operation_gone" });
+					if (teams.durabilityUncertain()) return reply.code(409).send({ error: "房间创建结果未确认；请重启服务并回读房间列表，勿直接重复发起", code: "room_creation_uncertain" });
+					throw err;
+				}
+			}
 			if (workspaceId) {
 				try {
 					await teams.workspaces.require(workspaceId);
 				} catch (err) {
-					return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+					return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code: "workspace_unavailable" });
 				}
 			}
-			const context = await teams.contextForWorkspace(workspaceId);
+			let context: Awaited<ReturnType<typeof teams.contextForWorkspace>>;
+			try { context = await teams.contextForWorkspace(workspaceId); }
+			catch (err) { return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code: "workspace_unavailable" }); }
 			if (type !== "direct" && type !== "group") {
 				return reply
 					.code(400)
 					.send({ error: 'type 必须是 "direct"（单聊）或 "group"（群聊）；solo 是置顶单例，不能手动创建' });
 			}
-			if (type === "direct") {
-				if (members.length !== 1) return reply.code(400).send({ error: "单聊需要恰好 1 个 worker" });
-				const existing = await teams.findDirectWindow(members[0]!, workspaceId);
-				if (existing) {
-					return { room: await buildWindowSummary(sessions, teams, existing), existed: true };
-				}
-			} else if (members.length < 2) {
+			if (type === "direct" && members.length !== 1) {
+				return reply.code(400).send({ error: "单聊需要恰好 1 个 worker" });
+			}
+			if (type === "group" && members.length < 2) {
 				return reply.code(400).send({ error: "群聊至少需要 2 个 worker" });
 			}
 			const agents = await teams.listAgents();
-			const known = new Set(agents.map((a) => a.name));
-			const pinned = new Set(agents.filter((a) => a.pinned).map((a) => a.name));
+			const byName = new Map(agents.map((agent) => [agent.name, agent]));
 			for (const m of members) {
-				if (!known.has(m)) return reply.code(400).send({ error: `worker not found: ${m}` });
-				if (pinned.has(m)) return reply.code(400).send({ error: `「${m}」是内置 manager，不能作为窗口成员` });
+				const agent = byName.get(m);
+				if (!agent) return reply.code(400).send({ error: `worker not found: ${m}`, code: "worker_unavailable" });
+				if (agent.pinned) return reply.code(400).send({ error: `「${m}」是内置 manager，不能作为窗口成员` });
+				if (agent.enabled === false) return reply.code(409).send({ error: `worker「${m}」已停用，不能发起新对话`, code: "worker_disabled" });
 			}
 			try {
 				if (type === "direct") {
 					let createdHere = false;
-					const w = await teams.ensureDirectWindow(members[0]!, workspaceId, async () => {
+					const w = await teams.ensureDirectWindow(members[0]!, workspaceId, async (reservedId) => {
 						createdHere = true;
 						return sessions.create(undefined, {
 							type,
@@ -289,17 +423,11 @@ export function registerRoomsRoutes(
 							prompt: req.body?.prompt,
 							workspaceId,
 							cwd: context.cwdSnapshot,
-						});
-					}, { name: req.body?.name, prompt: req.body?.prompt, cwdSnapshot: context.cwdSnapshot });
-					return { room: await buildWindowSummary(sessions, teams, w), existed: !createdHere };
+						}, reservedId);
+					}, { name: req.body?.name, prompt: req.body?.prompt, cwdSnapshot: context.cwdSnapshot, requireEnabledMember: true, rollbackSession: (id) => sessions.remove(id), journalSession: true });
+					return { room: await buildWindowSummary(sessions, teams, w, activityProjector), existed: !createdHere };
 				}
-				const created = await sessions.create(undefined, {
-					type,
-					members,
-					prompt: req.body?.prompt,
-					workspaceId,
-					cwd: context.cwdSnapshot,
-				});
+				let createdHere = false;
 				const w = await teams.createWindow({
 					type,
 					members,
@@ -307,11 +435,33 @@ export function registerRoomsRoutes(
 					cwdSnapshot: context.cwdSnapshot,
 					name: req.body?.name,
 					prompt: req.body?.prompt,
-					sessionId: created.id,
+					requireEnabledMembers: true,
+					journalSession: true,
+					creationOperation,
+					createSession: (reservedId) => { createdHere = true; return sessions.create(undefined, {
+						type,
+						members,
+						prompt: req.body?.prompt,
+						workspaceId,
+						cwd: context.cwdSnapshot,
+					}, reservedId); },
+					rollbackSession: (id) => sessions.remove(id),
 				});
-				return { room: await buildWindowSummary(sessions, teams, w), existed: false };
+				return { room: await buildWindowSummary(sessions, teams, w, activityProjector), existed: !createdHere };
 			} catch (err) {
-				return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+				if (err instanceof RoomCreationOperationConflictError) return reply.code(409).send({ error: err.message, code: "room_operation_conflict" });
+				if (err instanceof RoomCreationOperationGoneError) return reply.code(409).send({ error: err.message, code: "room_operation_gone" });
+				if (teams.durabilityUncertain()) {
+					return reply.code(409).send({ error: "房间创建结果未确认；请重启服务并回读房间列表，勿直接重复发起", code: "room_creation_uncertain" });
+				}
+				if (err instanceof WindowSessionCleanupError) {
+					app.log.error({ err, sessionId: err.sessionId }, "room creation Session cleanup failed");
+					return reply.code(500).send({ error: err.message, code: "room_session_cleanup_failed" });
+				}
+				if (err instanceof RoomWorkerUnavailableError) return reply.code(400).send({ error: err.message, code: "worker_unavailable" });
+				if (err instanceof RoomWorkspaceUnavailableError) return reply.code(400).send({ error: err.message, code: "workspace_unavailable" });
+				const message = err instanceof Error ? err.message : String(err);
+				return reply.code(message.includes("已停用") ? 409 : 400).send({ error: message, ...(message.includes("已停用") ? { code: "worker_disabled" } : {}) });
 			}
 		},
 	);
@@ -333,19 +483,21 @@ export function registerRoomsRoutes(
 					members: req.body.members,
 					prompt: req.body.prompt,
 				});
-				return { room: await buildWindowSummary(sessions, teams, w) };
+				return { room: await buildWindowSummary(sessions, teams, w, activityProjector) };
 			} catch (err) {
-				return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+				if (teams.durabilityUncertain()) {
+					return reply.code(409).send({ error: "房间修改结果未确认；请重启服务并回读房间列表，勿直接重复修改", code: "room_update_uncertain" });
+				}
+				const message = err instanceof Error ? err.message : String(err);
+				return reply.code(message.includes("已停用") ? 409 : 400).send({ error: message, ...(message.includes("已停用") ? { code: "worker_disabled" } : {}) });
 			}
 		},
 	);
 
 	/** direct/group 切项目创建或打开独立窗口；仅 solo 原地停放/恢复 Workspace context。 */
-	app.post<{ Params: { id: string }; Body: { workspaceId?: string | null; mode?: "new_window" | "in_place" } }>(
+	app.post<{ Params: { id: string }; Body: { workspaceId?: string | null; mode?: "new_window" | "in_place"; source?: { type: WindowType; name: string; members: string[]; prompt: string; workspaceId: string | null; cwdSnapshot: string } } }>(
 		"/api/rooms/:id/switch-workspace",
 		async (req, reply) => {
-			const source = await teams.getWindow(req.params.id);
-			if (!source) return reply.code(404).send({ error: "window not found" });
 			if (!req.body || !("workspaceId" in req.body)) {
 				return reply.code(400).send({ error: "workspaceId is required; use null for no workspace" });
 			}
@@ -354,17 +506,70 @@ export function registerRoomsRoutes(
 				return reply.code(400).send({ error: "workspaceId must be a non-empty string or null" });
 			}
 			const workspaceId = rawWorkspaceId === null ? undefined : rawWorkspaceId!.trim();
+			const rawOperationKey = req.headers["idempotency-key"];
+			if (rawOperationKey !== undefined && (typeof rawOperationKey !== "string" || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(rawOperationKey))) {
+				return reply.code(400).send({ error: "群聊 Idempotency-Key 格式无效", code: "room_operation_invalid" });
+			}
+			const creationOperation = req.body.mode !== "in_place" && typeof rawOperationKey === "string"
+				? { key: rawOperationKey, requestHash: createHash("sha256").update(JSON.stringify({
+					operation: "group-workspace-switch", sourceId: req.params.id, workspaceId: workspaceId ?? null, source: req.body.source ?? null,
+				})).digest("hex") }
+				: undefined;
+			if (creationOperation) {
+				try {
+					const previous = await teams.findGroupByCreationOperation(creationOperation.key, creationOperation.requestHash);
+					if (previous) return { room: await buildWindowSummary(sessions, teams, previous, activityProjector), existed: true, restored: true };
+				} catch (err) {
+					if (err instanceof RoomCreationOperationConflictError) return reply.code(409).send({ error: err.message, code: "room_operation_conflict" });
+					if (err instanceof RoomCreationOperationGoneError) return reply.code(409).send({ error: err.message, code: "room_operation_gone" });
+					if (teams.durabilityUncertain()) return reply.code(409).send({ error: "房间切换结果未确认；请重启服务并回读房间列表，勿直接重复发起", code: "room_switch_uncertain" });
+					throw err;
+			}
+			}
+			const sourceWindow = await teams.getWindow(req.params.id);
+			if (!sourceWindow) return reply.code(404).send({ error: "window not found", code: "room_source_unavailable" });
+			const source = structuredClone(sourceWindow);
+			let sourceSnapshot: RoomSourceSnapshot | undefined;
+			if (source.type !== "solo" && req.body.mode !== "in_place") {
+				const supplied = req.body.source;
+				if (!supplied || (supplied.type !== "direct" && supplied.type !== "group") || typeof supplied.name !== "string" ||
+					!Array.isArray(supplied.members) || supplied.members.some((member) => typeof member !== "string") ||
+					typeof supplied.prompt !== "string" || (supplied.workspaceId !== null && typeof supplied.workspaceId !== "string") ||
+					typeof supplied.cwdSnapshot !== "string") {
+					return reply.code(400).send({ error: "跨项目发起需要来源房间快照", code: "room_source_invalid" });
+				}
+				const configuredAgents = await teams.listAgents();
+				const displayMembers = source.members.map((member) => configuredAgents.find((agent) => agent.name === member)).filter((agent): agent is AgentConfig => Boolean(agent));
+				const actualName = source.name || autoTitle(source, displayMembers);
+				if (supplied.type !== source.type || supplied.name !== actualName || supplied.prompt !== (source.prompt ?? "") ||
+					supplied.workspaceId !== (source.workspaceId ?? null) || supplied.cwdSnapshot !== source.cwdSnapshot ||
+					supplied.members.length !== source.members.length || supplied.members.some((member, index) => member !== source.members[index])) {
+					return reply.code(409).send({ error: "来源房间配置已变化；请刷新房间后重新发起", code: "room_source_changed" });
+				}
+				sourceSnapshot = { id: source.id, type: source.type, name: source.name, members: [...source.members], prompt: source.prompt, workspaceId: source.workspaceId, cwdSnapshot: source.cwdSnapshot };
+			}
+			if (source.type === "group" && req.body.mode !== "in_place" && !creationOperation) {
+				return reply.code(400).send({ error: "跨项目新建群聊需要 Idempotency-Key", code: "room_operation_invalid" });
+			}
 			let target;
 			try {
 				target = await teams.contextForWorkspace(workspaceId);
 			} catch (err) {
-				return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+				return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), ...(err instanceof RoomWorkspaceUnavailableError ? { code: "workspace_unavailable" } : {}) });
 			}
 			if (workspaceId === source.workspaceId && target.cwdSnapshot === source.cwdSnapshot) {
-				return { room: await buildWindowSummary(sessions, teams, source), existed: true, restored: true };
+				return { room: await buildWindowSummary(sessions, teams, source, activityProjector), existed: true, restored: true };
 			}
 			if (req.body?.mode === "in_place" && source.type !== "solo") {
 				return reply.code(400).send({ error: "单聊和群聊按项目使用独立窗口，不能替换当前窗口的 Workspace" });
+			}
+			if (req.body?.mode !== "in_place" && source.type !== "solo") {
+				const agents = new Map((await teams.listAgents()).map((agent) => [agent.name, agent]));
+				for (const member of source.members) {
+					const agent = agents.get(member);
+					if (!agent) return reply.code(400).send({ error: `worker not found: ${member}`, code: "worker_unavailable" });
+					if (agent.enabled === false) return reply.code(409).send({ error: `worker「${member}」已停用，不能发起新对话`, code: "worker_disabled" });
+				}
 			}
 			try {
 				if (req.body?.mode !== "in_place") {
@@ -373,22 +578,25 @@ export function registerRoomsRoutes(
 						members: source.members,
 						prompt: source.prompt,
 						workspaceId,
-					cwd: target.cwdSnapshot,
+						cwd: target.cwdSnapshot,
 					};
 					if (source.type === "direct") {
-						const existing = await teams.findDirectWindow(source.members[0]!, workspaceId, target.cwdSnapshot);
+						let createdHere = false;
 						const next = await teams.ensureDirectWindow(
 							source.members[0]!,
 							workspaceId,
-							() => sessions.create(undefined, ctx),
-							{ name: source.name, prompt: source.prompt, cwdSnapshot: target.cwdSnapshot },
+							(reservedId) => {
+								createdHere = true;
+								return sessions.create(undefined, ctx, reservedId);
+							},
+							{ name: source.name, prompt: source.prompt, cwdSnapshot: target.cwdSnapshot, requireEnabledMember: true, rollbackSession: (id) => sessions.remove(id), journalSession: true, sourceSnapshot },
 						);
-						return { room: await buildWindowSummary(sessions, teams, next), existed: Boolean(existing), restored: Boolean(existing) };
+						return { room: await buildWindowSummary(sessions, teams, next, activityProjector), existed: !createdHere, restored: !createdHere };
 					}
 					if (source.type === "solo") {
 						return reply.code(400).send({ error: "solo 项目切换必须使用 in_place" });
 					}
-					const created = await sessions.create(undefined, ctx);
+					let createdHere = false;
 					const next = await teams.createWindow({
 						type: source.type,
 						members: source.members,
@@ -396,9 +604,14 @@ export function registerRoomsRoutes(
 						prompt: source.prompt,
 						workspaceId,
 						cwdSnapshot: target.cwdSnapshot,
-						sessionId: created.id,
+						requireEnabledMembers: true,
+						journalSession: true,
+						creationOperation,
+						sourceSnapshot,
+						createSession: (reservedId) => { createdHere = true; return sessions.create(undefined, ctx, reservedId); },
+						rollbackSession: (id) => sessions.remove(id),
 					});
-					return { room: await buildWindowSummary(sessions, teams, next), existed: false, restored: false };
+					return { room: await buildWindowSummary(sessions, teams, next, activityProjector), existed: !createdHere, restored: !createdHere };
 				}
 				if (!invoker) throw new Error("in-place workspace switching is unavailable");
 				const switched = await invoker.switchWorkspaceInPlace(
@@ -436,9 +649,23 @@ export function registerRoomsRoutes(
 						).catch(() => undefined);
 					}
 				}
-				return { room: await buildWindowSummary(sessions, teams, current), existed: switched.existed, restored: switched.restored };
+				return { room: await buildWindowSummary(sessions, teams, current, activityProjector), existed: switched.existed, restored: switched.restored };
 			} catch (err) {
-				return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+				if (err instanceof RoomCreationOperationConflictError) return reply.code(409).send({ error: err.message, code: "room_operation_conflict" });
+				if (err instanceof RoomCreationOperationGoneError) return reply.code(409).send({ error: err.message, code: "room_operation_gone" });
+				if (teams.durabilityUncertain()) {
+					return reply.code(409).send({ error: "房间切换结果未确认；请重启服务并回读房间列表，勿直接重复发起", code: "room_switch_uncertain" });
+				}
+				if (err instanceof WindowSessionCleanupError) {
+					app.log.error({ err, sessionId: err.sessionId }, "workspace switch Session cleanup failed");
+					return reply.code(500).send({ error: err.message, code: "room_session_cleanup_failed" });
+				}
+				if (err instanceof RoomWorkerUnavailableError) return reply.code(400).send({ error: err.message, code: "worker_unavailable" });
+				if (err instanceof RoomWorkspaceUnavailableError) return reply.code(400).send({ error: err.message, code: "workspace_unavailable" });
+				if (err instanceof RoomSourceUnavailableError) return reply.code(404).send({ error: err.message, code: "room_source_unavailable" });
+				if (err instanceof RoomSourceChangedError) return reply.code(409).send({ error: err.message, code: "room_source_changed" });
+				const message = err instanceof Error ? err.message : String(err);
+				return reply.code(message.includes("已停用") ? 409 : 400).send({ error: message, ...(message.includes("已停用") ? { code: "worker_disabled" } : {}) });
 			}
 		},
 	);
@@ -478,12 +705,21 @@ export function registerRoomsRoutes(
 	app.get<{ Params: { id: string } }>("/api/rooms/:id/sessions", async (req, reply) => {
 		const w = await teams.getWindow(req.params.id);
 		if (!w) return reply.code(404).send({ error: "window not found" });
-		const summary = await buildWindowSummary(sessions, teams, w);
+		const summary = await buildWindowSummary(sessions, teams, w, activityProjector);
 		return { sessions: summary.sessions, active: summary.activeSession };
 	});
 
+	/** Resolve a Manager deep link without treating a parked Session as active. */
+	app.get<{ Params: { id: string; sid: string } }>("/api/rooms/:id/sessions/:sid/location", async (req, reply) => {
+		const room = await teams.getWindow(req.params.id);
+		if (!room || room.type !== "solo") return reply.code(404).send({ error: "Manager 工作台不存在" });
+		const context = await teams.contextForSession(req.params.sid);
+		if (!context || context.window.id !== room.id) return reply.code(404).send({ error: "目标工作记录不存在或不属于 Manager" });
+		return { roomId: room.id, sessionId: req.params.sid, workspaceId: context.workspaceId ?? null, active: context.active };
+	});
+
 	/** 窗口内新建一个 pi session 并激活。 */
-	app.post<{ Params: { id: string }; Body: { goal?: string; completionBoundary?: string; reviewMode?: "manager" | "independent"; reviewerModel?: string } }>("/api/rooms/:id/sessions", async (req, reply) => {
+	app.post<{ Params: { id: string }; Body: { goal?: string; completionBoundary?: string; reviewMode?: "manager" | "independent"; reviewerModel?: string; initialContentHash?: string; expectedWorkspaceId?: string | null; expectedCwdSnapshot?: string } }>("/api/rooms/:id/sessions", async (req, reply) => {
 		const w = await teams.getWindow(req.params.id);
 		if (!w) return reply.code(404).send({ error: "window not found" });
 		const requestedGoal = req.body?.goal?.trim();
@@ -506,6 +742,50 @@ export function registerRoomsRoutes(
 		}
 		if (requestedGoal && localFiles?.productSettings && (await localFiles.productSettings.get()).harness.goalActivation[w.type] === "disabled") {
 			return reply.code(403).send({ error: `Harness 已禁用 ${w.type} Goal` });
+		}
+		if (!requestedGoal && goalOperationId) {
+			if (!sessionCreationOperations) return reply.code(503).send({ error: "Session 幂等存储未配置" });
+			if ("expectedWorkspaceId" in (req.body ?? {}) && (req.body.expectedWorkspaceId !== (w.workspaceId ?? null)
+				|| req.body.expectedCwdSnapshot !== w.cwdSnapshot)) {
+				return reply.code(409).send({ error: "Manager 已切换项目，请回到原项目后重试", code: "workspace_context_changed" });
+			}
+			try {
+				const contextKey = JSON.stringify([w.workspaceId ?? null, w.cwdSnapshot]);
+				const current = await buildWindowSummary(sessions, teams, w, activityProjector);
+				const idleCandidate = w.type === "solo" && w.sessions.length === 1 && !current.lastActivityAt
+					? await sessions.open(w.activeSession).catch(() => undefined) : undefined;
+				const preferredSessionId = idleCandidate?.messages.length === 0 ? w.activeSession : undefined;
+				const operation = await sessionCreationOperations.reserve(goalOperationId, w.id, contextKey, preferredSessionId, req.body?.initialContentHash);
+				let pending = pendingSessionCreations.get(goalOperationId);
+				if (!pending) {
+					pending = (async () => {
+						const listed = (await sessions.list()).find((item) => item.id === operation.sessionId);
+						const owner = await teams.windowForSession(operation.sessionId);
+						if (operation.phase === "attached" && !listed && !owner) throw new DeletedWorkSessionError(operation.sessionId);
+						if (operation.phase === "attached" && (!listed || owner?.id !== w.id)) {
+							throw new Error("幂等 Session 已提交但不存在或归属改变");
+						}
+						if (owner && owner.id !== w.id) throw new Error("幂等 Session 属于其他房间");
+						if (!listed && operation.phase === "reserved") await sessions.create(undefined, await contextFor(w), operation.sessionId);
+						if (operation.phase === "reserved") await teams.addWindowSession(w.id, operation.sessionId);
+						await sessionCreationOperations.markAttached(goalOperationId, operation.sessionId);
+						const session = (await sessions.list()).find((item) => item.id === operation.sessionId);
+						if (!session) throw new Error("幂等 Session 创建后不可读取");
+						return session;
+					})();
+					pendingSessionCreations.set(goalOperationId, pending);
+					void pending.finally(() => {
+						if (pendingSessionCreations.get(goalOperationId) === pending) pendingSessionCreations.delete(goalOperationId);
+					}).catch(() => undefined);
+				}
+				return { session: await pending, workState: null };
+			} catch (err) {
+				return reply.code(409).send({
+					error: err instanceof Error ? err.message : String(err),
+					code: err instanceof DeletedWorkSessionError ? "session_creation_deleted" : "idempotent_session_conflict",
+					...(err instanceof DeletedWorkSessionError ? { sessionId: err.sessionId } : {}),
+				});
+			}
 		}
 		let createdId: string | undefined;
 		try {
@@ -534,6 +814,108 @@ export function registerRoomsRoutes(
 			}
 			if (err instanceof WorkStateOperationConflictError) return reply.code(409).send({ error: err.message, code: err.code });
 			return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+		}
+	});
+
+	/** First Manager send owns one durable Session identity across HTTP retries. */
+	app.post<{ Params: { id: string }; Body: { content?: string; modelRef?: string; thinkingLevel?: string; attachments?: UploadInput[]; workspaceId?: string | null; cwdSnapshot?: string } }>("/api/rooms/:id/new-work", { bodyLimit: 28 * 1024 * 1024 }, async (req, reply) => {
+		const room = await teams.getWindow(req.params.id);
+		if (!room || room.type !== "solo") return reply.code(404).send({ error: "Manager 工作台不存在" });
+		if (!req.body || !("workspaceId" in req.body) || typeof req.body.cwdSnapshot !== "string") {
+			return reply.code(400).send({ error: "新工作必须指定发起时的 Workspace context" });
+		}
+		if (req.body.workspaceId !== (room.workspaceId ?? null) || req.body.cwdSnapshot !== room.cwdSnapshot) {
+			return reply.code(409).send({ error: "Manager 已切换项目，请回到原项目后重试", code: "workspace_context_changed" });
+		}
+		const content = req.body?.content?.trim();
+		if (!content || content.length > 100_000) return reply.code(400).send({ error: "新工作内容必须为 1–100000 字符" });
+		if (req.body.modelRef !== undefined && (typeof req.body.modelRef !== "string" || !req.body.modelRef.trim() || req.body.modelRef.length > 512)) {
+			return reply.code(400).send({ error: "新工作模型引用无效" });
+		}
+		const modelRef = req.body.modelRef?.trim();
+		// 思考强度与模型同为预约身份的一部分（§10.6）：改档位等同改模型，须换操作键。
+		if (req.body.thinkingLevel !== undefined && (typeof req.body.thinkingLevel !== "string" || !req.body.thinkingLevel.trim() || req.body.thinkingLevel.length > 32)) {
+			return reply.code(400).send({ error: "新工作思考强度无效" });
+		}
+		const thinkingLevel = req.body.thinkingLevel?.trim();
+		let attachmentIdentities;
+		try { attachmentIdentities = identifyUploads(req.body.attachments ?? []); }
+		catch (err) { return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) }); }
+		if (attachmentIdentities.length && !localFiles?.uploads) return reply.code(400).send({ error: "平台未启用会话附件冻结" });
+		const key = typeof req.headers["idempotency-key"] === "string" ? req.headers["idempotency-key"].trim() : "";
+		if (!key) return reply.code(400).send({ error: "新工作需要 Idempotency-Key" });
+		const contentHash = createHash("sha256").update(JSON.stringify([content, modelRef ?? null, thinkingLevel ?? null, attachmentIdentities])).digest("hex");
+		const freezeId = createHash("sha256").update(JSON.stringify([key, contentHash])).digest("hex");
+		const creation = await app.inject({
+			method: "POST",
+			url: `/api/rooms/${encodeURIComponent(room.id)}/sessions`,
+			headers: { "idempotency-key": key },
+			payload: { initialContentHash: contentHash, expectedWorkspaceId: req.body.workspaceId, expectedCwdSnapshot: req.body.cwdSnapshot },
+		});
+		if (creation.statusCode !== 200) return reply.code(creation.statusCode).send(creation.json());
+		const sessionId = (creation.json() as { session: { id: string } }).session.id;
+		const sessionContext = await teams.contextForSession(sessionId);
+		if (!sessionContext || sessionContext.window.id !== room.id || sessionContext.workspaceId !== (req.body.workspaceId ?? undefined)
+			|| sessionContext.cwdSnapshot !== req.body.cwdSnapshot || !sessionContext.active) {
+			return reply.code(409).send({ error: "Manager 项目在创建期间发生变化，请回到原项目后重试", code: "workspace_context_changed" });
+		}
+		let pending = pendingNewWork.get(key);
+		if (!pending) {
+			pending = (async () => {
+				const session = await sessions.open(sessionId);
+				const firstUserEntry = session.sessionManager.getBranch().find((entry) => entry.type === "message" && entry.message.role === "user");
+				if (firstUserEntry || session.messages.some((message) => message.role === "user")) {
+					if (firstUserEntry?.type !== "message" || firstUserEntry.message.role !== "user") {
+						throw new Error("首次发送尚未写入会话记录，请保留原操作键重试");
+					}
+					const message = await durableUserMessageText(session.sessionFile, firstUserEntry.id);
+					if (message === null) throw new Error("首次发送尚未写入会话记录，请保留原操作键重试");
+					const workspaceRoot = await realpath(room.cwdSnapshot).catch(() => path.resolve(room.cwdSnapshot));
+					const workspacePath = path.resolve(room.cwdSnapshot);
+					const pathReferences = (await Promise.all(localPathReferences(content).map(async (reference): Promise<FirstMessagePathReference | null> => {
+						const lexical = path.resolve(reference.absolutePath);
+						const canonical = await realpath(reference.absolutePath).catch(() => undefined);
+						if (canonical) return isWithin(canonical, workspaceRoot) ? null : { token: reference.token, required: true };
+						const definitelyExternal = !isWithin(lexical, workspaceRoot) && !isWithin(lexical, workspacePath);
+						return { token: reference.token, required: definitelyExternal };
+					}))).filter((reference): reference is FirstMessagePathReference => reference !== null);
+					const matches = localFiles?.uploads
+						? await localFiles.uploads.matchesFirstMessage(sessionId, message, content, attachmentIdentities, pathReferences)
+						: pathReferences.every((reference) => !reference.required) && attachmentIdentities.length === 0 && message === content;
+					if (!matches) throw new FirstWorkMessageConflictError();
+				}
+				if (!firstUserEntry && !session.messages.some((message) => message.role === "user")) {
+					if (sessions.isRunning(sessionId)) throw new Error("首次发送仍在处理，请保留原操作键稍后重试");
+					if (session.sessionManager.getBranch().some((entry) => entry.type === "message")) throw new FirstWorkMessageConflictError();
+					await localFiles?.uploads?.discardUnacceptedFirstWork(sessionId, freezeId);
+					const selectedModel = modelRef ? await sessions.setModel(sessionId, modelRef) : session.model;
+					if (!selectedModel || !(await sessions.hasModelAuth(selectedModel.provider))) {
+						throw new Error("请先为 Manager 配置模型；新工作草稿和 Session 已保留，可重试发送");
+					}
+					// 档位与模型同样在首发前落到预约 Session；非法值由 store 拒绝。
+					if (thinkingLevel) await sessions.setThinkingLevel(sessionId, thinkingLevel);
+					const sent = await app.inject({
+						method: "POST",
+						url: `/api/sessions/${encodeURIComponent(sessionId)}/messages`,
+						headers: { "x-puddingteams-await-preflight": "1", "x-puddingteams-first-work-freeze-id": freezeId, "x-puddingteams-first-work-token": internalFirstWorkFreezeToken },
+						payload: { content, attachments: req.body.attachments ?? [] },
+					});
+					if (sent.statusCode !== 200) throw new Error((sent.json() as { error?: string }).error ?? `首次发送失败：${sent.statusCode}`);
+				}
+				return { sessionId, accepted: true };
+			})();
+			pendingNewWork.set(key, pending);
+			void pending.finally(() => {
+				if (pendingNewWork.get(key) === pending) pendingNewWork.delete(key);
+			}).catch(() => undefined);
+		}
+		try { return await pending; }
+		catch (err) {
+			return reply.code(err instanceof FirstWorkMessageConflictError ? 409 : 400).send({
+				error: err instanceof Error ? err.message : String(err),
+				sessionId,
+				...(err instanceof FirstWorkMessageConflictError ? { code: "first_message_conflict" } : {}),
+			});
 		}
 	});
 
@@ -582,7 +964,7 @@ export function registerRoomsRoutes(
 			}
 			try {
 				await sessions.rename(req.params.sid, req.body.name);
-				const summary = await buildWindowSummary(sessions, teams, w);
+				const summary = await buildWindowSummary(sessions, teams, w, activityProjector);
 				return { session: summary.sessions.find((item) => item.id === req.params.sid)! };
 			} catch (err) {
 				return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });

@@ -10,6 +10,7 @@ import {
 } from "../store/work-state.js";
 import type { AgentRuntime } from "../agent-runtime/runtime.js";
 import type { ProductSettingsStore } from "../store/product-settings.js";
+import { settleWorkItemReview } from "../agent-runtime/work-item-settlement.js";
 
 export function registerWorkStateRoutes(
 	app: FastifyInstance,
@@ -181,6 +182,7 @@ export function registerWorkStateRoutes(
 			removeItemIds?: string[];
 			cancelItemIds?: string[];
 			reopenItemIds?: string[];
+			confirmGoalCoverage?: boolean;
 			reason: string;
 		};
 	}>("/api/sessions/:id/work-plan", async (req, reply) => {
@@ -202,7 +204,14 @@ export function registerWorkStateRoutes(
 			if (!req.body.expectedGoalId?.trim()) return reply.code(400).send({ error: "验收 WorkItem 需要 expectedGoalId" });
 			if (!req.body.expectedSubmissionId?.trim()) return reply.code(400).send({ error: "验收 WorkItem 需要 expectedSubmissionId" });
 			const { expectedGoalId, expectedRevision, expectedEpoch, ...review } = req.body;
-			const workState = await workStates.reviewWorkItem(req.params.id, req.params.workItemId, expectedRevision, review, idempotencyKey(req.headers as Record<string, unknown>), expectedEpoch, expectedGoalId);
+			const { state: workState } = await settleWorkItemReview({
+				workStates, sessionId: req.params.id, goalId: expectedGoalId, workItemId: req.params.workItemId,
+				expectedRevision, expectedEpoch, review, operationId: idempotencyKey(req.headers as Record<string, unknown>),
+				promoteWorkspaceChangeSet: (scopeId, changeSetId) => {
+					if (!runtime) throw new Error("Workspace 提升运行时未启用");
+					return runtime.promoteWorkspaceChangeSet(scopeId, changeSetId);
+				},
+			});
 			return { workState, workItem: workState.plan?.items[req.params.workItemId] };
 		} catch (err) { return sendError(reply, err) }
 	});

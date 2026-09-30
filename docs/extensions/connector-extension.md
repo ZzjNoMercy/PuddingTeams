@@ -66,7 +66,7 @@ pi resource-loader 按此字段找入口，`pi install <source>` 后加载 `pi/i
 | `entry` | Driver 入口（包内相对路径，指向 `driver/index.ts`）；与 `connector.declarative` 互斥 |
 | `connector.id` / `displayName` / `apiVersion` | Connector contribution 身份；`apiVersion` 只支持 `"1"` |
 | `connector.defaultTransport` / `supportedTransports` | `spawn` / `http` / `rpc` / `acp` / `sdk`；default 必须包含在 supported 中，且不得重复。`spawn` 必须申请 `spawn` permission，`http/rpc/acp` 必须申请 `network` permission。Worker 实例把实际选择独立保存为 `AgentConnectorBinding.transport`。当前纯 `connector.declarative` 执行器只接受唯一的 `spawn` transport；HTTP 等方式必须使用代码型 Driver |
-| `connector.configSchema` | JSON Schema 子集，前端据此渲染配置表单。字段可用 `"x-puddingteams-transports": ["spawn"]` 限定只在指定 transport 下显示（必须是 supported 的子集）；`format: "model"` 使用平台模型目录；`"x-puddingteams-options": "driver"` 调用该 Connector 的动态选项发现。transport 由宿主统一渲染，不在 configSchema 重复声明 |
+| `connector.configSchema` | JSON Schema 子集，前端据此渲染配置表单。**每个字段必须给 `title`（用户可见的中文标签）**，否则 UI 会把 `permissionMode` 这类内部 key 直接当标签展示。字段可用 `"x-puddingteams-transports": ["spawn"]` 限定只在指定 transport 下显示（必须是 supported 的子集）；`format: "model"` 使用平台模型目录；`"x-puddingteams-options": "driver"` 调用该 Connector 的动态选项发现；`description` 作为字段下方的补充说明而非占位符。运维向字段（普通用户没有改它场景的旋钮，例如内置 pi 的 `sessionDir` 会话存储目录）标注 `"x-puddingteams-hidden": true`：仍留在配置契约里（API 可写、Driver 可读、导入导出可带），但配置页不生成表单。transport 由宿主统一渲染，不在 configSchema 重复声明 |
 | `connector.secretSchema` | `[{key, label, required}]`；密钥写 CredentialsStore，只存 secretRefs |
 | `connector.avatar` | 默认头像，包内相对资源路径（如 `assets/codex.svg`） |
 
@@ -222,6 +222,6 @@ PuddingTeams 激活同一个 Connector 包时不会用这条门面链承担房�
 
 明确延后（写包时不要假设存在）：
 
-- **隔离 Extension Host**：代码型 Connector 目前只在显式开发者模式下跑在 server 进程内（§10.3 第 2 级的进程隔离 + 权限 Broker 未落地）；该项已记录为待办，产品功能与发行验收全部完成后才重新评估；
+- **隔离 Extension Host**：用户安装的代码型 Connector 目前只在显式开发者模式下跑在 server 进程内；普通模式的复制安装、更新和重启激活均拒绝其代码入口。随发行物审核的第一方包仍在主进程加载，§10.3 第 2 级的进程隔离、权限 Broker 与 T03 编译隔离未落地。`extension validate` 只做静态检查，不执行 entry，也不保证导出正确；
 - **npm/pi 社区发布渠道**：发布前的 `workspace:*` → semver 改写与 registry 发布流程未产品化；
 - puddingclaw / pi 两个内置 Connector 尚未迁移成本目录双宿主包；Capability 包模板与样例未交付。

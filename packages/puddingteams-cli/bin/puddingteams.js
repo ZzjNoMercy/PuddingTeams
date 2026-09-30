@@ -9,11 +9,13 @@
  *   PUDDINGTEAMS_HOME（缺省 ~/.puddingteams），单写者 Lease 由 server 自带。
  */
 import { spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { matchesManagedHealth, pidAlive } from "./process-state.js";
 
 const require = createRequire(import.meta.url);
 const PKG = require("../package.json");
@@ -23,6 +25,7 @@ const SERVER_BUNDLE = path.join(ROOT, "runtime", "apps", "server", "src", "serve
 const CLI_BUNDLE = path.join(ROOT, "runtime", "apps", "server", "src", "cli", "cli.bundle.mjs");
 
 const HOME = process.env.PUDDINGTEAMS_HOME?.trim() || path.join(os.homedir(), ".puddingteams");
+const DATA_HOME_ID = createHash("sha256").update(path.resolve(HOME)).digest("hex");
 const PID_FILE = path.join(HOME, "run", "server.pid");
 const LOG_FILE = path.join(HOME, "logs", "server.log");
 const DEFAULT_PORT = 8933;
@@ -81,28 +84,32 @@ function readRunState() {
 		const parsed = raw.startsWith("{") ? JSON.parse(raw) : { pid: Number(raw) };
 		const pid = Number(parsed.pid);
 		if (!Number.isInteger(pid) || pid <= 0) return {};
-		return { pid, port: Number.isInteger(parsed.port) ? parsed.port : undefined };
+		return { pid, port: Number.isInteger(parsed.port) ? parsed.port : undefined, runId: typeof parsed.runId === "string" ? parsed.runId : undefined };
 	} catch {
 		return {};
 	}
 }
 
-function pidAlive(pid) {
+async function healthInfo(port) {
 	try {
-		process.kill(pid, 0);
+		const res = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(1500) });
+		return res.ok ? await res.json() : null;
+	} catch {
+		return null;
+	}
+}
+
+async function portResponds(port) {
+	try {
+		await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(1500) });
 		return true;
 	} catch {
 		return false;
 	}
 }
 
-async function healthOk(port) {
-	try {
-		const res = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(1500) });
-		return res.ok;
-	} catch {
-		return false;
-	}
+async function ownsRunningServer(state) {
+	return Boolean(state.pid && state.port && pidAlive(state.pid) && matchesManagedHealth(state, await healthInfo(state.port), DATA_HOME_ID));
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -121,26 +128,32 @@ async function cmdStart(args) {
 	const { flags } = parseFlags(args, new Set(["port"]));
 	const port = resolvePort(flags);
 	if (!existsSync(SERVER_BUNDLE)) fail("runtime 不完整：缺少 server.bundle.mjs（请重新安装/构建发行包）");
-	const { pid } = readRunState();
+	const state = readRunState();
+	const { pid } = state;
 	if (pid && pidAlive(pid)) {
-		console.log(`已在运行（pid ${pid}）→ http://127.0.0.1:${port}`);
-		return;
+		if (await ownsRunningServer(state)) {
+			console.log(`已在运行（pid ${pid}）→ http://127.0.0.1:${state.port}`);
+			return;
+		}
+		fail(`pid ${pid} 仍存在但无法核实为当前数据目录的后端；保留运行记录，请检查后手动处理`);
 	}
-	if (await healthOk(port)) fail(`端口 ${port} 已有一个 PuddingTeams server 在响应（非本 CLI 管理）；先 puddingteams stop 或换 --port`);
+	if (await portResponds(port)) fail(`端口 ${port} 已有服务在响应（非本 CLI 管理）；请换 --port`);
 	mkdirSync(path.dirname(PID_FILE), { recursive: true });
 	mkdirSync(path.dirname(LOG_FILE), { recursive: true });
 	const logFd = openSync(LOG_FILE, "a");
+	const runId = randomUUID();
 	const child = spawn(process.execPath, [SERVER_BUNDLE], {
-		env: { ...process.env, PORT: String(port), PUDDINGTEAMS_HOME: HOME },
+		env: { ...process.env, PORT: String(port), PUDDINGTEAMS_HOME: HOME, PUDDINGTEAMS_RUN_ID: runId },
 		detached: true,
 		stdio: ["ignore", logFd, logFd],
 	});
 	child.unref();
 	if (!child.pid) fail("server 进程拉起失败");
-	writeFileSync(PID_FILE, JSON.stringify({ pid: child.pid, port }), "utf-8");
+	const runState = { pid: child.pid, port, runId };
+	writeFileSync(PID_FILE, JSON.stringify(runState), "utf-8");
 	for (let i = 0; i < 40; i++) {
 		await sleep(500);
-		if (await healthOk(port)) {
+		if (matchesManagedHealth(runState, await healthInfo(port), DATA_HOME_ID)) {
 			console.log(`✓ 已启动（pid ${child.pid}，数据目录 ${HOME}）`);
 			console.log(`  → http://127.0.0.1:${port}   （puddingteams open 打开浏览器）`);
 			console.log(`  日志：${LOG_FILE}`);
@@ -154,13 +167,25 @@ async function cmdStart(args) {
 
 async function cmdStop(args) {
 	parseFlags(args, new Set());
-	const { pid } = readRunState();
+	const state = readRunState();
+	const { pid } = state;
 	if (!pid || !pidAlive(pid)) {
 		rmSync(PID_FILE, { force: true });
 		console.log("未在运行");
 		return;
 	}
-	process.kill(pid, "SIGTERM");
+	if (!(await ownsRunningServer(state))) fail(`pid ${pid} 存在但服务身份无法核实；已保留运行记录，不发送停止信号`);
+	try {
+		process.kill(pid, "SIGTERM");
+	} catch (error) {
+		if (error?.code === "EPERM") fail(`无权停止 pid ${pid}；已保留运行记录`);
+		if (error?.code === "ESRCH") {
+			rmSync(PID_FILE, { force: true });
+			console.log("未在运行");
+			return;
+		}
+		throw error;
+	}
 	for (let i = 0; i < 20; i++) {
 		await sleep(500);
 		if (!pidAlive(pid)) {
@@ -174,19 +199,21 @@ async function cmdStop(args) {
 
 async function cmdStatus(args) {
 	parseFlags(args, new Set());
-	const { pid, port } = readRunState();
+	const state = readRunState();
+	const { pid, port } = state;
 	const alive = pid !== undefined && pidAlive(pid);
 	console.log(`数据目录：${HOME}`);
-	console.log(`进程：${alive ? `运行中（pid ${pid}）` : "未运行"}`);
+	const owned = alive && await ownsRunningServer(state);
+	console.log(`进程：${owned ? `运行中（pid ${pid}）` : alive ? `存在但身份未核实（pid ${pid}）` : "未运行"}`);
 	const probePort = alive && port ? port : Number(process.env.PORT) || DEFAULT_PORT;
-	console.log(`健康检查（:${probePort}）：${(await healthOk(probePort)) ? "ok" : "无响应"}`);
+	console.log(`健康检查（:${probePort}）：${owned ? "ok" : (await portResponds(probePort)) ? "有响应但身份未核实" : "无响应"}`);
 }
 
 async function cmdOpen(args) {
 	const { flags } = parseFlags(args, new Set(["port"]));
-	const { pid, port: runPort } = readRunState();
-	const port = flags.port !== undefined || process.env.PORT ? resolvePort(flags) : runPort && pid && pidAlive(pid) ? runPort : resolvePort(flags);
-	if (!(await healthOk(port))) fail(`server 未在 :${port} 响应，先 puddingteams start`);
+	const state = readRunState();
+	const port = flags.port !== undefined || process.env.PORT ? resolvePort(flags) : state.port ?? resolvePort(flags);
+	if (!(await ownsRunningServer(state)) || state.port !== port) fail(`无法核实当前数据目录的 server 正在 :${port} 运行，先 puddingteams start`);
 	const url = `http://127.0.0.1:${port}`;
 	const [cmd, cmdArgs] =
 		process.platform === "darwin" ? ["open", [url]] : process.platform === "win32" ? ["cmd", ["/c", "start", "", url]] : ["xdg-open", [url]];

@@ -13,11 +13,17 @@
 /** 四种统一操作语义。 */
 export type AgentOperation = "run" | "continue" | "respond" | "cancel";
 
+/** Per-turn LLM settings. Distinct from business options.model. */
+export interface RuntimeModelSettings {
+	model?: string;
+	effort?: string;
+}
+
 export interface RunInput {
 	message: string;
 	/** 幂等键：同一 requestId 重复提交不重复执行。 */
 	requestId: string;
-	options?: Record<string, unknown>;
+	options?: Record<string, unknown> & { runtimeModel?: RuntimeModelSettings };
 }
 
 export interface ContinueInput extends RunInput {
@@ -218,6 +224,8 @@ export interface VerificationInvocationProfile {
 }
 
 export interface DriverCapabilities {
+	/** Driver supports per-turn LLM overrides on both run and continue. */
+	runtimeModel?: { effortLevels: string[] };
 	operations: Array<"run" | "continue" | "respond" | "cancel">;
 	interactionKinds: Array<"permission" | "question" | "confirmation">;
 	progress: "none" | "coarse" | "stream";
@@ -250,6 +258,20 @@ export interface InvocationContext {
 	idempotencyKey?: string;
 	/** Present only for purpose=verification; resolved by Harness, never accepted from a prompt. */
 	verificationProfile?: VerificationInvocationProfile;
+	/** Internal knowledge-compile process boundary. The host must issue and bind this
+	 * to a CompileJob; a Connector may only enforce it, never manufacture it. */
+	protectedCompile?: {
+		jobId: string;
+		stagingRoot: string;
+		commandPath: string;
+		commandSha256: string;
+		sandboxProfilePath: string;
+		sandboxProfileSha256: string;
+		/** Host-owned loopback Responses proxy; absent means no network allowance. */
+		modelChannel?: { port: number };
+		/** Complete replacement for the ordinary Agent/host environment. */
+		env: NodeJS.ProcessEnv;
+	};
 	/** 已注入凭证的环境变量。 */
 	env: NodeJS.ProcessEnv;
 	signal?: AbortSignal;
@@ -295,6 +317,7 @@ export interface DriverConfigOption {
 	label: string;
 	description?: string;
 	isDefault?: boolean;
+	effortLevels?: string[];
 }
 
 /**

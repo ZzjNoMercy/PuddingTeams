@@ -257,7 +257,7 @@ test("Phase4: 激活策略——委托工具全窗口默认激活，capability �
 			delegateToolName("claude-code"),
 			delegateToolName("codex"),
 			delegateToolName("pi-b"),
-			delegateToolName("puddingclaw"),
+			delegateToolName("wiki"),
 		],
 	);
 
@@ -1067,7 +1067,8 @@ test("manager 建房: solo create_group_window 建成群聊并 fire-and-forget �
 	const { store, cwd } = await makeTeamsWithCwd([agentConfig("alpha"), agentConfig("beta")]);
 	const prompted: string[] = [];
 	const mockSessions = {
-		create: async () => ({ id: "group-session-1" }),
+		create: async (_model: unknown, _window: unknown, id: string) => ({ id }),
+		remove: async () => true,
 		open: async (id: string) => ({
 			prompt: async (text: string) => {
 				prompted.push(`${id}::${text}`);
@@ -1093,12 +1094,12 @@ test("manager 建房: solo create_group_window 建成群聊并 fire-and-forget �
 	assert.deepEqual(window.members, ["alpha", "beta"]);
 	assert.equal(window.name, "报告组");
 	assert.equal(window.prompt, "先分工再汇总", "群聊协作提示词落库（只给该房间 manager）");
-	assert.deepEqual(window.sessions, ["group-session-1"]);
+	assert.match(window.sessions[0]!, /^[0-9a-f-]{36}$/);
 
 	// fire-and-forget 首发任务：等 promise 链跑完后新 session 收到首条消息。
 	await new Promise((resolve) => setImmediate(resolve));
 	await new Promise((resolve) => setImmediate(resolve));
-	assert.deepEqual(prompted, ["group-session-1::做一份对比报告"]);
+	assert.deepEqual(prompted, [`${window.activeSession}::做一份对比报告`]);
 
 	// 校验：<2 成员 / 未知 worker / 禁用 worker / pinned manager 分别拒绝。
 	await assert.rejects(
@@ -1116,13 +1117,38 @@ test("manager 建房: solo create_group_window 建成群聊并 fire-and-forget �
 	);
 });
 
+test("manager 建房: roster 校验后停用成员，不创建孤立 Session 或群聊", async () => {
+	const { store, cwd } = await makeTeamsWithCwd([agentConfig("alpha"), agentConfig("beta")]);
+	let sessionCreates = 0;
+	const mockSessions = {
+		create: async () => { sessionCreates++; return { id: "unwanted-group-session" }; },
+		open: async () => ({ prompt: async () => {} }),
+		generateSessionTitle: async () => undefined,
+	};
+	const ctx: ManagerWindowContext = { type: "solo", members: [], cwd };
+	const tools = await registerCoreTools(makeRoomDeps(store, ctx, mockSessions));
+	const originalWindowForSession = store.windowForSession.bind(store);
+	store.windowForSession = async (id) => {
+		store.windowForSession = originalWindowForSession;
+		await store.setEnabled("beta", false);
+		return originalWindowForSession(id);
+	};
+	await assert.rejects(
+		() => tools.get(CORE_TOOL_CREATE_GROUP)!.execute("race-call", { members: ["alpha", "beta"], task: "对比" }, undefined, undefined, {} as ExtensionContext),
+		/beta.*已停用/,
+	);
+	assert.equal(sessionCreates, 0);
+	assert.equal((await store.listWindows()).filter((window) => window.type === "group").length, 0);
+});
+
 test("manager 建房: members 接受显示名并解析为内部 id（name/id 解耦）", async () => {
 	const { store, cwd } = await makeTeamsWithCwd([
 		agentConfig("alpha", { displayName: "阿尔法" }),
 		agentConfig("pi-b", { displayName: "Designer" }),
 	]);
 	const mockSessions = {
-		create: async () => ({ id: "group-session-1" }),
+		create: async (_model: unknown, _window: unknown, id: string) => ({ id }),
+		remove: async () => true,
 		open: async () => ({ prompt: async () => {} }),
 		generateSessionTitle: async () => undefined,
 	};
@@ -1238,8 +1264,7 @@ test("solo 派活: worker 单聊绑在其他项目时保留原窗口，并为当
 		message: { customType: string; content: string; details?: Record<string, unknown> };
 	}> = [];
 	const sessions = {
-		create: async () => {
-			const id = `sess-new-${createdIds.length + 1}`;
+		create: async (_model: unknown, _window: unknown, id: string) => {
 			createdIds.push(id);
 			return { id };
 		},
@@ -1301,7 +1326,8 @@ test("solo 派活: worker 单聊绑在其他项目时保留原窗口，并为当
 	const preserved = (await store.getWindow(direct.id))!;
 	assert.equal(preserved.workspaceId, wsA.id, "原项目单聊必须保留原绑定");
 	assert.equal(preserved.activeSession, "sess-alpha", "原项目 Session 历史不得被替换");
-	assert.deepEqual(createdIds, ["sess-new-1"], "当前项目只创建一个新的单聊 Session");
+	assert.equal(createdIds.length, 1, "当前项目只创建一个新的单聊 Session");
+	assert.match(createdIds[0]!, /^[0-9a-f-]{36}$/);
 	assert.deepEqual(removedIds, [], "切换项目不得删除旧项目 Session");
 	assert.equal((await store.listWindows()).filter((w) => w.type === "direct" && w.members[0] === "alpha").length, 2, "同一 worker 可按项目拥有独立单聊");
 
@@ -1309,7 +1335,7 @@ test("solo 派活: worker 单聊绑在其他项目时保留原窗口，并为当
 		item.message.customType === "pudding:task_assign" && item.message.details?.taskId === "call-1"
 	);
 	assert.ok(visibleAssign, "solo 派活开始时必须立即把任务镜像到 worker 单聊");
-	assert.equal(visibleAssign.sessionId, "sess-new-1");
+	assert.equal(visibleAssign.sessionId, createdIds[0]);
 	assert.equal(visibleAssign.message.details?.from, "solo");
 
 	const enriched = projections.at(-1);
@@ -1325,7 +1351,7 @@ test("solo 派活: worker 单聊绑在其他项目时保留原窗口，并为当
 
 	const completed = targetMessages.find((item) => item.message.customType === "pudding:task_result");
 	assert.ok(completed, "solo worker 落定后必须向单聊写结果卡");
-	assert.equal(completed.sessionId, "sess-new-1");
+	assert.equal(completed.sessionId, createdIds[0]);
 	assert.equal(completed.message.details?.delegationId, (result.details as { delegationId?: string }).delegationId);
 	assert.equal(completed.message.details?.processView, true, "完成态结果卡仍必须保留执行过程入口");
 	assert.equal(completed.message.details?.sessionHandle, "alpha-sess");

@@ -105,7 +105,7 @@ export function ChatInfoDialog({
 	onEditPrompt: () => void;
 	onSwitchWorkspace: () => void;
 	onSwitchSession: (sessionId: string) => void | Promise<void>;
-	onNewSession: () => void | Promise<void>;
+	onNewSession?: () => void | Promise<void>;
 	onRenameSession: (session: RoomSession) => void;
 	onDeleteSession: (session: RoomSession) => void;
 }) {

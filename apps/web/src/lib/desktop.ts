@@ -8,6 +8,8 @@ export interface PuddingTeamsDesktop {
 	pickDirectory: (initialPath?: string) => Promise<string | null>;
 	revealInFinder: (targetPath: string) => Promise<void>;
 	openExternal: (url: string) => Promise<void>;
+	/** 在 Obsidian 中打开（T24）：主进程复核 obsidian:// URI 后调起，失败返回 error。 */
+	openInObsidian: (uri: string) => Promise<{ ok: boolean; error?: string }>;
 }
 
 declare global {

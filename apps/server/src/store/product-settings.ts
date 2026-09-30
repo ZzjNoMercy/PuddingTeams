@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -79,6 +79,25 @@ export const DEFAULT_WORKSPACE_EXECUTION_SETTINGS: WorkspaceExecutionSettings = 
 	promotion: { autoApplyAfterAcceptance: true, autoCommit: false, autoPush: false, conflictAction: "block_preserve_changes" },
 	managerWritePolicy: "delegation_required",
 };
+
+function canonicalValue(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonicalValue);
+	if (value !== null && typeof value === "object") {
+		return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, item]) => [key, canonicalValue(item)]));
+	}
+	return value;
+}
+
+export function harnessSettingsRevision(harness: ProductSettings["harness"]): string {
+	return createHash("sha256").update(JSON.stringify(canonicalValue(harness))).digest("hex");
+}
+
+export class HarnessSettingsConflictError extends Error {
+	constructor(readonly currentRevision: string) {
+		super("Harness 设置已变化，请读取最新配置后核对草稿");
+		this.name = "HarnessSettingsConflictError";
+	}
+}
 
 export class ProductSettingsStore {
 	private readonly file: string;
@@ -192,9 +211,11 @@ export class ProductSettingsStore {
 		goalRecovery?: Partial<GoalRecoverySettings>;
 		verification?: VerificationSettingsPatch;
 		workspaceExecution?: WorkspaceExecutionSettingsPatch;
-	}): Promise<ProductSettings> {
+	}, expectedRevision?: string): Promise<ProductSettings> {
 		const run = this.queue.then(async () => {
 			const current = await this.get();
+			const currentRevision = harnessSettingsRevision(current.harness);
+			if (expectedRevision !== undefined && expectedRevision !== currentRevision) throw new HarnessSettingsConflictError(currentRevision);
 			const codeSearch = { ...current.harness.codeSearch, ...(input.codeSearch ?? {}) };
 			if (!["builtin", "fff"].includes(codeSearch.defaultProvider)) throw new Error("codeSearch.defaultProvider 无效");
 			const activation = { ...current.harness.goalActivation, ...(input.goalActivation ?? {}) };
@@ -271,7 +292,7 @@ export class ProductSettingsStore {
 			const tmp = `${this.file}.${randomUUID().slice(0, 8)}.tmp`;
 			await writeFile(tmp, JSON.stringify(settings, null, 2) + "\n", "utf-8");
 			await rename(tmp, this.file);
-			return settings;
+			return this.get();
 		});
 		this.queue = run.then(() => undefined, () => undefined);
 		return run;

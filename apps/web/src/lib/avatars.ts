@@ -18,7 +18,7 @@ import type { AgentConfig } from "./types";
 /** name -> per-agent cache-busting version (bumped on upload/delete). */
 const versions = new Map<string, number>();
 /** name -> uploaded avatar / connector-bundled avatar availability. */
-const avatarKinds = new Map<string, { uploaded: boolean; bundled: boolean }>();
+const avatarKinds = new Map<string, { uploaded: boolean; bundled: boolean; defaultRevision?: string }>();
 /** 内部 id（name）-> 显示名（displayName 缺省回退 name）。 */
 const displayNames = new Map<string, string>();
 const listeners = new Set<() => void>();
@@ -37,6 +37,7 @@ function ensureLoaded(): void {
 				avatarKinds.set(a.name, {
 					uploaded: Boolean(a.avatar),
 					bundled: Boolean(a.hasDefaultAvatar),
+					defaultRevision: a.defaultAvatarRevision,
 				});
 				displayNames.set(a.name, a.displayName?.trim() || a.name);
 				if (!versions.has(a.name)) versions.set(a.name, 0);
@@ -52,18 +53,19 @@ function ensureLoaded(): void {
 /** Record an avatar change (upload/delete) so every WorkerAvatar refreshes. */
 export function agentAvatarChanged(name: string, uploaded: boolean): void {
 	const current = avatarKinds.get(name);
-	avatarKinds.set(name, { uploaded, bundled: current?.bundled ?? false });
+	avatarKinds.set(name, { uploaded, bundled: current?.bundled ?? false, defaultRevision: current?.defaultRevision });
 	versions.set(name, (versions.get(name) ?? 0) + 1);
 	emit();
 }
 
 /** 注册刚创建的 Agent，避免一次性列表缓存要到整页刷新后才认识其头像来源。 */
 export function agentRegistered(
-	agent: Pick<AgentConfig, "name" | "displayName" | "avatar" | "hasDefaultAvatar">,
+	agent: Pick<AgentConfig, "name" | "displayName" | "avatar" | "hasDefaultAvatar" | "defaultAvatarRevision">,
 ): void {
 	avatarKinds.set(agent.name, {
 		uploaded: Boolean(agent.avatar),
 		bundled: Boolean(agent.hasDefaultAvatar),
+		defaultRevision: agent.defaultAvatarRevision,
 	});
 	displayNames.set(agent.name, agent.displayName?.trim() || agent.name);
 	if (!versions.has(agent.name)) versions.set(agent.name, 0);
@@ -122,7 +124,7 @@ export function useAgentLabels(): Record<string, string> {
 function currentUrl(name: string, uploadedOnly = false): string | null {
 	const kind = avatarKinds.get(name);
 	if (!kind || (uploadedOnly ? !kind.uploaded : !kind.uploaded && !kind.bundled)) return null;
-	return agentAvatarUrl(name, versions.get(name) ?? 0);
+	return agentAvatarUrl(name, versions.get(name) ?? 0, kind.defaultRevision);
 }
 
 /** Avatar URL for a worker name, or null when the default should be shown. */

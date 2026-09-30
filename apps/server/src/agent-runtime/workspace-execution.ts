@@ -416,28 +416,28 @@ async function installExact(
 	baselineEntry: SnapshotEntry | undefined,
 	finalEntry: SnapshotEntry | undefined,
 	promotionId: string,
+	afterBackup?: (relative: string, backup: string) => Promise<void>,
 ): Promise<PromotionStep> {
 	const target = absoluteInside(targetRoot, relative);
 	await mkdir(path.dirname(target), { recursive: true });
 	if (!sameEntry(await entryAt(targetRoot, relative), baselineEntry)) throw new WorkspaceExecutionError("promotion_conflict", `target changed before promotion: ${relative}`);
 	const step: PromotionStep = { relative, target, ...(finalEntry ? { finalEntry } : {}) };
-	if (baselineEntry) {
-		const backup = `${target}.puddingteams-${promotionId}.bak`;
-		await rename(target, backup);
-		step.backup = backup;
-		const backupInfo = await lstat(backup);
-		const moved = { path: relative, hash: fileDigest(await readFile(backup)), mode: backupInfo.mode & 0o777 };
-		if (!sameEntry(moved, baselineEntry)) {
-			await rename(backup, target).catch(() => undefined);
-			throw new WorkspaceExecutionError("promotion_conflict", `target changed during promotion: ${relative}`);
-		}
-	}
-	if (!finalEntry) return step;
-	const source = absoluteInside(sourceRoot, relative);
-	const sourceInfo = await lstat(source);
-	if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink()) throw new WorkspaceExecutionError("unsupported_layout", `cannot promote non-regular path: ${relative}`);
-	const temporary = `${target}.${promotionId}.tmp`;
+	let temporary: string | undefined;
 	try {
+		if (baselineEntry) {
+			const backup = `${target}.puddingteams-${promotionId}.bak`;
+			await rename(target, backup);
+			step.backup = backup;
+			const backupInfo = await lstat(backup);
+			const moved = { path: relative, hash: fileDigest(await readFile(backup)), mode: backupInfo.mode & 0o777 };
+			if (!sameEntry(moved, baselineEntry)) throw new WorkspaceExecutionError("promotion_conflict", `target changed during promotion: ${relative}`);
+			await afterBackup?.(relative, backup);
+		}
+		if (!finalEntry) return step;
+		const source = absoluteInside(sourceRoot, relative);
+		const sourceInfo = await lstat(source);
+		if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink()) throw new WorkspaceExecutionError("unsupported_layout", `cannot promote non-regular path: ${relative}`);
+		temporary = `${target}.${promotionId}.tmp`;
 		await copyFile(source, temporary, fsConstants.COPYFILE_EXCL);
 		await chmod(temporary, finalEntry.mode);
 		const staged = await entryAt(path.dirname(temporary), path.basename(temporary));
@@ -445,11 +445,18 @@ async function installExact(
 		await copyFile(temporary, target, fsConstants.COPYFILE_EXCL);
 		await chmod(target, finalEntry.mode);
 	} catch (error) {
-		if (step.backup && !await lstat(target).catch(() => undefined)) await rename(step.backup, target).catch(() => undefined);
+		if (step.backup) {
+			// Never overwrite a path created by another writer after the baseline was
+			// moved. Keep the original in its named backup for manual recovery.
+			if (!await lstat(target).catch(() => undefined)) {
+				await rename(step.backup, target).catch(() => undefined);
+			}
+		}
+		const preservedBackup = step.backup && await lstat(step.backup).catch(() => undefined) ? `; original preserved at ${step.backup}` : "";
 		if (error instanceof WorkspaceExecutionError) throw error;
-		throw new WorkspaceExecutionError("promotion_conflict", `target changed during promotion: ${relative}`);
+		throw new WorkspaceExecutionError("promotion_conflict", `target changed during promotion: ${relative}${preservedBackup}`);
 	} finally {
-		await rm(temporary, { force: true }).catch(() => undefined);
+		if (temporary) await rm(temporary, { force: true }).catch(() => undefined);
 	}
 	return step;
 }
@@ -470,14 +477,16 @@ export class WorkspaceExecutionCoordinator {
 	private leaseTimeoutMs: number;
 	private readonly clock: () => number;
 	private readonly promotionCheckpoint?: (scope: WorkspaceExecutionScope) => Promise<void>;
+	private readonly promotionInstallCheckpoint?: (relative: string, backup: string) => Promise<void>;
 	private queue: Promise<unknown> = Promise.resolve();
 
-	constructor(private readonly stateDir: string, options: { worktreeRoot?: string; leaseTimeoutMs?: number; now?: () => number; promotionCheckpoint?: (scope: WorkspaceExecutionScope) => Promise<void> } = {}) {
+	constructor(private readonly stateDir: string, options: { worktreeRoot?: string; leaseTimeoutMs?: number; now?: () => number; promotionCheckpoint?: (scope: WorkspaceExecutionScope) => Promise<void>; promotionInstallCheckpoint?: (relative: string, backup: string) => Promise<void> } = {}) {
 		this.file = path.join(stateDir, "workspace-execution.json");
 		this.worktreeRoot = options.worktreeRoot ?? path.join(stateDir, "worktrees");
 		this.leaseTimeoutMs = Math.max(5_000, Math.min(options.leaseTimeoutMs ?? 600_000, 86_400_000));
 		this.clock = options.now ?? (() => Date.now());
 		this.promotionCheckpoint = options.promotionCheckpoint;
+		this.promotionInstallCheckpoint = options.promotionInstallCheckpoint;
 	}
 
 	async init(): Promise<void> {
@@ -850,7 +859,7 @@ export class WorkspaceExecutionCoordinator {
 			try {
 			const changeSet = state.changeSets[changeSetId ?? scope.latestChangeSetId ?? ""];
 			if (!changeSet || changeSet.executionScopeId !== scopeId) throw new WorkspaceExecutionError("scope_not_found", "change-set not found for execution scope");
-			if (changeSet.promotionState === "applied") return structuredClone(changeSet);
+			if (changeSet.promotionState === "applied" || changeSet.promotionState === "conflict" || changeSet.promotionState === "failed") return structuredClone(changeSet);
 			if (scope.state === "fenced") throw new WorkspaceExecutionError("promotion_conflict", "execution scope is fenced");
 			const currentExecution = await this.currentEntries(scope);
 			if (currentExecution.fingerprint !== changeSet.outputFingerprint) {
@@ -886,7 +895,7 @@ export class WorkspaceExecutionCoordinator {
 			const applied: PromotionStep[] = [];
 			try {
 				for (const relative of changeSet.changedPaths) {
-					applied.push(await installExact(scope.executionRoot, scope.canonicalRoot, relative, baselineMap.get(relative), finalMap.get(relative), promotionId));
+					applied.push(await installExact(scope.executionRoot, scope.canonicalRoot, relative, baselineMap.get(relative), finalMap.get(relative), promotionId, this.promotionInstallCheckpoint));
 				}
 				const transientBackups = new Set(applied.flatMap((step) => step.backup ? [safeRelative(path.relative(scope.canonicalRoot, step.backup))] : []));
 				const after = (await entriesFor(scope.canonicalRoot, true)).filter((entry) => !transientBackups.has(entry.path));

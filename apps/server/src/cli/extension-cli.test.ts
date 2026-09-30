@@ -1,7 +1,7 @@
 import { test, after } from "node:test";
 import assert from "node:assert";
 import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseExtensionManifest } from "../agent-runtime/extensions.js";
@@ -71,10 +71,21 @@ test("validate 声明式真包 echo → 0", async () => {
 	assert.match(out, /\{packageDir\}\/cli\.mjs 存在/);
 });
 
-test("validate 代码型真包 codex → 0（真 import driver 模块）", async () => {
+test("validate 代码型真包 codex → 0（不执行入口）", async () => {
 	const { code, out } = await runBin(["extension", "validate", path.join(REPO_ROOT, "extensions/connectors/codex")]);
 	assert.strictEqual(code, 0, out);
-	assert.match(out, /createDriver 工厂已导出/);
+	assert.match(out, /未执行模块/);
+});
+
+test("validate 未受信任代码入口只做静态检查，不运行模块顶层代码", async () => {
+	const dir = path.join(freshDir(".tmp-ext-cli-static-"), "probe");
+	assert.equal((await runBin(["extension", "init", "--type", "connector", "--id", "probe", dir])).code, 0);
+	const marker = path.join(dir, "module-ran");
+	writeFileSync(path.join(dir, "driver/index.ts"), `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "ran"); export function createDriver() { throw new Error("should not run"); }\n`);
+	const result = await runBin(["extension", "validate", dir]);
+	assert.equal(result.code, 0, result.out);
+	assert.match(result.out, /未执行模块/);
+	assert.equal(existsSync(marker), false);
 });
 
 // ---- validate 坏包 ----
@@ -171,7 +182,7 @@ test("validate entry 声明但文件缺失 → 1", async () => {
 
 // ---- init 代码型 ----
 
-test("init 代码型 connector：manifest 过校验，产物经 validate（含 driver import）→ 0", async () => {
+test("init 代码型 connector：manifest 过静态校验，产物经 validate → 0", async () => {
 	const dir = path.join(freshDir(".tmp-ext-cli-init-", true), "demo-cli");
 	const { code } = await runBin(["extension", "init", "--type", "connector", "--id", "demo-cli", dir]);
 	assert.strictEqual(code, 0);
@@ -190,10 +201,10 @@ test("init 代码型 connector：manifest 过校验，产物经 validate（含 d
 	assert.ok(driverSrc.includes("export function createDriver"));
 	assert.ok(!driverSrc.includes("__CONNECTOR_ID__"));
 
-	// validate 交叉验证：entry import + createDriver 导出检查全过（生成后即可编译运行）。
+	// validate 只核对静态内容，不 import 未受信任代码。
 	const res = await runBin(["extension", "validate", dir]);
 	assert.strictEqual(res.code, 0, res.out);
-	assert.match(res.out, /createDriver 工厂已导出/);
+	assert.match(res.out, /未执行模块/);
 });
 
 test("init 自定义 --name / --display", async () => {

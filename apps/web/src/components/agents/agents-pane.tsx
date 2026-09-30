@@ -1,20 +1,22 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { CopyIcon, LoaderIcon, MoreHorizontalIcon, PlusIcon, RefreshCwIcon, Settings2Icon, TrashIcon, UserCheckIcon } from "lucide-react";
+import { ChevronRightIcon, CopyIcon, LoaderIcon, MoreHorizontalIcon, PlusIcon, RefreshCwIcon, SearchIcon, Settings2Icon, TrashIcon, UserCheckIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Dialog, DialogBody, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
 	ApiConflictError,
+	AgentCreationUncertainError,
 	createAgent,
 	deleteAgent,
 	duplicateAgent,
+	getViewerIdentity,
 	listAgents,
 	listExtensionCatalog,
 	probeAgent,
@@ -26,6 +28,8 @@ import type { AgentConfig, AgentConnectorBinding, AgentProbeResult, CatalogEntry
 import { agentDisplayName, isConnectorProbe } from "@/lib/types";
 import { ManagerAvatar, WorkerAvatar } from "@/components/chat/worker-avatar";
 import { ConfigSchemaForm, SecretSchemaFields } from "@/components/agents/form-parts";
+import { AgentSetupUnconfirmedError, createAgentWithInitialSecrets } from "@/components/agents/create-agent-flow";
+import { acquireAgentCreateAttempt, agentCreateDigest, clearAgentCreateAttempt, type AgentCreateAttempt } from "@/components/agents/agent-create-attempt";
 import {
 	DropdownMenu,
 	DropdownMenuContent,
@@ -76,9 +80,9 @@ function probeSummary(probe: AgentProbeResult): string {
 	return probe.ok ? "探测健康" : `探测异常：${probe.error ?? `exit ${probe.exitCode}`}`;
 }
 
-/** Worker 分组跟随 Connector 目录来源标签；legacy / 未知 Connector 默认第三方。 */
+/** 内置 Worker 为平台本地 Pi 角色；随平台提供的外部连接插件不代表内置角色。 */
 function isBuiltinWorker(agent: AgentConfig, connectorCatalog: CatalogEntry[]): boolean {
-	if (agent.pinned || !agent.connector) return false;
+	if (agent.pinned || agent.connector?.connectorId !== "pi") return false;
 	const entry = connectorCatalog.find(
 		(item) => item.manifest.kind === "connector" && item.manifest.id === agent.connector!.extensionId,
 	);
@@ -96,11 +100,14 @@ function CreateAgentDialog({
 	onOpenChange: (open: boolean) => void;
 	onCreated: () => void;
 }) {
+	const router = useRouter();
 	const [mode, setMode] = useState<"connector" | "command">("connector");
 	const [name, setName] = useState("");
 	const [identifier, setIdentifier] = useState("");
 	const [description, setDescription] = useState("");
 	const [catalog, setCatalog] = useState<CatalogEntry[] | null>(null);
+	const [catalogError, setCatalogError] = useState<string | null>(null);
+	const [catalogAttempt, setCatalogAttempt] = useState(0);
 	const [extensionId, setExtensionId] = useState("");
 	const [transport, setTransport] = useState<AgentConnectorBinding["transport"] | "">("");
 	const [config, setConfig] = useState<Record<string, unknown>>({});
@@ -110,31 +117,52 @@ function CreateAgentDialog({
 	const [probeArgs, setProbeArgs] = useState("");
 	const [enabled, setEnabled] = useState(true);
 	const [saving, setSaving] = useState(false);
+	const creatingRef = useRef(false);
 	const [error, setError] = useState<string | null>(null);
+	const creationAttempt = useRef<AgentCreateAttempt | null>(null);
+	const attemptStorage = () => { try { return sessionStorage; } catch { return null; } };
+	const finishCreationAttempt = () => {
+		clearAgentCreateAttempt(creationAttempt.current, attemptStorage());
+		creationAttempt.current = null;
+	};
 
 	// 打开时清空上次错误（渲染期间重置）；目录拉取留在 effect。
 	const [prevOpen, setPrevOpen] = useState(open);
 	if (open !== prevOpen) {
 		setPrevOpen(open);
-		if (open) setError(null);
+		if (open) {
+			setError(null);
+			setCatalog(null);
+			setCatalogError(null);
+		}
 	}
 	useEffect(() => {
 		if (!open) return;
 		let cancelled = false;
 		listExtensionCatalog("connector")
 			.then((entries) => {
-				if (!cancelled) setCatalog(entries);
+				if (!cancelled) {
+					setCatalog(entries);
+					setCatalogError(null);
+				}
 			})
-			.catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)));
+			.catch((err: unknown) => {
+				if (!cancelled) setCatalogError(err instanceof Error ? err.message : String(err));
+			});
 		return () => {
 			cancelled = true;
 		};
-	}, [open]);
+	}, [open, catalogAttempt]);
 
 	const installed = (catalog ?? []).filter((e) => e.installed && e.loaded);
 	const selected = installed.find((e) => e.manifest.id === extensionId);
 	const contribution = selected?.manifest.kind === "connector" ? selected.manifest.connector : undefined;
 	const selectedTransport = transport || contribution?.defaultTransport || "";
+	const retryCatalog = () => {
+		setCatalog(null);
+		setCatalogError(null);
+		setCatalogAttempt((value) => value + 1);
+	};
 
 	const reset = () => {
 		setName("");
@@ -150,8 +178,13 @@ function CreateAgentDialog({
 		setEnabled(true);
 		setError(null);
 	};
+	const closeDialog = () => {
+		reset();
+		onOpenChange(false);
+	};
 
 	const handleSubmit = async () => {
+		if (creatingRef.current) return;
 		setError(null);
 		if (!name.trim()) return setError("名称必填");
 		if (identifier.trim() && !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(identifier.trim())) {
@@ -159,9 +192,15 @@ function CreateAgentDialog({
 		}
 		if (mode === "connector" && !contribution) return setError("请选择连接插件");
 		if (mode === "connector" && !selectedTransport) return setError("请选择传输方式");
+		if (mode === "connector" && enabled) {
+			const missing = (contribution?.secretSchema ?? []).filter((item) => item.required && !secrets[item.key]);
+			if (missing.length > 0) return setError(`创建后立即启用需要填写密钥：${missing.map((item) => item.label).join("、")}`);
+		}
 		if (mode === "command" && !command.trim()) return setError("命令必填");
+		creatingRef.current = true;
 		setSaving(true);
 		try {
+			const hasSecrets = mode === "connector" && Object.keys(secrets).length > 0;
 			const agent: AgentConfig =
 				mode === "connector"
 					? {
@@ -189,39 +228,61 @@ function CreateAgentDialog({
 							},
 							enabled,
 						};
-			const created = await createAgent(agent);
+			const created = await createAgentWithInitialSecrets(agent, hasSecrets ? {
+				extensionId,
+				connectorId: contribution!.id,
+				transport: selectedTransport as AgentConnectorBinding["transport"],
+				config,
+				secrets,
+			} : null, { create: async (input) => {
+				const identity = await getViewerIdentity();
+				const scope = JSON.stringify([identity.tenant.id, identity.user.id]);
+				const body = JSON.stringify(input);
+				const digest = await agentCreateDigest(body);
+				creationAttempt.current = acquireAgentCreateAttempt(scope, digest, creationAttempt.current, attemptStorage(), () => crypto.randomUUID());
+				return createAgent(input, creationAttempt.current.key);
+			}, configure: (agentName, input, expectedRevision) => putAgentConnector(agentName, { ...input, expectedRevision }), enable: (agentName, expectedRevision) => setAgentEnabled(agentName, true, expectedRevision) });
+			finishCreationAttempt();
 			agentRenamed(created.name, created.displayName);
-			// 创建时填写的 secret：再走一次 PUT connector（明文提交，服务端只存 refs）。
-			if (mode === "connector" && Object.keys(secrets).length > 0) {
-				await putAgentConnector(created.name, {
-					extensionId,
-					connectorId: contribution!.id,
-					transport: selectedTransport as AgentConnectorBinding["transport"],
-					config,
-					secrets,
-				});
-			}
 			toast.success(`「${name.trim()}」已创建${enabled ? "" : "（未启用）"}`);
-			onOpenChange(false);
-			reset();
+			closeDialog();
 			onCreated();
 		} catch (err) {
-			setError(err instanceof Error ? err.message : String(err));
+			const message = err instanceof Error ? err.message : String(err);
+			if (err instanceof AgentSetupUnconfirmedError) {
+				const created = err.agent;
+				finishCreationAttempt();
+				agentRenamed(created.name, created.displayName);
+				toast.error(err.stage === "configure"
+					? `Worker 已创建并保持停用，凭证配置未确认：${message}。请在配置页核对后启用。`
+					: `Worker 与凭证已配置，启用结果未确认：${message}。请在配置页核对当前状态。`);
+				closeDialog();
+				onCreated();
+				router.push(`/agents/config?name=${encodeURIComponent(created.name)}`);
+			} else if (err instanceof AgentCreationUncertainError) {
+				finishCreationAttempt();
+				toast.error(`Worker 创建结果未确认：${message}。请核对已有配置。`);
+				closeDialog();
+				onCreated();
+				router.push(`/agents/config?name=${encodeURIComponent(err.agentName)}`);
+			} else setError(message);
 		} finally {
+			creatingRef.current = false;
 			setSaving(false);
 		}
 	};
 
 	return (
-		<Dialog open={open} onOpenChange={onOpenChange}>
-			<DialogContent className="worker-create max-h-[85vh] overflow-y-auto sm:max-w-xl">
+		<Dialog open={open} onOpenChange={(next) => { if (creatingRef.current) return; if (next) onOpenChange(true); else closeDialog(); }}>
+			<DialogContent className="worker-create flex max-h-[85vh] flex-col overflow-hidden sm:max-w-xl">
 				<DialogHeader>
-					<DialogTitle>添加 Worker</DialogTitle>
+					<DialogTitle>添加智能体</DialogTitle>
 					<DialogDescription>
 						选接入方式、填名称和描述即可创建；Connector 的细项配置与探测、启用都在创建后的配置页完成。
 					</DialogDescription>
 				</DialogHeader>
-				<div className="flex flex-col gap-5">
+				<DialogBody>
+				<fieldset disabled={saving} className="flex min-w-0 flex-col gap-5">
 					<div className="worker-create-segment" role="tablist" aria-label="接入方式">
 						{(["connector", "command"] as const).map((m) => (
 							<button
@@ -263,6 +324,7 @@ function CreateAgentDialog({
 							<label className="worker-create-field">
 								<span className="worker-create-label">连接插件<span className="worker-create-required">*</span></span>
 								<Select
+									disabled={catalog === null || Boolean(catalogError)}
 									value={extensionId}
 									onValueChange={(v) => {
 										setExtensionId(v);
@@ -284,10 +346,14 @@ function CreateAgentDialog({
 									</SelectContent>
 								</Select>
 								<span className="worker-create-hint">
-									{installed.length === 0
+									{catalogError ? "请重新加载后选择连接插件。"
+									: catalog === null
+									? "正在读取连接插件目录…"
+									: installed.length === 0
 									? "没有已安装的连接插件，请先到「扩展」页安装。"
 									: "决定 Worker 的运行方式；选中后下方显示该插件的配置项。"}
 								</span>
+								{catalogError ? <span role="alert" className="text-xs text-destructive">连接插件目录加载失败：{catalogError} <Button type="button" variant="outline" size="sm" onClick={retryCatalog}>重新加载</Button></span> : null}
 							</label>
 							{contribution ? (
 								<section className="worker-create-section">
@@ -349,14 +415,15 @@ function CreateAgentDialog({
 					</label>
 					{error ? <p className="text-xs text-destructive">{error}</p> : null}
 					<DialogFooter>
-						<Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
+						<Button type="button" variant="ghost" onClick={closeDialog}>
 							取消
 						</Button>
 						<Button type="button" onClick={() => void handleSubmit()} disabled={saving}>
 							{saving ? "保存中…" : "创建"}
 						</Button>
 					</DialogFooter>
-				</div>
+				</fieldset>
+				</DialogBody>
 			</DialogContent>
 		</Dialog>
 	);
@@ -369,8 +436,13 @@ export function AgentsPane() {
 	const [agents, setAgents] = useState<AgentConfig[]>([]);
 	const [connectorCatalog, setConnectorCatalog] = useState<CatalogEntry[]>([]);
 	const [loading, setLoading] = useState(true);
+	const [loadError, setLoadError] = useState<string | null>(null);
+	const [query, setQuery] = useState("");
 	const [createOpen, setCreateOpen] = useState(false);
 	const [pendingDelete, setPendingDelete] = useState<AgentConfig | null>(null);
+	const [deleteError, setDeleteError] = useState<string | null>(null);
+	const [deleteRuns, setDeleteRuns] = useState<ConflictRun[]>([]);
+	const [deleting, setDeleting] = useState(false);
 	const [duplicating, setDuplicating] = useState<string | null>(null);
 	const [probing, setProbing] = useState<string | null>(null);
 	const [probes, setProbes] = useState<Record<string, AgentProbeResult>>({});
@@ -379,8 +451,11 @@ export function AgentsPane() {
 
 	const refresh = useCallback(() => {
 		Promise.allSettled([listAgents(), listExtensionCatalog("connector")]).then(([agentResult, catalogResult]) => {
-			if (agentResult.status === "fulfilled") setAgents(agentResult.value);
-			else toast.error(agentResult.reason instanceof Error ? agentResult.reason.message : String(agentResult.reason));
+			if (agentResult.status === "fulfilled") {
+				setAgents(agentResult.value);
+				setLoadError(null);
+			}
+			else setLoadError(agentResult.reason instanceof Error ? agentResult.reason.message : String(agentResult.reason));
 			if (catalogResult.status === "fulfilled") setConnectorCatalog(catalogResult.value);
 			else {
 				// 目录不可用时安全回退：无法确认 builtin 标签的 Worker 都进入第三方组。
@@ -412,7 +487,7 @@ export function AgentsPane() {
 	const applyEnabled = useCallback(async (agent: AgentConfig, enabled: boolean, resolve?: "keep" | "cancel") => {
 		setResolving(true);
 		try {
-			const res = await setAgentEnabled(agent.name, enabled, resolve);
+			const res = await setAgentEnabled(agent.name, enabled, agent.extensionRevision ?? 0, resolve);
 			setAgents((prev) => prev.map((a) => (a.name === res.agent.name ? res.agent : a)));
 			setEnableConflict(null);
 			const { affectedSessions, reloadPending } = res.affectedSessions;
@@ -424,27 +499,38 @@ export function AgentsPane() {
 						}`,
 			);
 		} catch (err) {
-			if (err instanceof ApiConflictError) {
-				setEnableConflict({ agent, message: err.message, runs: err.payload.runs ?? [] });
+			if (err instanceof ApiConflictError && err.payload.runs?.length) {
+				setEnableConflict({ agent, message: err.message, runs: err.payload.runs });
+			} else if (err instanceof ApiConflictError) {
+				setEnableConflict(null);
+				refresh();
+				toast.error("Agent 配置已变化，请核对最新状态后重试");
 			} else {
 				toast.error(err instanceof Error ? err.message : String(err));
 			}
 		} finally {
 			setResolving(false);
 		}
-	}, []);
+	}, [refresh]);
 
 	const handleDelete = useCallback(async () => {
 		if (!pendingDelete) return;
+		setDeleting(true);
+		setDeleteError(null);
+		setDeleteRuns([]);
 		try {
-			await deleteAgent(pendingDelete.name);
+			const result = await deleteAgent(pendingDelete.name);
 			agentRemoved(pendingDelete.name);
-			toast.success(`「${agentDisplayName(pendingDelete)}」已删除`);
+			if (result.credentialsCleanup === "pending") toast.warning(`「${agentDisplayName(pendingDelete)}」已删除；凭证清理待下次启动重试`);
+			else toast.success(`「${agentDisplayName(pendingDelete)}」已删除`);
+			setPendingDelete(null);
 			refresh();
 		} catch (err) {
-			toast.error(err instanceof Error ? err.message : String(err));
+			setDeleteError(err instanceof Error ? err.message : String(err));
+			if (err instanceof ApiConflictError) setDeleteRuns(err.payload.runs ?? []);
+		} finally {
+			setDeleting(false);
 		}
-		setPendingDelete(null);
 	}, [pendingDelete, refresh]);
 
 	const handleDuplicate = useCallback(async (agent: AgentConfig) => {
@@ -470,34 +556,46 @@ export function AgentsPane() {
 	const workers = agents.filter((agent) => !agent.pinned);
 	const builtinWorkers = workers.filter((agent) => isBuiltinWorker(agent, connectorCatalog));
 	const thirdPartyWorkers = workers.filter((agent) => !isBuiltinWorker(agent, connectorCatalog));
+	const normalizedQuery = query.trim().toLocaleLowerCase();
+	const matchesQuery = (agent: AgentConfig) => !normalizedQuery || [
+		agent.name,
+		agentDisplayName(agent),
+		agent.description,
+		agent.connector?.connectorId ?? "",
+	].some((value) => value.toLocaleLowerCase().includes(normalizedQuery));
+	const visibleManagers = managers.filter(matchesQuery);
+	const visibleBuiltinWorkers = builtinWorkers.filter(matchesQuery);
+	const visibleThirdPartyWorkers = thirdPartyWorkers.filter(matchesQuery);
+	const visibleCount = visibleManagers.length + visibleBuiltinWorkers.length + visibleThirdPartyWorkers.length;
 
 	const renderAgentCard = (agent: AgentConfig) => {
 		const description = agent.description;
 		return (
 			<div
 				key={agent.name}
-				className="ops-agent-card group relative flex min-h-40 flex-col rounded-2xl p-4 transition-all"
+				className="ops-agent-card group relative flex min-h-[132px] rounded-xl p-5 pr-12 transition-all"
 			>
-				<button type="button" className="ops-agent-main flex flex-1 flex-col text-left" onClick={() => openManage(agent)}>
-					<span className="ops-agent-avatar"><WorkerAvatar name={agent.name} size={42} /></span>
-					<div className="mt-3 min-w-0">
+				<button type="button" className="ops-agent-main flex min-w-0 flex-1 items-start gap-4 text-left" onClick={() => openManage(agent)}>
+					<span className="ops-agent-avatar shrink-0"><WorkerAvatar name={agent.name} size={42} /></span>
+					<div className="flex min-w-0 flex-1 self-stretch flex-col">
 						<div className="flex items-baseline gap-2">
-							<span className="truncate text-sm font-semibold tracking-tight">{agentDisplayName(agent)}</span>
-							<span className="truncate font-mono text-[11px] text-muted-foreground">{agent.connector?.connectorId ?? "command"}</span>
+							<span className="truncate text-sm font-medium tracking-tight">{agentDisplayName(agent)}</span>
+							<span className={`ops-agent-status-dot ${agent.enabled === false ? "is-disabled" : ""}`} role="img" aria-label={agent.enabled !== false ? "已启用" : "已停用"} />
 						</div>
 						<p className="mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground" title={description}>
 							{description || "尚未填写角色描述"}
 						</p>
+						<div className="mt-auto flex flex-wrap items-center gap-2 pt-3 text-[11px] text-muted-foreground">
+							<span className="ops-agent-kind-pill">{agent.connector?.connectorId === "pi" ? "Pi" : agent.connector?.connectorId ?? "命令"}</span>
+							<span>{agent.enabled !== false ? "可用" : "已停用"}</span>
+							{probes[agent.name] ? <span>{probeSummary(probes[agent.name])}</span> : null}
+						</div>
 					</div>
-					<div className="mt-auto flex items-center gap-2 pt-4 text-[11px] text-muted-foreground">
-						<span className="rounded-full bg-foreground/[0.035] px-2 py-0.5">{agent.enabled !== false ? "已启用" : "已停用"}</span>
-						{agent.connector?.transport ? <span className="rounded-full bg-foreground/[0.035] px-2 py-0.5">{transportLabel(agent.connector.transport)}</span> : null}
-						{probes[agent.name] ? <span>{probeSummary(probes[agent.name])}</span> : null}
-					</div>
-				</button>
+					</button>
+				<ChevronRightIcon className="ops-agent-chevron pointer-events-none absolute right-5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
 				<DropdownMenu>
 					<DropdownMenuTrigger asChild>
-						<Button type="button" size="icon" variant="ghost" aria-label={`管理 ${agentDisplayName(agent)}`} className="absolute right-3 top-3 size-8 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100">
+						<Button type="button" size="icon" variant="ghost" aria-label={`管理 ${agentDisplayName(agent)}`} className="ops-agent-menu-trigger absolute right-3 top-3 size-8 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100">
 							<MoreHorizontalIcon className="size-4" />
 						</Button>
 					</DropdownMenuTrigger>
@@ -514,7 +612,7 @@ export function AgentsPane() {
 						<DropdownMenuItem disabled={probing === agent.name} onSelect={() => void handleProbe(agent.name)}><RefreshCwIcon />{probing === agent.name ? "探测中…" : "运行探测"}</DropdownMenuItem>
 						<DropdownMenuItem disabled={resolving} onSelect={() => void applyEnabled(agent, !(agent.enabled !== false))}><UserCheckIcon />{agent.enabled !== false ? "停用" : "启用"}</DropdownMenuItem>
 						<DropdownMenuSeparator />
-						<DropdownMenuItem variant="destructive" onSelect={() => setPendingDelete(agent)}><TrashIcon />删除</DropdownMenuItem>
+						<DropdownMenuItem variant="destructive" onSelect={() => { setDeleteError(null); setDeleteRuns([]); setPendingDelete(agent); }}><TrashIcon />删除</DropdownMenuItem>
 					</DropdownMenuContent>
 				</DropdownMenu>
 			</div>
@@ -525,78 +623,91 @@ export function AgentsPane() {
 		const description = agent.description.replace(/^内置\s+Pi\s+manager[：:]?\s*/i, "");
 		return <button key={agent.name} type="button" className="ops-manager-strip" onClick={() => openManage(agent)}>
 			<ManagerAvatar size={48} className="ops-manager-avatar" />
-			<div className="min-w-0 text-left">
-				<div className="flex items-center gap-2"><span className="text-sm font-semibold">{agent.displayName?.trim() || "Manager"}</span><span className="ops-origin-pill">内置</span></div>
+			<div className="ops-manager-content min-w-0 text-left">
+				<div className="flex items-center gap-2"><span className="text-sm font-medium">{agent.displayName?.trim() || "Manager"}</span><span className={`ops-agent-status-dot ${agent.enabled === false ? "is-disabled" : ""}`} role="img" aria-label={agent.enabled !== false ? "可用" : "已停用"} /></div>
 				<p className="mt-1 text-xs leading-5 text-muted-foreground">{description || "理解目标、组织协作并汇总结果"}</p>
-				<div className="mt-2 flex gap-2 text-[11px] text-muted-foreground"><span className="rounded-full bg-foreground/[0.035] px-2 py-0.5">固定角色</span><span className="rounded-full bg-foreground/[0.035] px-2 py-0.5">Pi Runtime</span></div>
+				<div className="ops-manager-meta"><span className="ops-origin-pill">Pi</span><span>个人助理 · 房间协调</span></div>
 			</div>
-			<div className="ops-manager-meta"><span className="size-2 rounded-full bg-primary" /><span>可用</span></div>
+			<ChevronRightIcon className="ops-manager-chevron" size={15} aria-hidden="true" />
 		</button>;
 	};
 
 	return (
 		<div className="ops-page flex h-full flex-col">
-			<header className="ops-page-header">
+			<header className="ops-page-header ops-agents-header">
 				<div>
 					<h1 className="ops-page-title">智能体</h1>
 					<p className="ops-page-subtitle">管理协作角色、连接方式与运行状态</p>
 				</div>
 				<Button type="button" size="sm" onClick={() => setCreateOpen(true)}>
 					<PlusIcon className="size-4" />
-					添加 Worker
+					添加智能体
 				</Button>
 			</header>
 			<div className="ops-page-scroll flex-1 overflow-y-auto">
 				<div className="mx-auto w-full max-w-[1180px] px-7 pb-10">
+					<div className="flex flex-wrap items-center justify-between gap-3 border-b border-border/60 py-4">
+						<p className="text-xs text-muted-foreground">{loading ? "正在读取智能体…" : loadError ? "智能体列表加载失败" : `${agents.length} 个智能体 · ${agents.filter((agent) => agent.enabled !== false).length} 个已启用`}</p>
+						<div className="relative w-full sm:w-64">
+							<SearchIcon className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+							<Input aria-label="搜索智能体" placeholder="搜索智能体" value={query} onChange={(event) => setQuery(event.target.value)} className="pl-9" />
+						</div>
+					</div>
 				{loading ? (
 					<div className="flex items-center justify-center gap-2 pt-20 text-sm text-muted-foreground">
 						<LoaderIcon className="size-4 animate-spin" />
 						加载中…
 					</div>
+				) : loadError ? (
+					<div role="alert" className="flex flex-col items-start gap-3 py-10 text-sm">
+						<p>智能体列表加载失败：{loadError}</p>
+						<Button type="button" variant="outline" size="sm" onClick={() => { setLoading(true); refresh(); }}><RefreshCwIcon className="size-4" />重新加载</Button>
+					</div>
 				) : (
 					<div className="flex flex-col gap-10 py-8">
+						{normalizedQuery && visibleCount === 0 ? <p className="text-sm text-muted-foreground">没有找到匹配「{query.trim()}」的智能体。</p> : null}
 						<section className="flex flex-col gap-3">
 							<div className="flex items-baseline gap-2">
-								<h2 className="text-sm font-semibold">Manager</h2>
+								<h2 className="text-sm font-medium">Manager</h2>
 								<span className="text-xs text-muted-foreground">理解消息、组织协作并汇总结果</span>
 							</div>
-							{managers.length > 0 ? (
+							{visibleManagers.length > 0 ? (
 								<div className="grid grid-cols-1 gap-3">
-									{managers.map(renderManagerStrip)}
+									{visibleManagers.map(renderManagerStrip)}
 								</div>
-							) : (
+							) : !normalizedQuery ? (
 								<p className="text-sm text-muted-foreground">未找到 Manager 配置。</p>
-							)}
+							) : null}
 						</section>
 
 						<section className="flex flex-col gap-9">
 							<div className="flex flex-col gap-3">
 								<div className="flex items-center justify-between gap-4">
-									<div className="flex items-center gap-2"><h3 className="text-sm font-semibold">Worker（内置）</h3>
+									<div className="flex items-center gap-2"><h3 className="text-sm font-medium">Worker（内置）</h3>
 									<Badge variant="secondary">{builtinWorkers.length}</Badge>
 									</div><span className="text-xs text-muted-foreground">随平台提供或由 Pi 衍生</span>
 								</div>
-								{builtinWorkers.length > 0 ? (
-									<div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-										{builtinWorkers.map(renderAgentCard)}
+								{visibleBuiltinWorkers.length > 0 ? (
+									<div className="grid grid-cols-1 gap-3 sm:grid-cols-2 min-[1500px]:grid-cols-3">
+										{visibleBuiltinWorkers.map(renderAgentCard)}
 									</div>
-								) : (
+								) : !normalizedQuery ? (
 									<p className="text-sm text-muted-foreground">暂无内置 Worker。</p>
-								)}
+								) : null}
 							</div>
 							<div className="flex flex-col gap-3">
 								<div className="flex items-center justify-between gap-4">
-									<div className="flex items-center gap-2"><h3 className="text-sm font-semibold">Worker（第三方）</h3>
+									<div className="flex items-center gap-2"><h3 className="text-sm font-medium">Worker（第三方）</h3>
 									<Badge variant="secondary">{thirdPartyWorkers.length}</Badge>
 									</div><span className="text-xs text-muted-foreground">通过连接插件添加，默认归入此处</span>
 								</div>
-								{thirdPartyWorkers.length > 0 ? (
-									<div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-										{thirdPartyWorkers.map(renderAgentCard)}
+								{visibleThirdPartyWorkers.length > 0 ? (
+									<div className="grid grid-cols-1 gap-3 sm:grid-cols-2 min-[1500px]:grid-cols-3">
+										{visibleThirdPartyWorkers.map(renderAgentCard)}
 									</div>
-								) : (
+								) : !normalizedQuery ? (
 									<p className="text-sm text-muted-foreground">暂无第三方 Worker，点击右上角添加。</p>
-								)}
+								) : null}
 							</div>
 						</section>
 					</div>
@@ -607,20 +718,27 @@ export function AgentsPane() {
 			<CreateAgentDialog open={createOpen} onOpenChange={setCreateOpen} onCreated={refresh} />
 
 			{/* 删除确认 */}
-			<Dialog open={pendingDelete !== null} onOpenChange={(open) => !open && setPendingDelete(null)}>
+			<Dialog open={pendingDelete !== null} onOpenChange={(open) => { if (!open && !deleting) setPendingDelete(null); }}>
 				<DialogContent>
 					<DialogHeader>
 						<DialogTitle>删除智能体</DialogTitle>
 						<DialogDescription>
-							确定删除「{pendingDelete?.name}」吗？该 worker 将从 teams.json 移除，无法恢复。
+							删除「{pendingDelete ? agentDisplayName(pendingDelete) : ""}」的配置？现有会话保留历史信息，删除后无法恢复此 Agent。
 						</DialogDescription>
 					</DialogHeader>
+					{pendingDelete?.enabled !== false ? <p className="text-sm text-muted-foreground">请先停用此 Agent，处理进行中的 Run，再删除。</p> : null}
+					{deleteError ? <p role="alert" className="text-sm text-destructive">{deleteError}</p> : null}
+					{deleteRuns.length > 0 ? (
+						<div className="flex flex-col gap-1 text-xs text-muted-foreground">
+							{deleteRuns.map((run) => <div key={run.delegationId} className="font-mono">{run.delegationId} · {run.executionState} · 窗口 {run.windowId}</div>)}
+						</div>
+					) : null}
 					<DialogFooter>
-						<Button type="button" variant="ghost" onClick={() => setPendingDelete(null)}>
+						<Button type="button" variant="ghost" disabled={deleting} onClick={() => setPendingDelete(null)}>
 							取消
 						</Button>
-						<Button type="button" variant="destructive" onClick={() => void handleDelete()}>
-							删除
+						<Button type="button" variant="destructive" disabled={deleting || pendingDelete?.enabled !== false} onClick={() => void handleDelete()}>
+							{deleting ? <LoaderIcon className="size-4 animate-spin" /> : null}{deleteRuns.length > 0 ? "重新检查并删除" : "删除"}
 						</Button>
 					</DialogFooter>
 				</DialogContent>
@@ -638,7 +756,7 @@ export function AgentsPane() {
 							<span className="text-sm text-muted-foreground">进行中 / 等待审批的 Run：</span>
 							{enableConflict.runs.map((run) => (
 								<div key={run.delegationId} className="font-mono text-xs text-muted-foreground">
-									{run.delegationId} · {run.status} · 窗口 {run.windowId}
+									{run.delegationId} · {run.executionState} · 窗口 {run.windowId}
 								</div>
 							))}
 						</div>

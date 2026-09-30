@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants, createReadStream, createWriteStream } from "node:fs";
-import { chmod, copyFile, mkdir, open, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { constants, createWriteStream } from "node:fs";
+import { chmod, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import path from "node:path";
 
@@ -8,7 +8,7 @@ import path from "node:path";
 export interface ArtifactRecord {
 	id: string;
 	name: string;
-	/** 本地绝对路径（登记时解析）；content 下载只读这个登记路径本身。 */
+	/** 本地源文件的规范路径，仅用于来源追溯；下载读取 snapshotPath。 */
 	path: string;
 	/** 登记瞬间冻结的只读副本；下载永远读取它，不受 workspace 后续修改影响。 */
 	snapshotPath: string;
@@ -27,7 +27,14 @@ export interface ArtifactRecord {
 	createdAt: string;
 }
 
-export type ArtifactInput = Omit<ArtifactRecord, "id" | "createdAt" | "snapshotPath" | "contentHash">;
+export type ArtifactInput = Omit<ArtifactRecord, "id" | "createdAt" | "snapshotPath" | "contentHash" | "size">;
+
+export class ArtifactIntegrityError extends Error {
+	constructor() {
+		super("交付物冻结快照与登记哈希不一致，无法打开");
+		this.name = "ArtifactIntegrityError";
+	}
+}
 
 interface ArtifactsFile {
 	version: number;
@@ -43,6 +50,7 @@ interface ArtifactsFile {
 export class ArtifactStore {
 	private queue: Promise<unknown> = Promise.resolve();
 	private readonly file: string;
+	private readonly downloadsDir: string;
 	/** artifact.created 事件订阅方（index.ts 挂到 manager session 通知通道）。 */
 	private listeners = new Set<(record: ArtifactRecord) => void>();
 
@@ -51,10 +59,15 @@ export class ArtifactStore {
 		private readonly blobsDir: string,
 	) {
 		this.file = path.join(stateDir, "artifacts.json");
+		this.downloadsDir = path.join(blobsDir, ".downloads");
 	}
 
 	async init(): Promise<void> {
 		await mkdir(this.blobsDir, { recursive: true });
+		// The Home lease is acquired before init; no live backend can own these
+		// request copies after a restart.
+		await rm(this.downloadsDir, { recursive: true, force: true });
+		await mkdir(this.downloadsDir, { recursive: true, mode: 0o700 });
 	}
 
 	/** 订阅 artifact.created；返回退订函数。 */
@@ -100,7 +113,7 @@ export class ArtifactStore {
 		await rename(tmp, this.file);
 	}
 
-	/** 登记一个交付物（push/observe 无差别）。size 缺省时尽力 stat 补齐。 */
+	/** 登记一个交付物（push/observe 无差别）。大小和哈希都以冻结副本为准。 */
 	async register(input: ArtifactInput): Promise<ArtifactRecord> {
 		const root = await realpath(input.cwdSnapshot);
 		if (root !== input.cwdSnapshot) throw new Error("cwdSnapshot identity changed");
@@ -113,36 +126,86 @@ export class ArtifactStore {
 		if (!info.isFile()) throw new Error("artifact is not a file");
 		const id = randomUUID();
 		const snapshotPath = path.join(await realpath(this.blobsDir), id);
-		await copyFile(target, snapshotPath);
-		const snapshotInfo = await stat(snapshotPath);
-		const contentHash = await new Promise<string>((resolve, reject) => {
+		let sourceHandle;
+		try {
+			sourceHandle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+			const [currentRoot, currentTarget, pathInfo, fdInfo] = await Promise.all([
+				realpath(input.cwdSnapshot), realpath(target), stat(target), sourceHandle.stat(),
+			]);
+			if (currentRoot !== root || currentTarget !== target || !fdInfo.isFile() || pathInfo.dev !== fdInfo.dev || pathInfo.ino !== fdInfo.ino) {
+				throw new Error("artifact source identity changed before capture");
+			}
 			const hash = createHash("sha256");
-			const stream = createReadStream(snapshotPath);
-			stream.on("data", (chunk) => hash.update(chunk));
-			stream.on("error", reject);
-			stream.on("end", () => resolve(hash.digest("hex")));
-		});
-		const size = input.size ?? snapshotInfo.size;
-		const record: ArtifactRecord = {
-			...input,
-			path: target,
-			snapshotPath,
-			contentHash,
-			size,
-			id,
-			createdAt: new Date().toISOString(),
-		};
-		await this.serialize(async () => {
-			const all = await this.load();
-			all[record.id] = record;
-			await this.write(all);
-		});
-		this.emitCreated(record);
-		return record;
+			let size = 0;
+			const source = sourceHandle.createReadStream({ autoClose: true });
+			source.on("data", (chunk: string | Buffer) => { hash.update(chunk); size += Buffer.byteLength(chunk); });
+			await pipeline(source, createWriteStream(snapshotPath, { flags: "wx", mode: 0o600 }));
+			await chmod(snapshotPath, 0o444);
+			const record: ArtifactRecord = {
+				...input,
+				path: target,
+				snapshotPath,
+				contentHash: hash.digest("hex"),
+				size,
+				id,
+				createdAt: new Date().toISOString(),
+			};
+			await this.serialize(async () => {
+				const all = await this.load();
+				all[record.id] = record;
+				await this.write(all);
+			});
+			this.emitCreated(record);
+			return record;
+		} catch (error) {
+			await rm(snapshotPath, { force: true }).catch(() => undefined);
+			throw error;
+		} finally {
+			await sourceHandle?.close().catch(() => undefined);
+		}
 	}
 
 	async get(id: string): Promise<ArtifactRecord | undefined> {
 		return (await this.load())[id];
+	}
+
+	private async copyVerifiedSnapshot(record: ArtifactRecord, destination: string): Promise<void> {
+		const resolved = path.resolve(record.snapshotPath);
+		let handle;
+		try {
+			handle = await open(resolved, constants.O_RDONLY | constants.O_NOFOLLOW);
+			const [blobRoot, real, pathInfo, fdInfo] = await Promise.all([
+				realpath(this.blobsDir), realpath(resolved), stat(resolved), handle.stat(),
+			]);
+			const relative = path.relative(blobRoot, real);
+			if (real !== record.snapshotPath || relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error("artifact snapshot path rejected");
+			if (!fdInfo.isFile() || pathInfo.dev !== fdInfo.dev || pathInfo.ino !== fdInfo.ino) throw new Error("artifact snapshot is not stable");
+			const hash = createHash("sha256");
+			const source = handle.createReadStream({ autoClose: true });
+			source.on("data", (chunk: string | Buffer) => { hash.update(chunk); });
+			await pipeline(source, createWriteStream(destination, { flags: "wx", mode: 0o600 }));
+			if (hash.digest("hex") !== record.contentHash) throw new ArtifactIntegrityError();
+		} catch (error) {
+			await rm(destination, { force: true }).catch(() => undefined);
+			throw error;
+		} finally {
+			await handle?.close().catch(() => undefined);
+		}
+	}
+
+	/** A unique verified copy keeps download bytes stable after the hash check. */
+	async prepareDownload(id: string): Promise<{ record: ArtifactRecord; filePath: string; cleanup: () => Promise<void> } | undefined> {
+		const record = await this.get(id);
+		if (!record) return undefined;
+		const directory = await mkdtemp(path.join(this.downloadsDir, "request-"));
+		const filePath = path.join(directory, "content");
+		try {
+			await this.copyVerifiedSnapshot(record, filePath);
+		} catch (error) {
+			await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+			throw error;
+		}
+		return { record, filePath, cleanup: () => rm(directory, { recursive: true, force: true }) };
 	}
 
 	/**
@@ -153,35 +216,17 @@ export class ArtifactStore {
 	async materializeForOpen(id: string): Promise<string | undefined> {
 		const record = await this.get(id);
 		if (!record) return undefined;
-		const resolved = path.resolve(record.snapshotPath);
-		let handle;
-		try {
-			handle = await open(resolved, constants.O_RDONLY | constants.O_NOFOLLOW);
-			const [blobRoot, real, pathInfo, fdInfo] = await Promise.all([
-				realpath(this.blobsDir),
-				realpath(resolved),
-				stat(resolved),
-				handle.stat(),
-			]);
-			const relative = path.relative(blobRoot, real);
-			if (real !== record.snapshotPath || relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error("artifact snapshot path rejected");
-			if (!fdInfo.isFile() || pathInfo.dev !== fdInfo.dev || pathInfo.ino !== fdInfo.ino) throw new Error("artifact snapshot is not stable");
-		} catch (error) {
-			await handle?.close().catch(() => undefined);
-			throw error;
-		}
 		const safeName = path.basename(record.name).replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_") || `artifact-${id}`;
 		const directory = path.join(this.blobsDir, "open", id);
 		await mkdir(directory, { recursive: true });
 		const target = path.join(directory, safeName);
 		const temporary = `${target}.${randomUUID().slice(0, 8)}.tmp`;
 		try {
-			await pipeline(handle.createReadStream({ autoClose: true }), createWriteStream(temporary, { flags: "wx", mode: 0o600 }));
+			await this.copyVerifiedSnapshot(record, temporary);
 			await chmod(temporary, 0o444).catch(() => undefined);
 			await rm(target, { force: true });
 			await rename(temporary, target);
 		} catch (error) {
-			await handle.close().catch(() => undefined);
 			await rm(temporary, { force: true }).catch(() => undefined);
 			throw error;
 		}

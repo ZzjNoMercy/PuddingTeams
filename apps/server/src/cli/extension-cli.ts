@@ -14,7 +14,7 @@ import { runDoctorCli, runInitCli } from "./init-cli.js";
  *
  * - init     从 extensions/shared/templates/ 复制模板并替换占位符；
  * - validate 校验 manifest（与安装流程共用 readManifestFromDir）、entry
- *   存在性、代码型包的 createDriver/driver 导出、声明式包的 {packageDir}
+ *   存在性、声明式包的 {packageDir}
  *   引用文件。
  *
  * bin/puddingteams.mjs 是纯 node 引导，用 tsx 跑本文件；runExtensionCli
@@ -36,7 +36,7 @@ const USAGE = `puddingteams — 初始化引导 / 环境体检 / Extension 包�
                 非 TTY 只提示不安装，跳过不阻塞（退出码 0）
   doctor        只读体检：Node、数据目录、各 worker 可用性与修复建议；worker 缺失不影响退出码
   extension init     从模板生成 Extension 包骨架（--declarative 生成纯 manifest 声明式包）
-  extension validate 校验包的 manifest、entry 与 Driver 导出，全部通过退出码 0
+  extension validate 静态校验包的 manifest、entry 路径与声明式资源，不执行代码入口
 `;
 
 function log(msg: string): void {
@@ -213,34 +213,6 @@ function fail(label: string, detail: string): CheckResult {
 	return { ok: false, label, detail };
 }
 
-interface LoadedEntryModule {
-	createDriver?: unknown;
-	driver?: unknown;
-	extension?: unknown;
-	default?: unknown;
-}
-
-/** 代码型包：动态 import entry，按 registry 的识别规则检查导出。 */
-async function checkEntryExports(entryPath: string, manifest: PuddingTeamsExtensionManifest & { entry?: string }): Promise<CheckResult> {
-	let mod: LoadedEntryModule;
-	try {
-		mod = (await import(pathToFileURL(entryPath).href)) as LoadedEntryModule;
-	} catch (e) {
-		return fail("模块加载", `import ${manifest.entry} 失败：${e instanceof Error ? e.message : String(e)}`);
-	}
-	const inner = (mod.default ?? {}) as LoadedEntryModule & { register?: unknown };
-	if (manifest.kind === "capability") {
-		const extension = mod.extension ?? (inner.register ? inner : undefined);
-		if (extension) return pass("模块导出", "capability 模块（extension/default.register）已导出");
-		return fail("模块导出", "capability 包未导出 extension 模块（含 manifest + register）");
-	}
-	const createDriver = mod.createDriver ?? inner.createDriver;
-	const driver = mod.driver ?? inner.driver;
-	if (typeof createDriver === "function") return pass("模块导出", "createDriver 工厂已导出（多实例，推荐）");
-	if (driver && typeof driver === "object") return pass("模块导出", "driver 单例已导出（建议改为 createDriver 工厂）");
-	return fail("模块导出", "connector 包未导出 createDriver/driver");
-}
-
 /** 声明式包：收集 argv 里 {packageDir}/xxx 引用并检查文件存在（不探测可执行性，避免副作用）。 */
 function checkDeclarativeRefs(dir: string, manifest: ConnectorExtensionManifest): CheckResult[] {
 	const declarative = manifest.connector.declarative!;
@@ -296,10 +268,9 @@ async function extensionValidate(args: string[]): Promise<number> {
 	const declarative = manifest.kind === "connector" ? manifest.connector.declarative : undefined;
 	if (manifest.entry) {
 		const entryPath = path.join(dir, manifest.entry);
-		if (existsSync(entryPath)) {
+		if (existsSync(entryPath) && (await stat(entryPath)).isFile()) {
 			results.push(pass("entry 文件", `${manifest.entry} 存在`));
-			// 4a. 代码型包：import entry 检查导出。
-			results.push(await checkEntryExports(entryPath, manifest));
+			results.push(pass("代码入口", "仅静态检查路径；未执行模块，导出与运行能力须在受控开发环境验证"));
 		} else {
 			results.push(fail("entry 文件", `${manifest.entry} 不存在于包内`));
 		}

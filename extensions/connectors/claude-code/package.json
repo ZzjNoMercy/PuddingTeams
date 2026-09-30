@@ -41,15 +41,16 @@
 			"configSchema": {
 				"type": "object",
 				"properties": {
-					"command": { "type": "string", "description": "Claude Code 可执行文件名或路径", "default": "claude" },
-					"model": { "type": "string", "title": "model", "x-puddingteams-options": "driver", "description": "按 Claude Code 的模型别名与本机 availableModels/自定义配置选择；留空用 Claude 默认" },
+					"command": { "type": "string", "title": "CLI 命令", "description": "Claude Code 可执行文件名或路径", "default": "claude" },
+					"model": { "type": "string", "title": "模型", "x-puddingteams-options": "driver", "description": "按 Claude Code 的模型别名与本机 availableModels/自定义配置选择；留空用 Claude 默认" },
 					"permissionMode": {
 						"type": "string",
+						"title": "权限模式",
 						"enum": ["default", "acceptEdits", "plan", "bypassPermissions"],
 						"description": "Claude Code 权限模式（--permission-mode）。默认 bypassPermissions 适合无头执行但会绕过 Claude 权限确认，属于高风险；PuddingTeams 的项目目录只提供 cwd，不构成强制文件访问边界。"
 					},
-					"systemPrompt": { "type": "string", "description": "追加到系统提示的自定义指令（--append-system-prompt）" },
-					"allowedTools": { "type": "string", "description": "工具白名单（--allowedTools），如 \"Bash(git *) Edit\"；留空不限" }
+					"systemPrompt": { "type": "string", "title": "追加系统提示词", "description": "追加到系统提示的自定义指令（--append-system-prompt）" },
+					"allowedTools": { "type": "string", "title": "工具白名单", "description": "工具白名单（--allowedTools），如 \"Bash(git *) Edit\"；留空不限" }
 				}
 			},
 			"secretSchema": [{ "key": "ANTHROPIC_API_KEY", "label": "Anthropic API Key（可选）", "required": false }],

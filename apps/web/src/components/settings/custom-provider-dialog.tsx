@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { LoaderIcon, PlusIcon, RefreshCwIcon, Trash2Icon, ZapIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -15,6 +15,7 @@ import {
 	DialogTitle,
 } from "@/components/ui/dialog";
 import {
+	ApiConflictError,
 	discoverProviderModels,
 	MODELS_CHANGED_EVENT,
 	setProviderKey,
@@ -48,12 +49,22 @@ export function CustomProviderDialog({
 	open,
 	onOpenChange,
 	editing,
+	catalogConfirmed,
+	expectedRevision,
+	catalogIssue,
+	existingProviderIds,
+	onConflict,
 	onSaved,
 }: {
 	open: boolean;
 	onOpenChange: (open: boolean) => void;
 	/** 编辑已有 provider 时传入；新增为 undefined。 */
 	editing?: CustomProviderRecord;
+	catalogConfirmed: boolean;
+	expectedRevision: string | null;
+	catalogIssue: string | null;
+	existingProviderIds: string[];
+	onConflict: () => void;
 	onSaved: () => void;
 }) {
 	const [id, setId] = useState(editing?.id ?? "");
@@ -62,12 +73,25 @@ export function CustomProviderDialog({
 	const [api, setApi] = useState(editing?.api ?? "openai-completions");
 	const [apiKey, setApiKey] = useState("");
 	const [models, setModels] = useState<ModelRow[]>(toRows(editing?.models ?? []));
+	const duplicateNewId = !editing && existingProviderIds.includes(id.trim());
 	const [busy, setBusy] = useState<"test" | "discover" | "save" | null>(null);
+	const busyRef = useRef<"test" | "discover" | "save" | null>(null);
+	const begin = (action: "test" | "discover" | "save") => {
+		if (busyRef.current) return false;
+		busyRef.current = action;
+		setBusy(action);
+		return true;
+	};
+	const finish = () => { busyRef.current = null; setBusy(null); };
+	const changeOpen = (next: boolean) => {
+		if (!next && busyRef.current) return;
+		onOpenChange(next);
+	};
 
 	const canTest = baseUrl.trim().length > 0 && busy === null;
 
 	const test = async () => {
-		setBusy("test");
+		if (!baseUrl.trim() || !begin("test")) return;
 		try {
 			const result = await testProviderConnection({
 				baseUrl: baseUrl.trim(),
@@ -78,12 +102,12 @@ export function CustomProviderDialog({
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
-			setBusy(null);
+			finish();
 		}
 	};
 
 	const discover = async () => {
-		setBusy("discover");
+		if (!baseUrl.trim() || !begin("discover")) return;
 		try {
 			const result = await discoverProviderModels({
 				baseUrl: baseUrl.trim(),
@@ -104,11 +128,13 @@ export function CustomProviderDialog({
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
-			setBusy(null);
+			finish();
 		}
 	};
 
 	const save = async () => {
+		if (!catalogConfirmed || !expectedRevision || duplicateNewId) return;
+		if (!begin("save")) return;
 		const providerId = (editing?.id ?? id).trim();
 		const cleanModels: CustomModelInput[] = models
 			.filter((m) => m.id.trim())
@@ -116,28 +142,37 @@ export function CustomProviderDialog({
 				id: m.id.trim(),
 				...(m.name?.trim() ? { name: m.name.trim() } : {}),
 				reasoning: m.reasoning === true,
+				vision: m.vision === true,
 				...(m.contextWindow ? { contextWindow: m.contextWindow } : {}),
 				...(m.maxTokens ? { maxTokens: m.maxTokens } : {}),
 			}));
-		setBusy("save");
+		let providerSaved = false;
 		try {
 			await upsertCustomProvider(providerId, {
 				name: name.trim(),
 				baseUrl: baseUrl.trim(),
 				api,
 				models: cleanModels,
-			});
+			}, expectedRevision);
+			providerSaved = true;
 			if (apiKey.trim()) {
 				await setProviderKey(providerId, apiKey.trim());
 			}
-			toast.success(`自定义 provider「${name.trim() || providerId}」已保存`);
 			window.dispatchEvent(new Event(MODELS_CHANGED_EVENT));
+			toast.success(`自定义 provider「${name.trim() || providerId}」已保存`);
+			finish();
 			onOpenChange(false);
 			onSaved();
 		} catch (err) {
-			toast.error(err instanceof Error ? err.message : String(err));
+			if (err instanceof ApiConflictError) onConflict();
+			const message = err instanceof Error ? err.message : String(err);
+			if (providerSaved) {
+				window.dispatchEvent(new Event(MODELS_CHANGED_EVENT));
+				toast.warning(`Provider 配置已保存，但 API Key 未确认：${message}`);
+				onSaved();
+			} else toast.error(message);
 		} finally {
-			setBusy(null);
+			if (busyRef.current) finish();
 		}
 	};
 
@@ -146,7 +181,7 @@ export function CustomProviderDialog({
 	};
 
 	return (
-		<Dialog open={open} onOpenChange={onOpenChange}>
+		<Dialog open={open} onOpenChange={changeOpen}>
 			<DialogContent overlayClassName="custom-provider-dialog-overlay" className="custom-provider-dialog max-h-[min(78vh,700px)] gap-0 overflow-hidden p-0 sm:max-w-[640px]">
 				<DialogHeader className="custom-provider-dialog-header">
 					<DialogTitle>{editing ? `编辑自定义 Provider「${editing.id}」` : "添加自定义 Provider"}</DialogTitle>
@@ -155,7 +190,7 @@ export function CustomProviderDialog({
 						及其模型进入全局模型目录，manager 与 worker 都可选。
 					</DialogDescription>
 				</DialogHeader>
-				<div className="custom-provider-dialog-body">
+				<div className="custom-provider-dialog-body" inert={busy !== null} aria-busy={busy !== null}>
 					<section className="custom-provider-section">
 						<div className="custom-provider-section-heading">
 							<strong>连接信息</strong>
@@ -273,6 +308,7 @@ export function CustomProviderDialog({
 										/>
 										思考
 									</label>
+									<label className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground" title="模型接收图片输入；请按服务商实际能力声明"><input type="checkbox" checked={m.vision === true} onChange={(e) => updateRow(m._key, { vision: e.target.checked })} className="size-3.5 accent-foreground" />支持图片</label>
 									<Button
 										type="button"
 										size="sm"
@@ -288,12 +324,13 @@ export function CustomProviderDialog({
 					</section>
 				</div>
 				<DialogFooter className="custom-provider-dialog-footer">
-					<Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
+					{catalogIssue || duplicateNewId ? <span role="alert" className="text-xs text-destructive">{catalogIssue ?? "该 Provider ID 已存在，请编辑现有条目或更换 ID。"}</span> : null}
+					<Button type="button" variant="ghost" disabled={busy !== null} onClick={() => changeOpen(false)}>
 						取消
 					</Button>
 					<Button
 						type="button"
-						disabled={busy !== null || (!editing && !id.trim()) || !name.trim() || !baseUrl.trim() || models.every((m) => !m.id.trim())}
+						disabled={!catalogConfirmed || duplicateNewId || busy !== null || (!editing && !id.trim()) || !name.trim() || !baseUrl.trim() || models.every((m) => !m.id.trim())}
 						onClick={() => void save()}
 					>
 						{busy === "save" ? <LoaderIcon className="size-3.5 animate-spin" /> : null}

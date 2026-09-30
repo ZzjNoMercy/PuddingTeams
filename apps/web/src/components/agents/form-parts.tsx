@@ -1,12 +1,21 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ImagePlusIcon, LoaderIcon, XIcon } from "lucide-react";
+import { CheckIcon, ChevronDownIcon, ImagePlusIcon, LoaderIcon, XIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+	DropdownMenu,
+	DropdownMenuContent,
+	DropdownMenuItem,
+	DropdownMenuSub,
+	DropdownMenuSubContent,
+	DropdownMenuSubTrigger,
+	DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
 	deleteAgentAvatar,
 	deleteAgentSecret,
@@ -17,6 +26,8 @@ import {
 	uploadAgentAvatar,
 } from "@/lib/api";
 import { agentAvatarChanged } from "@/lib/avatars";
+import { isIMEComposing } from "@/lib/ime";
+import { useModelCatalog } from "@/lib/model-catalog";
 import { ManagerAvatar, WorkerAvatar } from "@/components/chat/worker-avatar";
 import { agentDisplayName, type AgentConfig, type AffectedSessions, type DriverConfigOption, type ModelSummary, type SecretSchemaItem } from "@/lib/types";
 
@@ -39,6 +50,8 @@ interface JsonSchemaProp {
 	"x-puddingteams-options"?: string;
 	/** Only render this field for the selected Connector transport(s). */
 	"x-puddingteams-transports"?: string[];
+	/** 运维向字段：保留在配置契约里，但配置页不生成表单。 */
+	"x-puddingteams-hidden"?: boolean;
 	/** Optional display labels for string enum values; persisted values stay unchanged. */
 	"x-puddingteams-enum-labels"?: Record<string, string>;
 	/** Only render this field when another schema field resolves to the given value. */
@@ -46,6 +59,15 @@ interface JsonSchemaProp {
 		field: string;
 		equals: string | number | boolean;
 	};
+	/**
+	 * 把该 enum 收敛为「指定 model 字段所选模型实际支持的档位」。
+	 *
+	 * Connector 的 configSchema 是静态声明，只能给出归一化档位全集；某模型真正
+	 * 支持哪些档位来自它自己的 `thinkingLevelMap`（`/api/models` 的
+	 * `thinkingLevels`，并经平台能力表修正）。不收敛的话，用户能在只支持开/关的
+	 * 模型上选到 `minimal`/`medium`，被 SDK 静默 clamp，看起来像设了其实没生效。
+	 */
+	"x-puddingteams-thinking-levels-from"?: string;
 	enum?: unknown[];
 	default?: unknown;
 }
@@ -55,6 +77,9 @@ function isSchemaPropertyVisible(
 	props: Record<string, JsonSchemaProp>,
 	value: Record<string, unknown>,
 ): boolean {
+	// 运维向字段（如会话存储目录）：仍属于 connector 配置契约（API 可写、运行时
+	// 可读、导入导出可带），但不在配置页生成表单。
+	if (prop["x-puddingteams-hidden"]) return false;
 	const condition = prop["x-puddingteams-visible-when"];
 	if (!condition) return true;
 	const controllingValue = value[condition.field] ?? props[condition.field]?.default;
@@ -131,7 +156,11 @@ function JsonConfigEditor({
 /** 清除哨兵：非必填下拉选「不设置」时删除该 key（回落 connector 默认）。 */
 const UNSET = "__unset__";
 
-/** format: "model" 的模型下拉：数据源 /api/models（含自定义 provider 的模型）。 */
+/**
+ * format: "model" 的模型选择：数据源 /api/models（含自定义 provider 的模型）。
+ * 目录有上百个模型，扁平下拉会撑满整个视口，所以按 provider 分组、二级菜单
+ * 限高——与 composer 的模型选择器同一套交互与外观（.model-picker-*）。
+ */
 function ModelSelectField({
 	label,
 	mark,
@@ -162,29 +191,68 @@ function ModelSelectField({
 			cancelled = true;
 		};
 	}, []);
-	const value = typeof current === "string" && current ? current : UNSET;
+	const value = typeof current === "string" && current ? current : undefined;
 	const known = models?.some((m) => m.id === value) ?? false;
+	const selected = models?.find((m) => m.id === value);
+	const byProvider = new Map<string, ModelSummary[]>();
+	for (const model of models ?? []) {
+		const group = byProvider.get(model.provider) ?? [];
+		group.push(model);
+		byProvider.set(model.provider, group);
+	}
 	return (
-		<label className="flex flex-col gap-1 text-sm">
-			<span className="text-muted-foreground">
+		<label className="agent-config-field">
+			<span>
 				{label}
 				{mark}
 			</span>
-			<Select value={value} onValueChange={(v) => onSelect(v === UNSET ? undefined : v)}>
-				<SelectTrigger className="w-full">
-					<SelectValue placeholder={models === null ? "加载模型中…" : "请选择模型"} />
-				</SelectTrigger>
-				<SelectContent>
-					<SelectItem value={UNSET}>不设置（用默认模型）</SelectItem>
-					{value !== UNSET && !known ? <SelectItem value={value}>{value}（当前值，目录中没有）</SelectItem> : null}
-					{(models ?? []).map((m) => (
-						<SelectItem key={m.id} value={m.id}>
-							{m.name} · {m.provider}
-						</SelectItem>
+			{description ? <small>{description}</small> : null}
+			<DropdownMenu>
+				<DropdownMenuTrigger asChild>
+					<Button type="button" variant="outline" className="agent-config-model-trigger">
+						<span className="min-w-0 flex-1 truncate">
+							{models === null
+								? "加载模型中…"
+								: selected
+									? selected.name
+									: value
+										? `当前模型：${value}`
+										: "不设置（用默认模型）"}
+						</span>
+						{selected ? <span className="agent-config-model-provider">{selected.provider}</span> : null}
+						<ChevronDownIcon className="size-4 shrink-0 opacity-55" />
+					</Button>
+				</DropdownMenuTrigger>
+				<DropdownMenuContent className="model-picker-menu" align="start" sideOffset={8}>
+					<DropdownMenuItem className="model-picker-item" onSelect={() => onSelect(undefined)}>
+						<span className="min-w-0 flex-1 truncate">不设置（用默认模型）</span>
+						{value === undefined ? <CheckIcon className="model-picker-check size-4" /> : null}
+					</DropdownMenuItem>
+					{value !== undefined && !known ? (
+						<DropdownMenuItem className="model-picker-item" onSelect={() => onSelect(value)}>
+							<span className="min-w-0 flex-1 truncate">{value}</span>
+							<span className="model-picker-note">当前值，目录中没有</span>
+							<CheckIcon className="model-picker-check size-4" />
+						</DropdownMenuItem>
+					) : null}
+					{[...byProvider.entries()].map(([provider, providerModels]) => (
+						<DropdownMenuSub key={provider}>
+							<DropdownMenuSubTrigger className="model-picker-provider-item">
+								<span className="min-w-0 flex-1 truncate">{provider}</span>
+								{providerModels.some((model) => model.id === value) ? <span className="model-picker-provider-active" aria-label="当前 Provider" /> : null}
+							</DropdownMenuSubTrigger>
+							<DropdownMenuSubContent className="model-picker-submenu" sideOffset={8}>
+								{providerModels.map((model) => (
+									<DropdownMenuItem key={model.id} className="model-picker-item" onSelect={() => onSelect(model.id)}>
+										<span className="min-w-0 flex-1 truncate">{model.name}</span>
+										{model.id === value ? <CheckIcon className="model-picker-check size-4" /> : null}
+									</DropdownMenuItem>
+								))}
+							</DropdownMenuSubContent>
+						</DropdownMenuSub>
 					))}
-				</SelectContent>
-			</Select>
-			{description ? <span className="text-xs text-muted-foreground/70">{description}</span> : null}
+				</DropdownMenuContent>
+			</DropdownMenu>
 		</label>
 	);
 }
@@ -230,8 +298,8 @@ function DriverOptionSelectField({
 	const value = typeof current === "string" && current ? current : UNSET;
 	const known = options?.some((option) => option.value === value) ?? false;
 	return (
-		<label className="flex flex-col gap-1 text-sm">
-			<span className="text-muted-foreground">{label}{mark}</span>
+		<label className="agent-config-field">
+			<span>{label}{mark}</span>
 			{error ? (
 				<Input
 					value={typeof current === "string" ? current : ""}
@@ -255,7 +323,86 @@ function DriverOptionSelectField({
 				</Select>
 			)}
 			{error ? <span className="text-xs text-amber-600">模型列表读取失败，可手动输入：{error}</span> : null}
-			{description ? <span className="text-xs text-muted-foreground/70">{description}</span> : null}
+			{description ? <small>{description}</small> : null}
+		</label>
+	);
+}
+
+/**
+ * enum 字段（思考强度等）：选项按 x-puddingteams-thinking-levels-from 指向的模型
+ * 收敛（与 composer / Manager 表单共用同一份 thinkingLevels map）。已存档位
+ * 不再被新模型支持时仍必须可见可改，不能静默改写用户配置。
+ */
+function EnumSelectField({
+	fieldKey,
+	prop,
+	value,
+	props,
+	required,
+	catalogLevels,
+	catalogGraded,
+	onChange,
+}: {
+	fieldKey: string;
+	prop: JsonSchemaProp;
+	value: Record<string, unknown>;
+	props: Record<string, JsonSchemaProp>;
+	required: string[];
+	catalogLevels: string[];
+	catalogGraded: boolean;
+	onChange: (next: Record<string, unknown>) => void;
+}) {
+	const current = value[fieldKey];
+	const defaultValue = typeof prop.default === "string" ? prop.default : undefined;
+	const enumValue = typeof current === "string" && current ? current : defaultValue ?? UNSET;
+	const enumLabels = prop["x-puddingteams-enum-labels"] ?? {};
+	const levelsFrom = prop["x-puddingteams-thinking-levels-from"];
+	const modelRef = levelsFrom ? value[levelsFrom] : undefined;
+	const declared = prop.enum as string[];
+	const options = levelsFrom && typeof modelRef === "string" && modelRef.trim()
+		? declared.filter((option) => catalogLevels.includes(option))
+		: declared;
+	const staleValue = typeof current === "string" && current && !options.includes(current) && declared.includes(current);
+	return (
+		<label className="agent-config-field">
+			<span>
+				{prop.title ?? fieldKey}
+				{required.includes(fieldKey) ? <span className="text-destructive"> *</span> : null}
+			</span>
+			{/* 说明写在标题下面：解释"这个字段是干什么的"；控件下面只留随当前值
+			    变化的动态提示（例如某个模型不支持分档）。 */}
+			{prop.description ? <small>{prop.description}</small> : null}
+			<Select
+				value={enumValue}
+				onValueChange={(v) => {
+					const updated = { ...value };
+					if (v === UNSET) delete updated[fieldKey];
+					else updated[fieldKey] = v;
+					for (const [dependentKey, dependentProp] of Object.entries(props)) {
+						if (dependentProp["x-puddingteams-visible-when"]?.field === fieldKey
+							&& !isSchemaPropertyVisible(dependentProp, props, updated)) {
+							delete updated[dependentKey];
+						}
+					}
+					onChange(updated);
+				}}
+			>
+				<SelectTrigger className="w-full">
+					<SelectValue placeholder="请选择" />
+				</SelectTrigger>
+				<SelectContent>
+					{required.includes(fieldKey) || defaultValue ? null : <SelectItem value={UNSET}>不设置（默认）</SelectItem>}
+					{staleValue ? <SelectItem value={current as string}>{current as string}（当前模型不支持）</SelectItem> : null}
+					{options.map((option) => (
+						<SelectItem key={option} value={option}>
+							{enumLabels[option] ?? option}
+						</SelectItem>
+					))}
+				</SelectContent>
+			</Select>
+			{levelsFrom && typeof modelRef === "string" && modelRef.trim() && !catalogGraded ? (
+				<small>该模型只支持思考开/关，各档在链路上无差别。</small>
+			) : null}
 		</label>
 	);
 }
@@ -277,20 +424,39 @@ export function ConfigSchemaForm({
 	transport?: string;
 }) {
 	const props = simpleProperties(schema);
+	// 思考强度档位与 composer / Manager 表单同源；只有声明了
+	// x-puddingteams-thinking-levels-from 的字段会用到它。
+	const catalog = useModelCatalog();
 	if (!props) {
 		// 无 schema 或含数组/嵌套对象等复杂结构：回退 JSON 文本。
 		return <JsonConfigEditor value={value} onChange={onChange} />;
 	}
 	const required = Array.isArray(schema?.required) ? (schema.required as unknown[]).filter((v) => typeof v === "string") : [];
+	// 收敛发生在每个字段自己的 render 内（按 x-puddingteams-thinking-levels-from
+	// 指向的 model 字段取值），这里只把目录能力传下去。
+	const catalogLevels = catalog.levelsFor(String(value.model ?? ""));
+	const catalogGraded = catalog.gradedFor(String(value.model ?? ""));
+	const isFieldVisible = (key: string, prop: JsonSchemaProp) => {
+		const transportVisible = !Array.isArray(prop["x-puddingteams-transports"])
+			|| !transport
+			|| prop["x-puddingteams-transports"]!.includes(transport);
+		return transportVisible && isSchemaPropertyVisible(prop, props, value);
+	};
+	// 与模型配对、要在模型右侧并排渲染的字段（当前是思考强度）。两侧都可见才配对，
+	// 否则配对的一方单独消失会留下空洞。
+	const pairedLevelKeys = new Set(
+		Object.entries(props)
+			.filter(([key, prop]) => {
+				const from = prop["x-puddingteams-thinking-levels-from"];
+				const modelProp = from ? props[from] : undefined;
+				return Boolean(from && modelProp?.format === "model" && isFieldVisible(key, prop) && isFieldVisible(from, modelProp));
+			})
+			.map(([key]) => key),
+	);
 	return (
-		<div className="flex flex-col gap-2">
+		<div className="agent-config-form agent-config-fields">
 			{Object.entries(props)
-				.filter(([, prop]) => {
-					const transportVisible = !Array.isArray(prop["x-puddingteams-transports"])
-						|| !transport
-						|| prop["x-puddingteams-transports"]!.includes(transport);
-					return transportVisible && isSchemaPropertyVisible(prop, props, value);
-				})
+				.filter(([key, prop]) => !pairedLevelKeys.has(key) && isFieldVisible(key, prop))
 				.map(([key, prop]) => {
 				const label = prop.title ?? key;
 				const current = value[key];
@@ -315,7 +481,9 @@ export function ConfigSchemaForm({
 					);
 				}
 				if (prop.format === "model" && (prop.type === "string" || prop.type === undefined)) {
-					return (
+					const levelEntry = Object.entries(props).find(([, candidate]) => candidate["x-puddingteams-thinking-levels-from"] === key);
+					const pairLevel = levelEntry && pairedLevelKeys.has(levelEntry[0]) ? levelEntry : undefined;
+					const modelField = (
 						<ModelSelectField
 							key={key}
 							label={label}
@@ -330,66 +498,61 @@ export function ConfigSchemaForm({
 							}}
 						/>
 					);
-				}
-				if (prop.type === "boolean") {
+					if (!pairLevel) return modelField;
+					// 模型与思考强度是同一件事的两面（选模型 + 选它的档位），并排一行，
+					// 沿用原型的 .form-columns；各占一整行会把这一节拉得过长。
 					return (
-						<label key={key} className="flex items-center gap-2 text-sm">
-							<input
-								type="checkbox"
-								checked={Boolean(current ?? prop.default ?? false)}
-								onChange={(e) => onChange({ ...value, [key]: e.target.checked })}
-								className="size-4 accent-foreground"
+						<div className="agent-config-columns" key={`${key}-pair`}>
+							{modelField}
+							<EnumSelectField
+								fieldKey={pairLevel[0]}
+								prop={pairLevel[1]}
+								value={value}
+								props={props}
+								required={required}
+								catalogLevels={catalogLevels}
+								catalogGraded={catalogGraded}
+								onChange={onChange}
 							/>
-							<span className="text-muted-foreground">{label}</span>
-							{mark}
-						</label>
+						</div>
 					);
 				}
-				if (Array.isArray(prop.enum)) {
-					const defaultValue = typeof prop.default === "string" ? prop.default : undefined;
-					const enumValue = typeof current === "string" && current ? current : defaultValue ?? UNSET;
-					const enumLabels = prop["x-puddingteams-enum-labels"] ?? {};
-					return (
-						<label key={key} className="flex flex-col gap-1 text-sm">
-							<span className="text-muted-foreground">
-								{label}
-								{mark}
-							</span>
-							<Select
-								value={enumValue}
-								onValueChange={(v) => {
-									const updated = { ...value };
-									if (v === UNSET) delete updated[key];
-									else updated[key] = v;
-									for (const [dependentKey, dependentProp] of Object.entries(props)) {
-										if (dependentProp["x-puddingteams-visible-when"]?.field === key
-											&& !isSchemaPropertyVisible(dependentProp, props, updated)) {
-											delete updated[dependentKey];
-										}
-									}
-									onChange(updated);
-								}}
-							>
-								<SelectTrigger className="w-full">
-									<SelectValue placeholder="请选择" />
-								</SelectTrigger>
-								<SelectContent>
-									{required.includes(key) || defaultValue ? null : <SelectItem value={UNSET}>不设置（默认）</SelectItem>}
-									{(prop.enum as string[]).map((option) => (
-										<SelectItem key={option} value={option}>
-											{enumLabels[option] ?? option}
-										</SelectItem>
-									))}
-								</SelectContent>
-							</Select>
-							{prop.description ? <span className="text-xs text-muted-foreground/70">{prop.description}</span> : null}
-						</label>
-					);
-				}
+			if (prop.type === "boolean") {
+				return (
+					<label key={key} className="agent-config-toggle">
+						<span>
+							<strong>{label}</strong>
+							{prop.description ? <small>{prop.description}</small> : null}
+						</span>
+						<input
+							type="checkbox"
+							role="switch"
+							checked={Boolean(current ?? prop.default ?? false)}
+							onChange={(e) => onChange({ ...value, [key]: e.target.checked })}
+						/>
+						{mark}
+					</label>
+				);
+			}
+			if (Array.isArray(prop.enum)) {
+				return (
+					<EnumSelectField
+						key={key}
+						fieldKey={key}
+						prop={prop}
+						value={value}
+						props={props}
+						required={required}
+						catalogLevels={catalogLevels}
+						catalogGraded={catalogGraded}
+						onChange={onChange}
+					/>
+				);
+			}
 				if (prop.type === "number" || prop.type === "integer") {
 					return (
-						<label key={key} className="flex flex-col gap-1 text-sm">
-							<span className="text-muted-foreground">
+						<label key={key} className="agent-config-field">
+							<span>
 								{label}
 								{mark}
 							</span>
@@ -405,8 +568,8 @@ export function ConfigSchemaForm({
 					);
 				}
 				return (
-					<label key={key} className="flex flex-col gap-1 text-sm">
-						<span className="text-muted-foreground">
+					<label key={key} className="agent-config-field">
+						<span>
 							{label}
 							{mark}
 						</span>
@@ -439,17 +602,17 @@ export function SecretSchemaFields({
 }) {
 	if (!schema || schema.length === 0) return null;
 	return (
-		<div className="flex flex-col gap-2">
-			<span className="text-sm text-muted-foreground">密钥（加密存储，只存引用）</span>
+		<div className="flex flex-col gap-3">
+			<span className="text-xs text-muted-foreground">密钥（加密存储，只存引用）</span>
 			{schema.map((item) => {
 				const configured = configuredKeys.includes(item.key);
 				return (
-					<label key={item.key} className="flex flex-col gap-1 text-sm">
-						<span className="flex items-center gap-2 text-muted-foreground">
+					<label key={item.key} className="agent-config-field">
+						<span className="flex flex-wrap items-center gap-2">
 							{item.label}
-							<code className="font-mono text-xs">{item.key}</code>
+							<code className="font-mono text-[10px] text-muted-foreground">{item.key}</code>
 							{item.required ? <span className="text-destructive">*</span> : null}
-							{configured ? <span className="text-xs text-muted-foreground/70">已配置</span> : null}
+							{configured ? <span className="text-[10px] text-muted-foreground/70">已配置</span> : null}
 						</span>
 						<Input
 							type="password"
@@ -493,8 +656,11 @@ export function AvatarEditor({
 }) {
 	const inputRef = useRef<HTMLInputElement>(null);
 	const [busy, setBusy] = useState(false);
+	const mutationRef = useRef(false);
 
 	const handleFile = async (file: File) => {
+		if (mutationRef.current) return;
+		mutationRef.current = true;
 		setBusy(true);
 		try {
 			const updated = await uploadAgentAvatar(agent.name, file);
@@ -504,22 +670,26 @@ export function AvatarEditor({
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
+			mutationRef.current = false;
 			setBusy(false);
 			if (inputRef.current) inputRef.current.value = "";
 		}
 	};
 
 	const handleRemove = async () => {
+		if (mutationRef.current) return;
+		mutationRef.current = true;
 		setBusy(true);
 		try {
-			await deleteAgentAvatar(agent.name);
+			const updated = await deleteAgentAvatar(agent.name);
 			// 删除上传后由展示组件决定使用 Connector 或产品默认头像。
 			agentAvatarChanged(agent.name, false);
-			onUpdated({ ...agent, avatar: undefined });
+			onUpdated(updated);
 			toast.success(`「${agentDisplayName(agent)}」头像已删除，回落默认头像`);
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
+			mutationRef.current = false;
 			setBusy(false);
 		}
 	};
@@ -551,7 +721,7 @@ export function AvatarEditor({
 					) : null}
 				</div>
 				<p className="text-xs text-muted-foreground">
-					png / jpg / webp / gif，最大 2MB；未上传时使用{agent.pinned ? " PuddingTeams 默认头像" : agent.hasDefaultAvatar ? "连接插件默认头像" : "程序化默认头像"}。
+					png / jpg / webp / gif，最大 2MB；未上传时使用{agent.pinned ? " PuddingTeams 默认头像" : agent.hasDefaultAvatar ? "内置默认头像" : "程序化默认头像"}。
 				</p>
 			</div>
 		</div>
@@ -562,18 +732,29 @@ export function AvatarEditor({
 export function SecretsEditor({ agent }: { agent: AgentConfig }) {
 	const [configured, setConfigured] = useState<string[]>([]);
 	const [loading, setLoading] = useState(true);
+	const [loadError, setLoadError] = useState<string | null>(null);
+	const [loadRevision, setLoadRevision] = useState(0);
 	const [keyName, setKeyName] = useState("");
 	const [value, setValue] = useState("");
 	const [busy, setBusy] = useState(false);
+	const mutationRef = useRef(false);
+	const retryLoad = () => {
+		setLoading(true);
+		setLoadError(null);
+		setLoadRevision((revision) => revision + 1);
+	};
 
 	useEffect(() => {
 		let cancelled = false;
 		getAgentSecrets(agent.name)
 			.then((keys) => {
-				if (!cancelled) setConfigured(keys);
+				if (!cancelled) {
+					setConfigured(keys);
+					setLoadError(null);
+				}
 			})
 			.catch((err: unknown) => {
-				if (!cancelled) toast.error(err instanceof Error ? err.message : String(err));
+				if (!cancelled) setLoadError(err instanceof Error ? err.message : String(err));
 			})
 			.finally(() => {
 				if (!cancelled) setLoading(false);
@@ -581,11 +762,12 @@ export function SecretsEditor({ agent }: { agent: AgentConfig }) {
 		return () => {
 			cancelled = true;
 		};
-	}, [agent.name]);
+	}, [agent.name, loadRevision]);
 
 	const handleSave = async () => {
 		const key = keyName.trim();
-		if (!key || !value) return;
+		if (!key || !value || mutationRef.current) return;
+		mutationRef.current = true;
 		setBusy(true);
 		try {
 			const keys = await setAgentSecrets(agent.name, { [key]: value });
@@ -596,11 +778,14 @@ export function SecretsEditor({ agent }: { agent: AgentConfig }) {
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
+			mutationRef.current = false;
 			setBusy(false);
 		}
 	};
 
 	const handleRemove = async (key: string) => {
+		if (mutationRef.current) return;
+		mutationRef.current = true;
 		setBusy(true);
 		try {
 			await deleteAgentSecret(agent.name, key);
@@ -609,6 +794,7 @@ export function SecretsEditor({ agent }: { agent: AgentConfig }) {
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
+			mutationRef.current = false;
 			setBusy(false);
 		}
 	};
@@ -626,6 +812,11 @@ export function SecretsEditor({ agent }: { agent: AgentConfig }) {
 				<div className="flex items-center gap-2 py-2 text-xs text-muted-foreground">
 					<LoaderIcon className="size-3.5 animate-spin" />
 					加载中…
+				</div>
+			) : loadError ? (
+				<div role="alert" className="flex flex-wrap items-center gap-2 text-xs text-destructive">
+					<span>无法读取已配置密钥：{loadError}</span>
+					<Button type="button" size="sm" variant="outline" onClick={retryLoad}>重试读取</Button>
 				</div>
 			) : (
 				<>
@@ -665,7 +856,9 @@ export function SecretsEditor({ agent }: { agent: AgentConfig }) {
 								placeholder="令牌值"
 								className="flex-1 font-mono text-xs"
 								onKeyDown={(e) => {
-									if (e.key === "Enter") void handleSave();
+									if (e.key !== "Enter" || e.repeat || isIMEComposing(e)) return;
+									e.preventDefault();
+									void handleSave();
 								}}
 							/>
 							<Button type="button" size="sm" disabled={busy || !keyName.trim() || !value} onClick={() => void handleSave()}>

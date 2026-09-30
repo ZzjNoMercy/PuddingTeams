@@ -65,6 +65,9 @@ export default function codexConnector(pi: ExtensionAPI) {
 			if (res.killed) {
 				return { content: [{ type: "text", text: "codex 任务已取消。" }], details: details() };
 			}
+			if (res.exitCode !== 0) {
+				return { content: [{ type: "text", text: `codex 执行失败（退出码 ${res.exitCode}）。` }], details: details() };
+			}
 			const boundary = reducer.boundary("codex");
 			if (boundary.type === "completed") {
 				return {

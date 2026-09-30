@@ -214,3 +214,31 @@ test('pi 截断恢复后取消与 Provider 错误保持真实失败边界', asyn
 		assert.equal(end.result.status, stopReason === 'aborted' ? 'cancelled' : 'failed');
 	}
 });
+
+test("Pi Worker 续聊在联网授权变化后重建工具面，授权未变时复用会话", async () => {
+ const { SessionManager } = await import("@earendil-works/pi-coding-agent");
+ let allowed = true;
+ let disposed = 0;
+ let created = 0;
+ const driver = new LocalPiDriver({ sessionDir: freshDir("pi-network-access-"), managedExtensionsFingerprintFor: async () => JSON.stringify({ fetch: allowed }) });
+ type FixtureSession = { sessionId: string; tools: string[]; dispose(): void };
+ const fixture = driver as unknown as {
+  newSession(manager: ReturnType<typeof SessionManager.create>): Promise<FixtureSession>;
+  resolveModel(): Promise<undefined>;
+  openSession(context: InvocationContext, handle?: string): Promise<{session: FixtureSession; sessionHandle: string}>;
+ };
+ fixture.resolveModel = async () => undefined;
+ fixture.newSession = async manager => {
+  created++;
+  // A real durable SDK transcript permits the continuation path to restore it.
+  manager.appendMessage({ role: "assistant", content: [{ type: "text", text: "previous reply" }], timestamp: Date.now() } as Parameters<typeof manager.appendMessage>[0]);
+  return { sessionId: manager.getSessionId(), tools: allowed ? ["fetch_url"] : [], dispose() { disposed++; } };
+ };
+ const first = await fixture.openSession(ctx);
+ const same = await fixture.openSession(ctx, first.sessionHandle);
+ assert.equal(same.session, first.session);assert.equal(created, 1);
+ allowed = false;
+ const revoked = await fixture.openSession(ctx, first.sessionHandle);
+ assert.notEqual(revoked.session, first.session);assert.equal(created, 2);assert.equal(disposed, 1);
+ assert.deepEqual(revoked.session.tools, []);
+});

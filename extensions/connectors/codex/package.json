@@ -41,10 +41,11 @@
 			"configSchema": {
 				"type": "object",
 				"properties": {
-					"command": { "type": "string", "description": "Codex 可执行文件名或路径", "default": "codex" },
-					"model": { "type": "string", "title": "model", "x-puddingteams-options": "driver", "description": "从 Codex app-server model/list 读取当前账号可用模型；留空用 Codex 默认" },
+					"command": { "type": "string", "title": "CLI 命令", "description": "Codex 可执行文件名或路径", "default": "codex" },
+					"model": { "type": "string", "title": "模型", "x-puddingteams-options": "driver", "description": "从 Codex app-server model/list 读取当前账号可用模型；留空用 Codex 默认" },
 					"sandbox": {
 						"type": "string",
+						"title": "沙箱模式",
 						"enum": ["read-only", "workspace-write", "danger-full-access"],
 						"description": "Codex 自身沙箱模式（-s，默认 workspace-write）。workspace-write 将写入限制在 Codex 认可的工作区；danger-full-access 会关闭该保护。PuddingTeams 的项目目录本身不是通用权限沙箱。"
 					}

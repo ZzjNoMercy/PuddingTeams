@@ -24,17 +24,25 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Textarea } from "@/components/ui/textarea";
 import { preloadChatHistory, useChat } from "@/hooks/useChat";
 import { compactDay } from "@/lib/time";
+import { isIMEComposing } from "@/lib/ime";
+import { preferCurrentRoomSummary } from "@/lib/room-order";
 import {
 	createRoomSession,
 	createWorkspace,
 	deleteRoomSession,
+	fetchRoomDelegationProcesses,
 	getRoom,
 	listWorkspaces,
+	markRoomRead,
 	renameRoomSession,
 	setActiveRoomSession,
 	switchRoomWorkspace,
 	updateRoom,
+	RoomCreationOperationConflictError,
+	RoomSelectionStaleError,
+	RoomSourceStaleError,
 } from "@/lib/api";
+import { clearGroupCreationOperation, groupWorkspaceSwitchFingerprint, reserveGroupCreationOperation } from "@/lib/group-creation-operation";
 import { agentDisplayName, type ChatMessage, type ChatStatus, type RoomSession, type RoomSummary, type WorkspaceRecord } from "@/lib/types";
 import { Composer } from "./composer";
 import { computeSessionStats } from "@/lib/session-stats";
@@ -64,6 +72,48 @@ function subscribeInlinePreference(notify: () => void) {
 function AtBottomReporter({ onChange }: { onChange: (atBottom: boolean) => void }) {
 	const { isAtBottom } = useStickToBottomContext();
 	useEffect(() => onChange(isAtBottom), [isAtBottom, onChange]);
+	return null;
+}
+
+/** 同一浏览器标签内按 Room/Session 保存阅读位置；等完整历史显露后恢复。 */
+function ConversationScrollMemory({ roomId, sessionId, ready }: { roomId: string; sessionId: string; ready: boolean }) {
+	const { scrollRef, stopScroll } = useStickToBottomContext();
+	useEffect(() => {
+		if (!ready) return;
+		const scroller = scrollRef.current;
+		if (!scroller) return;
+		const key = `puddingteams:conversation-scroll:v1:${roomId}:${sessionId}`;
+		let saved: { top: number; atBottom: boolean } | null = null;
+		try {
+			const parsed: unknown = JSON.parse(sessionStorage.getItem(key) ?? "null");
+			if (parsed && typeof parsed === "object" && "top" in parsed && "atBottom" in parsed
+				&& typeof parsed.top === "number" && Number.isFinite(parsed.top) && typeof parsed.atBottom === "boolean") saved = parsed as { top: number; atBottom: boolean };
+		} catch { /* Storage is optional; this tab still works without restoration. */ }
+		const save = () => {
+			const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+			try { sessionStorage.setItem(key, JSON.stringify({ top: scroller.scrollTop, atBottom: max - scroller.scrollTop <= 24 })); }
+			catch { /* Storage can be unavailable in a private browser context. */ }
+		};
+		let attached = false;
+		let saveFrame = 0;
+		const onScroll = () => {
+			if (saveFrame) return;
+			saveFrame = requestAnimationFrame(() => { saveFrame = 0; save(); });
+		};
+		const frame = requestAnimationFrame(() => {
+			if (saved && !saved.atBottom) {
+				stopScroll();
+				scroller.scrollTop = Math.min(Math.max(0, saved.top), Math.max(0, scroller.scrollHeight - scroller.clientHeight));
+			}
+			scroller.addEventListener("scroll", onScroll, { passive: true });
+			attached = true;
+		});
+		return () => {
+			cancelAnimationFrame(frame);
+			cancelAnimationFrame(saveFrame);
+			if (attached) { scroller.removeEventListener("scroll", onScroll); save(); }
+		};
+	}, [ready, roomId, sessionId, scrollRef, stopScroll]);
 	return null;
 }
 
@@ -218,15 +268,21 @@ function SessionChat({
 	workspaceLabel,
 	workspacePath,
 	workspaceAvailable,
+	draftContextKey,
 	onOpenWorkspace,
 	blocked,
 	sessionModel,
+	sessionThinkingLevel,
+	directWorkerModel,
 	onSessionModelChange,
+	onSessionThinkingChange,
 	runtimeOpen,
 	onRuntimeOpenChange,
 	runtimeView,
 	onRuntimeViewChange,
 	onRuntimeSummaryChange,
+	activityRevision,
+	onHistoryReady,
 }: {
 	roomId: string;
 	sessionId: string;
@@ -242,18 +298,30 @@ function SessionChat({
 	workspaceLabel: string;
 	workspacePath: string;
 	workspaceAvailable: boolean;
+	draftContextKey: string;
 	onOpenWorkspace: () => void;
 	blocked?: boolean;
 	/** 会话真实模型 ref（rooms 数据），composer 选择器以此为准。 */
 	sessionModel?: string;
-	onSessionModelChange?: (model: string) => void;
+	/** 会话真实 thinking level（rooms 数据，§10.6），composer 思考强度选择器以此为准。 */
+	sessionThinkingLevel?: string;
+	/** direct 消息由目标 Worker 的 Connector 执行，而不是房间 Session 模型。 */
+	directWorkerModel?: { name: string; model?: string };
+	onSessionModelChange?: (sessionId: string, model: string) => void;
+	onSessionThinkingChange?: (sessionId: string, level: string) => void;
 	runtimeOpen: boolean;
 	onRuntimeOpenChange: (open: boolean) => void;
 	runtimeView: SessionRuntimeView;
 	onRuntimeViewChange: (view: SessionRuntimeView) => void;
 	onRuntimeSummaryChange: (summary: SessionRuntimeSummary) => void;
+	activityRevision: number;
+	onHistoryReady?: (sessionId: string, activityRevision: number) => Promise<boolean>;
 }) {
-	const { messages, historyLoading, status, running, stopping, error, send, stop } = useChat(sessionId);
+	const { messages, historyLoading, historyLoaded, status, running, unansweredUserMessage, unfinishedAssistantTurn, sending, stopping, error, unconfirmedOperation, send, stop, refreshHistory, reviewUnconfirmedHistory, startNewMessageIntent } = useChat(sessionId);
+	const [newMessageIntentOpen, setNewMessageIntentOpen] = useState(false);
+	const initialActivityRevision = useRef(activityRevision);
+	const [presentedActivityRevision, setPresentedActivityRevision] = useState<number | null>(null);
+	const acknowledgedRevision = useRef(0);
 	const handleStop = useCallback(async () => {
 		try {
 			const result = await stop();
@@ -280,6 +348,10 @@ function SessionChat({
 	const [hasGoal, setHasGoal] = useState(false);
 	const [scrollButtonHost, setScrollButtonHost] = useState<HTMLDivElement | null>(null);
 	const [atBottom, setAtBottom] = useState(true);
+	const [transcriptReady, setTranscriptReady] = useState(false);
+	const [transcriptReadReady, setTranscriptReadReady] = useState(false);
+	const handleTranscriptReady = useCallback(() => setTranscriptReady(true), []);
+	const handleTranscriptReadinessChange = useCallback((ready: boolean) => setTranscriptReadReady(ready), []);
 	const [composerDraft, setComposerDraft] = useState<{ id: number; content: string }>();
 	const composerDraftId = useRef(0);
 	const draftFromMessage = useCallback((content: string) => {
@@ -292,6 +364,56 @@ function SessionChat({
 		setGoalCreateOpen(true);
 	}, []);
 	const layoutReady = !historyLoading;
+	useEffect(() => {
+		if (!historyLoaded || !layoutReady || !transcriptReady || !transcriptReadReady) return;
+		setPresentedActivityRevision((previous) => previous ?? initialActivityRevision.current);
+	}, [historyLoaded, layoutReady, transcriptReady, transcriptReadReady]);
+	useEffect(() => {
+		if (status === "gone" || presentedActivityRevision === null || !transcriptReadReady || !onHistoryReady) return;
+		let cancelled = false;
+		let inFlight = false;
+		let retryTimer: ReturnType<typeof setTimeout> | null = null;
+		const acknowledgeVisibleHistory = async () => {
+			if (cancelled || inFlight || document.visibilityState !== "visible" || presentedActivityRevision <= acknowledgedRevision.current) return;
+			inFlight = true;
+			const confirmed = await onHistoryReady(sessionId, presentedActivityRevision);
+			inFlight = false;
+			// The acknowledgement callback refreshes room state and may replace this
+			// effect before it resolves. Keep the confirmed watermark across cleanup.
+			if (confirmed) acknowledgedRevision.current = Math.max(acknowledgedRevision.current, presentedActivityRevision);
+			if (cancelled) return;
+			if (!confirmed) retryTimer = setTimeout(() => void acknowledgeVisibleHistory(), 5000);
+		};
+		void acknowledgeVisibleHistory();
+		document.addEventListener("visibilitychange", acknowledgeVisibleHistory);
+		return () => {
+			cancelled = true;
+			if (retryTimer) clearTimeout(retryTimer);
+			document.removeEventListener("visibilitychange", acknowledgeVisibleHistory);
+		};
+	}, [onHistoryReady, presentedActivityRevision, sessionId, status, transcriptReadReady]);
+	useEffect(() => {
+		if (status === "gone" || !historyLoaded || !layoutReady || !transcriptReady || !transcriptReadReady || presentedActivityRevision === null || activityRevision <= presentedActivityRevision) return;
+		let cancelled = false;
+		let inFlight = false;
+		let retryTimer: ReturnType<typeof setTimeout> | null = null;
+		const synchronizeVisibleHistory = async () => {
+			if (cancelled || inFlight || document.visibilityState !== "visible") return;
+			inFlight = true;
+			const synchronized = await refreshHistory();
+			inFlight = false;
+			if (cancelled) return;
+			if (synchronized) setPresentedActivityRevision((previous) => Math.max(previous ?? 0, activityRevision));
+			else retryTimer = setTimeout(() => void synchronizeVisibleHistory(), 5000);
+		};
+		void synchronizeVisibleHistory();
+		document.addEventListener("visibilitychange", synchronizeVisibleHistory);
+		return () => {
+			cancelled = true;
+			if (retryTimer) clearTimeout(retryTimer);
+			document.removeEventListener("visibilitychange", synchronizeVisibleHistory);
+		};
+	}, [activityRevision, historyLoaded, layoutReady, presentedActivityRevision, refreshHistory, status, transcriptReady, transcriptReadReady]);
 	const sessionStats = useMemo(() => computeSessionStats(messages), [messages]);
 	// running 态指派卡（pudding:task_assign）在同 taskId 的结果/审批卡到达后
 	// 落定折叠。
@@ -349,6 +471,10 @@ function SessionChat({
 	// delegateWorker 反解出的是内部 id；等待提示渲染显示名。
 	const agentLabels = useAgentLabels();
 	const busyHint = running && waitingWorkers.length > 0 ? `等待 ${waitingWorkers.map((id) => agentLabels[id] ?? id).join("、")} 返回…` : undefined;
+	const showUnansweredUserMessage = historyLoaded && unansweredUserMessage && !running && !sending &&
+		messages.findLast((message) => message.role === "user" || message.role === "assistant")?.role === "user";
+	const showUnfinishedAssistantTurn = historyLoaded && unfinishedAssistantTurn && !running && !sending &&
+		messages.findLast((message) => message.role === "user" || message.role === "assistant")?.piStopReason === "toolUse";
 
 	return (
 		<div className="home-session-chat relative flex min-h-0 flex-1 flex-col" aria-busy={!layoutReady}>
@@ -371,7 +497,8 @@ function SessionChat({
 				<MessageQuickActionProvider onDraft={draftFromMessage}>
 					<Conversation initial="instant" resize={layoutReady ? "smooth" : "instant"}>
 						<AtBottomReporter onChange={setAtBottom} />
-						<InlinePiHistoryGate ids={inlineHistoryIds} historyLoading={historyLoading}>
+						<ConversationScrollMemory roomId={roomId} sessionId={sessionId} ready={transcriptReady} />
+						<InlinePiHistoryGate ids={inlineHistoryIds} historyLoading={historyLoading} onReady={handleTranscriptReady} onReadinessChange={handleTranscriptReadinessChange}>
 						<QueryInputAxis items={queryAxisItems} />
 						<ConversationContent className="home-message-column">
 							<div className="home-session-marker"><span />{sessionLabel}{sessionModifiedAt ? ` · ${compactDay(sessionModifiedAt)}` : ""}<span /></div>
@@ -388,6 +515,16 @@ function SessionChat({
 									),
 								)
 							)}
+							{showUnansweredUserMessage ? (
+								<p role="status" className="mx-auto mt-4 max-w-2xl rounded-lg border border-amber-500/30 bg-amber-500/5 px-4 py-3 text-sm text-foreground">
+									上次消息已保存，但未找到完成的回复。请核对历史；如需继续，请发送新指令。
+								</p>
+							) : null}
+							{showUnfinishedAssistantTurn ? (
+								<p role="status" className="mx-auto mt-4 max-w-2xl rounded-lg border border-amber-500/30 bg-amber-500/5 px-4 py-3 text-sm text-foreground">
+									本轮已有工具调用记录，但未找到最终回复。请先核对工具和审批状态，再决定是否发送新指令。
+								</p>
+							) : null}
 						</ConversationContent>
 						</InlinePiHistoryGate>
 						<ConversationScrollButton
@@ -405,7 +542,9 @@ function SessionChat({
 				) : null}
 				<Composer
 					sessionId={sessionId}
-					disabled={running || stopping || Boolean(blocked)}
+					draftScope={JSON.stringify([draftContextKey, roomId, sessionId])}
+					disabled={status !== "connected" || running || sending || stopping || Boolean(blocked)}
+					sending={sending}
 					stopAvailable={running || stopping}
 					stopping={stopping}
 					busyHint={busyHint}
@@ -414,9 +553,12 @@ function SessionChat({
 					workspacePath={workspacePath}
 					workspaceAvailable={workspaceAvailable}
 					sessionModel={sessionModel}
+					sessionThinkingLevel={sessionThinkingLevel}
+					directWorkerModel={directWorkerModel}
 					stats={sessionStats}
 					statsVisible={atBottom}
 					onModelChanged={onSessionModelChange}
+					onThinkingChanged={onSessionThinkingChange}
 					onSend={send}
 					onStop={handleStop}
 					onGoalCommand={openGoalCommand}
@@ -431,28 +573,79 @@ function SessionChat({
 				</div>
 			) : null}
 			{error ? (
-				<div className="absolute bottom-24 left-1/2 z-20 max-w-[min(90%,36rem)] -translate-x-1/2 rounded-md border border-destructive/30 bg-background px-3 py-2 text-xs text-destructive shadow-md" role="alert">
-					{error}
+				<div className="absolute bottom-24 left-1/2 z-20 w-[min(90%,36rem)] -translate-x-1/2 rounded-md border border-destructive/30 bg-background px-3 py-2 text-xs text-destructive shadow-md" role="alert">
+					<p>{error}</p>
+					{unconfirmedOperation ? (
+						<div className="mt-2 flex flex-wrap items-center gap-2">
+							<Button type="button" size="sm" variant="outline" onClick={() => {
+								void reviewUnconfirmedHistory().then((ok) => {
+									if (ok) toast.info("历史已刷新，请核对本次消息是否出现");
+									else toast.error("历史刷新失败，请稍后重试");
+								});
+							}}>刷新并核对历史</Button>
+							<Button type="button" size="sm" variant="outline" disabled={!unconfirmedOperation.historyReviewed} onClick={() => setNewMessageIntentOpen(true)}>
+								核对后发起新消息
+							</Button>
+						</div>
+					) : null}
 				</div>
 			) : null}
+			<Dialog open={newMessageIntentOpen} onOpenChange={setNewMessageIntentOpen}>
+				<DialogContent>
+					<DialogHeader>
+						<DialogTitle>将草稿作为新消息发送？</DialogTitle>
+						<DialogDescription>旧消息的结果仍未确认。请先核对上方历史；如果旧消息稍后出现，再发送可能产生第二条消息。确认后只会更新操作身份并保留草稿，需要你再次点击发送。</DialogDescription>
+					</DialogHeader>
+					<DialogFooter>
+						<Button type="button" variant="outline" onClick={() => setNewMessageIntentOpen(false)}>继续核对</Button>
+						<Button type="button" onClick={() => {
+							if (!startNewMessageIntent()) { toast.error("请先刷新并核对历史"); return; }
+							setNewMessageIntentOpen(false);
+							toast.info("草稿已保留；确认后请再次点击发送");
+						}}>保留草稿，发起新消息</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
 		</div>
 	);
 }
 
 export function ChatPane({
 	roomId,
+	requestedSessionId,
+	requestedSessionActivation = "self",
+	workspaceSwitchRequest,
+	workspaceDialogOnly = false,
+	openWorkspaceOnMount = false,
+	onWorkspacePickerClosed,
 	onOpenWindow,
+	onInvalidRequestedSession,
 	onRoomUpdated,
+	onSessionActivated,
+	onWorkspaceSwitched,
 	onOpenRoomList,
 	onRoomsMayHaveChanged,
 }: {
 	roomId: string;
-	onOpenWindow?: (windowId: string) => void;
+	requestedSessionId?: string | null;
+	requestedSessionActivation?: "self" | "parent";
+	workspaceSwitchRequest?: number;
+	workspaceDialogOnly?: boolean;
+	openWorkspaceOnMount?: boolean;
+	onWorkspacePickerClosed?: () => void;
+	onOpenWindow?: (windowId: string, sourceSessionId?: string) => void;
+	onInvalidRequestedSession?: (roomId: string, sessionId: string) => void;
 	onRoomUpdated?: (room: RoomSummary) => void;
+	/** Local session creation or selection; parent updates its requested session and URL. */
+	onSessionActivated?: (room: RoomSummary) => void;
+	/** Local in-place Workspace change; parent routes away from the old Session. */
+	onWorkspaceSwitched?: (room: RoomSummary) => void;
 	onOpenRoomList?: () => void;
 	onRoomsMayHaveChanged?: () => void;
 }) {
 	const [room, setRoom] = useState<RoomSummary | null>(null);
+	const [roomLoadError, setRoomLoadError] = useState<string | null>(null);
+	const [roomLoadNonce, setRoomLoadNonce] = useState(0);
 	const inlinePreferenceKey = `pudding:inline-pi-process:${roomId}`;
 	const inlinePiProcess = useSyncExternalStore(subscribeInlinePreference, () => {
 		try { return localStorage.getItem(inlinePreferenceKey) === "true"; } catch { return false; }
@@ -464,6 +657,10 @@ export function ChatPane({
 		} catch { toast.error("无法保存显示偏好"); }
 	};
 	const [activeId, setActiveId] = useState<string>("");
+	const [historicalPiProcess, setHistoricalPiProcess] = useState<{ roomId: string; sessionId: string; available: boolean } | null>(null);
+	const sessionSwitchQueue = useRef<Promise<void>>(Promise.resolve());
+	const pendingSessionSwitches = useRef(0);
+	const sessionSwitchGeneration = useRef(0);
 	const [status, setStatus] = useState<ChatStatus>("connecting");
 	const [delayedConnectionStatus, setDelayedConnectionStatus] = useState<ChatStatus | null>(null);
 	const [renaming, setRenaming] = useState(false);
@@ -476,23 +673,29 @@ export function ChatPane({
 	const [runtimeView, setRuntimeView] = useState<SessionRuntimeView>("activity");
 	const [runtimeSummary, setRuntimeSummary] = useState<SessionRuntimeSummary | null>(null);
 	const [requestedDelegationId, setRequestedDelegationId] = useState<string | null>(null);
+	const [requestedFullWorkerSession, setRequestedFullWorkerSession] = useState(false);
 	const [pendingDeleteSession, setPendingDeleteSession] = useState<RoomSession | null>(null);
 	const [renamingSession, setRenamingSession] = useState<RoomSession | null>(null);
 	const [sessionRenameValue, setSessionRenameValue] = useState("");
 	const [workspaceOpen, setWorkspaceOpen] = useState(false);
 	const [workspaceOptions, setWorkspaceOptions] = useState<WorkspaceRecord[]>([]);
+	const [workspaceLoadError, setWorkspaceLoadError] = useState<string | null>(null);
+	const [workspaceSelectionError, setWorkspaceSelectionError] = useState<string | null>(null);
 	const [targetWorkspaceId, setTargetWorkspaceId] = useState("");
 	const [workspacePath, setWorkspacePath] = useState("");
 	const [switchToDefault, setSwitchToDefault] = useState(false);
 	const [directoryPickerOpen, setDirectoryPickerOpen] = useState(false);
 	const [switchingWorkspace, setSwitchingWorkspace] = useState(false);
+	const workspacePreparationRef = useRef(false);
+	const workspaceRequestRef = useRef(false);
 	const [trustCandidate, setTrustCandidate] = useState<{ workspace: WorkspaceRecord; mode: "new_window" | "in_place" } | null>(null);
 	/** 头部「待信任/已拒绝」badge 点开的信任复核（与切换项目流程分开）。 */
 	const [trustReview, setTrustReview] = useState<WorkspaceRecord | null>(null);
-	const openWorkerProcess = useCallback((delegationId: string) => {
+	const openWorkerProcess = useCallback((delegationId: string, fullSession = false) => {
 		setChatInfoOpen(false);
 		setGoalRuntimeOpen(false);
 		setRequestedDelegationId(delegationId);
+		setRequestedFullWorkerSession(fullSession);
 		setWorkerProcessOpen(true);
 	}, []);
 	const changeGoalRuntimeOpen = useCallback((open: boolean) => {
@@ -507,8 +710,29 @@ export function ChatPane({
 
 	useEffect(() => {
 		let cancelled = false;
-		getRoom(roomId)
-			.then((r) => {
+		void getRoom(roomId)
+			.then(async (initial) => {
+				if (cancelled) return;
+				let r = initial;
+				if (requestedSessionId) {
+					if (!r.sessions.some((session) => session.id === requestedSessionId)) {
+						if (requestedSessionActivation === "parent") { onRoomUpdated?.(r); return; }
+						toast.error("目标会话不存在或不属于此对话，已打开当前会话");
+						onInvalidRequestedSession?.(roomId, requestedSessionId);
+					} else if (r.activeSession !== requestedSessionId) {
+						if (requestedSessionActivation === "parent") { onRoomUpdated?.(r); return; }
+						try {
+							await setActiveRoomSession(roomId, requestedSessionId);
+							r = await getRoom(roomId);
+							if (r.activeSession !== requestedSessionId || !r.sessions.some((session) => session.id === requestedSessionId)) {
+								throw new Error("目标会话已在其他窗口改变，请重试");
+							}
+						} catch (error) {
+							if (!cancelled) setRoomLoadError(`无法定位目标会话：${error instanceof Error ? error.message : String(error)}`);
+							return;
+						}
+					}
+				}
 				if (cancelled) return;
 				setWorkerProcessOpen(false);
 				setGoalRuntimeOpen(false);
@@ -516,36 +740,41 @@ export function ChatPane({
 				setRuntimeView("activity");
 				setRequestedDelegationId(null);
 				setRoom(r);
+				setRoomLoadError(null);
 				setActiveId(r.activeSession || "");
+				onRoomUpdated?.(r);
 			})
 			.catch((err: unknown) => {
 				if (cancelled) return;
-				toast.error(err instanceof Error ? err.message : String(err));
+				setRoomLoadError(err instanceof Error ? err.message : String(err));
 			});
 		return () => {
 			cancelled = true;
 		};
-	}, [roomId]);
+	}, [roomId, requestedSessionId, requestedSessionActivation, onRoomUpdated, onInvalidRequestedSession, roomLoadNonce]);
 
 	// 首条消息发出后 LLM 异步生成会话标题；轻量轮询把标题/时间刷出来。
 	// 正常情况下保留当前 activeId；若另一个客户端切换了 Solo Workspace，
 	// 旧 Session 会被停放并从当前 sessions 移除，此时必须跟随服务端切到
 	// 新 activeSession，否则会持续请求 inactive context 并得到 409。
 	useEffect(() => {
+		let cancelled = false;
 		const timer = setInterval(() => {
+			const switchGeneration = sessionSwitchGeneration.current;
 			void getRoom(roomId)
 				.then((r) => {
-					setRoom((prev) => (prev ? { ...r } : prev));
+					if (cancelled || pendingSessionSwitches.current > 0 || switchGeneration !== sessionSwitchGeneration.current || (room && preferCurrentRoomSummary(room, r) !== r)) return;
+					setRoom((prev) => (prev ? preferCurrentRoomSummary(prev, r) : prev));
 					setActiveId((current) =>
 						r.sessions.some((session) => session.id === current)
-							? current
-							: r.activeSession || "",
+						? current
+						: r.activeSession || "",
 					);
 				})
 				.catch(() => undefined);
 		}, 8000);
-		return () => clearInterval(timer);
-	}, [roomId]);
+		return () => { cancelled = true; clearInterval(timer); };
+	}, [roomId, room]);
 
 	// Session 切换会创建一条新 WebSocket，正常握手通常在一瞬间完成。
 	// 延迟展示非 connected 状态，避免把正常切换误报成一次可见的连接故障；
@@ -556,45 +785,63 @@ export function ChatPane({
 		return () => clearTimeout(timer);
 	}, [status]);
 
-	const patchSessions = useCallback((sessions: RoomSession[], active: string) => {
-		setRoom((prev) => (prev ? { ...prev, sessions, activeSession: active } : prev));
-		setActiveId(active);
-	}, []);
+	const acknowledgePresentedActivity = useCallback(async (sessionId: string, revision: number): Promise<boolean> => {
+		if (!room?.sessions.some((session) => session.id === sessionId) || revision === 0) return true;
+		try {
+			await markRoomRead(roomId, sessionId, revision);
+			const updated = await getRoom(roomId);
+			setRoom((prev) => preferCurrentRoomSummary(prev, updated));
+			onRoomUpdated?.(updated);
+			return true;
+		} catch {
+			return false;
+		}
+	}, [room?.sessions, roomId, onRoomUpdated]);
 
 	/** composer 改模型后本地同步 rooms 数据，避免切换会话后回读旧值。 */
-	const handleSessionModelChange = useCallback((model: string) => {
+	const handleSessionModelChange = useCallback((sessionId: string, model: string) => {
 		setRoom((prev) =>
 			prev
-				? { ...prev, sessions: prev.sessions.map((s) => (s.id === prev.activeSession ? { ...s, model } : s)) }
+				? { ...prev, sessions: prev.sessions.map((s) => (s.id === sessionId ? { ...s, model } : s)) }
 				: prev,
 		);
 	}, []);
 
-	const switchSession = useCallback(
-		async (sessionId: string) => {
-			if (sessionId === activeId) return;
+	/** composer 改思考强度后本地同步 rooms 数据（§10.6 会话级真值）。 */
+	const handleSessionThinkingChange = useCallback((sessionId: string, thinkingLevel: string) => {
+		setRoom((prev) =>
+			prev
+				? { ...prev, sessions: prev.sessions.map((s) => (s.id === sessionId ? { ...s, thinkingLevel } : s)) }
+				: prev,
+		);
+	}, []);
+
+	const switchSession = useCallback((sessionId: string): Promise<void> => {
+		if (sessionId === activeId && pendingSessionSwitches.current === 0) return Promise.resolve();
+		pendingSessionSwitches.current += 1;
+		sessionSwitchGeneration.current += 1;
+		const next = sessionSwitchQueue.current.then(async () => {
 			setWorkerProcessOpen(false);
 			setGoalRuntimeOpen(false);
 			setRuntimeSummary(null);
 			setRuntimeView("activity");
 			setRequestedDelegationId(null);
-			try {
-				await Promise.all([
-					setActiveRoomSession(roomId, sessionId),
-					preloadChatHistory(sessionId).catch(() => undefined),
-				]);
-				if (room) {
-					patchSessions(
-						room.sessions.map((s) => ({ ...s, active: s.id === sessionId })),
-						sessionId,
-					);
-				}
-			} catch (err) {
-				toast.error(err instanceof Error ? err.message : String(err));
-			}
-		},
-		[roomId, activeId, room, patchSessions],
-	);
+			void preloadChatHistory(sessionId).catch(() => undefined);
+			await setActiveRoomSession(roomId, sessionId);
+			const updated = await getRoom(roomId);
+			if (updated.activeSession !== sessionId) throw new Error("当前会话已在其他窗口改变，请从会话列表重新打开");
+			setRoom(updated);
+			setActiveId(sessionId);
+			onSessionActivated?.(updated);
+		}).catch((err: unknown) => {
+			toast.error(err instanceof Error ? err.message : String(err));
+		}).finally(() => {
+			pendingSessionSwitches.current -= 1;
+			sessionSwitchGeneration.current += 1;
+		});
+		sessionSwitchQueue.current = next;
+		return next;
+	}, [roomId, activeId, onSessionActivated]);
 
 	const newSession = useCallback(async () => {
 		setWorkerProcessOpen(false);
@@ -604,23 +851,16 @@ export function ChatPane({
 		setRequestedDelegationId(null);
 		try {
 			const created = await createRoomSession(roomId);
-			setRoom((prev) =>
-				prev
-					? {
-							...prev,
-							sessions: [
-								{ id: created.id, firstMessage: "", modifiedAt: created.modifiedAt, active: true },
-								...prev.sessions.map((s) => ({ ...s, active: false })),
-							],
-							activeSession: created.id,
-						}
-					: prev,
-			);
+			const updated = await getRoom(roomId);
+			if (updated.activeSession !== created.id) throw new Error("新会话已创建，但当前会话已在其他窗口改变，请从会话列表打开");
+			setRoom(updated);
 			setActiveId(created.id);
+			onSessionActivated?.(updated);
+			onRoomsMayHaveChanged?.();
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		}
-	}, [roomId]);
+	}, [roomId, onSessionActivated, onRoomsMayHaveChanged]);
 
 	const removeSession = useCallback(
 		async (sessionId: string) => {
@@ -699,39 +939,103 @@ export function ChatPane({
 	}, [roomId, promptValue]);
 
 	const openWorkspaceSwitch = useCallback(() => {
+		if (workspacePreparationRef.current || workspaceRequestRef.current) return;
 		setWorkspaceOpen(true);
 		setWorkspacePath("");
 		setTargetWorkspaceId("");
 		setSwitchToDefault(false);
 		setDirectoryPickerOpen(false);
+		setWorkspaceLoadError(null);
+		setWorkspaceSelectionError(null);
 		void listWorkspaces()
 			.then((items) => {
 				setWorkspaceOptions(items);
 			})
-			.catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)));
+			.catch((err: unknown) => setWorkspaceLoadError(err instanceof Error ? err.message : String(err)));
 	}, []);
+	const previousWorkspaceSwitchRequest = useRef(workspaceSwitchRequest);
+	useEffect(() => {
+		if (openWorkspaceOnMount) openWorkspaceSwitch();
+	}, [openWorkspaceOnMount, openWorkspaceSwitch]);
+	const workspacePickerWasOpen = useRef(false);
+	useEffect(() => {
+		if (!openWorkspaceOnMount) return;
+		if (workspaceOpen) workspacePickerWasOpen.current = true;
+		else if (workspacePickerWasOpen.current) {
+			workspacePickerWasOpen.current = false;
+			onWorkspacePickerClosed?.();
+		}
+	}, [openWorkspaceOnMount, workspaceOpen, onWorkspacePickerClosed]);
+	useEffect(() => {
+		if (workspaceSwitchRequest === undefined || workspaceSwitchRequest === previousWorkspaceSwitchRequest.current) return;
+		previousWorkspaceSwitchRequest.current = workspaceSwitchRequest;
+		openWorkspaceSwitch();
+	}, [workspaceSwitchRequest, openWorkspaceSwitch]);
 
 	const doWorkspaceSwitch = useCallback(
 		async (workspaceId: string | null, mode: "new_window" | "in_place") => {
-			const result = await switchRoomWorkspace(roomId, workspaceId, mode);
-			setWorkspaceOpen(false);
-			if (result.room.id === roomId) {
-				setRoom(result.room);
-				setActiveId(result.room.activeSession || "");
-				onRoomUpdated?.(result.room);
-			} else {
-				onOpenWindow?.(result.room.id);
+			if (workspaceRequestRef.current) return;
+			workspaceRequestRef.current = true;
+			setSwitchingWorkspace(true);
+			try {
+				const groupSwitch = room?.type === "group" && mode === "new_window";
+				const fingerprint = groupSwitch ? groupWorkspaceSwitchFingerprint(roomId, workspaceId) : "";
+				let storage: Storage | null = null;
+				try { storage = window.sessionStorage; } catch { /* Same-tab memory fallback. */ }
+				const operationId = groupSwitch ? reserveGroupCreationOperation(fingerprint, storage) : undefined;
+				let result: Awaited<ReturnType<typeof switchRoomWorkspace>>;
+				try {
+					result = await switchRoomWorkspace(roomId, workspaceId, mode, operationId, room ?? undefined);
+				} catch (error) {
+					if (operationId && (error instanceof RoomCreationOperationConflictError || error instanceof RoomSourceStaleError)) clearGroupCreationOperation(fingerprint, operationId, storage);
+					if (error instanceof RoomSourceStaleError) {
+						setWorkspaceSelectionError(`${error.message}。请重新打开来源房间后发起。`);
+						if (!error.unavailable) {
+							try { setRoom(await getRoom(roomId)); } catch { /* The source may have been deleted meanwhile. */ }
+						}
+						onRoomsMayHaveChanged?.();
+					}
+					if (error instanceof RoomSelectionStaleError) {
+						setWorkspaceSelectionError(error.selection === "workspace"
+							? `${error.message}。请重新选择项目。`
+							: `${error.message}。请更新房间成员或重新启用 Worker。`);
+						if (error.selection === "workspace") {
+							try {
+								setWorkspaceOptions(await listWorkspaces());
+								setWorkspaceLoadError(null);
+							} catch (refreshError) {
+								setWorkspaceLoadError(refreshError instanceof Error ? refreshError.message : String(refreshError));
+							}
+						}
+					}
+					throw error;
+				}
+				if (operationId) clearGroupCreationOperation(fingerprint, operationId, storage);
+				setWorkspaceOpen(false);
+				if (result.room.id === roomId) {
+					setRoom(result.room);
+					setActiveId(result.room.activeSession || "");
+					if (onWorkspaceSwitched) onWorkspaceSwitched(result.room);
+					else onRoomUpdated?.(result.room);
+				} else {
+					onOpenWindow?.(result.room.id, activeId);
+				}
+				toast.success(
+					mode === "in_place"
+						? result.restored ? "已切换项目并恢复历史会话" : "已切换项目并开始新会话"
+						: result.existed ? "已打开已有对话" : "已创建新对话",
+				);
+			} finally {
+				workspaceRequestRef.current = false;
+				setSwitchingWorkspace(false);
 			}
-			toast.success(
-				mode === "in_place"
-					? result.restored ? "已切换项目并恢复历史会话" : "已切换项目并开始新会话"
-					: result.existed ? "已打开已有对话" : "已创建新对话",
-			);
 		},
-		[roomId, onRoomUpdated, onOpenWindow],
+		[roomId, room, activeId, onRoomUpdated, onWorkspaceSwitched, onOpenWindow, onRoomsMayHaveChanged],
 	);
 
 	const saveWorkspaceSwitch = useCallback(async (mode: "new_window" | "in_place") => {
+		if (workspacePreparationRef.current || workspaceRequestRef.current) return;
+		workspacePreparationRef.current = true;
 		setSwitchingWorkspace(true);
 		try {
 			let workspace: WorkspaceRecord | undefined;
@@ -752,6 +1056,7 @@ export function ChatPane({
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
+			workspacePreparationRef.current = false;
 			setSwitchingWorkspace(false);
 		}
 	}, [targetWorkspaceId, workspacePath, switchToDefault, workspaceOptions, doWorkspaceSwitch]);
@@ -760,9 +1065,22 @@ export function ChatPane({
 	const directMemberName = members[0]?.name ?? "Worker";
 	const type = room?.type ?? "solo";
 	const isSingle = type === "direct";
-	const canInlinePiProcess = isSingle && members[0]?.connector?.connectorId === "pi";
+	const currentPiWorker = isSingle && members[0]?.connector?.connectorId === "pi";
+	const canInlinePiProcess = isSingle && (currentPiWorker || (historicalPiProcess?.roomId === roomId && historicalPiProcess.sessionId === activeId && historicalPiProcess.available));
+	useEffect(() => {
+		if (!isSingle || currentPiWorker || !activeId) return;
+		let current = true;
+		void fetchRoomDelegationProcesses(roomId, activeId)
+			.then((items) => {
+				if (current) setHistoricalPiProcess({ roomId, sessionId: activeId, available: items.some((item) => item.view === "session" && item.workerStarted) });
+			})
+			.catch(() => {
+				if (current) setHistoricalPiProcess({ roomId, sessionId: activeId, available: false });
+			});
+		return () => { current = false; };
+	}, [roomId, activeId, isSingle, currentPiWorker]);
 	const isGroup = type === "group";
-	const headerTitle = room?.name ?? "与 pi manager 对话";
+	const headerTitle = room?.name ?? (roomLoadError ? "对话暂不可用" : "正在加载对话…");
 	const activeSession = room?.sessions.find((s) => s.active);
 	const sessionTitle =
 		activeSession?.name ||
@@ -773,8 +1091,8 @@ export function ChatPane({
 			? `${members.length} 位 Worker · Manager 在场`
 			: type === "direct"
 				? members[0]?.description || `与 ${members[0] ? agentDisplayName(members[0]) : ""} 单聊`
-				: "理解消息、组织协作并汇总结果";
-	const workspaceTargetReady = switchToDefault || Boolean(targetWorkspaceId || workspacePath.trim());
+			: room ? "理解消息、组织协作并汇总结果" : "";
+	const workspaceTargetReady = !workspaceLoadError && !workspaceSelectionError && (switchToDefault || Boolean(targetWorkspaceId || workspacePath.trim()));
 	const workspaceLabel = room?.workspace ? `项目 · ${room.workspace.name}` : "默认目录";
 	const currentWorkspacePath = room?.workspace?.rootPath ?? room?.cwdSnapshot ?? "";
 	const recentWorkspaceOptions = workspaceOptions.filter((item) => item.id !== room?.workspace?.id);
@@ -785,15 +1103,16 @@ export function ChatPane({
 	const emptyHint = isGroup
 		? `群聊：${members.map((m) => agentDisplayName(m)).join("、")} 在窗口里，pi manager 负责调度。试试对 manager 说：让 ${members[0] ? agentDisplayName(members[0]) : "worker"} 分析一个任务…`
 		: isSingle
-			? `和 ${members[0] ? agentDisplayName(members[0]) : "worker"} 单聊（经 pi manager 中转）。派一个任务，manager 会交给 ${members[0] ? agentDisplayName(members[0]) : "它"} 执行`
+			? `和 ${members[0] ? agentDisplayName(members[0]) : "Worker"} 单聊。发送消息后由本窗口的 Worker 直接执行。`
 			: "开始和 pi manager 对话";
 
 	return (
 		<div className="home-chat-pane relative flex h-full min-w-0">
+			{!workspaceDialogOnly ? <>
 			<div className={`home-chat-primary flex min-w-0 flex-1 flex-col${goalRuntimeOpen ? ` runtime-drawer-open runtime-view-${runtimeView}` : ""}`}>
 			<header className="home-chat-header">
 				<div className="home-chat-identity">
-					{onOpenRoomList ? <Button type="button" size="icon" variant="ghost" className="md:hidden" aria-label="打开对话列表" onClick={onOpenRoomList}><PanelLeftOpenIcon className="size-4" /></Button> : null}
+					{onOpenRoomList ? <Button type="button" size="icon" variant="ghost" className="home-open-rooms md:hidden" aria-label="打开对话列表" onClick={onOpenRoomList}><PanelLeftOpenIcon className="size-4" /></Button> : null}
 					{isGroup ? (
 						<MemberStack members={members} size={34} />
 					) : isSingle ? (
@@ -842,7 +1161,7 @@ export function ChatPane({
 							onClick={() => changeGoalRuntimeOpen(true)}
 						>
 							<ListTreeIcon className="size-4" />
-							{runtimeSummary.total > 0 ? <span className="goal-header-badge">{runtimeSummary.completed}/{runtimeSummary.total}</span> : runtimeSummary.pending > 0 ? <span className="goal-header-badge">{runtimeSummary.pending}</span> : runtimeSummary.running > 0 ? <span className="goal-header-live" /> : null}
+							{runtimeSummary.total > 0 ? <span className="goal-header-badge">已报告 {runtimeSummary.completed}/{runtimeSummary.total}</span> : runtimeSummary.pending > 0 ? <span className="goal-header-badge">{runtimeSummary.pending}</span> : runtimeSummary.running > 0 ? <span className="goal-header-live" /> : null}
 						</Button>
 					) : null}
 					<Button type="button" size="icon" variant="ghost" className="home-chat-more" aria-label="聊天设置" title="聊天设置" onClick={() => { setWorkerProcessOpen(false); setChatInfoOpen(true); }}>
@@ -873,32 +1192,44 @@ export function ChatPane({
 					emptyHint={emptyHint}
 					windowType={type}
 					onStatus={setStatus}
-					onOpenWindow={onOpenWindow}
+					onOpenWindow={(windowId) => onOpenWindow?.(windowId, activeId)}
 					onRoomsMayHaveChanged={onRoomsMayHaveChanged}
 					workspaceLabel={workspaceLabel}
 					workspacePath={currentWorkspacePath}
 					workspaceAvailable={room.contextAvailable}
+					draftContextKey={JSON.stringify([room.workspace?.id ?? null, room.cwdSnapshot])}
 					onOpenWorkspace={openWorkspaceSwitch}
 					blocked={!room.contextAvailable || status === "gone"}
 					sessionModel={activeSession?.model}
+					sessionThinkingLevel={activeSession?.thinkingLevel}
+					directWorkerModel={isSingle ? { name: members[0]?.name ?? "", model: typeof members[0]?.connector?.config?.model === "string" ? members[0].connector.config.model : undefined } : undefined}
 					onSessionModelChange={handleSessionModelChange}
+					onSessionThinkingChange={handleSessionThinkingChange}
 					runtimeOpen={goalRuntimeOpen}
 					onRuntimeOpenChange={changeGoalRuntimeOpen}
 					runtimeView={runtimeView}
 					onRuntimeViewChange={setRuntimeView}
-					onRuntimeSummaryChange={setRuntimeSummary}
+						onRuntimeSummaryChange={setRuntimeSummary}
+						activityRevision={room.activityRevision}
+						onHistoryReady={acknowledgePresentedActivity}
 				/>
 				</InlinePiProcessProvider>
-			) : null}
+			) : (
+				<div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center" role={roomLoadError ? "alert" : "status"}>
+					<p className="text-sm text-muted-foreground">{roomLoadError ? `无法加载对话：${roomLoadError}` : "正在加载对话…"}</p>
+					{roomLoadError ? <Button type="button" variant="outline" onClick={() => { setRoomLoadError(null); setRoomLoadNonce((value) => value + 1); }}>重新加载</Button> : null}
+				</div>
+			)}
 			</div>
 
 			{room && activeId ? (
 				<WorkerProcessProvider value={{ openWorkerProcess }}>
 				<WorkerProcessDrawer
-					key={`${activeId}:${requestedDelegationId ?? "index"}`}
+					key={`${activeId}:${requestedDelegationId ?? "index"}:${requestedFullWorkerSession ? "full" : "delegation"}`}
 					roomId={roomId}
 					managerSessionId={activeId}
 					requestedDelegationId={requestedDelegationId}
+					requestedFullSession={requestedFullWorkerSession}
 					showWorkerFilter={isGroup}
 					open={workerProcessOpen}
 					onOpenChange={setWorkerProcessOpen}
@@ -920,6 +1251,7 @@ export function ChatPane({
 					onDeleteSession={setPendingDeleteSession}
 				/>
 			) : null}
+			</> : null}
 
 			<Dialog
 				open={pendingDeleteSession !== null}
@@ -962,7 +1294,9 @@ export function ChatPane({
 						maxLength={60}
 						autoFocus
 						onKeyDown={(e) => {
-							if (e.key === "Enter") void saveSessionRename();
+							if (e.key !== "Enter" || e.repeat || isIMEComposing(e)) return;
+							e.preventDefault();
+							void saveSessionRename();
 						}}
 					/>
 					<DialogFooter>
@@ -1004,6 +1338,7 @@ export function ChatPane({
 			<Dialog
 				open={workspaceOpen}
 				onOpenChange={(open) => {
+					if (!open && (workspacePreparationRef.current || workspaceRequestRef.current)) return;
 					setWorkspaceOpen(open);
 					if (!open) setDirectoryPickerOpen(false);
 				}}
@@ -1037,7 +1372,7 @@ export function ChatPane({
 								<small>新会话将使用平台默认运行目录</small>
 							</div>
 							<span className="workspace-switch-selected">已选择</span>
-							<Button type="button" size="sm" variant="ghost" onClick={() => setSwitchToDefault(false)}>更改</Button>
+							<Button type="button" size="sm" variant="ghost" disabled={switchingWorkspace} onClick={() => setSwitchToDefault(false)}>更改</Button>
 						</div>
 					) : (
 						<div className="workspace-switch-body">
@@ -1046,14 +1381,16 @@ export function ChatPane({
 								<div className="workspace-switch-input-row">
 									<Input
 										value={workspacePath}
+										disabled={switchingWorkspace}
 										onChange={(e) => {
 											setWorkspacePath(e.target.value);
 											if (e.target.value) setTargetWorkspaceId("");
+											setWorkspaceSelectionError(null);
 										}}
 										placeholder="选择文件夹或输入绝对目录"
 										className="workspace-switch-path"
 									/>
-									<Button type="button" variant="outline" className="workspace-switch-browse" onClick={() => setDirectoryPickerOpen(true)}>
+									<Button type="button" variant="outline" className="workspace-switch-browse" disabled={switchingWorkspace} onClick={() => setDirectoryPickerOpen(true)}>
 										<FolderOpenIcon className="size-4" />
 										浏览…
 									</Button>
@@ -1066,11 +1403,13 @@ export function ChatPane({
 										{room?.workspace ? (
 											<button
 												type="button"
+												disabled={switchingWorkspace}
 												className="workspace-switch-default-button"
-												onClick={() => {
-													setSwitchToDefault(true);
-													setWorkspacePath("");
-													setTargetWorkspaceId("");
+											onClick={() => {
+												setSwitchToDefault(true);
+												setWorkspacePath("");
+												setTargetWorkspaceId("");
+												setWorkspaceSelectionError(null);
 												}}
 											>
 												<FolderGit2Icon aria-hidden="true" />
@@ -1081,9 +1420,11 @@ export function ChatPane({
 									{recentWorkspaceOptions.length > 0 ? (
 										<Select
 											value={targetWorkspaceId}
+											disabled={switchingWorkspace}
 											onValueChange={(value) => {
 												setTargetWorkspaceId(value);
 												setWorkspacePath("");
+												setWorkspaceSelectionError(null);
 											}}
 										>
 											<SelectTrigger className="workspace-switch-select" aria-label="最近项目">
@@ -1124,8 +1465,17 @@ export function ChatPane({
 								: `“${newWindowLabel}”会打开目标项目的已有对话或创建新对话，当前对话会保留。`}
 						</p>
 					</div>
+					{workspaceSelectionError ? <p className="text-sm text-destructive" role="alert">{workspaceSelectionError}</p> : null}
+					{workspaceLoadError ? (
+						<div className="flex items-center gap-2 text-sm text-destructive" role="alert">
+							<span>项目列表读取失败：{workspaceLoadError}</span>
+							<Button type="button" size="sm" variant="outline" disabled={switchingWorkspace} onClick={() => {
+								void listWorkspaces().then((items) => { setWorkspaceOptions(items); setWorkspaceLoadError(null); }).catch((error: unknown) => setWorkspaceLoadError(error instanceof Error ? error.message : String(error)));
+							}}>重试</Button>
+						</div>
+					) : null}
 					<DialogFooter className="workspace-switch-footer">
-						<Button type="button" variant="ghost" onClick={() => setWorkspaceOpen(false)}>取消</Button>
+						<Button type="button" variant="ghost" disabled={switchingWorkspace} onClick={() => { if (!workspacePreparationRef.current && !workspaceRequestRef.current) setWorkspaceOpen(false); }}>取消</Button>
 						<Button type="button" disabled={switchingWorkspace || !workspaceTargetReady} onClick={() => void saveWorkspaceSwitch(type === "solo" ? "in_place" : "new_window")}>
 							{switchingWorkspace ? "处理中…" : type === "solo" ? "切换项目" : newWindowLabel}
 						</Button>
@@ -1138,9 +1488,11 @@ export function ChatPane({
 				initialPath={directoryPickerInitialPath}
 				onOpenChange={setDirectoryPickerOpen}
 				onSelect={(path) => {
+					if (workspacePreparationRef.current || workspaceRequestRef.current) return;
 					setWorkspacePath(path);
 					setTargetWorkspaceId("");
 					setSwitchToDefault(false);
+					setWorkspaceSelectionError(null);
 				}}
 			/>
 
@@ -1182,7 +1534,9 @@ export function ChatPane({
 						onChange={(e) => setRenameValue(e.target.value)}
 						placeholder="默认按窗口类型显示"
 						onKeyDown={(e) => {
-							if (e.key === "Enter") void saveRename();
+							if (e.key !== "Enter" || e.repeat || isIMEComposing(e)) return;
+							e.preventDefault();
+							void saveRename();
 						}}
 					/>
 					<DialogFooter>

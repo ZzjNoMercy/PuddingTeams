@@ -25,6 +25,7 @@ export interface ClaudeCodeDriverOptions {
 	command?: string;
 	/** 模型（--model）；留空用 claude 默认。 */
 	model?: string;
+	effort?: string;
 	/**
 	 * 权限模式（--permission-mode）。房间 worker 无人值守，默认
 	 * bypassPermissions；该模式绕过 Claude 自身权限确认，cwd 不是强制沙箱。
@@ -159,9 +160,12 @@ export class ClaudeCodeDriver implements AgentDriver {
 		});
 	}
 
-	private optionArgs(): string[] {
+	private optionArgs(settings?: import("@puddingteams/pwcp/types").RuntimeModelSettings): string[] {
 		const args = ["--output-format", "stream-json", "--verbose", "--permission-mode", this.opts.permissionMode ?? "bypassPermissions"];
-		if (this.opts.model) args.push("--model", this.opts.model);
+		const model = settings?.model ?? this.opts.model;
+		const effort = settings?.effort ?? this.opts.effort;
+		if (model) args.push("--model", model);
+		if (effort) args.push("--effort", effort);
 		if (this.opts.systemPrompt) args.push("--append-system-prompt", this.opts.systemPrompt);
 		if (this.opts.allowedTools) args.push("--allowedTools", this.opts.allowedTools);
 		return args;
@@ -265,13 +269,13 @@ export class ClaudeCodeDriver implements AgentDriver {
 		// 事件会带回同一个 id 作交叉验证。
 		const sessionId = randomUUID();
 		yield { type: "started", sessionHandle: sessionId };
-		yield await this.runCli(["-p", input.message, ...this.optionArgs(), "--session-id", sessionId], ctx);
+		yield await this.runCli(["-p", input.message, ...this.optionArgs(input.options?.runtimeModel), "--session-id", sessionId], ctx);
 	}
 
 	async *continue(input: ContinueInput, ctx: InvocationContext): AsyncIterable<AgentEvent> {
 		ctx.onUpdate?.("worker 正在续接会话…", { running: true });
 		yield { type: "started", sessionHandle: input.sessionHandle };
-		yield await this.runCli(["-p", input.message, ...this.optionArgs(), "--resume", input.sessionHandle], ctx);
+		yield await this.runCli(["-p", input.message, ...this.optionArgs(input.options?.runtimeModel), "--resume", input.sessionHandle], ctx);
 	}
 
 	async *respond(input: RespondInput, _ctx: InvocationContext): AsyncIterable<AgentEvent> {
@@ -339,6 +343,7 @@ export function createDriver(config: Record<string, unknown>): AgentDriver {
 	return new ClaudeCodeDriver({
 		command: str(config.command),
 		model: str(config.model),
+		effort: str(config.effort),
 		permissionMode: permissionModeOf(config.permissionMode),
 		systemPrompt: str(config.systemPrompt),
 		allowedTools: str(config.allowedTools),

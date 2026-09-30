@@ -42,7 +42,7 @@ function DefaultAvatar({ name, size }: { name: string; size: number }) {
 	return (
 		<span
 			className={cn(
-				"relative flex h-full w-full items-center justify-center overflow-hidden rounded-full font-semibold",
+				"relative flex h-full w-full items-center justify-center overflow-hidden rounded-full font-medium",
 				theme.bg,
 				theme.text,
 			)}

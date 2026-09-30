@@ -1,13 +1,15 @@
 import type { FastifyInstance } from "fastify";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import {
 	AVATAR_MAX_BYTES,
 	MANAGER_AGENT_NAME,
 	TeamsStore,
+	AgentRemovalRequiresDisabledError,
 	agentIdFromDisplayName,
 	type AgentConfig,
 } from "../store/teams.js";
-import { CredentialsStore } from "../store/credentials.js";
+import { BindingTransactionCommittedError, BindingTransactionRecoveryRequiredError, CredentialsStore } from "../store/credentials.js";
 import type { AgentRuntime } from "../agent-runtime/runtime.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import type { ExtensionRegistry } from "../agent-runtime/extension-registry.js";
@@ -21,6 +23,8 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { previewPiResources } from "../pi-bridge/pi-resources.js";
 import { PI_CONNECTOR_ID } from "../agent-runtime/pi-extension.js";
 import type { McpServerStore } from "../store/mcp-servers.js";
+import { AgentCreationOperationConflict, AgentCreationOperations } from "../store/agent-creation-operations.js";
+import { scopedAgentSecrets } from "../agent-runtime/agent-secrets.js";
 
 /** 头像回退用的 connector id：有绑定用绑定；pinned manager / pi worker 归 pi。 */
 function avatarConnectorId(agent: AgentConfig): string | undefined {
@@ -41,6 +45,8 @@ export interface AgentsRouteDeps {
 	capabilityStateRoot?: string;
 	/** 平台 MCP Server Catalog，用于 Agent 勾选校验。 */
 	mcpServers?: McpServerStore;
+	/** Durable identity reservation for retryable Agent creation. */
+	agentCreationStatePath?: string;
 }
 
 interface MutationResponse {
@@ -78,12 +84,32 @@ function connectorSecurityWarnings(agent: AgentConfig): string[] {
 /** Thin HTTP facade over the worker registry (agents.json) + Phase 5 管理 API（§10.1）。 */
 export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, deps: AgentsRouteDeps = {}): void {
 	const { credentials, runtime, invoker, extensions, sessions, capabilityStateRoot, mcpServers } = deps;
+	const creationOperations = deps.agentCreationStatePath ? new AgentCreationOperations(deps.agentCreationStatePath) : null;
+	const pendingCreations = new Map<string, Promise<AgentConfig>>();
+	const secretMutationGates = new Map<string, Promise<void>>();
 
-	/** 给 API 的 Agent 视图补充包内默认头像事实；不写回 agents.json。 */
-	function presentAgent(agent: AgentConfig): AgentConfig & { hasDefaultAvatar?: true } {
+	async function withAgentSecretGate<T>(name: string, fn: () => Promise<T>): Promise<T> {
+		const previous = secretMutationGates.get(name) ?? Promise.resolve();
+		let release!: () => void;
+		const current = new Promise<void>((resolve) => { release = resolve; });
+		secretMutationGates.set(name, current);
+		await previous;
+		try {
+			await credentials?.assertReady();
+			return await teams.withAgentCatalogMutation(() => teams.withAgentRunAdmission(name, fn));
+		}
+		finally {
+			release();
+			if (secretMutationGates.get(name) === current) secretMutationGates.delete(name);
+		}
+	}
+
+	/** 给 API 的 Agent 视图补充宿主/Connector 默认头像事实；不写回 agents.json。 */
+	function presentAgent(agent: AgentConfig): AgentConfig & { hasDefaultAvatar?: true; defaultAvatarRevision?: string } {
 		const connectorId = avatarConnectorId(agent);
-		return !agent.avatar && connectorId && extensions?.hasConnectorAvatar(connectorId)
-			? { ...agent, hasDefaultAvatar: true }
+		const defaultAvatarRevision = teams.builtinAvatarRevision(agent);
+		return defaultAvatarRevision || (connectorId && extensions?.hasConnectorAvatar(connectorId))
+			? { ...agent, hasDefaultAvatar: true, ...(defaultAvatarRevision ? { defaultAvatarRevision } : {}) }
 			: agent;
 	}
 
@@ -105,6 +131,26 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		return undefined;
 	}
 
+	function requiredConnectorKeys(binding: AgentConnectorBinding | undefined): string[] {
+		if (!binding) return [];
+		const manifest = extensions?.manifestOf(binding.extensionId);
+		return manifest?.kind === "connector" ? (manifest.connector.secretSchema ?? []).filter((item) => item.required).map((item) => item.key) : [];
+	}
+
+	async function missingRequiredConnectorKeys(
+		name: string,
+		binding: AgentConnectorBinding | undefined,
+		proposedSecrets?: Record<string, string>,
+	): Promise<string[]> {
+		const required = requiredConnectorKeys(binding);
+		if (required.length === 0) return [];
+		const stored = credentials ? await credentials.getSecrets(name) : {};
+		return required.filter((key) => {
+			if (proposedSecrets && Object.hasOwn(proposedSecrets, key)) return !proposedSecrets[key];
+			return !binding?.secretRefs?.[key] || !stored[key];
+		});
+	}
+
 	/**
 	 * 写操作统一响应（§10.1）：先同步撤权，再带 extensionRevision 与受影响
 	 * manager Session 统计（active_now / reload_pending）。
@@ -119,39 +165,115 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 
 	function notFoundOr400(reply: { code: (n: number) => { send: (b: unknown) => unknown } }, err: unknown): unknown {
 		const msg = err instanceof Error ? err.message : String(err);
+		if (err instanceof BindingTransactionRecoveryRequiredError) return reply.code(503).send({ error: msg, code: "credentials_recovery_required" });
+		if (msg.includes("changed during binding update")) return reply.code(409).send({ error: msg, code: "binding_conflict" });
 		return reply.code(msg.includes("not found") || msg.includes("不存在") ? 404 : 400).send({ error: msg });
 	}
 
+	function secretPayloadIssue(secrets: unknown): string | undefined {
+		return secrets !== undefined && (typeof secrets !== "object" || secrets === null || Array.isArray(secrets))
+			? "secrets 必须是对象"
+			: undefined;
+	}
+
 	/** secret 明文只进 CredentialsStore，Agent 配置里只留 secretRefs（key→key 引用）。 */
-	async function applySecrets(
-		name: string,
+	function planSecrets(
 		secrets: Record<string, string> | undefined,
 		existingRefs: Record<string, string> | undefined,
+		currentSecrets: Record<string, string>,
 		allowedKeys?: ReadonlySet<string>,
-	): Promise<Record<string, string> | undefined> {
+		sharedKeys: ReadonlySet<string> = new Set(),
+	): { refs: Record<string, string> | undefined; changes: Record<string, string> } {
 		const refs = { ...(existingRefs ?? {}) };
-		if (allowedKeys) {
-			for (const key of Object.keys(refs)) {
-				if (allowedKeys.has(key)) continue;
-				delete refs[key];
-				await credentials?.removeSecret(name, key);
-			}
-		}
-		if (secrets === undefined) return Object.keys(refs).length > 0 ? refs : undefined;
-		if (!credentials) throw new Error("secrets store not configured");
-		for (const [k, v] of Object.entries(secrets)) {
+		if (secrets !== undefined && !credentials) throw new Error("secrets store not configured");
+		for (const [k, v] of Object.entries(secrets ?? {})) {
 			if (typeof v !== "string") throw new Error(`secret "${k}" must be a string`);
 			if (!SECRET_KEY.test(k)) throw new Error(`secret key "${k}" must be UPPER_SNAKE (env var name)`);
 			if (allowedKeys && !allowedKeys.has(k)) throw new Error(`secret "${k}" is not declared by this extension`);
 		}
-		await credentials.setSecrets(name, secrets);
-		for (const k of Object.keys(secrets)) refs[k] = k;
-		return Object.keys(refs).length > 0 ? refs : undefined;
+		for (const [key, value] of Object.entries(secrets ?? {})) {
+			if (value && sharedKeys.has(key) && currentSecrets[key] !== value) {
+				throw new Error(`secret "${key}" is shared by another binding; change it from the Agent secrets page`);
+			}
+		}
+		const privateChanges: Record<string, string> = {};
+		if (allowedKeys) {
+			for (const key of Object.keys(refs)) {
+				if (allowedKeys.has(key)) continue;
+				delete refs[key];
+				if (!sharedKeys.has(key)) privateChanges[key] = "";
+			}
+		}
+		if (secrets !== undefined) {
+			for (const [key, value] of Object.entries(secrets)) {
+				if (!sharedKeys.has(key)) privateChanges[key] = value;
+				if (value === "") delete refs[key];
+				else refs[key] = key;
+			}
+		}
+		return { refs: Object.keys(refs).length > 0 ? refs : undefined, changes: privateChanges };
+	}
+
+	async function commitBindingSecrets(
+		name: string,
+		currentSecrets: Record<string, string>,
+		changes: Record<string, string>,
+		commit: (transactionId: string | undefined) => Promise<AgentConfig>,
+	): Promise<{ agent: AgentConfig; cleanupPending: boolean; committedUncertain?: boolean }> {
+		if (!credentials) {
+			if (Object.keys(changes).length > 0) throw new Error("secrets store not configured");
+			return { agent: await commit(undefined), cleanupPending: false };
+		}
+		try {
+			const { result, cleanupPending } = await credentials.transactBinding(
+				name, changes, currentSecrets, commit,
+				(id) => teams.credentialTransactionCommitted(name, id),
+			);
+			return { agent: result, cleanupPending };
+		} catch (error) {
+			if (!(error instanceof BindingTransactionCommittedError)) throw error;
+			const agent = await teams.getAgent(name);
+			if (!agent) throw new BindingTransactionRecoveryRequiredError();
+			return { agent, cleanupPending: false, committedUncertain: true };
+		}
+	}
+
+	function otherBindingSecretKeys(agent: AgentConfig, except?: { kind: "connector" } | { kind: "capability"; id: string }): Set<string> {
+		const keys = new Set<string>();
+		if (except?.kind !== "connector") for (const key of Object.keys(agent.connector?.secretRefs ?? {})) keys.add(key);
+		for (const binding of agent.capabilityExtensions ?? []) {
+			if (except?.kind === "capability" && binding.id === except.id) continue;
+			for (const key of Object.keys(binding.secretRefs ?? {})) keys.add(key);
+		}
+		return keys;
+	}
+
+	function revokedBindingSecrets(
+		oldRefs: Record<string, string> | undefined,
+		newRefs: Record<string, string> | undefined,
+		otherRefs: ReadonlySet<string>,
+		currentSecrets: Record<string, string>,
+		changes: Record<string, string> = {},
+	): Record<string, string> {
+		const next = { ...changes };
+		for (const key of Object.keys(oldRefs ?? {})) {
+			if (!newRefs?.[key] && !otherRefs.has(key) && Object.hasOwn(currentSecrets, key)) next[key] = "";
+		}
+		return next;
+	}
+
+	async function scopedSecretsForSnapshot(agent: AgentConfig): Promise<Record<string, string>> {
+		const stored = credentials ? await credentials.getSecrets(agent.name) : {};
+		const current = await teams.getAgent(agent.name);
+		if (!current || (current.extensionRevision ?? 0) !== (agent.extensionRevision ?? 0)) {
+			throw new Error("Agent configuration changed during credential read; retry");
+		}
+		return scopedAgentSecrets(agent, stored);
 	}
 
 	app.get("/api/agents", async () => {
 		const agents = await teams.listAgents();
-		// §11：未上传头像但 connector 声明了包内默认头像时，标记 hasDefaultAvatar，
+		// §11：宿主或 Connector 存在默认头像时标记 hasDefaultAvatar（上传后仍保留），
 		// 前端据此走 avatar URL（GET avatar 路由会回退到包内资源）。
 		if (!extensions) return { agents };
 		return { agents: agents.map(presentAgent) };
@@ -183,12 +305,17 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		}
 	});
 
-	app.post<{ Body: Partial<Record<string, unknown>> }>("/api/agents", async (req, reply) => {
+	app.post<{ Body: Partial<Record<string, unknown>> }>("/api/agents", async (req, reply) => teams.withAgentCatalogMutation(async () => {
 		try {
 			const body = { ...(req.body ?? {}) } as Record<string, unknown>;
 			let generateUniqueName = false;
 			const connectorIssue = connectorBindingIssue(body.connector);
 			if (connectorIssue) return reply.code(400).send({ error: connectorIssue });
+			const requestedConnector = body.connector as AgentConnectorBinding | undefined;
+			const requiredAtCreate = requiredConnectorKeys(requestedConnector);
+			if (body.enabled !== false && requiredAtCreate.length > 0) {
+				return reply.code(400).send({ error: `Connector 必填密钥 ${requiredAtCreate.join("、")} 尚未配置；请先创建停用 Worker，配置凭证后再启用` });
+			}
 			// name/id 解耦：未显式给内部 id（name）时，从显示名派生并保证唯一。
 			if (typeof body.name !== "string" || !body.name.trim()) {
 				const displayName = typeof body.displayName === "string" ? body.displayName.trim() : "";
@@ -199,29 +326,60 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 				// 显式 id 必须是文件名/工具名安全字符（生成路径已保证）。
 				return reply.code(400).send({ error: "name（内部 id）只能包含字母、数字、连字符或下划线，且以字母或数字开头" });
 			}
-			const agent = await teams.upsertAgent(body as unknown as AgentConfig, { createOnly: true, generateUniqueName });
+			const key = typeof req.headers["idempotency-key"] === "string" ? req.headers["idempotency-key"].trim() : "";
+			let agent: AgentConfig;
+			if (key) {
+				if (!creationOperations) return reply.code(503).send({ error: "Agent 创建操作存储未配置" });
+				const bodyHash = createHash("sha256").update(JSON.stringify(req.body ?? {})).digest("hex");
+				const operation = await creationOperations.reserve(key, bodyHash, body.name as string, generateUniqueName, await teams.reservedAgentIds());
+				const existing = await teams.getAgent(operation.agentName);
+				if (operation.phase === "attached") {
+					if (!existing) throw new AgentCreationOperationConflict("此创建操作已提交，但 Agent 已不存在", "agent_creation_stale", operation.agentName);
+					agent = existing;
+				} else {
+					let pending = pendingCreations.get(key);
+					if (!pending) {
+						pending = (async () => {
+							if (existing) throw new AgentCreationOperationConflict(`Agent「${operation.agentName}」已存在，创建结果未确认，请核对`, "agent_creation_uncertain", operation.agentName);
+							const created = await teams.upsertAgent({ ...body, name: operation.agentName } as unknown as AgentConfig, { createOnly: true });
+							await creationOperations.markAttached(key, created.name);
+							return created;
+						})();
+						pendingCreations.set(key, pending);
+						void pending.finally(() => { if (pendingCreations.get(key) === pending) pendingCreations.delete(key); }).catch(() => undefined);
+					}
+					agent = await pending;
+				}
+			} else {
+				agent = await teams.upsertAgent(body as unknown as AgentConfig, { createOnly: true, generateUniqueName });
+			}
 			return mutationReply(agent);
 		} catch (err) {
+			if (err instanceof AgentCreationOperationConflict) return reply.code(409).send({ error: err.message, code: err.code, agentName: err.agentName });
 			return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
 		}
-	});
+	}));
 
 	/**
 	 * 复制 Worker 配置并创建独立、默认停用的新身份。凭证、env、头像、
 	 * Session/Window 关系不复制；Capability binding id 由存储层重新生成。
 	 */
-	app.post<{ Params: { name: string } }>("/api/agents/:name/duplicate", async (req, reply) => {
+	app.post<{ Params: { name: string } }>("/api/agents/:name/duplicate", async (req, reply) => teams.withAgentCatalogMutation(async () => {
 		try {
 			return mutationReply(await teams.duplicateAgent(req.params.name));
 		} catch (err) {
 			return notFoundOr400(reply, err);
 		}
-	});
+	}));
 
 	app.put<{ Params: { name: string }; Body: Partial<Record<string, unknown>> }>(
 		"/api/agents/:name",
-		async (req, reply) => {
+		async (req, reply) => withAgentSecretGate(req.params.name, async () => {
 			try {
+				const expectedRevision = req.body?.expectedRevision;
+				if (!Number.isSafeInteger(expectedRevision) || (expectedRevision as number) < 0) {
+					return reply.code(400).send({ error: "Agent 更新需要非负整数 expectedRevision" });
+				}
 				// pinned manager 的可编辑项走专用通道（§10.5）。
 				if (req.params.name === MANAGER_AGENT_NAME) {
 					const agent = await teams.updateManager({
@@ -238,30 +396,46 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 						...(req.body?.piResources === null || (req.body?.piResources && typeof req.body.piResources === "object")
 							? { piResources: req.body.piResources as AgentConfig["piResources"] | null }
 							: {}),
-					});
+					}, expectedRevision as number);
 					return mutationReply(agent);
 				}
 				const existing = await teams.getAgent(req.params.name);
 				if (!existing) return reply.code(404).send({ error: "agent not found" });
 				const connectorIssue = connectorBindingIssue(req.body?.connector);
 				if (connectorIssue) return reply.code(400).send({ error: connectorIssue });
+				const requestedConnector = req.body?.connector as AgentConnectorBinding | undefined;
+				if (requestedConnector && req.body?.enabled !== false) {
+					const missing = await missingRequiredConnectorKeys(existing.name, requestedConnector);
+					if (missing.length > 0) return reply.code(400).send({ error: `Connector 必填密钥 ${missing.join("、")} 尚未配置` });
+				}
+				const agentBody = { ...req.body };
+				delete agentBody.expectedRevision;
 				const agent = await teams.upsertAgent({
-					...(req.body as unknown as AgentConfig),
+					...(agentBody as unknown as AgentConfig),
 					name: req.params.name,
-				});
+				}, { expectedRevision: expectedRevision as number });
 				return mutationReply(agent);
 			} catch (err) {
 				return notFoundOr400(reply, err);
 			}
-		},
+		}),
 	);
 
 	/** pinned manager 可编辑配置（§10.5）：描述 + manager settings 合并更新。 */
-	app.patch<{ Params: { name: string }; Body: { description?: string; displayName?: string | null; manager?: Record<string, unknown>; responsibility?: AgentConfig["responsibility"] | null; piResources?: AgentConfig["piResources"] | null } }>(
+	app.patch<{ Params: { name: string }; Body: { description?: string; displayName?: string | null; manager?: Record<string, unknown>; responsibility?: AgentConfig["responsibility"] | null; piResources?: AgentConfig["piResources"] | null; expectedRevision?: number } }>(
 		"/api/agents/:name/manager",
-		async (req, reply) => {
+		async (req, reply) => withAgentSecretGate(req.params.name, async () => {
 			if (req.params.name !== MANAGER_AGENT_NAME) {
 				return reply.code(400).send({ error: "只有 pinned manager 支持该配置区" });
+			}
+			const expectedRevision = req.body?.expectedRevision;
+			if (!Number.isSafeInteger(expectedRevision) || expectedRevision! < 0) {
+				return reply.code(400).send({ error: "Manager 配置需要非负整数 expectedRevision" });
+			}
+			const current = await teams.getAgent(MANAGER_AGENT_NAME);
+			if (!current) return reply.code(404).send({ error: "pinned manager 不存在" });
+			if (expectedRevision !== (current.extensionRevision ?? 0)) {
+				return reply.code(409).send({ error: "Manager 配置已变化，请读取最新配置后重试", code: "binding_conflict" });
 			}
 			try {
 				const agent = await teams.updateManager({
@@ -270,12 +444,12 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 					...(req.body?.responsibility !== undefined ? { responsibility: req.body.responsibility } : {}),
 					...(req.body?.manager !== undefined ? { manager: req.body.manager } : {}),
 					...(req.body?.piResources !== undefined ? { piResources: req.body.piResources } : {}),
-				});
+				}, expectedRevision!);
 				return mutationReply(agent);
 			} catch (err) {
 				return notFoundOr400(reply, err);
 			}
-		},
+		}),
 	);
 
 	app.get<{ Params: { name: string }; Querystring: { workspaceId?: string } }>(
@@ -310,27 +484,34 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		},
 	);
 
-	app.put<{ Params: { name: string }; Body: { piResources?: AgentConfig["piResources"] | null } }>(
+	app.put<{ Params: { name: string }; Body: { piResources?: AgentConfig["piResources"] | null; expectedRevision?: number } }>(
 		"/api/agents/:name/pi-resources",
-		async (req, reply) => {
+		async (req, reply) => withAgentSecretGate(req.params.name, async () => {
 			const agent = await teams.getAgent(req.params.name);
 			if (!agent) return reply.code(404).send({ error: "agent not found" });
 			if (!agent.pinned && agent.connector?.connectorId !== "pi") {
 				return reply.code(400).send({ error: "只有 pi Agent 支持资源配置" });
 			}
+			const expectedRevision = req.body?.expectedRevision;
+			if (!Number.isSafeInteger(expectedRevision) || expectedRevision! < 0) {
+				return reply.code(400).send({ error: "Pi 资源配置需要非负整数 expectedRevision" });
+			}
+			if (expectedRevision !== (agent.extensionRevision ?? 0)) {
+				return reply.code(409).send({ error: "Pi 资源配置已变化，请读取最新配置后重试", code: "binding_conflict" });
+			}
 			try {
 				if (agent.pinned) {
-					return mutationReply(await teams.updateManager({ piResources: req.body?.piResources ?? null }));
+					return mutationReply(await teams.updateManager({ piResources: req.body?.piResources ?? null }, expectedRevision!));
 				}
 				const updated = await teams.upsertAgent({
 					...agent,
 					piResources: req.body?.piResources ?? undefined,
-				});
+				}, { expectedRevision: expectedRevision! });
 				return mutationReply(updated);
 			} catch (err) {
 				return notFoundOr400(reply, err);
 			}
-		},
+		}),
 	);
 
 	/** Pi Agent 的 MCP Server 选择；Server 全集由扩展页统一维护。 */
@@ -343,7 +524,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		return { serverIds: agent.mcpServerIds ?? [], revision: agent.extensionRevision ?? 0 };
 	});
 
-	app.put<{ Params: { name: string }; Body: { serverIds?: unknown } }>("/api/agents/:name/mcp", async (req, reply) => {
+	app.put<{ Params: { name: string }; Body: { serverIds?: unknown; expectedRevision?: unknown } }>("/api/agents/:name/mcp", async (req, reply) => withAgentSecretGate(req.params.name, async () => {
 		const agent = await teams.getAgent(req.params.name);
 		if (!agent) return reply.code(404).send({ error: "agent not found" });
 		if (!agent.pinned && agent.connector?.connectorId !== PI_CONNECTOR_ID) {
@@ -352,6 +533,13 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		if (!Array.isArray(req.body?.serverIds) || req.body.serverIds.some((id) => typeof id !== "string" || !id.trim())) {
 			return reply.code(400).send({ error: "serverIds 必须是字符串数组" });
 		}
+		const expectedRevision = req.body.expectedRevision;
+		if (!Number.isSafeInteger(expectedRevision) || (expectedRevision as number) < 0) {
+			return reply.code(400).send({ error: "MCP 选择需要非负整数 expectedRevision" });
+		}
+		if (expectedRevision !== (agent.extensionRevision ?? 0)) {
+			return reply.code(409).send({ error: "MCP 选择已变化，请读取最新值后重新选择", code: "binding_conflict" });
+		}
 		const serverIds = [...new Set(req.body.serverIds.map((id) => (id as string).trim()))];
 		if (mcpServers) {
 			const available = new Set((await mcpServers.list()).map((server) => server.id));
@@ -359,11 +547,11 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 			if (missing.length > 0) return reply.code(400).send({ error: `MCP Server 不存在：${missing.join(", ")}` });
 		}
 		try {
-			return mutationReply(await teams.setMcpServerIds(agent.name, serverIds));
+			return mutationReply(await teams.setMcpServerIds(agent.name, serverIds, expectedRevision as number));
 		} catch (err) {
 			return notFoundOr400(reply, err);
 		}
-	});
+	}));
 
 	/**
 	 * 统一配置接口（独立配置页，§10.5）：manager 与 pi worker 同构的合并更新。
@@ -381,11 +569,18 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 			connector?: { config?: Record<string, unknown> } | null;
 			piResources?: AgentConfig["piResources"] | null;
 			codeSearch?: AgentConfig["codeSearch"];
+			expectedRevision?: number;
 		};
-	}>("/api/agents/:name/config", async (req, reply) => {
+	}>("/api/agents/:name/config", async (req, reply) => withAgentSecretGate(req.params.name, async () => {
 		const agent = await teams.getAgent(req.params.name);
 		if (!agent) return reply.code(404).send({ error: "agent not found" });
 		const body = req.body ?? {};
+		if (!Number.isSafeInteger(body.expectedRevision) || (body.expectedRevision as number) < 0) {
+			return reply.code(400).send({ error: "配置保存需要非负整数 expectedRevision" });
+		}
+		if (body.expectedRevision !== (agent.extensionRevision ?? 0)) {
+			return reply.code(409).send({ error: "Agent 配置已变化，请读取最新配置后再保存", code: "binding_conflict" });
+		}
 		if (agent.pinned) {
 			if (body.connector !== undefined) {
 				return reply.code(400).send({ error: "pinned manager 不绑定 Connector" });
@@ -397,7 +592,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 					...(body.responsibility !== undefined ? { responsibility: body.responsibility } : {}),
 					...(body.manager !== undefined ? { manager: body.manager } : {}),
 					...(body.piResources !== undefined ? { piResources: body.piResources } : {}),
-				});
+				}, body.expectedRevision);
 				return mutationReply(updated);
 			} catch (err) {
 				return notFoundOr400(reply, err);
@@ -441,32 +636,59 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 			if (body.connector !== undefined && agent.connector) {
 				next.connector = { ...agent.connector, ...(connectorConfig !== undefined ? { config: connectorConfig } : {}) };
 			}
-			return mutationReply(await teams.upsertAgent(next));
+			return mutationReply(await teams.upsertAgent(next, { expectedRevision: body.expectedRevision }));
 		} catch (err) {
 			return notFoundOr400(reply, err);
 		}
-	});
+	}));
 
-	app.delete<{ Params: { name: string } }>("/api/agents/:name", async (req, reply) => {
+	app.delete<{ Params: { name: string } }>("/api/agents/:name", async (req, reply) => withAgentSecretGate(req.params.name, async () => {
 		const existing = await teams.getAgent(req.params.name);
 		if (!existing) return reply.code(404).send({ error: "agent not found" });
 		// pinned 双层拒绝（§10.5）：路由先挡，store 再兜底。
 		if (existing.pinned) return reply.code(400).send({ error: `agent「${existing.name}」是 pinned 内置 Agent，不可删除` });
-		const removed = await teams.removeAgent(req.params.name);
+		const active = runtime
+			? (await runtime.listDelegations()).filter((delegation) => delegation.agentId === existing.name &&
+				["waiting_admission", "admitted", "running", "waiting_input", "cancel_requested", "reconciling"].includes(delegation.executionState))
+			: [];
+		if (active.length > 0) return reply.code(409).send({
+			error: `agent「${existing.name}」仍有 ${active.length} 个进行中/等待处理的 Run；先停用并处理这些 Run，再删除`,
+			runs: active.map((delegation) => ({
+				delegationId: delegation.id,
+				agentId: delegation.agentId,
+				executionState: delegation.executionState,
+				windowId: delegation.windowId,
+				managerSessionId: delegation.managerSessionId,
+			})),
+		});
+		if (existing.enabled !== false) return reply.code(409).send({
+			error: `agent「${existing.name}」仍处于启用状态；请先停用，再删除`,
+			code: "agent_enabled",
+		});
+		let removed: boolean;
+		try { removed = await teams.removeAgent(req.params.name, true); }
+		catch (error) {
+			if (error instanceof AgentRemovalRequiresDisabledError) return reply.code(409).send({ error: error.message, code: "agent_enabled" });
+			throw error;
+		}
 		if (!removed) return reply.code(404).send({ error: "agent not found" });
 		// 连带清除该 worker 的加密密钥。
-		await credentials?.removeAgentSecrets(req.params.name);
+		try { await credentials?.removeAgentSecrets(req.params.name); }
+		catch (error) {
+			req.log.error({ err: error, agentName: req.params.name }, "Agent 已删除，凭证清理将在下次启动时重试");
+			return reply.code(202).send({ deleted: true, agentName: req.params.name, credentialsCleanup: "pending" });
+		}
 		return reply.code(204).send();
-	});
+	}));
 
 	/**
 	 * 启用/禁用（§9.3.6）：禁用时若该 Agent 有 active/waiting Run，必须显式
 	 * 传 resolve——"keep" 保留 Run 但拒绝新委托，"cancel" 走 Runtime 取消；
 	 * 否则 409 + 受影响 Run 清单，绝不静默杀死。
 	 */
-	app.put<{ Params: { name: string }; Body: { enabled?: boolean; resolve?: string } }>(
+	app.put<{ Params: { name: string }; Body: { enabled?: boolean; resolve?: string; expectedRevision?: number } }>(
 		"/api/agents/:name/enabled",
-		async (req, reply) => {
+		async (req, reply) => withAgentSecretGate(req.params.name, async () => {
 			const agent = await teams.getAgent(req.params.name);
 			if (!agent) return reply.code(404).send({ error: "agent not found" });
 			const enabled = req.body?.enabled;
@@ -474,13 +696,23 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 			if (agent.pinned && !enabled) {
 				return reply.code(400).send({ error: `agent「${agent.name}」是 pinned 内置 Agent，不可禁用` });
 			}
+			const expectedRevision = req.body?.expectedRevision;
+			if (!Number.isSafeInteger(expectedRevision) || expectedRevision! < 0) {
+				return reply.code(400).send({ error: "Agent 启停需要非负整数 expectedRevision" });
+			}
+			if (expectedRevision !== (agent.extensionRevision ?? 0)) {
+				return reply.code(409).send({ error: "Agent 启停状态已变化，请读取最新配置后重试", code: "binding_conflict" });
+			}
 			if (enabled) {
-				return mutationReply(await teams.setEnabled(agent.name, true));
+				const missing = await missingRequiredConnectorKeys(agent.name, agent.connector);
+				if (missing.length > 0) return reply.code(400).send({ error: `Connector 必填密钥 ${missing.join("、")} 尚未配置` });
+				try { return mutationReply(await teams.setEnabled(agent.name, true, expectedRevision)); }
+				catch (err) { return notFoundOr400(reply, err); }
 			}
 			const resolve = req.body?.resolve;
 			const active = runtime
 				? (await runtime.listDelegations()).filter(
-						(d) => d.agentId === agent.name && (d.executionState === "running" || d.executionState === "waiting_input" || d.executionState === "cancel_requested" || d.executionState === "reconciling"),
+						(d) => d.agentId === agent.name && ["admitted", "waiting_admission", "running", "waiting_input", "cancel_requested", "reconciling"].includes(d.executionState),
 					)
 				: [];
 			if (active.length > 0 && resolve !== "keep" && resolve !== "cancel") {
@@ -494,14 +726,17 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 					})),
 				});
 			}
+			let updated: AgentConfig;
+			try { updated = await teams.setEnabled(agent.name, false, expectedRevision); }
+			catch (err) { return notFoundOr400(reply, err); }
 			if (resolve === "cancel" && runtime) {
 				for (const d of active) {
 					await runtime.cancel(d.id, { cwd: teams.defaultContextCwd(), env: {} }).catch(() => undefined);
 				}
 			}
 			// "keep"：保留 Run，新委托由 Invoker 门控拒绝（§9.3.6）。
-			return mutationReply(await teams.setEnabled(agent.name, false));
-		},
+			return mutationReply(updated);
+		}),
 	);
 
 	// ---- Connector 绑定（§10.1 基础接入） ----
@@ -529,7 +764,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 				const driver = await invoker.driverFor(agent.name);
 				if (!driver) return reply.code(404).send({ error: "Connector driver unavailable" });
 				if (!driver.listConfigOptions) return { options: [] };
-				const secrets = credentials ? await credentials.getSecrets(agent.name) : {};
+				const secrets = await scopedSecretsForSnapshot(agent);
 				return {
 					options: await driver.listConfigOptions(req.params.field, {
 						cwd: teams.defaultContextCwd(),
@@ -551,11 +786,19 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 			config?: Record<string, unknown>;
 			secrets?: Record<string, string>;
 			versionPin?: string;
+			expectedRevision?: number;
 		};
-	}>("/api/agents/:name/connector", async (req, reply) => {
+	}>("/api/agents/:name/connector", async (req, reply) => withAgentSecretGate(req.params.name, async () => {
 		const agent = await teams.getAgent(req.params.name);
 		if (!agent) return reply.code(404).send({ error: "agent not found" });
 		if (agent.pinned) return reply.code(400).send({ error: "pinned manager 不绑定 Connector" });
+		const expectedRevision = req.body?.expectedRevision;
+		if (!Number.isSafeInteger(expectedRevision) || expectedRevision! < 0) {
+			return reply.code(400).send({ error: "Connector 绑定需要非负整数 expectedRevision" });
+		}
+		if (expectedRevision !== (agent.extensionRevision ?? 0)) {
+			return reply.code(409).send({ error: "Connector 绑定已变化，请读取最新配置后重试", code: "binding_conflict" });
+		}
 		const { extensionId, connectorId, transport, config } = req.body ?? {};
 		if (!extensionId?.trim() || !connectorId?.trim() || !transport?.trim()) {
 			return reply.code(400).send({ error: "body must be { extensionId, connectorId, transport, config?, secrets? }" });
@@ -563,6 +806,11 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		if (config !== undefined && (typeof config !== "object" || config === null || Array.isArray(config))) {
 			return reply.code(400).send({ error: "connector.config 必须是对象" });
 		}
+		if (req.body?.versionPin !== undefined && typeof req.body.versionPin !== "string") {
+			return reply.code(400).send({ error: "versionPin 必须是字符串" });
+		}
+		const secretsIssue = secretPayloadIssue(req.body?.secrets);
+		if (secretsIssue) return reply.code(400).send({ error: secretsIssue });
 		// 校验安装包存在且 contribution 匹配（§9.3：先安装再绑定）。
 		const manifest = extensions?.manifestOf(extensionId);
 		if (extensions && (!manifest || manifest.kind !== "connector" || manifest.connector.id !== connectorId)) {
@@ -572,21 +820,34 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 			return reply.code(400).send({ error: `connector「${connectorId}」不支持 transport「${transport}」` });
 		}
 		try {
+			if (agent.enabled !== false) {
+				const sameConnector = agent.connector?.extensionId === extensionId.trim() && agent.connector?.connectorId === connectorId.trim();
+				const candidate = { extensionId: extensionId.trim(), connectorId: connectorId.trim(), transport: transport as AgentConnectorBinding["transport"], config: config ?? {}, secretRefs: sameConnector ? agent.connector?.secretRefs : undefined };
+				const missing = await missingRequiredConnectorKeys(agent.name, candidate, req.body?.secrets);
+				if (missing.length > 0) return reply.code(400).send({ error: `Connector 必填密钥 ${missing.join("、")} 尚未配置；请先停用 Worker 或提交凭证` });
+			}
 			const allowedSecretKeys = new Set(manifest?.kind === "connector" ? (manifest.connector.secretSchema ?? []).map((item) => item.key) : []);
-			const secretRefs = await applySecrets(agent.name, req.body?.secrets, agent.connector?.secretRefs, allowedSecretKeys);
-			const updated = await teams.setConnectorBinding(agent.name, {
+			const currentSecrets = credentials ? await credentials.getSecrets(agent.name) : {};
+			const sameConnector = agent.connector?.extensionId === extensionId.trim() && agent.connector?.connectorId === connectorId.trim();
+			const otherRefs = otherBindingSecretKeys(agent, { kind: "connector" });
+			const { refs: secretRefs, changes } = planSecrets(req.body?.secrets, sameConnector ? agent.connector?.secretRefs : undefined, currentSecrets, allowedSecretKeys, otherRefs);
+			const finalChanges = revokedBindingSecrets(agent.connector?.secretRefs, secretRefs, otherRefs, currentSecrets, changes);
+			const { agent: updated, cleanupPending, committedUncertain } = await commitBindingSecrets(agent.name, currentSecrets, finalChanges, (id) => teams.setConnectorBinding(agent.name, {
 				extensionId: extensionId.trim(),
 				connectorId: connectorId.trim(),
 				transport: transport as AgentConnectorBinding["transport"],
 				config: config ?? {},
 				...(secretRefs ? { secretRefs } : {}),
 				...(typeof req.body?.versionPin === "string" ? { versionPin: req.body.versionPin } : {}),
-			});
-			return mutationReply(updated);
+			}, { expectedRevision: expectedRevision!, id }));
+			const body = await mutationReply(updated);
+			return cleanupPending || committedUncertain
+				? reply.code(202).send({ ...body, ...(cleanupPending ? { credentialsCleanup: "pending" } : {}), ...(committedUncertain ? { commitState: "committed_readback" } : {}) })
+				: body;
 		} catch (err) {
 			return notFoundOr400(reply, err);
 		}
-	});
+	}));
 
 	// ---- Capability Extension 绑定（§10.1 Extensions 页签） ----
 
@@ -599,6 +860,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 	app.post<{
 		Params: { name: string };
 		Body: {
+			expectedRevision?: number;
 			extensionId?: string;
 			capabilityId?: string;
 			enabled?: boolean;
@@ -607,9 +869,16 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 			versionPin?: string;
 			secrets?: Record<string, string>;
 		};
-	}>("/api/agents/:name/extensions", async (req, reply) => {
+	}>("/api/agents/:name/extensions", async (req, reply) => withAgentSecretGate(req.params.name, async () => {
 		const agent = await teams.getAgent(req.params.name);
 		if (!agent) return reply.code(404).send({ error: "agent not found" });
+		const expectedRevision = req.body?.expectedRevision;
+		if (!Number.isSafeInteger(expectedRevision) || expectedRevision! < 0) {
+			return reply.code(400).send({ error: "新增绑定需要非负整数 expectedRevision" });
+		}
+		if (expectedRevision !== (agent.extensionRevision ?? 0)) {
+			return reply.code(409).send({ error: "绑定配置已变化，请核对最新值后重试", code: "binding_conflict" });
+		}
 		const { extensionId, capabilityId, enabled, config, activation, versionPin } = req.body ?? {};
 		if (!extensionId?.trim() || !capabilityId?.trim()) {
 			return reply.code(400).send({ error: "body must be { extensionId, capabilityId, enabled?, config? }" });
@@ -617,6 +886,17 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		if (activation !== undefined && activation !== "always" && activation !== "searchable") {
 			return reply.code(400).send({ error: 'activation 必须是 "always" | "searchable"' });
 		}
+		if (enabled !== undefined && typeof enabled !== "boolean") {
+			return reply.code(400).send({ error: "enabled 必须是布尔值" });
+		}
+		if (config !== undefined && (typeof config !== "object" || config === null || Array.isArray(config))) {
+			return reply.code(400).send({ error: "capability.config 必须是对象" });
+		}
+		if (versionPin !== undefined && typeof versionPin !== "string") {
+			return reply.code(400).send({ error: "versionPin 必须是字符串" });
+		}
+		const secretsIssue = secretPayloadIssue(req.body?.secrets);
+		if (secretsIssue) return reply.code(400).send({ error: secretsIssue });
 		const manifest = extensions?.manifestOf(extensionId);
 		if (extensions && (!manifest || manifest.kind !== "capability" || manifest.capability.id !== capabilityId)) {
 			return reply.code(400).send({ error: `extension「${extensionId}」未安装或不包含 capability「${capabilityId}」` });
@@ -631,8 +911,9 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 		}
 		try {
 			const allowedSecretKeys = new Set(manifest?.kind === "capability" ? (manifest.capability.secretSchema ?? []).map((item) => item.key) : []);
-			const secretRefs = await applySecrets(agent.name, req.body?.secrets, undefined, allowedSecretKeys);
-			const updated = await teams.addCapabilityBinding(agent.name, {
+			const currentSecrets = credentials ? await credentials.getSecrets(agent.name) : {};
+			const { refs: secretRefs, changes } = planSecrets(req.body?.secrets, undefined, currentSecrets, allowedSecretKeys, otherBindingSecretKeys(agent));
+			const { agent: updated, cleanupPending, committedUncertain } = await commitBindingSecrets(agent.name, currentSecrets, changes, (id) => teams.addCapabilityBinding(agent.name, {
 				extensionId: extensionId.trim(),
 				capabilityId: capabilityId.trim(),
 				enabled: enabled ?? true,
@@ -640,57 +921,104 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 				...(secretRefs ? { secretRefs } : {}),
 				...(activation ? { activation } : {}),
 				...(typeof versionPin === "string" ? { versionPin } : {}),
-			});
-			return mutationReply(updated);
+			}, { expectedRevision: expectedRevision!, id }));
+			const body = await mutationReply(updated);
+			return cleanupPending || committedUncertain
+				? reply.code(202).send({ ...body, ...(cleanupPending ? { credentialsCleanup: "pending" } : {}), ...(committedUncertain ? { commitState: "committed_readback" } : {}) })
+				: body;
 		} catch (err) {
 			return notFoundOr400(reply, err);
 		}
-	});
+	}));
 
 	app.patch<{
 		Params: { name: string; bindingId: string };
 		Body: {
+			expectedRevision?: number;
 			enabled?: boolean;
 			config?: Record<string, unknown>;
 			activation?: string;
 			versionPin?: string;
 			secrets?: Record<string, string>;
 		};
-	}>("/api/agents/:name/extensions/:bindingId", async (req, reply) => {
+	}>("/api/agents/:name/extensions/:bindingId", async (req, reply) => withAgentSecretGate(req.params.name, async () => {
 		const agent = await teams.getAgent(req.params.name);
 		if (!agent) return reply.code(404).send({ error: "agent not found" });
 		const binding = (agent.capabilityExtensions ?? []).find((b) => b.id === req.params.bindingId);
 		if (!binding) return reply.code(404).send({ error: `binding not found: ${req.params.bindingId}` });
+		const expectedRevision = req.body?.expectedRevision;
+		if (!Number.isSafeInteger(expectedRevision) || expectedRevision! < 0) {
+			return reply.code(400).send({ error: "修改绑定需要非负整数 expectedRevision" });
+		}
+		if (expectedRevision !== (agent.extensionRevision ?? 0)) {
+			return reply.code(409).send({ error: "绑定配置已变化，请核对最新值后重试", code: "binding_conflict" });
+		}
 		const { enabled, config, activation, versionPin } = req.body ?? {};
 		if (activation !== undefined && activation !== "always" && activation !== "searchable") {
 			return reply.code(400).send({ error: 'activation 必须是 "always" | "searchable"' });
 		}
+		if (enabled !== undefined && typeof enabled !== "boolean") {
+			return reply.code(400).send({ error: "enabled 必须是布尔值" });
+		}
+		if (config !== undefined && (typeof config !== "object" || config === null || Array.isArray(config))) {
+			return reply.code(400).send({ error: "capability.config 必须是对象" });
+		}
+		if (versionPin !== undefined && typeof versionPin !== "string") {
+			return reply.code(400).send({ error: "versionPin 必须是字符串" });
+		}
+		const secretsIssue = secretPayloadIssue(req.body?.secrets);
+		if (secretsIssue) return reply.code(400).send({ error: secretsIssue });
 		const manifest = extensions?.manifestOf(binding.extensionId);
 		try {
 			const allowedSecretKeys = new Set(manifest?.kind === "capability" ? (manifest.capability.secretSchema ?? []).map((item) => item.key) : []);
-			const secretRefs = await applySecrets(agent.name, req.body?.secrets, binding.secretRefs, allowedSecretKeys);
+			const currentSecrets = credentials ? await credentials.getSecrets(agent.name) : {};
+			const { refs: secretRefs, changes } = planSecrets(req.body?.secrets, binding.secretRefs, currentSecrets, allowedSecretKeys, otherBindingSecretKeys(agent, { kind: "capability", id: binding.id }));
 			const patch: Partial<Omit<AgentCapabilityBinding, "id" | "extensionId" | "capabilityId">> = {
 				...(enabled !== undefined ? { enabled } : {}),
 				...(config !== undefined ? { config } : {}),
 				...(activation !== undefined ? { activation } : {}),
 				...(versionPin !== undefined ? { versionPin } : {}),
-				...(secretRefs !== undefined ? { secretRefs } : {}),
+				...(req.body?.secrets !== undefined || secretRefs !== undefined ? { secretRefs: secretRefs ?? {} } : {}),
 			};
-			return mutationReply(await teams.patchCapabilityBinding(agent.name, binding.id, patch));
+			const { agent: updated, cleanupPending, committedUncertain } = await commitBindingSecrets(agent.name, currentSecrets, changes, (id) =>
+				teams.patchCapabilityBinding(agent.name, binding.id, patch, { expectedRevision: expectedRevision!, id }));
+			const body = await mutationReply(updated);
+			return cleanupPending || committedUncertain
+				? reply.code(202).send({ ...body, ...(cleanupPending ? { credentialsCleanup: "pending" } : {}), ...(committedUncertain ? { commitState: "committed_readback" } : {}) })
+				: body;
 		} catch (err) {
 			return notFoundOr400(reply, err);
 		}
-	});
+	}));
 
 	app.delete<{ Params: { name: string; bindingId: string } }>(
 		"/api/agents/:name/extensions/:bindingId",
-		async (req, reply) => {
+		async (req, reply) => withAgentSecretGate(req.params.name, async () => {
 			try {
-				return mutationReply(await teams.removeCapabilityBinding(req.params.name, req.params.bindingId));
+				const agent = await teams.getAgent(req.params.name);
+				if (!agent) return reply.code(404).send({ error: "agent not found" });
+				const binding = (agent.capabilityExtensions ?? []).find((entry) => entry.id === req.params.bindingId);
+				if (!binding) return reply.code(404).send({ error: `binding not found: ${req.params.bindingId}` });
+				const rawRevision = req.headers["x-expected-revision"];
+				if (typeof rawRevision !== "string" || !/^(0|[1-9]\d*)$/.test(rawRevision) || !Number.isSafeInteger(Number(rawRevision))) {
+					return reply.code(400).send({ error: "删除绑定需要非负整数 x-expected-revision" });
+				}
+				const expectedRevision = Number(rawRevision);
+				if (expectedRevision !== (agent.extensionRevision ?? 0)) {
+					return reply.code(409).send({ error: "绑定配置已变化，请核对最新值后重试", code: "binding_conflict" });
+				}
+				const currentSecrets = credentials ? await credentials.getSecrets(agent.name) : {};
+				const changes = revokedBindingSecrets(binding.secretRefs, undefined, otherBindingSecretKeys(agent, { kind: "capability", id: binding.id }), currentSecrets);
+				const { agent: updated, cleanupPending, committedUncertain } = await commitBindingSecrets(agent.name, currentSecrets, changes, (id) =>
+					teams.removeCapabilityBinding(agent.name, binding.id, { expectedRevision, id }));
+				const body = await mutationReply(updated);
+				return cleanupPending || committedUncertain
+					? reply.code(202).send({ ...body, ...(cleanupPending ? { credentialsCleanup: "pending" } : {}), ...(committedUncertain ? { commitState: "committed_readback" } : {}) })
+					: body;
 			} catch (err) {
 				return notFoundOr400(reply, err);
 			}
-		},
+		}),
 	);
 
 	/** Capability 绑定探测：安装/加载/启用状态与将注册的工具清单。 */
@@ -796,7 +1124,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 						},
 					};
 				}
-				const secrets = credentials ? await credentials.getSecrets(agent.name) : {};
+				const secrets = await scopedSecretsForSnapshot(agent);
 				const probe = await driver.probe({
 					cwd: teams.defaultContextCwd(),
 					env: { ...process.env, ...(agent.env ?? {}), ...secrets },
@@ -827,9 +1155,10 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 
 	app.put<{ Params: { name: string }; Body: { secrets?: Record<string, string> } }>(
 		"/api/agents/:name/secrets",
-		async (req, reply) => {
+		async (req, reply) => withAgentSecretGate(req.params.name, async () => {
 			if (!credentials) return reply.code(501).send({ error: "secrets store not configured" });
-			if (!(await teams.getAgent(req.params.name))) return reply.code(404).send({ error: "agent not found" });
+			const agent = await teams.getAgent(req.params.name);
+			if (!agent) return reply.code(404).send({ error: "agent not found" });
 			const secrets = req.body?.secrets;
 			if (!secrets || typeof secrets !== "object" || Array.isArray(secrets)) {
 				return reply.code(400).send({ error: "body must be { secrets: { KEY: value } }" });
@@ -839,24 +1168,31 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 				if (!SECRET_KEY.test(k)) {
 					return reply.code(400).send({ error: `secret key "${k}" must be UPPER_SNAKE (env var name)` });
 				}
+				if (v === "" && otherBindingSecretKeys(agent).has(k)) {
+					return reply.code(409).send({ error: `secret "${k}" is referenced by a Connector or Capability binding; clear it from the binding first` });
+				}
 			}
 			const configured = await credentials.setSecrets(req.params.name, secrets);
 			await teams.bumpAgentRevision(req.params.name);
 			await sessions?.syncAgentConfigChange();
 			return { configured };
-		},
+		}),
 	);
 
 	app.delete<{ Params: { name: string; key: string } }>(
 		"/api/agents/:name/secrets/:key",
-		async (req, reply) => {
+		async (req, reply) => withAgentSecretGate(req.params.name, async () => {
 			if (!credentials) return reply.code(501).send({ error: "secrets store not configured" });
-			if (!(await teams.getAgent(req.params.name))) return reply.code(404).send({ error: "agent not found" });
+			const agent = await teams.getAgent(req.params.name);
+			if (!agent) return reply.code(404).send({ error: "agent not found" });
+			if (otherBindingSecretKeys(agent).has(req.params.key)) {
+				return reply.code(409).send({ error: `secret "${req.params.key}" is referenced by a Connector or Capability binding; clear it from the binding first` });
+			}
 			await credentials.removeSecret(req.params.name, req.params.key);
 			await teams.bumpAgentRevision(req.params.name);
 			await sessions?.syncAgentConfigChange();
 			return reply.code(204).send();
-		},
+		}),
 	);
 
 	// ---- avatars (§11): files under <assets>/avatars/, field on agents.json ----
@@ -886,8 +1222,8 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 
 	app.delete<{ Params: { name: string } }>("/api/agents/:name/avatar", async (req, reply) => {
 		try {
-			await teams.removeAvatar(req.params.name);
-			return reply.code(204).send();
+			const agent = await teams.removeAvatar(req.params.name);
+			return { agent };
 		} catch (err) {
 			return notFoundOr400(reply, err);
 		}
@@ -895,10 +1231,17 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 
 	app.get<{ Params: { name: string } }>("/api/agents/:name/avatar", async (req, reply) => {
 		const avatar = await teams.readAvatar(req.params.name);
-		// 未上传头像时回退到 connector manifest 声明的包内默认头像（§11）。
+		// 上传优先，其次宿主内置角色头像，再回退 Connector 默认头像（§11）。
 		if (!avatar) {
+			const agent = (await teams.listAgents()).find((a) => a.name === req.params.name);
+			const builtin = agent ? await teams.readBuiltinAvatar(agent) : null;
+			if (builtin) {
+				return reply
+					.header("content-type", builtin.mime)
+					.header("cache-control", "public, max-age=3600")
+					.send(builtin.buf);
+			}
 			if (extensions) {
-				const agent = (await teams.listAgents()).find((a) => a.name === req.params.name);
 				const connectorId = agent ? avatarConnectorId(agent) : undefined;
 				const fallback = connectorId ? await extensions.readConnectorAvatar(connectorId) : null;
 				if (fallback) {

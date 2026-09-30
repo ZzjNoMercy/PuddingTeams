@@ -38,17 +38,17 @@ function sendFile(reply: FastifyReply, filePath: string, status = 200): FastifyR
 		.send(createReadStream(filePath));
 }
 
-function resolvePage(urlPath: string): string | undefined {
+function resolvePage(urlPath: string, webOutDir: string): string | undefined {
 	const rel = urlPath.replace(/^\/+/, "");
-	if (!rel) return path.join(WEB_OUT_DIR, "index.html");
+	if (!rel) return path.join(webOutDir, "index.html");
 	// 防路径穿越：归一化后必须仍在 out/ 内。
 	const candidates = [
-		path.resolve(WEB_OUT_DIR, rel),
-		path.resolve(WEB_OUT_DIR, `${rel}.html`),
-		path.resolve(WEB_OUT_DIR, rel, "index.html"),
+		path.resolve(webOutDir, rel),
+		path.resolve(webOutDir, `${rel}.html`),
+		path.resolve(webOutDir, rel, "index.html"),
 	];
 	for (const candidate of candidates) {
-		if (!candidate.startsWith(WEB_OUT_DIR + path.sep)) continue;
+		if (!candidate.startsWith(webOutDir + path.sep)) continue;
 		if (existsSync(candidate) && statSync(candidate).isFile()) return candidate;
 	}
 	return undefined;
@@ -58,9 +58,9 @@ function resolvePage(urlPath: string): string | undefined {
  * out/index.html 存在时注册静态托管并返回 true。走 setNotFoundHandler：已注册
  * 的 /api/* 路由不受影响，未匹配的 /api/* 仍回 JSON 404，其余按页面/资源解析。
  */
-export function registerWebStatic(app: FastifyInstance): boolean {
-	if (!existsSync(path.join(WEB_OUT_DIR, "index.html"))) return false;
-	const notFoundPage = path.join(WEB_OUT_DIR, "404.html");
+export function registerWebStatic(app: FastifyInstance, webOutDir = WEB_OUT_DIR): boolean {
+	if (!existsSync(path.join(webOutDir, "index.html"))) return false;
+	const notFoundPage = path.join(webOutDir, "404.html");
 	app.setNotFoundHandler((req: FastifyRequest, reply: FastifyReply) => {
 		if (req.method !== "GET" && req.method !== "HEAD") {
 			return reply.status(404).send({ message: `Route ${req.method}:${req.url} not found`, error: "Not Found", statusCode: 404 });
@@ -71,10 +71,16 @@ export function registerWebStatic(app: FastifyInstance): boolean {
 		} catch {
 			return reply.status(404).send({ message: "Not Found", error: "Not Found", statusCode: 404 });
 		}
-		if (urlPath.startsWith("/api/")) {
-			return reply.status(404).send({ message: `Route GET:${urlPath} not found`, error: "Not Found", statusCode: 404 });
+		let decodedPath: string;
+		try {
+			decodedPath = decodeURIComponent(urlPath);
+		} catch {
+			return reply.status(404).send({ message: "Not Found", error: "Not Found", statusCode: 404 });
 		}
-		const file = resolvePage(decodeURIComponent(urlPath));
+		if (decodedPath === "/api" || decodedPath.startsWith("/api/")) {
+			return reply.status(404).send({ message: `Route GET:${decodedPath} not found`, error: "Not Found", statusCode: 404 });
+		}
+		const file = resolvePage(decodedPath, webOutDir);
 		if (file) return sendFile(reply, file);
 		if (existsSync(notFoundPage)) return sendFile(reply, notFoundPage, 404);
 		return reply.status(404).send({ message: "Not Found", error: "Not Found", statusCode: 404 });

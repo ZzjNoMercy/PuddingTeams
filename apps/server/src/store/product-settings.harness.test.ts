@@ -3,7 +3,7 @@ import assert from "node:assert";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { ProductSettingsStore } from "./product-settings.js";
+import { HarnessSettingsConflictError, ProductSettingsStore, harnessSettingsRevision } from "./product-settings.js";
 
 test("Harness 设置原子更新并施加安全边界", async () => {
 	const store = new ProductSettingsStore(mkdtempSync(path.join(tmpdir(), "pt-product-settings-")));
@@ -57,4 +57,23 @@ test("Harness 设置原子更新并施加安全边界", async () => {
 	await assert.rejects(() => store.setHarness({
 		workspaceExecution: { promotion: { autoCommit: true } },
 	}), /autoCommit 必须为 false/);
+});
+
+test("Harness revision 在写队列内检查，旧表单不能覆盖新设置", async () => {
+	const store = new ProductSettingsStore(mkdtempSync(path.join(tmpdir(), "pt-harness-revision-")));
+	const initial = await store.get();
+	const revision = harnessSettingsRevision(initial.harness);
+	await store.setDeveloperMode(true);
+	assert.equal(harnessSettingsRevision((await store.get()).harness), revision, "开发者模式变化不应冲突 Harness 表单");
+	const writes = await Promise.allSettled([
+		store.setHarness({ codeSearch: { defaultProvider: "fff" } }, revision),
+		store.setHarness({ goalRecovery: { mode: "manual" } }, revision),
+	]);
+	assert.equal(writes.filter((result) => result.status === "fulfilled").length, 1);
+	const rejected = writes.find((result) => result.status === "rejected");
+	assert.ok(rejected && rejected.status === "rejected" && rejected.reason instanceof HarnessSettingsConflictError);
+	const current = await store.get();
+	assert.equal(harnessSettingsRevision(current.harness), rejected.reason.currentRevision);
+	assert.equal(current.harness.codeSearch.defaultProvider, "fff");
+	assert.equal(current.harness.goalRecovery.mode, "safe_auto", "被拒的第二次写入未落盘");
 });

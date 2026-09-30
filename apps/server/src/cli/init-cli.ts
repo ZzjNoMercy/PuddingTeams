@@ -100,7 +100,7 @@ const WORKERS: WorkerEntry[] = [
 		},
 		// npm 公开包名是 scoped 的 @puddingai/puddingclaw（bin 名 puddingclaw）。
 		installSpec: "@puddingai/puddingclaw",
-		purpose: "PuddingClaw worker（连接 PuddingClaw Backend 的数据分析 Agent，第一优先 worker）",
+		purpose: "可选 PuddingClaw worker（连接本机 PuddingClaw Backend）",
 	},
 	{
 		id: "codex",
@@ -665,7 +665,7 @@ async function stagePuddingClawSetup(deps: ResolvedDeps, draft: InitDraft, log: 
 		log("  ○ 非交互模式跳过（可稍后重跑 init 或在 Web 智能体管理配置）");
 		return;
 	}
-	const yes = await askYesNo(deps, "  现在配置 PuddingClaw Backend 接入？", true);
+	const yes = await askYesNo(deps, "  创建或配置可选 PuddingClaw Worker？", false);
 	if (!yes) {
 		log("  已跳过（稍后可重跑 init 或在 Web 智能体管理 → puddingclaw 配置）");
 		return;
@@ -760,8 +760,11 @@ async function applyDraft(draft: InitDraft, deps: ResolvedDeps): Promise<string[
 				credentials,
 			);
 			await teams.init();
-			const agent = await teams.getAgent("puddingclaw");
-			if (!agent) throw new Error("agents.json 缺少内置 puddingclaw agent（数据损坏）");
+			const agent = await teams.getAgent("puddingclaw") ?? {
+				name: "puddingclaw", description: "",
+				connector: { extensionId: "puddingclaw", connectorId: "puddingclaw", transport: "spawn" as const, config: { command: "puddingclaw" } },
+				enabled: true,
+			};
 			await teams.upsertAgent({ ...agent, env: { ...(agent.env ?? {}), PUDDINGCLAW_URL: draft.puddingclaw.url } });
 			applied.push("puddingclaw Backend URL");
 		}

@@ -6,6 +6,8 @@ import path from "node:path";
 import { Type } from "typebox";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { TeamsStore } from "../store/teams.js";
+import { CredentialsStore } from "../store/credentials.js";
+import { McpServerStore } from "../store/mcp-servers.js";
 import { AgentRuntime } from "../agent-runtime/runtime.js";
 import { DelegationStore } from "../agent-runtime/delegation-store.js";
 import { InteractionSecretStore } from "../agent-runtime/interaction-secret-store.js";
@@ -13,6 +15,7 @@ import { DriverRegistry } from "../agent-runtime/driver-registry.js";
 import { AgentInvoker } from "../agent-runtime/invoker.js";
 import { ExtensionCatalog, delegateToolName, extensionToolName, type CapabilityExtensionModule } from "../agent-runtime/extensions.js";
 import { PiSessionStore } from "./session-store.js";
+import { RoomActivityProjector } from "../routes/room-activity.js";
 import type { AgentDriver, AgentEvent, InvocationContext } from "../agent-runtime/types.js";
 
 /**
@@ -25,11 +28,75 @@ function freshDir(prefix: string): string {
 	return mkdtempSync(path.join(tmpdir(), prefix));
 }
 
+test("Manager 会话装配期间 MCP 更新后必须重建到同一配置代次", async () => {
+	process.env.PI_CODING_AGENT_DIR = freshDir("pt-mgr-mcp-agentdir-");
+	const dir = freshDir("pt-mgr-mcp-epoch-");
+	const teams = new TeamsStore({ state: path.join(dir, "teams"), assets: path.join(dir, "teams"), managedWorkspaces: path.join(dir, "managed") }, dir);
+	await teams.init();
+	const credentials = new CredentialsStore(path.join(dir, "mcp-secrets"));
+	await credentials.init();
+	const mcp = new McpServerStore(path.join(dir, "config"), credentials);
+	await mcp.create({ id: "docs", displayName: "Docs", definition: { command: "echo", env: { API_TOKEN: "${API_TOKEN}" } }, secrets: { API_TOKEN: "old-token" } });
+	const manager = (await teams.getManager())!;
+	await teams.setMcpServerIds("manager", ["docs"], manager.extensionRevision ?? 0);
+	const sessions = new PiSessionStore(dir, path.join(dir, "sessions"), teams, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, mcp);
+	const originalDefinitionsFor = mcp.definitionsFor.bind(mcp);
+	const observed: string[] = [];
+	let entered!: () => void;
+	const reached = new Promise<void>((resolve) => { entered = resolve; });
+	let release!: () => void;
+	const hold = new Promise<void>((resolve) => { release = resolve; });
+	let releaseOpen: () => void = () => {};
+	mcp.definitionsFor = async (ids) => {
+		const definitions = await originalDefinitionsFor(ids);
+		observed.push(definitions.docs?.env?.API_TOKEN ?? "missing");
+		if (observed.length === 1) { entered(); await hold; }
+		return {};
+	};
+	try {
+		const creating = sessions.create(undefined, { type: "solo", members: [], cwd: dir });
+		await reached;
+		await mcp.update("docs", { displayName: "Docs", definition: { command: "echo", env: { API_TOKEN: "${API_TOKEN}" } }, secrets: { API_TOKEN: "new-token" } });
+		await teams.bumpAgentRevision("manager");
+		await sessions.syncAgentConfigChange();
+		release();
+		const summary = await creating;
+		assert.deepEqual(observed, ["old-token", "new-token"]);
+		await teams.ensureSoloWindow(async () => ({ id: summary.id }), async () => true);
+		await sessions.open(summary.id);
+		assert.deepEqual(observed, ["old-token", "new-token"], "稳定装配不应在首次 open 时再次漂移");
+		await sessions.dispose(summary.id);
+		const reopened: string[] = [];
+		let enteredOpen!: () => void;
+		const reachedOpen = new Promise<void>((resolve) => { enteredOpen = resolve; });
+		const holdOpen = new Promise<void>((resolve) => { releaseOpen = resolve; });
+		mcp.definitionsFor = async (ids) => {
+			const definitions = await originalDefinitionsFor(ids);
+			reopened.push(definitions.docs?.env?.API_TOKEN ?? "missing");
+			if (reopened.length === 1) { enteredOpen(); await holdOpen; }
+			return {};
+		};
+		const opening = sessions.open(summary.id);
+		await reachedOpen;
+		await mcp.update("docs", { displayName: "Docs", definition: { command: "echo", env: { API_TOKEN: "${API_TOKEN}" } }, secrets: { API_TOKEN: "third-token" } });
+		await teams.bumpAgentRevision("manager");
+		await sessions.syncAgentConfigChange();
+		releaseOpen();
+		await opening;
+		assert.deepEqual(reopened, ["new-token", "third-token"]);
+	} finally {
+		release();
+		releaseOpen();
+		await sessions.disposeAll();
+	}
+});
+
 async function makeStack(catalog?: ExtensionCatalog) {
 	process.env.PI_CODING_AGENT_DIR = freshDir("pt-mgr-agentdir-");
 	const dir = freshDir("pt-mgr-");
 	const teams = new TeamsStore({ state: path.join(dir, "teams"), assets: path.join(dir, "teams"), managedWorkspaces: path.join(dir, "managed") }, dir);
 	await teams.init();
+	await teams.upsertAgent({ name: "puddingclaw", description: "", connector: { extensionId: "puddingclaw", connectorId: "puddingclaw", transport: "spawn", config: { command: "puddingclaw" } }, enabled: true });
 	const delegations = new DelegationStore(path.join(dir, "rt"));
 	await delegations.init();
 	const secrets = new InteractionSecretStore(path.join(dir, "sec"));
@@ -776,6 +843,43 @@ test("store 级事件订阅跨 runtimeDirty 重建存活（WS 推送不断流）
 	await sessions.disposeAll();
 });
 
+test("first user message and completed assistant reply advance durable activity, stream updates do not", async () => {
+	const { teams, sessions, dir } = await makeStack();
+	const summary = await sessions.create();
+	await teams.ensureSoloWindow(async () => ({ id: summary.id }), async () => true);
+	const session = await sessions.open(summary.id);
+	assert.equal(existsSync(summary.sessionFile), true, "platform materializes the header when it creates the Session");
+	const userMessage = { role: "user", content: [{ type: "text", text: "等待模型时也要保留我的工作" }], timestamp: Date.now() };
+	const handleEvent = (session as unknown as { _handleAgentEvent: (event: AgentSessionEvent) => Promise<void> })._handleAgentEvent;
+	await handleEvent({
+		type: "message_end", message: userMessage,
+	} as AgentSessionEvent);
+	const entries = readFileSync(summary.sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { type: string; message?: { role?: string } });
+	assert.equal(entries.filter((entry) => entry.type === "message" && entry.message?.role === "user").length, 1);
+	assert.equal(entries.some((entry) => entry.type === "message" && entry.message?.role === "assistant"), false);
+	const statePath = path.join(dir, "activity.json");
+	const projector = new RoomActivityProjector(statePath);
+	const source = [{ id: summary.id, sessionFile: summary.sessionFile }];
+	const outgoing = await projector.project("solo", source);
+	assert.equal(outgoing.lastMessagePreview, "等待模型时也要保留我的工作");
+	assert.equal(outgoing.activityRevision, 1);
+	const assistant = {
+		role: "assistant", content: [{ type: "text", text: "已收到，正在处理" }],
+		api: "openai", provider: "openai", model: "fake",
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: "stop", timestamp: Date.now(),
+	};
+	await handleEvent({ type: "message_start", message: { ...assistant, content: [] } } as AgentSessionEvent);
+	await handleEvent({ type: "message_update", message: assistant, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "已收到" } } as AgentSessionEvent);
+	assert.deepEqual(await projector.project("solo", source), outgoing, "visible stream chunks are not yet durable activity");
+	await handleEvent({ type: "message_end", message: assistant } as AgentSessionEvent);
+	const replied = await projector.project("solo", source);
+	assert.equal(replied.lastMessagePreview, "已收到，正在处理");
+	assert.equal(replied.activityRevision, 2);
+	await sessions.disposeAll();
+	assert.deepEqual(await new RoomActivityProjector(statePath).project("solo", source), replied);
+});
+
 test("group running 投影直接追加为隐藏 custom entry，不进入展示消息流", async () => {
 	const { teams, sessions } = await makeStack();
 	const summary = await sessions.create();
@@ -819,4 +923,18 @@ test("group running 投影直接追加为隐藏 custom entry，不进入展示�
 	assert.equal((liveProjection.message.details as { delegationId?: string }).delegationId, "delegation-1");
 	unsubscribe();
 	await sessions.disposeAll();
+});
+
+test("平台联网只装入 Manager Solo，Direct/Group relay 不获得联网工具", async () => {
+ const { sessions, dir } = await makeStack();
+ sessions.setWebResearchExtension(() => ({ name: "web-fixture", factory: (pi) => {
+  pi.registerTool({ name: "web_search", label: "Search", description: "search", parameters: Type.Object({}), async execute() { return { content: [{ type: "text", text: "source" }], details: {} }; } });
+ } }));
+ try {
+  for (const type of ["solo", "direct", "group"] as const) {
+   const summary = await sessions.create(undefined, { type, members: type === "solo" ? [] : ["puddingclaw"], cwd: dir });
+   const session = await sessions.open(summary.id);
+   assert.equal(session.getActiveToolNames().includes("web_search"), type === "solo", type);
+  }
+ } finally { await sessions.disposeAll(); }
 });

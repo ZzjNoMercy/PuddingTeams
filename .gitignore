@@ -7,8 +7,11 @@ apps/docs/out/
 .env.local
 .DS_Store
 .playwright-cli/
+output/
 apps/server/.sessions/
 apps/server/.teams/
+# 扩展 CLI 测试在 server 目录下建的临时包（测试被中断时会残留）
+apps/server/.tmp-*/
 
 # 发行构建产物
 packages/puddingteams-cli/runtime/

@@ -5,13 +5,7 @@ import path from "node:path";
 import type { DelegationStore } from "../agent-runtime/delegation-store.js";
 import type { WorkspaceExecutionCoordinator, WorkspaceExecutionScope } from "../agent-runtime/workspace-execution.js";
 import { openNativeFile } from "../platform/native-file-opener.js";
-
-const PREVIEW_LIMIT = 2 * 1024 * 1024;
-const TEXT_EXTENSIONS = new Set([
-	".md", ".mdx", ".txt", ".log", ".json", ".jsonl", ".csv", ".tsv",
-	".yaml", ".yml", ".toml", ".xml", ".html", ".css", ".js", ".jsx",
-	".ts", ".tsx", ".py", ".sh", ".zsh", ".sql", ".rs", ".go", ".java",
-]);
+import { readBoundedPreviewBytes, TEXT_PREVIEW_EXTENSIONS, TEXT_PREVIEW_LIMIT } from "./file-preview.js";
 
 export type RuntimeFilePreview = "markdown" | "json" | "csv" | "text" | "external";
 
@@ -37,7 +31,7 @@ function previewKind(relative: string): RuntimeFilePreview {
 	if (extension === ".md" || extension === ".mdx") return "markdown";
 	if (extension === ".json" || extension === ".jsonl") return "json";
 	if (extension === ".csv" || extension === ".tsv") return "csv";
-	return TEXT_EXTENSIONS.has(extension) ? "text" : "external";
+	return TEXT_PREVIEW_EXTENSIONS.has(extension) ? "text" : "external";
 }
 
 function absoluteInside(root: string, relative: string): string | undefined {
@@ -134,24 +128,30 @@ export function registerRuntimeFilesRoutes(
 	app.get<{ Params: { id: string }; Querystring: { path?: string } }>("/api/delegations/:id/files/content", async (req, reply) => {
 		const resolved = await resolveChangedFile(req.params.id, req.query.path ?? "", delegations, workspaceExecution);
 		if ("error" in resolved) return reply.code(resolved.status).send({ error: resolved.error });
-		if (!TEXT_EXTENSIONS.has(path.extname(resolved.relative).toLowerCase())) return reply.code(415).send({ error: "runtime file does not support inline preview" });
+		if (!TEXT_PREVIEW_EXTENSIONS.has(path.extname(resolved.relative).toLowerCase())) return reply.code(415).send({ error: "runtime file does not support inline preview" });
 		let handle;
 		try {
 			handle = await open(resolved.target, constants.O_RDONLY | constants.O_NOFOLLOW);
 			const info = await handle.stat();
 			if (!info.isFile()) throw new Error("not a file");
-			if (info.size > PREVIEW_LIMIT) {
-				await handle.close();
-				return reply.code(413).send({ error: "runtime file is too large to preview", limit: PREVIEW_LIMIT });
+			if (info.size > TEXT_PREVIEW_LIMIT) {
+				return reply.code(413).send({ error: "runtime file is too large to preview", limit: TEXT_PREVIEW_LIMIT });
 			}
-			const content = await handle.readFile({ encoding: "utf8" });
-			await handle.close();
+			const bytes = await readBoundedPreviewBytes(handle);
+			if (!bytes) return reply.code(413).send({ error: "runtime file is too large to preview", limit: TEXT_PREVIEW_LIMIT });
+			let content: string;
+			try {
+				content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+			} catch {
+				return reply.code(415).send({ error: "runtime file is not valid UTF-8 text" });
+			}
 			reply.header("content-type", "text/plain; charset=utf-8");
 			reply.header("content-disposition", "inline");
 			return reply.send(content);
 		} catch {
-			await handle?.close().catch(() => undefined);
 			return reply.code(404).send({ error: "runtime file unavailable" });
+		} finally {
+			await handle?.close().catch(() => undefined);
 		}
 	});
 

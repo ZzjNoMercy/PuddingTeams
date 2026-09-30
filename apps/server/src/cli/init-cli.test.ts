@@ -261,7 +261,7 @@ test("init 阶段3：只配置本机 URL，不采集或保存 PuddingClaw Token"
 	// provider=4(跳过) → 阶段3 配置=Y → URL=回车(默认) → 确认=y
 	const fake = makeFake({
 		isTTY: true,
-		answers: ["4", "", "", "y"],
+		answers: ["4", "y", "", "y"],
 		commands: {
 			puddingclaw: { code: 0, stdout: '{"cli_version":"1.2.3","configured":true,"reachable":true}\n' },
 			codex: { code: 0, stdout: "codex 0.40.0\n" },

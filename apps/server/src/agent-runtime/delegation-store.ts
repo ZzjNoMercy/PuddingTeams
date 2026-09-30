@@ -18,7 +18,9 @@ export interface DelegationRecord {
 	cwdSnapshot: string;
 	managerSessionId: string;
 	managerToolCallId?: string;
-	purpose: "execution" | "verification";
+	purpose: "execution" | "verification" | "knowledge_compile";
+	/** Immutable link to the platform-owned CompileJob journal. */
+	compileJobId?: string;
 	verificationId?: string;
 	verifiesSubmissionId?: string;
 	environmentProfileId?: string;
@@ -45,6 +47,8 @@ export interface DelegationRecord {
 	/** Agent/Connector configuration generation captured when the Run starts. */
 	agentRevision: number;
 	driverId?: string;
+	/** Pi JSONL location captured at admission; null means platform default. */
+	workerSessionDir?: string | null;
 	driverTransport?: DriverTransport;
 	/** Driver capability snapshot used for the admission decision. */
 	workspaceCapabilities?: DriverWorkspaceCapabilities;
@@ -272,13 +276,13 @@ export class DelegationStore {
 		const immutableKeys: Array<keyof DelegationRecord> = [
 			"operationId", "contractHash", "goalId", "workPlanId", "workItemId", "attempt", "goalEpoch",
 			"goalRevision", "workItemRevision", "task", "intent", "expectedOutcome",
-			"evidenceRequirements", "completionBoundary", "agentId", "agentRevision", "driverId",
+			"evidenceRequirements", "completionBoundary", "agentId", "agentRevision", "driverId", "workerSessionDir",
 			"driverTransport", "operation", "sessionHandle", "runHandle", "executionState", "result",
 			"receipt", "requestedWorkspaceExecutionScopeId", "workspaceExecutionScopeId", "workspaceChangeSetId", "purpose",
 			"workspaceExecutionPolicy", "executionCwd",
 			"workspaceCapabilities", "capabilityFingerprint", "readOnlyAssessment", "admissionInteractionId", "workerStarted", "options",
 			"replacementAdmissionReady",
-			"verificationId", "verifiesSubmissionId", "environmentProfileId", "verificationEnvironmentId",
+			"verificationId", "verifiesSubmissionId", "environmentProfileId", "verificationEnvironmentId", "compileJobId",
 		];
 		for (const key of immutableKeys) {
 			if (!(key in patch)) continue;
