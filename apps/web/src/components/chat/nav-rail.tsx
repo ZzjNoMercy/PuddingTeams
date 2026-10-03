@@ -142,6 +142,10 @@ export function NavRail({ view, returnSessionId }: { view: AppView; returnSessio
 			<Link href="/contacts" title="通讯录" aria-label="通讯录" aria-current={view === "contacts" ? "page" : undefined} className={cn("mt-1", itemClass())}>
 				<UsersIcon className="size-4 shrink-0" /><span className="nav-label">通讯录</span>
 			</Link>
+			<Link href="/calendar" title="日历" aria-label="日历" aria-current={view === "calendar" ? "page" : undefined} className={cn("mt-1", itemClass())}>
+				<CalendarDaysIcon className="size-4 shrink-0" />
+				<span className="nav-label">日历</span>
+			</Link>
 			<Link href="/knowledge" title="知识库" aria-label="知识库" aria-current={view === "knowledge" || view === "review" ? "page" : undefined} className={cn("mt-1", itemClass())}>
 				<BookOpenIcon className="size-4 shrink-0" />
 				<span className="nav-label">知识库</span>
@@ -170,10 +174,6 @@ export function NavRail({ view, returnSessionId }: { view: AppView; returnSessio
 			>
 				<BoxesIcon className="size-4 shrink-0" />
 				<span className="nav-label">扩展</span>
-			</Link>
-			<Link href="/calendar" title="日历" aria-label="日历" aria-current={view === "calendar" ? "page" : undefined} className={cn("mt-1", itemClass())}>
-				<CalendarDaysIcon className="size-4 shrink-0" />
-				<span className="nav-label">日历</span>
 			</Link>
 			</div>
 
