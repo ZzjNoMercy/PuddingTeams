@@ -18,3 +18,12 @@ export function resolveWallTime(local: string, timeZone: string, fold: "reject" 
 	if (matches.length > 1 && fold === "reject") throw new Error("此时间因夏令时回拨出现两次，请选择第一次或第二次");
 	return new Date(fold === "later" ? matches.at(-1)! : matches[0]!).toISOString();
 }
+
+/** A civil day can begin after 00:00 during a DST jump. Never use host timezone. */
+export function dayBoundary(day: string, timeZone: string): string {
+	for (let minute = 0; minute <= 180; minute++) {
+		try { return resolveWallTime(`${day}T${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}`, timeZone, "earlier"); }
+		catch { /* Find the first actual minute of this civil day. */ }
+	}
+	throw new Error("无法解析当前日历区间的时区边界，请选择其他日期");
+}

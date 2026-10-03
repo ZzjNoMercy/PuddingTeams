@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import {
 	getKnowledgeObservations,
+	getWikiCuratorJob,
 	listKnowledgeBindings,
 	listKnowledgeTree,
 	listWikiBatchPage,
@@ -31,13 +32,14 @@ import {
 import { KnowledgeTree } from "./tree";
 import { KnowledgeSearchPanel } from "./search-panel";
 import { KnowledgeNoteView } from "./note-view";
-import { WikiCompileDialog } from "./compile-dialog";
+import { WikiCuratorDialog } from "./curator-dialog";
 import { CreateVaultDialog } from "./create-vault-dialog";
 import { MEMORY_SETUP_EVENT, MEMORY_SETUP_COMPLETED_EVENT } from "./memory-onboarding";
 import { VaultDescriptionDialog, VaultUnbindDialog } from "./vault-dialogs";
 import { vaultIcon, vaultTone } from "./vault-tones";
 import { useWikiReviewQueue } from "@/lib/wiki-review-queue";
 import { LatestSerialQueue } from "@/lib/latest-serial-queue";
+import { WikiCuratorTasks } from "./curator-tasks";
 
 const emptyTree: KnowledgeTreeNode[] = [];
 
@@ -74,7 +76,6 @@ function KnowledgeHomeView({ bindings, scanStates, onRefresh, onCreateVault }: {
 	onRefresh: () => void;
 	onCreateVault: () => void;
 }) {
-	const router = useRouter();
 	const { pendingCount, error: reviewError } = useWikiReviewQueue();
 	const [homeQuery, setHomeQuery] = useState("");
 	const needle = homeQuery.trim().toLowerCase();
@@ -89,7 +90,14 @@ function KnowledgeHomeView({ bindings, scanStates, onRefresh, onCreateVault }: {
 					<h1>你的资料，各得其所。</h1>
 					<p>为不同的生活、研究和项目建立独立知识库，让每份资料有自己的结构。</p>
 				</div>
-				<div className="flex shrink-0 items-center gap-2">
+				<div className="flex flex-wrap items-center gap-2">
+					<Link href="/knowledge?tasks=1" className="flex items-center gap-1.5 rounded border border-border px-3 py-2 text-sm hover:bg-muted" title="查看所有知识库的编译任务">
+						<ClipboardCheckIcon size={15} />编译任务中心
+					</Link>
+					<Link href="/knowledge/review" className="flex items-center gap-1.5 rounded border border-border px-3 py-2 text-sm hover:bg-muted" title={reviewError ? "审核数量暂不可用，仍可进入审核中心" : "审核所有知识库的待发布修改"}>
+						<ClipboardCheckIcon size={15} />审核中心
+						{pendingCount !== null && pendingCount > 0 ? <span className="rounded bg-muted px-1.5 text-xs" aria-label={`${pendingCount} 项待审核`}>{pendingCount}</span> : null}
+					</Link>
 					<button type="button" className="rounded border border-border px-3 py-2 text-sm hover:bg-muted" onClick={() => window.dispatchEvent(new Event(MEMORY_SETUP_EVENT))}>长期记忆设置</button>
 					<Link href="/knowledge/connect" className="flex items-center gap-1.5 rounded border border-border px-3 py-2 text-sm hover:bg-muted">
 						<FolderOpenIcon size={15} />接入本地 Wiki
@@ -104,11 +112,6 @@ function KnowledgeHomeView({ bindings, scanStates, onRefresh, onCreateVault }: {
 				</div>
 			</div>
 
-			<Link href="/knowledge/review" className="knowledge-review-inbox">
-				<span className="knowledge-review-inbox-icon"><ClipboardCheckIcon size={23} /></span>
-				<span><strong>全部待审核 <b>{pendingCount ?? "…"}</b></strong><small>{reviewError ? "数量暂不可用，打开审核中心重试。" : "集中查看所有知识库的候选变更，确认后再发布。"}</small></span>
-				<span className="knowledge-review-inbox-open">打开审核中心 <ArrowUpRightIcon size={15} /></span>
-			</Link>
 			<div className="knowledge-home-toolbar">
 				<div>
 					<div className="flex items-center gap-2">
@@ -145,11 +148,11 @@ function KnowledgeHomeView({ bindings, scanStates, onRefresh, onCreateVault }: {
 							const tone = vaultTone(item);
 							const Icon = vaultIcon(item);
 							return (
-								<button
+								<Link
 									key={item.id}
-									type="button"
+									href={`/knowledge?vault=${encodeURIComponent(item.id)}`}
+									aria-label={`打开 ${item.name} 知识库`}
 									className="knowledge-vault-card"
-									onClick={() => router.push(`/knowledge?vault=${encodeURIComponent(item.id)}`)}
 								>
 									<div className="flex items-start justify-between">
 										<span className="knowledge-vault-icon" data-tone={tone}><Icon size={22} /></span>
@@ -177,7 +180,7 @@ function KnowledgeHomeView({ bindings, scanStates, onRefresh, onCreateVault }: {
 											<span>最近扫描 {formatScannedAt(scanState.scannedAt)}</span>
 										) : null}
 									</div>
-								</button>
+								</Link>
 							);
 						})}
 						<button type="button" onClick={onCreateVault} className="knowledge-vault-create">
@@ -211,6 +214,8 @@ export function KnowledgeApp() {
 	const params = useSearchParams();
 	const requestedVault = params.get("vault");
 	const requestedNote = params.get("note");
+	const requestedJob = params.get("job");
+	const tasksOpen = params.get("tasks") === "1" || Boolean(requestedJob);
 	const requestedAnchor = params.get("anchor");
 	const historyOpen = params.get("history") === "1" || Boolean(params.get("historyVersion"));
 
@@ -224,11 +229,27 @@ export function KnowledgeApp() {
 	const [scanStates, setScanStates] = useState<Record<string, BindingScanState>>({});
 	const [actionError, setActionError] = useState<string | null>(null);
 	const [allowedRemoteImages, setAllowedRemoteImages] = useState<ReadonlySet<string>>(new Set());
-	const [compileOpen, setCompileOpen] = useState(false);
+	const [curatorOpen, setCuratorOpen] = useState(false);
 	const [createVaultOpen, setCreateVaultOpen] = useState(false);
 	const [descriptionOpen, setDescriptionOpen] = useState(false);
 	const [unbindOpen, setUnbindOpen] = useState(false);
 	const [pendingReviews, setPendingReviews] = useState<{ key: string; count: number } | null>(null);
+	const [resolvedJobId, setResolvedJobId] = useState<string | null>(null);
+	const [jobRouteError, setJobRouteError] = useState<{ id: string; message: string } | null>(null);
+	useEffect(() => {
+		if (!requestedJob) return;
+		let active = true;
+		void getWikiCuratorJob(requestedJob).then(({ job }) => {
+			if (!active) return;
+			setJobRouteError(null);
+			setResolvedJobId(job.id);
+			if (requestedVault !== job.targetBindingId) {
+				const query = new URLSearchParams({ vault: job.targetBindingId, job: job.id });
+				router.replace(`/knowledge?${query}`, { scroll: false });
+			}
+		}).catch((cause) => { if (active) setJobRouteError({ id: requestedJob, message: cause instanceof Error ? cause.message : String(cause) }); });
+		return () => { active = false; };
+	}, [requestedJob, requestedVault, router]);
 
 	const selected = bindings?.find((item) => item.id === requestedVault) ?? null;
 	const selectedId = selected?.id;
@@ -272,7 +293,7 @@ export function KnowledgeApp() {
 
 	// 当前库可见时温和同步；串行队列让切库/手动刷新淘汰旧响应，历史视图保持固定。
 	useEffect(() => {
-		if (!selectedId || !treeKey || selectedAvailability !== "available" || historyOpen) return;
+		if (!selectedId || !treeKey || selectedAvailability !== "available" || historyOpen || tasksOpen) return;
 		const queue = scanQueue.current;
 		queue.invalidate();
 		let active = true, loading = false;
@@ -308,7 +329,7 @@ export function KnowledgeApp() {
 			active = false; queue.invalidate(); window.clearInterval(timer);
 			window.removeEventListener("focus", onFocus); document.removeEventListener("visibilitychange", onFocus);
 		};
-	}, [selectedId, selectedAvailability, treeKey, historyOpen]);
+	}, [selectedId, selectedAvailability, treeKey, historyOpen, tasksOpen]);
 
 	const noteCount = useMemo(() => {
 		const count = (nodes: KnowledgeTreeNode[]): number =>
@@ -364,14 +385,14 @@ export function KnowledgeApp() {
 
 	return (
 		<>
-		<SectionTopbar crumbs={selected
+		<SectionTopbar crumbs={tasksOpen ? [{label:"知识库",href:"/knowledge"}, ...(selected ? [{label:selected.name,href:`/knowledge?vault=${encodeURIComponent(selected.id)}`}] : []), {label: requestedJob ? "任务详情" : "编译任务"}] : selected
 			? [{ label: "知识库", href: "/knowledge" }, { label: selected.name }]
 			: requestedVault && !bindings
 				? [{ label: "知识库", href: "/knowledge" }, { label: "正在加载…" }]
 				: [{ label: "知识库" }]}
 		/>
 		<div className="flex min-w-0 flex-1 flex-col overflow-hidden bg-background">
-			{selected ? (
+			{selected && !tasksOpen ? (
 				<header className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-6 py-4">
 					<div className="min-w-0 max-w-xl">
 						<h1 className="text-2xl font-medium tracking-tight">{selected.name}</h1>
@@ -380,6 +401,7 @@ export function KnowledgeApp() {
 						) : null}
 					</div>
 					<div className="flex flex-wrap items-center justify-end gap-2">
+						<Link href={`/knowledge?vault=${encodeURIComponent(selected.id)}&tasks=1`} className="flex items-center gap-1.5 rounded border border-border px-3 py-2 text-sm hover:bg-muted">编译任务</Link>
 						<Link
 							href={`/knowledge/schema?vault=${encodeURIComponent(selected.id)}`}
 							className="flex items-center gap-1.5 rounded border border-border px-3 py-2 text-sm hover:bg-muted"
@@ -409,7 +431,7 @@ export function KnowledgeApp() {
 								</Link>
 								<button
 									type="button"
-									onClick={() => setCompileOpen(true)}
+									onClick={() => setCuratorOpen(true)}
 									className="flex items-center gap-1.5 rounded border border-border px-3 py-2 text-sm"
 								>
 									<SparklesIcon size={15} />
@@ -438,11 +460,16 @@ export function KnowledgeApp() {
 				</p>
 			) : null}
 			{actionError ? <p role="alert" className="mx-5 mt-3 text-sm text-destructive">{actionError}</p> : null}
-			{!selected ? (
+			{requestedJob && jobRouteError?.id === requestedJob ? <p role="alert" className="m-5 text-sm text-destructive">无法打开此整理任务：{jobRouteError.message}</p> : null}
+			{tasksOpen && (!requestedJob || (selected && resolvedJobId === requestedJob)) ? (
+				<main className="min-h-0 min-w-0 flex-1 overflow-y-auto px-5 py-8 sm:px-8"><WikiCuratorTasks key={`${requestedVault ?? "all"}:${requestedJob ?? ""}:${params.get("q") ?? ""}:${params.get("filter") ?? "all"}:${params.get("period") ?? "week"}:${params.get("offset") ?? "0"}`} bindingId={requestedVault ?? undefined} selectedJobId={requestedJob} bindings={bindings ?? []} /></main>
+			) : requestedJob ? (
+				<p className="p-6 text-sm text-muted-foreground">{resolvedJobId === requestedJob && bindings ? "此任务所属知识库当前不可见，请检查任务链接或知识库绑定。" : jobRouteError?.id === requestedJob ? "请检查任务链接后重试。" : "正在定位任务所属知识库…"}</p>
+			) : !selected ? (
 				<KnowledgeHomeView bindings={bindings} scanStates={scanStates} onRefresh={refreshAll} onCreateVault={() => setCreateVaultOpen(true)} />
 			) : (
 				<div className="flex min-h-0 flex-1 flex-col sm:flex-row">
-					<aside data-knowledge-tree className="w-full shrink-0 overflow-y-auto border-b border-border p-4 sm:w-72 sm:border-b-0 sm:border-r">
+					{tasksOpen ? null : <aside data-knowledge-tree className="w-full shrink-0 overflow-y-auto border-b border-border p-4 sm:w-72 sm:border-b-0 sm:border-r">
 						<div>
 							{selected.availability === "available" ? (
 								<>
@@ -467,7 +494,7 @@ export function KnowledgeApp() {
 								<p className="mt-4 text-sm text-destructive">目录离线或身份已变化。请核对原路径。</p>
 							)}
 						</div>
-					</aside>
+					</aside>}
 					<main className="min-w-0 flex-1 overflow-y-auto p-6">
 						{!requestedNote ? (
 							<div className="mx-auto max-w-xl py-12 text-center text-sm text-muted-foreground">从左侧文件树选择笔记。</div>
@@ -501,14 +528,12 @@ export function KnowledgeApp() {
 				onUnbound={() => { refreshAll(); setActionError(null); router.push("/knowledge"); }}
 			/>
 			{selected ? (
-				<WikiCompileDialog
+				<WikiCuratorDialog
+					key={selected.id}
 					bindingId={selected.id}
 					bindingName={selected.name}
-					open={compileOpen}
-					onOpenChange={setCompileOpen}
-					onCandidateReady={(batchId) => router.push(
-						`/knowledge/review?vault=${encodeURIComponent(selected.id)}&batch=${encodeURIComponent(batchId)}`,
-					)}
+					open={curatorOpen}
+					onOpenChange={setCuratorOpen}
 				/>
 			) : null}
 		</div>

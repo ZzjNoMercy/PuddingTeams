@@ -81,184 +81,93 @@ test("Runtime 在 Driver 启动前把无只读强制能力的 Git 任务路由�
 	assert.equal(readFileSync(path.join(root, "result.txt"), "utf8"), "result\n");
 });
 
-test("Connector 不能保证只读时先等待 Teams 准入；拒绝后 Worker 从未启动", async () => {
-	const root = temp("pt-runtime-nongit-");
-	const state = temp("pt-runtime-nongit-state-");
+async function inspectionStack(options: { enforcement?: "none" | "sandbox"; write?: boolean; honorsCwd?: boolean; coordinator?: boolean } = {}) {
+	const root = temp("pt-readonly-decision-");
+	const state = temp("pt-readonly-decision-state-");
+	writeFileSync(path.join(root, "input.txt"), "base");
 	const delegations = new DelegationStore(state); await delegations.init();
 	const secrets = new InteractionSecretStore(state); await secrets.init();
-	const coordinator = new WorkspaceExecutionCoordinator(state, { worktreeRoot: temp("pt-runtime-nongit-worktrees-") }); await coordinator.init();
-	let invoked = false;
+	const scopes = new WorkspaceExecutionCoordinator(state); await scopes.init();
+	let starts = 0;
 	const driver: AgentDriver = {
 		id: "worker",
-		async capabilities() { return { operations: ["run"], interactionKinds: [], progress: "none", transport: "spawn", workspace: { honorsInvocationCwd: true, readOnlyEnforcement: "none", mutationObservation: ["filesystem_diff"] } }; },
-		async *run() { invoked = true; }, async *continue() {}, async *respond() {},
-		async probe() { return { extensionInstalled: true, detected: true, configured: true, authenticated: true, enabled: true, compatibility: "supported", capabilities: await this.capabilities(), issues: [] }; },
+		async capabilities() { return { operations: ["run"], interactionKinds: [], progress: "none", transport: "spawn", workspace: { honorsInvocationCwd: options.honorsCwd ?? true, readOnlyEnforcement: options.enforcement ?? "none", mutationObservation: [] } }; },
+		async *run(_input, ctx) {
+			starts++;
+			if (options.write) writeFileSync(path.join(ctx.cwd, "unexpected.txt"), "mutation");
+			yield { type: "completed", result: { agentId: "worker", status: "completed", content: "inspected" } };
+		},
+		async *continue() {}, async *respond() {}, async probe() { throw new Error("unused"); },
 	};
-	const runtime = new AgentRuntime(delegations, secrets, () => driver, { ttlMs: 60_000 }, undefined, undefined, coordinator);
-	const outcome = await runtime.delegate({
-		windowId: "w", cwdSnapshot: root, managerSessionId: "s", agentId: "worker", agentRevision: 1, message: "inspect", mode: "run",
-		workspaceExecutionPolicy: { mode: "read_only_shared", source: "harness_default", reason: "default", baselineStrategy: "filesystem_manifest", promoteOnAcceptance: false },
-	}, { cwd: root, env: {} });
-	assert.equal(invoked, false);
-	assert.equal(outcome.status, "needs_input");
-	assert.equal(outcome.delegation.executionState, "waiting_admission");
-	assert.equal(outcome.delegation.workerStarted, false);
-	assert.equal(outcome.interaction?.source, "platform_policy");
-	const request = outcome.interaction!.requests[0]!;
-	const rejected = await runtime.respond(outcome.interaction!.id, {
-		requestId: "reject-admission",
-		revision: outcome.interaction!.revision,
-		responses: [{ requestId: request.requestId, action: "reject" }],
-	}, { cwd: root, env: {} });
-	assert.equal(rejected.status, "rejected");
-	assert.equal(rejected.delegation.executionState, "cancelled");
-	assert.equal(rejected.delegation.receipt?.reportedOutcome, "cancelled");
-	assert.equal(rejected.delegation.receipt?.workerStarted, false);
-	assert.equal(invoked, false);
-});
-
-test("Teams 准入只允许使用 Worker，不改变原只读契约；批准后才启动", async () => {
-	const root = temp("pt-runtime-admission-approve-");
-	const state = temp("pt-runtime-admission-approve-state-");
-	const delegations = new DelegationStore(state); await delegations.init();
-	const secrets = new InteractionSecretStore(state); await secrets.init();
-	const coordinator = new WorkspaceExecutionCoordinator(state, { worktreeRoot: temp("pt-runtime-admission-worktrees-") }); await coordinator.init();
-	let invoked = 0;
-	const driver: AgentDriver = {
-		id: "worker",
-		async capabilities() { return { operations: ["run"], interactionKinds: [], progress: "none", transport: "spawn", workspace: { honorsInvocationCwd: true, readOnlyEnforcement: "none", mutationObservation: ["filesystem_diff"] } }; },
-		async *run() { invoked += 1; yield { type: "completed", result: { agentId: "worker", status: "completed", content: "inspected" } }; },
-		async *continue() {}, async *respond() {},
-		async probe() { return { extensionInstalled: true, detected: true, configured: true, authenticated: true, enabled: true, compatibility: "supported", capabilities: await this.capabilities(), issues: [] }; },
-	};
-	const runtime = new AgentRuntime(delegations, secrets, () => driver, { ttlMs: 60_000 }, undefined, undefined, coordinator);
-	const policy = { mode: "read_only_shared" as const, source: "harness_default" as const, reason: "inspect only", baselineStrategy: "filesystem_manifest" as const, promoteOnAcceptance: false };
-	const pending = await runtime.delegate({
+	const runtime = new AgentRuntime(delegations, secrets, () => driver, { ttlMs: 60_000 }, undefined, undefined, options.coordinator === false ? undefined : scopes);
+	const run = (policy: import("./workspace-execution.js").WorkspaceExecutionPolicy = { mode: "read_only_shared", source: "harness_default", reason: "inspection", baselineStrategy: "filesystem_manifest", promoteOnAcceptance: false }) => runtime.delegate({
 		windowId: "w", cwdSnapshot: root, managerSessionId: "s", agentId: "worker", agentRevision: 1, message: "inspect", mode: "run", workspaceExecutionPolicy: policy,
 	}, { cwd: root, env: {} });
-	assert.equal(invoked, 0);
-	const interaction = pending.interaction!;
-	const approved = await runtime.respond(interaction.id, {
-		requestId: "approve-admission",
-		revision: interaction.revision,
-		responses: [{ requestId: interaction.requests[0]!.requestId, action: "approve", scope: "proceed_with_worker" }],
-	}, { cwd: root, env: {} });
-	assert.equal(approved.status, "completed");
-	assert.equal(invoked, 1);
-	assert.equal(approved.delegation.workerStarted, true);
-	assert.equal(approved.delegation.readOnlyAssessment, "unverified_user_accepted");
-	assert.equal(approved.delegation.workspaceExecutionPolicy?.mode, "read_only_shared", "Teams 准入不得改写任务契约");
+	return { root, runtime, scopes, delegations, run, starts: () => starts };
+}
+
+test("普通只读任务自动执行：无准入交互、保留只读契约并释放观测租约，重复执行不询问", async () => {
+	const s = await inspectionStack();
+	for (let i = 0; i < 2; i++) {
+		const result = await s.run();
+		assert.equal(result.status, "completed", JSON.stringify(result.result));
+		assert.equal(result.interaction, undefined);
+		assert.equal(result.delegation.admissionInteractionId, undefined);
+		assert.equal(result.delegation.readOnlyAssessment, "unverified_observed");
+		assert.equal(result.delegation.workspaceExecutionPolicy?.mode, "read_only_shared");
+		assert.equal(result.delegation.receipt?.integrity, "clean");
+		const scope = await s.scopes.get(result.delegation.workspaceExecutionScopeId!);
+		assert.equal(scope?.mode, "exclusive_write", "观测租约不等于增加 Worker 权限");
+		assert.equal(scope?.state, "released");
+	}
+	assert.equal(s.starts(), 2);
 });
 
-test("准入期间 Connector 能力变化会使决定失效，且不启动 Worker", async () => {
-	const root = temp("pt-runtime-admission-stale-");
-	const state = temp("pt-runtime-admission-stale-state-");
-	const delegations = new DelegationStore(state); await delegations.init();
-	const secrets = new InteractionSecretStore(state); await secrets.init();
-	let readOnlyEnforcement: "none" | "sandbox" = "none";
-	let invoked = false;
-	const driver: AgentDriver = {
-		id: "worker",
-		async capabilities() { return { operations: ["run"], interactionKinds: [], progress: "none", transport: "spawn", workspace: { honorsInvocationCwd: true, readOnlyEnforcement, mutationObservation: [] } }; },
-		async *run() { invoked = true; }, async *continue() {}, async *respond() {},
-		async probe() { return { extensionInstalled: true, detected: true, configured: true, authenticated: true, enabled: true, compatibility: "supported", capabilities: await this.capabilities(), issues: [] }; },
-	};
-	const runtime = new AgentRuntime(delegations, secrets, () => driver, { ttlMs: 60_000 });
-	const pending = await runtime.delegate({
-		windowId: "w", cwdSnapshot: root, managerSessionId: "s", agentId: "worker", agentRevision: 1, message: "inspect", mode: "run",
-		workspaceExecutionPolicy: { mode: "read_only_shared", source: "harness_default", reason: "inspect", baselineStrategy: "filesystem_manifest", promoteOnAcceptance: false },
-	}, { cwd: root, env: {} });
-	readOnlyEnforcement = "sandbox";
-	await assert.rejects(() => runtime.respond(pending.interaction!.id, {
-		requestId: "stale-admission",
-		revision: pending.interaction!.revision,
-		responses: [{ requestId: pending.interaction!.requests[0]!.requestId, action: "approve", scope: "proceed_with_worker" }],
-	}, { cwd: root, env: {} }), /能力已变化/);
-	assert.equal(invoked, false);
-	assert.equal((await runtime.getDelegation(pending.delegation.id))?.workerStarted, false);
+test("自动查阅仍记录意外写入为契约违规，不能当成干净只读或待提升产物", async () => {
+	const s = await inspectionStack({ write: true });
+	const result = await s.run();
+	assert.equal(result.status, "completed");
+	assert.equal(result.delegation.receipt?.integrity, "violation");
+	assert.match(result.delegation.receipt?.issues.join(" ") ?? "", /Workspace 写入/);
+	const changes = await s.runtime.getWorkspaceChangeSet(result.delegation.workspaceChangeSetId!);
+	assert.deepEqual(changes?.changedPaths, ["unexpected.txt"]);
+	assert.equal(changes?.promotionState, "not_required");
+	assert.equal(changes?.integrity, "violation");
 });
 
-test("Teams 准入 TTL 过期会封存 pre-start cancelled，绝不调用 Driver", async () => {
-	const root = temp("pt-runtime-admission-ttl-");
-	const state = temp("pt-runtime-admission-ttl-state-");
-	const delegations = new DelegationStore(state); await delegations.init();
-	const secrets = new InteractionSecretStore(state); await secrets.init();
-	let invoked = false;
-	const driver: AgentDriver = {
-		id: "worker",
-		async capabilities() { return { operations: ["run"], interactionKinds: [], progress: "none", transport: "spawn", workspace: { honorsInvocationCwd: true, readOnlyEnforcement: "none", mutationObservation: [] } }; },
-		async *run() { invoked = true; }, async *continue() {}, async *respond() {},
-		async probe() { return { extensionInstalled: true, detected: true, configured: true, authenticated: true, enabled: true, compatibility: "supported", capabilities: await this.capabilities(), issues: [] }; },
-	};
-	const runtime = new AgentRuntime(delegations, secrets, () => driver, { ttlMs: 1 });
-	const pending = await runtime.delegate({
-		windowId: "w", cwdSnapshot: root, managerSessionId: "s", agentId: "worker", agentRevision: 1, message: "inspect", mode: "run",
-		workspaceExecutionPolicy: { mode: "read_only_shared", source: "harness_default", reason: "inspect", baselineStrategy: "filesystem_manifest", promoteOnAcceptance: false },
-	}, { cwd: root, env: {} });
-	assert.equal(await runtime.expireAdmissionRequests(Date.now() + 10_000), 1);
-	const expired = await runtime.getDelegation(pending.delegation.id);
-	assert.equal(expired?.executionState, "cancelled");
-	assert.equal(expired?.workerStarted, false);
-	assert.equal(expired?.receipt?.workerStarted, false);
-	assert.equal(invoked, false);
+for (const source of ["user", "manager_derived"] as const) {
+	test(`强制只读能力缺口返回 Manager 可恢复失败，不要求无效确认（source=${source}）`, async () => {
+		const s = await inspectionStack();
+		const result = await s.run({ mode: "read_only_shared", source, ...(source === "manager_derived" ? { readOnlyRequirement: "enforced" as const } : {}), reason: "must never write", baselineStrategy: "filesystem_manifest", promoteOnAcceptance: false });
+		assert.equal(result.status, "failed");
+		assert.equal(result.result.status, "blocked");
+		assert.equal(result.result.meta?.userDecisionRequired, false);
+		assert.equal(result.interaction, undefined);
+		assert.equal(result.delegation.workerStarted, false);
+		assert.equal(result.delegation.receipt?.workerStarted, false);
+		assert.equal(result.delegation.workspaceExecutionScopeId, undefined);
+		assert.equal(result.delegation.readOnlyAssessment, "unverified");
+		assert.equal(s.starts(), 0);
+	});
+}
+
+test("真实只读能力自动执行强制只读任务并使用共享 scope", async () => {
+	const s = await inspectionStack({ enforcement: "sandbox" });
+	const result = await s.run({ mode: "read_only_shared", source: "user", reason: "never write", baselineStrategy: "filesystem_manifest", promoteOnAcceptance: false });
+	assert.equal(result.status, "completed");
+	assert.equal(result.delegation.readOnlyAssessment, "verified");
+	assert.equal((await s.scopes.get(result.delegation.workspaceExecutionScopeId!))?.mode, "read_only_shared");
 });
 
-test("旧式 approved 但缺 application 的崩溃窗口会 fail-closed 收敛，不会重启 Worker", async () => {
-	const root = temp("pt-runtime-admission-journal-gap-");
-	const state = temp("pt-runtime-admission-journal-gap-state-");
-	const delegations = new DelegationStore(state); await delegations.init();
-	const secrets = new InteractionSecretStore(state); await secrets.init();
-	let invoked = false;
-	const driver: AgentDriver = {
-		id: "worker",
-		async capabilities() { return { operations: ["run"], interactionKinds: [], progress: "none", transport: "spawn", workspace: { honorsInvocationCwd: true, readOnlyEnforcement: "none", mutationObservation: [] } }; },
-		async *run() { invoked = true; }, async *continue() {}, async *respond() {},
-		async probe() { return { extensionInstalled: true, detected: true, configured: true, authenticated: true, enabled: true, compatibility: "supported", capabilities: await this.capabilities(), issues: [] }; },
-	};
-	const runtime = new AgentRuntime(delegations, secrets, () => driver, { ttlMs: 60_000 });
-	const pending = await runtime.delegate({
-		windowId: "w", cwdSnapshot: root, managerSessionId: "s", agentId: "worker", agentRevision: 1, message: "inspect", mode: "run",
-		workspaceExecutionPolicy: { mode: "read_only_shared", source: "harness_default", reason: "inspect", baselineStrategy: "filesystem_manifest", promoteOnAcceptance: false },
-	}, { cwd: root, env: {} });
-	await delegations.updateInteraction(pending.interaction!.id, { status: "approved", revision: 1 });
-	assert.equal(await runtime.reconcileAdmissionApplications(), 1);
-	const closed = await runtime.getDelegation(pending.delegation.id);
-	const interaction = await runtime.getInteraction(pending.interaction!.id);
-	assert.equal(closed?.executionState, "cancelled");
-	assert.equal(closed?.workerStarted, false);
-	assert.equal(interaction?.application?.status, "failed");
-	assert.equal(interaction?.application?.failureCode, "start_confirmation_lost");
-	assert.equal(invoked, false);
-});
-
-test("Driver 在首事件前抛错时不得声称 Worker 已启动", async () => {
-	const root = temp("pt-runtime-admission-start-throw-");
-	const state = temp("pt-runtime-admission-start-throw-state-");
-	const delegations = new DelegationStore(state); await delegations.init();
-	const secrets = new InteractionSecretStore(state); await secrets.init();
-	const driver: AgentDriver = {
-		id: "worker",
-		async capabilities() { return { operations: ["run"], interactionKinds: [], progress: "none", transport: "spawn", workspace: { honorsInvocationCwd: true, readOnlyEnforcement: "none", mutationObservation: [] } }; },
-		async *run() { throw new Error("spawn failed before first event"); }, async *continue() {}, async *respond() {},
-		async probe() { return { extensionInstalled: true, detected: true, configured: true, authenticated: true, enabled: true, compatibility: "supported", capabilities: await this.capabilities(), issues: [] }; },
-	};
-	const runtime = new AgentRuntime(delegations, secrets, () => driver, { ttlMs: 60_000 });
-	const pending = await runtime.delegate({
-		windowId: "w", cwdSnapshot: root, managerSessionId: "s", agentId: "worker", agentRevision: 1, message: "inspect", mode: "run",
-		workspaceExecutionPolicy: { mode: "read_only_shared", source: "harness_default", reason: "inspect", baselineStrategy: "filesystem_manifest", promoteOnAcceptance: false },
-	}, { cwd: root, env: {} });
-	await assert.rejects(() => runtime.respond(pending.interaction!.id, {
-		requestId: "approve-start-throw",
-		revision: pending.interaction!.revision,
-		responses: [{ requestId: pending.interaction!.requests[0]!.requestId, action: "approve", scope: "proceed_with_worker" }],
-	}, { cwd: root, env: {} }), /spawn failed/);
-	const closed = await runtime.getDelegation(pending.delegation.id);
-	const interaction = await runtime.getInteraction(pending.interaction!.id);
-	assert.equal(closed?.executionState, "reported_failed");
-	assert.equal(closed?.workerStarted, false);
-	assert.equal(closed?.receipt?.workerStarted, false);
-	assert.equal(interaction?.application?.status, "failed");
-});
+for (const options of [{ honorsCwd: false }, { coordinator: false }]) {
+	test(`没有可靠目录观测时不伪造自动只读保障：${JSON.stringify(options)}`, async () => {
+		const s = await inspectionStack(options);
+		const result = await s.run();
+		assert.equal(result.status, "failed");
+		assert.equal(result.interaction, undefined);
+		assert.equal(s.starts(), 0);
+	});
+}
 
 test("Goal Verifier 使用平台签发的非 Git 隔离副本，任意 cwd/跨 Verification 复用均被拒绝", async () => {
 	const root = temp("pt-runtime-goal-verification-");

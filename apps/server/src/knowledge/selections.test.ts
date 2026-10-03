@@ -57,3 +57,39 @@ test("memory defaults join existing and new contexts; opt-outs survive restart, 
 		assert.deepEqual((await selections.effective("owner", "session:new")).selectedBindingIds, []);
 	} finally { await rm(base, { recursive: true, force: true }); }
 });
+
+test("all owned knowledge libraries default into existing/new sessions; opt-outs, late libraries and offline recovery remain distinct", async () => {
+	const base = await mkdtemp(path.join(tmpdir(), "pt-all-kb-defaults-"));
+	try {
+		const state = path.join(base, "state"), bindings = new KnowledgeBindingRegistry(state);
+		const create = async (name: string, ownerId = "owner") => {
+			const vault = path.join(base, name); await mkdir(vault);
+			return bindings.create({ ownerId, name, description: name, rootPath: vault });
+		};
+		const memory = await create("Memory"), ai = await create("AI Wiki"), people = await create("People"), foreign = await create("Foreign", "other");
+		// Existing sessions that previously only received default Memory were not opting out of other libraries.
+		const previous = new KnowledgeSelectionStore(state, bindings, async () => [memory.id]);
+		await previous.set("owner", "session:existing", 0, [memory.id]);
+		let selections = new KnowledgeSelectionStore(state, bindings);
+		const all = [memory.id, ai.id, people.id];
+		assert.deepEqual((await selections.effective("owner", "session:existing")).selectedBindingIds, all);
+		assert.deepEqual((await selections.effective("owner", "session:new")).selectedBindingIds, all);
+		assert.deepEqual((await selections.effective("other", "session:new")).selectedBindingIds, [foreign.id]);
+		await selections.set("owner", "workbench", 0, [memory.id, people.id]);
+		await selections.inherit("owner", "session:inherited", "workbench");
+		selections = new KnowledgeSelectionStore(state, bindings);
+		assert.deepEqual((await selections.effective("owner", "session:inherited")).selectedBindingIds, [memory.id, people.id]);
+		const late = await create("Research");
+		assert.deepEqual((await selections.effective("owner", "session:inherited")).selectedBindingIds, [memory.id, people.id, late.id]);
+		await selections.set("owner", "session:empty", 0, []);
+		assert.deepEqual((await selections.effective("owner", "session:empty")).selectedBindingIds, []);
+		await rename(people.canonicalBindingRoot, `${people.canonicalBindingRoot}-offline`);
+		const live = await selections.effective("owner", "session:new");
+		assert(!live.selectedBindingIds.includes(people.id));
+		await selections.set("owner", "session:new", live.revision, live.selectedBindingIds.filter(id => id !== ai.id));
+		await rename(`${people.canonicalBindingRoot}-offline`, people.canonicalBindingRoot);
+		assert.deepEqual((await selections.effective("owner", "session:new")).selectedBindingIds, [memory.id, late.id, people.id], "离线期间切换其他库不应把离线库记成取消");
+		await bindings.revoke("owner", late.id, late.bindingRevision);
+		assert.deepEqual((await selections.effective("owner", "session:new")).selectedBindingIds, [memory.id, people.id]);
+	} finally { await rm(base, { recursive: true, force: true }); }
+});

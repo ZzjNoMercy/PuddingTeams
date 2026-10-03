@@ -144,6 +144,8 @@ export class ReadLaterPromoter {
             capturedAt: version.capturedAt,
             extractorVersion: version.extractorVersion,
             contentHash: version.contentHash,
+            captureMethod: version.captureMethod,
+            sourceFilename: version.sourceFilename,
           },
           assets,
         });

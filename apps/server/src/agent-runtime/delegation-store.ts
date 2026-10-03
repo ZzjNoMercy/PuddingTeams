@@ -53,7 +53,7 @@ export interface DelegationRecord {
 	/** Driver capability snapshot used for the admission decision. */
 	workspaceCapabilities?: DriverWorkspaceCapabilities;
 	capabilityFingerprint?: string;
-	readOnlyAssessment?: "verified" | "unverified_user_accepted" | "not_required";
+	readOnlyAssessment?: "verified" | "unverified" | "unverified_observed" | "unverified_user_accepted" | "not_required";
 	admissionInteractionId?: string;
 	/**
 	 * Durable proof that every replacement-specific lifecycle guard (including
@@ -114,7 +114,7 @@ export interface InteractionRecord {
 	application?: {
 		operationId: string;
 		status: "pending" | "applying" | "applied" | "failed";
-		readOnlyAssessment?: "verified" | "unverified_user_accepted" | "not_required";
+		readOnlyAssessment?: "verified" | "unverified" | "unverified_observed" | "unverified_user_accepted" | "not_required";
 		failureCode?: string;
 		replacementAgentId?: string;
 		replacementDelegationId?: string;

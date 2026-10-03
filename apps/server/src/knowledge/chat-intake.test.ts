@@ -13,7 +13,7 @@ async function fixture() {
 	const root = await mkdtemp(path.join(tmpdir(), "pt-chat-intake-"));
 	const sources = new KnowledgeSourceStore({ stateDir: root, objects: new KnowledgeObjectStore(path.join(root, "objects")) });
 	const service = new ChatKnowledgeIntake({ stateDir: root, sources });
-	const branch: Array<{ id: string; type: string; customType?: string; details?: unknown; message?: { role: string; content: unknown[] } }> = [];
+	const branch: Array<{ id: string; type: string; customType?: string; content?: string; timestamp?: string; details?: unknown; message?: { role: string; content: unknown[] } }> = [];
 	const session = { sessionId: "session", sessionFile: path.join(root, "session.jsonl"), sessionManager: { getBranch: () => branch } } as unknown as AgentSession;
 	const flush = () => writeFile(session.sessionFile!, branch.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
 	const input = { ownerId: "owner", windowId: "window", sessionId: "session", operationId: "op", text: "用户原话：项目日期是10月23日。", uploads: [] };
@@ -97,5 +97,28 @@ test("unsupported附件不伪装完整来源，整理请求明确失败", async 
 		const refs = await f.service.prepare({ ...f.input, text: "", uploads: [{ name: "book.docx", mediaType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", size: 1, path: "unread", base64: "YQ==" }] });
 		f.branch.push({ id: "direct", type: "custom_message", customType: "pudding:user_message", details: { operationId: refs.operationId, sourceRefs: refs } }); await f.flush(); await f.service.admitDirect(f.session, refs);
 		await assert.rejects(f.service.resolve(f.session, "owner", { operationId: refs.operationId }), /尚不支持.*book.docx/);
+	} finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test("没有整理Job也可在重启后明确引用原聊天消息，保持原来源和时间且不能越界", async () => {
+	const f = await fixture();
+	try {
+		const original = await f.service.prepare({ ...f.input, text: "今天晚8点与两位联系人在北京吃饭" });
+		f.branch.push({ id: "original-user", type: "custom_message", customType: "pudding:user_message", content: "今天晚8点与两位联系人在北京吃饭", timestamp: "2026-10-03T10:08:27.900Z", details: { operationId: original.operationId, sourceRefs: original } });
+		await f.flush(); await f.service.admitDirect(f.session, original);
+		const continuation = await f.service.prepare({ ...f.input, operationId: "continue", text: "继续" });
+		f.branch.push({ id: "continue-user", type: "custom_message", customType: "pudding:user_message", content: "继续", timestamp: "2026-10-03T12:10:00.000Z", details: { operationId: continuation.operationId, sourceRefs: continuation } });
+		await f.flush(); await f.service.admitDirect(f.session, continuation);
+		const restarted = new ChatKnowledgeIntake({ stateDir: f.root, sources: f.sources });
+		assert.equal((await restarted.messages(f.session, "owner"))[0]?.id, "original-user");
+		const selected = await restarted.resolveMessages(f.session, "owner", ["original-user"]);
+		assert.deepEqual(selected.sourceIds, original.sourceIds);
+		assert(!selected.sourceIds.some(id => continuation.sourceIds.includes(id)));
+		const source = await f.sources.readText("owner", selected.sourceIds[0]!);
+		assert.equal(source.text, "今天晚8点与两位联系人在北京吃饭");
+		await assert.rejects(restarted.resolveMessages(f.session, "other", ["original-user"]), /当前聊天/);
+		await assert.rejects(restarted.resolveMessages({ ...f.session, sessionId: "other-session" } as AgentSession, "owner", ["original-user"]), /当前聊天/);
+		await assert.rejects(restarted.resolveMessages(f.session, "owner", ["invented"]), /当前聊天/);
+		await assert.rejects(restarted.resolveMessages(f.session, "owner", ["original-user", "original-user"]), /重复/);
 	} finally { await rm(f.root, { recursive: true, force: true }); }
 });

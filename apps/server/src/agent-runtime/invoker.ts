@@ -86,6 +86,9 @@ export interface AgentInvokeResult {
  * a second nested repository that cannot be captured or promoted safely.
  */
 export function messageForWorkspaceExecution(message: string, policy?: WorkspaceExecutionPolicy): string {
+	if (policy?.mode === "read_only_shared") {
+		return `${message}\n\n[PuddingTeams execution boundary]\n- This is an inspection task. Do not modify Workspace files or run commands with write side effects.\n- Report any unavoidable mutation explicitly; platform observation is not a sandbox or permission upgrade.`;
+	}
 	if (policy?.mode !== "isolated_worktree") return message;
 	return `${message}\n\n[PuddingTeams execution boundary]\n`
 		+ "- The current working directory is already the platform-created isolated checkout for this Run.\n"
@@ -167,6 +170,8 @@ export class AgentInvoker {
 	setDelegationStateObserver(observer: () => Promise<void>): void {
 		this.delegationStateObserver = observer;
 	}
+	private conversationHistoryFor?: (agent: AgentConfig, ctx: InvocationContext) => Promise<import("./direct-history.js").ConversationTurn[]>;
+	setConversationHistory(provider: NonNullable<AgentInvoker["conversationHistoryFor"]>): void { this.conversationHistoryFor = provider; }
 	setKnowledgeRuntime(provider: NonNullable<AgentInvoker["knowledgeFor"]>): void { this.knowledgeFor = provider; }
 	private webResearchExtension?: (agentId: string) => InlineExtension;
 	private webResearchFingerprint?: (agentId: string) => Promise<string>;
@@ -256,11 +261,22 @@ export class AgentInvoker {
 		]);
 		const owner = ownerContext?.window;
 		const binding = ownerContext?.workerBindings?.[managerSessionId]?.[agent.name];
-		if (!target || !owner || !ownerContext.active || !binding) return undefined;
+		if (!target || !owner || !ownerContext.active) return undefined;
 		const legalTarget = owner.type === "solo"
 			? target.type === "direct" && target.members.includes(agent.name)
 			: target.id === owner.id;
-		if (!legalTarget || binding.targetWindowId !== target.id) return undefined;
+		if (!legalTarget) return undefined;
+		// The execution ledger persists started handles before a Run can finish.
+		// A process crash may therefore leave no derived room binding yet.
+		const latest = (await this.runtime.listDelegations(windowId, managerSessionId))
+				.filter(item => item.agentId === agent.name && item.sessionHandle && item.workerStarted && item.purpose !== "verification")
+				.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+		if (latest || !binding) {
+			if (!latest || latest.workspaceId !== target.workspaceId || latest.cwdSnapshot !== await this.teams.workspaceFor(windowId) ||
+				latest.agentRevision !== agentRunConfigRevision(agent)) return undefined;
+			return latest.sessionHandle;
+		}
+		if (binding.targetWindowId !== target.id) return undefined;
 		if (binding.workspaceId !== target.workspaceId) return undefined;
 		if (binding.cwdSnapshot !== (await this.teams.workspaceFor(windowId))) return undefined;
 		if (binding.agentRevision !== agentRunConfigRevision(agent)) return undefined;
@@ -1532,6 +1548,7 @@ export class AgentInvoker {
 					? {
 							...(config ?? {}),
 							piResources: agent.piResources,
+							conversationHistoryFor: this.conversationHistoryFor ? (ctx: InvocationContext) => this.conversationHistoryFor!(agent, ctx) : undefined,
 							executionProfile: agent.builtinId === "wiki" ? "wiki_curator" : undefined,
 							webResearchToolsFor: this.webResearchTools ? () => this.webResearchTools!(agent.name) : undefined,
 							...(this.knowledgeFor ? { knowledgeFor: (ctx: InvocationContext, message: string) => this.knowledgeFor!(agent, ctx, message) } : {}),

@@ -2,7 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { delegationProcessWsUrl, fetchDelegationProcessMessages, WorkerProcessScopeError } from "@/lib/api";
-import { markRunningToolCalls, reducePiEvent, renderHistory, replayPiEvents } from "@/lib/events";
+import { markRunningToolCalls, reducePiEvent, renderHistory } from "@/lib/events";
+import { reconcileWorkerProcessMessages } from "@/lib/worker-process-messages";
 import type { ChatMessage, PiMessage } from "@/lib/types";
 
 /**
@@ -75,7 +76,8 @@ export function useWorkerProcess(delegationId: string | null, full = false, live
 					void fetchDelegationProcessMessages(delegationId, full).then((snapshot) => {
 						if (disposed || ws !== socket || version !== snapshotVersion) return;
 						latestSnapshotLive = snapshot.live;
-						if (!bufferOverflow) setMessages(replayPiEvents(renderSnapshot(snapshot), buffered));
+						const replay = buffered;
+						if (!bufferOverflow) setMessages((previous) => reconcileWorkerProcessMessages(previous, renderSnapshot(snapshot), replay));
 						setLive(snapshot.live && !offline && socket.readyState === WebSocket.OPEN);
 						setConnectionError(bufferOverflow ? "实时事件过多，无法确认执行记录完整；请重新读取执行记录" :
 							snapshot.live && !offline && socket.readyState !== WebSocket.OPEN ? "实时连接已断开，执行记录可能不是最新" : null);
@@ -114,7 +116,7 @@ export function useWorkerProcess(delegationId: string | null, full = false, live
 						// The terminal HTTP read may have started before the final WS
 						// events reached the JSONL file. Keep the visible stream if its
 						// bounded replay tail overflowed; otherwise replay that tail.
-						if (!tailOverflow) setMessages(replayPiEvents(renderSnapshot(snapshot), tail));
+						if (!tailOverflow) setMessages((previous) => reconcileWorkerProcessMessages(previous, renderSnapshot(snapshot), tail));
 						setStatus(snapshot.status);
 						setCreatedAt(snapshot.createdAt);
 						setConnectionError(tailOverflow ? "实时事件过多，无法确认最终记录完整；请重新读取执行记录" : null);
@@ -204,7 +206,7 @@ export function useWorkerProcess(delegationId: string | null, full = false, live
 					ws = null;
 					previous?.close();
 					connectLiveRef.current = null;
-					setMessages(renderSnapshot(snapshot));
+					setMessages((previous) => reconcileWorkerProcessMessages(previous, renderSnapshot(snapshot), []));
 					setLive(false);
 					setConnectionError(null);
 					setRefreshing(false);

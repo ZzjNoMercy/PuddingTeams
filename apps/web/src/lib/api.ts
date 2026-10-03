@@ -58,6 +58,26 @@ export type CalendarEventInput = {
 	title: string; description: string; location: string; kind: "event" | "focus"; timeZone: string; busy: boolean;
 } & ({ allDay: true; startDate: string; endDateExclusive: string } | { allDay: false; start: string; end: string });
 export type CalendarEventRecord = CalendarEventInput & { id: string; sourceId: "platform"; revision: number; operationId: string; status: "confirmed" | "cancelled" };
+export type CalendarDisplayEvent = CalendarEventInput & { id: string; sourceId: string; readonly?: boolean; sourceName?: string; appLink?: string; providerId?: string; providerName?: string; color?: string };
+export interface CalendarProviderDescriptor { id: string; name: string; description: string; color: string; readOnly: boolean; setupUrl?: string; authorization?: { description: string } }
+export interface ExternalCalendarSource { id: string; name: string; type: string; writable: boolean }
+export class CalendarProviderApiError extends Error {
+	constructor(readonly code: string, message: string) { super(message); }
+}
+async function calendarProviderRequest<T>(path: string): Promise<T> {
+	try {
+		const response = await fetch(`${SERVER_URL}/api/calendar/providers${path}`, { cache: "no-store", signal: AbortSignal.timeout(30_000) });
+		const data = await response.json() as T & { error?: string; code?: string };
+		if (!response.ok) throw new CalendarProviderApiError(data.code ?? "unavailable", data.error ?? "日历加载失败，请重试");
+		return data;
+	} catch (error) {
+		if (error instanceof CalendarProviderApiError) throw error;
+		throw new CalendarProviderApiError("unavailable", "日历请求超时或网络不可用，请重试");
+	}
+}
+export const listCalendarProviders = async () => (await calendarProviderRequest<{ providers: CalendarProviderDescriptor[] }>("")).providers;
+export const listProviderCalendars = async (providerId: string) => (await calendarProviderRequest<{ calendars: ExternalCalendarSource[] }>(`/${encodeURIComponent(providerId)}/calendars`)).calendars;
+export const listProviderCalendarEvents = async (providerId: string, calendarId: string, start: string, end: string) => (await calendarProviderRequest<{ events: CalendarDisplayEvent[] }>(`/${encodeURIComponent(providerId)}/events?${new URLSearchParams({ calendarId, start, end })}`)).events;
 export async function listCalendarEvents(): Promise<CalendarEventRecord[]> {
 	return (await knowledgeResponse<{ events: CalendarEventRecord[] }>(await fetch(`${SERVER_URL}/api/calendar/events`))).events;
 }
@@ -189,6 +209,12 @@ export interface KnowledgeNote {
 export async function readKnowledgeNote(id: string, notePath: string, version: KnowledgeNoteVersion = "observed"): Promise<KnowledgeNote> {
 	const url = `${SERVER_URL}/api/knowledge/${encodeURIComponent(id)}/note?path=${encodeURIComponent(notePath)}&version=${version}`;
 	return (await knowledgeResponse<{ note: KnowledgeNote }>(await fetch(url))).note;
+}
+
+export async function saveKnowledgeNote(id: string, input: { path: string; content: string; expectedHash: string }): Promise<{ note: KnowledgeNote; syncWarning?: string }> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/knowledge/${encodeURIComponent(id)}/note`, {
+		method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input),
+	}));
 }
 
 export interface KnowledgeObservedFile {
@@ -496,27 +522,57 @@ export type WikiBatchStatus = "candidate" | "pending_review" | "approved" | "pub
 
 export interface WikiCuratorJob {
 	id: string;
+	executionMode: "worker" | "background";
+	canRetryRegistration?: boolean;
+	origin?: { windowId: string; sessionId: string; toolCallId?: string; channel?: "user_input" | "agent_task" };
 	operationId: string;
 	targetBindingId: string;
 	agentId: string;
 	task: string;
-	status: "queued" | "running" | "pending_review" | "no_changes" | "needs_attention" | "failed" | "cancelled";
+	status: "queued" | "running" | "submitting" | "pending_review" | "no_changes" | "needs_attention" | "failed" | "cancelled";
 	candidateBatchId?: string;
 	failureCode?: string;
+	diagnostics?: { modelProvider?: string; modelId?: string; modelTurns: number; submitAttempts: number; submitErrors: number; stopReason?: string; errorCategory?: "timeout" | "provider_error" | "aborted" | "output_limit" | "no_submission" };
+	jobUrl?: string;
+	reviewUrl?: string;
 	createdAt: string;
 	updatedAt: string;
+	title: string;
+	bindingName: string;
+	displayStatus: "queued" | "running" | "submitting" | "pending" | "approved" | "publishing" | "published" | "rejected" | "returned" | "conflict" | "partial" | "closed" | "nochanges" | "failed" | "cancelled" | "unavailable";
+	activityAt: string;
+	material?: string;
+	materialUnavailable?: boolean;
+	materialIsRequest?: boolean;
+	publication?: { id: string; state: string; finishedAt?: string; applied: number; total: number };
+	retryOf?: string;
+	parentBatchId?: string;
+	sources?: Array<{ id: string; kind: string; title: string; byteSize: number }>;
+	result?: { added: number; updated: number; deleted: number; directories: number; attachments: number };
+	review?: { status: WikiBatchStatus; updatedAt: string; enteredReviewAt: string; decidedAt?: string; conflictReason?: string; feedback?: string; revisionJobId?: string; newBatchId?: string; files: Array<{ path: string; title: string; operation: string; kind: "image" | "markdown"; category: string; publicationStatus?: string }> };
+
 }
 
 export async function createWikiCuratorJob(input: {
-	operationId: string; bindingId: string; agentId: string; task: string; uploads?: MessageAttachmentInput[];
+	operationId: string; bindingId: string; agentId: string; task: string; material?: string; uploads?: MessageAttachmentInput[];
 }): Promise<{ job: WikiCuratorJob; replayed?: boolean }> {
 	return knowledgeResponse(await fetch(`${SERVER_URL}/api/wiki/curator-jobs`, {
 		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
 	}));
 }
 
-export async function listWikiCuratorJobs(bindingId: string): Promise<WikiCuratorJob[]> {
-	return (await knowledgeResponse<{ jobs: WikiCuratorJob[] }>(await fetch(`${SERVER_URL}/api/wiki/curator-jobs?bindingId=${encodeURIComponent(bindingId)}`))).jobs;
+export async function listWikiCuratorJobs(bindingId?: string): Promise<WikiCuratorJob[]> {
+	return (await knowledgeResponse<{ jobs: WikiCuratorJob[] }>(await fetch(`${SERVER_URL}/api/wiki/curator-jobs${bindingId ? `?bindingId=${encodeURIComponent(bindingId)}` : ""}`))).jobs;
+}
+
+export interface WikiCuratorTaskPage {
+	jobs: WikiCuratorJob[]; total: number; offset: number; limit: number;
+	counts: Record<"all" | "active" | "pending" | "ended" | "failed", number>;
+}
+export async function listWikiCuratorTaskPage(input: { bindingId?: string; q?: string; group?: string; since?: string; limit?: number; offset?: number }): Promise<WikiCuratorTaskPage> {
+	const query = new URLSearchParams();
+	for (const [key,value] of Object.entries(input)) if (value !== undefined && value !== "") query.set(key,String(value));
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/wiki/curator-jobs?${query}`));
 }
 
 export async function getWikiCuratorJob(id: string): Promise<{ job: WikiCuratorJob }> {
@@ -768,7 +824,7 @@ export async function closeWikiConflict(batchId: string, input: { operationId: s
 export interface KnowledgeHistoryVersion {
 	id: string; noteId: string; revision: number; relativePath: string; contentHash: string; actorId: string;
 	previousPath?: string;
-	channel: "initial" | "agent_publish" | "external_sync"; acceptedAt: string; createdAt: string; operationId: string; batchId?: string; summary: string; sourceIds: string[]; current: boolean;
+	channel: "initial" | "agent_publish" | "external_sync" | "manual_edit"; acceptedAt: string; createdAt: string; operationId: string; batchId?: string; summary: string; sourceIds: string[]; current: boolean;
 	actorName?: string;
 	changeKind?: "create" | "update" | "rename" | "delete";
 	deleted?: boolean;
@@ -1707,12 +1763,26 @@ export async function runExtensionConnectionAction(
 	return ((await res.json()) as { connection: ExtensionConnectionStatus }).connection;
 }
 
-/** 从本地目录安装 Extension：link（默认）= 开发者本地链接；copy = 用户安装（复制进数据目录）。 */
+/** 发起、读取或取消插件贡献的授权会话，浏览器不接触上游设备码。 */
+export interface FeishuSettingsSnapshot {
+	configured: boolean; appId: string; secretConfigured: boolean; scope: string; accountName?: string;
+}
+async function feishuSettingsRequest(path = "", init?: RequestInit): Promise<FeishuSettingsSnapshot> {
+	const response = await fetch(`${SERVER_URL}/api/settings/feishu${path}`, { ...init, cache: "no-store", signal: AbortSignal.timeout(15_000) });
+	const data = await response.json() as FeishuSettingsSnapshot & { error?: string };
+	if (!response.ok) throw new Error(data.error ?? "飞书设置请求失败");
+	return data;
+}
+export const getFeishuSettings = () => feishuSettingsRequest();
+export const saveFeishuSettings = (input: { appId: string; appSecret?: string; confirmReplace?: boolean }) => feishuSettingsRequest("", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
+export const importFeishuConnection = () => feishuSettingsRequest("/import-local", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+
 export async function extensionAuthorization(
 	connection: Pick<ExtensionConnectionStatus, "extensionId" | "connectionId">,
 	request: { actionId: string } | { sessionId: string; cancel?: boolean },
+	authorizationBase?: string,
 ): Promise<ExtensionAuthorizationSession | null> {
-	const base = `${SERVER_URL}/api/extensions/${encodeURIComponent(connection.extensionId)}/connections/${encodeURIComponent(connection.connectionId)}/authorizations`;
+	const base = `${SERVER_URL}${authorizationBase ?? `/api/extensions/${encodeURIComponent(connection.extensionId)}/connections/${encodeURIComponent(connection.connectionId)}/authorizations`}`;
 	const res = await fetch("sessionId" in request ? `${base}/${encodeURIComponent(request.sessionId)}` : base, {
 		method: "actionId" in request ? "POST" : request.cancel ? "DELETE" : "GET",
 		...( "actionId" in request ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(request) } : {}),

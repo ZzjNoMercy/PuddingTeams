@@ -878,3 +878,16 @@ test("Goal v6: Harness trigger 与三类 Workspace 默认值冻结进新 WorkIte
 	assert.equal(planned.plan?.items.N?.workspaceExecutionPolicy.baselineStrategy, "filesystem_manifest");
 	assert.ok(Object.values(planned.plan?.items ?? {}).every((item) => item.verificationPolicy.trigger === "auto_on_submission"));
 });
+
+
+test("强制只读要求保存在 WorkItem 冻结契约中，改派不能丢失，非法要求被拒绝", async () => {
+	const store = new WorkStateStore(mkdtempSync(path.join(tmpdir(), "pt-readonly-contract-"))); await store.init();
+	const goal = await store.create({ sessionId: "s", goal: "inspect", completionBoundary: "inspected", operationId: "goal" });
+	const item = { id: "W1", title: "inspect", acceptanceCriteria: ["inspected"], sourceGoalCriteria: ["goal:1:1"] };
+	const first = await store.updatePlan("s", goal.revision, { upsertItems: [{ ...item, assignedAgentId: "ordinary", workspaceExecutionPolicy: { mode: "read_only_shared", source: "user", reason: "must never write", baselineStrategy: "filesystem_manifest", promoteOnAcceptance: false, readOnlyRequirement: "enforced" } }], reason: "plan" }, "plan");
+	const next = await store.updatePlan("s", first.revision, { upsertItems: [{ ...item, assignedAgentId: "safe" }], reason: "capability recovery" }, "reassign");
+	assert.equal(next.plan!.items.W1!.workspaceExecutionPolicy.readOnlyRequirement, "enforced");
+	const contract = workItemContractHash(next, next.plan!, next.plan!.items.W1!);
+	assert.notEqual(contract, workItemContractHash(next, next.plan!, { ...next.plan!.items.W1!, workspaceExecutionPolicy: { ...next.plan!.items.W1!.workspaceExecutionPolicy, readOnlyRequirement: "best_effort" } }));
+	await assert.rejects(() => store.updatePlan("s", next.revision, { upsertItems: [{ ...item, workspaceExecutionPolicy: { readOnlyRequirement: "auto_approve" as "enforced" } }], reason: "invalid" }, "invalid"), /readOnlyRequirement 无效/);
+});

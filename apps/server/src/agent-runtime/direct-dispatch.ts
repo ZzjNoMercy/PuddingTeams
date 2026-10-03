@@ -104,7 +104,7 @@ export async function dispatchDirectMessage(
 		if (runtimeModel && Object.keys(runtimeModel).length === 0) runtimeModel = undefined;
 		await deps.sessions.sendCustomMessageDurable(
 			sessionId,
-			{ customType: "pudding:user_message", content: displayText, details: { windowId: window.id, operationId, ...(sourceRefs ? { sourceRefs } : {}) } },
+			{ customType: "pudding:user_message", content: displayText, details: { windowId: window.id, operationId, executionText: content, ...(sourceRefs ? { sourceRefs } : {}) } },
 		);
 		if (sourceRefs) await deps.onUserMessageDurable?.(sessionId, sourceRefs);
 		// direct 没有 manager 回合，首条消息用任务文本命名。

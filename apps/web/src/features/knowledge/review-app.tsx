@@ -446,6 +446,11 @@ function ReviewWorkspace({ batch, onBatchChange, onReload }: {
 	const [actionError, setActionError] = useState<{ message: string; code?: string } | null>(null);
 	const [publishNote, setPublishNote] = useState<string | null>(null);
 	const reviewOperation = useRef<{ key: string; id: string } | null>(null);
+	const previewScroll = useRef<HTMLDivElement>(null);
+
+	useEffect(() => {
+		if (previewScroll.current) previewScroll.current.scrollTop = 0;
+	}, [batch.id, selectedPath, view]);
 
 	useEffect(() => {
 		if (!selectedPath) return;
@@ -514,7 +519,7 @@ function ReviewWorkspace({ batch, onBatchChange, onReload }: {
 
 	return (
 		<div className="flex min-h-0 flex-1 flex-col">
-			<div className="flex flex-wrap items-center gap-3 border-b border-border px-6 py-3">
+			<div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-border px-6 py-3">
 				<BatchStatusBadge status={batch.status} closed={Boolean(batch.conflictClosure)} />
 				{(batch.parentBatchId ?? batch.batch.parentBatchId) ? <Link href={batchHref(scopeParams.toString(), (batch.parentBatchId ?? batch.batch.parentBatchId)!)} className="text-xs underline">查看上次候选与修订意见</Link> : null}
 				<span className="text-xs text-muted-foreground">
@@ -586,12 +591,13 @@ function ReviewWorkspace({ batch, onBatchChange, onReload }: {
 						))}
 					</div>
 				</aside>
-				<main className="min-w-0 flex-1 overflow-y-auto p-6">
-					<div className="mb-3 flex flex-wrap items-center gap-2 text-sm">
+				<main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden" aria-label="审核文件预览">
+					<div className="flex shrink-0 flex-wrap items-center gap-2 px-6 pb-3 pt-6 text-sm">
 						<button type="button" data-active={view === "preview"} onClick={() => setView("preview")} className="knowledge-version-tab">渲染预览</button>
 						<button type="button" data-active={view === "diff"} onClick={() => setView("diff")} className="knowledge-version-tab">版本差异</button>
 						<span className="min-w-0 break-all text-xs text-muted-foreground">{selectedPath}</span>
 					</div>
+					<div ref={previewScroll} tabIndex={0} aria-label="文件预览内容" className="min-h-0 flex-1 overflow-auto overscroll-contain px-6 pb-6">
 					{!active ? (
 						<p className="text-sm text-muted-foreground"><LoaderCircleIcon size={14} className="mr-1 inline animate-spin" />正在加载…</p>
 					) : active.error ? (
@@ -612,11 +618,12 @@ function ReviewWorkspace({ batch, onBatchChange, onReload }: {
 							</>
 						)
 					) : null}
-					{batch.status === "pending_review" ? <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4"><p className="text-xs text-muted-foreground">标记代表你声明已核对这项文件；页面与图片均需分别核对。</p><button type="button" disabled={!active?.value || !imageReady || Boolean(active.error) || viewed.has(selectedPath) || submitting} onClick={() => {
+					</div>
+					{batch.status === "pending_review" ? <div aria-label="文件审核操作" className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-border bg-background px-6 py-4"><p className="text-xs text-muted-foreground">标记代表你声明已核对这项文件；页面与图片均需分别核对。</p><button type="button" disabled={!active?.value || !imageReady || Boolean(active.error) || viewed.has(selectedPath) || submitting} onClick={() => {
 						const next = new Set(viewed).add(selectedPath);
 						setViewed(next);
 						setSelectedPath(files.find((file) => !next.has(file.targetPath))?.targetPath ?? selectedPath);
-					}} className="flex items-center gap-1.5 rounded border border-border px-3 py-2 text-sm disabled:opacity-40"><CheckIcon size={14} />{viewed.has(selectedPath) ? "已标记已阅" : "标记已阅，下一项"}<ChevronRightIcon size={14} /></button></div> : null}
+					}} className="ml-auto flex shrink-0 items-center gap-1.5 rounded border border-border px-3 py-2 text-sm disabled:opacity-40"><CheckIcon size={14} />{viewed.has(selectedPath) ? "已标记已阅" : "标记已阅，下一项"}<ChevronRightIcon size={14} /></button></div> : null}
 				</main>
 			</div>
 			<Dialog open={confirming !== null} onOpenChange={(open) => { if (!open && !submitting) setConfirming(null); }}>

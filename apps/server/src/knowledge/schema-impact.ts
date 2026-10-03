@@ -1,3 +1,4 @@
+import { schemaEntityDirectory } from "./schema-layout.js";
 import { constants as fsConstants } from "node:fs";
 import { open } from "node:fs/promises";
 import path from "node:path";
@@ -159,6 +160,7 @@ export function assessAcceptedNote(
 	noteFields: Record<string, unknown>,
 	oldSchema: TeamsSchemaPreset | null,
 	next: TeamsSchemaPreset,
+	contentPrefix = "",
 ): AffectedFile | undefined {
 	const type = typeof noteFields.type === "string" ? noteFields.type : undefined;
 	if (!type) return undefined;
@@ -182,7 +184,7 @@ export function assessAcceptedNote(
 		}
 		const previousEntity = oldSchema?.entities.find((entity) => entity.type === type);
 		if (previousEntity && previousEntity.directory !== nextEntity.directory &&
-			(relativePath === previousEntity.directory || relativePath.startsWith(`${previousEntity.directory}/`))) {
+			(relativePath === schemaEntityDirectory(contentPrefix, previousEntity.directory) || relativePath.startsWith(`${schemaEntityDirectory(contentPrefix, previousEntity.directory)}/`))) {
 			reasons.push(`directory_changed:${previousEntity.directory}->${nextEntity.directory}`);
 		}
 	}

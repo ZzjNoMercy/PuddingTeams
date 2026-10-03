@@ -1,3 +1,4 @@
+import { schemaContentPrefix, schemaEntityDirectory } from "../knowledge/schema-layout.js";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, mkdir, readdir, readFile, realpath, rm, stat } from "node:fs/promises";
@@ -205,7 +206,9 @@ export function registerWikiRoutes(app: FastifyInstance, deps: WikiRouteDeps): v
 			if (effectiveSchema.origin === "none" && effectiveSchema.warnings.some((warning) => warning.startsWith("wiki.schema.json"))) {
 				throw new WikiRouteError("invalid_input", effectiveSchema.warnings.join("；"));
 			}
-			const schemaContract = effectiveSchema.schema ? JSON.stringify(effectiveSchema.schema) : undefined;
+			const contentPrefix = await schemaContentPrefix(binding, effectiveSchema.schema);
+   const schemaContract = effectiveSchema.schema ? JSON.stringify({ ...effectiveSchema.schema,
+    pathRules: { contentPrefix, entityDirectories: effectiveSchema.schema.entities.map(entity => ({ type: entity.type, directory: schemaEntityDirectory(contentPrefix, entity.directory) })) } }) : undefined;
 			const agent = await deps.teams.getAgent(agentId);
 			if (!agent || agent.enabled === false || agent.connector?.connectorId !== "codex" || agent.connector.transport !== "spawn") {
 				throw new WikiRouteError("invalid_input", "编译 Worker 必须是启用状态的本地 Codex Agent");

@@ -11,6 +11,8 @@ import { KnowledgeObservationService } from "../knowledge/observation.js";
 import { KnowledgeSearchIndex } from "../knowledge/search-index.js";
 import { registerKnowledgeRoutes, type KnowledgeRouteDeps } from "./knowledge.js";
 import { KnowledgeSelectionStore } from "../knowledge/selections.js";
+import { localViewerIdentity, readViewerIdentity, registerIdentityRoutes } from "./identity.js";
+import { KnowledgeHistoryStore } from "../knowledge/history-store.js";
 
 test("knowledge route creates a binding, reads a note, and revokes without writing the vault", async () => {
 	const base = await mkdtemp(path.join(tmpdir(), "pt-knowledge-route-"));
@@ -54,8 +56,12 @@ async function m2Fixture(suffix: string, files: Record<string, string | Buffer>)
 	}
 	const registry = new KnowledgeBindingRegistry(path.join(base, "state"));
 	const objects = new KnowledgeObjectStore(path.join(base, "objects"));
-	const acceptance = new KnowledgeAcceptanceStore(path.join(base, "acceptance"));
+	const history = new KnowledgeHistoryStore(path.join(base, "history"));
+	const acceptance = new KnowledgeAcceptanceStore(path.join(base, "acceptance"), history);
+	const profilePaths = { config: path.join(base, "config"), assets: path.join(base, "assets") };
 	const deps: KnowledgeRouteDeps = {
+		viewerIdentity: () => readViewerIdentity(localViewerIdentity, profilePaths),
+		history,
 		objects,
 		acceptance,
 		observation: new KnowledgeObservationService(acceptance, { objects }),
@@ -63,11 +69,88 @@ async function m2Fixture(suffix: string, files: Record<string, string | Buffer>)
 		selections: new KnowledgeSelectionStore(path.join(base, "selection-state"), registry),
 	};
 	const app = Fastify();
+	registerIdentityRoutes(app, localViewerIdentity, profilePaths);
 	registerKnowledgeRoutes(app, registry, deps);
 	const create = await app.inject({ method: "POST", url: "/api/knowledge", payload: { path: root, name: "Vault", description: "M2" } });
 	assert.equal(create.statusCode, 201);
 	return { base, root, app, binding: create.json().binding as M2Fixture["binding"], deps };
 }
+
+test("human note edits save directly, update search and history, and stale concurrent edits cannot overwrite", async () => {
+	const f = await m2Fixture("edit", { "note.md": "---\nid: person-one\ntitle: 一个人\n---\n旧事实\n" });
+	try {
+		const before = (await f.app.inject(`/api/knowledge/${f.binding.id}/note?path=note.md`)).json().note;
+		const url = `/api/knowledge/${f.binding.id}/note`;
+		const content = before.content.replace("旧事实", "新事实");
+		const saved = await f.app.inject({ method: "PUT", url, payload: { path: "note.md", content, expectedHash: before.contentHash } });
+		assert.equal(saved.statusCode, 200, saved.body);
+		assert.equal(saved.json().note.content, content);
+		assert.equal(await readFile(path.join(f.root, "note.md"), "utf8"), content);
+		assert.equal((await f.app.inject(`/api/knowledge/${f.binding.id}/search?q=新事实`)).json().results.length, 1);
+		assert.equal((await f.app.inject(`/api/knowledge/${f.binding.id}/search?q=旧事实`)).json().results.length, 0);
+		const history = (await f.app.inject(`/api/knowledge/${f.binding.id}/history?path=note.md`)).json().versions;
+		assert.equal(history.length, 2);
+		assert.equal(history[0].channel, "manual_edit");
+		assert.equal(history[0].actorName, localViewerIdentity().user.displayName);
+		await f.app.inject({ method: "PATCH", url: "/api/identity/profile", payload: { displayName: "Pet" } });
+		const renamed = (await f.app.inject(`/api/knowledge/${f.binding.id}/history?path=note.md`)).json().versions;
+		assert.equal(renamed[0].actorName, "Pet");
+		assert.equal(renamed[0].actorId, history[0].actorId);
+		const detail = (await f.app.inject(`/api/knowledge/${f.binding.id}/history/${renamed[0].id}`)).json();
+		assert.equal(detail.version.actorName, "Pet");
+		assert.match(history[0].actorId, /^local:/);
+		assert.equal(history[0].previousHash, before.contentHash);
+		const stale = await f.app.inject({ method: "PUT", url, payload: { path: "note.md", content: "过期覆盖", expectedHash: before.contentHash } });
+		assert.equal(stale.statusCode, 409);
+		assert.equal(await readFile(path.join(f.root, "note.md"), "utf8"), content);
+		const competing = await Promise.all(["竞争甲", "竞争乙"].map(text => f.app.inject({ method: "PUT", url, payload: { path: "note.md", content: text, expectedHash: saved.json().note.contentHash } })));
+		assert.deepEqual(competing.map(response => response.statusCode).sort(), [200, 409]);
+	} finally { await f.app.close(); await rm(f.base, { recursive: true, force: true }); }
+});
+
+test("human note edit validates path, ownership, size and symlinks; revoked binding cannot write", async () => {
+	const f = await m2Fixture("edit-boundary", { "note.md": "原内容" });
+	try {
+		const before = (await f.app.inject(`/api/knowledge/${f.binding.id}/note?path=note.md`)).json().note;
+		const put = (id: string, payload: Record<string, unknown>) => f.app.inject({ method: "PUT", url: `/api/knowledge/${id}/note`, payload });
+		for (const relative of ["../outside.md", "/tmp/outside.md", "../note.md", ".hidden.md", "note.png"]) {
+			assert.equal((await put(f.binding.id, { path: relative, content: "覆盖", expectedHash: before.contentHash })).statusCode, 400);
+		}
+		assert.equal((await put(f.binding.id, { path: "note.md", content: "x" })).statusCode, 400);
+		assert.equal((await put("unowned-id", { path: "note.md", content: "x", expectedHash: before.contentHash })).statusCode, 404);
+		assert.equal((await put(f.binding.id, { path: "note.md", content: "x".repeat(2 * 1024 * 1024 + 1), expectedHash: before.contentHash })).statusCode, 413);
+		await symlink(path.join(f.root, "note.md"), path.join(f.root, "alias.md"));
+		assert.notEqual((await put(f.binding.id, { path: "alias.md", content: "覆盖", expectedHash: before.contentHash })).statusCode, 200);
+		await rm(path.join(f.root, "alias.md"));
+		await f.app.inject({ method: "DELETE", url: `/api/knowledge/${f.binding.id}`, payload: { expectedRevision: f.binding.bindingRevision } });
+		assert.equal((await put(f.binding.id, { path: "note.md", content: "覆盖", expectedHash: before.contentHash })).statusCode, 404);
+		assert.equal(await readFile(path.join(f.root, "note.md"), "utf8"), "原内容");
+	} finally { await f.app.close(); await rm(f.base, { recursive: true, force: true }); }
+});
+
+test("written note retains manual edit identity after synchronization failure and a fresh store recovers it", async () => {
+	const f = await m2Fixture("edit-recovery", { "note.md": "旧事实" });
+	try {
+		const before = (await f.app.inject(`/api/knowledge/${f.binding.id}/note?path=note.md`)).json().note;
+		const original = f.deps.objects.put.bind(f.deps.objects);
+		let calls = 0;
+		f.deps.objects.put = async (...args) => { if (++calls > 1) throw new Error("injected object write failure"); return original(...args); };
+		const saved = await f.app.inject({ method: "PUT", url: `/api/knowledge/${f.binding.id}/note`, payload: { path: "note.md", content: "已保存的新事实", expectedHash: before.contentHash } });
+		assert.equal(saved.statusCode, 200, saved.body);
+		assert.match(saved.json().syncWarning, /文件已保存/);
+		assert.equal(await readFile(path.join(f.root, "note.md"), "utf8"), "已保存的新事实");
+		f.deps.objects.put = original;
+		const reloaded = new KnowledgeAcceptanceStore(path.join(f.base, "acceptance"), f.deps.history);
+		const observation = new KnowledgeObservationService(reloaded, { objects: f.deps.objects });
+		const registry = new KnowledgeBindingRegistry(path.join(f.base, "state"));
+		const binding = (await registry.list(`local:${(await import("node:os")).userInfo().username}`))[0]!;
+		await observation.scan(binding);
+		const history = await f.deps.history!.list(binding.id, "note.md");
+		assert.equal(history.versions.length, 2);
+		assert.equal(history.versions[0]!.channel, "manual_edit");
+		assert.equal(Object.keys((await reloaded.getSnapshot(binding.id)).pendingManualEdits ?? {}).length, 0);
+	} finally { await f.app.close(); await rm(f.base, { recursive: true, force: true }); }
+});
 
 test("knowledge selection is isolated by work context and revision guarded", async () => {
 	const { app, binding } = await m2Fixture("selection", { "note.md": "# Note\n" });
@@ -75,7 +158,7 @@ test("knowledge selection is isolated by work context and revision guarded", asy
 	const initial = await app.inject({ method: "GET", url: `/api/knowledge-selection?contextKey=${encodeURIComponent(contextKey)}` });
 	assert.equal(initial.statusCode, 200);
 	assert.equal(initial.json().selection.contextKey, contextKey);
-	assert.deepEqual(initial.json().selection.selectedBindingIds, []);
+	assert.deepEqual(initial.json().selection.selectedBindingIds, [binding.id]);
 	assert.equal(initial.json().selection.revision, 0);
 
 	const saved = await app.inject({
@@ -92,6 +175,10 @@ test("knowledge selection is isolated by work context and revision guarded", asy
 	});
 	assert.equal(conflict.statusCode, 409);
 	assert.equal(conflict.json().code, "revision_conflict");
+	const cleared = await app.inject({ method: "PUT", url: "/api/knowledge-selection", payload: { contextKey, expectedRevision: 1, selectedBindingIds: [] } });
+	assert.equal(cleared.statusCode, 200); assert.deepEqual(cleared.json().selection.selectedBindingIds, []);
+	const refreshed = await app.inject({ method: "GET", url: `/api/knowledge-selection?contextKey=${encodeURIComponent(contextKey)}` });
+	assert.deepEqual(refreshed.json().selection.selectedBindingIds, []);
 	await app.close();
 });
 

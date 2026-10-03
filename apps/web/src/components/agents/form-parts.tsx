@@ -160,8 +160,15 @@ const UNSET = "__unset__";
  * format: "model" 的模型选择：数据源 /api/models（含自定义 provider 的模型）。
  * 目录有上百个模型，扁平下拉会撑满整个视口，所以按 provider 分组、二级菜单
  * 限高——与 composer 的模型选择器同一套交互与外观（.model-picker-*）。
+ *
+ * 导出给 Manager 的「模型与运行」分区复用：以前那里是 `<input list=datalist>`，
+ * 而原生 datalist 会按输入框当前值给候选项排序、只露出排序窗口的前几项
+ * （21 个模型里只看到 2 个 deepseek），外观也和 Worker 路径不一致。
+ * 更关键的是自由输入本身就是死路：未知 id 在 `LocalPiDriver.resolveModel`
+ * 会直接抛 `未知模型：xxx`，所以只提供目录里真实存在的选项，存档值已不在
+ * 目录中时单列一条而不是让用户重新敲。
  */
-function ModelSelectField({
+export function ModelSelectField({
 	label,
 	mark,
 	current,
@@ -169,7 +176,8 @@ function ModelSelectField({
 	onSelect,
 }: {
 	label: string;
-	mark: React.ReactNode;
+	/** schema 必填标记；非 schema 调用方（Manager 分区）没有 required 概念，可不传。 */
+	mark?: React.ReactNode;
 	current: unknown;
 	description?: string;
 	onSelect: (next: string | undefined) => void;

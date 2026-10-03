@@ -223,6 +223,24 @@ function reconcileDelegationStatus(list: ChatMessage[], next: ChatMessage): Chat
  * 历史回放与实时事件走同一去重，避免一张变两张。
  */
 function upsertCustomMessage(list: ChatMessage[], next: ChatMessage): ChatMessage[] {
+	if (next.customType === "pudding:knowledge_job") {
+		const details = next.details as { jobId?: string; status?: string; recoveryRevision?: number } | undefined;
+		const index = details?.jobId ? list.findIndex(message => message.customType === next.customType &&
+			(message.details as { jobId?: string } | undefined)?.jobId === details.jobId) : -1;
+		if (index >= 0) {
+			const previous = list[index]!;
+			const priorDetails = previous.details as { status?: string; recoveryRevision?: number } | undefined;
+			const priorStatus = priorDetails?.status;
+			const priorRevision = priorDetails?.recoveryRevision ?? 0, nextRevision = details?.recoveryRevision ?? 0;
+			const active = (status?: string) => ["queued", "running", "submitting"].includes(status ?? "");
+			// Only a host-claimed continuation may revive a stopped job; older generations stay stale.
+			if (nextRevision < priorRevision || (nextRevision === priorRevision &&
+				(next.timestamp < previous.timestamp || (priorStatus && !active(priorStatus) && active(details?.status))))) return list;
+			const copy = [...list];
+			copy[index] = { ...next, id: previous.id };
+			return copy;
+		}
+	}
 	let effectiveNext = next;
 	if (next.customType === "pudding:task_result") {
 		const taskId = (next.details as { taskId?: string } | undefined)?.taskId;
@@ -299,27 +317,33 @@ export function renderHistory(msgs: PiMessage[]): ChatMessage[] {
 		if (m.role === "custom") {
 			const next = renderCustom(m);
 			if (m.display === false) {
-				// Approval projections created while the manager is inside a delegate
-				// tool stay hidden in the pi/model transcript to preserve tool ordering,
+				// Approval and knowledge-job projections created during a delegate
+				// stay hidden in the pi/model transcript to preserve tool ordering,
 				// but are still first-class product UI and must survive reload.
-				if (m.customType === "pudding:interaction_required") {
+				if (m.customType === "pudding:interaction_required" || m.customType === "pudding:knowledge_job") {
 					const replaced = upsertCustomMessage(out, next);
-					out.length = 0;
-					out.push(...replaced);
+					if (replaced !== out) {
+						out.length = 0;
+						out.push(...replaced);
+					}
 					continue;
 				}
 				// Hidden group running projections are audit/recovery state, not a
 				// second chat card. Fold them into the original delegate tool call.
 				if (m.customType === "pudding:task_assign") {
 					const replaced = reconcileDelegationStatus(out, next);
-					out.length = 0;
-					out.push(...replaced);
+					if (replaced !== out) {
+						out.length = 0;
+						out.push(...replaced);
+					}
 				}
 				continue;
 			}
 			const replaced = upsertCustomMessage(out, next);
-			out.length = 0;
-			out.push(...replaced);
+			if (replaced !== out) {
+				out.length = 0;
+				out.push(...replaced);
+			}
 			continue;
 		}
 		if (m.role === "toolResult") {
@@ -573,7 +597,7 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 			if (m.role === "custom") {
 				const next = renderCustom(m);
 				if (m.display === false) {
-					if (m.customType === "pudding:interaction_required") {
+					if (m.customType === "pudding:interaction_required" || m.customType === "pudding:knowledge_job") {
 						return upsertCustomMessage(messages, next);
 					}
 					// Hidden manager projections are not cards, but they carry the

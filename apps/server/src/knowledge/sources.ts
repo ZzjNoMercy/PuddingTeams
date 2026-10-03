@@ -14,7 +14,7 @@ export interface KnowledgeSourceOrigin {
 	channel?: "user_input" | "agent_task";
 }
 
-export interface WebCaptureOrigin { itemId: string; versionId: string; originalUrl: string; canonicalUrl: string; fetchedUrl?: string; author: string; siteName: string; capturedAt: string; extractorVersion: string; contentHash: string }
+export interface WebCaptureOrigin { itemId: string; versionId: string; originalUrl: string; canonicalUrl: string; fetchedUrl?: string; author: string; siteName: string; capturedAt: string; extractorVersion: string; contentHash: string; captureMethod?: "http" | "saved_html"; sourceFilename?: string }
 export interface KnowledgeSource {
 	id: string;
 	ownerId: string;

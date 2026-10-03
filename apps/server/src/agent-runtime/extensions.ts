@@ -124,6 +124,8 @@ export interface CapabilitySessionRuntime {
 }
 
 export interface CapabilityRuntimeContext {
+	/** Host-provided shared external connection; no long-lived token in Session env. */
+	connection?: SharedCapabilityConnection;
 	agent: Readonly<AgentSummary & { pinned: boolean; connectorId?: string }>;
 	binding: Readonly<AgentCapabilityBinding>;
 	config: Readonly<Record<string, unknown>>;
@@ -175,6 +177,7 @@ export interface ExtensionConnectionAction {
 }
 
 export interface ExtensionConnectionContext {
+	connection?: SharedCapabilityConnection;
 	cwd: string;
 	env: NodeJS.ProcessEnv;
 	/** `<PUDDINGTEAMS_HOME>/secrets/capabilities/<extension>/shared`。 */
@@ -189,6 +192,16 @@ export interface ExtensionAuthorizationSession {
 	qrCodeDataUrl?: string;
 	expiresAt: string;
 	message?: string;
+}
+
+/** Shared core consumes a host-neutral service, not a host registry or Pi API. */
+export interface SharedCapabilityConnection {
+	status(): Promise<ExtensionConnectionStatus>;
+	begin(): Promise<ExtensionAuthorizationSession>;
+	authorizationStatus(id: string): Promise<ExtensionAuthorizationSession | undefined>;
+	cancel(id: string): Promise<void>;
+	/** Delegated broker access, not upstream app secrets/refresh tokens. */
+	runtimeEnv(): Promise<NodeJS.ProcessEnv>;
 }
 
 /** Capability Extension 运行时模块（当前进程内加载，隔离 Host 后迁入 Broker）。 */
@@ -219,6 +232,9 @@ export interface CapabilityExtensionModule {
  */
 export class ExtensionCatalog {
 	private readonly modules = new Map<string, CapabilityExtensionModule>();
+	private readonly connections = new Map<string, SharedCapabilityConnection>();
+	setConnection(id: string, connection: SharedCapabilityConnection): void { this.connections.set(id, connection); }
+	connectionOf(id: string): SharedCapabilityConnection | undefined { return this.connections.get(id); }
 
 	register(module: CapabilityExtensionModule): void {
 		if (module.manifest.kind !== "capability") {
@@ -284,6 +300,7 @@ export async function resolveAgentCapabilityRuntime(input: {
 		const sharedStateDir = path.join(input.stateRoot, binding.extensionId, "shared");
 		try {
 			const resolved = await module.runtime.resolveSession({
+				connection: input.catalog.connectionOf(binding.extensionId),
 				agent: {
 					id: input.agent.name,
 					name: input.agent.name,

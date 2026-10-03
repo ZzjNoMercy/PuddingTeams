@@ -2,12 +2,11 @@
 
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { listExtensionCatalog } from "@/lib/api";
 import type { AgentConfig, PiManagerSettings } from "@/lib/types";
 import { THINKING_LEVELS, useModelCatalog } from "@/lib/model-catalog";
-import { ConfigSchemaForm } from "@/components/agents/form-parts";
+import { ConfigSchemaForm, ModelSelectField } from "@/components/agents/form-parts";
 import type { ConfigDraft } from "@/components/agent-config/draft";
 import { SESSION_EFFECT_NOTE } from "@/components/agent-config/session-effect";
 
@@ -72,7 +71,6 @@ function ManagerFields({
 	onChange: (patch: Partial<ConfigDraft>) => void;
 }) {
 	const catalog = useModelCatalog();
-	const modelOptions = (catalog.models ?? []).map((m) => m.id);
 	const thinkingLevel = draft.manager.thinkingLevel ?? "default";
 	// 档位跟随所选模型（与 composer 同一份 thinkingLevels map）；未选定模型时回退全集。
 	const levels = catalog.levelsFor(draft.manager.model);
@@ -85,22 +83,12 @@ function ManagerFields({
 				<div className="agent-config-card-head"><h2>模型</h2><p>选择此智能体使用的模型与思考强度。</p></div>
 				<div className="agent-config-fields">
 					<div className="agent-config-columns">
-						<label className="agent-config-field">
-							<span>模型</span>
-							<small>智能体使用的模型，留空使用全局默认</small>
-							<Input
-								value={draft.manager.model ?? ""}
-								onChange={(e) => onChange({ manager: { ...draft.manager, model: e.target.value } })}
-								placeholder="如 anthropic/claude-sonnet-4-5；留空用运行时默认"
-								className="font-mono text-xs"
-								list="agent-config-model-options"
-							/>
-							<datalist id="agent-config-model-options">
-								{modelOptions.map((id) => (
-									<option key={id} value={id} />
-								))}
-							</datalist>
-						</label>
+						<ModelSelectField
+							label="模型"
+							current={draft.manager.model ?? ""}
+							description="智能体使用的模型，留空使用全局默认"
+							onSelect={(next) => onChange({ manager: { ...draft.manager, model: next } })}
+						/>
 						<label className="agent-config-field">
 							<span>思考强度</span>
 							<small>留空使用全局默认，档位随所选模型变化</small>
@@ -116,13 +104,16 @@ function ManagerFields({
 								}
 							>
 								<SelectTrigger className="w-full">
-									<SelectValue />
+									{/* 没有 placeholder 时，一旦当前值与任何选项都不匹配，Radix 会渲染成
+									    空白框——用户看到的是空的选择框而不是"默认"。Worker 路径的
+									    EnumSelectField 一直有 placeholder，这里补齐。 */}
+									<SelectValue placeholder="默认（不设置）" />
 								</SelectTrigger>
 								<SelectContent>
 									<SelectItem value="default">默认（不设置）</SelectItem>
 									{/* 已存档位不再被新模型支持时必须仍可见可改，不能静默改写用户配置。 */}
 									{pendingLevel ? <SelectItem value={thinkingLevel}>{thinkingLevel}（当前模型不支持）</SelectItem> : null}
-									{levels.filter((level) => level !== thinkingLevel).map((level) => (
+									{levels.map((level) => (
 										<SelectItem key={level} value={level}>
 											{level}
 										</SelectItem>
@@ -144,7 +135,7 @@ function ManagerFields({
 					<label className="agent-config-field">
 						<span>代码搜索</span>
 						<Select value={draft.manager.codeSearch ?? "off"} onValueChange={(value) => onChange({ manager: { ...draft.manager, codeSearch: value as PiManagerSettings["codeSearch"] } })}>
-							<SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+							<SelectTrigger className="w-full"><SelectValue placeholder="关闭（默认）" /></SelectTrigger>
 							<SelectContent><SelectItem value="off">关闭（默认）</SelectItem><SelectItem value="builtin">Pi 内置 grep/find</SelectItem><SelectItem value="fff">FFF Workspace 索引</SelectItem></SelectContent>
 						</Select>
 						<small>仅 Solo Manager 生效；Direct/Group relay 始终关闭搜索。</small>
@@ -235,7 +226,7 @@ export function ModelSection({
 				<label className="agent-config-field">
 					<span>代码搜索</span>
 					<Select value={draft.codeSearch} onValueChange={(value) => onChange({ codeSearch: value as ConfigDraft["codeSearch"] })}>
-						<SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+						<SelectTrigger className="w-full"><SelectValue placeholder="继承 Harness 默认" /></SelectTrigger>
 						<SelectContent><SelectItem value="inherit">继承 Harness 默认</SelectItem><SelectItem value="builtin">Pi 内置 grep/find</SelectItem><SelectItem value="fff">FFF Workspace 索引</SelectItem></SelectContent>
 					</Select>
 					<small>FFF 只索引当前已信任 Workspace，并按 Workspace 独立保存状态。</small>

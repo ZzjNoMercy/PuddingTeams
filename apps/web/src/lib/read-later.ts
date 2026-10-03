@@ -38,6 +38,8 @@ export interface ReadingVersion {
   warnings: string[];
   capturedAt: string;
   extractorVersion: string;
+  captureMethod: "http" | "saved_html";
+  sourceFilename?: string;
 }
 export interface ReadingDetail {
   item: ReadingItem;
@@ -54,6 +56,26 @@ export interface ReadingDetail {
     bindingId: string;
     createdAt: string;
   }>;
+}
+export interface ReadingCaptureJob {
+  id: string;
+  itemId: string;
+  title: string;
+  source: string;
+  itemAvailable: boolean;
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  step: string;
+  progress: number;
+  errorMessage?: string;
+  createdAt: string;
+}
+export interface ReadingCaptureJobPage {
+  jobs: ReadingCaptureJob[];
+  total: number;
+  counts: { all: number; active: number; problem: number };
+  page: number;
+  pages: number;
+  limit: number;
 }
 export interface ReadingList {
   items: ReadingItem[];

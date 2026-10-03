@@ -15,7 +15,7 @@ export class KnowledgeSelectionStore {
 	private readonly file: string;
 	private pending: Promise<void> = Promise.resolve();
 	constructor(private readonly stateDir: string, private readonly bindings: KnowledgeBindingRegistry,
-		private readonly defaultBindingIds: (ownerId: string) => Promise<string[]> = async () => []) {
+		private readonly defaultBindingIds: (ownerId: string) => Promise<string[]> = async ownerId => (await bindings.list(ownerId)).map(binding => binding.id)) {
 		this.file = path.join(stateDir, "selections.json");
 	}
 
@@ -70,7 +70,11 @@ export class KnowledgeSelectionStore {
 			const current = data.selections[key];
 			if ((current?.revision ?? 0) !== expectedRevision) throw new KnowledgeSelectionError("revision_conflict", "knowledge source selection changed");
 			for (const id of selectedBindingIds) await this.bindings.requireUsable(ownerId, id);
-			const defaults = await this.defaultBindingIds(ownerId);
+			// An offline default is absent from the effective UI selection, not an intentional opt-out.
+			const defaults: string[] = [];
+			for (const id of await this.defaultBindingIds(ownerId)) {
+				if (await this.bindings.requireUsable(ownerId, id).then(() => true, () => false)) defaults.push(id);
+			}
 			const excludedDefaultBindingIds = [...new Set([...(current?.excludedDefaultBindingIds ?? []), ...defaults])]
 				.filter((id) => !selectedBindingIds.includes(id));
 			const next = { ownerId, contextKey, selectedBindingIds: [...selectedBindingIds], excludedDefaultBindingIds, revision: expectedRevision + 1 };

@@ -36,18 +36,11 @@ async function stack(mode: WorkspaceAccessMode = "read_only_shared", strong = fa
 	const input: DelegateInput = {
 		windowId: "w", workspaceId: "workspace", cwdSnapshot: root, managerSessionId: "s", agentId: "worker", agentRevision: 1,
 		message: "inspect", mode: "run", goalId: "g", goalEpoch: 1, workPlanId: "p", workItemId: "i",
-		workspaceExecutionPolicy: { mode, source: "user", reason: "test", baselineStrategy: "filesystem_manifest", promoteOnAcceptance: mode === "isolated_worktree" },
+		workspaceExecutionPolicy: { mode, readOnlyRequirement: "best_effort", source: "user", reason: "test", baselineStrategy: "filesystem_manifest", promoteOnAcceptance: mode === "isolated_worktree" },
 	};
 	const ctx = { cwd: root, env: {} };
-	const approve = async (pending: Awaited<ReturnType<typeof runtime.delegate>>) => {
-		const interaction = pending.interaction!;
-		return runtime.respond(interaction.id, { requestId: `approve:${interaction.id}`, revision: interaction.revision, responses: [{ requestId: interaction.requests[0]!.requestId, action: "approve", scope: "proceed_with_worker" }] }, ctx);
-	};
-	const run = async (patch: Partial<DelegateInput> = {}) => {
-		const result = await runtime.delegate({ ...input, ...patch }, ctx);
-		return result.status === "needs_input" ? approve(result) : result;
-	};
-	return { runtime, input, ctx, approve, run, scopes, store, cwdSeen, root };
+	const run = (patch: Partial<DelegateInput> = {}) => runtime.delegate({ ...input, ...patch }, ctx);
+	return { runtime, input, ctx, run, scopes, store, cwdSeen, root };
 }
 
 for (const strong of [false, true]) {
@@ -116,15 +109,15 @@ test("fenced scope cannot be bypassed, and an unresolved co-owner prevents reuse
 	assert.equal(s.cwdSeen.length, 1);
 });
 
-test("explicit foreign or stale scope requests survive admission but never acquire, capture, or release ownership", async () => {
+test("explicit foreign or stale scope requests fail before start and never acquire, capture, or release ownership", async () => {
 	const s = await stack();
 	const foreign = await s.scopes.begin({ workspacePath: s.root, mode: "exclusive_write", delegationId: "foreign", goalId: "foreign", goalEpoch: 1 });
 	for (const id of [foreign.id, "missing-scope"]) {
 		const pending = await s.runtime.delegate({ ...s.input, workspaceExecutionScopeId: id }, s.ctx);
-		assert.equal(pending.status, "needs_input");
+		assert.equal(pending.status, "failed");
 		assert.equal(pending.delegation.requestedWorkspaceExecutionScopeId, id);
 		assert.equal(pending.delegation.workspaceExecutionScopeId, undefined);
-		const result = await s.approve(pending);
+		const result = pending;
 		assert.equal(result.status, "failed");
 		assert.equal(result.delegation.workerStarted, false);
 		assert.equal(result.delegation.workspaceExecutionScopeId, undefined);

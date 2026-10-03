@@ -2,151 +2,85 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { LoaderIcon, PaperclipIcon, XIcon } from "lucide-react";
+import { ArrowRightIcon, CheckIcon, FileTextIcon, ImageIcon, LayersIcon, LoaderIcon, PaperclipIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
-import { Dialog, DialogBody, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { retryWikiCuratorJob, cancelWikiCuratorJob, createWikiCuratorJob, getWikiCuratorJob, KnowledgeApiError, listWikiCuratorJobs, listAgents, type WikiCuratorJob, type MessageAttachmentInput } from "@/lib/api";
-import { agentDisplayName, type AgentConfig } from "@/lib/types";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { createWikiCuratorJob, listAgents, type MessageAttachmentInput, type WikiCuratorJob } from "@/lib/api";
+import { curatorJobHref } from "@/lib/curator-job-presentation";
 import { WIKI_REVIEW_CHANGED } from "@/lib/wiki-review-queue";
+import styles from "./task-center.module.css";
 
 export interface WikiCuratorDialogProps {
-	bindingId: string;
-	bindingName: string;
-	open: boolean;
-	onOpenChange: (open: boolean) => void;
-	onCandidateReady: (batchId: string) => void;
-	taskPlaceholder?: string;
+	bindingId: string; bindingName: string; open: boolean; onOpenChange: (open: boolean) => void;
 }
 
-/** User instructions become an immutable candidate; this dialog never publishes. */
-export function WikiCuratorDialog({ bindingId, bindingName, open, onOpenChange, onCandidateReady, onUseCompiler, taskPlaceholder }: WikiCuratorDialogProps & { onUseCompiler: () => void }) {
-	const [task, setTask] = useState("");
-	const [uploads, setUploads] = useState<File[]>([]);
-	const [uploadError, setUploadError] = useState<string | null>(null);
-	const uploadInput = useRef<HTMLInputElement>(null);
-	const [agents, setAgents] = useState<AgentConfig[] | null>(null);
-	const [agentId, setAgentId] = useState("");
-	const [job, setJob] = useState<WikiCuratorJob | null>(null);
-	const [error, setError] = useState<string | null>(null);
-	const [submitting, setSubmitting] = useState(false);
-	const [cancelling, setCancelling] = useState(false);
-	const [cancelError, setCancelError] = useState<string | null>(null);
-	const [reload, setReload] = useState(0);
-	const request = useRef<{ key: string; operationId: string } | null>(null);
-	const jobMutation = useRef(0);
-	const busy = submitting || cancelling || job?.status === "queued" || job?.status === "running";
-	const activeJobId = job?.status === "queued" || job?.status === "running" ? job.id : null;
+/** A fresh intake is independent of existing jobs. Radix owns focus, Escape and scroll locking. */
+export function WikiCuratorDialog(props: WikiCuratorDialogProps) {
+	const submitting = useRef(false);
+	const changeOpen = (open: boolean) => {if (!submitting.current) props.onOpenChange(open);};
+	return <Dialog open={props.open} onOpenChange={changeOpen}>{props.open ? <IntakeForm key={props.bindingId} {...props} onOpenChange={changeOpen} onBusyChange={busy => {submitting.current = busy;}} /> : null}</Dialog>;
+}
 
+function IntakeForm({ bindingId, bindingName, onOpenChange, onBusyChange }: WikiCuratorDialogProps & {onBusyChange: (busy: boolean) => void}) {
+	const [material, setMaterial] = useState(""), [request, setRequest] = useState("");
+	const [uploads, setUploads] = useState<File[]>([]), [error, setError] = useState<string | null>(null);
+	const [agentId, setAgentId] = useState<string | null>(null), [configError, setConfigError] = useState<string | null>(null);
+	const [loadingAgents, setLoadingAgents] = useState(true), [reload, setReload] = useState(0), [busy, setBusy] = useState(false);
+	const [receipt, setReceipt] = useState<WikiCuratorJob | null>(null);
+	const fileInput = useRef<HTMLInputElement>(null), materialInput = useRef<HTMLTextAreaElement>(null);
+	const operation = useRef<{ key: string; id: string } | null>(null), lock = useRef(false), alive = useRef(true);
+	useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
 	useEffect(() => {
-		if (!open) return;
 		let active = true;
-		void Promise.all([listAgents(), listWikiCuratorJobs(bindingId)]).then(([items, jobs]) => {
+		void listAgents().then(items => {
 			if (!active) return;
-			setCancelError(null);
-			const workers = items.filter((agent) => agent.enabled !== false && agent.builtinId === "wiki" && agent.connector?.connectorId === "pi" && agent.connector.transport === "sdk");
-			setAgents(workers);
-			setAgentId((previous) => workers.some((agent) => agent.name === previous) ? previous : workers.find((agent) => /wiki|知识库/i.test(`${agent.name} ${agent.displayName ?? ""}`))?.name ?? workers[0]?.name ?? "");
-			const running = jobs.find((item) => item.status === "queued" || item.status === "running");
-			const resumable = running ?? jobs.find((item) => item.status === "needs_attention" || item.status === "failed");
-			setJob((previous) => running ?? jobs.find((item) => item.id === previous?.id) ?? resumable ?? null);
-			if (resumable) { setTask(resumable.task); setAgentId(resumable.agentId); }
-			setError(null);
-		}).catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : String(cause)); });
+			const workers = items.filter(a => a.enabled !== false && a.builtinId === "wiki" && a.connector?.connectorId === "pi" && a.connector.transport === "sdk");
+			setAgentId((workers.find(a => a.name === "wiki") ?? workers[0])?.name ?? ""); setConfigError(null); setLoadingAgents(false);
+		}).catch(cause => { if (active) { setConfigError(cause instanceof Error ? cause.message : "管理员暂不可用，请重试。"); setLoadingAgents(false); } });
 		return () => { active = false; };
-	}, [open, bindingId, reload]);
-
-	useEffect(() => {
-		if (!activeJobId || !open) return;
-		let active = true;
-		let loading = false;
-		const tick = async () => {
-			if (document.hidden || loading) return;
-			loading = true;
-			const mutation = jobMutation.current;
-			try {
-				const { job: next } = await getWikiCuratorJob(activeJobId);
-				if (active && mutation === jobMutation.current) { setJob(next); setError(null); if (next.status === "pending_review") window.dispatchEvent(new Event(WIKI_REVIEW_CHANGED)); }
-			} catch (cause) { if (active) setError(cause instanceof Error ? cause.message : String(cause)); }
-			finally { loading = false; }
-		};
-		void tick();
-		const timer = window.setInterval(() => void tick(), 1500);
-		document.addEventListener("visibilitychange", tick);
-		return () => { active = false; window.clearInterval(timer); document.removeEventListener("visibilitychange", tick); };
-	}, [activeJobId, open]);
-
-	const submit = async () => {
-		if (busy || !task.trim() || !agentId || error) return;
-		const key = JSON.stringify([bindingId, agentId, task.trim(), uploads.map((file) => [file.name, file.size, file.lastModified])]);
-		if (request.current?.key !== key) request.current = { key, operationId: crypto.randomUUID() };
-		setSubmitting(true);
+	}, [reload]);
+	const addFiles = (files: FileList | null) => {
+		const incoming = Array.from(files ?? []);
+		if (incoming.some(f => !(/\.(txt|md|markdown)$/i.test(f.name) || ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(f.type)))) { setError("请添加文字文件或图片，暂不支持其他格式。"); return; }
+		const next = [...uploads];
+		for (const file of incoming) if (!next.some(f => f.name === file.name && f.size === file.size && f.lastModified === file.lastModified)) next.push(file);
+		if (next.length > 5 || next.some(f => f.size > 8 * 1024 * 1024) || next.reduce((n,f) => n + f.size,0) > 20 * 1024 * 1024) { setError("一次最多 5 个附件，单个不超过 8 MB，合计不超过 20 MB。"); return; }
+		setUploads(next); setError(null);
+	};
+	const submit = async (event: React.FormEvent) => {
+		event.preventDefault();
+		if (lock.current || !agentId || (!material.trim() && !uploads.length)) return;
+		lock.current = true; onBusyChange(true); setBusy(true); setError(null);
+		const key = JSON.stringify([bindingId,agentId,material,request,uploads.map(f => [f.name,f.size,f.lastModified])]);
+		if (operation.current?.key !== key) operation.current = {key,id:crypto.randomUUID()};
 		try {
-			const attachments = await Promise.all(uploads.map((file) => new Promise<MessageAttachmentInput>((resolve, reject) => {
-				const reader = new FileReader();
-				reader.onerror = () => reject(new Error(`读取附件失败：${file.name}`));
-				reader.onload = () => {
-					const dataUrl = String(reader.result);
-					resolve({ filename: file.name, mediaType: /\.(md|markdown)$/i.test(file.name) ? "text/markdown" : /\.txt$/i.test(file.name) ? "text/plain" : file.type || "application/octet-stream", data: dataUrl.slice(dataUrl.indexOf(",") + 1) });
-				};
-				reader.readAsDataURL(file);
+			const attachments = await Promise.all(uploads.map(file => new Promise<MessageAttachmentInput>((resolve,reject) => {
+				const reader = new FileReader(); reader.onerror = () => reject(new Error(`读取附件失败：${file.name}`));
+				reader.onload = () => { const value = String(reader.result); resolve({filename:file.name,mediaType:/\.(md|markdown)$/i.test(file.name) ? "text/markdown" : /\.txt$/i.test(file.name) ? "text/plain" : file.type,data:value.slice(value.indexOf(",")+1)}); }; reader.readAsDataURL(file);
 			})));
-			const response = await createWikiCuratorJob({ operationId: request.current.operationId, bindingId, agentId, task: task.trim(), ...(attachments.length ? { uploads: attachments } : {}) });
-			setJob(response.job);
-			setError(null);
-			if (response.job.status === "pending_review") window.dispatchEvent(new Event(WIKI_REVIEW_CHANGED));
-		} catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
-		finally { setSubmitting(false); }
+			if (!alive.current) return;
+			const result = await createWikiCuratorJob({operationId:operation.current.id,bindingId,agentId,material,task:request.trim() || "整理提供的资料，遵循知识库已有结构，保留事实来源与不确定性。",...(attachments.length ? {uploads:attachments} : {})});
+			window.dispatchEvent(new Event(WIKI_REVIEW_CHANGED));
+			if (alive.current) setReceipt(result.job);
+		} catch (cause) { if (alive.current) setError(cause instanceof Error ? cause.message : "提交未成功，资料已保留，请重试。"); }
+		finally { onBusyChange(false); lock.current = false; if (alive.current) setBusy(false); }
 	};
-
-	const retry = async () => {
-		if (!job || busy || !["failed", "needs_attention"].includes(job.status)) return;
-		const key = `retry:${job.id}`;
-		if (request.current?.key !== key) request.current = { key, operationId: crypto.randomUUID() };
-		setSubmitting(true); setError(null);
-		try { const response = await retryWikiCuratorJob(job.id, request.current.operationId); setJob(response.job); }
-		catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
-		finally { setSubmitting(false); }
-	};
-
-	const cancel = async () => {
-		if (!job || cancelling || !["queued", "running", "needs_attention"].includes(job.status)) return;
-		setCancelling(true);
-		setCancelError(null);
-		jobMutation.current += 1;
-		try {
-			const response = await cancelWikiCuratorJob(job.id);
-			jobMutation.current += 1;
-			setJob(response.job);
-			setError(null);
-			request.current = null;
-		} catch (cause) {
-			setCancelError(cause instanceof KnowledgeApiError && cause.status === 409 ? "状态变化，请刷新。候选可能已进入审核。" : cause instanceof Error ? cause.message : String(cause));
-		} finally { setCancelling(false); }
-	};
-
-	return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent className="flex max-h-[85dvh] max-w-lg flex-col overflow-hidden">
-		<DialogHeader><DialogTitle>Wiki 管理员 · {bindingName}</DialogTitle><DialogDescription>说明要补充或整理的内容。管理员生成候选，逐文件审核并确认后才会更新知识库。</DialogDescription></DialogHeader>
-		<DialogBody className="space-y-4">
-			{error ? <p role="alert" className="text-sm text-destructive">{error} <button type="button" onClick={() => setReload((value) => value + 1)} className="underline">重新加载</button></p> : null}
-			{job?.status === "pending_review" && job.candidateBatchId ? <div className="space-y-4"><p className="text-sm">候选已生成，知识库尚未更新。</p><Button onClick={() => { onOpenChange(false); onCandidateReady(job.candidateBatchId!); }}>查看候选并审核</Button></div> : job?.status === "no_changes" || job?.status === "needs_attention" ? <div className="space-y-4"><p role="status" className="text-sm">{job.status === "needs_attention" ? "来源原件已保存，本次尚未生成候选。请处理解析问题，或补充可核对的文字后重新整理。" : "本次整理没有生成文件变更。"}</p>{job.status === "needs_attention" && job.failureCode ? <p role="alert" className="text-sm text-destructive">{job.failureCode}</p> : null}<Button variant="outline" disabled={busy} onClick={() => { setJob(null); request.current = null; }}>继续整理</Button></div> : <>
-				{job?.status === "failed" || job?.status === "cancelled" ? <p role="alert" className="text-sm text-destructive">{job.status === "cancelled" ? "整理已取消。" : `整理失败${job.failureCode ? `（${job.failureCode}）` : ""}。`}<button type="button" onClick={() => { setJob(null); request.current = null; }} className="ml-2 underline">重新发起</button></p> : null}
-				<div><label htmlFor="wiki-curator-task" className="mb-1 block text-sm font-medium">需要整理什么</label><Textarea id="wiki-curator-task" value={task} onChange={(event) => setTask(event.target.value)} disabled={busy} placeholder={taskPlaceholder ?? "例如：项目发布日期改为 10 月 22 日，请更新项目页、相关讨论和索引，并说明依据。"} className="min-h-32" /></div>
-				<div><input ref={uploadInput} type="file" accept=".txt,.md,.markdown,.pdf,image/*" multiple hidden onChange={(event) => {
-					const next = [...uploads, ...Array.from(event.target.files ?? [])];
-					event.target.value = "";
-					if (next.length > 5 || next.some((file) => file.size > 8 * 1024 * 1024) || next.reduce((sum, file) => sum + file.size, 0) > 20 * 1024 * 1024) { setUploadError("最多 5 个附件，每个不超过 8MB，合计不超过 20MB。"); return; }
-					setUploads(next); setUploadError(null); request.current = null;
-				}} /><Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => uploadInput.current?.click()}><PaperclipIcon size={14} />添加来源附件</Button><p className="mt-2 text-xs text-muted-foreground">文字与 Markdown 可作为依据；图片会按管理员模型能力提取，并保留原件供核对。PDF 仅保留原件，解析尚未接入。</p>{uploadError ? <p role="alert" className="mt-2 text-xs text-destructive">{uploadError}</p> : null}<div className="mt-2 space-y-1">{uploads.map((file, index) => <div key={`${file.name}:${index}`} className="flex items-center justify-between gap-2 rounded border border-border px-2 py-1 text-xs"><span className="min-w-0 truncate">{file.name}</span><button type="button" disabled={busy} onClick={() => { setUploads((previous) => previous.filter((_, at) => at !== index)); request.current = null; setUploadError(null); }} aria-label={`移除附件 ${file.name}`}><XIcon size={13} /></button></div>)}</div></div>
-				<div><p className="mb-1 text-sm font-medium">Wiki 管理员</p>{!agents ? <p className="text-sm text-muted-foreground">正在加载…</p> : agents.length === 0 ? <p className="text-sm text-muted-foreground">内置 Wiki 管理员尚未启用。<Link href="/agents" className="ml-1 underline">配置智能体</Link></p> : <Select value={agentId} onValueChange={setAgentId} disabled={busy}><SelectTrigger aria-label="选择 Wiki 管理员"><SelectValue placeholder="选择管理员" /></SelectTrigger><SelectContent>{agents.map((agent) => <SelectItem key={agent.name} value={agent.name}>{agentDisplayName(agent)}</SelectItem>)}</SelectContent></Select>}</div>
-				{busy ? <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><LoaderIcon size={14} className="animate-spin" />{submitting ? "正在提交…" : job?.status === "queued" ? "正在排队…" : "正在整理候选…"} 关闭后任务继续运行。</p> : null}
-				<div className="flex justify-end gap-2"><Button variant="outline" onClick={() => onOpenChange(false)}>关闭</Button><Button disabled={busy || !task.trim() || !agentId || Boolean(error) || job?.status === "failed" || job?.status === "cancelled"} onClick={() => void submit()}>生成审核候选</Button></div>
-			</>}
-			{job && ["needs_attention", "failed"].includes(job.status) ? <Button type="button" disabled={busy} onClick={() => void retry()}>{submitting ? "正在重试…" : "重试解析与整理"}</Button> : null}
-			{job && ["queued", "running", "needs_attention"].includes(job.status) ? <Button type="button" variant="outline" size="sm" disabled={cancelling} onClick={() => void cancel()}>{cancelling ? "正在取消…" : "取消整理"}</Button> : null}
-			{cancelError ? <p role="alert" className="text-sm text-destructive">{cancelError} <button type="button" onClick={() => setReload((value) => value + 1)} className="underline">刷新状态</button></p> : null}
-			<button type="button" disabled={busy} onClick={onUseCompiler} className="text-xs text-muted-foreground underline disabled:opacity-40">使用 Codex 编译已同步笔记</button>
-		</DialogBody>
-	</DialogContent></Dialog>;
+	if (receipt) return <DialogContent className={styles.receiptDialog}>
+		<DialogHeader className={styles.receiptHeader}><span className={styles.receiptCheck}><CheckIcon size={25} /></span><DialogTitle>资料已收到</DialogTitle><DialogDescription>已提交到{bindingName}。你可以先离开，<br />整理完成后再来审核修改。</DialogDescription></DialogHeader>
+		<footer className={styles.dialogFooter}><Button variant="outline" onClick={() => onOpenChange(false)}>返回知识库</Button><Button asChild><Link href={curatorJobHref(receipt.id,bindingId)} onClick={() => onOpenChange(false)}>查看任务<ArrowRightIcon size={15} /></Link></Button></footer>
+	</DialogContent>;
+	return <DialogContent className={styles.intakeDialog} showCloseButton={!busy} onEscapeKeyDown={event => {if (busy) event.preventDefault();}} onInteractOutside={event => {if (busy) event.preventDefault();}} onOpenAutoFocus={event => {event.preventDefault(); materialInput.current?.focus();}}>
+		<DialogHeader className={styles.intakeHeader}><DialogTitle>添加资料</DialogTitle><DialogDescription>交给 Wiki 管理员整理，完成后由你确认。</DialogDescription></DialogHeader>
+		<form className={styles.intakeForm} onSubmit={event => void submit(event)}>
+			<div className={styles.intakeBody}>
+				<div className={styles.destination}><span>整理到</span><strong><LayersIcon size={15} />{bindingName}</strong></div>
+				<label className={styles.fieldLabel} htmlFor="wiki-material">资料内容</label>
+				<div className={styles.materialEditor}><textarea id="wiki-material" ref={materialInput} value={material} maxLength={100_000} disabled={busy} onChange={e => setMaterial(e.target.value)} placeholder="粘贴要保存的资料，或写下想记住的事情…" /><div className={styles.materialTools}><input ref={fileInput} type="file" hidden accept=".txt,.md,.markdown,image/png,image/jpeg,image/gif,image/webp" multiple onChange={e => {addFiles(e.target.files); e.target.value = "";}} /><button type="button" disabled={busy} onClick={() => fileInput.current?.click()}><PaperclipIcon size={16} />添加附件</button><span>文字文件、图片</span></div></div>
+				{uploads.length ? <ul className={styles.attachments} aria-label="已添加的附件">{uploads.map((f,i) => <li key={`${f.name}:${i}`}><span className={styles.attachmentIcon}>{f.type.startsWith("image/") ? <ImageIcon size={18} /> : <FileTextIcon size={18} />}</span><span><strong>{f.name}</strong><small>{f.size < 1024*1024 ? `${Math.max(1,Math.round(f.size/1024))} KB` : `${(f.size/1024/1024).toFixed(1)} MB`}</small></span><button type="button" disabled={busy} aria-label={`移除附件 ${f.name}`} onClick={() => {setUploads(items => items.filter((_,at) => at !== i));setError(null);}}><XIcon size={15} /></button></li>)}</ul> : null}
+				<label className={`${styles.fieldLabel} ${styles.requestLabel}`} htmlFor="wiki-request">整理要求<span>选填</span></label><textarea className={styles.requestEditor} id="wiki-request" rows={2} maxLength={20_000} value={request} disabled={busy} onChange={e => setRequest(e.target.value)} placeholder="有特别的整理方式，可以在这里说明。" />
+				{loadingAgents ? <p className={styles.hint}>正在连接管理员…</p> : configError ? <p role="alert" className={styles.error}>{configError} <button type="button" onClick={() => {setLoadingAgents(true);setReload(n => n+1);}}>重试</button></p> : !agentId ? <p className={styles.hint}>知识库管理员尚未启用。<Link href="/agents">前往设置</Link></p> : null}
+				{error ? <p role="alert" className={styles.error}>{error}</p> : null}
+			</div><footer className={styles.dialogFooter}><span className={styles.reviewNote}>审核通过后才会更新知识库</span><div><Button variant="outline" type="button" disabled={busy} onClick={() => onOpenChange(false)}>取消</Button><Button type="submit" disabled={busy || loadingAgents || Boolean(configError) || !agentId || (!material.trim() && !uploads.length)}>{busy ? <><LoaderIcon size={15} className="animate-spin" />正在提交</> : <>开始整理<ArrowRightIcon size={15} /></>}</Button></div></footer>
+		</form>
+	</DialogContent>;
 }

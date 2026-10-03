@@ -5,7 +5,7 @@ import path from "node:path";
 export interface NoteHistoryEvent {
 	id: string; bindingId: string; noteId: string; relativePath: string; previousPath?: string;
 	contentHash: string; snapshotRef: string; previousHash?: string; previousSnapshotRef?: string;
-	actorId: string; channel: "initial" | "agent_publish" | "external_sync";
+	actorId: string; channel: "initial" | "agent_publish" | "external_sync" | "manual_edit";
 	changeKind?: "create" | "update" | "rename" | "delete";
 	deleted?: boolean;
 	acceptedAt: string; operationId: string; batchId?: string; batchRevision?: number; decisionId?: string;

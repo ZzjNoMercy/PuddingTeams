@@ -28,14 +28,14 @@ export async function readImageDiskBytes(absolute: string): Promise<Buffer> {
 		return bytes.subarray(0, read.bytesRead);
 	} finally { await handle.close(); }
 }
-export function imageAssetPath(hash: string, mediaType: string): string {
+export function imageAssetPath(hash: string, mediaType: string, contentPrefix = ""): string {
 	const extension = IMAGE_ASSET_EXTENSIONS[mediaType];
-	if (!/^[a-f0-9]{64}$/.test(hash) || !extension) throw new Error("图片资产格式或哈希无效");
-	return `assets/images/${hash}.${extension}`;
+	if (!["", "wiki/"].includes(contentPrefix) || !/^[a-f0-9]{64}$/.test(hash) || !extension) throw new Error("图片资产格式或哈希无效");
+	return `${contentPrefix}assets/images/${hash}.${extension}`;
 }
 export function assertImageAssetBytes(targetPath: string, bytes: Buffer, mediaType?: string): string {
 	const actual = actualImageMediaType(bytes);
-	if (!actual || (mediaType && actual !== mediaType) || imageAssetPath(hashBufferSha256(bytes), actual) !== targetPath) throw new Error("图片资产路径、签名或哈希不一致");
+	if (!actual || (mediaType && actual !== mediaType) || imageAssetPath(hashBufferSha256(bytes), actual, targetPath.startsWith("wiki/") ? "wiki/" : "") !== targetPath) throw new Error("图片资产路径、签名或哈希不一致");
 	return actual;
 }
 export function relativeImagePath(pagePath: string, assetPath: string): string {
@@ -45,7 +45,7 @@ export function resolveImagePath(pagePath: string, target: string): string {
 	if (!target || /^[A-Za-z][A-Za-z0-9+.-]*:|^\//.test(target) || /[\\\u0000-\u001f?#]/.test(target)) throw new Error("候选图片只能引用宿主冻结的库内相对资源");
 	let decoded: string; try { decoded = decodeURIComponent(target); } catch { throw new Error("图片相对路径编码无效"); }
 	const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(pagePath), decoded));
-	if (!/^assets\/images\/[a-f0-9]{64}\.(png|jpg|gif|webp|avif)$/.test(resolved)) throw new Error("候选图片路径不属于宿主管理的图片资产");
+	if (!/^(?:wiki\/)?assets\/images\/[a-f0-9]{64}\.(png|jpg|gif|webp|avif)$/.test(resolved)) throw new Error("候选图片路径不属于宿主管理的图片资产");
 	return resolved;
 }
 /** Standard inline/reference Markdown images only; code examples are not references. */
@@ -57,11 +57,11 @@ export function markdownImageTargets(content: string): string[] {
 	});
 	return targets;
 }
-export function sourceImageAssets(sources: KnowledgeSource[]): Array<{ sourceId: string; path: string; hash: string; mediaType: string }> {
-	return sources.flatMap((source) => (source.kind === "image" ? [{ hash: source.originalHash, mediaType: source.mediaType }] : source.assets ?? []).map(asset => ({ sourceId: source.id, path: imageAssetPath(asset.hash, asset.mediaType), hash: asset.hash, mediaType: asset.mediaType })));
+export function sourceImageAssets(sources: KnowledgeSource[], contentPrefix = ""): Array<{ sourceId: string; path: string; hash: string; mediaType: string }> {
+	return sources.flatMap((source) => (source.kind === "image" ? [{ hash: source.originalHash, mediaType: source.mediaType }] : source.assets ?? []).map(asset => ({ sourceId: source.id, path: imageAssetPath(asset.hash, asset.mediaType, contentPrefix), hash: asset.hash, mediaType: asset.mediaType })));
 }
-export function attachSourceImages(pagePath: string, content: string, usedSources: string[], sources: KnowledgeSource[]): { content: string; assets: ReturnType<typeof sourceImageAssets> } {
-	const assets = sourceImageAssets(sources.filter((source) => usedSources.includes(source.id)));
+export function attachSourceImages(pagePath: string, content: string, usedSources: string[], sources: KnowledgeSource[], contentPrefix = ""): { content: string; assets: ReturnType<typeof sourceImageAssets> } {
+	const assets = sourceImageAssets(sources.filter((source) => usedSources.includes(source.id)), contentPrefix);
 	let updated = content;
 	const paths = new Set(markdownImageTargets(updated).map((target) => resolveImagePath(pagePath, target)));
 	for (const target of paths) if (!assets.some((asset) => asset.path === target)) throw new Error("候选图片缺少该页已采纳的原件来源");

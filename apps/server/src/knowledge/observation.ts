@@ -38,6 +38,7 @@ export interface ObservationRecord {
 	duplicates: Array<{ declaredId: string; paths: string[] }>;
 }
 
+
 export function withinKnowledgeRoot(root: string, target: string): boolean {
 	const relative = path.relative(root, target);
 	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
@@ -150,7 +151,11 @@ export class KnowledgeObservationService {
 	setPublicationJournal(journal: Pick<PublishJournal, "protectedCandidateHashes">): void { this.deps.journal = journal; }
 
 	async scan(binding: KnowledgeBinding): Promise<ObservationRecord> {
-		return withKnowledgeMutation(binding.id, async () => {
+		return withKnowledgeMutation(binding.id, () => this.scanWithinMutation(binding));
+	}
+
+	/** Internal writer only: caller must already hold withKnowledgeMutation(binding.id). */
+	async scanWithinMutation(binding: KnowledgeBinding): Promise<ObservationRecord> {
 			const root = await checkedKnowledgeRoot(binding), diskPaths = await walkNotePaths(root);
 			const guarded = await this.deps.journal?.protectedCandidateHashes(binding.id) ?? new Map<string, Set<string>>();
 			const disk = new Map<string, { bytes: Buffer; hash: string; size: number; diskIdentity: string; declaredId?: string; title?: string }>();
@@ -199,7 +204,6 @@ export class KnowledgeObservationService {
 			await this.deps.searchIndex?.load(binding.id, ledger);
 			const record = { scannedAt: new Date().toISOString(), files, duplicates };
 			this.records.set(binding.id, record); return record;
-		});
 	}
 
 	/** 服务启动时全量扫描可用绑定，并每 30s 周期重扫（unref，不阻止退出）。 */

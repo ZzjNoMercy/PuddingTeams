@@ -31,6 +31,7 @@ export interface AcceptanceLedger {
 	/** Reviewed navigation/log snapshots are separate from notes and cannot be normal compile sources. */
 	controlEntries?: Record<string, StoredAcceptedControlVersion>;
 	historyOutbox?: NoteHistoryEvent[];
+	pendingManualEdits?: Record<string, { operationId: string; actorId: string; beforeHash: string; contentHash: string }>;
 }
 
 export interface AdoptNoteItem {
@@ -217,6 +218,26 @@ export class KnowledgeAcceptanceStore {
 		return this.adoptBatch(bindingId, items, expectedRevision, true, context);
 	}
 
+	/** Durable intent lets a post-write scan recover user attribution after a crash or sync failure. */
+	async prepareManualEdit(bindingId: string, relativePath: string, beforeHash: string, contentHash: string, actorId: string): Promise<string> {
+		return this.serial(bindingId, async () => {
+			const ledger = structuredClone(await this.load(bindingId)), operationId = randomUUID();
+			ledger.pendingManualEdits ??= {};
+			ledger.pendingManualEdits[relativePath] = { operationId, actorId, beforeHash, contentHash };
+			await this.save(bindingId, ledger); this.cache.set(bindingId, ledger);
+			return operationId;
+		});
+	}
+
+	async discardManualEdit(bindingId: string, relativePath: string, operationId: string): Promise<void> {
+		await this.serial(bindingId, async () => {
+			const ledger = structuredClone(await this.load(bindingId));
+			if (ledger.pendingManualEdits?.[relativePath]?.operationId !== operationId) return;
+			delete ledger.pendingManualEdits[relativePath];
+			await this.save(bindingId, ledger); this.cache.set(bindingId, ledger);
+		});
+	}
+
 	/** Replace current external observations atomically; this is never a human approval. */
 	async syncExternal(bindingId: string, items: AdoptNoteItem[], presentPaths: string[], protectedPaths: string[], unreadablePaths: string[]): Promise<void> {
 		await this.serial(bindingId, async () => {
@@ -227,6 +248,9 @@ export class KnowledgeAcceptanceStore {
 			const entries: typeof ledger.entries = {}, controls: NonNullable<typeof ledger.controlEntries> = {};
 			let changed = false; const observedAt = new Date().toISOString();
 			for (const item of items) {
+				const intent = ledger.pendingManualEdits?.[item.relativePath];
+				const edited = intent?.contentHash === item.contentHash;
+				if (intent) delete ledger.pendingManualEdits![item.relativePath];
 				const control = isControlDocument(item.relativePath);
 				if (control && !["index.md", "log.md"].includes(path.posix.basename(item.relativePath).toLowerCase())) continue;
 				const key = control ? `path:${item.relativePath}` : noteIdentityKey({ declaredNoteId: item.declaredNoteId, normalizedRelativePath: item.relativePath });
@@ -245,16 +269,16 @@ export class KnowledgeAcceptanceStore {
 				const same = previous?.availability === "current" && previous.contentHash === item.contentHash && previous.relativePath === item.relativePath && JSON.stringify(previous.noteIdentity) === JSON.stringify(identity);
 				const record: StoredAcceptedNoteVersion = same ? { ...previous!, diskIdentity: item.diskIdentity } : {
 					noteId: previous?.noteId ?? randomUUID(), noteIdentity: identity, relativePath: item.relativePath, title: item.title,
-					contentHash: item.contentHash, snapshotRef: item.snapshotRef, acceptedBy: "platform-observer", acceptedAt: observedAt,
+					contentHash: item.contentHash, snapshotRef: item.snapshotRef, acceptedBy: edited ? intent.actorId : "platform-observer", acceptedAt: observedAt,
 					acceptanceId: randomUUID(), sourceRefs: item.sourceIds ?? [], availability: "current", diskIdentity: item.diskIdentity,
 				};
 				if (!same) {
 					changed = true;
 					if (!control) ledger.historyOutbox.push({ id: record.acceptanceId, bindingId, noteId: record.noteId!, relativePath: record.relativePath,
 						...(previous ? { previousPath: previous.relativePath, previousHash: previous.contentHash, previousSnapshotRef: previous.snapshotRef } : {}),
-						contentHash: record.contentHash, snapshotRef: record.snapshotRef, actorId: "platform-observer", channel: "external_sync",
+						contentHash: record.contentHash, snapshotRef: record.snapshotRef, actorId: edited ? intent.actorId : "platform-observer", channel: edited ? "manual_edit" : "external_sync",
 						changeKind: !previous ? "create" : previous.relativePath !== record.relativePath ? "rename" : "update", acceptedAt: observedAt,
-						operationId: record.acceptanceId, summary: "平台观察外部文件变化（非人工确认）", sourceIds: record.sourceRefs });
+						operationId: edited ? intent.operationId : record.acceptanceId, summary: edited ? "用户在知识库页面保存修改" : "平台观察外部文件变化（非人工确认）", sourceIds: record.sourceRefs });
 				}
 				if (control) {
 					if (["index.md", "log.md"].includes(path.posix.basename(item.relativePath).toLowerCase())) controls[key] = { ...record, controlKind: path.posix.basename(item.relativePath).toLowerCase() === "index.md" ? "index" : "log" };

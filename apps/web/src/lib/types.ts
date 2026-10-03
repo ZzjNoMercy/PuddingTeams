@@ -923,6 +923,7 @@ export interface WorkItem {
 	};
 	workspaceExecutionPolicy: {
 		mode: WorkspaceAccessMode;
+		readOnlyRequirement?: "best_effort" | "enforced";
 		source: "harness_default" | "manager_derived" | "user";
 		reason: string;
 		baselineStrategy: "git_tree" | "filesystem_manifest" | "external_snapshot";
@@ -983,7 +984,7 @@ export interface DelegationTrace {
 	completionBoundary?: string;
 	executionState: "admitted" | "waiting_admission" | "running" | "waiting_input" | "reported_completed" | "reported_failed" | "cancel_requested" | "reconciling" | "cancelled" | "observation_lost";
 	workerStarted?: boolean;
-	readOnlyAssessment?: "verified" | "unverified_user_accepted" | "not_required";
+	readOnlyAssessment?: "verified" | "unverified" | "unverified_observed" | "unverified_user_accepted" | "not_required";
 	receipt?: {
 		contractHash?: string;
 		collectionStatus?: "complete" | "partial" | "failed";

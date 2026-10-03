@@ -1,8 +1,9 @@
 "use client";
 
+import { KnowledgeJobCard } from "./knowledge-job-card";
+
 import { createContext, type ComponentProps, type ReactNode, useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
-import Link from "next/link";
-import { CheckIcon, ChevronDownIcon, ChevronRightIcon, CircleAlertIcon, ClipboardCheckIcon, CopyIcon, ExternalLinkIcon, FilePenIcon, FileSearchIcon, FileTextIcon, FolderIcon, ListTreeIcon, RotateCcwIcon, SquareIcon, SquareTerminalIcon, UserPlusIcon, UsersIcon, WrenchIcon } from "lucide-react";
+import { CheckIcon, ChevronDownIcon, ChevronRightIcon, CircleAlertIcon, CopyIcon, ExternalLinkIcon, FilePenIcon, FileSearchIcon, FileTextIcon, FolderIcon, ListTreeIcon, RotateCcwIcon, SquareIcon, SquareTerminalIcon, UserPlusIcon, UsersIcon, WrenchIcon } from "lucide-react";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
 	Message as AiMessage,
@@ -22,6 +23,7 @@ import { writeTextToClipboard } from "@/core/clipboard";
 import { delegateWorker, groupConsecutiveModelErrors, isDelegateCall } from "@/lib/events";
 import { useAgentLabel } from "@/lib/avatars";
 import { formatTokens } from "@/lib/session-stats";
+import { toolSummary } from "@/lib/tool-summary";
 import { cancelDelegation, openRoomFile } from "@/lib/api";
 import type { ChatMessage, ToolCallView, WindowType } from "@/lib/types";
 import { toast } from "sonner";
@@ -876,6 +878,7 @@ function CustomMessageEntry({
 		| {
 				worker?: string;
 				jobId?: string;
+				failureCode?: string;
 				bindingId?: string;
 				batchId?: string;
 				status?: string;
@@ -897,10 +900,7 @@ function CustomMessageEntry({
 		| undefined;
 
 	if (message.customType === "pudding:knowledge_job") {
-		const status = details?.status ?? "";
-		const labels: Record<string, string> = { queued: "正在排队", running: "正在整理", pending_review: "候选已生成", no_changes: "没有文件变更", needs_attention: "需要补充来源", failed: "整理失败", cancelled: "已取消" };
-		const failed = status === "failed" || status === "needs_attention";
-		return <div className="w-full rounded-xl border border-border bg-muted/30 px-4 py-3"><div className="flex flex-wrap items-center gap-2"><ClipboardCheckIcon size={16} className={failed ? "text-amber-600 dark:text-amber-400" : "text-primary"} /><strong className="text-sm font-medium">Wiki 管理员</strong><Badge variant={failed ? "outline" : "secondary"}>{labels[status] ?? "整理记录"}</Badge></div><p className="mt-2 whitespace-pre-wrap text-sm text-muted-foreground">{message.content}</p>{details?.batchId ? <Link href={`/knowledge/review?batch=${encodeURIComponent(details.batchId)}`} className="mt-3 inline-flex items-center gap-1.5 text-sm text-primary hover:underline">查看固定候选并审核<ChevronRightIcon size={14} /></Link> : details?.bindingId ? <Link href={`/knowledge?vault=${encodeURIComponent(details.bindingId)}`} className="mt-3 inline-flex items-center gap-1.5 text-sm text-primary hover:underline">打开知识库<ChevronRightIcon size={14} /></Link> : null}</div>;
+		return <KnowledgeJobCard content={message.content} details={details} />;
 	}
 
 	// direct 直派（§5.2）：用户发言以普通用户气泡呈现。
@@ -1223,8 +1223,8 @@ function ModelErrorSummary({ messages, recovered = false }: { messages: ChatMess
 
 /**
  * 工具折叠摘要行：一段里连续的非 delegate 工具调用折成一行
- * 「使用了 N 个工具，运行 M 个命令」（M=bash 数，为 0 时省略后半句），
- * chevron 展开看每个工具细节；有工具在跑时显示「执行中 · 工具名」+ 脉冲点。
+ * 「使用了 X 个工具，成功 Y 个，失败 Z 个」，以同一低强调行显示，
+ * chevron 展开看每个工具细节；未完成/中断状态单独统计，不计为成功。
  */
 function ToolSummaryRow({
 	calls,
@@ -1239,13 +1239,7 @@ function ToolSummaryRow({
 }) {
 	const [open, setOpen] = useState(false);
 	const { rootRef, toggle: toggleKeepingAnchor } = useAnchorPreservingToggle<HTMLDivElement>();
-	const running = calls.filter((c) => c.status === "running");
-	const failed = calls.filter((c) => c.status === "error" || c.isError).length;
-	const bashCount = calls.filter((c) => c.name === "bash").length;
-	const summary =
-		running.length > 0
-			? `执行中 · ${running[running.length - 1]!.name}`
-			: `使用了 ${calls.length} 个工具${bashCount > 0 ? `，运行 ${bashCount} 个命令` : ""}`;
+	const summary = toolSummary(calls);
 	return (
 		<Collapsible
 			ref={rootRef}
@@ -1254,9 +1248,8 @@ function ToolSummaryRow({
 		>
 			<CollapsibleTrigger className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground">
 				{open ? <ChevronDownIcon className="size-3.5" /> : <ChevronRightIcon className="size-3.5" />}
-				{running.length > 0 ? <span className="size-1.5 animate-pulse rounded-full bg-muted-foreground" /> : null}
-				{summary}
-				{failed > 0 && running.length === 0 ? <Badge variant="destructive">{failed} 失败</Badge> : null}
+				{summary.running > 0 ? <span className="size-1.5 shrink-0 animate-pulse rounded-full bg-muted-foreground" /> : null}
+				<span className="text-left">{summary.text}</span>
 			</CollapsibleTrigger>
 			<CollapsibleContent className="mt-2 flex w-full flex-col gap-2">
 				{calls.map((call) => (

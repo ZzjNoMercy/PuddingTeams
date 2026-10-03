@@ -18,12 +18,16 @@
 	],
 	"exports": {
 		".": "./index.ts",
+		"./connection": "./connection.ts",
+		"./cli-bridge": "./cli-bridge.ts",
 		"./pi": "./pi/index.js"
 	},
 	"files": [
 		"index.ts",
 		"pi",
-		"README.md"
+		"README.md",
+		"connection.ts",
+		"cli-bridge.ts"
 	],
 	"pi": {
 		"extensions": [
@@ -47,43 +51,17 @@
 			"secrets"
 		],
 		"entry": "index.ts",
-			"capability": {
+		"capability": {
 			"id": "lark-cli",
 			"displayName": "飞书 CLI",
 			"apiVersion": "1",
 			"compatibleConnectors": [
 				"pi"
 			],
-				"configSchema": {
-					"type": "object",
-					"properties": {
-						"authMode": {
-							"type": "string",
-							"title": "登录方式",
-							"default": "auto",
-							"enum": [
-								"auto",
-								"local",
-								"isolated"
-							],
-							"x-puddingteams-enum-labels": {
-								"auto": "自动选择",
-								"local": "沿用本机登录状态",
-								"isolated": "使用独立登录目录"
-							},
-							"description": "检测到本机 CLI 时沿用本机登录状态；由平台安装 CLI 时，为当前绑定单独保存登录状态"
-						},
-						"configDir": {
-							"type": "string",
-							"title": "自定义登录目录",
-							"x-puddingteams-visible-when": {
-								"field": "authMode",
-								"equals": "isolated"
-							},
-							"description": "指定当前绑定单独保存登录状态的位置"
-						}
-					}
-				},
+			"configSchema": {
+				"type": "object",
+				"properties": {}
+			},
 			"tools": []
 		}
 	},

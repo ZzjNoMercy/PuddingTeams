@@ -11,7 +11,7 @@ import { KnowledgeObjectStore } from "./objects.js";
 import { KnowledgeSelectionStore } from "./selections.js";
 import { KnowledgeRuntimeService } from "./runtime-service.js";
 import { KnowledgeSourceStore } from "./sources.js";
-import { CuratorJobStore, WikiCuratorService, type CuratorJob } from "./curator-jobs.js";
+import { CuratorJobStore, WikiCuratorService, curatorJobFeedback, type CuratorJob } from "./curator-jobs.js";
 import { ReviewStore } from "./wiki/review-store.js";
 import { MarkdownWikiPublisher } from "./wiki/publisher-markdown.js";
 import { PublishJournal } from "./wiki/publish-journal.js";
@@ -28,7 +28,7 @@ import { ReadLaterStore } from "../read-later/store.js";
 import { ReadLaterCaptureService } from "../read-later/capture-service.js";
 import { ReadLaterPromoter } from "../read-later/promote.js";
 
-async function fixture(generate?: ConstructorParameters<typeof WikiCuratorService>[0]["generate"], extractImage?: ConstructorParameters<typeof WikiCuratorService>[0]["extractImage"], ownerId = "owner") {
+async function fixture(generate?: ConstructorParameters<typeof WikiCuratorService>[0]["generate"], extractImage?: ConstructorParameters<typeof WikiCuratorService>[0]["extractImage"], ownerId = "owner", notify?: ConstructorParameters<typeof WikiCuratorService>[0]["notify"], workerTimeoutMs?: number) {
 	const root = await mkdtemp(path.join(tmpdir(), "pt-curator-")), vault = path.join(root, "vault"), cwd = path.join(root, "project");
 	await mkdir(vault); await mkdir(cwd);
 	const teams = new TeamsStore({ state: path.join(root, "teams"), assets: path.join(root, "assets"), managedWorkspaces: path.join(root, "workspaces") }, cwd);
@@ -41,12 +41,13 @@ async function fixture(generate?: ConstructorParameters<typeof WikiCuratorServic
 	const runtime = new KnowledgeRuntimeService({ teams, bindings, acceptance, objects, selections, stateDir: path.join(root, "state"), cacheDir: path.join(root, "cache") });
 	const jobs = new CuratorJobStore(path.join(root, "state")), reviews = new ReviewStore(path.join(root, "reviews"));
 	const service = new WikiCuratorService({ jobs, bindings, acceptance, objects, reviews, runtime, teams, sources, cacheDir: path.join(root, "cache"),
-		extractImage, generate: generate ?? (async (job, _surface, submit) => {
+		extractImage, notify, workerTimeoutMs, generate: generate ?? (async (job, _surface, submit) => {
 			await submit.execute("submit", { pages: [{ path: "note.md", content: `---\nsources: [${job.sources[0]!.id}]\n---\n# 记录\n${job.task}\n`, reason: "整理用户原话" }] }, undefined, undefined, {} as never);
 		}) });
 	const publisher = new MarkdownWikiPublisher({ bindings, reviews, objects, acceptance, journal: new PublishJournal(path.join(root, "operations")),
 		observation: new KnowledgeObservationService(acceptance, { objects }), searchIndex: new KnowledgeSearchIndex(path.join(root, "cache"), objects), operationsDir: path.join(root, "operations") });
-	return { root, vault, cwd, teams, bindings, binding, objects, acceptance, history, runtime, jobs, reviews, sources, service, publisher };
+	const restartService = () => new WikiCuratorService({ jobs: new CuratorJobStore(path.join(root, "state")), bindings, acceptance, objects, reviews: new ReviewStore(path.join(root, "reviews")), runtime, teams, sources, cacheDir: path.join(root, "cache"), generate: async () => { throw new Error("恢复聊天不能启动后台模型"); } });
+	return { root, vault, cwd, teams, bindings, binding, objects, acceptance, history, runtime, jobs, reviews, sources, service, publisher, restartService };
 }
 async function completed(jobs: CuratorJobStore, id: string): Promise<CuratorJob> {
 	for (let attempt = 0; attempt < 200; attempt++) {
@@ -57,6 +58,129 @@ async function completed(jobs: CuratorJobStore, id: string): Promise<CuratorJob>
 	throw new Error("job did not settle");
 }
 
+test("聊天Wiki由当前Worker提交候选；准备重放不新增任务，后台生成器零调用，仍须人审发布", async () => {
+	let generated = 0;
+	const notices: string[] = [];
+	const f = await fixture(async () => { generated++; }, undefined, "owner", async job => { notices.push(job.status); });
+	const scope = { ownerId: "owner", windowId: "window", sessionId: "worker-chat", contextKey: "worker-chat" };
+	const worker = f.service.workerSurface(await f.runtime.mount(scope, [f.binding.id]), { ...scope, operationId: "chat-op", sourceText: "冻结用户事实" }, "wiki");
+	try {
+		assert(!worker.tools.some(tool => tool.name === "knowledge_request_curation"));
+		const prepare = worker.tools.find(tool => tool.name === "knowledge_prepare_candidate")!;
+		const submit = worker.tools.find(tool => tool.name === "knowledge_submit_candidate")!;
+		await assert.rejects(submit.execute("premature", { bindingId: f.binding.id, pages: [] }, undefined, undefined, {} as never), /先调用/);
+		const first = await prepare.execute("prepare-1", { bindingId: f.binding.id, task: "整理事实" }, undefined, undefined, {} as never);
+		const payload = JSON.parse((first.content[0] as { text: string }).text);
+		assert.equal(payload.status, "running"); assert.match(payload.message, /当前知识管家/);
+		assert.equal(payload.context.sources[0].content, "冻结用户事实");
+		await prepare.execute("prepare-2", { bindingId: f.binding.id, task: "模型重新措辞" }, undefined, undefined, {} as never);
+		assert.equal((await f.jobs.list()).length, 1);
+		const job = (await f.jobs.list())[0]!;
+		assert.equal(job.executionMode, "worker");
+		const status = await worker.tools.find(tool => tool.name === "knowledge_curation_status")!.execute("status", { jobId: job.id }, undefined, undefined, {} as never);
+		const live = JSON.parse((status.content[0] as { text: string }).text);
+		assert.equal(live.executionMode, "worker"); assert.match(live.nextAction, /来源聊天/); assert.doesNotMatch(live.nextAction, /后台/);
+		await f.service.run(job.id); await f.service.waitForIdle();
+		assert.equal(generated, 0, "Worker模式不能启动后台Curator会话");
+		const content = `---\nsources: [${payload.context.sources[0].id}]\n---\n# 事实\n冻结用户事实\n`;
+		const outcome = await submit.execute("submit-current", { bindingId: f.binding.id, pages: [{ path: "fact.md", content, reason: "采纳用户事实" }] }, undefined, undefined, {} as never);
+		const receipt = JSON.parse((outcome.content[0] as { text: string }).text);
+		assert.equal(receipt.status, "pending_review"); assert.ok(receipt.reviewUrl);
+		assert.equal(await worker.workerExecution!.shouldStop(), true);
+		assert.equal((await worker.workerExecution!.finish("worker_no_submission"))?.status, "completed");
+		assert.deepEqual(notices, ["running", "pending_review"]);
+		assert.deepEqual(await readdir(f.vault), []);
+		const batch = (await f.reviews.get((await f.jobs.get(job.id))!.candidateBatchId!))!.batch;
+		const approved = await f.reviews.decide({ batchId: batch.id, operationId: "human", actorId: "owner", decision: "approve", manifestHash: batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: batch.files.map(file => file.targetPath) });
+		await f.publisher.onApproved(batch, approved.decision);
+		assert.equal(await readFile(path.join(f.vault, "fact.md"), "utf8"), content);
+	} finally { await worker.workerExecution!.finish("cancelled"); await rm(f.root, { recursive: true, force: true }); }
+});
+
+test("聊天纯查询不创建任务，准备后只口头完成被记录为失败", async () => {
+	const f = await fixture();
+	const scope = { ownerId: "owner", windowId: "window", sessionId: "query", contextKey: "query" };
+	const worker = f.service.workerSurface(await f.runtime.mount(scope, [f.binding.id]), { ...scope, operationId: "query", sourceText: "原话" }, "wiki");
+	try {
+		assert.equal(await worker.workerExecution!.finish("worker_no_submission"), undefined);
+		assert.deepEqual(await f.jobs.list(), []);
+		await worker.tools.find(tool => tool.name === "knowledge_prepare_candidate")!.execute("prepare", { bindingId: f.binding.id, task: "整理" }, undefined, undefined, {} as never);
+		const result = await worker.workerExecution!.finish("worker_no_submission");
+		assert.equal(result?.status, "failed"); assert.equal(result?.errorCode, "worker_no_submission");
+		assert.equal((await f.jobs.list())[0]!.status, "failed");
+		assert.deepEqual(await f.reviews.list(), []); assert.deepEqual(await readdir(f.vault), []);
+	} finally { await worker.workerExecution!.finish("cancelled"); await rm(f.root, { recursive: true, force: true }); }
+});
+
+test("聊天宿主deadline直接落超时终态，无需等待Worker停止；迟到提交不能进入审核", async () => {
+	const f = await fixture(undefined, undefined, "owner", undefined, 20);
+	const scope = { ownerId: "owner", windowId: "window", sessionId: "deadline", contextKey: "deadline" };
+	const worker = f.service.workerSurface(await f.runtime.mount(scope, [f.binding.id]), { ...scope, operationId: "deadline", sourceText: "原话" }, "wiki");
+	try {
+		await worker.tools.find(tool => tool.name === "knowledge_prepare_candidate")!.execute("prepare", { bindingId: f.binding.id, task: "整理" }, undefined, undefined, {} as never).catch(error => { assert.match(String(error), /model_timeout/); });
+		const job = await completed(f.jobs, (await f.jobs.list())[0]!.id);
+		assert.equal(job.failureCode, "model_timeout"); assert.equal(job.status, "failed");
+		assert.match(curatorJobFeedback(job).message, /返回来源对话/);
+		await assert.rejects(f.service.retry("owner", job.id, "retry-worker"), /返回来源对话/);
+		await assert.rejects(worker.tools.find(tool => tool.name === "knowledge_submit_candidate")!.execute("late", { bindingId: f.binding.id, pages: [] }, undefined, undefined, {} as never), /model_timeout|不在运行/);
+		assert.equal((await worker.workerExecution!.finish("cancelled"))?.errorCode, "model_timeout");
+		assert.deepEqual(await f.reviews.list(), []);
+	} finally { await worker.workerExecution!.finish("cancelled"); await rm(f.root, { recursive: true, force: true }); }
+});
+
+test("聊天prepare落盘途中取消，晚到任务立即cancelled且不启动图片提取", async () => {
+	let imageCalls = 0, entered!: () => void, release!: () => void;
+	const entry = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+	const f = await fixture(undefined, async input => { imageCalls++; return extractFixture(input); });
+	const scope = { ownerId: "owner", windowId: "window", sessionId: "cancel-create", contextKey: "cancel-create" };
+	const image = await f.sources.createUploads("owner", [{ filename: "image.png", mediaType: "image/png", data: assetPng.toString("base64") }]);
+	const worker = f.service.workerSurface(await f.runtime.mount(scope, [f.binding.id]), { ...scope, operationId: "cancel-create", sourceIds: image.map(source => source.id) }, "wiki");
+	const create = f.jobs.create.bind(f.jobs);
+	f.jobs.create = async job => { entered(); await gate; return create(job); };
+	const controller = new AbortController();
+	const preparation = worker.tools.find(tool => tool.name === "knowledge_prepare_candidate")!.execute("prepare", { bindingId: f.binding.id, task: "整理图片" }, controller.signal, undefined, {} as never);
+	try {
+		await entry; controller.abort(); await worker.workerExecution!.abort!("cancelled"); release();
+		await assert.rejects(preparation, /cancelled|aborted/);
+		assert.equal((await f.jobs.list())[0]!.status, "cancelled"); assert.equal(imageCalls, 0);
+		assert.deepEqual(await f.reviews.list(), []);
+	} finally { release(); await worker.workerExecution!.finish("cancelled"); await rm(f.root, { recursive: true, force: true }); }
+});
+
+test("聊天图片deadline同步阻止衍生写账，即使超时状态CAS尚未落盘", { timeout: 10_000 }, async () => {
+	const f = await fixture(undefined, extractFixture, "owner", undefined, 1000);
+	let releaseBytes!: () => void, bytesEntered!: () => void, releaseStop!: () => void, stopEntered!: () => void, stopReturned!: () => void;
+	const bytesGate = new Promise<void>(resolve => { releaseBytes = resolve; }), bytesEntry = new Promise<void>(resolve => { bytesEntered = resolve; });
+	const stopGate = new Promise<void>(resolve => { releaseStop = resolve; }), stopEntry = new Promise<void>(resolve => { stopEntered = resolve; });
+	const stopExit = new Promise<void>(resolve => { stopReturned = resolve; });
+	const image = await f.sources.createUploads("owner", [{ filename: "image.png", mediaType: "image/png", data: assetPng.toString("base64") }]);
+	const scope = { ownerId: "owner", windowId: "window", sessionId: "image-deadline", contextKey: "image-deadline" };
+	const worker = f.service.workerSurface(await f.runtime.mount(scope, [f.binding.id]), { ...scope, operationId: "image-deadline", sourceIds: image.map(source => source.id) }, "wiki");
+	const put = f.objects.put.bind(f.objects), transition = f.jobs.transition.bind(f.jobs);
+	f.objects.put = async bytes => { if (bytes.toString().includes('"sourceId"')) { bytesEntered(); await bytesGate; } return put(bytes); };
+	let gated = false;
+	f.jobs.transition = async (...args: Parameters<typeof transition>) => {
+		if (!gated && args[2].failureCode === "model_timeout") {
+			gated = true; stopEntered(); await stopGate;
+			try { return await transition(...args); } finally { stopReturned(); }
+		}
+		return transition(...args);
+	};
+	const result = worker.tools.find(tool => tool.name === "knowledge_prepare_candidate")!.execute("prepare", { bindingId: f.binding.id, task: "整理图片" }, undefined, undefined, {} as never).then(() => undefined, error => error as Error);
+	try {
+		await bytesEntry; await stopEntry;
+		assert.equal((await f.jobs.list())[0]!.status, "running", "模拟超时终态尚未落盘的窗口");
+		releaseBytes(); assert.match(String(await result), /model_timeout/);
+		const job = (await f.jobs.list())[0]!; assert.equal(job.status, "failed"); assert.equal(job.failureCode, "model_timeout");
+		const db = new DatabaseSync(path.join(f.root, "state", "sources.sqlite"));
+		try { assert.equal((db.prepare("SELECT COUNT(*) AS n FROM knowledge_sources").get() as { n: number }).n, 1, "超时后未插入衍生来源"); } finally { db.close(); }
+		assert.deepEqual(await f.reviews.list(), []); assert.deepEqual(await readdir(f.vault), []);
+	} finally {
+		releaseBytes(); releaseStop(); if (gated) await stopExit;
+		await result; await worker.workerExecution!.finish("cancelled"); await rm(f.root, { recursive: true, force: true });
+	}
+});
+
 test("普通 Pi Worker 对 Wiki 只读，memory 专用请求不能改目标，默认库变更后工具失效", async () => {
 	const f = await fixture();
 	try {
@@ -64,10 +188,10 @@ test("普通 Pi Worker 对 Wiki 只读，memory 专用请求不能改目标，�
 		const base = await f.runtime.mount(scope, [f.binding.id]);
 		const input = { ...scope, operationId: "memory-turn", sourceText: "用户明确要求：以后回复用中文" };
 		const regular = f.service.requestSurface(base, input);
-		assert.equal(regular.prompt, base.prompt);
+		assert(regular.prompt.startsWith(base.prompt));
 		const ordinaryReadOnly = f.service.workerSurface(base, input);
 		assert.deepEqual(ordinaryReadOnly.tools.map(tool => tool.name).sort(), ["knowledge_context", "knowledge_glob", "knowledge_links", "knowledge_read", "knowledge_search"]);
-		assert(f.service.workerSurface(base, input, "wiki").tools.some(tool => tool.name === "knowledge_request_curation"));
+		assert(f.service.workerSurface(base, input, "wiki").tools.some(tool => tool.name === "knowledge_submit_candidate"));
 		let current = true;
 		const defaultMemory = { bindingId: f.binding.id, assertCurrent: async () => { if (!current) throw new Error("默认 memory 已变化"); } };
 		assert(!f.service.workerSurface(base, input, undefined, defaultMemory).tools.some(tool => tool.name === "memory_request_update"), "没有实际挂载 memory 不提供更新入口");
@@ -298,12 +422,13 @@ test("并发提交只有一个固定候选，跨数据库崩溃按同一manifest
 		const originalRegister = f.reviews.registerCandidate.bind(f.reviews);
 		f.reviews.registerCandidate = async () => { throw new Error("simulated crash after durable claim"); };
 		const second = await f.service.create({ ownerId: "owner", operationId: "crash", bindingId: f.binding.id, agentId: "wiki", task: "facts" });
-		for (let n = 0; n < 200 && (await f.jobs.get(second.job.id))?.status !== "submitting"; n++) await new Promise((r) => setTimeout(r, 10));
+		await completed(f.jobs, second.job.id);
 		await f.service.waitForIdle();
 		const staged = (await f.jobs.get(second.job.id))!;
-		assert.equal(staged.status, "submitting");
+		assert.equal(staged.status, "failed");
+		assert.equal(staged.failureCode, "candidate_registration_failed");
 		f.reviews.registerCandidate = originalRegister;
-		await f.service.recover();
+		await f.service.retry("owner", second.job.id, "retry-registration");
 		const recovered = (await f.jobs.get(second.job.id))!;
 		assert.equal(recovered.status, "pending_review");
 		assert.equal((await f.reviews.get(recovered.candidateBatchId!))?.batch.manifestHash, staged.frozenCandidate?.manifestHash);
@@ -413,4 +538,212 @@ test("图片衍生保存中的取消/授权撤销：缓存可留，来源账本�
    assert.deepEqual(await readdir(f.vault),[]);
   }finally{release();await f.service.waitForIdle();await rm(f.root,{recursive:true,force:true});}
  }
+});
+
+test("整理回执按真实阶段提供任务入口，失败幂等重放不伪称排队或待审核", async () => {
+ const notices: string[] = [], f = await fixture(async () => {}, undefined, "owner", async job => { notices.push(job.status); });
+ try {
+  const scope = { ownerId: "owner", windowId: "window", sessionId: "feedback-chat", contextKey: "feedback-chat" };
+  const surface = await f.runtime.mount(scope, [f.binding.id]);
+  const request = f.service.requestSurface(surface, { ...scope, operationId: "feedback", sourceText: "PRIVATE_USER_TEXT_MUST_NOT_APPEAR_IN_FEEDBACK" }).tools.find(tool => tool.name === "knowledge_request_curation")!;
+  const args = { bindingId: f.binding.id, task: "整理用户事实" };
+  const first = await request.execute("fixed-call", args, undefined, undefined, {} as never);
+  const initial = JSON.parse(first.content[0]!.type === "text" ? first.content[0]!.text : "{}");
+  assert.match(initial.jobUrl, /\/knowledge\?vault=.+&job=.+/); assert.equal(initial.reviewUrl, undefined);
+  await f.service.waitForIdle();
+  const replay = await request.execute("fixed-call", args, undefined, undefined, {} as never);
+  const receipt = JSON.parse(replay.content[0]!.type === "text" ? replay.content[0]!.text : "{}");
+  assert.equal(receipt.jobId, initial.jobId); assert.equal(receipt.status, "failed"); assert.equal(receipt.replayed, true);
+  assert.equal(receipt.failureCode, "worker_no_submission"); assert.match(receipt.message, /失败/); assert.doesNotMatch(receipt.message, /已排队|已进入审核|已发布/);
+  assert(!JSON.stringify(receipt).includes("PRIVATE_USER_TEXT")); assert.equal(receipt.reviewUrl, undefined);
+  assert.deepEqual(notices.slice(0, 3), ["queued", "running", "failed"]);
+  assert.deepEqual(await f.reviews.list(), []); assert.deepEqual(await readdir(f.vault), []);
+  for (const status of ["queued", "running", "submitting"] as const) {
+   const feedback = curatorJobFeedback({ ...(await f.jobs.get(receipt.jobId))!, status });
+   assert.match(feedback.message, /尚未/); assert.equal("reviewUrl" in feedback, false);
+  }
+  const pending = curatorJobFeedback({ ...(await f.jobs.get(receipt.jobId))!, status: "pending_review", candidateBatchId: "batch/with spaces" });
+  assert.equal(pending.reviewUrl, "/knowledge/review?batch=batch%2Fwith%20spaces");
+  assert.match(pending.message, /当前审核与发布状态/); assert.doesNotMatch(pending.message, /尚未修改|等待用户审核/);
+  const broken = curatorJobFeedback({ ...(await f.jobs.get(receipt.jobId))!, status: "pending_review" }); assert.equal("reviewUrl" in broken, false);
+  const timedOut = curatorJobFeedback({ ...(await f.jobs.get(receipt.jobId))!, status: "failed", failureCode: "model_timeout" });
+  assert.match(timedOut.message, /超时.*已停止/); assert.match(timedOut.message, /重试/);
+  assert.equal(timedOut.failureCode, "model_timeout");
+ } finally { await f.service.waitForIdle(); await rm(f.root, { recursive: true, force: true }); }
+});
+
+test("候选CAS事务同步guard拒绝超时提交并保留running状态", async () => {
+ const f = await fixture();
+ try {
+  f.service.kick = () => {};
+  const created = await f.service.create({ ownerId: "owner", bindingId: f.binding.id, agentId: "wiki", operationId: "guard", task: "测试" });
+  await f.jobs.transition(created.job.id, ["queued"], { status: "running" });
+  await assert.rejects(f.jobs.transition(created.job.id, ["running"], { status: "submitting" }, () => { throw new Error("model_timeout"); }), /model_timeout/);
+  assert.equal((await f.jobs.get(created.job.id))!.status, "running"); assert.deepEqual(await f.reviews.list(), []);
+ } finally { await f.service.waitForIdle(); await rm(f.root, { recursive: true, force: true }); }
+});
+
+
+test("知识整理状态查询只读：运行中不重建Job，终态与审核链接实时读取，跨owner或挂载不可见", async () => {
+ let release!: () => void;
+ const gate = new Promise<void>(resolve => { release = resolve; });
+ const f = await fixture(async (job, _surface, submit) => {
+  await gate;
+  await submit.execute("submit", { pages: [{ path: "fact.md", content: `---\nsources: [${job.sources[0]!.id}]\n---\n事实`, reason: "获准来源" }] }, undefined, undefined, {} as never);
+ });
+ try {
+  const scope = { ownerId: "owner", windowId: "window", sessionId: "status-test", contextKey: "session:status-test" };
+  const base = await f.runtime.mount(scope, [f.binding.id]);
+  const surface = f.service.requestSurface(base, { ...scope, sourceText: "原始事实", operationId: "turn" });
+  assert.notEqual(surface.fingerprint, base.fingerprint);
+  const request = surface.tools.find(tool => tool.name === "knowledge_request_curation")!;
+  const status = surface.tools.find(tool => tool.name === "knowledge_curation_status")!;
+  const result = await request.execute("create", { bindingId: f.binding.id, task: "记录" }, undefined, undefined, {} as never);
+  const id = JSON.parse((result.content[0] as { text: string }).text).jobId;
+  for (let i = 0; i < 2; i++) {
+   const result = await status.execute("read", { jobId: id }, undefined, undefined, {} as never);
+   const value = JSON.parse((result.content[0] as { text: string }).text);
+   assert(["queued", "running"].includes(value.status)); assert.match(value.nextAction, /不重复提交/);
+   assert.equal(value.sources, undefined); assert.equal(value.task, undefined);
+  }
+  assert.equal((await f.jobs.list("owner")).length, 1);
+  const other = f.service.requestSurface(base, { ...scope, ownerId: "other", operationId: "other" }).tools.find(tool => tool.name === "knowledge_curation_status")!;
+  await assert.rejects(other.execute("read", { jobId: id }, undefined, undefined, {} as never), /不存在或不在本轮授权/);
+  const unmounted = f.service.requestSurface(await f.runtime.mount(scope, []), { ...scope, operationId: "none" }).tools.find(tool => tool.name === "knowledge_curation_status")!;
+  await assert.rejects(unmounted.execute("read", { jobId: id }, undefined, undefined, {} as never), /不存在或不在本轮授权/);
+  release(); await f.service.waitForIdle();
+  const final = JSON.parse(((await status.execute("read", { jobId: id }, undefined, undefined, {} as never)).content[0] as { text: string }).text);
+  assert.equal(final.status, "pending_review"); assert.equal(final.reviewStatus, "pending_review"); assert.match(final.reviewUrl, /batch=/);
+  const batch = (await f.reviews.get((await f.jobs.get(id))!.candidateBatchId!))!.batch;
+  await f.reviews.decide({ batchId: batch.id, actorId: "owner", operationId: "reject", decision: "reject", manifestHash: batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: [] });
+  const afterReview = await f.service.readStatus("owner", id);
+  assert.equal(afterReview?.status, "pending_review"); assert.equal(afterReview?.reviewStatus, "rejected", "生成完成与当前审核状态分别读取");
+  assert.equal((await f.jobs.list("owner")).length, 1);
+  await f.bindings.revoke("owner", f.binding.id, f.binding.bindingRevision);
+  await assert.rejects(status.execute("read", { jobId: id }, undefined, undefined, {} as never));
+ } finally { release(); await f.service.waitForIdle(); await rm(f.root, { recursive: true, force: true }); }
+});
+
+
+test("根绑定Wiki布局：控制页不越区，原图和相对引用与页面同在wiki下发布", async () => {
+ const f = await fixture(async (job, _surface, submit) => {
+  const image = job.sources.find(source => source.kind === "image")!;
+  await assert.rejects(submit.execute("outside", { pages: [{ path: "index.md", content: "# 错误位置", reason: "测试" }] }, undefined, undefined, {} as never), /控制页必须位于内容区/);
+  const content = `---\ntype: fact\ntitle: 图片事实\nsources: [${image.id}]\n---\n# 图片事实\n原图事实`;
+  await assert.rejects(submit.execute("double", { pages: [{ path: "wiki/wiki/facts/image.md", content, reason: "测试" }] }, undefined, undefined, {} as never), /invalid_directory/);
+  await submit.execute("valid", { pages: [{ path: "wiki/facts/image.md", content, reason: "图片来源" }, { path: "wiki/log.md", content: "# 日志\n新增图片事实", reason: "记录" }] }, undefined, undefined, {} as never);
+ }, extractFixture);
+ try {
+  await mkdir(path.join(f.vault, "wiki")); await writeFile(path.join(f.vault, "wiki", "index.md"), "# Wiki");
+  await writeFile(path.join(f.vault, "wiki.schema.json"), JSON.stringify({ formatVersion: 1, schemaId: "image-layout", revision: 1, name: "图片测试", description: "布局", entities: [{ type: "fact", directory: "facts", fields: [{ name: "type", type: "text", required: true }, { name: "title", type: "text", required: true }] }], relations: [] }));
+  const created = await f.service.create({ ownerId: "owner", operationId: "wiki-image", bindingId: f.binding.id, agentId: "wiki", task: "整理图片", uploads: [{ filename: "image.png", mediaType: "image/png", data: assetPng.toString("base64") }] });
+  await f.service.waitForIdle(); const done = (await f.jobs.get(created.job.id))!;
+  assert.equal(done.status, "pending_review", done.failureCode);
+  const batch = (await f.reviews.get(done.candidateBatchId!))!.batch;
+  assert(batch.files.every(file => file.targetPath.startsWith("wiki/")));
+  const imagePath = batch.files.find(file => file.kind === "image")!.targetPath;
+  assert.match(imagePath, /^wiki\/assets\/images\//);
+  const approval = await f.reviews.decide({ batchId: batch.id, operationId: "approve", actorId: "owner", decision: "approve", manifestHash: batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: batch.files.map(file => file.targetPath) });
+  await f.publisher.onApproved(batch, approval.decision);
+  assert.deepEqual(await readFile(path.join(f.vault, imagePath)), assetPng);
+  assert.match(await readFile(path.join(f.vault, "wiki", "facts", "image.md"), "utf8"), /!\[image.png\]\(\.\.\/assets\/images\//);
+  assert.equal((await readdir(f.vault)).includes("assets"), false);
+ } finally { await f.service.waitForIdle(); await rm(f.root, { recursive: true, force: true }); }
+});
+
+test("知识库纯附件整理不创建空文字来源，要求与附件原文分开保存",async()=>{
+	const f=await fixture();
+	try {const created=await f.service.create({ownerId:"owner",operationId:"only-attachment",bindingId:f.binding.id,agentId:"wiki",task:"按已有结构整理",sourceText:"",uploads:[{filename:"原文.md",mediaType:"text/markdown",data:Buffer.from("# 附件原文\n真实资料").toString("base64")}]});
+		await f.service.waitForIdle();const job=(await f.jobs.get(created.job.id))!;assert.equal(job.sources.length,1);assert.equal(job.sources[0]!.title,"原文.md");assert.equal(job.task,"按已有结构整理");assert.equal(job.status,"pending_review");assert.equal((await f.sources.readText("owner",job.sources[0]!.id)).text,"# 附件原文\n真实资料");
+	}finally{await rm(f.root,{recursive:true,force:true});}
+});
+
+test("重建聊天整理工具恢复原任务和冻结来源，错误jobId可纠正，候选不重复", async () => {
+	const f = await fixture();
+	const scope = { ownerId: "owner", windowId: "window", sessionId: "restart-chat", contextKey: "restart-chat" };
+	const surfaces: ReturnType<WikiCuratorService["workerSurface"]>[] = [];
+	const make = async (service: WikiCuratorService, op: string, sourceText: string) => { const w = service.workerSurface(await f.runtime.mount(scope, [f.binding.id]), { ...scope, operationId: op, sourceText, resolveSources: op === "continue" ? async () => { throw new Error("不能用继续作来源"); } : undefined }, "wiki"); surfaces.push(w); return w; };
+	const exec = async (w: typeof surfaces[number], name: string, args: unknown) => { const result = await w.tools.find(t => t.name === name)!.execute(name, args, undefined, undefined, {} as never); const block = result.content.find(b => b.type === "text"); assert(block?.type === "text"); return JSON.parse(block.text); };
+	try {
+		const old = await make(f.service, "original", "今天晚上8点和刘大强还有周泽宇在北京有一个饭局");
+		await exec(old, "knowledge_prepare_candidate", { bindingId: f.binding.id, task: "记录2026-10-03 20:00北京饭局" });
+		const original = (await f.jobs.list())[0]!; await old.workerExecution!.finish("model_error");
+		await f.jobs.transition(original.id, ["failed"], { failureCode: "server_restart" });
+		const restored = await make(f.restartService(), "continue", "继续");
+		const context = await exec(restored, "knowledge_context", {});
+		assert.equal(context.curationTasks[0].jobId, original.id); assert.equal(context.curationTasks[0].resumable, true);
+		await assert.rejects(exec(restored, "knowledge_prepare_candidate", { bindingId: f.binding.id, jobId: "wrong" }), /不属于/);
+		const payload = await exec(restored, "knowledge_prepare_candidate", { bindingId: f.binding.id, jobId: original.id });
+		assert.equal(payload.jobId, original.id); assert.equal(payload.recoveryRevision, 1); assert.equal(payload.context.task, original.task);
+		assert.match(payload.context.sources[0].content, /刘大强.*周泽宇/);
+		assert.equal(payload.context.sources[0].id, original.sources[0]!.id); assert.equal(payload.context.sources[0].createdAt, original.sources[0]!.createdAt);
+		const content = `---\nsources: [${original.sources[0]!.id}]\n---\n# 饭局\n2026-10-03 20:00，北京，刘大强、周泽宇与用户。\n`;
+		const submitted = await exec(restored, "knowledge_submit_candidate", { bindingId: f.binding.id, pages: [{ path: "dinner.md", content, reason: "原饭局" }] });
+		assert.equal(submitted.status, "pending_review"); assert.ok(submitted.reviewUrl); await restored.workerExecution!.finish("worker_no_submission");
+		const replay = await make(f.restartService(), "after-review", "继续");
+		const again = await exec(replay, "knowledge_prepare_candidate", { bindingId: f.binding.id, jobId: original.id });
+		assert.equal(again.status, "pending_review"); assert.equal(again.context, undefined);
+		assert.equal((await f.jobs.list()).length, 1); assert.equal((await f.reviews.list()).length, 1); assert.deepEqual(await readdir(f.vault), []);
+	} finally { for (const w of surfaces) await w.workerExecution!.finish("cancelled"); await rm(f.root, { recursive: true, force: true }); }
+});
+
+test("中断恢复拒绝其他聊天、窗口、挂载与取消；并发只有一个执行获得任务", async () => {
+	const f = await fixture();
+	const scope = { ownerId: "owner", windowId: "window", sessionId: "restart-boundary", contextKey: "restart-boundary" };
+	const surfaces: ReturnType<WikiCuratorService["workerSurface"]>[] = [];
+	const make = async (extra = {}, mounted = true) => { const input = { ...scope, ...extra, operationId: "continue", sourceText: "继续" }; const w = f.restartService().workerSurface(await f.runtime.mount(input, mounted ? [f.binding.id] : []), input, "wiki"); surfaces.push(w); return w; };
+	const prepare = (w: typeof surfaces[number], id: string) => w.tools.find(t => t.name === "knowledge_prepare_candidate")!.execute("prepare", { bindingId: f.binding.id, jobId: id }, undefined, undefined, {} as never);
+	try {
+		const { job } = await f.service.create({ ...scope, bindingId: f.binding.id, agentId: "wiki", task: "原饭局", sourceText: "原事实", executionMode: "worker", operationId: "original", origin: { sessionId: scope.sessionId, windowId: scope.windowId } });
+		await f.jobs.transition(job.id, ["running"], { status: "failed", failureCode: "server_restart" });
+		for (const extra of [{ sessionId: "other-chat" }, { windowId: "other-window" }]) await assert.rejects(prepare(await make(extra), job.id), /不属于/);
+		await assert.rejects(prepare(await make({}, false), job.id), /授权范围/);
+		const contenders = await Promise.all([make(), make()]);
+		const results = await Promise.allSettled(contenders.map(w => prepare(w, job.id)));
+		assert.equal(results.filter(r => r.status === "fulfilled").length, 1); assert.equal(results.filter(r => r.status === "rejected").length, 1);
+		await f.jobs.transition(job.id, ["running"], { status: "cancelled" });
+		await assert.rejects(prepare(await make(), job.id), /只能恢复/);
+		assert.equal((await f.jobs.list()).length, 1); assert.deepEqual(await f.reviews.list(), []);
+	} finally { for (const w of surfaces) await w.workerExecution!.finish("cancelled"); await rm(f.root, { recursive: true, force: true }); }
+});
+
+test("恢复仍校验原基线，新消息不会自动吸收旧失败任务来源", async () => {
+	const f = await fixture();
+	const scope = { ownerId: "owner", windowId: "window", sessionId: "restart-baseline", contextKey: "restart-baseline" };
+	const surfaces: ReturnType<WikiCuratorService["workerSurface"]>[] = [];
+	const make = async (operationId: string, sourceText: string) => { const w = f.restartService().workerSurface(await f.runtime.mount(scope, [f.binding.id]), { ...scope, operationId, sourceText }, "wiki"); surfaces.push(w); return w; };
+	try {
+		await writeFile(path.join(f.vault, "note.md"), "旧事实");
+		const original = await f.service.create({ ...scope, operationId: "original", bindingId: f.binding.id, agentId: "wiki", task: "原任务", sourceText: "原事实", executionMode: "worker", origin: { windowId: scope.windowId, sessionId: scope.sessionId } });
+		await f.jobs.transition(original.job.id, ["running"], { status: "failed", failureCode: "server_restart" });
+		await writeFile(path.join(f.vault, "note.md"), "外部新事实");
+		const resumed = await make("continue", "继续");
+		await resumed.tools.find(t => t.name === "knowledge_prepare_candidate")!.execute("prepare", { bindingId: f.binding.id, jobId: original.job.id }, undefined, undefined, {} as never);
+		await assert.rejects(resumed.tools.find(t => t.name === "knowledge_submit_candidate")!.execute("submit", { bindingId: f.binding.id, pages: [{ path: "note.md", content: `---\nsources: [${original.job.sources[0]!.id}]\n---\n覆盖`, reason: "旧任务" }] }, undefined, undefined, {} as never), /基线|磁盘|未采纳/);
+		assert.equal(await readFile(path.join(f.vault, "note.md"), "utf8"), "外部新事实");
+		const fresh = await make("new-material", "新的独立事实");
+		const result = await fresh.tools.find(t => t.name === "knowledge_prepare_candidate")!.execute("new", { bindingId: f.binding.id, task: "新目标" }, undefined, undefined, {} as never);
+		const block = result.content.find(b => b.type === "text"); assert(block?.type === "text"); const payload = JSON.parse(block.text);
+		assert.equal(payload.context.sources.length, 1); assert.equal(payload.context.sources[0].content, "新的独立事实"); assert.notEqual(payload.jobId, original.job.id);
+	} finally { for (const w of surfaces) await w.workerExecution!.finish("cancelled"); await rm(f.root, { recursive: true, force: true }); }
+});
+
+test("无既有Job时引用原聊天素材重新整理，继续消息不进入候选事实", async () => {
+	const f = await fixture();
+	const scope = { ownerId: "owner", windowId: "window", sessionId: "history-chat", contextKey: "history-chat" };
+	let worker: ReturnType<WikiCuratorService["workerSurface"]> | undefined;
+	try {
+		const source = await f.sources.createText("owner", "原请求：2026-10-03 20:00北京饭局，刘大强、周泽宇与用户", { windowId: scope.windowId, sessionId: scope.sessionId, channel: "user_input" });
+		assert.equal((await f.jobs.list()).length, 0);
+		worker = f.restartService().workerSurface(await f.runtime.mount(scope, [f.binding.id]), { ...scope, operationId: "continue", listSourceMessages: async () => [{ id: "original-user", text: "原饭局请求", createdAt: source.createdAt }],
+			resolveSources: async (_call, ids) => { assert.deepEqual(ids, ["original-user"]); return { operationId: "original-material", sourceIds: [source.id] }; } }, "wiki");
+		const run = async (name: string, args: unknown) => { const result = await worker!.tools.find(t => t.name === name)!.execute(name, args, undefined, undefined, {} as never); const block = result.content.find(b => b.type === "text"); assert(block?.type === "text"); return JSON.parse(block.text); };
+		const context = await run("knowledge_context", {});
+		assert.equal(context.curationTasks.length, 0); assert.equal(context.sourceMessages[0].id, "original-user");
+		const prepared = await run("knowledge_prepare_candidate", { bindingId: f.binding.id, task: "继续原饭局请求", sourceMessageIds: ["original-user"] });
+		assert.equal(prepared.context.sources[0].id, source.id); assert.equal(prepared.context.sources[0].createdAt, source.createdAt);
+		assert.match(prepared.context.sources[0].content, /原请求.*刘大强.*周泽宇/);
+		const result = await run("knowledge_submit_candidate", { bindingId: f.binding.id, pages: [{ path: "dinner.md", reason: "记录原饭局", content: `---\nsources: [${source.id}]\n---\n# 饭局\n2026-10-03 20:00北京，刘大强、周泽宇与用户。\n` }] });
+		assert.equal(result.status, "pending_review"); assert.equal((await f.jobs.list()).length, 1); assert.deepEqual(await readdir(f.vault), []);
+	} finally { await worker?.workerExecution?.finish("cancelled"); await rm(f.root, { recursive: true, force: true }); }
 });

@@ -302,3 +302,42 @@ test("pi SDK 连续自动重试错误合并为一个渲染组", () => {
 	assert.equal(groups[0]?.length, 4);
 	assert.equal(groups[1]?.[0]?.id, "success");
 });
+
+
+test("Manager 忙时隐藏的知识整理投影仍显示，实时与历史均按 job 保留最新状态", () => {
+	const projection = (status: string, timestamp: number, jobId = "job-1"): PiMessage => ({
+		role: "custom", customType: "pudding:knowledge_job", display: false,
+		content: "后台任务回执", timestamp,
+		details: { jobId, status, ...(status === "failed" ? { failureCode: "model_timeout" } : {}) },
+	} as unknown as PiMessage);
+	const events = [projection("queued", 1), projection("running", 2), projection("failed", 3)];
+	const history = renderHistory(events);
+	const live = events.reduce((messages, message) => reducePiEvent(messages, { type: "message_start", message }), renderHistory([]));
+	for (const messages of [history, live]) {
+		assert.equal(messages.length, 1);
+		assert.equal(messages[0]?.customType, "pudding:knowledge_job");
+		assert.deepEqual(messages[0]?.details, { jobId: "job-1", status: "failed", failureCode: "model_timeout" });
+		const replayed = reducePiEvent(messages, { type: "message_start", message: events[2] });
+		assert.equal(replayed.length, 1, "重放不会重复错误卡");
+		for (const stale of [events[0], projection("running", 4)]) {
+			assert.deepEqual(reducePiEvent(replayed, { type: "message_start", message: stale }), replayed, "终态不能退回运行中");
+		}
+		assert.equal(reducePiEvent(messages, { type: "message_start", message: projection("running", 4, "job-2") }).length, 2);
+	}
+	assert.equal(renderHistory([{ ...events[0], customType: "pudding:message_admission" } as PiMessage]).length, 0, "其他隐藏审计仍隐藏");
+});
+
+test("恢复轮次允许同一整理任务续跑，历史和实时投影均拒绝旧轮次通知", () => {
+	const projection = (status: string, timestamp: number, recoveryRevision: number): PiMessage => ({
+		role: "custom", customType: "pudding:knowledge_job", display: false,
+		content: "整理回执", timestamp, details: { jobId: "resumed-job", status, recoveryRevision },
+	} as unknown as PiMessage);
+	const events = [projection("failed", 10, 0), projection("running", 11, 1), projection("failed", 20, 0), projection("pending_review", 12, 1), projection("running", 21, 1)];
+	assert.equal((renderHistory(events.slice(0, 3))[0]?.details as { status: string }).status, "running");
+	const history = renderHistory(events);
+	const live = events.reduce((messages, message) => reducePiEvent(messages, { type: "message_start", message }), renderHistory([]));
+	for (const messages of [history, live]) {
+		assert.equal(messages.length, 1);
+		assert.deepEqual(messages[0]?.details, { jobId: "resumed-job", status: "pending_review", recoveryRevision: 1 });
+	}
+});

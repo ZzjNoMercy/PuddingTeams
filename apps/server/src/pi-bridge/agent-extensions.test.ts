@@ -758,6 +758,9 @@ test("Phase4: roster 由 before_agent_start 注入 system prompt 且每轮刷新
 	assert.ok(first.includes("alpha") && first.includes("beta"), "成员必须出现在 prompt 中");
 	assert.ok(first.includes(delegateToolName("alpha")), "prompt 必须给出委托工具名");
 	assert.match(first, /input_required\/respond/);
+	assert.match(first, /普通查阅按 best_effort 自动执行/);
+	assert.match(first, /先按任务职责改派合适 Worker、保持原约束/);
+	assert.match(first, /同一问题集中询问一次/);
 	assert.match(first, /不得拆成询问前\/后两个 WorkItem/);
 	assert.match(first, /不得再发 followup、验证委托或替代委托/);
 

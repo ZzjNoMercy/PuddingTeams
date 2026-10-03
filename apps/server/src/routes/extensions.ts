@@ -33,6 +33,7 @@ export interface ExtensionRouteDeps {
 export function registerExtensionsRoutes(app: FastifyInstance, deps: ExtensionRouteDeps): void {
 	const { registry, teams } = deps;
 	const connectionContext = (extensionId: string) => ({
+		connection: registry.connectionServiceOf(extensionId),
 		cwd: process.cwd(),
 		env: process.env,
 		stateDir: path.join(deps.capabilityStateRoot, extensionId, "shared"),

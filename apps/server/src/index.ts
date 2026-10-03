@@ -1,3 +1,4 @@
+import { directConversationHistory } from "./agent-runtime/direct-history.js";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
@@ -8,13 +9,17 @@ import { config } from "./config.js";
 import { acquireLease, ensurePaths, puddingTeamsHomeId, resolvePuddingTeamsPaths } from "./paths.js";
 import { PiSessionStore } from "./pi-bridge/session-store.js";
 import { CredentialsStore } from "./store/credentials.js";
+import { mkdir } from "node:fs/promises";
+import QRCode from "qrcode";
+import { LarkConnection } from "@puddingteams/capability-lark-cli/connection";
+import { registerFeishuRoutes, startFeishuBroker } from "./network/feishu.js";
 import { WebResearchSettings, registerWebResearchSettingsRoutes, webResearchTarget } from "./network/web-research.js";
 import { TeamsStore } from "./store/teams.js";
 import { ExtensionMutationJournal } from "./store/extension-mutation-journal.js";
 import { registerChatRoutes } from "./routes/chat.js";
 import { ProviderDeletionCoordinator } from "./pi-bridge/provider-deletion.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
-import { registerIdentityRoutes } from "./routes/identity.js";
+import { readViewerIdentity, registerIdentityRoutes } from "./routes/identity.js";
 import { registerProvidersRoutes } from "./routes/providers.js";
 import { registerAgentsRoutes } from "./routes/agents.js";
 import { registerResourcesRoutes } from "./routes/resources.js";
@@ -69,12 +74,15 @@ import { registerContactsRoutes } from "./routes/contacts.js";
 import { registerKnowledgeRoutes } from "./routes/knowledge.js";
 import { MemorySetupService } from "./knowledge/memory-setup.js";
 import { registerCalendarRoutes } from "./routes/calendar.js";
+import { registerCalendarProviderRoutes } from "./routes/calendar-providers.js";
+import { CalendarProviderRegistry } from "./calendar/providers.js";
+import { createFeishuCalendarProvider } from "./calendar/feishu.js";
 import { CalendarStore } from "./calendar/store.js";
 import { registerWikiRoutes, resolveCodexCompileCommand } from "./routes/wiki.js";
 import { localViewerIdentity } from "./routes/identity.js";
 import { KnowledgeSelectionStore } from "./knowledge/selections.js";
 import { KnowledgeRuntimeService } from "./knowledge/runtime-service.js";
-import { CuratorJobStore, WikiCuratorService } from "./knowledge/curator-jobs.js";
+import { CuratorJobStore, WikiCuratorService, curatorJobFeedback } from "./knowledge/curator-jobs.js";
 import { KnowledgeSourceStore } from "./knowledge/sources.js";
 import { ChatKnowledgeIntake } from "./knowledge/chat-intake.js";
 import { directTaskId } from "./agent-runtime/direct-dispatch.js";
@@ -212,6 +220,19 @@ await extensionRegistry.installOrUpdateFromDir(path.join(REPO_CONNECTORS_DIR, "c
 await extensionRegistry.installOrUpdateFromDir(path.join(REPO_CONNECTORS_DIR, "claude-code"));
 await extensionRegistry.installOrUpdateFromDir(path.join(REPO_CAPABILITIES_DIR, "lark-cli"));
 const capabilityStateRoot = path.join(paths.secrets, "capabilities");
+// One encrypted record for the application and user; bindings only reference it.
+const feishuVaultDir = path.join(paths.secrets, "connections", "feishu");
+await mkdir(feishuVaultDir, { recursive: true, mode: 0o700 });
+const feishuVault = new CredentialsStore(feishuVaultDir);
+await feishuVault.init();
+const feishuConnection = new LarkConnection({
+	read: async () => (await feishuVault.getSecrets("default")).connection,
+	write: async value => { await feishuVault.setSecrets("default", { connection: value }); },
+}, { qr: url => QRCode.toDataURL(url, { width: 224, margin: 2, color: { dark: "#000000", light: "#ffffff" } }) });
+const feishuBroker = await startFeishuBroker(feishuConnection);
+catalog.setConnection("lark-cli", feishuBroker.service);
+registerFeishuRoutes(app, feishuConnection);
+app.addHook("onClose", async () => { await feishuBroker.close(); });
 const compileJobs = new CompileJobStore(paths.knowledgeState);
 const reviewStore = new ReviewStore(paths.knowledgeReviews);
 const knowledgeRegistry = new KnowledgeBindingRegistry(paths.knowledgeState);
@@ -226,10 +247,7 @@ const knowledgeProbes = new KnowledgeProbeStore();
 const knowledgePlans = new KnowledgePlanStore(paths.knowledgePlans);
 const memorySetup = new MemorySetupService(paths.knowledgeState, { registry: knowledgeRegistry,
 	probes: knowledgeProbes, plans: knowledgePlans, acceptance: knowledgeAcceptance, objects: knowledgeObjects });
-const knowledgeSelections = new KnowledgeSelectionStore(paths.knowledgeState, knowledgeRegistry, async (ownerId) => {
-	const memory = await memorySetup.status(ownerId);
-	return memory.status === "configured" ? [memory.binding.id] : [];
-});
+const knowledgeSelections = new KnowledgeSelectionStore(paths.knowledgeState, knowledgeRegistry);
 const knowledgeRuntime = new KnowledgeRuntimeService({ bindings: knowledgeRegistry, acceptance: knowledgeAcceptance,
 	objects: knowledgeObjects, observation: knowledgeObservation, selections: knowledgeSelections, teams, stateDir: paths.knowledgeState, cacheDir: paths.knowledgeCache });
 const curatorJobs = new CuratorJobStore(paths.knowledgeState);
@@ -239,13 +257,13 @@ const wikiCurator = new WikiCuratorService({ jobs: curatorJobs, bindings: knowle
 	objects: knowledgeObjects, reviews: reviewStore, runtime: knowledgeRuntime, teams, cacheDir: paths.knowledgeCache, sources: knowledgeSources,
 	notify: async (job) => {
 		if (!job.origin || !await teams.contextForSession(job.origin.sessionId)) return;
-		await store.appendCustomMessageIfAbsent(job.origin.sessionId, `wiki-curator:${job.id}:${job.status}`, {
+		await store.appendCustomMessageIfAbsent(job.origin.sessionId, `wiki-curator:${job.id}:${job.status}:${job.recoveryRevision ?? 0}`, {
 			customType: "pudding:knowledge_job",
-			content: job.status === "pending_review" ? "知识库候选已生成，等待你审核；正式知识库尚未修改。" :
-				job.status === "no_changes" ? "知识整理完成，无需修改知识库。" : `知识整理需要处理：${job.failureCode ?? job.status}`,
-			details: { jobId: job.id, bindingId: job.targetBindingId, batchId: job.candidateBatchId, status: job.status },
+			content: curatorJobFeedback(job).message,
+			details: { ...curatorJobFeedback(job), bindingId: job.targetBindingId, batchId: job.candidateBatchId },
 		}, { triggerTurn: false });
 	} });
+knowledgeRuntime.setCurationStatusReader((ownerId, jobId) => wikiCurator.readStatus(ownerId, jobId));
 const wikiRevisions = new WikiRevisionService({ curator: wikiCurator, jobs: curatorJobs, reviews: reviewStore, bindings: knowledgeRegistry, objects: knowledgeObjects, publications: publishJournal });
 // T40/T42/T44：发布操作日志 + Markdown 发布器（检索索引为派生缓存，提前构造供发布回写后重建）。
 const wikiPublisher = new MarkdownWikiPublisher({
@@ -298,6 +316,18 @@ const store = new PiSessionStore(
 	mcpServers,
 );
 store.setKnowledgeRuntime(knowledgeRuntime);
+invoker.setConversationHistory(async (agent, ctx) => {
+	const delegation = ctx.delegationId ? await runtime.getDelegation(ctx.delegationId) : undefined;
+	if (!delegation?.operationId) return [];
+	const context = await teams.contextForSession(delegation.managerSessionId);
+	if (context?.window.type !== "direct") return [];
+	if (!context.active || context.window.id !== delegation.windowId || !context.window.members.includes(agent.name) ||
+		context.workspaceId !== ctx.workspaceId || context.cwdSnapshot !== ctx.cwd)
+		throw new Error("聊天上下文不属于当前执行窗口和项目");
+	const session = await store.open(delegation.managerSessionId);
+	return directConversationHistory(session.sessionManager.getBranch(), delegation.operationId);
+});
+
 const readLaterStore = new ReadLaterStore(path.join(paths.state, "read-later"));
 const readLaterCapture = new ReadLaterCaptureService(readLaterStore);
 const readLaterPromoter = new ReadLaterPromoter({ store: readLaterStore, capture: readLaterCapture, sources: knowledgeSources, curator: wikiCurator, bindings: knowledgeRegistry, teams });
@@ -324,9 +354,17 @@ invoker.setKnowledgeRuntime(async (agent, ctx, _message) => {
 		const current = await memorySetup.status(localViewerIdentity().user.id);
 		if (current.status !== "configured" || current.binding.id !== memory.binding.id) throw new Error("默认 memory 已变化，请重新开始本轮");
 	} } : undefined;
+	const direct = Boolean(delegation?.operationId && delegation.managerToolCallId === directTaskId(delegation.operationId));
 	const curatedSurface = scope ? wikiCurator.workerSurface(surface, { ...scope, operationId: ctx.operationId ?? ctx.delegationId ?? scope.sessionId,
-		resolveSources: async () => chatKnowledgeIntakes.resolve(await store.open(scope.sessionId), scope.ownerId,
-			delegation?.operationId && delegation.managerToolCallId === directTaskId(delegation.operationId) ? { operationId: delegation.operationId } : { toolCallId: delegation?.managerToolCallId }) }, agent.builtinId, defaultMemory) : surface;
+		...(direct ? { listSourceMessages: async () => chatKnowledgeIntakes.messages(await store.open(scope.sessionId), scope.ownerId) } : {}),
+		resolveSources: async (_toolCallId, sourceMessageIds) => {
+			const session = await store.open(scope.sessionId);
+			if (sourceMessageIds) {
+				if (!direct) throw new Error("历史消息素材选择只属于当前单聊");
+				return chatKnowledgeIntakes.resolveMessages(session, scope.ownerId, sourceMessageIds);
+			}
+			return chatKnowledgeIntakes.resolve(session, scope.ownerId, direct ? { operationId: delegation!.operationId } : { toolCallId: delegation?.managerToolCallId });
+		} }, agent.builtinId, defaultMemory) : surface;
 	return agent.builtinId === "wiki" ? curatedSurface : withReadLater(curatedSurface, localViewerIdentity().user.id, readLaterStore, readLaterCapture);
 });
 const extensionMutationJournal = new ExtensionMutationJournal(path.join(paths.state, "extension-mutation-pending.json"));
@@ -715,6 +753,7 @@ await registerChatRoutes(app, store, teams, workStates, uploads, invoker, {
 registerIdentityRoutes(app, localViewerIdentity, paths);
 registerWebResearchSettingsRoutes(app, webResearch);
 registerCalendarRoutes(app, new CalendarStore(paths.calendarState));
+registerCalendarProviderRoutes(app, new CalendarProviderRegistry([createFeishuCalendarProvider(feishuConnection)]));
 await registerSettingsRoutes(app, defaultCwd, productSettings, workStates, (settings) => {
 	store.markAllDirty();
 	workspaceExecution.configure({ leaseTimeoutMs: settings.harness.workspaceExecution.leaseTimeoutMs });
@@ -749,6 +788,7 @@ registerWorkspacesRoutes(app, teams.workspaces, undefined, store);
 // Teams 2.0 知识库 M2：绑定注册表 + 采纳账本 + 内容寻址快照库 + 观察服务 + 检索索引 + 接入探测/计划。
 registerContactsRoutes(app, new ContactsProjection({ bindings: knowledgeRegistry, objects: knowledgeObjects, acceptance: knowledgeAcceptance, observation: knowledgeObservation, searchIndex: knowledgeSearchIndex }));
 registerKnowledgeRoutes(app, knowledgeRegistry, {
+	viewerIdentity: () => readViewerIdentity(localViewerIdentity, paths),
 	memorySetup,
 	reviews: reviewStore,
 	objects: knowledgeObjects,
@@ -786,7 +826,7 @@ registerWikiRoutes(app, {
 	revisions: wikiRevisions,
 });
 await knowledgeObservation.startAll(knowledgeRegistry, localViewerIdentity().user.id);
-registerWikiCuratorRoutes(app, { service: wikiCurator, jobs: curatorJobs, reviews: reviewStore, objects: knowledgeObjects, bindings: knowledgeRegistry, teams, revisions: wikiRevisions });
+registerWikiCuratorRoutes(app, { service: wikiCurator, jobs: curatorJobs, reviews: reviewStore, objects: knowledgeObjects, bindings: knowledgeRegistry, teams, revisions: wikiRevisions, publications: publishJournal });
 registerReadLaterRoutes(app, { store: readLaterStore, capture: readLaterCapture, promoter: readLaterPromoter });
 app.addHook("onClose", async () => { await readLaterCapture.close(); });
 readLaterCapture.start();

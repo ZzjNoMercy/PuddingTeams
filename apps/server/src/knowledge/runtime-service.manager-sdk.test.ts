@@ -16,7 +16,7 @@ import { KnowledgeObjectStore } from "./objects.js";
 import { KnowledgeSelectionStore } from "./selections.js";
 import { KnowledgeRuntimeService, type KnowledgeMountSurface } from "./runtime-service.js";
 
-test("真实 Manager SDK 重建后持久知识指纹阻止旧上下文外发，安全边界不依赖 extension 抛错", { timeout: 30_000 }, async () => {
+test("真实 Manager SDK 配置变化和重建保留同聊天历史，当前权限仍在 provider 边界核对", { timeout: 30_000 }, async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pt-manager-knowledge-sdk-"));
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 	process.env.PI_CODING_AGENT_DIR = path.join(root, "pi-agent");
@@ -56,9 +56,11 @@ test("真实 Manager SDK 重建后持久知识指纹阻止旧上下文外发，�
 		const runtime = await sharedModelRuntime(); const model = runtime.getModel("manager-knowledge-fixture", "fixture-model"); assert.ok(model);
 		const sessionDir = path.join(root, "sessions");
 		const open = async (manager: SessionManager): Promise<AgentSession> => {
+			const service = new KnowledgeRuntimeService(deps);
+			service.forSession = async () => active;
 			const loader = new DefaultResourceLoader({ cwd: root, agentDir: process.env.PI_CODING_AGENT_DIR!, settingsManager: SettingsManager.inMemory(),
 				noExtensions: true, noSkills: true, noContextFiles: true, noPromptTemplates: true,
-				extensionFactories: [(pi) => { pi.on("context", async () => { swallowedContextThrows++; throw new Error("SDK_CONTEXT_EXTENSION_THROW_IS_SWALLOWED"); }); }],
+				extensionFactories: [(pi) => { pi.on("context", async () => { swallowedContextThrows++; throw new Error("SDK_CONTEXT_EXTENSION_THROW_IS_SWALLOWED"); }); }, service.managerExtension(() => manager.getSessionId())],
 			});
 			await loader.reload();
 			const { session } = await createAgentSession({ cwd: root, model, modelRuntime: runtime, sessionManager: manager, resourceLoader: loader,
@@ -69,8 +71,6 @@ test("真实 Manager SDK 重建后持久知识指纹阻止旧上下文外发，�
 			await session.bindExtensions({ mode: "rpc" });
 			// A fresh service instance represents process/session reconstruction. The
 			// real guard must use the JSONL profile, rather than extension closure state.
-			const service = new KnowledgeRuntimeService(deps);
-			service.forSession = async () => active;
 			service.guardManagerSession(session);
 			sessions.push(session); return session;
 		};
@@ -90,17 +90,19 @@ test("真实 Manager SDK 重建后持久知识指纹阻止旧上下文外发，�
 		active = { ...active, fingerprint: "manager-mount-B" };
 		const changed = await open(SessionManager.open(file, sessionDir));
 		await changed.prompt("重启后挂载 B");
-		assert.equal(requests.length, 3, "新实例必须在任何 provider 请求前阻断持久指纹不匹配");
-		assert.match(JSON.stringify(changed.messages.at(-1)), /知识库上下文已变化/); changed.dispose();
+		assert.equal(requests.length, 4, "配置变化不要求用户新建聊天");
+		assert.equal(changed.sessionId, initial.sessionId);
+		assert.ok(JSON.stringify(requests.at(-1)).includes("PERSISTED_MANAGER_SECRET_A")); changed.dispose();
 		active = { fingerprint: "no-mounted-knowledge", prompt: "已撤销挂载", tools: [], assertCurrent: async () => {} };
 		const narrowed = await open(SessionManager.open(file, sessionDir));
 		await narrowed.prompt("重启后撤销全部挂载");
-		assert.equal(requests.length, 3, "收窄为空也不能重发旧上下文");
-		assert.match(JSON.stringify(narrowed.messages.at(-1)), /知识库上下文已变化/); narrowed.dispose();
+		assert.equal(requests.length, 5, "撤销挂载保留对话，当前路由元数据刷新");
+		assert.equal(narrowed.sessionId, initial.sessionId);
+		assert.ok(JSON.stringify(requests.at(-1)).includes("PERSISTED_MANAGER_SECRET_A")); narrowed.dispose();
 		active = { fingerprint: "manager-mount-A", prompt: "平台挂载 A", tools: [], assertCurrent: async () => { throw new Error("MANAGER_AUTHORITY_REVOKED"); } };
 		const revoked = await open(SessionManager.open(file, sessionDir));
 		await revoked.prompt("同指纹但权限已撤销");
-		assert.equal(requests.length, 3, "同指纹也须检查当前权限");
+		assert.equal(requests.length, 5, "同指纹也须检查当前权限");
 		assert.match(JSON.stringify(revoked.messages.at(-1)), /MANAGER_AUTHORITY_REVOKED/);
 		assert.equal(swallowedContextThrows, 6, "失败请求仍经过会吞异常的扩展；仅 stream fence 阻止外发");
 	} finally {

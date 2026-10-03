@@ -258,7 +258,6 @@ function statusLabelOf(status: ChatStatus): string {
 function SessionChat({
 	roomId,
 	sessionId,
-	sessionLabel,
 	sessionModifiedAt,
 	emptyHint,
 	windowType,
@@ -286,7 +285,6 @@ function SessionChat({
 }: {
 	roomId: string;
 	sessionId: string;
-	sessionLabel: string;
 	/** 会话最后活动时间，用于分隔条的 今天/昨天/周X 展示（与列表同源）。 */
 	sessionModifiedAt?: string;
 	emptyHint?: string;
@@ -501,7 +499,7 @@ function SessionChat({
 						<InlinePiHistoryGate ids={inlineHistoryIds} historyLoading={historyLoading} onReady={handleTranscriptReady} onReadinessChange={handleTranscriptReadinessChange}>
 						<QueryInputAxis items={queryAxisItems} />
 						<ConversationContent className="home-message-column">
-							<div className="home-session-marker"><span />{sessionLabel}{sessionModifiedAt ? ` · ${compactDay(sessionModifiedAt)}` : ""}<span /></div>
+							{sessionModifiedAt ? <div className="home-session-marker"><span />{compactDay(sessionModifiedAt)}<span /></div> : null}
 							{messages.length === 0 ? (
 								<div className="flex flex-1 items-center justify-center pt-20 text-sm text-muted-foreground">
 									{emptyHint ?? "开始和 pi manager 对话"}
@@ -1082,10 +1080,7 @@ export function ChatPane({
 	const isGroup = type === "group";
 	const headerTitle = room?.name ?? (roomLoadError ? "对话暂不可用" : "正在加载对话…");
 	const activeSession = room?.sessions.find((s) => s.active);
-	const sessionTitle =
-		activeSession?.name ||
-		(activeSession?.firstMessage && activeSession.firstMessage !== "新对话" && activeSession.firstMessage !== "(no messages)" ? activeSession.firstMessage : "") ||
-		"";
+	const sessionTitle = activeSession?.name?.trim() || "";
 	const subtitle =
 		type === "group"
 			? `${members.length} 位 Worker · Manager 在场`
@@ -1187,7 +1182,6 @@ export function ChatPane({
 					key={activeId}
 					roomId={roomId}
 					sessionId={activeId}
-					sessionLabel={sessionTitle || "新会话"}
 					sessionModifiedAt={room.sessions.find((s) => s.id === activeId)?.modifiedAt}
 					emptyHint={emptyHint}
 					windowType={type}

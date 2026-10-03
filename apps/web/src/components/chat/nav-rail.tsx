@@ -89,7 +89,12 @@ export function NavRail({ view, returnSessionId }: { view: AppView; returnSessio
 	const username = identity ? identity.user.displayName.trim() || identity.user.username.trim() || "未命名用户" : identityState.status === "error" ? "身份读取失败" : "正在加载身份";
 	useEffect(() => {
 		const onShortcut = (event: KeyboardEvent) => {
-			if (event.defaultPrevented || event.key.toLowerCase() !== "k" || !(event.metaKey || event.ctrlKey)) return;
+			if (
+				event.defaultPrevented ||
+				typeof event.key !== "string" ||
+				event.key.toLowerCase() !== "k" ||
+				!(event.metaKey || event.ctrlKey)
+			) return;
 			event.preventDefault();
 			setSearchOpen(true);
 		};

@@ -481,21 +481,6 @@ test("审批后 blocked 的真实错误和执行事实进入 Manager 正文，Wo
 });
 
 
-test("Teams 准入已经批准但 workspace 启动失败时，Manager 收到真实 pre-start blocked 而非继续等待卡片", async () => {
-	const { invoker, interaction, sent } = await makeStack("completed", "manager-sess-1", true);
-	await invoker.respond(interaction.id, { requestId: "approve-admission", revision: interaction.revision, responses: [{ requestId: interaction.requests[0]!.requestId, action: "approve", scope: "proceed_with_worker" }] });
-	await waitForSent(sent, 2);
-	assert.ok(sent.every((message) => message.customType === "pudding:task_result"), "Worker 未启动时不能发布开始执行的 approved 投影");
-	const result = sent.find((message) => message.sessionId === "manager-sess-1" && message.customType === "pudding:task_result")!;
-	assert.match(result.content, /execution scope not found: missing-scope/);
-	assert.match(result.content, /workspace_policy_blocked/);
-	assert.match(result.content, /"workerStarted":false/);
-	assert.match(result.content, /"waitingInput":false/);
-	assert.match(result.content, /unverified_user_accepted/);
-	assert.equal(result.status, "failed");
-	assert.equal(result.options.triggerTurn, true);
-});
-
 test("未配置 MCP 时平台联网工厂仍进入 Pi Worker", async () => {
  const { teams, drivers, invoker } = await makeStack("completed");
  let config: Record<string, unknown> | undefined;

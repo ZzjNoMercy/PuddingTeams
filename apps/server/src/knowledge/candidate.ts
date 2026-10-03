@@ -7,6 +7,7 @@ import type { KnowledgeBindingRegistry } from "./bindings.js";
 import { assertPublicationBatchShape, publicationManifestHash, type CompileJob, type PublicationBatch, type PublicationFile } from "./contracts.js";
 import { readNoteBytes } from "./observation.js";
 import type { KnowledgeObjectStore } from "./objects.js";
+import { schemaContentPrefix, schemaEntityDirectory } from "./schema-layout.js";
 import { validateTeamsNote } from "./note-validation.js";
 import { effectiveSchemaHash, resolveEffectiveSchema } from "./schema-impact.js";
 import { hashTeamsSchema, type TeamsSchemaPreset } from "./schema-presets.js";
@@ -39,7 +40,7 @@ export function candidateBatchIdFor(job: Pick<CompileJob, "id">): string {
  */
 export function composeCompileTask(rawTask: string, job: Pick<CompileJob, "sourceSnapshotRoot" | "sourceAcceptanceIds" | "sourceSnapshotRefs" | "schemaContract">): string {
 	const sources = job.sourceAcceptanceIds.map((id, index) => `  - ${id}（快照 ${job.sourceSnapshotRefs[index]}）`).join("\n");
-	const structure = job.schemaContract ? `\n- 目标 Wiki 的结构契约如下。按 entities 的 type/directory 选择目标路径和 frontmatter；不要自行发明页面类型。\n\n\`\`\`json\n${job.schemaContract}\n\`\`\`\n` : "";
+	const structure = job.schemaContract ? `\n- 目标 Wiki 的结构契约如下。按 entities 的 type 选择 frontmatter；目标路径使用 pathRules.entityDirectories 给出的完整目录（若提供），不自行增减 wiki/。datetime字段必须使用包含T和时区的ISO时间，不得只填日期。不要自行发明页面类型。\n\n\`\`\`json\n${job.schemaContract}\n\`\`\`\n` : "";
 	return `${rawTask.trim()}
 
 ---
@@ -215,6 +216,9 @@ export function createCandidateValidator(deps: CandidateValidatorDeps): (job: Co
 			}
 			schema = effective.schema;
 		}
+		const contentPrefix = await schemaContentPrefix(binding, schema);
+  const frozenLayout = job.schemaContract ? (JSON.parse(job.schemaContract) as { pathRules?: { contentPrefix: string } }).pathRules : undefined;
+  if (frozenLayout && frozenLayout.contentPrefix !== contentPrefix) throw new Error("CompileJob content layout changed");
 		const candidates = await scanCandidateStaging(job.stagingRoot);
 		const byAcceptanceId = new Map<string, StoredAcceptedNoteVersion>();
 		for (const entry of Object.values(ledger.entries)) byAcceptanceId.set(entry.acceptanceId, entry);
@@ -233,7 +237,7 @@ export function createCandidateValidator(deps: CandidateValidatorDeps): (job: Co
 				const entity = schema.entities.find((item) => item.type === fields.type);
 				const sourceField = entity?.fields.find((item) => item.name === "sources");
 				const errors = validateTeamsNote(schema, { ...fields, sources: sourceField?.type === "text_list" ? fields.sources : sources });
-				if (entity && !candidate.targetPath.startsWith(`${entity.directory}/`)) errors.push(`invalid_directory:${entity.directory}`);
+				if (entity && !candidate.targetPath.startsWith(`${schemaEntityDirectory(contentPrefix, entity.directory)}/`)) errors.push(`invalid_directory:${entity.directory}`);
 				if (errors.length > 0) {
 					throw new Error(`CompileJob candidate ${candidate.targetPath} failed schema validation: ${errors.join(",")}`);
 				}

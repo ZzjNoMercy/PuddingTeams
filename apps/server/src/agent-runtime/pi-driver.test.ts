@@ -9,6 +9,7 @@ import { ExtensionRegistry } from "./extension-registry.js";
 import { LocalPiDriver, PI_CAPABILITIES, piSearchFingerprint, transientCooldownMs } from "./pi-driver.js";
 import { piConnectorManifest, piExtensionHooks } from "./pi-extension.js";
 import type { AgentEvent, InvocationContext } from "./types.js";
+import type { KnowledgeWorkerExecution } from "../knowledge/runtime-service.js";
 
 /**
  * Phase 6：本地 pi Connector（§9.1 Pi 调 Pi）——装配级测试。
@@ -241,4 +242,132 @@ test("Pi Worker 续聊在联网授权变化后重建工具面，授权未变时�
  const revoked = await fixture.openSession(ctx, first.sessionHandle);
  assert.notEqual(revoked.session, first.session);assert.equal(created, 2);assert.equal(disposed, 1);
  assert.deepEqual(revoked.session.tools, []);
+ assert.equal(revoked.sessionHandle, first.sessionHandle, "工具撤销重建实例，不新建聊天上下文");
+ const stored = SessionManager.open((await SessionManager.list(ctx.cwd, (driver as unknown as { sessionDir(): string }).sessionDir()))[0]!.path);
+ assert(stored.getBranch().some(entry => entry.type === "message" && entry.message.role === "assistant"));
+});
+
+async function runWikiLifecycle(options: {
+ ending?: Record<string, unknown>;
+ receipt?: Awaited<ReturnType<KnowledgeWorkerExecution['finish']>>;
+ finalizeError?: boolean;
+ stop?: boolean;
+ signal?: AbortSignal;
+}) {
+ const messages: Array<Record<string, unknown>> = [];
+ let prompts = 0, bound = 0, stopChecks = 0, aborts = 0;
+ const reasons: string[] = [];
+ const execution: KnowledgeWorkerExecution = {
+  bind() { bound++; },
+  async shouldStop() { stopChecks++; return options.stop ?? false; },
+  async abort() { aborts++; },
+  async finish(reason) {
+   reasons.push(reason);
+   if (options.finalizeError) throw new Error('durable receipt unavailable');
+   return options.receipt;
+  },
+ };
+ const session = {
+  messages,
+  agent: { state: { messages }, shouldStopAfterTurn: undefined as undefined | ((context: unknown) => Promise<boolean>) },
+  subscribe: () => () => undefined,
+  async prompt() {
+   prompts++;
+   messages.push({ role: 'assistant', ...(options.ending ?? { stopReason: 'stop', content: [{ type: 'text', text: 'model claims completed' }] }) });
+   const stop = await this.agent.shouldStopAfterTurn?.({});
+   if (options.stop && !stop) throw new Error('candidate caused an extra model turn');
+  },
+  async abort() {},
+ };
+ const driver = new LocalPiDriver({ transientRecovery: { maxAttempts: 2, rateLimitDelayMs: 0 } });
+ const drive = (driver as unknown as {
+  drive(session: unknown, message: string, context: InvocationContext, sessionHandle: string, runHandle: string,
+   transientAttempt: number, usageStart: undefined, outputAttempt: number, execution: KnowledgeWorkerExecution): AsyncIterable<AgentEvent>;
+ }).drive.bind(driver);
+ const events = await collect(drive(session, 'organize', { ...ctx, signal: options.signal }, 'wiki-session', 'wiki-run', 0, undefined, 0, execution));
+ return { events, prompts, bound, stopChecks, aborts, reasons, session };
+}
+
+test('Wiki committed candidate stops at tool boundary and completes with host receipt without final prose', async () => {
+ const result = await runWikiLifecycle({ ending: { stopReason: 'toolUse', content: [{ type: 'toolCall', id: 'submit', name: 'knowledge_submit_candidate', arguments: {} }] },
+  stop: true, receipt: { status: 'completed', content: '候选 batch-1 等待用户审核' } });
+ assert.equal(result.prompts, 1); assert.equal(result.bound, 1); assert.equal(result.stopChecks, 1);
+ const end = result.events.at(-1)!;
+ assert.equal(end.type, 'completed');
+ if (end.type === 'completed') assert.equal(end.result.content, '候选 batch-1 等待用户审核');
+ assert.equal(result.session.agent.shouldStopAfterTurn, undefined);
+});
+
+test('Wiki natural language success without submit is a host failure; pure query keeps ordinary result', async () => {
+ const missing = await runWikiLifecycle({ receipt: { status: 'failed', content: '未提交候选', errorCode: 'worker_no_submission' } });
+ assert.equal(missing.events.at(-1)?.type, 'failed');
+ assert.deepEqual(missing.reasons, ['worker_no_submission']);
+ assert.ok(!missing.events.some(event => event.type === 'completed'));
+ const query = await runWikiLifecycle({});
+ assert.equal(query.events.at(-1)?.type, 'completed');
+});
+
+test('Wiki host outcome prevents outer length/error recovery and reports actual failure', async () => {
+ for (const [stopReason, reason] of [['length', 'model_output_limit'], ['error', 'model_error']] as const) {
+  const result = await runWikiLifecycle({ ending: { stopReason, errorMessage: '429', content: [] },
+   receipt: { status: 'failed', content: reason, errorCode: reason } });
+  assert.equal(result.prompts, 1); assert.deepEqual(result.reasons, [reason]);
+  assert.equal(result.events.at(-1)?.type, 'failed');
+  assert.ok(!result.events.some(event => event.type === 'progress' && /recovery|wait/.test(event.stage ?? '')));
+ }
+});
+
+test('Wiki durable candidate survives late model abort while unsubmitted cancellation stays cancelled', async () => {
+ const committed = await runWikiLifecycle({ ending: { stopReason: 'aborted', content: [] },
+  receipt: { status: 'completed', content: '候选已提交待审核' } });
+ assert.equal(committed.events.at(-1)?.type, 'completed');
+ assert.deepEqual(committed.reasons, ['cancelled']);
+ const signal = new AbortController(); signal.abort();
+ const cancelled = await runWikiLifecycle({ signal: signal.signal,
+  receipt: { status: 'cancelled', content: '已取消', errorCode: 'cancelled' } });
+ assert.equal(cancelled.prompts, 0); assert.equal(cancelled.aborts, 1);
+ const end = cancelled.events.at(-1)!;
+ assert.equal(end.type, 'failed');
+ if (end.type === 'failed') assert.equal(end.result.status, 'cancelled');
+});
+
+test('Wiki finalization storage failure is explicit failure and cannot fall through to prose success', async () => {
+ const result = await runWikiLifecycle({ finalizeError: true });
+ const end = result.events.at(-1)!;
+ assert.equal(end.type, 'failed');
+ if (end.type === 'failed') assert.equal(end.result.errorCode, 'knowledge_execution_finalize_failed');
+});
+
+test('Wiki driver cancellation records host abort without waiting for SDK idle', async () => {
+ let entered!: () => void, release!: () => void;
+ const started = new Promise<void>(resolve => { entered = resolve; });
+ const gate = new Promise<void>(resolve => { release = resolve; });
+ let recorded = 0;
+ const execution: KnowledgeWorkerExecution = {
+  bind() {}, async shouldStop() { return false; },
+  async abort() { recorded++; },
+  async finish() { return { status: 'cancelled', content: '已取消', errorCode: 'cancelled' }; },
+ };
+ const messages: Array<Record<string, unknown>> = [];
+ const session = {
+  messages, agent: { state: { messages }, shouldStopAfterTurn: undefined },
+  subscribe: () => () => undefined,
+  async prompt() { entered(); await gate; messages.push({ role: 'assistant', stopReason: 'aborted' }); },
+  // Uncooperative SDK abort is deliberately left unresolved.
+  abort: () => new Promise<void>(() => {}),
+ };
+ const driver = new LocalPiDriver();
+ const drive = (driver as unknown as {
+  drive(session: unknown, message: string, context: InvocationContext, sessionHandle: string, runHandle: string,
+   transientAttempt: number, usageStart: undefined, outputAttempt: number, execution: KnowledgeWorkerExecution): AsyncIterable<AgentEvent>;
+ }).drive.bind(driver);
+ const collected = collect(drive(session, 'organize', ctx, 'cancel-session', 'cancel-wiki-run', 0, undefined, 0, execution));
+ await started;
+ await driver.cancel({ runHandle: 'cancel-wiki-run' }, ctx);
+ assert.equal(recorded, 1);
+ release();
+ const events = await collected;
+ const end = events.at(-1)!;
+ assert.equal(end.type, 'failed');
+ if (end.type === 'failed') assert.equal(end.result.status, 'cancelled');
 });

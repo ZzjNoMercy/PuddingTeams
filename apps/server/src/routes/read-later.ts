@@ -6,10 +6,13 @@ import {
   presentJob,
   type ReadLaterCreate,
   type ReadLaterUpdate,
+  type MarkReadInput,
+  type SavedHtmlInput,
 } from "../read-later/contracts.js";
 import type { ReadLaterStore } from "../read-later/store.js";
 import type { ReadLaterCaptureService } from "../read-later/capture-service.js";
 import type { ReadLaterPromoter, PromoteInput } from "../read-later/promote.js";
+import { importSavedHtml } from "../read-later/saved-html.js";
 export function registerReadLaterRoutes(
   app: FastifyInstance,
   deps: {
@@ -43,9 +46,27 @@ export function registerReadLaterRoutes(
         error: e instanceof Error ? e.message : "稍后读请求失败",
         code: e instanceof ReadLaterError ? e.code : undefined,
       });
-  app.get("/api/read-later/jobs", async () => ({
-    jobs: deps.store.listJobs(owner()).map(presentJob),
-  }));
+  app.get<{ Querystring: { filter?: string; page?: string; limit?: string } }>("/api/read-later/jobs", async (req, reply) => {
+    try {
+      const result = deps.store.listJobs(owner(), {
+        filter: req.query.filter,
+        page: req.query.page === undefined ? undefined : Number(req.query.page),
+        limit: req.query.limit === undefined ? undefined : Number(req.query.limit),
+      });
+      return { ...result, jobs: result.jobs.map((job) => ({
+        ...presentJob(job), title: job.title, source: job.source, itemAvailable: job.itemAvailable,
+      })) };
+    } catch (e) {
+      return error(e, reply);
+    }
+  });
+  app.post<{ Body: MarkReadInput }>("/api/read-later/mark-read", async (req, reply) => {
+    try {
+      return deps.store.markRead(owner(), req.body);
+    } catch (e) {
+      return error(e, reply);
+    }
+  });
   app.get<{ Params: { id: string } }>(
     "/api/read-later/jobs/:id",
     async (req, reply) => {
@@ -125,6 +146,12 @@ export function registerReadLaterRoutes(
     } catch (e) {
       return error(e, reply);
     }
+  });
+  app.post<{ Params: { id: string }; Body: SavedHtmlInput }>("/api/read-later/:id/import-html", { bodyLimit: 17 * 1024 * 1024 }, async (req, reply) => {
+    try {
+      const result = await importSavedHtml(deps.store, owner(), req.params.id, req.body);
+      return { item: presentItem(result.item), job: presentJob(result.job), replayed: result.replayed };
+    } catch (e) { return error(e, reply); }
   });
   app.delete<{
     Params: {

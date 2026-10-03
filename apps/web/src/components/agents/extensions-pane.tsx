@@ -748,7 +748,7 @@ function ConnectionsView({
 				<div className="grid gap-3 md:grid-cols-2">
 					{connections.map((connection) => {
 						const meta = CONNECTION_STATE_META[connection.state];
-						const statusLabel = connection.actions?.some((action) => action.id === "install-cli") ? "CLI 未安装" : meta.label;
+						const statusLabel = meta.label;
 						const checkedAt = new Date(connection.checkedAt);
 						const checkedLabel = Number.isNaN(checkedAt.getTime())
 							? "刚刚检查"
@@ -775,7 +775,7 @@ function ConnectionsView({
 								<div className="mt-4 grid grid-cols-2 gap-3 border-t border-border/70 pt-4 xl:grid-cols-3">
 									<div><div className="text-[11px] text-muted-foreground">账号</div><div className="mt-1 text-sm font-medium">{connection.accountName ?? "—"}</div></div>
 									<div><div className="text-[11px] text-muted-foreground">身份</div><div className="mt-1 text-sm font-medium">{connection.identity ?? "—"}</div></div>
-									<div><div className="text-[11px] text-muted-foreground">CLI 版本</div><div className="mt-1 font-mono text-sm">{connection.version ? `v${connection.version}` : "—"}</div></div>
+									<div><div className="text-[11px] text-muted-foreground">CLI 版本</div><div className="mt-1 font-mono text-sm">{connection.version ? `v${connection.version}` : connection.actions?.some(action => action.id === "install-cli") ? "未安装" : "—"}</div></div>
 									{connection.userAuthorization ? <div><div className="text-[11px] text-muted-foreground">用户授权</div><div className={`mt-1 text-sm font-medium ${connection.userAuthorization === "authorized" ? "text-emerald-700 dark:text-emerald-300" : "text-amber-700 dark:text-amber-300"}`}>{connection.userAuthorization === "authorized" ? "已授权" : connection.userAuthorization === "expired" ? "已过期" : "未授权"}</div></div> : null}
 								</div>
 								{connection.message ? <p className="mt-3 text-xs text-muted-foreground">{connection.message}</p> : null}

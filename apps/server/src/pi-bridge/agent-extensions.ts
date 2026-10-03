@@ -330,6 +330,7 @@ const UpdateWorkPlanParams = Type.Object({
 			reason: Type.String({ minLength: 1 }),
 		}, { description: "WorkItem 验证策略；不得低于 Goal 下限，首次执行后冻结且只能提高。" })),
 		workspaceExecutionPolicy: Type.Optional(Type.Object({
+			readOnlyRequirement: Type.Optional(Type.Union([Type.Literal("best_effort"), Type.Literal("enforced")], { description: "普通查阅用 best_effort（默认），自动执行并观测文件变更；用户明确要求禁止写入或必须隔离时用 enforced，能力不足先改派，不能用审批代替保障。source=user 未指定时按 enforced。" })),
 			mode: Type.Union([Type.Literal("read_only_shared"), Type.Literal("exclusive_write"), Type.Literal("isolated_worktree")]),
 			source: Type.Union([Type.Literal("harness_default"), Type.Literal("manager_derived"), Type.Literal("user")]),
 			reason: Type.String({ minLength: 1 }),
@@ -641,6 +642,7 @@ export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowCon
 		lines.join("\n"),
 		`委托工具默认全部已激活，按 roster 里的工具名直接调用，不要先搜索。标注「已激活」的扩展能力工具同样直接调用；只有未激活的扩展能力工具才先用 ${CORE_TOOL_SEARCH} 按名称激活后再调用。若调用返回工具不存在（Tool ... not found），说明它当前未激活（服务重启后会话重建会重置激活态）：用 ${CORE_TOOL_SEARCH} 激活后重试一次即可，不要当作 worker 不可用。只有搜索不到该 worker 的工具、或激活后调用仍被明确拒绝时，才说明该 worker 已不可用，不要继续重试。`,
 		"Worker 的原生 input_required/respond 是同一个 WorkItem、同一个 Delegation、同一个 Run 内的暂停与恢复：WorkPlan 必须把询问与用户回答后的继续执行建成一个 WorkItem，不得拆成询问前/后两个 WorkItem。用户在审批卡提交业务选择后，Runtime 会自动恢复原 Delegation；不得再发 followup、验证委托或替代委托来完成、提交或验收该流程。",
+		"最少用户介入：先沿用用户已授权的范围与现有偏好，平台可验证的事实自行检查，常规可逆实现选择自行决定。普通查阅按 best_effort 自动执行；用户明确要求不得写入时设 readOnlyRequirement=enforced。workspace_policy_blocked 是可恢复的能力缺口，先按任务职责改派合适 Worker、保持原约束，不要索要无效只读准入确认。只有缺少必要授权、用户独有信息或影响交付的真实业务取舍且无法按现有偏好解决时才询问；同一问题集中询问一次，不因重试/改派再次索要已有授权。实际发布和破坏性操作仍遵守原门禁。",
 		MANAGER_HUMAN_WAIT_INSTRUCTION,
 		...(soloCtx
 			? [
@@ -1285,7 +1287,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 			name: CORE_TOOL_REQUEST_DECISION,
 			executionMode: "sequential",
 			label: "Request Human Decision",
-			description: "创建业务级人类决策请求并暂停当前 Goal；它不替代 Connector 的 permission/confirmation 审批。",
+			description: "仅在缺少必要授权、用户独有信息或无法由现有偏好解决的实质业务取舍时请求人类决策；先自行查证、选择可逆方案或改派合适 Worker。同类问题合并一次询问，不为普通只读能力未知请求准入。它不替代 Connector 的真实 permission/confirmation 审批。",
 			parameters: RequestDecisionParams,
 			async execute(toolCallId, params: Static<typeof RequestDecisionParams>, signal) {
 				await assertManagerNotWaiting(deps);

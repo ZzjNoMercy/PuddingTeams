@@ -112,7 +112,7 @@ export class ReadLaterCaptureService {
         90000,
       ),
       heartbeat = setInterval(() => {
-        if (!this.store.progress(job, "正在采集", 20))
+        if (!this.store.progress(job))
           controller.abort(new Error("任务租约已失效"));
       }, 10000);
     const versionId = randomUUID(),
@@ -145,12 +145,19 @@ export class ReadLaterCaptureService {
         });
         return;
       }
+      this.store.progress(job, "提取正文", 30);
       const article = extractArticle(
           decodeArticle(response.body, contentType),
           response.url,
           contentType,
-        ),
-        metadata = {
+        );
+      if (article.unavailableReason) {
+        // Keep the saved URL and any existing article; verification redirects
+        // contain short-lived tokens and must not become article metadata.
+        this.store.complete(job, { error: article.unavailableReason });
+        return;
+      }
+      const metadata = {
           title: article.title,
           siteName: article.siteName,
           author: article.author,
@@ -174,6 +181,7 @@ export class ReadLaterCaptureService {
           warnings.push("已达到图片采集上限，剩余图片未保存");
           break;
         }
+        this.store.progress(job, "归档正文与图片", 40 + Math.floor(50 * index / Math.min(article.images.length, 32)));
         try {
           const result = await this.fetch(image.url, controller.signal),
             declared = String(result.headers["content-type"] ?? "")
@@ -229,6 +237,7 @@ export class ReadLaterCaptureService {
             : `${label.slice(1)}（图片未保存）`,
       );
       controller.signal.throwIfAborted();
+      this.store.progress(job, "保存正文", 95);
       const version: ArticleVersion = {
         id: versionId,
         itemId: job.itemId,
@@ -239,6 +248,7 @@ export class ReadLaterCaptureService {
         coverAssetId: assets.find((a) => a.role === "cover")?.id,
         capturedAt: new Date().toISOString(),
         extractorVersion: "teams-read-later/1",
+        captureMethod: "http",
       };
       committed = this.store.complete(job, { metadata, version });
     } catch (error) {

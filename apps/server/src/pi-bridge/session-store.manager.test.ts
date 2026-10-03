@@ -938,3 +938,42 @@ test("平台联网只装入 Manager Solo，Direct/Group relay 不获得联网工
   }
  } finally { await sessions.disposeAll(); }
 });
+
+test("started已持久但房间绑定未更新时，重启续聊从执行账本恢复最新合法Worker", async () => {
+	const { teams, drivers, runtime, dir, sessions } = await makeStack();
+	const agent = await teams.upsertAgent({ name: "resume-worker", description: "resume", invoke: { type: "command", command: "echo", runArgs: [] } });
+	const window = await teams.createWindow({ type: "direct", members: [agent.name], sessionId: "resume-chat" });
+	let handle = "worker-first";
+	const driver: AgentDriver = {
+		id: agent.name,
+		async capabilities() { return { operations: ["run", "continue", "cancel"], interactionKinds: [], progress: "none", transport: "spawn" }; },
+		async *run() { yield { type: "started", sessionHandle: handle, runHandle: `run-${handle}` }; yield { type: "failed", result: { agentId: agent.name, status: "failed", sessionHandle: handle, errorCode: "server_restart", error: "服务重启", recoverable: true } }; },
+		async *continue(input) { yield { type: "completed", result: { agentId: agent.name, status: "completed", sessionHandle: input.sessionHandle, content: "恢复上下文" } }; },
+		async *respond() { throw new Error("unused"); },
+		async cancel() {},
+		async probe() { return { extensionInstalled: true, detected: true, configured: true, authenticated: "unknown" as const, enabled: true, compatibility: "supported" as const, capabilities: await this.capabilities(), issues: [] }; },
+	};
+	drivers.register(driver);
+	const cwd = await teams.workspaceFor(window.id);
+	const run = () => runtime.delegate({ windowId: window.id, managerSessionId: "resume-chat", agentId: agent.name, agentRevision: agent.extensionRevision ?? 0, cwdSnapshot: cwd, message: "原目标", mode: "run", driver }, { cwd, env: {} });
+	try {
+		await run(); // Runtime had a handle, but the crashed Invoker never returned to rememberSession.
+		const restartedTeams = new TeamsStore({ state: path.join(dir, "teams"), assets: path.join(dir, "teams"), managedWorkspaces: path.join(dir, "managed") }, dir); await restartedTeams.init();
+		const records = new DelegationStore(path.join(dir, "rt")); await records.init();
+		const secrets = new InteractionSecretStore(path.join(dir, "sec")); await secrets.init();
+		const restartedRuntime = new AgentRuntime(records, secrets, id => drivers.get(id));
+		const restored = new AgentInvoker(restartedTeams, restartedRuntime, drivers, undefined, dir);
+		assert.equal(await restored.sessionHandleFor(window.id, "resume-chat", agent), "worker-first");
+		await teams.rememberWorkerSession(window.id, "resume-chat", agent.name, "worker-first", undefined, cwd, agent.extensionRevision ?? 0);
+		await new Promise(resolve => setTimeout(resolve, 5)); handle = "worker-second"; await run();
+		const newer = new AgentInvoker(teams, runtime, drivers, undefined, dir);
+		assert.equal(await newer.sessionHandleFor(window.id, "resume-chat", agent), "worker-second", "旧房间绑定不能遮住较新的started记录");
+		await teams.rememberWorkerSession(window.id, "resume-chat", agent.name, "worker-first", undefined, cwd, agent.extensionRevision ?? 0);
+		assert.equal(await newer.sessionHandleFor(window.id, "resume-chat", agent), "worker-second", "旧轮次迟到的绑定写入不能遮住实际最新启动");
+		const other = await teams.createWindow({ type: "direct", members: [agent.name], sessionId: "other-chat" });
+		assert.equal(await newer.sessionHandleFor(other.id, "other-chat", agent), undefined);
+		assert.equal(await newer.sessionHandleFor(other.id, "resume-chat", agent), undefined);
+		const changed = await teams.upsertAgent({ ...agent, description: "new-config" });
+		assert.equal(await newer.sessionHandleFor(window.id, "resume-chat", changed), undefined);
+	} finally { await sessions.disposeAll(); }
+});

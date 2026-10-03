@@ -1,16 +1,17 @@
 "use client";
 
 import { useState } from "react";
-import { BrainCircuitIcon, PaletteIcon, ServerCogIcon, XIcon } from "lucide-react";
+import { BrainCircuitIcon, CableIcon, PaletteIcon, ServerCogIcon, XIcon } from "lucide-react";
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { AppearanceSettings } from "./appearance-settings";
 import { ProviderSettings } from "./provider-settings";
 import { HarnessSettingsPanel } from "./harness-settings";
+import { FeishuSettings } from "./feishu-settings";
 
 export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
-	const [section, setSection] = useState<"appearance" | "providers" | "harness">("appearance");
+	const [section, setSection] = useState<"appearance" | "providers" | "harness" | "feishu">("appearance");
 	const [harnessVisited, setHarnessVisited] = useState(false);
-	const sectionKicker = section === "appearance" ? "APPEARANCE" : section === "providers" ? "PROVIDERS" : "HARNESS";
+	const sectionKicker = section === "feishu" ? "飞书连接" : section === "appearance" ? "APPEARANCE" : section === "providers" ? "PROVIDERS" : "HARNESS";
 
 	return (
 		<Dialog open={open} onOpenChange={onOpenChange}>
@@ -33,6 +34,7 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
 				</header>
 				<div className="settings-body">
 					<nav className="settings-nav" aria-label="设置分类">
+						<button type="button" className="settings-nav-item" data-active={section === "feishu" ? "true" : "false"} onClick={() => setSection("feishu")}><CableIcon aria-hidden="true" /><span><strong>飞书默认应用</strong><small>应用与共享授权</small></span></button>
 						<button
 							type="button"
 							className="settings-nav-item"
@@ -57,6 +59,7 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
 						</button>
 					</nav>
 					<main className="settings-content">
+						{section === "feishu" ? <FeishuSettings /> : null}
 						{section === "appearance" ? (
 							<div className="settings-content-column">
 								<div className="settings-section-heading">

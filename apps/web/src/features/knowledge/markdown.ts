@@ -3,12 +3,22 @@
  * 标题 slug、相对资源路径解析。渲染组件见 note-markdown.tsx。
  */
 
+import { parseDocument } from "yaml";
+
 /** 渲染层用带哨兵的 href 承载 wiki 链接目标，a 组件据此接管点击。 */
 export const WIKI_LINK_PREFIX = "#pudding-wiki:";
 
 export function splitFrontmatter(content: string): { body: string; properties: Array<[string, string]> } {
-	const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n/.exec(content);
+	const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(content);
 	if (!match) return { body: content, properties: [] };
+	try {
+		const document = parseDocument(match[1]!, { schema: "failsafe" });
+		if (document.errors.length) throw new Error("invalid frontmatter");
+		const fields: unknown = document.toJS({ maxAliasCount: 100 });
+		if (fields && typeof fields === "object" && !Array.isArray(fields)) {
+			return { body: content.slice(match[0].length), properties: Object.entries(fields).map(([key, value]) => [key, propertyText(value)]) };
+		}
+	} catch { /* malformed metadata remains visible; never change source bytes */ }
 	const properties: Array<[string, string]> = [];
 	for (const line of match[1]!.split(/\r?\n/)) {
 		const separator = line.indexOf(":");
@@ -16,6 +26,24 @@ export function splitFrontmatter(content: string): { body: string; properties: A
 	}
 	return { body: content.slice(match[0].length), properties };
 }
+
+function propertyText(value: unknown): string {
+	if (value === null || value === undefined || value === "") return "—";
+	if (Array.isArray(value)) return value.length ? value.map(propertyText).join("、") : "—";
+	if (typeof value === "object") return Object.entries(value).map(([key, item]) => `${key}：${propertyText(item)}`).join("；");
+	return String(value);
+}
+
+export function formatPropertyValue(value: string): string {
+	if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?$/.test(value)) return value;
+	const date = new Date(value);
+	if (!Number.isFinite(date.getTime())) return value;
+	const pad = (n: number) => String(n).padStart(2, "0");
+	return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+const propertyLabels: Record<string, string> = { id: "编号", type: "类型", title: "标题", created: "创建时间", updated: "更新时间", sources: "来源", phone: "电话", birthday: "出生年份", location: "所在地" };
+export const propertyLabel = (key: string): string => propertyLabels[key] ?? key;
 
 const IMAGE_EMBED_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "ico"]);
 

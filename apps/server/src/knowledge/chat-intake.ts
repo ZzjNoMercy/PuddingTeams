@@ -85,6 +85,29 @@ export class ChatKnowledgeIntake {
 		if (entries.length !== 1) throw new Error("direct 用户消息素材关联不唯一");
 		await this.bind(session, refs, entries[0]!.id);
 	}
+	/** Same-chat admitted user messages remain usable after a restart, before any Job exists. */
+	async messages(session: AgentSession, ownerId: string): Promise<Array<{ id: string; text: string; createdAt: string }>> {
+		const admitted = await this.database(db => (db.prepare("SELECT record_json FROM intakes").all() as { record_json: string }[])
+			.map(row => JSON.parse(row.record_json) as Intake).filter(record => record.ownerId === ownerId && record.sessionId === session.sessionId && record.sourceIds.length));
+		const ids = new Set(admitted.map(record => record.userEntryId));
+		return session.sessionManager.getBranch().flatMap(entry => {
+			if (!ids.has(entry.id)) return [];
+			if (entry.type === "custom_message" && entry.customType === "pudding:user_message") return [{ id: entry.id, text: textOf(entry.content), createdAt: entry.timestamp }];
+			if (entry.type === "message" && entry.message.role === "user") return [{ id: entry.id, text: textOf(entry.message.content), createdAt: entry.timestamp }];
+			return [];
+		});
+	}
+	async resolveMessages(session: AgentSession, ownerId: string, messageIds: string[]): Promise<ChatSourceRefs> {
+		if (!messageIds.length || new Set(messageIds).size !== messageIds.length) throw new Error("原消息选择不能为空或重复");
+		const allowed = new Set((await this.messages(session, ownerId)).map(message => message.id));
+		if (messageIds.some(id => !allowed.has(id))) throw new Error("原消息不在当前聊天的已落盘来源内");
+		return this.database(db => {
+			const records = (db.prepare("SELECT record_json FROM intakes").all() as { record_json: string }[]).map(row => JSON.parse(row.record_json) as Intake);
+			const chosen = messageIds.map(id => records.find(record => record.userEntryId === id && record.ownerId === ownerId && record.sessionId === session.sessionId)!);
+			if (chosen.some(record => record.unsupportedNames.length)) throw new Error("原消息含尚不支持整理的附件");
+			return { operationId: hash(JSON.stringify(chosen.map(record => record.operationId))), sourceIds: [...new Set(chosen.flatMap(record => record.sourceIds))] };
+		});
+	}
 	async resolve(session: AgentSession, ownerId: string, selector: { operationId?: string; toolCallId?: string }): Promise<ChatSourceRefs> {
 		const branch = session.sessionManager.getBranch();
 		let entryId: string | undefined;

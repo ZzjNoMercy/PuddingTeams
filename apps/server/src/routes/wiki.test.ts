@@ -327,6 +327,9 @@ test("wiki 编译路由：running 任务取消后 Job 与 Delegation 收敛，�
 	assert.equal(created.statusCode, 202);
 	const job = created.json().job as CompileJob;
 	const running = (await waitFor(() => fixture.jobs.get(job.id), (current) => current?.status === "running" && !!current.delegationId))!;
+	// Job admission precedes the Driver's started receipt. This case tests
+	// acknowledged cancellation of a running Driver, so wait for its run handle.
+	await waitFor(() => fixture.delegations.getDelegation(running.delegationId!), (record) => record?.executionState === "running" && !!record.runHandle);
 	const cancel = await fixture.app.inject({ method: "POST", url: `/api/wiki/compile-jobs/${job.id}/cancel` });
 	assert.equal(cancel.statusCode, 200);
 	assert.equal((cancel.json().job as CompileJob).status, "cancelled");

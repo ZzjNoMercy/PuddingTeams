@@ -16,7 +16,7 @@ import { KnowledgeSelectionStore } from "./selections.js";
 import { KnowledgeRuntimeService } from "./runtime-service.js";
 import { KnowledgeSourceStore } from "./sources.js";
 import { ChatKnowledgeIntake } from "./chat-intake.js";
-import { WikiCuratorService } from "./curator-jobs.js";
+import { WikiCuratorService, type CuratorJob } from "./curator-jobs.js";
 import { buildManagerExtensionFactories, type ManagerExtensionDeps } from "../pi-bridge/agent-extensions.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 
@@ -31,7 +31,7 @@ test("实际Manager SDK只委派知识管家；Worker整理引用原话与图片
 		res.writeHead(200, { "content-type": "text/event-stream" });
 		const send = (delta: unknown, finish_reason: string | null = null) => res.write(`data: ${JSON.stringify({ id: `fixture-${requests.length}`, object: "chat.completion.chunk", created: 1780000000, model: "fixture", choices: [{ index: 0, delta, finish_reason }] })}\n\n`);
 		if (first) { send({ role: "assistant", tool_calls: [{ index: 0, id: `request-${requests.length}`, type: "function", function: { name: "agent_wiki__delegate", arguments: JSON.stringify({ task: "目标binding：模型整理指令：虚构日期10月30日" }) } }] }); send({}, "tool_calls"); }
-		else { send({ role: "assistant", content: "候选整理已排队，需要人工审核" }); send({}, "stop"); }
+		else { send({ role: "assistant", content: "知识管家已返回宿主回执，请按实际状态继续。" }); send({}, "stop"); }
 		res.end("data: [DONE]\n\n");
 	});
 	const sessions: AgentSession[] = [];
@@ -59,10 +59,33 @@ test("实际Manager SDK只委派知识管家；Worker整理引用原话与图片
 			const templates = await service.mount({ ownerId: "owner", windowId: "window", sessionId: "schema", contextKey: "schema" }, []);
 			const context = templates.tools.find((tool) => tool.name === "knowledge_context")!;
 			service.forSession = async () => ({ ...templates, fingerprint: "fixture-authorized", prompt: "固定授权知识库", managerPrompt: '授权库：binding。通过 agent_wiki__delegate 委派知识管家。', assertCurrent: async () => { if (revoked) throw new Error("知识库授权已撤销"); }, tools: templates.tools.map(tool => tool.name === "knowledge_context" ? { ...context, execute: async () => ({ content: [{ type: "text", text: JSON.stringify({ mounts: [{ bindingId: "binding" }] }) }], details: {} }) } : tool) });
-			// Real requestSurface and real SDK registration; capture the private create
-			// boundary here. Default Curator SDK generation is covered separately.
-			const curator = new WikiCuratorService({} as never); let created: Parameters<WikiCuratorService["create"]>[0] | undefined;
-			curator.create = async (input) => { created = input; if (revoke) revoked = true; return { job: { id: "fixed-job", status: "queued" } as never, replayed: false }; };
+			// Real Worker surface and Manager SDK registration. Only durable storage,
+			// extraction and candidate validation are stubbed; no second Agent runs.
+			let currentJob: CuratorJob | undefined;
+			const curator = new WikiCuratorService({ jobs: {
+				get: async () => currentJob,
+				transition: async (_id: string, from: string[], patch: Partial<CuratorJob>) => {
+					assert.ok(currentJob && from.includes(currentJob.status));
+					currentJob = { ...currentJob, ...patch }; return currentJob;
+				},
+			}, workerTimeoutMs: 5_000 } as never);
+			let created: Parameters<WikiCuratorService["create"]>[0] | undefined, createCalls = 0, preparationCalls = 0;
+			curator.create = async (input) => {
+				created = input; createCalls++; if (revoke) revoked = true;
+				currentJob = { id: "fixed-job", executionMode: input.executionMode, ownerId: input.ownerId,
+					targetBindingId: input.bindingId, status: "running", sources: (await sources.manifest(input.ownerId, input.sourceIds!)).sources } as CuratorJob;
+				return { job: currentJob, replayed: false };
+			};
+			const fixture = curator as unknown as {
+				prepareSources(job: CuratorJob): Promise<CuratorJob>;
+				candidateContext(job: CuratorJob): Promise<unknown>;
+				assertAuthority(job: CuratorJob): Promise<void>;
+			};
+			fixture.prepareSources = async job => { await fixture.assertAuthority(job); preparationCalls++; return job; };
+			fixture.assertAuthority = async () => { if (revoked) throw new Error("知识库授权已撤销"); };
+			fixture.candidateContext = async job => ({ sources: await Promise.all(job.sources.map(async source => ({ ...source,
+				...(source.kind === "text" ? { content: (await sources.readText(job.ownerId, source.id)).text } : {}) }))) });
+			curator.submit = async job => { currentJob = { ...job, status: "no_changes" }; return currentJob; };
 			let session!: AgentSession;
 			let delegatedTask: string | undefined;
 			const invoker = { requireAgent: async () => wiki, delegationsForManagerSession: async () => [],
@@ -72,9 +95,21 @@ test("实际Manager SDK只委派知识管家；Worker整理引用原话与图片
 					const worker = curator.workerSurface(await service.forSession(input.managerSessionId!), { ownerId: "owner", windowId: "window", sessionId: input.managerSessionId!, operationId: "delegation",
 						resolveSources: () => intakes.resolve(session, "owner", { toolCallId: input.managerToolCallId }) }, "wiki");
 					assert.ok(worker.tools.some(tool => tool.name === "knowledge_search"));
-					const request = worker.tools.find(tool => tool.name === "knowledge_request_curation")!;
-					const result = await request.execute("worker-request", { bindingId: "binding", task: input.message }, undefined, undefined, {} as never);
-					return { status: "completed", content: (result.content[0] as { text: string }).text, details: { worker: "wiki" } };
+					assert.ok(!worker.tools.some(tool => tool.name === "knowledge_request_curation"), "聊天Worker不得另开后台整理");
+					const prepare = worker.tools.find(tool => tool.name === "knowledge_prepare_candidate")!;
+					try {
+						const result = await prepare.execute("worker-prepare", { bindingId: "binding", task: input.message }, undefined, undefined, {} as never);
+						const payload = JSON.parse((result.content[0] as { text: string }).text);
+						assert.equal(payload.context.sources[0].content, userInput, "委派指令不能替换冻结用户原话");
+						assert.equal(payload.context.sources[1].kind, "image");
+						assert.equal(payload.context.sources[1].originalHash, (await sources.get("owner", payload.context.sources[1].id))!.originalHash);
+						const submit = worker.tools.find(tool => tool.name === "knowledge_submit_candidate")!;
+						await submit.execute("worker-submit", { bindingId: "binding", pages: [] }, undefined, undefined, {} as never);
+						assert.equal(await worker.workerExecution!.shouldStop(), true);
+						const receipt = await worker.workerExecution!.finish("worker_no_submission");
+						assert.equal(receipt?.status, "completed");
+						return { status: "completed", content: receipt!.content, details: { worker: "wiki" } };
+					} finally { await worker.workerExecution!.finish("model_error"); }
 				} } as unknown as AgentInvoker;
 			service.setChatIntake(async (active) => {
 				const sm = active.sessionManager as unknown as { fileEntries: unknown[]; flushed: boolean };
@@ -98,6 +133,8 @@ test("实际Manager SDK只委派知识管家；Worker整理引用原话与图片
 			assert.ok(JSON.stringify(requests[before]!.messages).includes(image.base64));
 			assert.equal(delegatedTask, "目标binding：模型整理指令：虚构日期10月30日");
 			assert.equal(created?.task, delegatedTask); assert.equal(created?.sourceText, undefined); assert.deepEqual(created?.sourceIds, refs.sourceIds);
+			assert.equal(created?.executionMode, "worker"); assert.equal(createCalls, 1);
+			assert.equal(preparationCalls, revoke ? 0 : 1);
 			assert.equal((await sources.readText("owner", refs.sourceIds[0]!)).text, userInput);
 			if (expand) {
 				assert.ok(JSON.stringify(requests[before]!.messages).includes("可信技能展开文本"), "使用真实SDK技能加载和展开，不是测试手动改写prompt");
@@ -110,6 +147,7 @@ test("实际Manager SDK只委派知识管家；Worker整理引用原话与图片
 				assert.doesNotMatch((await sources.readText("owner", refs.sourceIds[0]!)).text, /可信模板展开文本/);
 			}
 			assert.equal((await sources.get("owner", refs.sourceIds[1]!))?.kind, "image");
+			assert.deepEqual((await sources.readOriginal("owner", refs.sourceIds[1]!)).bytes, Buffer.from(image.base64, "base64"));
 			if (revoke) assert.match(JSON.stringify(session.messages.at(-1)), /授权已撤销/);
 		}
 	} finally {

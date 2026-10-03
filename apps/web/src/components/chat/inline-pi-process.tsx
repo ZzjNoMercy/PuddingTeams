@@ -5,7 +5,11 @@ import { useWorkerProcess } from "@/hooks/useWorkerProcess";
 import { fetchRoomDelegationProcesses, type WorkerProcessListItem } from "@/lib/api";
 import { groupForRender } from "@/lib/events";
 import { delegationMessageEnd } from "@/lib/worker-process-scope";
+import { workerProcessEmptyState } from "@/lib/worker-process-presentation";
+import { useAgentLabel } from "@/lib/avatars";
+import { Loader } from "@/components/ai-elements/loader";
 import { AssistantGroup, Message } from "./message";
+import { WorkerAvatar } from "./worker-avatar";
 import { WorkerProcessProvider } from "./worker-process-context";
 
 const HistoryReadiness = createContext({ enabled: false, indexReady: false, indexed: [] as string[], pending: [] as string[], unconfirmed: [] as string[], indexError: null as string | null, indexRetrying: false, retryIndex: () => {} });
@@ -39,13 +43,14 @@ function HistoryGate({ loading, readReady, onReady, onReadinessChange, children 
 type InlinePiProcessProps = { item: WorkerProcessListItem; until: number; fallback?: string; onReady: (id: string, confirmed: boolean) => void; openWorkerProcess: (id: string, fullSession?: boolean) => void };
 
 function InlinePiProcess({ item, until, fallback, onReady, openWorkerProcess }: InlinePiProcessProps) {
-	const [attempt, setAttempt] = useState(0);
-	return <InlinePiProcessAttempt key={attempt} item={item} until={until} fallback={fallback} onReady={onReady} openWorkerProcess={openWorkerProcess} onRetry={() => setAttempt((value) => value + 1)} />;
+	return <InlinePiProcessAttempt item={item} until={until} fallback={fallback} onReady={onReady} openWorkerProcess={openWorkerProcess} />;
 }
 
-function InlinePiProcessAttempt({ item, until, fallback, onReady, openWorkerProcess, onRetry }: InlinePiProcessProps & { onRetry: () => void }) {
+function InlinePiProcessAttempt({ item, until, fallback, onReady, openWorkerProcess }: InlinePiProcessProps) {
 	const active = ["running", "waiting_input", "cancel_requested", "reconciling"].includes(item.executionState);
 	const process = useWorkerProcess(item.delegationId, false, item.live && active && until === Infinity);
+	const label = useAgentLabel(item.agentId);
+	const emptyState = workerProcessEmptyState(item.executionState, process.live, Boolean(process.connectionError));
 	useEffect(() => {
 		if (!process.loading) onReady(item.delegationId, !process.error);
 	}, [process.loading, process.error, item.delegationId, onReady]);
@@ -57,10 +62,13 @@ function InlinePiProcessAttempt({ item, until, fallback, onReady, openWorkerProc
 		{fallback ? <p className="whitespace-pre-wrap text-muted-foreground">{fallback}</p> : null}
 		{process.scopeError
 			? <button type="button" className="font-medium text-primary underline underline-offset-2" onClick={() => openWorkerProcess(item.delegationId, true)}>核对完整会话</button>
-			: <button type="button" className="font-medium text-primary underline underline-offset-2" onClick={onRetry}>重试这条执行记录</button>}
+			: <button type="button" disabled={process.refreshing} className="font-medium text-primary underline underline-offset-2 disabled:opacity-50" onClick={process.refresh}>{process.refreshing ? "正在重新读取…" : "重试这条执行记录"}</button>}
 	</div>;
-	const connectionWarning = process.connectionError ? <div role="alert" className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-foreground"><p>{process.connectionError}</p><button type="button" className="font-medium text-primary underline underline-offset-2" onClick={onRetry}>重新读取执行记录</button></div> : null;
-	if (messages.length === 0) return <>{connectionWarning}<div className="whitespace-pre-wrap text-sm">{fallback || (process.connectionError ? "执行记录尚未确认完整" : "等待 Worker 回复…")}</div></>;
+	const connectionWarning = process.connectionError ? <div role="alert" className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-foreground"><p>{process.connectionError}</p><button type="button" disabled={process.refreshing} className="font-medium text-primary underline underline-offset-2 disabled:opacity-50" onClick={process.refresh}>{process.refreshing ? "正在重新读取…" : "重新读取执行记录"}</button></div> : null;
+	if (messages.length === 0) return <>{connectionWarning}<div className="flex items-start gap-2.5" role={emptyState.pending && !fallback ? "status" : undefined}>
+		<WorkerAvatar name={item.agentId} size={34} />
+		<div className="min-w-0 pt-1"><p className="mb-1 text-xs font-medium text-muted-foreground">{label}</p><div className="flex items-center gap-2 whitespace-pre-wrap text-sm">{emptyState.pending && !fallback ? <Loader size={14} /> : null}{fallback || emptyState.text}</div></div>
+	</div></>;
 	return <>{connectionWarning}<div className="flex min-w-0 flex-col gap-5" aria-label="Worker 执行对话">
 		{groupForRender(messages).map((entry) => "kind" in entry
 			? <AssistantGroup key={entry.id} roomId="" messages={entry.messages} windowType="direct" assistantAs={item.agentId} />

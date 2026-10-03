@@ -15,13 +15,16 @@ test("isolated_worktree 委托明确当前 cwd 已隔离，禁止 Worker 再建�
 	assert.match(message, /use its existing writable \.git/);
 });
 
-test("非 isolated_worktree 委托不改写业务消息", () => {
+test("只读委托保留用户任务并追加不写入边界，不宣称观测等于沙箱", () => {
 	const original = "inspect only";
-	assert.equal(messageForWorkspaceExecution(original, {
-		mode: "read_only_shared",
-		source: "manager_derived",
-		reason: "read only",
-		baselineStrategy: "filesystem_manifest",
-		promoteOnAcceptance: false,
-	}), original);
+	const message = messageForWorkspaceExecution(original, {
+		mode: "read_only_shared", source: "manager_derived", reason: "read only", baselineStrategy: "filesystem_manifest", promoteOnAcceptance: false,
+	});
+	assert.ok(message.startsWith(original));
+	assert.match(message, /Do not modify Workspace files/);
+	assert.match(message, /not a sandbox or permission upgrade/);
+});
+
+test("普通写入策略不额外改写业务消息", () => {
+	assert.equal(messageForWorkspaceExecution("write result", { mode: "exclusive_write", source: "manager_derived", reason: "write", baselineStrategy: "filesystem_manifest", promoteOnAcceptance: false }), "write result");
 });

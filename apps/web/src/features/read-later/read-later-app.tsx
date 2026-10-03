@@ -28,6 +28,7 @@ import {
   BookOpen,
   LoaderCircle,
   Newspaper,
+  FileUp,
 } from "lucide-react";
 import { SectionTopbar } from "@/components/section-topbar";
 import {
@@ -49,8 +50,11 @@ import {
   type ReadingDetail,
   type ReadingItem,
   type ReadingList,
+  type ReadingCaptureJob,
+  type ReadingCaptureJobPage,
 } from "@/lib/read-later";
 import "./read-later.css";
+import { hasMarkdownContent } from "./markdown-content";
 const filters = [
   { id: "all", label: "收件箱" },
   { id: "unread", label: "未读" },
@@ -83,6 +87,15 @@ const sourceLabel = (item: ReadingItem) => {
 const parseTags = (value: string) =>
   [...new Set(value.split(/[,，;；]/).map((tag) => tag.trim()).filter(Boolean))];
 
+function CaptureProgress({ value, label = "正文采集阶段进度" }: { value: number; label?: string }) {
+  const progress = Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0;
+  return (
+    <span className="rl-progress" role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}>
+      <span style={{ width: `${progress}%` }} />
+    </span>
+  );
+}
+
 function TagChips({ tags }: { tags: string[] }) {
   if (!tags.length) return null;
   return (
@@ -109,11 +122,12 @@ export function ReadLaterApp() {
     [busy, setBusy] = useState(false),
     [saveTags, setSaveTags] = useState(""),
     [dialog, setDialog] = useState<
-      "save" | "promote" | "delete" | "jobs" | null
+      "save" | "promote" | "delete" | "jobs" | "import" | null
     >(null),
     [focus, setFocus] = useState(false),
     [tab, setTab] = useState("body"),
     [selected, setSelected] = useState<Map<string, ReadingItem>>(new Map());
+  const firstThumbnailId = list?.items.find((item) => item.thumbnail)?.id;
   const [bindings, setBindings] = useState<KnowledgeBindingSummary[]>([]),
     [bindingError, setBindingError] = useState(""),
     [job, setJob] = useState<WikiCuratorJob | null>(null),
@@ -236,6 +250,17 @@ export function ReadLaterApp() {
     }
   };
   const current = detail?.item.id === selectedId ? detail : null;
+  const markRead = (scope: "all" | "selected") =>
+    act(async () => {
+      const result = await readingRequest<{ changed: number }>("/mark-read", "POST", {
+        scope,
+        ...(scope === "selected" ? {
+          items: [...selected.values()].map((item) => ({ id: item.id, expectedRevision: item.revision })),
+        } : {}),
+      });
+      setSelected(new Map());
+      setNotice(result.changed ? `已将 ${result.changed} 篇标为已读` : "没有需要标为已读的文章");
+    });
   const update = (patch: Record<string, unknown>) =>
     current &&
     act(async () => {
@@ -281,11 +306,12 @@ export function ReadLaterApp() {
                 采集任务
               </button>
               <button
-                className="rl-button"
+                className="rl-button rl-button-icon"
                 onClick={() => {
                   void reloadList();
                   void reloadDetail();
                 }}
+                aria-label="刷新"
                 title="刷新"
               >
                 <RefreshCw size={14} />
@@ -412,6 +438,14 @@ export function ReadLaterApp() {
                   />
                   全选
                 </label>
+                <button
+                  className="rl-text-action"
+                  title="将所有未读收藏标为已读，包括未加载及筛选之外的文章"
+                  disabled={busy || !list}
+                  onClick={() => void markRead("all")}
+                >
+                  全部已读
+                </button>
                 <select
                   aria-label="按来源筛选"
                   value={source}
@@ -516,7 +550,7 @@ export function ReadLaterApp() {
                             width={56}
                             height={56}
                             unoptimized
-                            loading="lazy"
+                            loading={item.id === firstThumbnailId ? "eager" : "lazy"}
                             decoding="async"
                           />
                         )}
@@ -548,15 +582,25 @@ export function ReadLaterApp() {
             </div>
             {selected.size > 0 && (
               <div className="rl-selection">
-                <span>已选 {selected.size} 篇</span>
+                <span>{selected.size} 已选</span>
                 <button
-                  className="rl-button rl-primary"
-                  disabled={!readyItems.length}
-                  onClick={openPromotion}
+                  className="rl-text-action"
+                  aria-label="将选中文章标为已读"
+                  disabled={busy || ![...selected.values()].some((item) => item.readingStatus === "unread")}
+                  onClick={() => void markRead("selected")}
                 >
-                  整理 {readyItems.length} 篇
+                  <Check size={13} /> 已读
                 </button>
                 <button
+                  className="rl-text-action"
+                  aria-label={`整理 ${readyItems.length} 篇选中文章到知识库`}
+                  disabled={busy || !readyItems.length}
+                  onClick={openPromotion}
+                >
+                  整理
+                </button>
+                <button
+                  className="rl-icon"
                   aria-label="取消选择"
                   onClick={() => setSelected(new Map())}
                 >
@@ -660,6 +704,7 @@ export function ReadLaterApp() {
                   </span>
                   {current.version && (
                     <span>
+                      {current.version.captureMethod === "saved_html" && "网页导入 · "}
                       {current.version.assets.length} 张本地图片 ·{" "}
                       {Math.max(
                         1,
@@ -679,6 +724,13 @@ export function ReadLaterApp() {
                         {...streamdownPlugins}
                         isAnimating={false}
                         components={{
+                          li: ({ children, ...props }: ComponentProps<"li"> | Record<string, unknown>) => {
+                            const attributes = props as ComponentProps<"li"> & { node?: unknown };
+                            delete attributes.node;
+                            return hasMarkdownContent(children as ReactNode)
+                              ? <li {...attributes}>{children as ReactNode}</li>
+                              : null;
+                          },
                           img: ({
                             src,
                             alt,
@@ -750,16 +802,19 @@ export function ReadLaterApp() {
                       current.item.parseStatus,
                     ) ? (
                       <>
-                        <LoaderCircle className="animate-spin" size={24} />
-                        <h2>正在为你保存正文</h2>
-                        <p>{current.job.step}</p>
-                        <progress max={100} value={current.job.progress} />
+                        <LoaderCircle className="animate-spin" size={20} />
+                        <h2>正在保存正文</h2>
+                        <div className="rl-capture-stage">
+                          <span>{current.job.step}</span>
+                          <CaptureProgress value={current.job.progress} />
+                        </div>
                       </>
                     ) : (
                       <>
                         <Bookmark size={24} />
                         <h2>链接已保存，正文暂不可用</h2>
-                        <p>可以打开原文阅读，或稍后重新采集。</p>
+                        <p>可以打开原文阅读，或导入浏览器保存的网页。</p>
+                        <button className="rl-button" disabled={busy} onClick={() => { setActionError(""); setDialog("import"); }}>导入网页正文</button>
                       </>
                     )}
                   </div>
@@ -836,6 +891,7 @@ export function ReadLaterApp() {
                 >
                   <Trash2 size={14} />
                 </button>
+                <button className="rl-icon" aria-label="导入网页正文" title="导入网页正文" disabled={busy} onClick={() => { setActionError(""); setDialog("import"); }}><FileUp size={14} /></button>
               </div>
               <button
                 className="rl-button rl-primary"
@@ -861,7 +917,7 @@ export function ReadLaterApp() {
           }
         }}
       >
-        <DialogContent className="rl-dialog">
+        <DialogContent className={`rl-dialog${dialog === "jobs" ? " rl-jobs-dialog" : ""}`}>
           <DialogHeader>
             <DialogTitle>
               {dialog === "save"
@@ -870,6 +926,8 @@ export function ReadLaterApp() {
                   ? "删除这篇收藏？"
                   : dialog === "jobs"
                     ? "采集任务"
+                    : dialog === "import"
+                      ? "导入网页正文"
                     : "整理到知识库"}
             </DialogTitle>
             <DialogDescription>
@@ -878,7 +936,9 @@ export function ReadLaterApp() {
                 : dialog === "delete"
                   ? "将删除这篇收藏的正文与图片，终止采集。已经冻结的整理来源和 Wiki 内容会保留。"
                   : dialog === "jobs"
-                    ? "后台采集会持久保存；失败后可以回到文章重新采集。"
+                    ? "后台自动保存，采集异常可打开收藏重试。"
+                    : dialog === "import"
+                      ? "导入浏览器保存的文章页面，保留这条收藏的标签和笔记。"
                     : "正文将交给 Wiki 管理员整理，候选需要审核后才会发布。"}
             </DialogDescription>
           </DialogHeader>
@@ -894,6 +954,25 @@ export function ReadLaterApp() {
                 navigate({ item: id });
               }}
             />
+          )}
+          {dialog === "import" && current && (
+            <SavedHtmlForm key={current.item.id} item={current.item} busy={busy} onImport={(htmlFile, images, op, revision) => void act(async () => {
+              if (htmlFile.size > 5 * 1024 * 1024) throw new Error("HTML 网页最多 5 MB");
+              if (images.length > 32 || images.reduce((sum, file) => sum + file.size, 0) > 8 * 1024 * 1024 || images.some(file => file.size > 5 * 1024 * 1024)) throw new Error("最多 32 张图片，单张 5 MB，总大小 8 MB");
+              const buffer = await htmlFile.arrayBuffer();
+              const header = new TextDecoder("ascii").decode(buffer.slice(0, 4096));
+              const charset = /charset\s*=\s*["']?([^\s;"'/>]+)/i.exec(header)?.[1] || "utf-8";
+              let html: string;
+              try { html = new TextDecoder(charset).decode(buffer); } catch { html = new TextDecoder().decode(buffer); }
+              const imageInputs = await Promise.all(images.map(async file => {
+                const bytes = new Uint8Array(await file.arrayBuffer());
+                let binary = "";
+                for (let offset = 0; offset < bytes.length; offset += 8192) binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+                return { path: file.name, base64: btoa(binary) };
+              }));
+              await readingRequest(`/${current.item.id}/import-html`, "POST", { operationId: op, expectedRevision: revision, filename: htmlFile.name, html, images: imageInputs });
+              setDialog(null); setNotice("网页正文已导入，标签和笔记已保留");
+            })} />
           )}
           {dialog === "save" && (
             <form
@@ -1127,6 +1206,20 @@ export function ReadLaterApp() {
     </div>
   );
 }
+function SavedHtmlForm({ item, busy, onImport }: { item: ReadingItem; busy: boolean; onImport: (html: File, images: File[], operation: string, revision: number) => void }) {
+  const [html, setHtml] = useState<File | null>(null), [images, setImages] = useState<File[]>([]);
+  const operation = useRef(crypto.randomUUID());
+  const revision = useRef(item.revision);
+  return <form onSubmit={event => { event.preventDefault(); if (html) onImport(html, images, operation.current, revision.current); }}>
+    <p className="rl-import-help">在浏览器打开原文，等待正文显示后按 ⌘S / Ctrl+S 保存为 HTML。若选择“网页，全部”，可一并选择随网页保存的图片文件。</p>
+    <p className="rl-import-target" title={item.originalUrl}>{item.title}<br /><span>{item.originalUrl}</span></p>
+    <label>文章网页<input type="file" accept=".html,.htm,text/html" required disabled={busy} onChange={event => { setHtml(event.target.files?.[0] ?? null); operation.current = crypto.randomUUID(); }} /></label>
+    <label>图片文件（可选，可多选）<input type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple disabled={busy} onChange={event => { setImages(Array.from(event.target.files ?? [])); operation.current = crypto.randomUUID(); }} /></label>
+    {images.length > 0 && <p className="rl-import-help">已选择 {images.length} 张图片</p>}
+    <p className="rl-import-help">只提取正文和所选图片，不执行网页脚本。导入后将替换当前正文版本，原有笔记、标签和阅读状态保持不变。</p>
+    <div className="rl-dialog-footer"><button className="rl-button rl-primary" disabled={busy || !html}>{busy ? "正在导入…" : "导入正文"}</button></div>
+  </form>;
+}
 function NotesEditor({
   item,
   busy,
@@ -1306,61 +1399,101 @@ function LocalImage({
   );
 }
 function CaptureTasks({ onOpenItem }: { onOpenItem: (id: string) => void }) {
-  const [jobs, setJobs] = useState<
-      Array<{
-        id: string;
-        itemId: string;
-        status: string;
-        step: string;
-        progress: number;
-        errorMessage?: string;
-        createdAt: string;
-      }>
-    >([]),
-    [error, setError] = useState("");
+  const [data, setData] = useState<ReadingCaptureJobPage | null>(null),
+    [dataFilter, setDataFilter] = useState("all"),
+    [error, setError] = useState(""),
+    [page, setPage] = useState(1),
+    [loading, setLoading] = useState(true),
+    [filter, setFilter] = useState("all");
+  const epoch = useRef(0);
   const refresh = useCallback(async () => {
+    const requestEpoch = ++epoch.current;
+    setLoading(true);
     try {
-      const data = await readingRequest<{ jobs: typeof jobs }>("/jobs");
-      setJobs(data.jobs);
+      const result = await readingRequest<ReadingCaptureJobPage>(`/jobs?filter=${filter}&page=${page}&limit=20`);
+      if (epoch.current !== requestEpoch) return;
+      setData(result);
+      setDataFilter(filter);
+      if (result.page !== page) setPage(result.page);
       setError("");
     } catch (e) {
-      setError(message(e));
+      if (epoch.current === requestEpoch) setError(message(e));
+    } finally {
+      if (epoch.current === requestEpoch) setLoading(false);
     }
-  }, []);
+  }, [filter, page]);
+  const invalidate = useCallback(() => { epoch.current++; }, []);
   useEffect(() => {
     const first = setTimeout(() => void refresh(), 0),
       timer = setInterval(() => void refresh(), 3000);
     return () => {
       clearTimeout(first);
       clearInterval(timer);
+      invalidate();
     };
-  }, [refresh]);
+  }, [refresh, invalidate]);
+  const active = (job: ReadingCaptureJob) => ["queued", "running"].includes(job.status);
+  const pending = loading || dataFilter !== filter || data?.page !== page;
+  const jobs = dataFilter === filter && data?.page === page ? data.jobs : [];
+  const problem = (job: ReadingCaptureJob) => job.status === "failed" || (job.status === "succeeded" && !!job.errorMessage);
+  const label = (job: ReadingCaptureJob) => ({
+    queued: "排队中", running: "采集中", succeeded: job.errorMessage ? "仅链接" : "已完成", failed: "失败", cancelled: "已取消",
+  })[job.status];
+  const time = (value: string) => new Date(value).toLocaleString("zh-CN", {
+    month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false,
+  });
   return (
     <div className="rl-capture-tasks">
+      <div className="rl-task-filters" aria-label="采集任务筛选">
+        {[
+          { id: "all", text: "全部", count: data?.counts.all ?? 0 },
+          { id: "active", text: "进行中", count: data?.counts.active ?? 0 },
+          { id: "problem", text: "异常", count: data?.counts.problem ?? 0 },
+        ].map((option) => (
+          <button key={option.id} aria-pressed={filter === option.id} onClick={() => { setFilter(option.id); setPage(1); }}>
+            {option.text} <span>{option.count}</span>
+          </button>
+        ))}
+      </div>
       {error && (
         <p className="rl-error" role="alert">
-          {error}
-          <button onClick={() => void refresh()}>重试</button>
+          {error} <button onClick={() => void refresh()}>重试</button>
         </p>
       )}
-      {!jobs.length && !error && <p>暂无采集任务</p>}
-      {jobs.map((job) => (
-        <div className="rl-task" key={job.id}>
-          <div>
-            <strong>{job.step}</strong>
-            <span>
-              {date(job.createdAt)} · {job.status}
-            </span>
+      <div className="rl-task-list">
+        {!jobs.length && !error && <p className="rl-task-empty">{pending ? "正在加载任务…" : filter === "all" ? "暂无采集任务" : "暂无匹配任务"}</p>}
+        {jobs.map((job) => (
+          <div className="rl-task" key={job.id}>
+            <div className="rl-task-content">
+              <strong title={job.title}>{job.title}</strong>
+              <div className="rl-task-meta">
+                {job.source && <span>{job.source}</span>}
+                <time dateTime={job.createdAt}>{time(job.createdAt)}</time>
+                {!job.itemAvailable && <span>收藏已删除</span>}
+              </div>
+              {(active(job) || job.errorMessage) && (
+                <div className={`rl-task-detail${problem(job) ? " is-problem" : ""}`} title={job.errorMessage || job.step}>
+                  <span>{job.errorMessage || job.step}</span>
+                  {active(job) && <><CaptureProgress label={`${job.title}采集阶段进度`} value={job.progress} /><span>{job.progress}%</span></>}
+                </div>
+              )}
+            </div>
+            <span className={`rl-task-status task-${job.errorMessage && job.status === "succeeded" ? "link-only" : job.status}`}>{label(job)}</span>
+            <button className="rl-text-action" disabled={!job.itemAvailable} aria-label={`查看收藏：${job.title}`} onClick={() => onOpenItem(job.itemId)}>
+              查看
+            </button>
           </div>
-          {["queued", "running"].includes(job.status) && (
-            <progress max={100} value={job.progress} />
-          )}{" "}
-          {job.errorMessage && <p className="rl-error">{job.errorMessage}</p>}
-          <button className="rl-button" onClick={() => onOpenItem(job.itemId)}>
-            查看收藏
-          </button>
+        ))}
+      </div>
+      {data && (
+        <div className="rl-task-pagination" aria-label="采集任务分页">
+          <span>共 {data.total} 条 · {data.page} / {data.pages} 页</span>
+          <div>
+            <button aria-label="上一页采集任务" disabled={pending || data.page <= 1} onClick={() => setPage(data.page - 1)}>上一页</button>
+            <button aria-label="下一页采集任务" disabled={pending || data.page >= data.pages} onClick={() => setPage(data.page + 1)}>下一页</button>
+          </div>
         </div>
-      ))}
+      )}
     </div>
   );
 }

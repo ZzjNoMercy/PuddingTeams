@@ -564,7 +564,7 @@ test("Manager abort 不响应时停止有服务端截止时间，随后刷新不
 	await app.close();
 });
 
-test("waiting_admission 刷新补回 needs_input，停止只取消 Teams 准入且不启动 Worker", async () => {
+test("强制只读能力缺口刷新补回 blocked，不能投影成等待用户准入", async () => {
 	const { app, sessions, runtime, dir } = await makeStack();
 	const summary = await sessions.create();
 	const session = await sessions.open(summary.id);
@@ -589,25 +589,21 @@ test("waiting_admission 刷新补回 needs_input，停止只取消 Teams 准入�
 	const pending = await runtime.delegate({
 		cwdSnapshot: dir, windowId: "manager-window", managerSessionId: summary.id, managerToolCallId: "call-admission",
 		agentId: driver.id, agentRevision: 0, message: "只读查询", mode: "run",
-		workspaceExecutionPolicy: { mode: "read_only_shared", source: "manager_derived", reason: "只读", baselineStrategy: "filesystem_manifest", promoteOnAcceptance: false },
+		workspaceExecutionPolicy: { mode: "read_only_shared", source: "user", reason: "必须只读", baselineStrategy: "filesystem_manifest", promoteOnAcceptance: false },
 		driver,
 	}, { cwd: dir, env: {} });
-	assert.equal(pending.status, "needs_input");
+	assert.equal(pending.status, "failed");
 	assert.equal(driverStarted, false);
 
 	const refreshed = await app.inject({ method: "GET", url: `/api/sessions/${summary.id}/messages` });
 	assert.equal(refreshed.statusCode, 200, refreshed.body);
 	const recovered = (refreshed.json() as { messages: Array<{ role?: string; toolCallId?: string; details?: Record<string, unknown> }> }).messages
 		.find((message) => message.role === "toolResult" && message.toolCallId === "call-admission");
-	assert.equal(recovered?.details?.status, "needs_input");
-	assert.equal(recovered?.details?.source, "platform_policy");
+	assert.equal(recovered?.details?.status, "failed");
 	assert.equal(recovered?.details?.workerStarted, false);
 
-	const stopped = await app.inject({ method: "POST", url: `/api/sessions/${summary.id}/abort` });
-	assert.equal(stopped.statusCode, 200, stopped.body);
-	assert.equal(stopped.json().aborted, true);
-	assert.equal((await runtime.getDelegation(pending.delegation.id))?.executionState, "cancelled");
-	assert.equal((await runtime.getDelegation(pending.delegation.id))?.receipt?.workerStarted, false);
+	assert.equal((await runtime.getDelegation(pending.delegation.id))?.executionState, "reported_failed");
+	assert.equal((await runtime.getDelegation(pending.delegation.id))?.admissionInteractionId, undefined);
 	assert.equal(driverStarted, false);
 	await app.close();
 });

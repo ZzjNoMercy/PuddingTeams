@@ -201,3 +201,17 @@ test("composeCompileTask：平台约定段只由 Job 冻结字段构成，重放
 	assert.ok(first.includes(job.sourceSnapshotRefs[0]!));
 	assert.ok(first.includes("删除请求"));
 });
+
+
+test("根绑定wiki布局的编译候选与Curator采用相同完整目录", async () => {
+ const f = await setupFixture({ schemaPresetId: "personal-assistant" });
+ try {
+  await mkdir(path.join(f.binding.contentRoot, "wiki")); await writeFile(path.join(f.binding.contentRoot, "wiki", "index.md"), "# Wiki");
+  const content = `---\nid: daily-test\ntype: daily\ntitle: 日记\ndate: 2026-10-01\nsources: [${f.sourceEntry.acceptanceId}]\n---\n# 日记`;
+  await f.writeCandidate("Daily/test.md", content);
+  await assert.rejects(f.validator(f.job, f.outcome), /invalid_directory/);
+  await rm(path.join(f.stagingRoot, "Daily"), { recursive: true });
+  await f.writeCandidate("wiki/Daily/test.md", content); await f.validator(f.job, f.outcome);
+  assert.deepEqual((await readCandidateBatch(f.job)).files.map(file => file.targetPath), ["wiki/Daily/test.md"]);
+ } finally { await rm(f.root, { recursive: true, force: true }); }
+});

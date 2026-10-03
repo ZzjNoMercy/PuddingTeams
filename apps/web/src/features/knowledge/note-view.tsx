@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
-import { ChevronRightIcon, ExternalLinkIcon, Loader2Icon, HistoryIcon } from "lucide-react";
+import { ChevronRightIcon, ExternalLinkIcon, Loader2Icon, HistoryIcon, PencilIcon } from "lucide-react";
 import { ClipboardSafeStreamdown } from "@/components/ai-elements/streamdown";
 import { streamdownPlugins } from "@/core/streamdown/plugins";
 import { writeTextToClipboard } from "@/core/clipboard";
@@ -18,7 +18,8 @@ import {
 	type KnowledgeNote,
 } from "@/lib/api";
 import { buildNoteMarkdownComponents } from "./note-markdown";
-import { rewriteWikiLinks, slugifyHeading, splitFrontmatter } from "./markdown";
+import { formatPropertyValue, propertyLabel, rewriteWikiLinks, slugifyHeading, splitFrontmatter } from "./markdown";
+import { KnowledgeNoteEditor } from "./note-editor";
 import { KnowledgePageHistory } from "./page-history";
 import { LatestSerialQueue } from "@/lib/latest-serial-queue";
 import { BacklinksPanel } from "./backlinks-panel";
@@ -72,6 +73,7 @@ export function KnowledgeNoteView(props: NoteViewProps) {
 	const [brokenLinks, setBrokenLinks] = useState<ReadonlySet<string>>(new Set());
 	const [ambiguous, setAmbiguous] = useState<AmbiguousChoice | null>(null);
 	const [obsidianBusy, setObsidianBusy] = useState(false);
+	const [editing, setEditing] = useState(false);
 	const articleRef = useRef<HTMLDivElement>(null);
 	const ambiguousRef = useRef<HTMLDivElement>(null);
 
@@ -229,9 +231,9 @@ export function KnowledgeNoteView(props: NoteViewProps) {
 			</div>
 			<div className="mb-4 flex flex-wrap items-center justify-between gap-3">
 				<h2 className="min-w-0 text-xl font-medium break-words">{noteTitle}</h2>
-				<div className="flex shrink-0 items-center gap-2">
+				{!editing ? <div className="flex flex-wrap items-center gap-2">
+					<button type="button" onClick={() => setEditing(true)} disabled={!activeNote || activeNote.status !== "current"} className="flex items-center gap-1.5 rounded border border-border px-2.5 py-1.5 text-xs hover:bg-muted disabled:opacity-50"><PencilIcon size={13} />编辑</button>
 					<button type="button" onClick={() => changeHistory(true)} className="flex items-center gap-1.5 rounded border border-border px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-muted"><HistoryIcon size={13} />页面历史</button>
-					{activeNote ? <span className="text-xs text-muted-foreground">{activeNote.size} B · 只读</span> : null}
 					<button
 						type="button"
 						onClick={() => void openInObsidian()}
@@ -242,7 +244,7 @@ export function KnowledgeNoteView(props: NoteViewProps) {
 						{obsidianBusy ? <Loader2Icon size={13} className="animate-spin" /> : <ExternalLinkIcon size={13} />}
 						在 Obsidian 中打开
 					</button>
-				</div>
+				</div> : null}
 			</div>
 			{observedError ? (
 				<p role="alert" className="text-sm text-destructive">
@@ -253,14 +255,14 @@ export function KnowledgeNoteView(props: NoteViewProps) {
 				<p className="flex items-center gap-1.5 text-sm text-muted-foreground">
 					<Loader2Icon size={14} className="animate-spin" />正在读取笔记…
 				</p>
-			) : (
+			) : editing ? <KnowledgeNoteEditor bindingId={binding.id} note={activeNote} onCancel={() => { setEditing(false); setRetryNonce((value) => value + 1); }} onSaved={(note) => { setObservedState({ key: loadKey, value: note, error: null }); setEditing(false); setRetryNonce((value) => value + 1); }} /> : (
 				<>
 					{displayed.properties.length ? (
 						<dl className="mb-6 grid gap-2 rounded border border-border bg-muted/20 p-4 text-xs sm:grid-cols-2">
 							{displayed.properties.map(([key, value]) => (
 								<div key={key} className="flex gap-2">
-									<dt className="text-muted-foreground">{key}</dt>
-									<dd className="min-w-0 break-words">{value}</dd>
+									<dt className="shrink-0 text-muted-foreground">{propertyLabel(key)}</dt>
+									<dd className="min-w-0 break-words [overflow-wrap:anywhere]">{formatPropertyValue(value)}</dd>
 								</div>
 							))}
 						</dl>

@@ -13,6 +13,7 @@ import type { ArtifactStore } from "./artifact-store.js";
 import type { DelegationTimelineStore } from "./delegation-timeline-store.js";
 import {
 	WorkspaceExecutionCoordinator,
+	requiresReadOnlyEnforcement,
 	type WorkspaceChangeSet,
 	type StandaloneVerificationEnvironment,
 	type VerificationEnvironmentCopy,
@@ -564,7 +565,7 @@ export class AgentRuntime {
 				readOnlyAssessment: input.workspaceExecutionPolicy?.mode === "read_only_shared"
 					? driverCapabilities.workspace?.readOnlyEnforcement === "sandbox" || driverCapabilities.workspace?.readOnlyEnforcement === "remote_policy"
 						? "verified"
-						: undefined
+						: "unverified"
 					: "not_required",
 				operation: input.mode,
 				sessionHandle: knownSession,
@@ -578,49 +579,28 @@ export class AgentRuntime {
 			if (knownSession && this.activeRuns.get(knownSession) === "pending") this.activeRuns.delete(knownSession);
 			throw error;
 		}
-		const readOnlyRequired = input.workspaceExecutionPolicy?.mode === "read_only_shared";
+		const readOnlyPolicy = input.workspaceExecutionPolicy?.mode === "read_only_shared" ? input.workspaceExecutionPolicy : undefined;
 		const readOnlyEnforced = driverCapabilities.workspace?.readOnlyEnforcement === "sandbox"
 			|| driverCapabilities.workspace?.readOnlyEnforcement === "remote_policy";
-		if (readOnlyRequired && !readOnlyEnforced && delegation.readOnlyAssessment !== "unverified_user_accepted") {
-			const requestId = `admission:${delegation.id}`;
-			const interaction = await this.delegations.createInteraction({
-				delegationId: delegation.id,
-				source: "platform_policy",
-				kind: "confirmation",
-				requests: [{
-					requestId,
-					prompt: `Teams 无法验证 Worker「${delegation.agentId}」会保持只读。是否仍允许 Teams 使用这个 Worker 执行本任务？`,
-					risk: "继续只代表 Teams 准入该 Worker，不会修改 Worker 权限；若产生文件变更，仍按原任务契约记录偏差。",
-					options: ["proceed_with_worker", "select_another_worker"],
-				}],
-				policyContext: {
-					reasonCode: "read_only_not_enforceable",
-					capabilityFingerprint: fingerprint,
-					allowedActions: ["cancel", "proceed_with_worker", "select_another_worker"],
-					workerStarted: false,
-				},
-				expiresAt: new Date(Date.now() + this.ttl.ttlMs).toISOString(),
-			});
-			const waiting = await this.delegations.transitionDelegation(delegation.id, ["admitted"], {
-				executionState: "waiting_admission",
-				admissionInteractionId: interaction.id,
-				revision: delegation.revision + 1,
-			});
-			delegation = waiting.record ?? delegation;
-			if (knownSession && this.activeRuns.get(knownSession) === "pending") this.activeRuns.delete(knownSession);
-			input.onCreated?.(delegation);
-			const result: NeedsInputResult = {
-				agentId: delegation.agentId,
-				status: "needs_input",
-				interaction: {
-					id: interaction.id,
-					kind: interaction.kind,
-					requests: interaction.requests,
-					expiresAt: interaction.expiresAt,
-				},
-				meta: { source: "platform_policy", workerStarted: false },
+		// A confirmation cannot supply missing enforcement. Return a recoverable
+		// capability gap to the Manager instead of creating a human approval loop.
+		const readOnlyBlock = readOnlyPolicy && !readOnlyEnforced
+			? requiresReadOnlyEnforcement(readOnlyPolicy)
+				? "本任务明确要求强制只读，但该 Worker 没有可验证的只读边界。请保持原约束，选择具备 sandbox/remote_policy 的合适 Worker；不要请求用户点击继续来冒充只读保障。"
+				: !this.workspaceExecution || driverCapabilities.workspace?.honorsInvocationCwd !== true
+					? "该 Worker 无法进入平台观测的工作目录，不能记录本次只读任务的文件变更。请选择支持平台 cwd 的合适 Worker。"
+					: undefined
+			: undefined;
+		if (readOnlyBlock) {
+			const result: Exclude<NormalizedResult, NeedsInputResult> = {
+				agentId: input.agentId, status: "blocked", errorCode: "workspace_policy_blocked",
+				error: readOnlyBlock, recoverable: true,
+				meta: { recoveryAction: "select_compatible_worker", userDecisionRequired: false },
 			};
-			return { status: "needs_input", result, delegation, interaction };
+			const terminal = await this.sealTerminal(delegation, ["admitted"], "reported_failed", result, { ...ctx, cwd: input.cwdSnapshot });
+			if (knownSession) this.activeRuns.delete(knownSession);
+			input.onCreated?.(terminal.record ?? delegation);
+			return { status: "failed", result, delegation: terminal.record ?? delegation };
 		}
 		if (this.workspaceExecution && input.workspaceExecutionPolicy && !verificationEnvironment) {
 			try {
@@ -631,9 +611,9 @@ export class AgentRuntime {
 					? "strong" as const
 					: "none" as const;
 				if (mode === "read_only_shared" && readOnlyEnforcement === "none") {
-					if (delegation.readOnlyAssessment !== "unverified_user_accepted") throw new Error("Worker 只读能力未验证，且尚未获得 Teams 准入决定");
-					// Conservative coordination only: acquire the target Workspace lease.
-					// This does not grant or change Worker permissions.
+					if (requiresReadOnlyEnforcement(input.workspaceExecutionPolicy)) throw new Error("Worker 不满足强制只读约束");
+					// Observe ordinary inspections under an exclusive lease, without a
+					// permission upgrade or a claim of enforced read-only behavior.
 					mode = "exclusive_write";
 				}
 				if (mode === "exclusive_write" && !inherited && this.workspaceOwnerClosed) {
@@ -664,6 +644,7 @@ export class AgentRuntime {
 					workspaceExecutionPolicy: input.workspaceExecutionPolicy,
 					workspaceExecutionScopeId: scope.id,
 					executionCwd: scope.executionCwd,
+					...(readOnlyPolicy && !readOnlyEnforced ? { readOnlyAssessment: "unverified_observed" as const } : {}),
 				})) ?? delegation;
 			} catch (error) {
 				const blocked: Exclude<NormalizedResult, NeedsInputResult> = {
@@ -1183,7 +1164,7 @@ export class AgentRuntime {
 		if (this.workspaceExecution && working.workspaceExecutionScopeId) {
 			try {
 				const scope = await this.workspaceExecution.get(working.workspaceExecutionScopeId);
-				workspaceChangeSet = await this.workspaceExecution.capture(working.workspaceExecutionScopeId, scope?.ownerToken);
+				workspaceChangeSet = await this.workspaceExecution.capture(working.workspaceExecutionScopeId, scope?.ownerToken, { readOnlyExpected: working.workspaceExecutionPolicy?.mode === "read_only_shared" });
 			} catch (error) {
 				workspaceIssue = `Workspace change-set 收集失败：${error instanceof Error ? error.message : String(error)}`;
 			}
@@ -1211,7 +1192,7 @@ export class AgentRuntime {
 			revision: working.revision + 1,
 		});
 		// read_only_shared never has a promotable execution result. When its
-		// boundary was not enforceable, admission conservatively upgraded the
+		// boundary was not enforceable, automatic observation selected the
 		// coordination scope to exclusive_write; retaining that lease after a
 		// Driver-observed terminal result fences every later read-only query on the
 		// Workspace. Capture the change-set first, commit the terminal fact, then

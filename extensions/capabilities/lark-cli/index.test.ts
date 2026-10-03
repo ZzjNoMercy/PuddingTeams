@@ -3,7 +3,15 @@ import { access, chmod, mkdtemp, readFile, symlink, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { listConnections, parseConfig, probeRuntime, resolveRuntime, runConnectionAction } from "./index.js";
+import { listConnections, probeRuntime, resolveRuntime, runConnectionAction } from "./index.js";
+
+const connectionService = {
+	status: async () => ({ id: "default", name: "飞书", state: "connected" as const, userAuthorization: "authorized" as const, accountName: "测试用户", message: "共享凭证有效", checkedAt: new Date().toISOString(), actions: [] }),
+	begin: async () => ({ id: "session", state: "pending" as const, expiresAt: new Date().toISOString() }),
+	authorizationStatus: async () => undefined,
+	cancel: async () => {},
+	runtimeEnv: async () => ({ PUDDING_LARK_BROKER_URL: "http://127.0.0.1:1234", PUDDING_LARK_BROKER_KEY: "test-delegation-key" }),
+};
 
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
@@ -33,11 +41,8 @@ exit 2
 	return { cliPath, logPath };
 }
 
-test("parseConfig 只保留平台需要的登录配置", () => {
-	assert.deepEqual(parseConfig({ cliMode: "managed", cliPath: "/tmp/old", authMode: 1, configDir: " /tmp/lark " }), {
-		authMode: "auto",
-		configDir: "/tmp/lark",
-	});
+test("缺少共享连接服务时拒绝独立 CLI 登录态回退", async () => {
+	await assert.rejects(resolveRuntime({ config: {}, env: {}, stateDir: "/tmp/lark", sharedStateDir: "/tmp/lark" }), /共享飞书连接/);
 });
 
 test("优先使用本机官方 CLI，自动更新并导出同版本 Skills", async () => {
@@ -45,6 +50,7 @@ test("优先使用本机官方 CLI，自动更新并导出同版本 Skills", asy
 	const { cliPath, logPath } = await fakeLarkCli(root);
 	const stateDir = path.join(root, "state");
 	const runtime = await resolveRuntime({
+		connection: connectionService,
 		config: { authMode: "auto" },
 		env: { PATH: root },
 		stateDir,
@@ -54,13 +60,16 @@ test("优先使用本机官方 CLI，自动更新并导出同版本 Skills", asy
 	assert.equal(runtime.details?.["CLI 来源"], "本机官方版本");
 	assert.equal(runtime.details?.["CLI 版本"], "1.2.3");
 	assert.equal(runtime.details?.["官方 Skills"], "1 个（与 CLI 同步）");
-	assert.equal(runtime.details?.["登录方式"], "沿用本机登录状态");
-	assert.equal(runtime.env?.LARKSUITE_CLI_CONFIG_DIR, undefined);
-	assert.equal(runtime.env?.PATH?.split(path.delimiter)[0], path.dirname(cliPath));
+	assert.equal(runtime.details?.["登录方式"], "平台与 CLI 共用加密凭证");
+	assert.equal(runtime.env?.LARKSUITE_CLI_CONFIG_DIR, "");
+	assert.equal(runtime.env?.PATH?.split(path.delimiter)[0], path.join(root, "shared", "bin"));
+	assert.equal(runtime.env?.PUDDING_LARK_REAL_CLI, cliPath);
+	assert.equal(runtime.env?.PUDDING_LARK_BROKER_KEY, "test-delegation-key");
+	assert.equal(runtime.env?.LARKSUITE_CLI_USER_ACCESS_TOKEN, "");
 	assert.equal(await readFile(path.join(runtime.skillPaths?.[0] ?? "", "lark-test", "SKILL.md"), "utf-8"), "# lark-test/SKILL.md\n");
 	assert.match(await readFile(logPath, "utf-8"), /update --json --skills-layout separate/);
 
-	await resolveRuntime({ config: {}, env: { PATH: root }, stateDir, sharedStateDir: path.join(root, "shared") });
+	await resolveRuntime({ connection: connectionService, config: {}, env: { PATH: root }, stateDir, sharedStateDir: path.join(root, "shared") });
 	const calls = await readFile(logPath, "utf-8");
 	assert.equal(calls.match(/^update /gm)?.length, 1, "新鲜度窗口内不重复调用官方更新");
 });
@@ -87,20 +96,20 @@ install_root="$1"
 	await symlink(npmPath, path.join(npmDir, "npm"));
 	const stateDir = path.join(root, "binding");
 	const sharedStateDir = path.join(root, "shared");
-	const probe = await probeRuntime({ config: {}, env: { PATH: npmDir }, stateDir, sharedStateDir });
+	const probe = await probeRuntime({ connection: connectionService, config: {}, env: { PATH: npmDir }, stateDir, sharedStateDir });
 	assert.deepEqual(probe.issues?.map((issue) => issue.code), ["cli_not_installed"]);
 	assert.equal(await access(npmLog).then(() => true, () => false), false, "只读探测不得调用 npm");
-	const [missing] = await listConnections({ env: { PATH: npmDir }, stateDir: sharedStateDir });
-	assert.equal(missing?.state, "unavailable");
+	const [missing] = await listConnections({ connection: connectionService, env: { PATH: npmDir }, stateDir: sharedStateDir });
+	assert.equal(missing?.state, "connected", "账号连接不依赖 CLI 安装状态");
 	assert.equal(missing?.actions?.[0]?.id, "install-cli");
 	await runConnectionAction("default", "install-cli", { env: { PATH: npmDir }, stateDir: sharedStateDir });
 	assert.match(await readFile(npmLog, "utf-8"), /install --prefix/);
 
-	const runtime = await resolveRuntime({ config: {}, env: { PATH: npmDir }, stateDir, sharedStateDir });
+	const runtime = await resolveRuntime({ connection: connectionService, config: {}, env: { PATH: npmDir }, stateDir, sharedStateDir });
 	assert.deepEqual(runtime.issues, []);
 	assert.equal(runtime.details?.["CLI 来源"], "平台安装的官方版本");
-	assert.equal(runtime.details?.["登录方式"], "当前绑定独立保存");
-	assert.equal(runtime.env?.LARKSUITE_CLI_CONFIG_DIR, path.join(stateDir, "auth"));
+	assert.equal(runtime.details?.["登录方式"], "平台与 CLI 共用加密凭证");
+	assert.equal(runtime.env?.LARKSUITE_CLI_CONFIG_DIR, "");
 	assert.equal(runtime.details?.["CLI 版本"], "1.2.3");
 });
 
@@ -108,6 +117,7 @@ test("官方更新暂时失败时继续使用当前 CLI 与其内嵌 Skills", as
 	const root = await mkdtemp(path.join(tmpdir(), "pt-lark-update-fail-"));
 	await fakeLarkCli(root, 1);
 	const runtime = await resolveRuntime({
+		connection: connectionService,
 		config: {},
 		env: { PATH: root },
 		stateDir: path.join(root, "state"),
@@ -118,10 +128,11 @@ test("官方更新暂时失败时继续使用当前 CLI 与其内嵌 Skills", as
 	assert.equal(runtime.details?.["官方 Skills"], "1 个（与 CLI 同步）");
 });
 
-	test("探测结果使用中文字段且不暴露 CLI 路径", async () => {
+test("探测结果使用中文字段且不暴露 CLI 路径", async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pt-lark-probe-"));
 	const { logPath } = await fakeLarkCli(root);
 	const probe = await probeRuntime({
+		connection: connectionService,
 		config: {},
 		env: { PATH: root },
 		stateDir: path.join(root, "state"),
@@ -129,20 +140,31 @@ test("官方更新暂时失败时继续使用当前 CLI 与其内嵌 Skills", as
 	});
 	assert.equal(probe.authenticated, true);
 	assert.equal(probe.details?.["登录用户"], "测试用户");
-	assert.equal(probe.details?.["身份状态"], "active");
 	assert.equal("cliPath" in (probe.details ?? {}), false);
-	assert.doesNotMatch(await readFile(logPath, "utf-8"), /^(update|skills) /m, "探测不得更新 CLI 或同步 Skills");
+	assert.doesNotMatch(await readFile(logPath, "utf-8"), /^(update|skills|auth) /m, "探测不得通过 CLI 认证、更新或同步 Skills");
 });
 
-test("连接状态只读展示本机飞书登录，不触发更新或泄露路径", async () => {
+test("CLI 版本探测失败仍注入共享凭证入口，不回退原生认证", async () => {
+	const root = await mkdtemp(path.join(tmpdir(), "pt-lark-bad-version-"));
+	const { cliPath } = await fakeLarkCli(root);
+	await writeFile(cliPath, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+	const sharedStateDir = path.join(root, "shared");
+	const runtime = await resolveRuntime({ connection: connectionService, config: {}, env: { PATH: root }, stateDir: path.join(root, "binding"), sharedStateDir });
+	assert.ok(runtime.issues?.some(issue => issue.code === "version_probe_failed"));
+	assert.equal(runtime.env?.PATH?.split(path.delimiter)[0], path.join(sharedStateDir, "bin"));
+	assert.equal(runtime.env?.PUDDING_LARK_BROKER_KEY, "test-delegation-key");
+	assert.match(await readFile(path.join(sharedStateDir, "bin", "lark-cli"), "utf-8"), /PUDDING_LARK_BROKER_URL/);
+});
+
+test("连接状态使用共享接口，不通过 CLI 读取或刷新登录", async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pt-lark-connection-"));
 	const { logPath } = await fakeLarkCli(root);
-	const [connection] = await listConnections({ env: { PATH: root }, stateDir: path.join(root, "shared") });
+	const [connection] = await listConnections({ connection: connectionService, env: { PATH: root }, stateDir: path.join(root, "shared") });
 	assert.equal(connection?.state, "connected");
-	assert.equal(connection?.name, "飞书 CLI");
+	assert.equal(connection?.name, "飞书");
 	assert.equal(connection?.version, "1.2.3");
 	assert.equal(connection?.accountName, "测试用户");
-	assert.equal(connection?.message, "登录状态有效");
+	assert.equal(connection?.message, "共享凭证有效");
 	assert.equal("cliPath" in (connection ?? {}), false);
-	assert.doesNotMatch(await readFile(logPath, "utf-8"), /^update /m);
+	assert.doesNotMatch(await readFile(logPath, "utf-8"), /^(update|auth) /m);
 });

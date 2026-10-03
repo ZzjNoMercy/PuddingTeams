@@ -15,10 +15,17 @@ export type WorkspaceLeaseState = "active" | "fenced" | "released";
 
 export interface WorkspaceExecutionPolicy {
 	mode: WorkspaceAccessMode;
+	/** User constraints require enforcement; ordinary inspections use observed best effort. */
+	readOnlyRequirement?: "best_effort" | "enforced";
 	source: "harness_default" | "manager_derived" | "user";
 	reason: string;
 	baselineStrategy: "git_tree" | "filesystem_manifest" | "external_snapshot";
 	promoteOnAcceptance: boolean;
+}
+
+export function requiresReadOnlyEnforcement(policy: WorkspaceExecutionPolicy): boolean {
+	return policy.mode === "read_only_shared"
+		&& (policy.readOnlyRequirement ?? (policy.source === "user" ? "enforced" : "best_effort")) === "enforced";
 }
 
 export interface WorkspaceExecutionRequest {
@@ -819,7 +826,7 @@ export class WorkspaceExecutionCoordinator {
 		return { inputFingerprint: copy.inputFingerprint, outputFingerprint, changedPaths: changedPaths(before, after) };
 	}
 
-	async capture(scopeId: string, ownerToken?: string): Promise<WorkspaceChangeSet> {
+	async capture(scopeId: string, ownerToken?: string, options: { readOnlyExpected?: boolean } = {}): Promise<WorkspaceChangeSet> {
 		return this.serialize(async () => {
 			const state = await this.load();
 			const scope = state.scopes[scopeId];
@@ -834,7 +841,7 @@ export class WorkspaceExecutionCoordinator {
 				changedPaths: paths,
 				diffHash: digest({ baseline: scope.baselineEntries, output: current.entries, changedPaths: paths }),
 				promotionState: scope.mode === "isolated_worktree" ? "pending" : "not_required",
-				createdAt: now(), integrity: scope.mode === "read_only_shared" && paths.length ? "violation" : "clean",
+				createdAt: now(), integrity: (scope.mode === "read_only_shared" || options.readOnlyExpected) && paths.length ? "violation" : "clean",
 			};
 			state.changeSets[changeSet.id] = changeSet;
 			scope.latestChangeSetId = changeSet.id;

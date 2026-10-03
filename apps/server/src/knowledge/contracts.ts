@@ -221,9 +221,9 @@ export function assertPublicationBatchShape(batch: PublicationBatch): void {
 		targets.add(file.targetPath);
 		if (file.kind === "image") {
 			const extension = ({ "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp", "image/avif": "avif" } as Record<string, string>)[file.mediaType ?? ""];
-			if (!extension || file.targetPath !== `assets/images/${file.candidateHash}.${extension}` || file.blobRef !== file.candidateHash || file.operation === "delete" ||
+			if (!extension || file.targetPath !== `${file.targetPath.startsWith("wiki/") ? "wiki/" : ""}assets/images/${file.candidateHash}.${extension}` || file.blobRef !== file.candidateHash || file.operation === "delete" ||
 				(file.operation === "update" && file.expectedHashOrAbsent !== file.candidateHash) || !file.sourceIds?.length || new Set(file.sourceIds).size !== file.sourceIds.length) throw new Error("invalid image publication asset");
-		} else if (file.targetPath.startsWith("assets/images/") || file.mediaType || file.sourceIds) throw new Error("image asset requires explicit metadata");
+		} else if (/^(?:wiki\/)?assets\/images\//.test(file.targetPath) || file.mediaType || file.sourceIds) throw new Error("image asset requires explicit metadata");
 		if (file.operation === "create" && file.expectedHashOrAbsent !== null) throw new Error("create target must be absent");
 		if (file.operation !== "create" && !isHash(file.expectedHashOrAbsent)) throw new Error("mutation requires an exact baseline hash");
 		if (file.operation === "delete") {

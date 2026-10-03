@@ -236,7 +236,7 @@ export function ManagerDialog({
 								<SelectItem value="default">默认（不设置）</SelectItem>
 								{/* 已存档位不再被新模型支持时必须仍可见可改。 */}
 								{selectedLevel && !levels.includes(selectedLevel) ? <SelectItem value={selectedLevel}>{selectedLevel}（当前模型不支持）</SelectItem> : null}
-								{levels.filter((level) => level !== selectedLevel).map((level) => (
+								{levels.map((level) => (
 									<SelectItem key={level} value={level}>
 										{level}
 									</SelectItem>

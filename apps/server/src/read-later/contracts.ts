@@ -53,6 +53,15 @@ export interface ArticleVersion {
   coverAssetId?: string;
   capturedAt: string;
   extractorVersion: string;
+  captureMethod: "http" | "saved_html";
+  sourceFilename?: string;
+}
+export interface SavedHtmlInput {
+  operationId: string;
+  expectedRevision: number;
+  filename: string;
+  html: string;
+  images?: Array<{ path: string; base64: string }>;
 }
 export interface CaptureJob {
   id: string;
@@ -97,6 +106,9 @@ export interface Promotion {
   jobId?: string;
   createdAt: string;
 }
+export type MarkReadInput =
+  | { scope: "all" }
+  | { scope: "selected"; items: Array<{ id: string; expectedRevision: number }> };
 export class ReadLaterError extends Error {
   constructor(
     readonly code:

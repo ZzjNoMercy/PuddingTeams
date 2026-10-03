@@ -15,6 +15,7 @@ import { agentDisplayName, type RoomSummary } from "@/lib/types";
 import { sessionTitle } from "@/lib/global-search-results";
 import { compactTime } from "@/lib/time";
 import { ManagerAvatar, MemberStack, WorkerAvatar } from "./worker-avatar";
+import { MessagePreview } from "./message-preview";
 
 function WindowRow({
 	room,
@@ -57,7 +58,7 @@ function WindowRow({
 					{/* 工作目录不进列表项：它是一条常驻的第三行，读起来像状态而不是内容，
 					    而且多数房间的标题已经指向同一个项目。仍留在 aria-label 与删除
 					    确认里——不可见不等于不可访问，删除时也要能分辨是哪个目录。 */}
-					<span className="home-room-preview" title={workspaceName}>{fromOtherSession ? room.hasUnreadActivity ? "其他会话有未读进展 · " : "其他会话 · " : ""}{subtitle}</span>
+					<span className="home-room-preview" title={workspaceName}>{fromOtherSession ? room.hasUnreadActivity ? "其他会话有未读进展 · " : "其他会话 · " : ""}<MessagePreview content={subtitle} /></span>
 				</span>
 				<span className="home-room-time">{compactTime(room.modifiedAt)}</span>
 			</button>

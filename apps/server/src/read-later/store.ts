@@ -14,6 +14,7 @@ import {
   type ReadLaterCreate,
   type ReadLaterItem,
   type ReadLaterUpdate,
+  type MarkReadInput,
 } from "./contracts.js";
 import { canonicalizeUrl } from "./public-fetch.js";
 export const digest = (value: unknown) =>
@@ -109,12 +110,29 @@ export class ReadLaterStore {
       return job;
     });
   }
-  listJobs(owner: string): CaptureJob[] {
-    return this.db((db) =>
-      this.jobs(db)
-        .filter((job) => job.ownerId === owner)
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
-    );
+  listJobs(owner: string, options: { filter?: string; page?: number; limit?: number } = {}) {
+    const filter = options.filter ?? "all", limit = options.limit ?? 20, requestedPage = options.page ?? 1;
+    if (!["all", "active", "problem"].includes(filter) ||
+      !Number.isSafeInteger(limit) || limit < 1 || limit > 100 ||
+      !Number.isSafeInteger(requestedPage) || requestedPage < 1)
+      throw new ReadLaterError("invalid_input", "任务筛选或分页参数无效");
+    return this.db((db) => {
+      const ownerSql = "json_extract(record_json,'$.ownerId')=?";
+      const activeSql = "json_extract(record_json,'$.status') IN ('queued','running')";
+      const problemSql = "(json_extract(record_json,'$.status')='failed' OR (json_extract(record_json,'$.status')='succeeded' AND coalesce(json_extract(record_json,'$.errorMessage'),'')<>''))";
+      const counts = db.prepare(`SELECT count(*) AS "all", coalesce(sum(CASE WHEN ${activeSql} THEN 1 ELSE 0 END),0) AS active, coalesce(sum(CASE WHEN ${problemSql} THEN 1 ELSE 0 END),0) AS problem FROM jobs WHERE ${ownerSql}`).get(owner) as { all: number; active: number; problem: number };
+      const total = counts[filter as keyof typeof counts], pages = Math.max(1, Math.ceil(total / limit)), page = Math.min(requestedPage, pages);
+      const filterSql = filter === "active" ? ` AND ${activeSql}` : filter === "problem" ? ` AND ${problemSql}` : "";
+      const rows = db.prepare(`SELECT record_json FROM jobs WHERE ${ownerSql}${filterSql} ORDER BY json_extract(record_json,'$.createdAt') DESC,id DESC LIMIT ? OFFSET ?`).all(owner, limit, (page - 1) * limit) as Row[];
+      const itemQuery = db.prepare("SELECT record_json FROM items WHERE id=? AND owner_id=?");
+      const jobs = rows.map((row) => {
+        const job = JSON.parse(row.record_json) as CaptureJob;
+        const itemRow = itemQuery.get(job.itemId, owner) as Row | undefined;
+        const item = itemRow ? JSON.parse(itemRow.record_json) as ReadLaterItem : undefined;
+        return { ...job, title: item?.title ?? "收藏已删除", source: item?.siteName ?? "", itemAvailable: !!item && !item.deletedAt };
+      });
+      return { jobs, total, counts, page, pages, limit };
+    });
   }
   list(
     owner: string,
@@ -343,6 +361,41 @@ export class ReadLaterStore {
       return item;
     });
   }
+  markRead(owner: string, input: MarkReadInput) {
+    if (!input || !["all", "selected"].includes(input.scope))
+      throw new ReadLaterError("invalid_input", "请选择全部或选中的收藏");
+    return this.db((db) => {
+      let items: ReadLaterItem[];
+      if (input.scope === "selected") {
+        if (
+          !Array.isArray(input.items) || !input.items.length || input.items.length > 100 ||
+          input.items.some((ref) => !ref || typeof ref.id !== "string") ||
+          new Set(input.items.map((ref) => ref.id)).size !== input.items.length
+        ) throw new ReadLaterError("invalid_input", "请选择 1–100 篇不同的收藏");
+        items = input.items.map((ref) => {
+          const item = this.item(db, owner, ref.id);
+          if (item.revision !== expectedRevision(ref.expectedRevision))
+            throw new ReadLaterError("conflict", "收藏已变化，请重新选择后重试");
+          return item;
+        });
+      } else {
+        items = (db.prepare("SELECT record_json FROM items WHERE owner_id=? AND deleted=0").all(owner) as Row[])
+          .map((row) => JSON.parse(row.record_json) as ReadLaterItem);
+      }
+      const timestamp = now();
+      let changed = 0;
+      for (const item of items) {
+        if (item.readingStatus !== "unread") continue;
+        item.readingStatus = "read";
+        item.readAt = timestamp;
+        item.updatedAt = timestamp;
+        item.revision++;
+        this.save(db, item);
+        changed++;
+      }
+      return { changed };
+    });
+  }
   retry(owner: string, id: string, revision: number, op: string) {
     return this.db((db) => {
       operationId(op);
@@ -396,6 +449,42 @@ export class ReadLaterStore {
         id,
         job.id,
       );
+      return { item, job, replayed: false };
+    });
+  }
+  importVersion(owner: string, id: string, revision: number, op: string, hash: string,
+    metadata: Pick<ReadLaterItem, "title" | "siteName" | "author" | "description">, version: ArticleVersion) {
+    operationId(op);
+    return this.db(db => {
+      const item = this.item(db, owner, id);
+      const previous = db.prepare("SELECT hash,item_id,job_id FROM operations WHERE owner_id=? AND id=?").get(owner, `import:${op}`) as { hash: string; item_id: string; job_id: string } | undefined;
+      if (previous) {
+        if (previous.hash !== hash || previous.item_id !== id) throw new ReadLaterError("conflict", "导入标识已用于不同内容");
+        return { item, job: this.jobs(db).find(job => job.id === previous.job_id)!, replayed: true };
+      }
+      if (item.revision !== expectedRevision(revision)) throw new ReadLaterError("conflict", "收藏已变化，请刷新后重新导入");
+      if (version.itemId !== id) throw new ReadLaterError("invalid_input", "正文归属无效");
+      for (const job of this.jobs(db).filter(job => job.itemId === id && ["queued", "running"].includes(job.status))) {
+        this.saveJob(db, { ...job, status: "cancelled", step: "已由网页导入替代", updatedAt: now(), leaseExpiresAt: undefined });
+      }
+      const timestamp = now(), job: CaptureJob = {
+        id: randomUUID(), itemId: id, ownerId: owner, generation: ++item.generation,
+        status: "succeeded", step: "网页正文已导入", progress: 100, createdAt: timestamp, updatedAt: timestamp,
+      };
+      db.prepare("INSERT INTO versions VALUES(?,?,?)").run(version.id, id, JSON.stringify(version));
+      Object.assign(item, metadata);
+      item.extractedTitle = metadata.title;
+      item.title = item.userTitle || metadata.title;
+      item.activeVersionId = version.id;
+      item.latestJobId = job.id;
+      item.parseStatus = "ready";
+      item.errorMessage = undefined;
+      item.fetchedUrl = undefined; // This version came from a supplied file, not a network response.
+      item.fetchedAt = version.capturedAt;
+      item.revision++;
+      item.updatedAt = timestamp;
+      this.save(db, item); this.saveJob(db, job);
+      db.prepare("INSERT INTO operations VALUES(?,?,?,?,?)").run(owner, `import:${op}`, hash, id, job.id);
       return { item, job, replayed: false };
     });
   }
@@ -468,7 +557,8 @@ export class ReadLaterStore {
       return undefined;
     });
   }
-  progress(job: CaptureJob, step: string, progress: number): boolean {
+  // Omitting the stage renews the lease without rewinding displayed progress.
+  progress(job: CaptureJob, step?: string, progress?: number): boolean {
     return this.db((db) => {
       const current = this.jobs(db).find((j) => j.id === job.id);
       if (
@@ -477,8 +567,8 @@ export class ReadLaterStore {
         current.leaseOwner !== job.leaseOwner
       )
         return false;
-      current.step = step;
-      current.progress = progress;
+      if (step !== undefined) current.step = step;
+      if (progress !== undefined) current.progress = progress;
       current.updatedAt = now();
       current.leaseExpiresAt = new Date(Date.now() + 30000).toISOString();
       this.saveJob(db, current);

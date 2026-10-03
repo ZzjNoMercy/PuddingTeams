@@ -94,8 +94,16 @@ export const fetchArticle: ArticleFetch = async (url, signal) => {
         maxBytes: MAX_RESPONSE_BYTES,
         timeoutMs: 25000,
         headers: {
+          // Preserve PuddingClaw's read-later request profile. Node derives Host
+          // from each validated URL so redirects cannot retain the old host.
+          "User-Agent":
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
           Accept:
-            "text/html,application/xhtml+xml,text/plain,image/avif,image/webp,image/*;q=0.8",
+            "text/html,application/json,text/plain,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.1",
+          "Accept-Encoding": "gzip, deflate",
+          "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          Connection: "close",
         },
       });
     } catch (error) {

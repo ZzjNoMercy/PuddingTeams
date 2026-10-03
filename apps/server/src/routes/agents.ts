@@ -1070,6 +1070,7 @@ export function registerAgentsRoutes(app: FastifyInstance, teams: TeamsStore, de
 							binding.id,
 						),
 						sharedStateDir: path.join(capabilityStateRoot, binding.extensionId, "shared"),
+						connection: extensions?.connectionServiceOf(binding.extensionId),
 					});
 					for (const issue of runtimeProbe.issues ?? []) issues.push(issue);
 				} catch (err) {

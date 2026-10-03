@@ -370,6 +370,7 @@ export class ExtensionRegistry {
 	capabilityModuleOf(id: string): CapabilityExtensionModule | undefined {
 		return this.catalog.get(id);
 	}
+	connectionServiceOf(id: string) { return this.catalog.connectionOf(id); }
 
 	// ---- builtin 注册 ----
 

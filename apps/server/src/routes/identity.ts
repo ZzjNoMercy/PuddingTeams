@@ -54,6 +54,22 @@ async function existingAvatar(assets: string): Promise<{ file: string; mime: str
 	return null;
 }
 
+export async function readViewerIdentity(
+	identityProvider: () => ViewerIdentity = localViewerIdentity,
+	paths?: Pick<PuddingTeamsPaths, "config" | "assets">,
+): Promise<ViewerIdentity> {
+	const profileFile = paths && path.join(paths.config, "viewer-profile.json");
+	const identity = identityProvider();
+	if (!paths || !profileFile || identity.mode !== "local") return identity;
+	let displayName = identity.user.displayName;
+	try {
+		const saved = JSON.parse(await readFile(profileFile, "utf8")) as { displayName?: unknown };
+		if (typeof saved.displayName === "string" && saved.displayName.trim()) displayName = saved.displayName;
+	} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+	const avatar = await existingAvatar(paths.assets);
+	return { ...identity, user: { ...identity.user, displayName, ...(avatar ? { avatarVersion: avatar.version } : {}) } };
+}
+
 /** Only presentation fields are editable; the OS username and owner ID remain stable. */
 export function registerIdentityRoutes(
 	app: FastifyInstance,
@@ -61,17 +77,7 @@ export function registerIdentityRoutes(
 	paths?: Pick<PuddingTeamsPaths, "config" | "assets">,
 ): void {
 	const profileFile = paths && path.join(paths.config, "viewer-profile.json");
-	const current = async (): Promise<ViewerIdentity> => {
-		const identity = identityProvider();
-		if (!paths || !profileFile || identity.mode !== "local") return identity;
-		let displayName = identity.user.displayName;
-		try {
-			const saved = JSON.parse(await readFile(profileFile, "utf8")) as { displayName?: unknown };
-			if (typeof saved.displayName === "string" && saved.displayName.trim()) displayName = saved.displayName;
-		} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-		const avatar = await existingAvatar(paths.assets);
-		return { ...identity, user: { ...identity.user, displayName, ...(avatar ? { avatarVersion: avatar.version } : {}) } };
-	};
+	const current = () => readViewerIdentity(identityProvider, paths);
 	app.get("/api/identity", current);
 	if (!paths || !profileFile) return;
 	app.patch<{ Body: { displayName?: unknown } }>("/api/identity/profile", async (request, reply) => {

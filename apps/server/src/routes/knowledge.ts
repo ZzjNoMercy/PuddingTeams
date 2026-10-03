@@ -1,3 +1,5 @@
+import { schemaContentPrefix } from "../knowledge/schema-layout.js";
+import type { KnowledgeBinding } from "../knowledge/contracts.js";
 import { applyAndAcceptKnowledgePlan } from "../knowledge/apply-plan.js";
 import path from "node:path";
 import type { FastifyInstance, FastifyReply } from "fastify";
@@ -8,8 +10,9 @@ import { buildKnowledgePlan, KnowledgePlanStore } from "../knowledge/plans.js";
 import { hashTeamsSchema, TEAMS_SCHEMA_PRESETS, validateTeamsSchema, type TeamsSchemaPreset } from "../knowledge/schema-presets.js";
 import { assessAcceptedNote, diffTeamsSchemas, resolveEffectiveSchema, type AffectedFile } from "../knowledge/schema-impact.js";
 import { SchemaWriteError, writeTeamsSchema } from "../knowledge/schema-write.js";
+import { writeKnowledgeNote } from "../knowledge/note-write.js";
 import { KnowledgeReadError, listKnowledgeTree, readKnowledgeNote, type KnowledgeTreeNode } from "../knowledge/reader.js";
-import { localViewerIdentity } from "./identity.js";
+import { localViewerIdentity, type ViewerIdentity } from "./identity.js";
 import { KnowledgeAcceptanceStore, parseNoteFrontmatterFields, type AcceptanceLedger, type StoredAcceptedNoteVersion } from "../knowledge/acceptance.js";
 import { hashBufferSha256 } from "../knowledge/hashing.js";
 import type { KnowledgeObjectStore } from "../knowledge/objects.js";
@@ -19,12 +22,13 @@ import { KnowledgeSearchIndex, searchBuiltIndex } from "../knowledge/search-inde
 import { resolveMarkdownLinkTarget, resolveWikiLink, splitWikiLinkTarget } from "../knowledge/links.js";
 import { readKnowledgeAsset } from "../knowledge/assets.js";
 import { KnowledgeSelectionStore } from "../knowledge/selections.js";
-import type { KnowledgeHistoryStore } from "../knowledge/history-store.js";
+import type { KnowledgeHistoryStore, NoteHistoryVersion } from "../knowledge/history-store.js";
 import type { MemorySetupService } from "../knowledge/memory-setup.js";
 import type { ReviewStore } from "../knowledge/wiki/review-store.js";
 import { assertImageAssetBytes, assertImageBatchIntegrity, markdownImageTargets, resolveImagePath } from "../knowledge/image-publication.js";
 
 export interface KnowledgeRouteDeps {
+	viewerIdentity?: () => Promise<ViewerIdentity>;
 	memorySetup?: MemorySetupService;
 	history?: KnowledgeHistoryStore;
 	reviews?: Pick<ReviewStore, "get">;
@@ -60,14 +64,15 @@ async function ensureScan(deps: KnowledgeRouteDeps, bindingId: string, scan: () 
 	return await scan();
 }
 
-async function schemaAffectedFiles(deps: KnowledgeRouteDeps, bindingId: string, current: TeamsSchemaPreset | null, next: TeamsSchemaPreset): Promise<AffectedFile[]> {
-	const ledger = await deps.acceptance.getSnapshot(bindingId);
+async function schemaAffectedFiles(deps: KnowledgeRouteDeps, binding: KnowledgeBinding, current: TeamsSchemaPreset | null, next: TeamsSchemaPreset): Promise<AffectedFile[]> {
+	const ledger = await deps.acceptance.getSnapshot(binding.id);
+	const contentPrefix = await schemaContentPrefix(binding, current ?? next);
 	const affectedFiles: AffectedFile[] = [];
 	for (const entry of Object.values(ledger.entries)) {
 		if (entry.availability !== "current") continue;
 		const snapshot = await deps.objects.get(entry.snapshotRef).catch(() => null);
 		if (!snapshot) continue;
-		const affected = assessAcceptedNote(entry.relativePath, parseNoteFrontmatterFields(snapshot.toString("utf8")), current, next);
+		const affected = assessAcceptedNote(entry.relativePath, parseNoteFrontmatterFields(snapshot.toString("utf8")), current, next, contentPrefix);
 		if (affected) affectedFiles.push(affected);
 	}
 	affectedFiles.sort((a, b) => a.path.localeCompare(b.path));
@@ -105,6 +110,9 @@ function noteCounts(record: ObservationRecord): Record<string, number> {
 /** Local owner only; all file reads are scoped to a registered root. */
 export function registerKnowledgeRoutes(app: FastifyInstance, registry: KnowledgeBindingRegistry, deps?: KnowledgeRouteDeps): void {
 	const ownerId = () => localViewerIdentity().user.id;
+	const historyDisplayVersion = (version: NoteHistoryVersion, viewer: ViewerIdentity): NoteHistoryVersion =>
+		version.actorId === viewer.user.id && (version.channel === "manual_edit" || version.channel === "agent_publish")
+			? { ...version, actorName: viewer.user.displayName } : version;
 	const requireDeps = (): KnowledgeRouteDeps => {
 		if (!deps) throw new KnowledgeRouteError("capability_unavailable", "知识库 M2 能力未装配");
 		return deps;
@@ -138,7 +146,9 @@ export function registerKnowledgeRoutes(app: FastifyInstance, registry: Knowledg
 			assertValidNoteRelativePath(req.query.path ?? "");
 			if (!services.history) throw new KnowledgeRouteError("capability_unavailable", "页面历史未装配");
 			await services.acceptance.flushHistory(req.params.id);
-			return services.history.list(req.params.id, req.query.path!);
+			const history = await services.history.list(req.params.id, req.query.path!);
+			const viewer = await services.viewerIdentity?.() ?? localViewerIdentity();
+			return { ...history, versions: history.versions.map(version => historyDisplayVersion(version, viewer)) };
 		} catch (error) { return sendKnowledgeError(reply, error); }
 	});
 	app.get<{ Params: { id: string; versionId: string } }>("/api/knowledge/:id/history/:versionId", async (req, reply) => {
@@ -152,7 +162,8 @@ export function registerKnowledgeRoutes(app: FastifyInstance, registry: Knowledg
 			const bytes = await services.objects.get(version.snapshotRef), previous = version.previousSnapshotRef ? await services.objects.get(version.previousSnapshotRef) : undefined;
 			if (hashBufferSha256(bytes) !== version.contentHash || (previous && hashBufferSha256(previous) !== version.previousHash)) throw new Error("历史快照校验失败");
 			const content = bytes.toString("utf8"), previousContent = previous?.toString("utf8");
-			return { version, content, ...(previousContent !== undefined ? { previousContent } : {}), previousVersionId: version.previousVersionId,
+			const viewer = await services.viewerIdentity?.() ?? localViewerIdentity();
+			return { version: historyDisplayVersion(version, viewer), content, ...(previousContent !== undefined ? { previousContent } : {}), previousVersionId: version.previousVersionId,
 				diff: diffNoteContent(previousContent ?? "", content) };
 		} catch (error) { return sendKnowledgeError(reply, error); }
 	});
@@ -194,7 +205,8 @@ export function registerKnowledgeRoutes(app: FastifyInstance, registry: Knowledg
 			if (!contextKey || contextKey.length > 2_048 || !Number.isSafeInteger(expectedRevision) || (expectedRevision ?? -1) < 0 || !Array.isArray(selectedBindingIds)) {
 				throw new KnowledgeRouteError("invalid_input", "知识库选择请求无效");
 			}
-			return { selection: await deps.selections.set(ownerId(), contextKey, expectedRevision!, selectedBindingIds) };
+			await deps.selections.set(ownerId(), contextKey, expectedRevision!, selectedBindingIds);
+			return { selection: await deps.selections.effective(ownerId(), contextKey) };
 		} catch (error) { return sendKnowledgeError(reply, error); }
 	});
 
@@ -279,7 +291,7 @@ export function registerKnowledgeRoutes(app: FastifyInstance, registry: Knowledg
 			if (errors.length > 0) throw new KnowledgeRouteError("schema_invalid", "结构定义未通过校验", errors);
 			const current = await resolveEffectiveSchema(binding);
 			const changes = diffTeamsSchemas(current.schema ?? null, schema);
-			const affectedFiles = await schemaAffectedFiles(services, binding.id, current.schema ?? null, schema);
+			const affectedFiles = await schemaAffectedFiles(services, binding, current.schema ?? null, schema);
 			return {
 				impact: {
 					changes,
@@ -305,7 +317,7 @@ export function registerKnowledgeRoutes(app: FastifyInstance, registry: Knowledg
 			if (!current.schema || !current.schemaRef) throw new KnowledgeRouteError("capability_unavailable", "当前知识库没有可编辑的结构声明");
 			if (current.schemaRef.hash !== expectedHash) throw new KnowledgeRouteError("baseline_conflict", "结构声明已变化，请刷新后重试");
 			if (diffTeamsSchemas(current.schema, schema).length === 0) throw new KnowledgeRouteError("invalid_input", "实体和关系没有变化");
-			const affectedFiles = await schemaAffectedFiles(services, binding.id, current.schema, schema);
+			const affectedFiles = await schemaAffectedFiles(services, binding, current.schema, schema);
 			if (JSON.stringify(affectedFiles) !== JSON.stringify(expectedAffectedFiles)) {
 				throw new KnowledgeRouteError("baseline_conflict", "受影响笔记已变化，请重新预览后保存");
 			}
@@ -393,6 +405,13 @@ export function registerKnowledgeRoutes(app: FastifyInstance, registry: Knowledg
 					acceptedAt: found.entry.acceptedAt,
 				},
 			};
+		} catch (error) { return sendKnowledgeError(reply, error); }
+	});
+
+	app.put<{ Params: { id: string }; Body: { path: string; content: string; expectedHash: string } }>("/api/knowledge/:id/note", { bodyLimit: 3 * 1024 * 1024 }, async (req, reply) => {
+		try {
+			const services = requireDeps();
+			return await writeKnowledgeNote(registry, services.observation, services.acceptance, ownerId(), req.params.id, req.body ?? {});
 		} catch (error) { return sendKnowledgeError(reply, error); }
 	});
 

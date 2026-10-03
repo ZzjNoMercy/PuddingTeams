@@ -246,7 +246,7 @@ export function HarnessSettingsPanel({ selectedTab, onTabChange }: { selectedTab
 				<div className="harness-safety-note"><strong>平台始终强制</strong><p>每次复验使用 fresh Session；无法找到 Verifier、证据捕获失败或远端 Run 无法对账时都会阻塞，不会降级为自动通过。首期强制复验只覆盖 CLI / 代码任务。</p></div>
 			</div> : null}
 			{tab === "workspace" ? <div className="harness-settings-pane">
-				<div><h3 className="text-sm font-medium">Git 写入方式</h3><p className="mt-1 text-xs leading-5 text-muted-foreground">选择 Worker 修改 Git 项目时的默认工作方式。只读任务和非 Git 写任务由平台采用固定安全策略。</p></div>
+				<div><h3 className="text-sm font-medium">Git 写入方式</h3><p className="mt-1 text-xs leading-5 text-muted-foreground">选择 Worker 修改 Git 项目时的默认工作方式。普通查阅自动执行并观测变更；明确要求强制只读时按 Worker 的真实隔离能力执行。</p></div>
 				<div className="harness-choice-grid harness-choice-grid-two" role="radiogroup" aria-label="Git 写入方式">
 					<button type="button" className="harness-choice" role="radio" aria-checked={value.workspaceExecution.gitWriteDefault === "isolated_worktree"} data-active={value.workspaceExecution.gitWriteDefault === "isolated_worktree" ? "true" : "false"} onClick={() => setValue((current) => ({ ...current, workspaceExecution: { ...current.workspaceExecution, gitWriteDefault: "isolated_worktree" } }))}>
 						<strong>隔离 Worktree <span>推荐</span></strong><small>每个写任务独立执行，验收后再提升 change-set。</small>
@@ -259,7 +259,7 @@ export function HarnessSettingsPanel({ selectedTab, onTabChange }: { selectedTab
 					<summary>高级 Workspace 参数</summary>
 					<label className="mt-3 block space-y-1.5 text-xs"><span className="font-medium">独占租约（分钟）</span><Input type="number" min={1} max={60} value={value.workspaceExecution.leaseTimeoutMs / 60_000} onChange={(event) => setValue((current) => ({ ...current, workspaceExecution: { ...current.workspaceExecution, leaseTimeoutMs: Number(event.target.value) * 60_000 } }))} /><span className="block text-[10px] leading-4 text-muted-foreground">仅用于需要独占写入的任务；超时后重新协调所有权。</span></label>
 				</details>
-				<div className="harness-safety-note"><strong>平台始终强制</strong><p>只读任务共享只读；非 Git 写任务独占执行并记录 baseline/write-set；验收通过后提升精确 change-set，但不自动 commit 或 push。发生冲突时保留 worktree/diff 并阻塞，Manager 写任务必须委托 Worker。</p></div>
+				<div className="harness-safety-note"><strong>平台始终强制</strong><p>普通查阅优先使用真实只读能力，否则独占执行并记录变更，不弹出准入确认；强制只读约束不满足时先改派；非 Git 写任务独占执行并记录 baseline/write-set；验收通过后提升精确 change-set，但不自动 commit 或 push。发生冲突时保留 worktree/diff 并阻塞，Manager 写任务必须委托 Worker。</p></div>
 			</div> : null}
 			<div className="harness-settings-footer"><Button disabled={saving || saveConflict || JSON.stringify(value) === savedBaseline || (!!value.verification.reviewers.cliAgentId && (loadingAgents || !!agentsError || !agents.some((agent) => agent.name === value.verification.reviewers.cliAgentId)))} onClick={() => void save()}>{saving ? "保存中…" : "保存"}</Button></div>
 		</section>

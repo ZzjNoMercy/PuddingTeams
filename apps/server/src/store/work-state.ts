@@ -31,6 +31,8 @@ export interface WorkItemVerificationPolicy extends VerificationPolicy {
 }
 export interface WorkspaceExecutionPolicy {
 	mode: WorkspaceAccessMode;
+	/** User constraints require enforcement; ordinary inspections use observed best effort. */
+	readOnlyRequirement?: "best_effort" | "enforced";
 	source: "harness_default" | "manager_derived" | "user";
 	reason: string;
 	baselineStrategy: "git_tree" | "filesystem_manifest" | "external_snapshot";
@@ -795,6 +797,7 @@ export class WorkStateStore {
 					baselineStrategy: (requestedWorkspace.baselineStrategy ?? existing?.workspaceExecutionPolicy?.baselineStrategy ?? classifiedDefault.baselineStrategy) as WorkspaceExecutionPolicy["baselineStrategy"],
 					promoteOnAcceptance: requestedWorkspace.promoteOnAcceptance ?? existing?.workspaceExecutionPolicy?.promoteOnAcceptance ?? classifiedDefault.promoteOnAcceptance,
 				};
+				if (workspaceExecutionPolicy.readOnlyRequirement !== undefined && !["best_effort", "enforced"].includes(workspaceExecutionPolicy.readOnlyRequirement)) throw new Error(`${id}.workspaceExecutionPolicy.readOnlyRequirement 无效`);
 				if (!["read_only_shared", "exclusive_write", "isolated_worktree"].includes(workspaceExecutionPolicy.mode)) throw new Error(`${id}.workspaceExecutionPolicy.mode 无效`);
 				if (!["harness_default", "manager_derived", "user"].includes(workspaceExecutionPolicy.source)) throw new Error(`${id}.workspaceExecutionPolicy.source 无效`);
 				if (!["git_tree", "filesystem_manifest", "external_snapshot"].includes(workspaceExecutionPolicy.baselineStrategy)) throw new Error(`${id}.workspaceExecutionPolicy.baselineStrategy 无效`);
