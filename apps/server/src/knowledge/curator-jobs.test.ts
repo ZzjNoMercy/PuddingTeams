@@ -91,7 +91,7 @@ test("聊天Wiki由当前Worker提交候选；准备重放不新增任务，后�
 		assert.deepEqual(notices, ["running", "pending_review"]);
 		assert.deepEqual(await readdir(f.vault), []);
 		const batch = (await f.reviews.get((await f.jobs.get(job.id))!.candidateBatchId!))!.batch;
-		const approved = await f.reviews.decide({ batchId: batch.id, operationId: "human", actorId: "owner", decision: "approve", manifestHash: batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: batch.files.map(file => file.targetPath) });
+		const approved = await f.reviews.decide({ batchId: batch.id, operationId: "human", actorId: "owner", decision: "approve", manifestHash: batch.manifestHash, reviewedFiles: batch.files.map(file => file.targetPath) });
 		await f.publisher.onApproved(batch, approved.decision);
 		assert.equal(await readFile(path.join(f.vault, "fact.md"), "utf8"), content);
 	} finally { await worker.workerExecution!.finish("cancelled"); await rm(f.root, { recursive: true, force: true }); }
@@ -234,11 +234,11 @@ test("稍后读晋升冻结网页与图片；删除收藏后仍可审核发布",
 		assert.equal((await promoter.promote("owner", input)).job.id, outcome.job.id);
 		assert.equal((await f.sources.readAsset("owner", source.id, source.assets![0]!.hash)).equals(image), true);
 		const batch = (await f.reviews.get(done.candidateBatchId!))!.batch; assert.equal(batch.files.filter(file => file.kind === "image").length, 1);
-		await f.publisher.onApproved(batch, (await f.reviews.decide({ batchId: batch.id, operationId: "approve-web", actorId: "owner", decision: "approve", manifestHash: batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: batch.files.map(file => file.targetPath) })).decision);
+		await f.publisher.onApproved(batch, (await f.reviews.decide({ batchId: batch.id, operationId: "approve-web", actorId: "owner", decision: "approve", manifestHash: batch.manifestHash, reviewedFiles: batch.files.map(file => file.targetPath) })).decision);
 		assert.match(await readFile(path.join(f.vault, "note.md"), "utf8"), /assets\/images/);
 	} finally { await capture.close(); await f.service.waitForIdle(); await rm(f.root, { recursive: true, force: true }); }
 });
-const extractFixture: NonNullable<ConstructorParameters<typeof WikiCuratorService>[0]["extractImage"]> = async input => ({ version: 1, extractorId: "pi-vision", extractorVersion: "1", modelRef: "fixture/vision", configHash: "f".repeat(64), originalHash: input.originalHash, width: 1, height: 1, segments: [{ text: "原图事实", warnings: [] }], warnings: [], createdAt: new Date().toISOString() });
+const extractFixture: NonNullable<ConstructorParameters<typeof WikiCuratorService>[0]["extractImage"]> = async input => ({ version: 1, extractorId: "pi-vision", extractorVersion: "1", modelRef: "fixture/vision", originalHash: input.originalHash, width: 1, height: 1, segments: [{ text: "原图事实", warnings: [] }], warnings: [], createdAt: new Date().toISOString() });
 
 test("Curator原图随采用页固定；未采纳/无变化页的图片不入发布包", async () => {
 	let firstContent = "", mode = "first";
@@ -254,10 +254,10 @@ test("Curator原图随采用页固定；未采纳/无变化页的图片不入发
 		const batch = (await f.reviews.get(done.candidateBatchId!))!.batch;
 		assert.equal(batch.files.filter(file => file.kind === "image").length, 1);
 		const asset = batch.files.find(file => file.kind === "image")!, page = batch.files.find(file => file.kind !== "image")!;
-		firstContent = (await f.objects.get(page.blobRef!)).toString(); assert.match(firstContent, /!\[.*\]\(\.\.\/\.\.\/assets\/images\/[a-f0-9]{64}\.png\)/);
+		firstContent = (await f.objects.get(page.candidateHash!)).toString(); assert.match(firstContent, /!\[.*\]\(\.\.\/\.\.\/assets\/images\/[a-f0-9]{64}\.png\)/);
 		assert.deepEqual(batch.dependencyGroups, [[asset.targetPath, page.targetPath]]);
 		assert.deepEqual(await readdir(f.vault), []);
-		const decision = (await f.reviews.decide({ batchId: batch.id, operationId: "human", actorId: "owner", decision: "approve", manifestHash: batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: batch.files.map(file => file.targetPath) })).decision;
+		const decision = (await f.reviews.decide({ batchId: batch.id, operationId: "human", actorId: "owner", decision: "approve", manifestHash: batch.manifestHash, reviewedFiles: batch.files.map(file => file.targetPath) })).decision;
 		await f.publisher.onApproved(batch, decision);
 		assert.deepEqual(await readdir(path.join(f.vault, "assets/images")), [path.basename(asset.targetPath)]);
 		assert.equal((await f.history.list(f.binding.id, page.targetPath)).versions.length, 1);
@@ -282,7 +282,7 @@ test("历史原图只读取该固定版本实际引用的审核bytes，磁盘变
 		const created = await f.service.create({ ownerId: owner, operationId: "history-images", bindingId: f.binding.id, agentId: "wiki", task: "分别采纳两图", uploads: originals.map((bytes, i) => ({ filename: `${i}.png`, mediaType: "image/png", data: bytes.toString("base64") })) });
 		await f.service.waitForIdle(); const done = (await f.jobs.get(created.job.id))!; assert.equal(done.status, "pending_review", done.failureCode);
 		const batch = (await f.reviews.get(done.candidateBatchId!))!.batch;
-		await f.publisher.onApproved(batch, (await f.reviews.decide({ batchId: batch.id, operationId: "history-human", actorId: owner, decision: "approve", manifestHash: batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: batch.files.map(file => file.targetPath) })).decision);
+		await f.publisher.onApproved(batch, (await f.reviews.decide({ batchId: batch.id, operationId: "history-human", actorId: owner, decision: "approve", manifestHash: batch.manifestHash, reviewedFiles: batch.files.map(file => file.targetPath) })).decision);
 		const version = (await f.history.list(f.binding.id, "facts/0.md")).versions[0]!;
 		const ownAsset = imageAssetPath(done.sources.filter(source => source.kind === "image")[0]!.originalHash, "image/png"), otherAsset = imageAssetPath(done.sources.filter(source => source.kind === "image")[1]!.originalHash, "image/png");
 		const url = (target: string) => `/api/knowledge/${f.binding.id}/history/${version.id}/assets?path=${encodeURIComponent(target)}`;
@@ -323,7 +323,7 @@ test("聊天固定sourceIDs进入Curator，模型任务独立于用户原话；�
 		const final = await completed(f.jobs, result.jobId); assert.equal(final.status, "pending_review");
 		assert.deepEqual(final.sources.map((source) => source.id), refs.sourceIds);
 		const batch = (await f.reviews.get(final.candidateBatchId!))!;
-		const bytes = (await f.objects.get(batch.batch.files[0]!.blobRef!)).toString(); assert.match(bytes, /真实日期10月23日/); assert.doesNotMatch(bytes, /错误日期10月30日/);
+		const bytes = (await f.objects.get(batch.batch.files[0]!.candidateHash!)).toString(); assert.match(bytes, /真实日期10月23日/); assert.doesNotMatch(bytes, /错误日期10月30日/);
 		await f.bindings.revoke("owner", f.binding.id, f.binding.bindingRevision);
 		await assert.rejects(request.execute("new-tool", args, undefined, undefined, {} as never), /撤|授权|不可|信任|not found/);
 		assert.equal((await f.jobs.list("owner")).length, 1);
@@ -340,10 +340,10 @@ test("空库文字→固定候选→人审→按已审字节发布，cwd与Vault
 		assert.deepEqual(await readdir(f.cwd), [], "不把库挂成cwd也不写入项目");
 		const record = (await f.reviews.get(final.candidateBatchId!))!;
 		const approved = await f.reviews.decide({ batchId: record.batch.id, operationId: "human", actorId: "owner", decision: "approve",
-			manifestHash: record.batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: ["note.md"] });
+			manifestHash: record.batch.manifestHash, reviewedFiles: ["note.md"] });
 		await f.publisher.onApproved(record.batch, approved.decision);
 		assert.equal((await f.reviews.get(record.batch.id))?.status, "published");
-		assert.equal(await readFile(path.join(f.vault, "note.md"), "utf8"), (await f.objects.get(record.batch.files[0]!.blobRef!)).toString("utf8"));
+		assert.equal(await readFile(path.join(f.vault, "note.md"), "utf8"), (await f.objects.get(record.batch.files[0]!.candidateHash!)).toString("utf8"));
 		assert.equal(Object.keys((await f.acceptance.getSnapshot(f.binding.id)).entries).length, 1);
 	} finally { await f.service.waitForIdle(); await rm(f.root, { recursive: true, force: true }); }
 });
@@ -372,7 +372,7 @@ test("来源会话删除后拒绝与审批来源可读取，重启不依赖会�
 		const final = await completed(f.jobs, created.job.id);
 		await rm(sessionRoot, { recursive: true });
 		const reopened = new ReviewStore(path.join(f.root, "reviews")), record = (await reopened.get(final.candidateBatchId!))!;
-		await reopened.decide({ batchId: record.batch.id, operationId: "reject", actorId: "owner", decision: "reject", manifestHash: record.batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: [] });
+		await reopened.decide({ batchId: record.batch.id, operationId: "reject", actorId: "owner", decision: "reject", manifestHash: record.batch.manifestHash, reviewedFiles: [] });
 		assert.equal((await reopened.get(record.batch.id))?.status, "rejected");
 		assert.equal((await new KnowledgeSourceStore({ stateDir: path.join(f.root, "state"), objects: f.objects }).readText("owner", final.sources[0]!.id)).text, "待确认事实");
 		assert.deepEqual(await readdir(f.vault), []);
@@ -469,7 +469,7 @@ test("更新保留该页真实历史来源，历史来源不授予其他页凭�
 			const old = await f.sources.createText("owner", "已审核历史事实");
 			const bytes = Buffer.from(`---\nsources: [${old.id}]\n---\n历史事实`), snapshot = await f.objects.put(bytes);
 			await writeFile(path.join(f.vault, "note.md"), bytes);
-			await f.acceptance.adopt(f.binding.id, [{ relativePath: "note.md", contentHash: snapshot.hash, snapshotRef: snapshot.hash, acceptedBy: "owner" }], 0);
+			await f.acceptance.adopt(f.binding.id, [{ relativePath: "note.md", contentHash: snapshot.hash, acceptedBy: "owner" }], 0);
 			const { job } = await f.service.create({ ownerId: "owner", operationId: mode, bindingId: f.binding.id, agentId: "wiki", task: "只修订标题" });
 			const final = await completed(f.jobs, job.id);
 			assert.equal(final.status, mode === "preserve" ? "pending_review" : "failed");
@@ -486,7 +486,7 @@ test("固定契约随审核冻结，候选不能改写AGENTS，批准后契约�
 		const { job } = await f.service.create({ ownerId: "owner", operationId: "contract", bindingId: f.binding.id, agentId: "wiki", task: "事实" });
 		const final = await completed(f.jobs, job.id), record = (await f.reviews.get(final.candidateBatchId!))!;
 		assert.equal(record.batch.contractHash, job.contractHash);
-		const approved = await f.reviews.decide({ batchId: record.batch.id, operationId: "human", actorId: "owner", decision: "approve", manifestHash: record.batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: ["note.md"] });
+		const approved = await f.reviews.decide({ batchId: record.batch.id, operationId: "human", actorId: "owner", decision: "approve", manifestHash: record.batch.manifestHash, reviewedFiles: ["note.md"] });
 		await writeFile(path.join(f.vault, "AGENTS.md"), "库操作契约v2");
 		await f.publisher.onApproved(record.batch, approved.decision).catch(() => undefined);
 		assert(!(await readdir(f.vault)).includes("note.md"));
@@ -506,19 +506,19 @@ test("历史已采纳来源版本离开实时账本后，仍沿实际发布recei
 	try {
 		const firstSource = await f.objects.put(Buffer.from("# source v1"));
 		await writeFile(path.join(f.vault, "source.md"), "# source v1");
-		await f.acceptance.adopt(f.binding.id, [{ relativePath: "source.md", contentHash: firstSource.hash, snapshotRef: firstSource.hash, acceptedBy: "owner" }], 0);
+		await f.acceptance.adopt(f.binding.id, [{ relativePath: "source.md", contentHash: firstSource.hash, acceptedBy: "owner" }], 0);
 		const first = await f.service.create({ ownerId: "owner", operationId: "first", bindingId: f.binding.id, agentId: "wiki", task: "first" });
 		const ready = await completed(f.jobs, first.job.id); await f.service.waitForIdle();
 		const batch = (await f.reviews.get(ready.candidateBatchId!))!.batch;
-		const approved = await f.reviews.decide({ batchId: batch.id, operationId: "approve", actorId: "owner", decision: "approve", manifestHash: batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: ["output.md"] });
+		const approved = await f.reviews.decide({ batchId: batch.id, operationId: "approve", actorId: "owner", decision: "approve", manifestHash: batch.manifestHash, reviewedFiles: ["output.md"] });
 		await f.publisher.onApproved(batch, approved.decision);
 		const secondSource = await f.objects.put(Buffer.from("# source v2"));
 		await writeFile(path.join(f.vault, "source.md"), "# source v2");
-		await f.acceptance.adopt(f.binding.id, [{ relativePath: "source.md", contentHash: secondSource.hash, snapshotRef: secondSource.hash, acceptedBy: "owner" }], 2);
+		await f.acceptance.adopt(f.binding.id, [{ relativePath: "source.md", contentHash: secondSource.hash, acceptedBy: "owner" }], 2);
 		const second = await f.service.create({ ownerId: "owner", operationId: "second", bindingId: f.binding.id, agentId: "wiki", task: "second" });
 		const final = await completed(f.jobs, second.job.id); await f.service.waitForIdle();
 		assert.equal(final.status, "pending_review");
-		assert.equal(final.historicalAcceptedSources?.[0]?.snapshotRef, firstSource.hash);
+		assert.equal(final.historicalAcceptedSources?.[0]?.hash, firstSource.hash);
 		assert.deepEqual((await f.reviews.get(final.candidateBatchId!))?.batch.sourceSnapshots, [firstSource.hash]);
 		assert.match(await readFile(path.join(f.vault, "output.md"), "utf8"), /first/);
 	} finally { await f.service.waitForIdle(); await rm(f.root, { recursive: true, force: true }); }
@@ -527,7 +527,7 @@ test("历史已采纳来源版本离开实时账本后，仍沿实际发布recei
 test("图片衍生保存中的取消/授权撤销：缓存可留，来源账本和候选不落", async()=>{
  const png=Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a9sAAAAASUVORK5CYII=","base64");
  for(const mode of ["cancel","revoke"]){
-  const f=await fixture(undefined,async(input)=>({version:1,extractorId:"pi-vision",extractorVersion:"1",modelRef:"fixture/vision",configHash:"f".repeat(64),originalHash:input.originalHash,width:1,height:1,segments:[{text:"图像事实",warnings:[]}],warnings:[],createdAt:new Date().toISOString()}));
+  const f=await fixture(undefined,async(input)=>({version:1,extractorId:"pi-vision",extractorVersion:"1",modelRef:"fixture/vision",originalHash:input.originalHash,width:1,height:1,segments:[{text:"图像事实",warnings:[]}],warnings:[],createdAt:new Date().toISOString()}));
   let release!:()=>void,enter!:()=>void;const blocked=new Promise<void>(resolve=>release=resolve),entered=new Promise<void>(resolve=>enter=resolve);
   const put=f.objects.put.bind(f.objects);f.objects.put=async(bytes)=>{if(bytes.toString().includes('"sourceId"')){enter();await blocked;}return put(bytes);};
   try{
@@ -615,7 +615,7 @@ test("知识整理状态查询只读：运行中不重建Job，终态与审核�
   const final = JSON.parse(((await status.execute("read", { jobId: id }, undefined, undefined, {} as never)).content[0] as { text: string }).text);
   assert.equal(final.status, "pending_review"); assert.equal(final.reviewStatus, "pending_review"); assert.match(final.reviewUrl, /batch=/);
   const batch = (await f.reviews.get((await f.jobs.get(id))!.candidateBatchId!))!.batch;
-  await f.reviews.decide({ batchId: batch.id, actorId: "owner", operationId: "reject", decision: "reject", manifestHash: batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: [] });
+  await f.reviews.decide({ batchId: batch.id, actorId: "owner", operationId: "reject", decision: "reject", manifestHash: batch.manifestHash, reviewedFiles: [] });
   const afterReview = await f.service.readStatus("owner", id);
   assert.equal(afterReview?.status, "pending_review"); assert.equal(afterReview?.reviewStatus, "rejected", "生成完成与当前审核状态分别读取");
   assert.equal((await f.jobs.list("owner")).length, 1);
@@ -643,7 +643,7 @@ test("根绑定Wiki布局：控制页不越区，原图和相对引用与页面�
   assert(batch.files.every(file => file.targetPath.startsWith("wiki/")));
   const imagePath = batch.files.find(file => file.kind === "image")!.targetPath;
   assert.match(imagePath, /^wiki\/assets\/images\//);
-  const approval = await f.reviews.decide({ batchId: batch.id, operationId: "approve", actorId: "owner", decision: "approve", manifestHash: batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: batch.files.map(file => file.targetPath) });
+  const approval = await f.reviews.decide({ batchId: batch.id, operationId: "approve", actorId: "owner", decision: "approve", manifestHash: batch.manifestHash, reviewedFiles: batch.files.map(file => file.targetPath) });
   await f.publisher.onApproved(batch, approval.decision);
   assert.deepEqual(await readFile(path.join(f.vault, imagePath)), assetPng);
   assert.match(await readFile(path.join(f.vault, "wiki", "facts", "image.md"), "utf8"), /!\[image.png\]\(\.\.\/assets\/images\//);

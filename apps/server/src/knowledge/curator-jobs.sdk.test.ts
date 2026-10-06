@@ -92,7 +92,7 @@ test("真实SDK复现目录和日期拒绝后修正：根绑定wiki目录候选�
 		const batch = (await f.reviews.get(done.candidateBatchId!))!.batch;
 		assert.deepEqual(batch.files.map(file => file.targetPath), ["wiki/facts/repaired.md"]);
 		assert.deepEqual(await readdir(path.join(f.vault, "wiki")), ["index.md"], "批准前不写候选");
-		const approved = await f.reviews.decide({ batchId: batch.id, operationId: "approve", actorId: "owner", decision: "approve", manifestHash: batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: batch.files.map(file => file.targetPath) });
+		const approved = await f.reviews.decide({ batchId: batch.id, operationId: "approve", actorId: "owner", decision: "approve", manifestHash: batch.manifestHash, reviewedFiles: batch.files.map(file => file.targetPath) });
 		await f.publisher.onApproved(batch, approved.decision);
 		assert.match(await readFile(path.join(f.vault, "wiki", "facts", "repaired.md"), "utf8"), /隔离测试事实/);
 	} finally {
@@ -238,9 +238,9 @@ test("真实 WikiCurator 默认 generate 经 SDK 提交、人审发布，工具�
 		const record = (await success.reviews.get(finished.candidateBatchId!))!;
 		assert.equal(record.status, "pending_review"); assert.equal(record.batch.contractHash, created.job.contractHash);
 		assert.deepEqual(record.batch.sourceSnapshots, created.job.sources.map((source) => source.originalHash));
-		assert.equal((await success.objects.get(record.batch.files[0]!.blobRef!)).toString("utf8"), submittedBytes);
+		assert.equal((await success.objects.get(record.batch.files[0]!.candidateHash!)).toString("utf8"), submittedBytes);
 		const approved = await success.reviews.decide({ batchId: record.batch.id, operationId: "human-sdk", actorId: "owner", decision: "approve",
-			manifestHash: record.batch.manifestHash, expectedBatchRevision: record.batch.revision, reviewedFiles: ["facts/sdk.md"] });
+			manifestHash: record.batch.manifestHash, reviewedFiles: ["facts/sdk.md"] });
 		await success.publisher.onApproved(record.batch, approved.decision);
 		assert.equal((await success.reviews.get(record.batch.id))?.status, "published");
 		assert.equal(await readFile(path.join(success.vault, "facts", "sdk.md"), "utf8"), submittedBytes);
@@ -250,7 +250,7 @@ test("真实 WikiCurator 默认 generate 经 SDK 提交、人审发布，工具�
 		const baselineBytes = "---\ntype: fact\ntitle: 已采纳事实\nsources: [prior]\n---\nBASELINE_SECRET_MUST_NOT_REACH_SECOND_PROVIDER\n";
 		const snapshot = await contract.objects.put(Buffer.from(baselineBytes)); await mkdir(path.join(contract.vault, "facts"));
 		await writeFile(path.join(contract.vault, "facts", "baseline.md"), baselineBytes);
-		await contract.acceptance.adopt(contract.binding.id, [{ relativePath: "facts/baseline.md", contentHash: snapshot.hash, snapshotRef: snapshot.hash, acceptedBy: "owner" }], 0);
+		await contract.acceptance.adopt(contract.binding.id, [{ relativePath: "facts/baseline.md", contentHash: snapshot.hash, acceptedBy: "owner" }], 0);
 		const originalMount = contract.runtime.mount.bind(contract.runtime); let realReads = 0;
 		contract.runtime.mount = async (...args) => {
 			const surface = await originalMount(...args), read = surface.tools.find((tool) => tool.name === "knowledge_read")!;
@@ -308,9 +308,9 @@ test("视觉真实SDK提取后才生成候选；空结果可原件重试；文�
   const done=(await f.jobs.get(start.job.id))!;assert.equal(done.status,"pending_review",JSON.stringify(done));assert.deepEqual(requests.map(r=>r.image),[true,false]);
   const image=done.sources.find(s=>s.kind==="image")!;assert(image.extraction);assert.equal(image.derivedFrom,start.job.sources[1]!.id);assert.equal((await f.sources.get("owner",image.derivedFrom!))!.status,"needs_attention");
   assert.deepEqual((await f.sources.readOriginal("owner",image.id)).bytes,png);assert(image.warnings.includes("数字需核对"));assert.deepEqual((await readdir(f.vault)).sort(),["AGENTS.md","wiki.schema.json"]);
-  const record=(await f.reviews.get(done.candidateBatchId!))!,approved=await f.reviews.decide({batchId:record.batch.id,operationId:"human",actorId:"owner",decision:"approve",manifestHash:record.batch.manifestHash,expectedBatchRevision:1,reviewedFiles:record.batch.files.map(file=>file.targetPath)});
-  const page=record.batch.files.find(file=>file.targetPath==="facts/image.md")!,asset=record.batch.files.find(file=>file.kind==="image")!;assert(asset);assert.match((await f.objects.get(page.blobRef!)).toString(),/!\[.*\]\(\.\.\/assets\/images\/[a-f0-9]{64}\.png\)/);
-  await f.publisher.onApproved(record.batch,approved.decision);assert.equal((await f.reviews.get(record.batch.id))!.status,"published");assert.equal(await readFile(path.join(f.vault,"facts/image.md"),"utf8"),(await f.objects.get(page.blobRef!)).toString());assert.deepEqual(await readFile(path.join(f.vault,asset.targetPath)),png);
+  const record=(await f.reviews.get(done.candidateBatchId!))!,approved=await f.reviews.decide({batchId:record.batch.id,operationId:"human",actorId:"owner",decision:"approve",manifestHash:record.batch.manifestHash,reviewedFiles:record.batch.files.map(file=>file.targetPath)});
+  const page=record.batch.files.find(file=>file.targetPath==="facts/image.md")!,asset=record.batch.files.find(file=>file.kind==="image")!;assert(asset);assert.match((await f.objects.get(page.candidateHash!)).toString(),/!\[.*\]\(\.\.\/assets\/images\/[a-f0-9]{64}\.png\)/);
+  await f.publisher.onApproved(record.batch,approved.decision);assert.equal((await f.reviews.get(record.batch.id))!.status,"published");assert.equal(await readFile(path.join(f.vault,"facts/image.md"),"utf8"),(await f.objects.get(page.candidateHash!)).toString());assert.deepEqual(await readFile(path.join(f.vault,asset.targetPath)),png);
   mode="empty";const empty=await make("empty"),fail=await empty.service.create(input(empty,"empty"));await empty.service.waitForIdle();assert.equal((await empty.jobs.get(fail.job.id))!.status,"needs_attention");assert.deepEqual(await empty.reviews.list(),[]);
   mode="retry";const retry=await empty.service.retry("owner",fail.job.id,"retry"),replay=await empty.service.retry("owner",fail.job.id,"retry");assert.equal(replay.job.id,retry.job.id);assert(replay.replayed);await empty.service.waitForIdle();assert.equal((await empty.jobs.get(retry.job.id))!.status,"pending_review");assert.equal((await empty.jobs.get(fail.job.id))!.status,"needs_attention");
   mode="text-only";const text=await make("text"),wiki=(await text.teams.getAgent("wiki"))!;await text.teams.upsertAgent({...wiki,connector:{...wiki.connector!,config:{model:"curator-sdk-fixture/text-only"}}});

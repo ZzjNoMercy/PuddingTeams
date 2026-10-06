@@ -320,7 +320,7 @@ test("onboarding：已确认计划新建index冻结为控制快照，跳过外�
 	const ledger = await deps.acceptance.getSnapshot(applied.json().binding.id);
 	assert.deepEqual(ledger.entries, {});
 	assert.equal(Object.keys(ledger.controlEntries!).length, 1);
-	assert.equal((await deps.objects.get(Object.values(ledger.controlEntries!)[0]!.snapshotRef)).toString(), plan.filesToCreate[0].content);
+	assert.equal((await deps.objects.get(Object.values(ledger.controlEntries!)[0]!.contentHash)).toString(), plan.filesToCreate[0].content);
 	const listing = await app.inject({ method: "GET", url: `/api/knowledge/${applied.json().binding.id}/observations` });
 	assert.equal(listing.statusCode, 200);
 	const status = await app.inject({ method: "POST", url: `/api/knowledge/${applied.json().binding.id}/scan` });

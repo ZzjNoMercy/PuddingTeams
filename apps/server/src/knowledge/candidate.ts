@@ -9,8 +9,8 @@ import { readNoteBytes } from "./observation.js";
 import type { KnowledgeObjectStore } from "./objects.js";
 import { schemaContentPrefix, schemaEntityDirectory } from "./schema-layout.js";
 import { validateTeamsNote } from "./note-validation.js";
-import { effectiveSchemaHash, resolveEffectiveSchema } from "./schema-impact.js";
-import { hashTeamsSchema, type TeamsSchemaPreset } from "./schema-presets.js";
+import { resolveEffectiveSchema } from "./schema-impact.js";
+import { type TeamsSchemaPreset } from "./schema-presets.js";
 import { markdownImageTargets } from "./image-publication.js";
 
 const MAX_CANDIDATE_FILES = 10_000;
@@ -181,8 +181,9 @@ export function createCandidateValidator(deps: CandidateValidatorDeps): (job: Co
 			throw new Error("CompileJob candidate did not come from the Job's own completed compile Delegation");
 		}
 		const binding = await deps.bindings.requireUsable(job.ownerId, job.targetBindingId);
+		const effective = await resolveEffectiveSchema(binding);
 		if (binding.bindingRevision !== job.bindingRevision || binding.trustRevision !== job.trustRevision ||
-			binding.rootIdentity !== job.rootIdentity || await effectiveSchemaHash(binding) !== job.schemaHash) {
+			binding.rootIdentity !== job.rootIdentity || effective.schemaRef?.hash !== job.schemaHash) {
 			throw new Error("CompileJob binding authority changed");
 		}
 		const ledger = await deps.acceptance.getSnapshot(binding.id);
@@ -204,16 +205,13 @@ export function createCandidateValidator(deps: CandidateValidatorDeps): (job: Co
 			if (matches.length !== 1) throw new Error("CompileJob accepted source identity changed");
 			const entry = matches[0]!;
 			if (entry.availability !== "current" || entry.noteIdentity.bindingId !== binding.id ||
-				entry.snapshotRef !== ref || entry.contentHash !== ref) {
+				entry.contentHash !== ref) {
 				throw new Error("CompileJob accepted source authority changed");
 			}
 		}
 		let schema: TeamsSchemaPreset | undefined;
 		if (job.schemaHash) {
-			const effective = await resolveEffectiveSchema(binding);
-			if (!effective.schema || hashTeamsSchema(effective.schema) !== job.schemaHash) {
-				throw new Error("CompileJob schema authority changed");
-			}
+			if (!effective.schema) throw new Error("CompileJob schema authority changed");
 			schema = effective.schema;
 		}
 		const contentPrefix = await schemaContentPrefix(binding, schema);
@@ -249,8 +247,6 @@ export function createCandidateValidator(deps: CandidateValidatorDeps): (job: Co
 				targetPath: candidate.targetPath,
 				expectedHashOrAbsent: baseline ? baseline.contentHash : null,
 				candidateHash: stored.hash,
-				// blobRef 是平台内容寻址对象库中的内容哈希；发布层据此取回候选字节。
-				blobRef: stored.hash,
 			});
 		}
 		files.sort((a, b) => byCodePoint(a.targetPath, b.targetPath));

@@ -34,8 +34,16 @@ export class ReadLaterStore {
    CREATE UNIQUE INDEX IF NOT EXISTS unique_live_url ON items(owner_id,url) WHERE deleted=0;
    CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,record_json TEXT NOT NULL);
    CREATE TABLE IF NOT EXISTS versions(id TEXT PRIMARY KEY,item_id TEXT NOT NULL,record_json TEXT NOT NULL);
-   CREATE TABLE IF NOT EXISTS operations(owner_id TEXT NOT NULL,id TEXT NOT NULL,hash TEXT NOT NULL,item_id TEXT NOT NULL,job_id TEXT,PRIMARY KEY(owner_id,id));
+   CREATE TABLE IF NOT EXISTS operations(owner_id TEXT NOT NULL,id TEXT NOT NULL,hash TEXT,item_id TEXT NOT NULL,job_id TEXT,PRIMARY KEY(owner_id,id));
    CREATE TABLE IF NOT EXISTS promotions(owner_id TEXT NOT NULL,id TEXT NOT NULL,record_json TEXT NOT NULL,PRIMARY KEY(owner_id,id));`);
+      // operations.hash 曾 NOT NULL；retry 行不再携带 hash，旧库需重建该表去掉约束。
+      const hashColumn = (db.prepare("PRAGMA table_info(operations)").all() as { name: string; notnull: number }[]).find(c => c.name === "hash");
+      if (hashColumn?.notnull) db.exec(`BEGIN;
+   CREATE TABLE operations_migrated(owner_id TEXT NOT NULL,id TEXT NOT NULL,hash TEXT,item_id TEXT NOT NULL,job_id TEXT,PRIMARY KEY(owner_id,id));
+   INSERT INTO operations_migrated SELECT owner_id,id,hash,item_id,job_id FROM operations;
+   DROP TABLE operations;
+   ALTER TABLE operations_migrated RENAME TO operations;
+   COMMIT;`);
       db.exec("BEGIN IMMEDIATE");
       try {
         const result = fn(db);
@@ -445,7 +453,7 @@ export class ReadLaterStore {
       db.prepare("INSERT INTO operations VALUES(?,?,?,?,?)").run(
         owner,
         `retry:${op}`,
-        digest({ id }),
+        null,
         id,
         job.id,
       );

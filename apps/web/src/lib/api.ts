@@ -56,9 +56,19 @@ export const SERVER_URL =
 
 export type CalendarEventInput = {
 	title: string; description: string; location: string; kind: "event" | "focus"; timeZone: string; busy: boolean;
+	participants?: Array<{ bindingId: string; personId: string }>;
+	interaction?: { bindingId: string; kind: "in_person" | "call" | "message" | "email" | "meal" | "event" | "other" };
 } & ({ allDay: true; startDate: string; endDateExclusive: string } | { allDay: false; start: string; end: string });
-export type CalendarEventRecord = CalendarEventInput & { id: string; sourceId: "platform"; revision: number; operationId: string; status: "confirmed" | "cancelled" };
-export type CalendarDisplayEvent = CalendarEventInput & { id: string; sourceId: string; readonly?: boolean; sourceName?: string; appLink?: string; providerId?: string; providerName?: string; color?: string };
+export type CalendarEventStatus = "confirmed" | "done" | "cancelled";
+export type CalendarEventRecord = CalendarEventInput & { id: string; sourceId: "platform"; revision: number; operationId: string; status: CalendarEventStatus; participantDetails?: Array<{ bindingId: string; personId: string; name: string; path: string }>; interactionState?: { status: "pending_review" | "published" | "needs_attention"; bindingId: string; path?: string; reviewUrl?: string; noteUrl?: string; message: string }; wikiSync?: { ok: boolean; changed?: boolean; error?: string } };
+export interface CalendarPeopleSource { bindingId: string; name: string; people: Array<{ personId: string; name: string; company: string; path: string }>; total: number }
+export async function findCalendarPeople(query = "", vault?: string): Promise<CalendarPeopleSource[]> {
+	return (await knowledgeResponse<{ sources: CalendarPeopleSource[] }>(await fetch(`${SERVER_URL}/api/calendar/people?${new URLSearchParams({ q: query, ...(vault ? { vault } : {}) })}`, { cache: "no-store" }))).sources;
+}
+export async function retryCalendarInteraction(id: string): Promise<CalendarEventRecord> {
+	return (await knowledgeResponse<{ event: CalendarEventRecord }>(await fetch(`${SERVER_URL}/api/calendar/events/${encodeURIComponent(id)}/interaction/retry`, { method: "POST" }))).event;
+}
+export type CalendarDisplayEvent = CalendarEventInput & { id: string; sourceId: string; status?: CalendarEventStatus; readonly?: boolean; sourceName?: string; appLink?: string; providerId?: string; providerName?: string; color?: string };
 export interface CalendarProviderDescriptor { id: string; name: string; description: string; color: string; readOnly: boolean; setupUrl?: string; authorization?: { description: string } }
 export interface ExternalCalendarSource { id: string; name: string; type: string; writable: boolean }
 export class CalendarProviderApiError extends Error {
@@ -87,6 +97,12 @@ export async function getCalendarEvent(id: string): Promise<CalendarEventRecord>
 export async function mutateCalendarEvent(action: "create" | "update" | "cancel", id: string | undefined, operation: { operationId: string; expectedRevision: number; event?: CalendarEventInput }): Promise<CalendarEventRecord> {
 	return (await knowledgeResponse<{ event: CalendarEventRecord }>(await fetch(`${SERVER_URL}/api/calendar/events${id ? `/${encodeURIComponent(id)}` : ""}`, {
 		method: action === "create" ? "POST" : action === "update" ? "PUT" : "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify(operation),
+	}))).event;
+}
+/** 日程状态直写（done/cancelled/confirmed）；关联 wiki 往来由服务端一跳同步（event.wikiSync）。 */
+export async function setCalendarEventStatus(id: string, status: CalendarEventStatus, operationId: string, expectedRevision: number): Promise<CalendarEventRecord> {
+	return (await knowledgeResponse<{ event: CalendarEventRecord }>(await fetch(`${SERVER_URL}/api/calendar/events/${encodeURIComponent(id)}/status`, {
+		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ status, operationId, expectedRevision }),
 	}))).event;
 }
 
@@ -214,6 +230,20 @@ export async function readKnowledgeNote(id: string, notePath: string, version: K
 export async function saveKnowledgeNote(id: string, input: { path: string; content: string; expectedHash: string }): Promise<{ note: KnowledgeNote; syncWarning?: string }> {
 	return knowledgeResponse(await fetch(`${SERVER_URL}/api/knowledge/${encodeURIComponent(id)}/note`, {
 		method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input),
+	}));
+}
+
+export type InteractionStatusValue = "planned" | "done" | "cancelled";
+export interface InteractionStatusResult {
+	note: { path: string; status: InteractionStatusValue; occurredAt?: string; contentHash: string };
+	changed: boolean;
+	calendarSync?: { ok: true; eventId: string; status: string; changed: boolean } | { ok: false; eventId: string; error: string };
+}
+
+/** 往来状态直写（planned/done/cancelled）；标 done 必须带 occurredAt；关联日程由服务端一跳同步（calendarSync）。 */
+export async function setInteractionStatus(bindingId: string, path: string, status: InteractionStatusValue, occurredAt?: string): Promise<InteractionStatusResult> {
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/knowledge/interactions/status`, {
+		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ bindingId, path, status, ...(occurredAt ? { occurredAt } : {}) }),
 	}));
 }
 
@@ -595,7 +625,6 @@ export interface WikiBatchFile {
 	targetPath: string;
 	expectedHashOrAbsent: string | null;
 	candidateHash: string | null;
-	blobRef: string | null;
 }
 
 export interface WikiPublicationBatch {
@@ -624,7 +653,7 @@ export interface WikiBatchSummary {
 	bindingAvailability?: KnowledgeBindingSummary["availability"];
 	title?: string;
 	status: WikiBatchStatus;
-	/** 账本代际：批次内容每次变化 +1；审核时作为 expectedBatchRevision 栅栏。 */
+	/** 账本代际：批次内容每次变化 +1。 */
 	revision: number;
 	manifestHash: string;
 	fileCount: number;
@@ -808,14 +837,14 @@ export async function getWikiBatchSources(id: string): Promise<WikiBatchSources>
 }
 
 export async function requestWikiRevision(batchId: string, input: {
-	operationId: string; manifestHash: string; expectedBatchRevision: number; feedback: string; reviewedFiles: string[];
+	operationId: string; manifestHash: string; feedback: string; reviewedFiles: string[];
 }): Promise<{ job: WikiCuratorJob; replayed: boolean }> {
 	return knowledgeResponse(await fetch(`${SERVER_URL}/api/wiki/batches/${encodeURIComponent(batchId)}/revisions`, {
 		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
 	}));
 }
 
-export async function closeWikiConflict(batchId: string, input: { operationId: string; manifestHash: string; expectedBatchRevision: number }): Promise<WikiBatchDetail> {
+export async function closeWikiConflict(batchId: string, input: { operationId: string; manifestHash: string }): Promise<WikiBatchDetail> {
 	return knowledgeResponse(await fetch(`${SERVER_URL}/api/wiki/batches/${encodeURIComponent(batchId)}/close-conflict`, {
 		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
 	}));
@@ -842,7 +871,7 @@ export async function getKnowledgeHistoryVersion(bindingId: string, versionId: s
 
 /** 提交审核决定；409 code=expired（超期）/ state_conflict（revision/manifest 变化或已有决定）。 */
 export async function submitWikiReview(batchId: string, input: {
-	operationId: string; decision: "approve" | "reject"; manifestHash: string; expectedBatchRevision: number; reviewedFiles: string[];
+	operationId: string; decision: "approve" | "reject"; manifestHash: string; reviewedFiles: string[];
 }): Promise<WikiReviewResponse> {
 	return knowledgeResponse(await fetch(`${SERVER_URL}/api/wiki/batches/${encodeURIComponent(batchId)}/reviews`, {
 		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
@@ -1270,7 +1299,6 @@ export interface CollaborationTrustProjection {
 	settlement: SettlementState;
 }
 export interface ExecutionReceiptView {
-	contractHash?: string;
 	collectionStatus?: "complete" | "partial" | "failed";
 	integrity?: "unknown" | "clean" | "suspect" | "violation";
 	issues?: string[];

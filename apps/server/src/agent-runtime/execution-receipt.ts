@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type {
 	ArtifactRef,
 	DriverTransport,
@@ -43,9 +42,8 @@ export interface ExecutionReceipt extends ExecutionReceiptPayload {
 	goalRevision?: number;
 	workItemRevision?: number;
 	goalEpoch?: number;
-	/** Harness-frozen business contract; contractHash below is the Runtime execution envelope. */
+	/** Harness-frozen business contract; the acceptance gate compares this. */
 	taskContractHash?: string;
-	contractHash: string;
 	requirementResults: ExecutionRequirementResult[];
 	artifactCapture: ArtifactCaptureResult[];
 	collectionStatus: "complete" | "partial" | "failed";
@@ -82,40 +80,6 @@ export interface ReceiptContractSnapshot {
 	workerStarted?: boolean;
 	workspaceExecutionScopeId?: string;
 	workspaceChangeSetId?: string;
-}
-
-function stable(value: unknown): string {
-	if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
-	if (value && typeof value === "object") {
-		return `{${Object.entries(value as Record<string, unknown>)
-			.sort(([left], [right]) => left.localeCompare(right))
-			.map(([key, item]) => `${JSON.stringify(key)}:${stable(item)}`)
-			.join(",")}}`;
-	}
-	return JSON.stringify(value);
-}
-
-export function executionContractHash(snapshot: ReceiptContractSnapshot): string {
-	return `sha256:${createHash("sha256").update(stable({
-		taskContractHash: snapshot.contractHash,
-		goalId: snapshot.goalId,
-		workPlanId: snapshot.workPlanId,
-		workItemId: snapshot.workItemId,
-		attempt: snapshot.attempt,
-		goalRevision: snapshot.goalRevision,
-		workItemRevision: snapshot.workItemRevision,
-		goalEpoch: snapshot.goalEpoch,
-		task: snapshot.task,
-		intent: snapshot.intent,
-		expectedOutcome: snapshot.expectedOutcome,
-		evidenceRequirements: snapshot.evidenceRequirements ?? [],
-		completionBoundary: snapshot.completionBoundary,
-		workspaceId: snapshot.workspaceId,
-		cwdSnapshot: snapshot.cwdSnapshot,
-		agentId: snapshot.agentId,
-		agentRevision: snapshot.agentRevision,
-		workspaceExecutionScopeId: snapshot.workspaceExecutionScopeId,
-	})).digest("hex")}`;
 }
 
 function unique(values: string[]): string[] {
@@ -186,7 +150,6 @@ export function sealExecutionReceipt(input: {
 		...(input.contract.workItemRevision !== undefined ? { workItemRevision: input.contract.workItemRevision } : {}),
 		...(input.contract.goalEpoch !== undefined ? { goalEpoch: input.contract.goalEpoch } : {}),
 		...(input.contract.contractHash ? { taskContractHash: input.contract.contractHash } : {}),
-		contractHash: executionContractHash(input.contract),
 		reportedOutcome: input.result.status,
 		upstream: {
 			...(input.result.sessionHandle ? { sessionHandle: input.result.sessionHandle } : {}),

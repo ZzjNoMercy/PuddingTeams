@@ -45,7 +45,6 @@ export interface ObservedNoteVersion {
 export interface AcceptedNoteVersion {
 	noteIdentity: NoteIdentity;
 	contentHash: string;
-	snapshotRef: string;
 	acceptedBy: string;
 	acceptedAt: string;
 	acceptanceId: string;
@@ -99,7 +98,6 @@ export interface CompileJob {
 	commandPath: string;
 	commandSha256: string;
 	schemaHash?: string;
-	baseManifestHash: string;
 	status: CompileJobStatus;
 	revision: number;
 	createdAt: string;
@@ -118,7 +116,6 @@ export interface PublicationFile {
 	targetPath: string;
 	expectedHashOrAbsent: string | null;
 	candidateHash: string | null;
-	blobRef: string | null;
 }
 
 export type PublicationBatchStatus = "candidate" | "pending_review" | "approved" | "publishing" | "published" | "partial" | "conflict" | "rejected" | "returned";
@@ -175,8 +172,10 @@ interface CalendarEventBase {
 	kind: "event" | "focus";
 	timeZone: string;
 	busy: boolean;
-	status: "confirmed" | "cancelled";
+	status: "confirmed" | "done" | "cancelled";
 	noteRefs: NoteIdentity[];
+	participants?: Array<{ bindingId: string; personId: string }>;
+	interaction?: { bindingId: string; kind: "in_person" | "call" | "message" | "email" | "meal" | "event" | "other" };
 	revision: number;
 	operationId: string;
 }
@@ -221,14 +220,14 @@ export function assertPublicationBatchShape(batch: PublicationBatch): void {
 		targets.add(file.targetPath);
 		if (file.kind === "image") {
 			const extension = ({ "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp", "image/avif": "avif" } as Record<string, string>)[file.mediaType ?? ""];
-			if (!extension || file.targetPath !== `${file.targetPath.startsWith("wiki/") ? "wiki/" : ""}assets/images/${file.candidateHash}.${extension}` || file.blobRef !== file.candidateHash || file.operation === "delete" ||
+			if (!extension || file.targetPath !== `${file.targetPath.startsWith("wiki/") ? "wiki/" : ""}assets/images/${file.candidateHash}.${extension}` || file.operation === "delete" ||
 				(file.operation === "update" && file.expectedHashOrAbsent !== file.candidateHash) || !file.sourceIds?.length || new Set(file.sourceIds).size !== file.sourceIds.length) throw new Error("invalid image publication asset");
 		} else if (/^(?:wiki\/)?assets\/images\//.test(file.targetPath) || file.mediaType || file.sourceIds) throw new Error("image asset requires explicit metadata");
 		if (file.operation === "create" && file.expectedHashOrAbsent !== null) throw new Error("create target must be absent");
 		if (file.operation !== "create" && !isHash(file.expectedHashOrAbsent)) throw new Error("mutation requires an exact baseline hash");
 		if (file.operation === "delete") {
-			if (file.candidateHash !== null || file.blobRef !== null) throw new Error("delete must not carry candidate bytes");
-		} else if (!isHash(file.candidateHash) || !file.blobRef) {
+			if (file.candidateHash !== null) throw new Error("delete must not carry candidate bytes");
+		} else if (!isHash(file.candidateHash)) {
 			throw new Error("candidate bytes and hash are required");
 		}
 	}

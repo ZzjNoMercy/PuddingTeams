@@ -45,7 +45,7 @@ export interface StoredReviewBatch {
 
 export interface ReturnRevisionInput {
 	batchId: string; operationId: string; actorId: string; feedback: string;
-	manifestHash: string; expectedBatchRevision: number; reviewedFiles: string[];
+	manifestHash: string; reviewedFiles: string[];
 }
 
 export interface ReviewDecisionInput {
@@ -55,7 +55,6 @@ export interface ReviewDecisionInput {
 	actorId: string;
 	decision: "approve" | "reject";
 	manifestHash: string;
-	expectedBatchRevision: number;
 	reviewedFiles: string[];
 }
 
@@ -121,8 +120,7 @@ export class ReviewStore {
 	private parseBatch(row: StoredBatchRow): StoredReviewBatch {
 		const record = JSON.parse(row.record_json) as StoredReviewBatch;
 		assertPublicationBatchShape(record.batch);
-		if (record.batch.manifestHash !== publicationManifestHash(record.batch) ||
-			!Number.isSafeInteger(record.revision) || record.revision < 1 || !record.enteredReviewAt) {
+		if (!Number.isSafeInteger(record.revision) || record.revision < 1 || !record.enteredReviewAt) {
 			throw new Error("invalid review batch record");
 		}
 		return record;
@@ -228,7 +226,7 @@ export class ReviewStore {
 	/** Return is an independent durable CAS decision, never a publication approval. */
 	async returnForRevision(input: ReturnRevisionInput, allowResolvedConflict = false): Promise<{ record: StoredReviewBatch; replayed: boolean }> {
 		if (!input.operationId?.trim() || input.operationId.length > 200 || !input.actorId || !input.feedback?.trim() || input.feedback.length > 20_000 ||
-			!Number.isSafeInteger(input.expectedBatchRevision) || input.expectedBatchRevision < 1 || !/^[a-f0-9]{64}$/.test(input.manifestHash) ||
+			!/^[a-f0-9]{64}$/.test(input.manifestHash) ||
 			!Array.isArray(input.reviewedFiles) || input.reviewedFiles.some((path) => typeof path !== "string") || new Set(input.reviewedFiles).size !== input.reviewedFiles.length)
 			throw new ReviewStoreError("invalid_input", "退回修改参数无效");
 		return this.withDatabase((db) => this.transaction(db, () => {
@@ -242,7 +240,7 @@ export class ReviewStore {
 			if (db.prepare("SELECT id FROM review_decisions WHERE operation_id=?").get(input.operationId)) throw new ReviewStoreError("conflict", "operationId 已用于审核决定");
 			if (record.conflictClosure || !(record.status === "pending_review" || (allowResolvedConflict && record.status === "conflict")) ||
 				(record.status === "pending_review" && this.now() - Date.parse(record.enteredReviewAt) > REVIEW_WINDOW_MS) ||
-				record.revision !== input.expectedBatchRevision || record.batch.manifestHash !== input.manifestHash || record.ownerId !== input.actorId ||
+				record.batch.manifestHash !== input.manifestHash || record.ownerId !== input.actorId ||
 				input.reviewedFiles.some((target) => !record.batch.files.some((file) => file.targetPath === target)))
 				throw new ReviewStoreError("conflict", "批次已变化，不能退回修改");
 			const now = new Date(this.now()).toISOString();
@@ -254,12 +252,12 @@ export class ReviewStore {
 	}
 
 	/** Closing a conflict records disposition, preserving the original review and publish evidence. */
-	async closeConflict(input: { batchId: string; operationId: string; actorId: string; manifestHash: string; expectedBatchRevision: number }): Promise<StoredReviewBatch> {
+	async closeConflict(input: { batchId: string; operationId: string; actorId: string; manifestHash: string }): Promise<StoredReviewBatch> {
 		if (!input.operationId?.trim() || input.operationId.length > 200 || !input.actorId) throw new ReviewStoreError("invalid_input", "关闭冲突参数无效");
 		return this.withDatabase(db => this.transaction(db, () => {
 			const record = this.readBatch(db, input.batchId);
 			if (!record || record.ownerId !== input.actorId) throw new ReviewStoreError("not_found", "审核批次不存在");
-			if (record.status !== "conflict" || record.revision !== input.expectedBatchRevision || record.batch.manifestHash !== input.manifestHash) throw new ReviewStoreError("conflict", "批次已变化，请刷新后再处理");
+			if (record.status !== "conflict" || record.batch.manifestHash !== input.manifestHash) throw new ReviewStoreError("conflict", "批次已变化，请刷新后再处理");
 			if (record.conflictClosure) {
 				if (record.conflictClosure.operationId !== input.operationId) throw new ReviewStoreError("conflict", "此冲突已经关闭");
 				return record;
@@ -283,15 +281,14 @@ export class ReviewStore {
 	/**
 	 * 提交审核决定。全部校验在事务内完成：幂等键回放（负载一致性以
 	 * manifestHash 为准）→ 批次存在 → 未超期 → pending_review →
-	 * (expectedBatchRevision ↔ 账本代际, manifestHash ↔ 内容) 双重匹配 →
+	 * manifestHash 匹配（revision 已在载荷内）→
 	 * approve reviewedFiles 恰好覆盖全部 targets；reject 只记录真实已阅的唯一目标子集（approve 走 contracts 的
 	 * assertReviewMatchesBatch）。落账的 ReviewDecision.revision 取批次号
-	 * （contracts 语义），账本代际只做并发栅栏、不写入决定。
+	 * （contracts 语义）；账本代际随 manifestHash 变化，已涵盖在哈希门内。
 	 */
 	async decide(input: ReviewDecisionInput): Promise<{ record: StoredReviewBatch; decision: ReviewDecision; replayed: boolean }> {
 		if (!input.operationId || !input.actorId || (input.decision !== "approve" && input.decision !== "reject") ||
 			!/^[a-f0-9]{64}$/.test(input.manifestHash) ||
-			!Number.isSafeInteger(input.expectedBatchRevision) || input.expectedBatchRevision < 1 ||
 			!Array.isArray(input.reviewedFiles) || input.reviewedFiles.some((file) => typeof file !== "string")) {
 			throw new ReviewStoreError("invalid_input", "invalid review decision input");
 		}
@@ -301,8 +298,7 @@ export class ReviewStore {
 				.get(input.operationId) as StoredDecisionRow | undefined;
 			if (replay) {
 				const decision = this.parseDecision(replay);
-				// 负载一致性以 manifestHash 为准（内容代际不同必然哈希不同）；
-				// decision.revision 是批次号，不能与客户端的账本代际 expectedBatchRevision 混比。
+				// 负载一致性以 manifestHash 为准（内容代际不同必然哈希不同）。
 				if (decision.batchId !== input.batchId || decision.actorId !== input.actorId || decision.decision !== input.decision ||
 					decision.manifestHash !== input.manifestHash ||
 					!sameMembers(decision.reviewedFiles, input.reviewedFiles)) {
@@ -310,9 +306,6 @@ export class ReviewStore {
 				}
 				const record = this.readBatch(db, input.batchId);
 				if (!record) throw new ReviewStoreError("not_found", "review batch not found");
-				if (record.decisionId === decision.id && record.revision !== input.expectedBatchRevision) {
-					throw new ReviewStoreError("conflict", "review operation revision does not match its decision");
-				}
 				return { record: this.expireIfOverdue(db, record), decision, replayed: true };
 			}
 			if (db.prepare("SELECT operation_id FROM review_returns WHERE operation_id=?").get(input.operationId)) throw new ReviewStoreError("conflict", "operationId 已用于退回修改");
@@ -331,13 +324,12 @@ export class ReviewStore {
 				}
 				throw new ReviewStoreError("conflict", "review batch is not pending review");
 			}
-			if (input.manifestHash !== record.batch.manifestHash || input.expectedBatchRevision !== record.revision) {
+			if (input.manifestHash !== record.batch.manifestHash) {
 				throw new ReviewStoreError("conflict", "review does not match the current batch revision");
 			}
 			const targets = record.batch.files.map((file) => file.targetPath);
 			// ReviewDecision.revision 绑定的是批次的批次号（contracts 语义：
-			// assertReviewMatchesBatch 要求 review.revision === batch.revision）；
-			// 账本代际 record.revision 的乐观并发栅栏由上面的 expectedBatchRevision 校验承担。
+			// assertReviewMatchesBatch 要求 review.revision === batch.revision）。
 			const decision: ReviewDecision = {
 				id: randomUUID(),
 				batchId: record.batch.id,

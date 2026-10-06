@@ -6,7 +6,8 @@ import path from "node:path";
 import Fastify from "fastify";
 import { canonicalizeUrl, decodeArticle } from "./public-fetch.js";
 import { extractArticle } from "./extract.js";
-import { ReadLaterStore } from "./store.js";
+import { ReadLaterStore, digest } from "./store.js";
+import { DatabaseSync } from "node:sqlite";
 import { ReadLaterCaptureService } from "./capture-service.js";
 import { registerReadLaterRoutes } from "../routes/read-later.js";
 import { localViewerIdentity } from "../routes/identity.js";
@@ -87,6 +88,21 @@ test("普通网页、微信、X Relay、纯文本保持正文与安全媒体", (
     extractArticle("<article>太短</article>", "https://example.com").warnings
       .length,
   );
+});
+test("Word HTML 的 Symbol 项目符号转为列表，普通间隔点和代码保持原样", () => {
+  const article = extractArticle(`<article><p>${body}</p>
+    <p class="Bulletedlist"><span style="font-family:Symbol">·<span>&nbsp;&nbsp; </span></span>定义 <strong>classes</strong></p>
+    <p class="Bulletedlist"><span style="font-family:Symbol">·<span>&nbsp;&nbsp; </span></span>安排 hierarchy</p>
+    <p class="Bulletedlist"><span style="font-family:Symbol">· </span></p>
+    <p>普通 · 间隔点</p><p class="Bulletedlist">无符号的段落</p>
+    <p class="Bulletedlist"><span style="font-family:Arial">· </span>普通字体内容</p>
+    <pre><code>· code</code></pre></article>`, "https://example.com/word");
+  assert.match(article.content, /- 定义 \*\*classes\*\* *\n- 安排 hierarchy/);
+  assert.doesNotMatch(article.content, /^-\s*$/m);
+  assert.match(article.content, /普通 · 间隔点/);
+  assert.match(article.content, /无符号的段落/);
+  assert.match(article.content, /· 普通字体内容/);
+  assert.match(article.content, /```\n· code\n```/);
 });
 test("微信初始隐藏正文可读取，但隐藏子块与其他页面仍过滤", () => {
   const html = `<h1 id="activity-name">微信标题</h1><div id="js_content" style="visibility: hidden; opacity: 0"><section>${body}</section><p style="visibility: hidden">隐藏子块</p><p style="display: none">隐藏广告</p><p hidden>隐藏属性</p><p aria-hidden="true">辅助隐藏</p></div>`;
@@ -529,6 +545,36 @@ test("真实Fastify路由禁止越权、非法输入，首次收藏无需知识�
   } finally {
     await app.close();
     await capture.close();
+    await f.close();
+  }
+});
+
+test("旧库 operations.hash NOT NULL 自动迁移为可空，已有数据与幂等语义保留", async () => {
+  const f = await fixture();
+  try {
+    const owner = "migration-owner", time = "2026-01-01T00:00:00.000Z";
+    const item = { id: "item-1", ownerId: owner, originalUrl: "https://example.com/a", canonicalUrl: "https://example.com/a", title: "旧收藏", siteName: "example.com", author: "", description: "", readingStatus: "unread", parseStatus: "failed", latestJobId: "job-1", tags: [], note: "", revision: 2, generation: 1, createdAt: time, updatedAt: time };
+    const job = { id: "job-1", itemId: item.id, ownerId: owner, generation: 1, status: "failed", step: "采集失败", progress: 0, createdAt: time, updatedAt: time };
+    const legacy = new DatabaseSync(path.join(f.root, "read-later.sqlite"));
+    legacy.exec(`CREATE TABLE items(id TEXT PRIMARY KEY,owner_id TEXT NOT NULL,url TEXT NOT NULL,deleted INTEGER NOT NULL,record_json TEXT NOT NULL);
+CREATE TABLE jobs(id TEXT PRIMARY KEY,record_json TEXT NOT NULL);
+CREATE TABLE versions(id TEXT PRIMARY KEY,item_id TEXT NOT NULL,record_json TEXT NOT NULL);
+CREATE TABLE operations(owner_id TEXT NOT NULL,id TEXT NOT NULL,hash TEXT NOT NULL,item_id TEXT NOT NULL,job_id TEXT,PRIMARY KEY(owner_id,id));
+CREATE TABLE promotions(owner_id TEXT NOT NULL,id TEXT NOT NULL,record_json TEXT NOT NULL,PRIMARY KEY(owner_id,id));`);
+    legacy.prepare("INSERT INTO items VALUES(?,?,?,?,?)").run(item.id, owner, item.canonicalUrl, 0, JSON.stringify(item));
+    legacy.prepare("INSERT INTO jobs VALUES(?,?)").run(job.id, JSON.stringify(job));
+    const saveHash = digest({ url: item.canonicalUrl, title: undefined, note: "", tags: [] });
+    legacy.prepare("INSERT INTO operations VALUES(?,?,?,?,?)").run(owner, "save:op-save", saveHash, item.id, job.id);
+    legacy.close();
+    const store = new ReadLaterStore(f.root);
+    const replayed = store.create(owner, { operationId: "op-save", url: item.originalUrl });
+    assert.equal(replayed.replayed, true, "迁移后旧 save 操作的幂等回放必须保留");
+    assert.equal(replayed.item.id, item.id);
+    const retried = store.retry(owner, item.id, 2, "op-retry");
+    assert.equal(retried.replayed, false, "迁移后 retry 写入 NULL hash 必须成功");
+    assert.equal(store.retry(owner, item.id, 3, "op-retry").replayed, true);
+    assert.equal(new ReadLaterStore(f.root).get(owner, item.id).id, item.id, "迁移必须幂等");
+  } finally {
     await f.close();
   }
 });

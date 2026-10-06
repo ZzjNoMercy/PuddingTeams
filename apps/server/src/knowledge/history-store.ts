@@ -4,7 +4,7 @@ import path from "node:path";
 
 export interface NoteHistoryEvent {
 	id: string; bindingId: string; noteId: string; relativePath: string; previousPath?: string;
-	contentHash: string; snapshotRef: string; previousHash?: string; previousSnapshotRef?: string;
+	contentHash: string; previousHash?: string;
 	actorId: string; channel: "initial" | "agent_publish" | "external_sync" | "manual_edit";
 	changeKind?: "create" | "update" | "rename" | "delete";
 	deleted?: boolean;
@@ -29,7 +29,7 @@ export class KnowledgeHistoryStore {
 			db.exec("BEGIN IMMEDIATE");
 			try {
 				for (const event of events) {
-					if (!event.id || !event.noteId || !event.bindingId || !event.actorId || !event.operationId || !/^[a-f0-9]{64}$/.test(event.contentHash) || event.snapshotRef !== event.contentHash || !Number.isFinite(Date.parse(event.acceptedAt))) throw new Error("invalid committed history event");
+					if (!event.id || !event.noteId || !event.bindingId || !event.actorId || !event.operationId || !/^[a-f0-9]{64}$/.test(event.contentHash) || !Number.isFinite(Date.parse(event.acceptedAt))) throw new Error("invalid committed history event");
 					const prior = db.prepare("SELECT record_json FROM note_history WHERE id=? OR (binding_id=? AND note_id=? AND operation_id=?)").get(event.id, event.bindingId, event.noteId, event.operationId) as { record_json: string } | undefined;
 					if (prior) { if (prior.record_json !== JSON.stringify(event)) throw new Error("history operation conflicts with committed bytes"); continue; }
 					db.prepare("INSERT INTO note_history(id,binding_id,note_id,operation_id,path,record_json) VALUES(?,?,?,?,?,?)").run(event.id, event.bindingId, event.noteId, event.operationId, event.relativePath, JSON.stringify(event));

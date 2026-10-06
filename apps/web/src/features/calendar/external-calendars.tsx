@@ -15,14 +15,14 @@ const MAX = 10;
 const failure = (e: unknown) => e instanceof Error ? e : new Error("日历加载失败，请重试");
 const colorStyle = (color: string): CSSProperties => ({ "--calendar-color": color } as CSSProperties);
 
-export function ExternalCalendars({ start, end, onEvents, refreshKey }: { start: string; end: string; onEvents: (events: CalendarDisplayEvent[]) => void; refreshKey: number }) {
+export function ExternalCalendars({ start, end, onEvents, onLoadingChange, refreshKey }: { start: string; end: string; onEvents: (events: CalendarDisplayEvent[]) => void; onLoadingChange: (loading: boolean) => void; refreshKey: number }) {
 	const router = useRouter();
 	const [selection, setSelection] = useState<Selection[]>([]), [ready, setReady] = useState(false);
 	const [providers, setProviders] = useState<CalendarProviderDescriptor[] | null>(null), [catalogError, setCatalogError] = useState<Error | null>(null);
 	const [activeId, setActiveId] = useState<string | null>(null), [picker, setPicker] = useState(false), [auth, setAuth] = useState(false);
 	const [sources, setSources] = useState<ExternalCalendarSource[] | null>(null), [draft, setDraft] = useState<string[]>([]);
 	const [loading, setLoading] = useState(false), [error, setError] = useState<Error | null>(null);
-	const [eventsLoading, setEventsLoading] = useState(false), [eventsErrors, setEventsErrors] = useState<{ providerId: string; error: Error }[]>([]), [retry, setRetry] = useState(0);
+	const [eventsErrors, setEventsErrors] = useState<{ providerId: string; error: Error }[]>([]), [retry, setRetry] = useState(0);
 	const eventsSequence = useRef(0), lists = useRef(0), catalogs = useRef(0);
 	const active = providers?.find(p => p.id === activeId);
 	const connection = useMemo<ExtensionConnectionStatus>(() => ({ id: `calendar:${activeId}`, extensionId: activeId ?? "calendar", connectionId: "default", extensionName: active?.name ?? "日历", name: `${active?.name ?? "日历"}日历`, state: "disconnected", checkedAt: "" }), [activeId, active?.name]);
@@ -62,17 +62,17 @@ export function ExternalCalendars({ start, end, onEvents, refreshKey }: { start:
 		const state = eventsSequence, serial = ++state.current;
 		const selected = selection.filter(s => s.visible && providers?.some(p => p.id === s.providerId));
 		const load = async () => {
-			onEvents([]); setEventsErrors([]); setEventsLoading(Boolean(selected.length && start && end));
+			onEvents([]); setEventsErrors([]); onLoadingChange(Boolean(ready && selected.length && start && end));
 			if (!ready || !selected.length || !start || !end) return;
 			const results = await Promise.allSettled(selected.map(async source => (await listProviderCalendarEvents(source.providerId, source.id, start, end)).map(event => ({ ...event, sourceName: source.name }))));
 			if (state.current !== serial) return;
 			onEvents(results.flatMap(result => result.status === "fulfilled" ? result.value : []));
 			const errors = new Map<string, Error>();
 			results.forEach((result, i) => { if (result.status === "rejected") errors.set(selected[i].providerId, failure(result.reason)); });
-			setEventsErrors([...errors].map(([providerId, error]) => ({ providerId, error }))); setEventsLoading(false);
+			setEventsErrors([...errors].map(([providerId, error]) => ({ providerId, error }))); onLoadingChange(false);
 		};
-		void load(); return () => { state.current++; };
-	}, [ready, selection, providers, start, end, onEvents, retry, refreshKey]);
+		void load(); return () => { state.current++; onLoadingChange(false); };
+	}, [ready, selection, providers, start, end, onEvents, onLoadingChange, retry, refreshKey]);
 	const help = (e: Error, provider?: CalendarProviderDescriptor, inline = false) => <div className={styles.sourceError} role="alert">
 		<p>{inline && provider ? `${provider.name}：` : ""}{e.message}</p>
 		{e instanceof CalendarProviderApiError && e.code === "not_configured" && provider?.setupUrl ? <Button size="sm" variant="outline" onClick={() => router.push(provider.setupUrl!)}>配置{provider.name}应用</Button>
@@ -88,7 +88,6 @@ export function ExternalCalendars({ start, end, onEvents, refreshKey }: { start:
 				return <div key={key(source)} className={styles.sourceRow} style={colorStyle(provider?.color ?? "#818cf8")}><label className={styles.check}><input type="checkbox" checked={source.visible} onChange={e => setSelection(previous => previous.map(s => key(s) === key(source) ? { ...s, visible: e.target.checked } : s))} /><span className={`${styles.dot} ${styles.sourceDot}`} /><span title={label}>{label}</span></label><button className={styles.removeSource} aria-label={`移除${label}`} title="仅从本页移除，不撤销授权" onClick={() => setSelection(previous => previous.filter(s => key(s) !== key(source)))}><XIcon size={12} /></button></div>;
 			})}
 			<button className={styles.addSource} onClick={() => { lists.current++; setActiveId(null); setPicker(true); if (!providers || catalogError) void loadProviders(); }}><PlusIcon size={13} />添加日历</button>
-			{eventsLoading && <p className={styles.hint} role="status">正在读取外部日程…</p>}
 			{catalogError && help(catalogError)}
 			{eventsErrors.map(({ providerId, error }) => <div key={providerId}>{help(error, providers?.find(p => p.id === providerId), true)}</div>)}
 		</div>

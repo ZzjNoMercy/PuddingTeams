@@ -164,13 +164,13 @@ export class KnowledgeSourceStore {
 	}
 
 	/** Trusted read-later intake; the HTTP intake never accepts object hashes. */
-	async createWebCapture(ownerId: string, input: { id: string; title: string; content: string; metadata: WebCaptureOrigin; warnings: string[]; assets: Array<{ bytes: Buffer; mediaType: string; alt: string; sourceUrl: string }> }): Promise<KnowledgeSource> {
+	async createWebCapture(ownerId: string, input: { id: string; title: string; content: string; metadata: WebCaptureOrigin; warnings: string[]; assets: Array<{ bytes: Buffer; hash?: string; mediaType: string; alt: string; sourceUrl: string }> }): Promise<KnowledgeSource> {
 		this.checkOwner(ownerId);
 		const existing = await this.get(ownerId, input.id); if (existing) return existing;
 		const source = await this.freeze(ownerId, "markdown", input.title, "text/markdown", Buffer.from(input.content));
 		source.id = input.id; source.webCapture = input.metadata; source.warnings = input.warnings;
 		source.assets = [];
-		for (const asset of input.assets) { const frozen = await this.objects.put(asset.bytes); source.assets.push({ hash: frozen.hash, mediaType: asset.mediaType, alt: asset.alt, sourceUrl: asset.sourceUrl }); }
+		for (const asset of input.assets) { const frozen = await this.objects.put(asset.bytes, asset.hash); source.assets.push({ hash: frozen.hash, mediaType: asset.mediaType, alt: asset.alt, sourceUrl: asset.sourceUrl }); }
 		try { await this.save([source]); } catch (error) { const winner = await this.get(ownerId, input.id); if (winner) return winner; throw error; }
 		return source;
 	}
@@ -260,7 +260,7 @@ export class KnowledgeSourceStore {
 		return { source, bytes: await this.objects.get(source.originalHash) };
 	}
 
-	async manifest(ownerId: string, ids: string[]): Promise<{ sources: KnowledgeSource[]; manifestHash: string }> {
+	async manifest(ownerId: string, ids: string[]): Promise<{ sources: KnowledgeSource[] }> {
 		if (!Array.isArray(ids) || ids.length === 0 || ids.length > 100 || new Set(ids).size !== ids.length) {
 			throw new KnowledgeSourceError("invalid_input", "素材列表必须非空且去重，最多 100 项");
 		}
@@ -275,6 +275,6 @@ export class KnowledgeSourceStore {
 			for (const asset of source.assets ?? []) await this.objects.get(asset.hash);
 			sources.push(source);
 		}
-		return { sources, manifestHash: knowledgeSourceManifestHash(sources) };
+		return { sources };
 	}
 }

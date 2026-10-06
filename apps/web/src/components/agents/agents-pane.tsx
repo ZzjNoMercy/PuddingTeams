@@ -603,7 +603,6 @@ export function AgentsPane() {
 						align="end"
 						sideOffset={8}
 						className="ops-agent-menu w-44"
-						onCloseAutoFocus={(event) => event.preventDefault()}
 					>
 						<DropdownMenuItem onSelect={() => openManage(agent)}><Settings2Icon />配置</DropdownMenuItem>
 						{agent.connector && agent.invoke?.type !== "command" ? (

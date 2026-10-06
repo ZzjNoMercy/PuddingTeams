@@ -3,6 +3,7 @@ import "./globals.css";
 import { ThemeProvider } from "@/components/theme-provider";
 import { AppToaster } from "@/components/app-toaster";
 import { MemoryOnboarding } from "@/features/knowledge/memory-onboarding";
+import { FocusModality } from "@/components/focus-modality";
 
 export const metadata: Metadata = {
 	title: "PuddingTeams",
@@ -21,6 +22,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 			</head>
 			<body className="flex min-h-full flex-col">
 				<ThemeProvider>
+					<FocusModality />
 					{children}
 					<AppToaster />
 					<MemoryOnboarding />

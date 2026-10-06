@@ -744,7 +744,7 @@ export interface VerificationRecord {
 	outputFingerprint?: string;
 	criteria: CompletionReviewCriterion[];
 	evidenceRefs: string[];
-	observations?: Array<{ id: string; delegationId: string; kind: "tool" | "file" | "search"; title: string; contentHash: string; itemId?: string }>;
+	observations?: Array<{ id: string; delegationId: string; kind: "tool" | "file" | "search"; title: string; itemId?: string }>;
 	integrity: "unknown" | "clean" | "suspect" | "violation";
 	failureReason?: string;
 	createdAt: string;
@@ -762,7 +762,6 @@ export interface WorkspaceChangeSet {
 	outputFingerprint: string;
 	changedPaths: string[];
 	diffArtifactId?: string;
-	diffHash?: string;
 	promotionState: "not_required" | "pending" | "applied" | "conflict" | "failed";
 	createdAt: string;
 	promotedAt?: string;
@@ -779,7 +778,6 @@ export interface ExecutionReceipt {
 	workItemRevision?: number;
 	goalEpoch?: number;
 	taskContractHash?: string;
-	contractHash: string;
 	inputFingerprint?: string;
 	reportedOutcome: "completed" | "failed" | "cancelled" | "blocked" | "input_required";
 	requirementResults: Array<{ requirement: string; status: "provided" | "missing" | "unavailable"; evidenceRefs: string[] }>;
@@ -986,7 +984,6 @@ export interface DelegationTrace {
 	workerStarted?: boolean;
 	readOnlyAssessment?: "verified" | "unverified" | "unverified_observed" | "unverified_user_accepted" | "not_required";
 	receipt?: {
-		contractHash?: string;
 		collectionStatus?: "complete" | "partial" | "failed";
 		integrity?: "clean" | "suspect" | "violation";
 		issues?: string[];

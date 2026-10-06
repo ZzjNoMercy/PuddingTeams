@@ -40,7 +40,7 @@ export function ProfileDialog({
 	};
 	return (
 		<Dialog open={open} onOpenChange={changeOpen}>
-			<DialogContent className="home-profile-dialog" onCloseAutoFocus={(event) => event.preventDefault()}>
+			<DialogContent className="home-profile-dialog">
 				<DialogHeader>
 					<DialogTitle>编辑个人资料</DialogTitle>
 					<DialogDescription>自定义侧栏显示的头像和名称，不会修改系统账户或历史记录归属。</DialogDescription>

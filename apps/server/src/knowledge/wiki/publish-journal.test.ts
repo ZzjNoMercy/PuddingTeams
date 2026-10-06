@@ -16,8 +16,8 @@ function buildBatch(id: string): PublicationBatch {
 		manifestHash: "",
 		rootIdentity: "root-1",
 		files: [
-			{ targetPath: "a.md", operation: "update", expectedHashOrAbsent: "b".repeat(64), candidateHash: content, blobRef: content },
-			{ targetPath: "Daily/x.md", operation: "create", expectedHashOrAbsent: null, candidateHash: content, blobRef: content },
+			{ targetPath: "a.md", operation: "update", expectedHashOrAbsent: "b".repeat(64), candidateHash: content},
+			{ targetPath: "Daily/x.md", operation: "create", expectedHashOrAbsent: null, candidateHash: content},
 		],
 		sourceSnapshots: ["snap-1"],
 		bindingRevision: 1,

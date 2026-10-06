@@ -57,7 +57,7 @@ async function wikiFixture(opts?: { now?: () => number; realPublisher?: boolean;
 	const objects = new KnowledgeObjectStore(path.join(root, "objects"));
 	const blob = await objects.put(await readFile(path.join(vault, "a.md")));
 	const acceptance = new KnowledgeAcceptanceStore(path.join(root, "acceptance"));
-	await acceptance.adopt(binding.id, [{ relativePath: "a.md", contentHash: blob.hash, snapshotRef: blob.hash, acceptedBy: ownerId }], 0);
+	await acceptance.adopt(binding.id, [{ relativePath: "a.md", contentHash: blob.hash, acceptedBy: ownerId }], 0);
 	const acceptanceId = Object.values((await acceptance.getSnapshot(binding.id)).entries)[0]!.acceptanceId;
 	const observation = new KnowledgeObservationService(acceptance, { objects });
 	const jobs = new CompileJobStore(path.join(root, "state"));
@@ -178,7 +178,6 @@ async function registerBatchDirect(fixture: WikiFixture,
 				expectedHashOrAbsent: operation === "create" ? null :
 					createHash("sha256").update("# Accepted\n").digest("hex"),
 				candidateHash: blob.hash,
-				blobRef: blob.hash,
 			};
 		})),
 		sourceSnapshots: ["snapshot-direct"],
@@ -198,7 +197,6 @@ const reviewBody = (batch: PublicationBatch, overrides: Record<string, unknown> 
 	operationId: `review-${batch.id}`,
 	decision: "approve",
 	manifestHash: batch.manifestHash,
-	expectedBatchRevision: 1,
 	reviewedFiles: batch.files.map((file) => file.targetPath),
 	...overrides,
 });
@@ -210,8 +208,8 @@ test("图片审核接口返回固定原图元数据和bytes，未入批次/跨�
 		const image = await f.objects.put(png), assetPath = imageAssetPath(image.hash, "image/png");
 		const page = await f.objects.put(Buffer.from(`---\nsources: [image-source]\n---\n![original](../../${assetPath})\n`));
 		const batch: PublicationBatch = { id: "image-api", revision: 1, bindingId: f.binding.id, manifestHash: "", rootIdentity: f.binding.rootIdentity, bindingRevision: 1, trustRevision: 1, sourceSnapshots: [image.hash], compilerVersion: "test", status: "candidate", validationReceipt: JSON.stringify({ sources: [{ id: "image-source", kind: "image", mediaType: "image/png", originalHash: image.hash }] }), files: [
-			{ kind: "image", targetPath: assetPath, mediaType: "image/png", sourceIds: ["image-source"], operation: "create", expectedHashOrAbsent: null, candidateHash: image.hash, blobRef: image.hash },
-			{ targetPath: "facts/nested/page.md", operation: "create", expectedHashOrAbsent: null, candidateHash: page.hash, blobRef: page.hash }
+			{ kind: "image", targetPath: assetPath, mediaType: "image/png", sourceIds: ["image-source"], operation: "create", expectedHashOrAbsent: null, candidateHash: image.hash },
+			{ targetPath: "facts/nested/page.md", operation: "create", expectedHashOrAbsent: null, candidateHash: page.hash }
 		], dependencyGroups: [[assetPath, "facts/nested/page.md"]] };
 		batch.manifestHash = publicationManifestHash(batch);
 		await f.reviews.registerCandidate(batch, localViewerIdentity().user.id);
@@ -275,7 +273,7 @@ test("wiki 编译路由：POST 202 → 运行至 candidate_ready → 幂等重�
 	const batch = detail.json().batch;
 	assert.deepEqual(batch.files.map((file: { operation: string; targetPath: string }) => `${file.operation}:${file.targetPath}`),
 		["create:Daily/2026-09-28.md", "update:a.md"]);
-	const updatedBlob = await fixture.objects.get(batch.files[1].blobRef);
+	const updatedBlob = await fixture.objects.get(batch.files[1].candidateHash);
 	assert.ok(updatedBlob.toString("utf8").includes("# Updated"));
 	// 正式库与账本零变化；候选字节只进对象库与 Job 私有批次文件
 	assert.equal(await readFile(path.join(fixture.vault, "a.md"), "utf8"), "# Accepted\n");
@@ -453,8 +451,12 @@ test("wiki 审核路由：reject 与审核防伪造校验", async () => {
 	// 伪造 manifestHash → 409
 	const forged = await fixture.app.inject({ method: "POST", url: `/api/wiki/batches/${batch.id}/reviews`, payload: reviewBody(batch, { manifestHash: "d".repeat(64) }) });
 	assert.equal(forged.statusCode, 409);
-	// 陈旧 revision → 409
-	const stale = await fixture.app.inject({ method: "POST", url: `/api/wiki/batches/${batch.id}/reviews`, payload: reviewBody(batch, { expectedBatchRevision: 2 }) });
+	// 陈旧 manifestHash（同 id 批次换代后旧负载）→ 409
+	const rotating = await registerBatchDirect(fixture, [{ targetPath: "notes/rot.md", content: "# R1\n" }]);
+	const rotated = { ...rotating, validationReceipt: "{\"rotated\":true}", manifestHash: "" };
+	rotated.manifestHash = publicationManifestHash(rotated);
+	await fixture.reviews.registerCandidate(rotated, localViewerIdentity().user.id);
+	const stale = await fixture.app.inject({ method: "POST", url: `/api/wiki/batches/${rotating.id}/reviews`, payload: reviewBody(rotating) });
 	assert.equal(stale.statusCode, 409);
 	// 部分覆盖 → 409
 	const partial = await fixture.app.inject({ method: "POST", url: `/api/wiki/batches/${batch.id}/reviews`, payload: reviewBody(batch, { reviewedFiles: ["notes/a.md", "notes/missing.md"] }) });
@@ -714,11 +716,11 @@ test("关闭冲突：幂等、持久化、需处理计数归零且历史完整�
 	const f = await wikiFixture();
 	try {
 		const batch = await registerBatchDirect(f, [{ targetPath: "close.md", content: "# Candidate\n" }]);
-		const decision = await f.reviews.decide({ batchId: batch.id, actorId: localViewerIdentity().user.id, operationId: "approve-before-conflict", decision: "approve", manifestHash: batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: ["close.md"] });
+		const decision = await f.reviews.decide({ batchId: batch.id, actorId: localViewerIdentity().user.id, operationId: "approve-before-conflict", decision: "approve", manifestHash: batch.manifestHash, reviewedFiles: ["close.md"] });
 		const operation = (await f.journal.begin({ batch, ownerId: localViewerIdentity().user.id, actorId: localViewerIdentity().user.id, reviewId: decision.decision.id, idempotencyKey: decision.decision.id })).record;
 		await f.journal.setRunning(operation.id); await f.reviews.markPublishing(batch.id);
 		await f.journal.settle(operation.id, "unknown"); await f.reviews.settlePublish(batch.id, "conflict", "publish_uncertain");
-		const body = { operationId: "close-conflict-one", manifestHash: batch.manifestHash, expectedBatchRevision: 1 };
+		const body = { operationId: "close-conflict-one", manifestHash: batch.manifestHash };
 		const url = `/api/wiki/batches/${encodeURIComponent(batch.id)}/close-conflict`;
 		assert.equal((await f.app.inject({method:"POST",url,payload:body})).statusCode,409);
 		await f.journal.settle(operation.id, "conflict");

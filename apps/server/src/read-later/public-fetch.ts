@@ -133,14 +133,47 @@ export const fetchArticle: ArticleFetch = async (url, signal) => {
   }
   throw last;
 };
+function decodeWithLabel(bytes: Buffer, label: string): string {
+  const decoder = new TextDecoder(label);
+  const decoded = decoder.decode(bytes);
+  // Some Node builds expose Latin-1 C1 controls for Windows-1252 aliases.
+  // Keep the browser's Windows-1252 mapping consistent across runtime versions.
+  if (decoder.encoding !== "windows-1252") return decoded;
+  const c1 = "€\u0081‚ƒ„…†‡ˆ‰Š‹Œ\u008dŽ\u008f\u0090‘’“”•–—˜™š›œ\u009džŸ";
+  return decoded.replace(/[\u0080-\u009f]/g, (char) => c1[char.charCodeAt(0) - 0x80]!);
+}
 export function decodeArticle(bytes: Buffer, contentType: string): string {
-  const declared = /charset\s*=\s*["']?([^\s;"']+)/i.exec(contentType)?.[1];
-  const htmlCharset = /charset\s*=\s*["']?([^\s;"'/>]+)/i.exec(
-    bytes.subarray(0, 4096).toString("ascii"),
-  )?.[1];
-  try {
-    return new TextDecoder(declared || htmlCharset || "utf-8").decode(bytes);
-  } catch {
+  // A BOM takes precedence over HTTP/meta labels, as it does in a browser.
+  if (bytes.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])))
     return new TextDecoder("utf-8").decode(bytes);
+  if (bytes.subarray(0, 2).equals(Buffer.from([0xff, 0xfe])))
+    return new TextDecoder("utf-16le").decode(bytes);
+  if (bytes.subarray(0, 2).equals(Buffer.from([0xfe, 0xff])))
+    return new TextDecoder("utf-16be").decode(bytes);
+  const declared = /charset\s*=\s*["']?([^\s;"']+)/i.exec(contentType)?.[1];
+  const isHtml = /^(?:text\/html|application\/xhtml\+xml)\b/i.test(contentType);
+  const htmlCharset = isHtml
+    ? /<meta\b[^>]*\bcharset\s*=\s*["']?([^\s;"'/>]+)/i.exec(
+        bytes.subarray(0, 4096).toString("latin1"),
+      )?.[1]
+    : undefined;
+  const label = declared || htmlCharset;
+  if (label) {
+    try {
+      return decodeWithLabel(bytes, label);
+    } catch {
+      /* Unsupported label: use the same fallback as an undeclared response. */
+    }
   }
+  // Keep modern unlabelled UTF-8 pages intact. Older Western HTML (including
+  // Word exports) uses single-byte Windows-1252 without declaring a charset.
+  // Decode strictly before falling back, so invalid bytes are not lost as U+FFFD.
+  if (isHtml) {
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      return decodeWithLabel(bytes, "windows-1252");
+    }
+  }
+  return new TextDecoder("utf-8").decode(bytes);
 }

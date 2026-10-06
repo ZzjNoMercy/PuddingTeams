@@ -20,8 +20,6 @@ export function SessionKnowledgePicker({ sessionId, disabled, onSavingChange }: 
 	const currentKey = useRef(contextKey);
 	useLayoutEffect(() => { currentKey.current = contextKey; }, [contextKey]);
 	const savingRef = useRef(false);
-	const triggerRef = useRef<HTMLButtonElement>(null);
-	const interactionRef = useRef<"pointer" | "keyboard" | null>(null);
 	const current = value?.key === contextKey ? value : null;
 	const selected = new Set(current?.selection.selectedBindingIds ?? []);
 	const loading = !current && !error;
@@ -62,7 +60,7 @@ export function SessionKnowledgePicker({ sessionId, disabled, onSavingChange }: 
 	};
 
 	const label = saving ? "保存知识库…" : loading ? "读取知识库…" : selected.size > 0 ? `${selected.size} 个知识库` : "选择知识库";
-	return <DropdownMenu><DropdownMenuTrigger asChild><button ref={triggerRef} onPointerDown={() => { interactionRef.current = "pointer"; }} onKeyDown={() => { interactionRef.current = "keyboard"; }} type="button" className="m1-workbench-knowledge session-knowledge-trigger" disabled={disabled || loading || saving} aria-label={`会话知识库：${label}`} title="当前会话可访问的知识库"><Layers3Icon size={14} /><span>{label}</span><ChevronDownIcon size={12} /></button></DropdownMenuTrigger><DropdownMenuContent align="start" className="m1-workbench-knowledge-menu" onCloseAutoFocus={(event) => { if (interactionRef.current === "pointer") { event.preventDefault(); triggerRef.current?.blur(); } interactionRef.current = null; }}>
+	return <DropdownMenu><DropdownMenuTrigger asChild><button type="button" className="m1-workbench-knowledge session-knowledge-trigger" disabled={disabled || loading || saving} aria-label={`会话知识库：${label}`} title="当前会话可访问的知识库"><Layers3Icon size={14} /><span>{label}</span><ChevronDownIcon size={12} /></button></DropdownMenuTrigger><DropdownMenuContent align="start" className="m1-workbench-knowledge-menu">
 		{error ? <><DropdownMenuItem disabled>{error}</DropdownMenuItem><DropdownMenuItem onSelect={() => setNonce((previous) => previous + 1)}><RefreshCwIcon size={13} />重试读取知识库</DropdownMenuItem></> : null}
 		{current?.bindings.length === 0 ? <DropdownMenuItem disabled>还没有已接入的知识库</DropdownMenuItem> : null}
 		{current?.bindings.map((binding) => <DropdownMenuCheckboxItem key={binding.id} checked={selected.has(binding.id)} disabled={saving || disabled || (binding.availability !== "available" && !selected.has(binding.id))} onSelect={(event) => event.preventDefault()} onCheckedChange={(checked) => void toggle(binding.id, checked === true)}><span className="m1-workbench-knowledge-item"><strong>{binding.name}{binding.availability !== "available" ? " · 离线" : ""}</strong>{binding.description ? <small>{binding.description}</small> : null}</span></DropdownMenuCheckboxItem>)}

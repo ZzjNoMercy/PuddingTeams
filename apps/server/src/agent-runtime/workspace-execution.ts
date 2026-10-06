@@ -89,7 +89,6 @@ export interface WorkspaceChangeSet {
 	baselineFingerprint: string;
 	outputFingerprint: string;
 	changedPaths: string[];
-	diffHash: string;
 	promotionState: "not_required" | "pending" | "applied" | "conflict" | "failed";
 	createdAt: string;
 	promotedAt?: string;
@@ -199,6 +198,11 @@ function fileDigest(data: Buffer): string {
 }
 
 function now(): string { return new Date().toISOString(); }
+
+// verificationId 形如 verification:<submissionId>:<toolCallId>；id 兼作磁盘目录名，需避开 Windows 保留字符。
+function verificationEnvironmentId(verificationId: string): string {
+	return `verify-${verificationId.replace(/[<>:"/\\|?*\u0000-\u001F]/g, "-")}`;
+}
 
 function safeRelative(relative: string): string {
 	const normalized = relative.split(path.sep).join("/");
@@ -708,7 +712,7 @@ export class WorkspaceExecutionCoordinator {
 			const scope = state.scopes[scopeId];
 			if (!scope || scope.state === "released") throw new WorkspaceExecutionError("scope_not_found", `execution scope not found: ${scopeId}`);
 			if (scope.ownerToken && ownerToken !== scope.ownerToken) throw new WorkspaceExecutionError("lease_conflict", "execution scope owner token mismatch");
-			const id = `verify-${createHash("sha256").update(verificationId).digest("hex").slice(0, 20)}`;
+			const id = verificationEnvironmentId(verificationId);
 			const existing = state.verificationCopies[id];
 			if (existing?.state === "active") return structuredClone(existing);
 			const root = path.join(this.worktreeRoot, id);
@@ -770,7 +774,7 @@ export class WorkspaceExecutionCoordinator {
 			const scope = state.scopes[scopeId];
 			if (!scope || scope.state === "released") throw new WorkspaceExecutionError("scope_not_found", `execution scope not found: ${scopeId}`);
 			if (scope.ownerToken && ownerToken !== scope.ownerToken) throw new WorkspaceExecutionError("lease_conflict", "execution scope owner token mismatch");
-			const id = `verify-${createHash("sha256").update(verificationId).digest("hex").slice(0, 20)}`;
+			const id = verificationEnvironmentId(verificationId);
 			const existing = state.verificationCopies[id];
 			if (existing?.state === "active") return structuredClone(existing);
 			const current = await this.currentEntries(scope);
@@ -839,7 +843,6 @@ export class WorkspaceExecutionCoordinator {
 				...(scope.workspaceId ? { workspaceId: scope.workspaceId } : {}), mode: scope.mode,
 				baselineFingerprint: scope.baselineFingerprint, outputFingerprint: current.fingerprint,
 				changedPaths: paths,
-				diffHash: digest({ baseline: scope.baselineEntries, output: current.entries, changedPaths: paths }),
 				promotionState: scope.mode === "isolated_worktree" ? "pending" : "not_required",
 				createdAt: now(), integrity: (scope.mode === "read_only_shared" || options.readOnlyExpected) && paths.length ? "violation" : "clean",
 			};

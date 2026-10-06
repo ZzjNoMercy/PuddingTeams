@@ -78,6 +78,9 @@ import { registerCalendarProviderRoutes } from "./routes/calendar-providers.js";
 import { CalendarProviderRegistry } from "./calendar/providers.js";
 import { createFeishuCalendarProvider } from "./calendar/feishu.js";
 import { CalendarStore } from "./calendar/store.js";
+import { CalendarService } from "./calendar/service.js";
+import { calendarExtension, calendarTools } from "./calendar/tools.js";
+import { setInteractionStatus, type InteractionStatusDeps } from "./knowledge/interaction-status.js";
 import { registerWikiRoutes, resolveCodexCompileCommand } from "./routes/wiki.js";
 import { localViewerIdentity } from "./routes/identity.js";
 import { KnowledgeSelectionStore } from "./knowledge/selections.js";
@@ -252,6 +255,17 @@ const knowledgeRuntime = new KnowledgeRuntimeService({ bindings: knowledgeRegist
 	objects: knowledgeObjects, observation: knowledgeObservation, selections: knowledgeSelections, teams, stateDir: paths.knowledgeState, cacheDir: paths.knowledgeCache });
 const curatorJobs = new CuratorJobStore(paths.knowledgeState);
 const knowledgeSources = new KnowledgeSourceStore({ stateDir: paths.knowledgeState, objects: knowledgeObjects });
+const contactsProjection = new ContactsProjection({ bindings: knowledgeRegistry, objects: knowledgeObjects, acceptance: knowledgeAcceptance, observation: knowledgeObservation, searchIndex: knowledgeSearchIndex });
+const calendarService = new CalendarService(new CalendarStore(paths.calendarState), { contacts: contactsProjection, bindings: knowledgeRegistry, acceptance: knowledgeAcceptance, observation: knowledgeObservation, objects: knowledgeObjects, sources: knowledgeSources, reviews: reviewStore });
+// 往来/日程统一状态：wiki 侧直写经 calendar 适配器一跳同步日程；日程侧经反向回调一跳同步 wiki，source 标记保证不递归。
+const interactionStatusDeps: InteractionStatusDeps = { bindings: knowledgeRegistry, observation: knowledgeObservation, acceptance: knowledgeAcceptance,
+	calendar: {
+		get: async (ownerId, eventId) => { const event = await calendarService.store.get(ownerId, eventId); return { revision: event.revision, status: event.status }; },
+		setStatus: (ownerId, eventId, operationId, expectedRevision, status) => calendarService.setStatus(ownerId, eventId, operationId, expectedRevision, status, { source: "wiki" }),
+	} };
+const interactionStatusHandler = (input: Parameters<typeof setInteractionStatus>[1]) => setInteractionStatus(interactionStatusDeps, input);
+calendarService.setInteractionStatusSync((args) => setInteractionStatus(interactionStatusDeps, args, { source: "calendar" }));
+knowledgeRuntime.setInteractionStatusHandler(interactionStatusHandler);
 const chatKnowledgeIntakes = new ChatKnowledgeIntake({ stateDir: paths.knowledgeState, sources: knowledgeSources });
 const wikiCurator = new WikiCuratorService({ jobs: curatorJobs, bindings: knowledgeRegistry, acceptance: knowledgeAcceptance,
 	objects: knowledgeObjects, reviews: reviewStore, runtime: knowledgeRuntime, teams, cacheDir: paths.knowledgeCache, sources: knowledgeSources,
@@ -275,6 +289,7 @@ const wikiPublisher = new MarkdownWikiPublisher({
 	objects: knowledgeObjects,
 	searchIndex: knowledgeSearchIndex,
 	operationsDir: paths.knowledgeOperations,
+	assertSourceCurrent: batch => calendarService.assertPublicationCurrent(batch),
 });
 const runtime: AgentRuntime = new AgentRuntime(
 	delegations,
@@ -316,6 +331,16 @@ const store = new PiSessionStore(
 	mcpServers,
 );
 store.setKnowledgeRuntime(knowledgeRuntime);
+const calendarScope = async (sessionId: string) => {
+ const scope = await knowledgeRuntime.scopeForSession(sessionId);
+ if (!scope) throw new Error("当前聊天上下文不可用");
+ const selection = await knowledgeSelections.effective(scope.ownerId, scope.contextKey);
+ return { ownerId: scope.ownerId, bindingIds: selection.selectedBindingIds, assertCurrent: async () => {
+  const next = await knowledgeSelections.effective(scope.ownerId, scope.contextKey);
+  if (next.revision !== selection.revision || JSON.stringify(next.selectedBindingIds) !== JSON.stringify(selection.selectedBindingIds)) throw new Error("本轮知识库选择已变化，请重试");
+ } };
+};
+store.setCalendarExtension(getSessionId => calendarExtension(calendarService, () => calendarScope(getSessionId())));
 invoker.setConversationHistory(async (agent, ctx) => {
 	const delegation = ctx.delegationId ? await runtime.getDelegation(ctx.delegationId) : undefined;
 	if (!delegation?.operationId) return [];
@@ -365,7 +390,9 @@ invoker.setKnowledgeRuntime(async (agent, ctx, _message) => {
 			}
 			return chatKnowledgeIntakes.resolve(session, scope.ownerId, direct ? { operationId: delegation!.operationId } : { toolCallId: delegation?.managerToolCallId });
 		} }, agent.builtinId, defaultMemory) : surface;
-	return agent.builtinId === "wiki" ? curatedSurface : withReadLater(curatedSurface, localViewerIdentity().user.id, readLaterStore, readLaterCapture);
+	if (agent.builtinId === "wiki") return curatedSurface;
+	const ordinary = withReadLater(curatedSurface, localViewerIdentity().user.id, readLaterStore, readLaterCapture);
+	return { ...ordinary, tools: [...ordinary.tools, ...calendarTools(calendarService, () => calendarScope(sessionId ?? ""))] };
 });
 const extensionMutationJournal = new ExtensionMutationJournal(path.join(paths.state, "extension-mutation-pending.json"));
 const recoveredExtensionAgents = await extensionMutationJournal.recover(async (name) => {
@@ -752,7 +779,7 @@ await registerChatRoutes(app, store, teams, workStates, uploads, invoker, {
 }, providerDeletion, new MessageSubmissionOperations(path.join(paths.state, "message-submission-operations")), chatKnowledgeIntakes);
 registerIdentityRoutes(app, localViewerIdentity, paths);
 registerWebResearchSettingsRoutes(app, webResearch);
-registerCalendarRoutes(app, new CalendarStore(paths.calendarState));
+registerCalendarRoutes(app, calendarService.store, () => localViewerIdentity().user.id, calendarService);
 registerCalendarProviderRoutes(app, new CalendarProviderRegistry([createFeishuCalendarProvider(feishuConnection)]));
 await registerSettingsRoutes(app, defaultCwd, productSettings, workStates, (settings) => {
 	store.markAllDirty();
@@ -786,7 +813,7 @@ await registerExtensionsRoutes(app, {
 registerResourcesRoutes(app);
 registerWorkspacesRoutes(app, teams.workspaces, undefined, store);
 // Teams 2.0 知识库 M2：绑定注册表 + 采纳账本 + 内容寻址快照库 + 观察服务 + 检索索引 + 接入探测/计划。
-registerContactsRoutes(app, new ContactsProjection({ bindings: knowledgeRegistry, objects: knowledgeObjects, acceptance: knowledgeAcceptance, observation: knowledgeObservation, searchIndex: knowledgeSearchIndex }));
+registerContactsRoutes(app, contactsProjection);
 registerKnowledgeRoutes(app, knowledgeRegistry, {
 	viewerIdentity: () => readViewerIdentity(localViewerIdentity, paths),
 	memorySetup,
@@ -799,6 +826,7 @@ registerKnowledgeRoutes(app, knowledgeRegistry, {
 	plans: knowledgePlans,
 	selections: knowledgeSelections,
 	history: knowledgeHistory,
+	setInteractionStatus: interactionStatusHandler,
 });
 // T30/T31 W1：知识库编译生产入口。取消复用 Runtime 的 Delegation 取消机制。
 registerWikiRoutes(app, {

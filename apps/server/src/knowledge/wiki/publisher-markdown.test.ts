@@ -26,7 +26,7 @@ async function imageBatch(f: PublisherFixture, options: { large?: boolean; reuse
 	const pagePath = options.update ? "a.md" : "facts/nested/page.md";
 	const content = `---\nsources: [image-source]\n---\n# Page\n![原图](${options.update ? "" : "../../"}${assetPath})\n`;
 	const batch = await buildBatch(f, [{ targetPath: pagePath, content, operation: options.update ? "update" : "create" }, ...(options.secondPage ? [{ targetPath: "q.md", content: "# Q\n" }] : [])]);
-	batch.files.unshift({ targetPath: assetPath, kind: "image", mediaType: "image/png", sourceIds: ["image-source"], operation: options.reuse ? "update" : "create", expectedHashOrAbsent: options.reuse ? blob.hash : null, candidateHash: blob.hash, blobRef: blob.hash });
+	batch.files.unshift({ targetPath: assetPath, kind: "image", mediaType: "image/png", sourceIds: ["image-source"], operation: options.reuse ? "update" : "create", expectedHashOrAbsent: options.reuse ? blob.hash : null, candidateHash: blob.hash});
 	batch.dependencyGroups = [[assetPath, ...batch.files.filter(file => file.kind !== "image").map(file => file.targetPath)]];
 	batch.sourceSnapshots = [blob.hash];
 	batch.validationReceipt = JSON.stringify({ sources: [{ id: "image-source", kind: "image", originalHash: blob.hash, mediaType: "image/png" }] });
@@ -59,7 +59,7 @@ async function publisherFixture(stepHook?: PublishStepHook): Promise<PublisherFi
 	const objects = new KnowledgeObjectStore(path.join(root, "objects"));
 	const acceptance = new KnowledgeAcceptanceStore(path.join(root, "acceptance"));
 	const blob = await objects.put(Buffer.from("# Accepted\n", "utf8"));
-	await acceptance.adopt(binding.id, [{ relativePath: "a.md", contentHash: blob.hash, snapshotRef: blob.hash, acceptedBy: OWNER }], 0);
+	await acceptance.adopt(binding.id, [{ relativePath: "a.md", contentHash: blob.hash, acceptedBy: OWNER }], 0);
 	const observation = new KnowledgeObservationService(acceptance, { objects });
 	const searchIndex = new KnowledgeSearchIndex(path.join(root, "index-cache"), objects);
 	const reviews = new ReviewStore(path.join(root, "reviews"));
@@ -90,7 +90,6 @@ async function buildBatch(fixture: PublisherFixture,
 			operation,
 			expectedHashOrAbsent: baseline,
 			candidateHash: blob?.hash ?? null,
-			blobRef: blob?.hash ?? null,
 		});
 	}
 	const batch: PublicationBatch = {
@@ -116,7 +115,7 @@ async function approveAndPublish(fixture: PublisherFixture, batch: PublicationBa
 	await fixture.reviews.registerCandidate(batch, OWNER);
 	const { decision } = await fixture.reviews.decide({
 		batchId: batch.id, operationId: `op-${batch.id}`, actorId: OWNER, decision: "approve",
-		manifestHash: batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: batch.files.map((file) => file.targetPath),
+		manifestHash: batch.manifestHash, reviewedFiles: batch.files.map((file) => file.targetPath),
 	});
 	const outcome = await fixture.publisher.onApproved(batch, decision);
 	return { decision, outcome };
@@ -281,7 +280,7 @@ test("reconcile：崩溃在组登记前——磁盘与账本证据齐全，补�
 	await fixture.reviews.registerCandidate(batch, OWNER);
 	const { decision } = await fixture.reviews.decide({
 		batchId: batch.id, operationId: `op-${batch.id}`, actorId: OWNER, decision: "approve",
-		manifestHash: batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: ["a.md"],
+		manifestHash: batch.manifestHash, reviewedFiles: ["a.md"],
 	});
 	await assert.rejects(() => fixture.publisher.onApproved(batch, decision), PublishCrashError);
 	assert.equal((await fixture.reviews.get(batch.id))!.status, "publishing");
@@ -308,7 +307,7 @@ test("reconcile：崩溃在写入后——未提交组回滚 before-image，账�
 	await fixture.reviews.registerCandidate(batch, OWNER);
 	const { decision } = await fixture.reviews.decide({
 		batchId: batch.id, operationId: `op-${batch.id}`, actorId: OWNER, decision: "approve",
-		manifestHash: batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: batch.files.map((file) => file.targetPath),
+		manifestHash: batch.manifestHash, reviewedFiles: batch.files.map((file) => file.targetPath),
 	});
 	await assert.rejects(() => fixture.publisher.onApproved(batch, decision), PublishCrashError);
 	assert.equal(await readVault(fixture, "a.md"), "# Updated\n", "崩溃时 rename 已生效");
@@ -338,7 +337,7 @@ test("reconcile：外部新编辑不被回滚覆盖，只报告转人工（P11�
 	await fixture.reviews.registerCandidate(batch, OWNER);
 	const { decision } = await fixture.reviews.decide({
 		batchId: batch.id, operationId: `op-${batch.id}`, actorId: OWNER, decision: "approve",
-		manifestHash: batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: ["a.md"],
+		manifestHash: batch.manifestHash, reviewedFiles: ["a.md"],
 	});
 	await assert.rejects(() => fixture.publisher.onApproved(batch, decision), PublishCrashError);
 	// 崩溃后、对账前：用户在外部又编辑了该文件
@@ -363,7 +362,7 @@ test("reconcile：磁盘已是候选但账本未写——补做组提交收敛 p
 	await fixture.reviews.registerCandidate(batch, OWNER);
 	const { decision } = await fixture.reviews.decide({
 		batchId: batch.id, operationId: `op-${batch.id}`, actorId: OWNER, decision: "approve",
-		manifestHash: batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: ["a.md"],
+		manifestHash: batch.manifestHash, reviewedFiles: ["a.md"],
 	});
 	await assert.rejects(() => fixture.publisher.onApproved(batch, decision), PublishCrashError);
 	const settled = await fixture.publisher.reconcileInterrupted();
@@ -376,7 +375,7 @@ test("reconcile：磁盘已是候选但账本未写——补做组提交收敛 p
 async function approveOnly(fixture: PublisherFixture, batch: PublicationBatch) {
 	await fixture.reviews.registerCandidate(batch, OWNER);
 	return (await fixture.reviews.decide({ batchId: batch.id, operationId: `op-${batch.id}`, actorId: OWNER,
-		decision: "approve", manifestHash: batch.manifestHash, expectedBatchRevision: 1,
+		decision: "approve", manifestHash: batch.manifestHash,
 		reviewedFiles: batch.files.map((file) => file.targetPath) })).decision;
 }
 
@@ -423,8 +422,8 @@ test("图片发布：3MiB原件先于嵌套页面，同hash复用不覆写且不
 test("图片审核/冲突：图和页全部已阅才能批准，拒绝零写，同名非原bytes不覆写", async () => {
 	const f = await publisherFixture(), image = await imageBatch(f);
 	await f.reviews.registerCandidate(image.batch, OWNER);
-	await assert.rejects(f.reviews.decide({ batchId: image.batch.id, operationId: "omit-image", actorId: OWNER, decision: "approve", manifestHash: image.batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: [image.pagePath] }));
-	await f.reviews.decide({ batchId: image.batch.id, operationId: "reject-image", actorId: OWNER, decision: "reject", manifestHash: image.batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: [] });
+	await assert.rejects(f.reviews.decide({ batchId: image.batch.id, operationId: "omit-image", actorId: OWNER, decision: "approve", manifestHash: image.batch.manifestHash, reviewedFiles: [image.pagePath] }));
+	await f.reviews.decide({ batchId: image.batch.id, operationId: "reject-image", actorId: OWNER, decision: "reject", manifestHash: image.batch.manifestHash, reviewedFiles: [] });
 	assert.equal(await readVault(f, image.assetPath), null); assert.equal(await readVault(f, image.pagePath), null);
 	const conflict = await imageBatch(f);
 	await mkdir(path.dirname(path.join(f.vault, conflict.assetPath)), { recursive: true });
@@ -531,7 +530,7 @@ test("publisher：调用方替换候选或审核决定被拒绝，正式区零�
 	const batch = await buildBatch(fixture, [{ targetPath: "forged.md", content: "# Reviewed\n" }]);
 	const review = await approveOnly(fixture, batch);
 	const blob = await fixture.objects.put(Buffer.from("# Unreviewed\n"));
-	const forged = { ...batch, files: batch.files.map((file) => ({ ...file, blobRef: blob.hash, candidateHash: blob.hash })) };
+	const forged = { ...batch, files: batch.files.map((file) => ({ ...file, candidateHash: blob.hash })) };
 	forged.manifestHash = publicationManifestHash(forged);
 	assert.equal((await fixture.publisher.onApproved(forged, review)).accepted, false);
 	assert.equal((await fixture.publisher.onApproved(batch, { ...review, actorId: "forged" })).accepted, false);
@@ -593,7 +592,7 @@ test("publisher：四文件含index/log发布，控制快照与笔记分开且�
 	assert.equal(Object.keys(ledger.entries).length, 2);
 	assert.equal(Object.keys(ledger.controlEntries!).length, 2);
 	assert.equal(ledger.entries["path:index.md"], undefined);
-	assert.equal((await fixture.objects.get(ledger.controlEntries!["path:index.md"]!.snapshotRef)).toString(), "# Index\n[[a]] [[b]]\n");
+	assert.equal((await fixture.objects.get(ledger.controlEntries!["path:index.md"]!.contentHash)).toString(), "# Index\n[[a]] [[b]]\n");
 	assert.equal((await fixture.reviews.get(batch.id))!.status, "published");
 	const index = await fixture.searchIndex.load(fixture.binding.id, ledger);
 	assert.equal(index.notesByPath.has("index.md"), false, "普通笔记检索索引不混入控制文档");

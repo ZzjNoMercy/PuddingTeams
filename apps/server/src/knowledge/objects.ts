@@ -19,8 +19,8 @@ export class KnowledgeObjectStore {
 		return path.join(this.rootDir, hash.slice(0, 2), `${hash}.md`);
 	}
 
-	async put(content: Buffer): Promise<{ hash: string; path: string }> {
-		const hash = createHash("sha256").update(content).digest("hex");
+	async put(content: Buffer, knownHash?: string): Promise<{ hash: string; path: string }> {
+		const hash = knownHash !== undefined && HASH_PATTERN.test(knownHash) ? knownHash : createHash("sha256").update(content).digest("hex");
 		const target = this.targetFor(hash);
 		await mkdir(path.dirname(target), { recursive: true });
 		try {

@@ -26,6 +26,7 @@ import type { KnowledgeHistoryStore, NoteHistoryVersion } from "../knowledge/his
 import type { MemorySetupService } from "../knowledge/memory-setup.js";
 import type { ReviewStore } from "../knowledge/wiki/review-store.js";
 import { assertImageAssetBytes, assertImageBatchIntegrity, markdownImageTargets, resolveImagePath } from "../knowledge/image-publication.js";
+import type { InteractionStatusHandler } from "../knowledge/runtime-service.js";
 
 export interface KnowledgeRouteDeps {
 	viewerIdentity?: () => Promise<ViewerIdentity>;
@@ -39,6 +40,7 @@ export interface KnowledgeRouteDeps {
 	probes?: KnowledgeProbeStore;
 	plans?: KnowledgePlanStore;
 	selections?: KnowledgeSelectionStore;
+	setInteractionStatus?: InteractionStatusHandler;
 }
 
 class KnowledgeRouteError extends Error {
@@ -70,7 +72,7 @@ async function schemaAffectedFiles(deps: KnowledgeRouteDeps, binding: KnowledgeB
 	const affectedFiles: AffectedFile[] = [];
 	for (const entry of Object.values(ledger.entries)) {
 		if (entry.availability !== "current") continue;
-		const snapshot = await deps.objects.get(entry.snapshotRef).catch(() => null);
+		const snapshot = await deps.objects.get(entry.contentHash).catch(() => null);
 		if (!snapshot) continue;
 		const affected = assessAcceptedNote(entry.relativePath, parseNoteFrontmatterFields(snapshot.toString("utf8")), current, next, contentPrefix);
 		if (affected) affectedFiles.push(affected);
@@ -159,7 +161,7 @@ export function registerKnowledgeRoutes(app: FastifyInstance, registry: Knowledg
 			await services.acceptance.flushHistory(req.params.id);
 			const version = await services.history.get(req.params.id, req.params.versionId);
 			if (!version) throw new KnowledgeRouteError("not_found", "历史版本不存在");
-			const bytes = await services.objects.get(version.snapshotRef), previous = version.previousSnapshotRef ? await services.objects.get(version.previousSnapshotRef) : undefined;
+			const bytes = await services.objects.get(version.contentHash), previous = version.previousHash ? await services.objects.get(version.previousHash) : undefined;
 			if (hashBufferSha256(bytes) !== version.contentHash || (previous && hashBufferSha256(previous) !== version.previousHash)) throw new Error("历史快照校验失败");
 			const content = bytes.toString("utf8"), previousContent = previous?.toString("utf8");
 			const viewer = await services.viewerIdentity?.() ?? localViewerIdentity();
@@ -178,11 +180,11 @@ export function registerKnowledgeRoutes(app: FastifyInstance, registry: Knowledg
 			if (!version || !record || record.ownerId !== ownerId() || record.batch.bindingId !== req.params.id || record.decisionId !== version.decisionId) throw new KnowledgeRouteError("not_found", "该版本没有固定图片发布回执");
 			const page = record.batch.files.find((file) => file.kind !== "image" && file.targetPath === version.relativePath && file.candidateHash === version.contentHash);
 			const asset = record.batch.files.find((file) => file.kind === "image" && file.targetPath === req.query.path);
-			if (!page || !asset?.blobRef || !record.batch.dependencyGroups.some((group) => group.includes(page.targetPath) && group.includes(asset.targetPath))) throw new KnowledgeRouteError("not_found", "图片不属于该历史页面");
-			const content = (await services.objects.get(version.snapshotRef)).toString("utf8");
+			if (!page || !asset?.candidateHash || !record.batch.dependencyGroups.some((group) => group.includes(page.targetPath) && group.includes(asset.targetPath))) throw new KnowledgeRouteError("not_found", "图片不属于该历史页面");
+			const content = (await services.objects.get(version.contentHash)).toString("utf8");
 			if (hashBufferSha256(content) !== version.contentHash || !markdownImageTargets(content).some((target) => resolveImagePath(version.relativePath, target) === asset.targetPath)) throw new KnowledgeRouteError("not_found", "历史正文未引用该固定图片");
 			await assertImageBatchIntegrity(record.batch, services.objects);
-			const bytes = await services.objects.get(asset.blobRef), mediaType = assertImageAssetBytes(asset.targetPath, bytes, asset.mediaType);
+			const bytes = await services.objects.get(asset.candidateHash), mediaType = assertImageAssetBytes(asset.targetPath, bytes, asset.mediaType);
 			return reply.header("Content-Type", mediaType).header("X-Content-Type-Options", "nosniff").header("Cache-Control", "no-store").send(bytes);
 		} catch (error) { return sendKnowledgeError(reply, error); }
 	});
@@ -392,7 +394,7 @@ export function registerKnowledgeRoutes(app: FastifyInstance, registry: Knowledg
 			const ledger = await services.acceptance.getSnapshot(binding.id);
 			const found = findLedgerEntry(ledger, scan, relativePath);
 			if (!found || found.entry.availability !== "current") throw new KnowledgeRouteError("not_found", "该笔记没有当前可读快照");
-			const snapshot = await services.objects.get(found.entry.snapshotRef).catch(() => null);
+			const snapshot = await services.objects.get(found.entry.contentHash).catch(() => null);
 			if (!snapshot) throw new KnowledgeRouteError("context_unavailable", "当前快照缺失，请重新同步");
 			return {
 				note: {
@@ -412,6 +414,18 @@ export function registerKnowledgeRoutes(app: FastifyInstance, registry: Knowledg
 		try {
 			const services = requireDeps();
 			return await writeKnowledgeNote(registry, services.observation, services.acceptance, ownerId(), req.params.id, req.body ?? {});
+		} catch (error) { return sendKnowledgeError(reply, error); }
+	});
+
+	// 往来/日程统一状态：用户授权的直写通道，立即生效、不生成审核候选；关联日程经 calendarSync 一跳同步。
+	app.post<{ Body: { bindingId?: string; path?: string; status?: string; occurredAt?: string } }>("/api/knowledge/interactions/status", async (req, reply) => {
+		try {
+			const services = requireDeps();
+			if (!services.setInteractionStatus) throw new KnowledgeRouteError("capability_unavailable", "往来状态能力未装配");
+			return await services.setInteractionStatus({
+				ownerId: ownerId(), bindingId: req.body?.bindingId ?? "", path: req.body?.path ?? "",
+				status: req.body?.status as "planned" | "done" | "cancelled", occurredAt: req.body?.occurredAt,
+			});
 		} catch (error) { return sendKnowledgeError(reply, error); }
 	});
 

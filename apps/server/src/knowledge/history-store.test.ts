@@ -26,7 +26,7 @@ async function fixture() {
 	const observation = new KnowledgeObservationService(acceptance, { objects }), searchIndex = new KnowledgeSearchIndex(path.join(root, "cache"), objects);
 	const adopt = async (text: string, relativePath: string, revision: number) => {
 		const blob = await objects.put(Buffer.from(text));
-		await acceptance.adopt(binding.id, [{ relativePath, declaredNoteId: "stable-declared-id", contentHash: blob.hash, snapshotRef: blob.hash, acceptedBy: OWNER, sourceIds: ["source-one"] }], revision);
+		await acceptance.adopt(binding.id, [{ relativePath, declaredNoteId: "stable-declared-id", contentHash: blob.hash, acceptedBy: OWNER, sourceIds: ["source-one"] }], revision);
 		return blob;
 	};
 	return { root, vault, history, objects, acceptance, bindings, binding, observation, searchIndex, adopt };
@@ -45,13 +45,13 @@ test("history：原子采纳outbox在SQLite投影失败后恢复，重启不重�
 		await restarted.recoverHistory(); await restarted.recoverHistory();
 		const first = (await f.history.list(f.binding.id, "first.md")).versions[0]!;
 		assert.equal(first.channel, "initial"); assert.equal(first.contentHash, a.hash);
-		await restarted.adopt(f.binding.id, [{ relativePath: "renamed.md", declaredNoteId: "stable-declared-id", contentHash: a.hash, snapshotRef: a.hash, acceptedBy: OWNER }], 1);
+		await restarted.adopt(f.binding.id, [{ relativePath: "renamed.md", declaredNoteId: "stable-declared-id", contentHash: a.hash, acceptedBy: OWNER }], 1);
 		const renamed = await f.history.list(f.binding.id, "renamed.md");
 		assert.equal(renamed.noteId, first.noteId); assert.equal(renamed.versions.length, 2);
 		assert.equal(renamed.versions[0]?.previousPath, "first.md");
 		assert.equal(renamed.versions[0]?.channel, "initial");
 		const before = Object.values((await restarted.getSnapshot(f.binding.id)).entries)[0]!;
-		await restarted.adopt(f.binding.id, [{ relativePath: "renamed.md", declaredNoteId: "stable-declared-id", contentHash: a.hash, snapshotRef: a.hash, acceptedBy: OWNER }], 2);
+		await restarted.adopt(f.binding.id, [{ relativePath: "renamed.md", declaredNoteId: "stable-declared-id", contentHash: a.hash, acceptedBy: OWNER }], 2);
 		assert.equal((await f.history.list(f.binding.id, "renamed.md")).versions.length, 2, "无变化不记版本");
 		const after = Object.values((await restarted.getSnapshot(f.binding.id)).entries)[0]!;
 		assert.notEqual(after.acceptanceId, before.acceptanceId, "显式重复采纳仍刷新授权身份，使旧compile来源失效");
@@ -72,7 +72,7 @@ test("history：SQLite写完但outbox清理前崩溃，重放仍只有一次事�
 		await restarted.recoverHistory(); await restarted.recoverHistory();
 		assert.equal((await freshHistory.list(f.binding.id, "note.md")).versions.length, 1);
 		assert.deepEqual((await restarted.getSnapshot(f.binding.id)).historyOutbox, []);
-		await assert.rejects(freshHistory.append([{ ...before[0]!, contentHash: "a".repeat(64), snapshotRef: "a".repeat(64) }]), /conflicts/);
+		await assert.rejects(freshHistory.append([{ ...before[0]!, contentHash: "a".repeat(64)}]), /conflicts/);
 	} finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
@@ -98,23 +98,23 @@ test("history publisher：待审/拒绝不记历史；partial只记已提交组�
 	try {
 		const reviews = new ReviewStore(path.join(f.root, "reviews")), journal = new PublishJournal(path.join(f.root, "operations"));
 		const files = await Promise.all(["a.md", "b.md"].map(async (targetPath) => { const blob = await f.objects.put(Buffer.from(`# ${targetPath}\n`));
-			return { operation: "create" as const, targetPath, expectedHashOrAbsent: null, candidateHash: blob.hash, blobRef: blob.hash }; }));
+			return { operation: "create" as const, targetPath, expectedHashOrAbsent: null, candidateHash: blob.hash}; }));
 		const batch: PublicationBatch = { id: "partial-history", revision: 1, bindingId: f.binding.id, rootIdentity: f.binding.rootIdentity, manifestHash: "", files,
 			sourceSnapshots: [], bindingRevision: 1, trustRevision: 1, dependencyGroups: [["a.md"], ["b.md"]], validationReceipt: JSON.stringify({ reasons: { "a.md": "修改理由" } }), compilerVersion: "fixture", status: "candidate" };
 		batch.manifestHash = publicationManifestHash(batch); await reviews.registerCandidate(batch, OWNER);
 		assert.deepEqual((await f.history.list(f.binding.id, "a.md")).versions, []);
-		const approved = await reviews.decide({ batchId: batch.id, operationId: "approve", actorId: OWNER, decision: "approve", manifestHash: batch.manifestHash, expectedBatchRevision: 1, reviewedFiles: ["a.md", "b.md"] });
+		const approved = await reviews.decide({ batchId: batch.id, operationId: "approve", actorId: OWNER, decision: "approve", manifestHash: batch.manifestHash, reviewedFiles: ["a.md", "b.md"] });
 		const publisher = new MarkdownWikiPublisher({ ...f, reviews, journal, operationsDir: path.join(f.root, "operations"), stepHook: async (step, target) => {
 			if (step === "group_commit" && target === "a.md") await writeFile(path.join(f.vault, "b.md"), "# external\n");
 		} });
 		await publisher.onApproved(batch, approved.decision); assert.equal((await reviews.get(batch.id))?.status, "partial");
 		const versions = (await f.history.list(f.binding.id, "a.md")).versions; assert.equal(versions.length, 1);
 		assert.equal(versions[0]?.channel, "agent_publish"); assert.equal(versions[0]?.batchId, batch.id); assert.equal(versions[0]?.decisionId, approved.decision.id); assert.equal(versions[0]?.summary, "修改理由");
-		const external = (await f.history.list(f.binding.id, "b.md")).versions; assert.equal(external.length, 1); assert.equal(external[0]!.channel, "external_sync"); assert.equal(external[0]!.decisionId, undefined); assert.equal((await f.objects.get(external[0]!.snapshotRef)).toString(), "# external\n");
+		const external = (await f.history.list(f.binding.id, "b.md")).versions; assert.equal(external.length, 1); assert.equal(external[0]!.channel, "external_sync"); assert.equal(external[0]!.decisionId, undefined); assert.equal((await f.objects.get(external[0]!.contentHash)).toString(), "# external\n");
 		await publisher.reconcileInterrupted(); await f.acceptance.recoverHistory();
 		assert.equal((await f.history.list(f.binding.id, "a.md")).versions.length, 1);
 		const rejectedBatch = { ...batch, id: "reject-history", manifestHash: "" }; rejectedBatch.manifestHash = publicationManifestHash(rejectedBatch);
-		await reviews.registerCandidate(rejectedBatch, OWNER); await reviews.decide({ batchId: rejectedBatch.id, operationId: "reject", actorId: OWNER, decision: "reject", manifestHash: rejectedBatch.manifestHash, expectedBatchRevision: 1, reviewedFiles: [] });
+		await reviews.registerCandidate(rejectedBatch, OWNER); await reviews.decide({ batchId: rejectedBatch.id, operationId: "reject", actorId: OWNER, decision: "reject", manifestHash: rejectedBatch.manifestHash, reviewedFiles: [] });
 		assert.equal((await f.history.list(f.binding.id, "a.md")).versions.length, 1);
 	} finally { await rm(f.root, { recursive: true, force: true }); }
 });

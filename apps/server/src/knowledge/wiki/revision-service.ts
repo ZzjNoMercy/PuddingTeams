@@ -22,19 +22,19 @@ export class WikiRevisionService {
 		const request = record.returnRequest!;
 		await this.deps.bindings.requireUsable(record.ownerId, record.batch.bindingId);
 		const original = await this.original(record);
-		const candidateFiles = await Promise.all(record.batch.files.filter((file) => file.blobRef).map(async (file) => {
-			const bytes = await this.deps.objects.get(file.blobRef!);
+		const candidateFiles = await Promise.all(record.batch.files.filter((file) => file.candidateHash).map(async (file) => {
+			const bytes = await this.deps.objects.get(file.candidateHash!);
 			if (createHash("sha256").update(bytes).digest("hex") !== file.candidateHash) throw new Error("原候选快照校验失败");
-			return { path: file.targetPath, contentHash: file.candidateHash!, snapshotRef: file.blobRef! };
+			return { path: file.targetPath, contentHash: file.candidateHash! };
 		}));
 		const receipt = JSON.parse(record.batch.validationReceipt) as { readEvidence?: Array<{ noteRef?: string; hash?: string }> };
 		const readable = new Map([...original.baseline, ...(original.revision?.acceptedSources ?? [])].map((entry) => [entry.acceptanceId, entry]));
-		const input = { ownerId: record.ownerId, operationId: `revision:${createHash("sha256").update(JSON.stringify([record.batch.id, request.operationId])).digest("hex")}`,
+		const input = { ownerId: record.ownerId, operationId: `revision:${record.batch.id}:${request.operationId}`,
 			bindingId: record.batch.bindingId, agentId: original.agentId, task: original.task, origin: original.origin,
 			revision: { parentBatchId: record.batch.id, parentManifestHash: record.batch.manifestHash, feedback: request.feedback,
 				sourceIds: original.sources.map((source) => source.id), candidateFiles,
 				acceptedSources: [...readable.values()].filter((entry) => {
-					return record.batch.sourceSnapshots.includes(entry.snapshotRef) && receipt.readEvidence?.some((evidence) => evidence.noteRef === entry.acceptanceId && evidence.hash === entry.contentHash);
+					return record.batch.sourceSnapshots.includes(entry.contentHash) && receipt.readEvidence?.some((evidence) => evidence.noteRef === entry.acceptanceId && evidence.hash === entry.contentHash);
 				}) } };
 		const result = await this.deps.curator.create(input);
 		await this.deps.reviews.attachRevisionJob(record.batch.id, request.operationId, result.job.id, result.job.candidateBatchId);

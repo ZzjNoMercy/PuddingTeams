@@ -62,7 +62,6 @@ test("Runtime 在 Driver 启动前把无只读强制能力的 Git 任务路由�
 	assert.equal(outcome.delegation.receipt?.collectionStatus, "complete");
 	assert.equal(outcome.delegation.receipt?.artifactCapture[0]?.status, "captured", "Artifact 必须从隔离执行 cwd 捕获，而不是提前读取目标 checkout");
 	assert.equal(outcome.delegation.receipt?.taskContractHash, frozenContractHash);
-	assert.notEqual(outcome.delegation.receipt?.contractHash, frozenContractHash, "Runtime envelope 还必须绑定 Agent/执行身份");
 	const changeSet = await runtime.getWorkspaceChangeSet(outcome.delegation.workspaceChangeSetId);
 	assert.deepEqual(changeSet?.changedPaths, ["result.txt"]);
 	assert.equal(changeSet?.promotionState, "pending");

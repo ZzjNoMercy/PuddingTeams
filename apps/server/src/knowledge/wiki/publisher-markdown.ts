@@ -2,7 +2,7 @@ import { lstat, link, mkdir, readFile, rename, unlink, writeFile } from "node:fs
 import path from "node:path";
 import { parseNoteFrontmatter, parseNoteFrontmatterFields, type KnowledgeAcceptanceStore } from "../acceptance.js";
 import type { KnowledgeBindingRegistry } from "../bindings.js";
-import { assertReviewMatchesBatch, publicationManifestHash, type KnowledgeBinding, type PublicationBatch, type PublicationFile, type ReviewDecision } from "../contracts.js";
+import { assertReviewMatchesBatch, type KnowledgeBinding, type PublicationBatch, type PublicationFile, type ReviewDecision } from "../contracts.js";
 import { hashBufferSha256 } from "../hashing.js";
 import type { KnowledgeObjectStore } from "../objects.js";
 import { checkedKnowledgeRoot, readNoteBytes, withinKnowledgeRoot, type KnowledgeObservationService } from "../observation.js";
@@ -33,6 +33,7 @@ export interface MarkdownWikiPublisherDeps {
 	/** before-image 等操作产物目录（state/knowledge/operations）。 */
 	operationsDir: string;
 	stepHook?: PublishStepHook;
+	assertSourceCurrent?: (batch: PublicationBatch) => Promise<void>;
 }
 
 interface ResolvedTarget {
@@ -100,7 +101,7 @@ export class MarkdownWikiPublisher implements WikiPublisher {
 		const stored = await this.deps.reviews.get(batch.id);
 		if (!stored) return { accepted: false, note: "批次不存在" };
 		const frozenReview = (await this.deps.reviews.decisionsFor(batch.id)).find((decision) => decision.id === stored.decisionId);
-		if (batch.manifestHash !== stored.batch.manifestHash || publicationManifestHash(batch) !== stored.batch.manifestHash ||
+		if (batch.manifestHash !== stored.batch.manifestHash ||
 			!frozenReview || review.id !== frozenReview.id || JSON.stringify(review) !== JSON.stringify(frozenReview)) {
 			return { accepted: false, note: "发布请求与冻结批次或审核决定不一致" };
 		}
@@ -159,6 +160,8 @@ export class MarkdownWikiPublisher implements WikiPublisher {
 			return this.abortBeforeWrite(batch, operation, `${contextChanges.join("；")}。未写入任何文件，请按当前知识库重新生成候选并审核`, "publish_preflight");
 		}
 		if (!root) return this.abortBeforeWrite(batch, operation, "当前无法访问或确认知识库文件夹，未写入任何文件", "publish_preflight");
+		try { await this.deps.assertSourceCurrent?.(batch); }
+		catch (error) { return this.abortBeforeWrite(batch, operation, error instanceof Error ? error.message : "来源已变化", "publish_preflight"); }
 		try { await assertImageBatchIntegrity(batch, this.deps.objects); }
 		catch (error) { return this.abortBeforeWrite(batch, operation, error instanceof Error ? error.message : "图片批次校验失败", "publish_preflight"); }
 		// 写前预读全部目标基线（P05）：任一冲突 → 未写盘即中止。
@@ -217,7 +220,7 @@ export class MarkdownWikiPublisher implements WikiPublisher {
 
 	private async preflightOne(root: string, file: PublicationFile): Promise<ResolvedTarget> {
 		const absolute = await this.resolveTarget(root, file.targetPath);
-		const candidateBytes = file.blobRef ? await this.deps.objects.get(file.blobRef).catch(() => null) : null;
+		const candidateBytes = file.candidateHash ? await this.deps.objects.get(file.candidateHash).catch(() => null) : null;
 		if (!candidateBytes || hashBufferSha256(candidateBytes) !== file.candidateHash) {
 			return { file, absolute, candidateBytes: Buffer.alloc(0), baselineBytes: null, conflict: "候选字节缺失或已损坏" };
 		}
@@ -334,7 +337,6 @@ export class MarkdownWikiPublisher implements WikiPublisher {
 				...(frontmatter.id ? { declaredNoteId: frontmatter.id } : {}),
 				...(frontmatter.title ? { title: frontmatter.title } : {}),
 				contentHash: file.candidateHash!,
-				snapshotRef: file.candidateHash!,
 				acceptedBy: actorId,
 				summary: reasons[file.targetPath] ?? "审核后发布",
 				sourceIds: Array.isArray(fields.sources) ? fields.sources.filter((value): value is string => typeof value === "string") : [],
@@ -459,7 +461,11 @@ export class MarkdownWikiPublisher implements WikiPublisher {
 				if (file.kind === "image") return classes.get(target) === "applied";
 				return [...Object.values(snapshot.entries), ...Object.values(snapshot.controlEntries ?? {})].some((entry) => entry.relativePath === target && entry.contentHash === file.candidateHash);
 			});
-			if (!inLedger) await this.commitGroup(binding, current, batch, group, current.actorId);
+			if (!inLedger) {
+				try { await this.deps.assertSourceCurrent?.(batch); }
+				catch { continue; } // Stale source: compensate uncommitted bytes below.
+				await this.commitGroup(binding, current, batch, group, current.actorId);
+			}
 			else for (const target of group) {
 				const file = batch.files.find((entry) => entry.targetPath === target)!;
 				if (await this.readDiskHash(await this.resolveTarget(root, target), file.kind) !== file.candidateHash) throw new Error("恢复提交前页面或原图已变化");

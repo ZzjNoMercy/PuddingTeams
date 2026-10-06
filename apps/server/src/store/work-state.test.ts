@@ -9,7 +9,7 @@ function sealedReceipt(state: SessionWorkState, item: WorkItem, delegationId: st
 	return {
 		id: `receipt-${delegationId}`, delegationId, goalId: state.goalId, workPlanId: state.plan?.id, workItemId: item.id,
 		goalRevision: state.goalRevision, workItemRevision: item.revision, goalEpoch: state.execution.epoch,
-		taskContractHash: workItemContractHash(state, state.plan!, item), contractHash: "sha256:runtime-envelope", reportedOutcome: "completed",
+		taskContractHash: workItemContractHash(state, state.plan!, item), reportedOutcome: "completed",
 		requirementResults: item.acceptanceCriteria.map((requirement) => ({ requirement, status: "provided" as const, evidenceRefs: [delegationId] })),
 		artifactCapture: [], collectionStatus: "complete", integrity: "clean", issues: [], sealedAt: new Date().toISOString(),
 	};

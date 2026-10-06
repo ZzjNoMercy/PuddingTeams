@@ -42,7 +42,6 @@ test("受信 CompileJob 在 Driver 首个事件前绑定唯一 Delegation，候�
 		stagingRoot: path.join(root, "staging"), privateRoot: path.join(root, "private"),
 		compilerRef: "@puddingteams/connector-codex", compilerPackageSha256: "a".repeat(64),
 		agentId: "codex", agentRevision: 1, task: "compile", commandPath, commandSha256: digest,
-		baseManifestHash: "b".repeat(64),
 	});
 	let activeJob = job;
 	let requireInput = false;
@@ -121,7 +120,7 @@ test("受信 CompileJob 在 Driver 首个事件前绑定唯一 Delegation，候�
 		stagingRoot: path.join(root, "staging2"), privateRoot: path.join(root, "private2"),
 		compilerRef: job.compilerRef, compilerPackageSha256: job.compilerPackageSha256,
 		agentId: job.agentId, agentRevision: job.agentRevision, task: job.task,
-		commandPath, commandSha256: digest, baseManifestHash: job.baseManifestHash,
+		commandPath, commandSha256: digest,
 	});
 	activeJob = second;
 	requireInput = true;
@@ -137,7 +136,7 @@ test("受信 CompileJob 在 Driver 首个事件前绑定唯一 Delegation，候�
 		stagingRoot: path.join(root, `staging${number}`), privateRoot: path.join(root, `private${number}`),
 		compilerRef: job.compilerRef, compilerPackageSha256: job.compilerPackageSha256,
 		agentId: job.agentId, agentRevision: job.agentRevision, task: job.task,
-		commandPath, commandSha256: digest, baseManifestHash: job.baseManifestHash,
+		commandPath, commandSha256: digest,
 	});
 	for (const name of ["source3", "staging3", "private3"]) await mkdir(path.join(root, name), { mode: 0o700 });
 	await writeFile(path.join(root, "source3", "input.md"), "approved\n");

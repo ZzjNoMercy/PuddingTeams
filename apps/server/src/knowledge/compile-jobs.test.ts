@@ -16,7 +16,6 @@ function input(root: string): NewCompileJob {
 		compilerRef: "@puddingteams/connector-codex", compilerPackageSha256: "a".repeat(64),
 		agentId: "codex", agentRevision: 1, task: "Compile approved source into staging",
 		commandPath: path.join(root, "trusted-codex"), commandSha256: "b".repeat(64),
-		baseManifestHash: "c".repeat(64),
 	};
 }
 

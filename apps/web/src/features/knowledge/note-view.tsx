@@ -262,7 +262,7 @@ export function KnowledgeNoteView(props: NoteViewProps) {
 							{displayed.properties.map(([key, value]) => (
 								<div key={key} className="flex gap-2">
 									<dt className="shrink-0 text-muted-foreground">{propertyLabel(key)}</dt>
-									<dd className="min-w-0 break-words [overflow-wrap:anywhere]">{formatPropertyValue(value)}</dd>
+									<dd className="min-w-0 break-words [overflow-wrap:anywhere]">{key === "calendarEventId" && /^[a-f0-9-]{36}$/.test(value) ? <a className="text-primary underline" href={`/calendar?event=${encodeURIComponent(value)}`}>查看日程</a> : formatPropertyValue(value)}</dd>
 								</div>
 							))}
 						</dl>

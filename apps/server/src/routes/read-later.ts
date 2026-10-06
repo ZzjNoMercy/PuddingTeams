@@ -4,6 +4,7 @@ import {
   ReadLaterError,
   presentItem,
   presentJob,
+  type ArticleVersion,
   type ReadLaterCreate,
   type ReadLaterUpdate,
   type MarkReadInput,
@@ -13,6 +14,11 @@ import type { ReadLaterStore } from "../read-later/store.js";
 import type { ReadLaterCaptureService } from "../read-later/capture-service.js";
 import type { ReadLaterPromoter, PromoteInput } from "../read-later/promote.js";
 import { importSavedHtml } from "../read-later/saved-html.js";
+function presentVersion(version: ArticleVersion | undefined) {
+  if (!version) return version;
+  const { contentHash: _contentHash, ...rest } = version;
+  return { ...rest, assets: version.assets.map(({ hash: _hash, ...asset }) => asset) };
+}
 export function registerReadLaterRoutes(
   app: FastifyInstance,
   deps: {
@@ -121,7 +127,7 @@ export function registerReadLaterRoutes(
       const item = deps.store.get(owner(), req.params.id);
       return {
         item: presentItem(item),
-        version: deps.store.version(owner(), item.id),
+        version: presentVersion(deps.store.version(owner(), item.id)),
         job: presentJob(deps.store.job(owner(), item.latestJobId)),
         promotions: deps.store
           .promotions(owner())

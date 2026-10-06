@@ -44,7 +44,7 @@ test("平台观测替换逐项 placeholder，形成不可伪造 observation 引�
 		criteria: input.criteria.map((criterion) => ({ criterion, status: "satisfied", evidenceRefs: [ENVIRONMENT_OBSERVATION_REF], explanation: "实际检查" })),
 		evidenceRefs: [ENVIRONMENT_OBSERVATION_REF],
 	}), input, meta);
-	const observation = { id: "observation:D-verifier:3", delegationId: "D-verifier", kind: "tool" as const, title: "test completed", contentHash: "sha256:test" };
+	const observation = { id: "observation:D-verifier:3", delegationId: "D-verifier", kind: "tool" as const, title: "test completed" };
 	const bound = bindEnvironmentObservations(parsed, [observation]);
 	assert.equal(bound.status, "passed");
 	assert.deepEqual(bound.criteria.map((criterion) => criterion.evidenceRefs), [[observation.id], [observation.id]]);

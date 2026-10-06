@@ -4,7 +4,8 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import Fastify from "fastify";
-import { CalendarStore } from "../calendar/store.js";
+import { CalendarError, CalendarStore } from "../calendar/store.js";
+import type { CalendarService } from "../calendar/service.js";
 import { registerCalendarRoutes } from "./calendar.js";
 
 const timed = { title: "跨午夜专注", kind: "focus", busy: true, timeZone: "Asia/Shanghai", allDay: false, start: "2026-09-30T23:30:00+08:00", end: "2026-10-01T01:00:00+08:00" };
@@ -27,9 +28,29 @@ test("Calendar CRUD: lost-response replay, conflict, cancellation and cold reope
 		const cancel = { operationId: "cancel-1", expectedRevision: 2 };
 		const cancelled = await app.inject({ method: "DELETE", url, payload: cancel }); assert.equal(cancelled.json().event.status, "cancelled");
 		assert.equal((await app.inject({ method: "DELETE", url, payload: cancel })).statusCode, 200);
-		assert.deepEqual(await new CalendarStore(root).list("owner"), []);
+		const remaining = await new CalendarStore(root).list("owner");
+		assert.equal(remaining.length, 1); assert.equal(remaining[0]!.status, "cancelled");
 		assert.equal((await app.inject({ method: "PUT", url, payload: { operationId: "resurrect", expectedRevision: 3, event: timed } })).statusCode, 409);
 		assert.equal((await app.inject({ method: "GET", url: "/api/calendar/sources" })).json().sources.length, 1);
+	} finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("POST /api/calendar/events/:id/status validates status and maps errors", async () => {
+	const root = await mkdtemp(path.join(tmpdir(), "pt-calendar-status-")); const app = Fastify();
+	const service = {
+		setStatus: async (_owner: string, id: string, _op: unknown, _rev: unknown, status: string) => {
+			if (id === "missing") throw new CalendarError("not_found", "日程不存在");
+			return { id, status, revision: 2 };
+		},
+	} as unknown as CalendarService;
+	registerCalendarRoutes(app, new CalendarStore(root), () => "owner", service);
+	try {
+		const invalid = await app.inject({ method: "POST", url: "/api/calendar/events/e1/status", payload: { status: "archived", operationId: "op", expectedRevision: 1 } });
+		assert.equal(invalid.statusCode, 400); assert.equal(invalid.json().code, "invalid_input");
+		const missing = await app.inject({ method: "POST", url: "/api/calendar/events/missing/status", payload: { status: "done", operationId: "op", expectedRevision: 1 } });
+		assert.equal(missing.statusCode, 404); assert.equal(missing.json().code, "not_found");
+		const ok = await app.inject({ method: "POST", url: "/api/calendar/events/e1/status", payload: { status: "done", operationId: "op", expectedRevision: 1 } });
+		assert.equal(ok.statusCode, 200); assert.equal(ok.json().event.status, "done");
 	} finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 

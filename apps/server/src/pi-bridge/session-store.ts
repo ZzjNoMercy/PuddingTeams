@@ -339,6 +339,8 @@ export class PiSessionStore {
 	setKnowledgeRuntime(service: import("../knowledge/runtime-service.js").KnowledgeRuntimeService): void { this.knowledgeRuntime = service; }
 	private webResearchExtension?: (agentId: string) => InlineExtension;
 	setWebResearchExtension(factory: (agentId: string) => InlineExtension): void { this.webResearchExtension = factory; }
+	private calendarExtension?: (sessionId: () => string) => InlineExtension;
+	setCalendarExtension(factory: (sessionId: () => string) => InlineExtension): void { this.calendarExtension = factory; }
 
 	/**
 	 * System-prompt shaping for a window's manager sessions（提示词管理方案 §5）：
@@ -427,6 +429,7 @@ export class PiSessionStore {
 		}
 		const guidance = PiSessionStore.resolveGuidance(ctx);
 		if (this.webResearchExtension && (!ctx || ctx.type === "solo")) factories.push(this.webResearchExtension((await this.teamsStore?.getManager())?.name ?? "manager"));
+		if (this.calendarExtension && (!ctx || ctx.type !== "direct")) factories.push(this.calendarExtension(getSessionId));
 		// 信任门（§7.2/§6.3）：服务端按窗口 workspaceId 计算三类放行，
 		// 与 manager 自己的资源开关取与；无 workspaceId = 全关。
 		const workspaceAccess = this.teamsStore

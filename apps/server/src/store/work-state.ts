@@ -48,7 +48,6 @@ export interface WorkspaceChangeSet {
 	outputFingerprint: string;
 	changedPaths: string[];
 	diffArtifactId?: string;
-	diffHash?: string;
 	promotionState: "not_required" | "pending" | "applied" | "conflict" | "failed";
 	createdAt: string;
 	promotedAt?: string;
@@ -64,7 +63,6 @@ export interface ExecutionReceipt {
 	workItemRevision?: number;
 	goalEpoch?: number;
 	taskContractHash?: string;
-	contractHash: string;
 	inputFingerprint?: string;
 	reportedOutcome: "completed" | "failed" | "cancelled" | "blocked" | "input_required";
 	requirementResults: Array<{ requirement: string; status: "provided" | "missing" | "unavailable"; evidenceRefs: string[] }>;
@@ -103,7 +101,7 @@ export interface VerificationRecord {
 	outputFingerprint?: string;
 	criteria: VerificationCriterionResult[];
 	evidenceRefs: string[];
-	observations?: Array<{ id: string; delegationId: string; kind: "tool" | "file" | "search"; title: string; contentHash: string; itemId?: string }>;
+	observations?: Array<{ id: string; delegationId: string; kind: "tool" | "file" | "search"; title: string; itemId?: string }>;
 	integrity: "unknown" | "clean" | "suspect" | "violation";
 	failureReason?: string;
 	createdAt: string;
@@ -1000,7 +998,7 @@ export class WorkStateStore {
 							executionReceipt: copy(receipt),
 							...(input.workspaceChangeSet ? { workspaceChangeSetId: input.workspaceChangeSet.id, workspaceChangeSet: copy(input.workspaceChangeSet) } : receipt.workspaceChangeSetId ? { workspaceChangeSetId: receipt.workspaceChangeSetId } : {}),
 							submittedStateRevision: state.revision + 1, goalRevision: state.goalRevision, workItemRevision: item.revision,
-							inputFingerprint: receipt.inputFingerprint ?? hash({ receiptId: receipt.id, contractHash: receipt.contractHash, artifactCapture: receipt.artifactCapture, workspaceChangeSetId: receipt.workspaceChangeSetId }),
+							inputFingerprint: receipt.inputFingerprint ?? hash({ receiptId: receipt.id, taskContractHash: receipt.taskContractHash, artifactCapture: receipt.artifactCapture, workspaceChangeSetId: receipt.workspaceChangeSetId }),
 							verifications: [],
 							...(input.summary?.trim() ? { summary: input.summary.trim() } : {}), submittedAt: timestamp,
 						});
@@ -1641,7 +1639,7 @@ export class WorkStateStore {
 			if (!state) continue;
 			const ids = items.filter((item) => item.goalId === state.goalId && item.goalEpoch === state.execution.epoch).map((item) => item.id).sort();
 			if (!ids.length) continue;
-			const fingerprint = `server_restart:${hash(ids)}`;
+			const fingerprint = `server_restart:${ids.join(",")}`;
 			if (ids.every((id) => state.execution.reconciledRestartDelegationIds?.includes(id))) continue;
 			const after = await this.interruptGoal(sessionId, state.revision, { kind: "server_restart", fingerprint, delegationIds: ids }, `reconcile:${fingerprint}`, state.goalId);
 			if (after.execution.epoch !== state.execution.epoch) interrupted++;

@@ -1,0 +1,226 @@
+[
+  {
+    "id": "v2_tech",
+    "label": "科技伙伴",
+    "category": "专业",
+    "file": "v2_tech.png",
+    "hash": "abac8e4589ef5197e2a66b1e5f83a221e570a065e8a03754f8d2f11efc6bfe03"
+  },
+  {
+    "id": "v2_professional",
+    "label": "专业顾问",
+    "category": "商务",
+    "file": "v2_professional.png",
+    "hash": "b3902467080209e57e02c77d629b71531f3e0828039f07f747ee1e2e53367690"
+  },
+  {
+    "id": "v2_executive",
+    "label": "商务精英",
+    "category": "商务",
+    "file": "v2_executive.png",
+    "hash": "e925a7951903df065ea748a15536f008fa39a46f3b622c9e8e331e1a06b763b6"
+  },
+  {
+    "id": "v2_creative",
+    "label": "创意主理人",
+    "category": "创意",
+    "file": "v2_creative.png",
+    "hash": "6fa41cd3243e3931da017af7eb019c219d944ec519bcf611b9f0426b0e32b47c"
+  },
+  {
+    "id": "v2_doctor",
+    "label": "健康专家",
+    "category": "专业",
+    "file": "v2_doctor.png",
+    "hash": "5d06bed68a489777e50545ed739b1e26afe6f174d2d25a8fefa3a59ea61f2a36"
+  },
+  {
+    "id": "v2_athlete",
+    "label": "运动达人",
+    "category": "活力",
+    "file": "v2_athlete.png",
+    "hash": "51cd28ab82972b93688ea2b9ebdc5d9c1e0200a80af35aff5cbfcb4bbad9016e"
+  },
+  {
+    "id": "v2_hospitality",
+    "label": "服务之星",
+    "category": "生活",
+    "file": "v2_hospitality.png",
+    "hash": "5a58cc0c17de5853d3419a21dcc6bd594f80aadacdc90156af8311d311ef5b5a"
+  },
+  {
+    "id": "v2_consultant",
+    "label": "沉稳顾问",
+    "category": "商务",
+    "file": "v2_consultant.png",
+    "hash": "1618fcf8402f90b06c62b3c38a1a1c6f56f3a3b48c1f602b403330a7e798cfde"
+  },
+  {
+    "id": "v2_analyst",
+    "label": "数据分析师",
+    "category": "专业",
+    "file": "v2_analyst.png",
+    "hash": "129dcafe3bbaa9caa02c111635444abff890eb4de46096ae74694e1a4cbe8926"
+  },
+  {
+    "id": "v2_finance",
+    "label": "金融伙伴",
+    "category": "商务",
+    "file": "v2_finance.png",
+    "hash": "39d1470d97687ba5315cf02946a1f534fd36e3cd37c6e4e60371270e20ef9016"
+  },
+  {
+    "id": "v2_mentor",
+    "label": "资深导师",
+    "category": "专业",
+    "file": "v2_mentor.png",
+    "hash": "6da1c8389e1abd8bfda6abcd3cbec6f6d23d0394f69692891af49382244f924c"
+  },
+  {
+    "id": "v2_founder",
+    "label": "创业伙伴",
+    "category": "活力",
+    "file": "v2_founder.png",
+    "hash": "8af1633b530ffec0ac2571e387141c65727546a463c3894d76e3f7e7c1c17e34"
+  },
+  {
+    "id": "v2_outdoor",
+    "label": "户外玩家",
+    "category": "生活",
+    "file": "v2_outdoor.png",
+    "hash": "1a22214bbf07d51ccfa027d3c22cf79e973917bd6a948e00cd70ff886276324c"
+  },
+  {
+    "id": "v2_musician",
+    "label": "音乐创作者",
+    "category": "创意",
+    "file": "v2_musician.png",
+    "hash": "b4b9493d4e85adcdf99a35e6c412cc3e58687f242acdb59798eb19f79abdb343"
+  },
+  {
+    "id": "v2_educator",
+    "label": "教育工作者",
+    "category": "专业",
+    "file": "v2_educator.png",
+    "hash": "a4a2cff0e820b7fa4c624ae18e9c8088648d61a7ffca3cb18db16808ea684e52"
+  },
+  {
+    "id": "v2_entrepreneur",
+    "label": "青年创业者",
+    "category": "活力",
+    "file": "v2_entrepreneur.png",
+    "hash": "b6e4d4730f0d8e1859644a9ad4395faffb230b2818d0584f1d238fbae559d3f9"
+  },
+  {
+    "id": "orange",
+    "label": "温柔短发",
+    "category": "经典",
+    "file": "orange.png",
+    "hash": "0aa43d39d84d2f659cd5e56b2e8e9d273eb0558967bada53c12e5aea1cdd08a0"
+  },
+  {
+    "id": "blue",
+    "label": "清爽青年",
+    "category": "经典",
+    "file": "blue.png",
+    "hash": "def0c562d351318ab813f3e9fb5bc2d169f78732d7944acd439895fd1c140b8f"
+  },
+  {
+    "id": "green",
+    "label": "知性女性",
+    "category": "经典",
+    "file": "green.png",
+    "hash": "f735b15290db414168e6cbd9b627b7c694e13b11ab160c7bc6749042f9f7a209"
+  },
+  {
+    "id": "pink",
+    "label": "沉稳男士",
+    "category": "经典",
+    "file": "pink.png",
+    "hash": "d56455d7eab30ae83444cc20f99b55e21f6010577ee19d4dac3b9b49f60eb456"
+  },
+  {
+    "id": "purple",
+    "label": "个性青年",
+    "category": "经典",
+    "file": "purple.png",
+    "hash": "56065c8da55440ab5eb08d006b6e92005e8f870e8ed17b41232569d347d8a0bf"
+  },
+  {
+    "id": "cyan",
+    "label": "商务青年",
+    "category": "经典",
+    "file": "cyan.png",
+    "hash": "23039b6f951166cc11cf4c2ef9b4864a4cac088e5cc98cf7d1eb024057de0a44"
+  },
+  {
+    "id": "yellow",
+    "label": "温和学者",
+    "category": "经典",
+    "file": "yellow.png",
+    "hash": "5ad8c217599c7b0338706dc104967148831cf88165b4b753512fd26210f619c3"
+  },
+  {
+    "id": "red",
+    "label": "安静青年",
+    "category": "经典",
+    "file": "red.png",
+    "hash": "77dc5864fc2c1860f8ac71b81881fe657fc86f563f3b0c64a5a5ceb0f231c458"
+  },
+  {
+    "id": "gentle_peach",
+    "label": "温柔桃子",
+    "category": "经典",
+    "file": "gentle_peach.png",
+    "hash": "57d8e274affd811a6f57a7885af1c30b9d11ba57c5db510e56246d9128f4a5d4"
+  },
+  {
+    "id": "magnetic_junyu",
+    "label": "磁性俊宇",
+    "category": "经典",
+    "file": "magnetic_junyu.png",
+    "hash": "6f8e708a4a228cbb71ea656eeebbf1eceb78452ebd55e3914098819935fa22fb"
+  },
+  {
+    "id": "sunny_sweet",
+    "label": "阳光甜妹",
+    "category": "经典",
+    "file": "sunny_sweet.png",
+    "hash": "aca296aafde8b11e1dff4cd763b53f27f83bb2fe1bd73b3323b554082fca83c5"
+  },
+  {
+    "id": "intellectual_tang",
+    "label": "知性小棠",
+    "category": "经典",
+    "file": "intellectual_tang.png",
+    "hash": "e72d9fe9beaaae3eaac1a623bd68c8d61cdcb0be57a98714db09c72ec2a4f5ff"
+  },
+  {
+    "id": "girl_next_door",
+    "label": "邻家女孩",
+    "category": "经典",
+    "file": "girl_next_door.png",
+    "hash": "819375d747d08df737271014fe7914853bb8f971efac1a41abd1b0788e13209d"
+  },
+  {
+    "id": "charming_sophie",
+    "label": "魅力苏菲",
+    "category": "经典",
+    "file": "charming_sophie.png",
+    "hash": "d3bc2bab8ba3f0242da5f3dab349aac29050faf4a66bbd82c4255faea8075728"
+  },
+  {
+    "id": "playful_junior",
+    "label": "撒娇学妹",
+    "category": "经典",
+    "file": "playful_junior.png",
+    "hash": "52803130203ea615fa432984f297dbb4a010237c84eac52d7bcf25f04d76981d"
+  },
+  {
+    "id": "boy_next_door",
+    "label": "邻家男孩",
+    "category": "经典",
+    "file": "boy_next_door.png",
+    "hash": "0b7cf0a7bc7c976b870d6d990d3fd4f33ad823c98cdf9959621167a708dd11bb"
+  }
+]

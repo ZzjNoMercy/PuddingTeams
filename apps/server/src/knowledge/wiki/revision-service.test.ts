@@ -37,7 +37,7 @@ async function fixture() {
 	const revisions = new WikiRevisionService({ reviews, jobs, curator, bindings, objects, publications });
 	const created = await curator.create({ ownerId: OWNER, operationId: "first", bindingId: binding.id, agentId: "wiki", task: "用户资料", origin: { windowId: "original-window", sessionId: "original-session" } }); await curator.waitForIdle();
 	const job = (await jobs.get(created.job.id))!, record = (await reviews.get(job.candidateBatchId!))!;
-	const input = { batchId: record.batch.id, actorId: OWNER, operationId: "return-one", manifestHash: record.batch.manifestHash, expectedBatchRevision: record.revision, feedback: "澄清日期，不要合并同名人物", reviewedFiles: [] };
+	const input = { batchId: record.batch.id, actorId: OWNER, operationId: "return-one", manifestHash: record.batch.manifestHash, feedback: "澄清日期，不要合并同名人物", reviewedFiles: [] };
 	return { root, vault, teams, binding, bindings, jobs, reviews, curator, revisions, objects, acceptance, runtime, sources, job, record, input, publications,
 		setRevisionFailure: (value: boolean) => { failRevision = value; } };
 }
@@ -52,7 +52,7 @@ test("退回生成独立Job/manifest，保留旧候选和真实已阅子集；�
 		assert.deepEqual(revised.sources.slice(0, f.job.sources.length).map((source) => source.id), f.job.sources.map((source) => source.id));
 		assert.equal(revised.sources.length, f.job.sources.length + 1, "修改意见是独立新来源，原件身份保持");
 		assert.equal((await f.sources.readText(OWNER, revised.sources.at(-1)!.id)).text, f.input.feedback);
-		assert.deepEqual(revised.revision?.candidateFiles, f.record.batch.files.map((file) => ({ path: file.targetPath, contentHash: file.candidateHash, snapshotRef: file.blobRef })));
+		assert.deepEqual(revised.revision?.candidateFiles, f.record.batch.files.map((file) => ({ path: file.targetPath, contentHash: file.candidateHash})));
 		assert.equal(batch.batch.parentBatchId, f.record.batch.id); assert.equal(batch.batch.revisionFeedback, f.input.feedback);
 		assert.notEqual(publicationManifestHash({ ...batch.batch, revisionFeedback: "其他反馈" }), batch.batch.manifestHash);
 		const old = (await f.reviews.get(f.record.batch.id))!;
@@ -61,7 +61,7 @@ test("退回生成独立Job/manifest，保留旧候选和真实已阅子集；�
 		const replay = await new WikiRevisionService({ ...f, curator: f.curator }).request(f.input);
 		assert.equal(replay.replayed, true); assert.equal(replay.job.id, revised.id);
 		await assert.rejects(f.revisions.request({ ...f.input, feedback: "不同反馈" }), /operationId/);
-		await assert.rejects(f.reviews.decide({ batchId: old.batch.id, operationId: "late-approve", actorId: OWNER, decision: "approve", manifestHash: old.batch.manifestHash, expectedBatchRevision: old.revision, reviewedFiles: ["note.md"] }));
+		await assert.rejects(f.reviews.decide({ batchId: old.batch.id, operationId: "late-approve", actorId: OWNER, decision: "approve", manifestHash: old.batch.manifestHash, reviewedFiles: ["note.md"] }));
 		assert.deepEqual(await readdir(f.vault), []);
 	} finally { await f.curator.waitForIdle(); await rm(f.root, { recursive: true, force: true }); }
 });
@@ -92,8 +92,8 @@ test("退回落账后创建Job失败可恢复，恢复两次只有一个新Job�
 		assert.equal((await f.jobs.list()).length, 2); assert.ok((await f.reviews.get(f.record.batch.id))?.returnRequest?.jobId);
 		const child = (await f.reviews.list()).find((batch) => batch.batch.parentBatchId === f.record.batch.id)!;
 		const race = await Promise.allSettled([
-			f.reviews.returnForRevision({ ...f.input, batchId: child.batch.id, operationId: "race-return", manifestHash: child.batch.manifestHash, expectedBatchRevision: child.revision }),
-			f.reviews.decide({ batchId: child.batch.id, operationId: "race-approve", actorId: OWNER, decision: "approve", manifestHash: child.batch.manifestHash, expectedBatchRevision: child.revision, reviewedFiles: ["note.md"] }),
+			f.reviews.returnForRevision({ ...f.input, batchId: child.batch.id, operationId: "race-return", manifestHash: child.batch.manifestHash}),
+			f.reviews.decide({ batchId: child.batch.id, operationId: "race-approve", actorId: OWNER, decision: "approve", manifestHash: child.batch.manifestHash, reviewedFiles: ["note.md"] }),
 		]);
 		assert.equal(race.filter((result) => result.status === "fulfilled").length, 1); assert.equal(race.filter((result) => result.status === "rejected").length, 1);
 		assert.deepEqual(await readdir(f.vault), []);
@@ -105,7 +105,7 @@ test("revision HTTP权限、反馈校验、幂等重放；client私有source/rev
 	try {
 		registerWikiCuratorRoutes(app, { ...f, service: f.curator, revisions: f.revisions });
 		const url = `/api/wiki/batches/${encodeURIComponent(f.record.batch.id)}/revisions`;
-		const body = { operationId: f.input.operationId, manifestHash: f.input.manifestHash, expectedBatchRevision: f.input.expectedBatchRevision, feedback: f.input.feedback, reviewedFiles: [] };
+		const body = { operationId: f.input.operationId, manifestHash: f.input.manifestHash, feedback: f.input.feedback, reviewedFiles: [] };
 		assert.equal((await app.inject({ method: "POST", url, payload: { ...body, feedback: "" } })).statusCode, 400);
 		assert.equal((await app.inject({ method: "POST", url, payload: { ...body, reviewedFiles: ["other.md"] } })).statusCode, 409);
 		const result = await app.inject({ method: "POST", url, payload: { ...body, revision: { sourceIds: ["forged"] } } }); assert.equal(result.statusCode, 202);
@@ -120,7 +120,7 @@ test("连续退回保留已离开当前基线但经实际阅读的旧采纳来�
 	let curator: WikiCuratorService | undefined;
 	try {
 		const original = await f.objects.put(Buffer.from("# fixed accepted A\n"));
-		await f.acceptance.adopt(f.binding.id, [{ relativePath: "source.md", contentHash: original.hash, snapshotRef: original.hash, acceptedBy: OWNER }], 0);
+		await f.acceptance.adopt(f.binding.id, [{ relativePath: "source.md", contentHash: original.hash, acceptedBy: OWNER }], 0);
 		const source = Object.values((await f.acceptance.getSnapshot(f.binding.id)).entries)[0]!;
 		curator = new WikiCuratorService({ ...f, cacheDir: path.join(f.root, "cache"), generate: async (job, surface, submit) => {
 			const result = await surface.tools.find((tool) => tool.name === "knowledge_read")!.execute("read", { bindingId: f.binding.id, noteRef: source.acceptanceId }, undefined, undefined, {} as never);
@@ -131,11 +131,11 @@ test("连续退回保留已离开当前基线但经实际阅读的旧采纳来�
 		const created = await curator.create({ ownerId: OWNER, operationId: "chain", bindingId: f.binding.id, agentId: "wiki", task: "据A整理" }); await curator.waitForIdle();
 		let job = (await f.jobs.get(created.job.id))!;
 		const newer = await f.objects.put(Buffer.from("# accepted B\n"));
-		await f.acceptance.adopt(f.binding.id, [{ relativePath: "source.md", contentHash: newer.hash, snapshotRef: newer.hash, acceptedBy: OWNER }], 1);
+		await f.acceptance.adopt(f.binding.id, [{ relativePath: "source.md", contentHash: newer.hash, acceptedBy: OWNER }], 1);
 		for (const number of [1, 2]) {
 			const record = (await f.reviews.get(job.candidateBatchId!))!;
 			const result = await service.request({ batchId: record.batch.id, actorId: OWNER, operationId: `chain-return-${number}`, manifestHash: record.batch.manifestHash,
-				expectedBatchRevision: record.revision, feedback: `修订${number}`, reviewedFiles: [] }); await curator.waitForIdle(); job = (await f.jobs.get(result.job.id))!;
+				feedback: `修订${number}`, reviewedFiles: [] }); await curator.waitForIdle(); job = (await f.jobs.get(result.job.id))!;
 			assert.equal(job.status, "pending_review", JSON.stringify(job));
 			assert.equal(job.revision?.acceptedSources?.[0]?.acceptanceId, source.acceptanceId);
 			assert.equal(job.baseline[0]?.contentHash, newer.hash);
@@ -145,7 +145,7 @@ test("连续退回保留已离开当前基线但经实际阅读的旧采纳来�
 });
 
 async function makeConflict(f: Awaited<ReturnType<typeof fixture>>, uncertain = false) {
-	const decision = await f.reviews.decide({ batchId: f.record.batch.id, actorId: OWNER, operationId: "original-approve", decision: "approve", manifestHash: f.record.batch.manifestHash, expectedBatchRevision: f.record.revision, reviewedFiles: f.record.batch.files.map(file => file.targetPath) });
+	const decision = await f.reviews.decide({ batchId: f.record.batch.id, actorId: OWNER, operationId: "original-approve", decision: "approve", manifestHash: f.record.batch.manifestHash, reviewedFiles: f.record.batch.files.map(file => file.targetPath) });
 	const operation = (await f.publications.begin({ batch: f.record.batch, ownerId: OWNER, actorId: OWNER, reviewId: decision.decision.id, idempotencyKey: decision.decision.id })).record;
 	await f.publications.setRunning(operation.id); await f.reviews.markPublishing(f.record.batch.id);
 	await f.publications.settle(operation.id, uncertain ? "unknown" : "conflict", uncertain ? "结果未知" : "结构已变化，零写入");
@@ -177,7 +177,7 @@ test("未知发布结果不允许重新整理，关闭与重新整理竞态只�
 		await f.publications.settle(operation.id, "conflict");
 		const race = await Promise.allSettled([
 			f.revisions.request(f.input),
-			f.reviews.closeConflict({ batchId: f.record.batch.id, actorId: OWNER, operationId: "close", manifestHash: f.record.batch.manifestHash, expectedBatchRevision: f.record.revision }),
+			f.reviews.closeConflict({ batchId: f.record.batch.id, actorId: OWNER, operationId: "close", manifestHash: f.record.batch.manifestHash}),
 		]);
 		assert.equal(race.filter(result => result.status === "fulfilled").length, 1);
 		assert.equal(race.filter(result => result.status === "rejected").length, 1);

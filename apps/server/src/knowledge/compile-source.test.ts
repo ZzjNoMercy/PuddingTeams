@@ -23,8 +23,8 @@ test("compiler source contains only selected accepted object bytes", async () =>
 	const first = await objects.put(Buffer.from("# Accepted\n"));
 	const second = await objects.put(Buffer.from("# Unselected\n"));
 	await acceptance.adopt(binding.id, [
-		{ relativePath: "notes/first.md", contentHash: first.hash, snapshotRef: first.hash, acceptedBy: "owner" },
-		{ relativePath: "notes/second.md", contentHash: second.hash, snapshotRef: second.hash, acceptedBy: "owner" },
+		{ relativePath: "notes/first.md", contentHash: first.hash, acceptedBy: "owner" },
+		{ relativePath: "notes/second.md", contentHash: second.hash, acceptedBy: "owner" },
 	], 0);
 	const ledger = await acceptance.getSnapshot(binding.id);
 	const id = Object.values(ledger.entries).find((entry) => entry.relativePath === "notes/first.md")!.acceptanceId;
@@ -49,7 +49,7 @@ test("compiler source rejects forged acceptance, unsafe paths, and object corrup
 	const observation = new KnowledgeObservationService(acceptance, { objects });
 	const object = await objects.put(Buffer.from("# Accepted\n"));
 	await acceptance.adopt(binding.id, [
-		{ relativePath: "safe.md", contentHash: object.hash, snapshotRef: object.hash, acceptedBy: "owner" },
+		{ relativePath: "safe.md", contentHash: object.hash, acceptedBy: "owner" },
 	], 0);
 	const ledger = await acceptance.getSnapshot(binding.id);
 	const entry = Object.values(ledger.entries)[0]!;
@@ -76,7 +76,7 @@ test("compiler source rejects forged acceptance, unsafe paths, and object corrup
 	await assert.rejects(materializeCompileSource(parent, ledger, [entry.acceptanceId], objects, binding, observation, acceptance), /内容校验失败|同哈希不同内容/);
 	await writeFile(object.path, "# Accepted\n");
 	await acceptance.adopt(binding.id, [
-		{ relativePath: "safe.md", contentHash: object.hash, snapshotRef: object.hash, acceptedBy: "owner" },
+		{ relativePath: "safe.md", contentHash: object.hash, acceptedBy: "owner" },
 	], (await acceptance.getSnapshot(binding.id)).acceptanceRevision);
 	await assert.rejects(materializeCompileSource(parent, ledger, [entry.acceptanceId], objects, binding, observation, acceptance), /accepted source authority changed/);
 });

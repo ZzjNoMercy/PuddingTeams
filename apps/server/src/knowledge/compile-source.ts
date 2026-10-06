@@ -43,7 +43,7 @@ export async function materializeCompileSource(
 	const selected = acceptanceIds.map((id) => {
 		const entry = byId.get(id);
 		if (!entry || entry.noteIdentity.bindingId !== ledger.bindingId || entry.availability !== "current" ||
-			!/^([a-f0-9]{64})$/.test(entry.contentHash) || entry.snapshotRef !== entry.contentHash) {
+			!/^([a-f0-9]{64})$/.test(entry.contentHash)) {
 			throw new Error("CompileJob source is not an accepted object for this binding");
 		}
 		const acceptedRelative = entry.relativePath.normalize("NFC");
@@ -76,7 +76,7 @@ export async function materializeCompileSource(
 		const latest = await acceptance.getSnapshot(binding.id);
 		if (latest.acceptanceRevision !== ledger.acceptanceRevision || selected.some(({ id, entry }) =>
 			!Object.values(latest.entries).some((candidate) => candidate.acceptanceId === id &&
-				candidate.contentHash === entry.contentHash && candidate.snapshotRef === entry.snapshotRef &&
+				candidate.contentHash === entry.contentHash &&
 				candidate.relativePath === entry.relativePath && candidate.availability === "current"))) {
 			throw new Error("CompileJob accepted source authority changed");
 		}
@@ -88,7 +88,7 @@ export async function materializeCompileSource(
 	try {
 		let totalBytes = 0;
 		for (const { entry, relative } of selected) {
-			const content = await objects.get(entry.snapshotRef);
+			const content = await objects.get(entry.contentHash);
 			totalBytes += content.byteLength;
 			if (totalBytes > 64 * 1024 * 1024) throw new Error("CompileJob source exceeds 64 MiB");
 			let directory = path.dirname(path.join(root, relative));
@@ -108,7 +108,7 @@ export async function materializeCompileSource(
 		return {
 			root,
 			sourceAcceptanceIds: selected.map(({ id }) => id),
-			sourceSnapshotRefs: selected.map(({ entry }) => entry.snapshotRef),
+			sourceSnapshotRefs: selected.map(({ entry }) => entry.contentHash),
 			sourceSnapshotHash: await fingerprintCompileSnapshot(root),
 		};
 	} catch (error) {

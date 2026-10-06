@@ -76,7 +76,6 @@ export function CollaborationTrustAxes({ source, compact = false }: { source: Co
 			</div>
 			{!compact && receipt ? <div className="collaboration-receipt-meta">
 				<span>Receipt {receipt.sealedAt ? "sealed" : "已记录"}</span>
-				{receipt.contractHash ? <code title={receipt.contractHash}>contract {receipt.contractHash.slice(0, 12)}…</code> : null}
 				{receipt.collectionStatus ? <span>证据 {receipt.collectionStatus === "complete" ? "完整" : receipt.collectionStatus === "partial" ? "部分" : "失败"}</span> : null}
 				{receipt.integrity && receipt.integrity !== "clean" ? <span className="is-warning">integrity {receipt.integrity}</span> : null}
 			</div> : null}

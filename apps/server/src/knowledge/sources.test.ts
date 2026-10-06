@@ -97,9 +97,10 @@ test("sources：manifest固定原件/文本/定位/来源，顺序稳定且跨�
 	const first = await store.createText("owner", "# First", { sessionId: "one" });
 	const second = await store.createText("owner", "# Second");
 	const frozen = await store.manifest("owner", [first.id, second.id]);
-	assert.equal(frozen.manifestHash, (await store.manifest("owner", [second.id, first.id])).manifestHash);
-	assert.notEqual(frozen.manifestHash, knowledgeSourceManifestHash([{ ...first, origin: { sessionId: "changed" } }, second]));
-	assert.notEqual(frozen.manifestHash, knowledgeSourceManifestHash([{ ...first, locations: [{ kind: "lines", startLine: 2, endLine: 2 }] }, second]));
+	const reversed = await store.manifest("owner", [second.id, first.id]);
+	assert.equal(knowledgeSourceManifestHash(frozen.sources), knowledgeSourceManifestHash(reversed.sources));
+	assert.notEqual(knowledgeSourceManifestHash(frozen.sources), knowledgeSourceManifestHash([{ ...first, origin: { sessionId: "changed" } }, second]));
+	assert.notEqual(knowledgeSourceManifestHash(frozen.sources), knowledgeSourceManifestHash([{ ...first, locations: [{ kind: "lines", startLine: 2, endLine: 2 }] }, second]));
 	await assert.rejects(() => store.manifest("owner", [first.id, first.id]), KnowledgeSourceError);
 	await assert.rejects(() => store.manifest("other", [first.id]), KnowledgeSourceError);
 	const originalGet = objects.get.bind(objects);

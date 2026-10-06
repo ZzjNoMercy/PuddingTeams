@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { KnowledgeObjectStore } from "./objects.js";
 
 test("objects.put 按 sha256 分桶落盘，get 原样取回", async () => {
@@ -39,6 +40,16 @@ test("objects.put 同路径异内容视为冲突抛 integrity_error", async () =
 	// 同内容再 put 命中同一哈希路径，但磁盘字节已被篡改 → 冲突。
 	await assert.rejects(() => store.put(Buffer.from("original")), { code: "integrity_error" });
 	await assert.rejects(() => store.get(hash), { code: "integrity_error" });
+});
+
+test("objects.put 合法预计算哈希直接复用，非法值回退重算", async () => {
+	const dir = await mkdtemp(path.join(tmpdir(), "pt-objects-known-"));
+	const store = new KnowledgeObjectStore(dir);
+	const content = Buffer.from("known bytes");
+	const hash = createHash("sha256").update(content).digest("hex");
+	assert.equal((await store.put(content, hash)).hash, hash);
+	assert.equal((await store.put(content, "not-a-hash")).hash, hash);
+	await assert.rejects(() => store.put(Buffer.from("different bytes"), hash), { code: "integrity_error" });
 });
 
 test("objects.get 非法哈希与缺失对象分别抛 invalid_input / not_found", async () => {

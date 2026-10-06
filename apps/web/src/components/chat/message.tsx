@@ -282,14 +282,10 @@ function workerStatusBadge(status?: string) {
 }
 
 /**
- * 展开/折叠时把卡片钉在原地：stopScroll() 解除 StickToBottom 吸底（内容变高时
- * 它的 ResizeObserver 会吸住底部，把被点的卡片顶到视口上方），同时记录卡片
- * 顶部的视口位置，React 提交后按位移补偿 scrollTop。只 stopScroll 不够——
- * 收起内容（负向 resize）时 use-stick-to-bottom 的 ResizeObserver 在
- * isNearBottom 下会重新吸底（setEscapedFromLock(false) + setIsAtBottom(true)），
- * 随后任何新内容都会把视口拽到底部，用户找不到刚才点的卡片。补偿滚动本身
- * 会触发 scroll 事件，方向向上，库会保持 escaped 状态，不会误吸底；
- * isNearBottom 不受影响，「回到底部」浮钮也不会误现。
+ * 展开/折叠时把卡片钉在原地：stopScroll() 暂停共享 Conversation 的底部跟随，
+ * 同时记录卡片顶部的视口位置，React 提交后按位移补偿 scrollTop。
+ * 阅读暂停意图由 Conversation 独立保持，不因负向 resize 的近底部重锁失效；
+ * 这里的补偿只处理布局变化导致的卡片位移，不负责恢复自动跟随。
  */
 function useAnchorPreservingToggle<T extends HTMLElement>() {
 	const { stopScroll, scrollRef } = useStickToBottomContext();

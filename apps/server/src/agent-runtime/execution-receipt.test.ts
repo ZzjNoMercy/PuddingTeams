@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-	executionContractHash,
 	sealExecutionReceipt,
 	type ReceiptContractSnapshot,
 } from "./execution-receipt.js";
@@ -30,14 +29,6 @@ function contract(overrides: Partial<ReceiptContractSnapshot> = {}): ReceiptCont
 		...overrides,
 	};
 }
-
-test("contract hash 对字段顺序稳定，冻结契约变化必然改变", () => {
-	const first = executionContractHash(contract());
-	const second = executionContractHash({ ...contract(), evidenceRequirements: ["提供测试结果"] });
-	const changed = executionContractHash(contract({ workItemRevision: 4 }));
-	assert.equal(first, second);
-	assert.notEqual(first, changed);
-});
 
 test("sealed Receipt 区分上游报告与 Runtime Artifact 捕获", () => {
 	const receipt = sealExecutionReceipt({

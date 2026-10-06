@@ -6,6 +6,7 @@ import type { KnowledgeAcceptanceStore } from "./acceptance.js";
 import { hashBufferSha256, MAX_HASH_BYTES } from "./hashing.js";
 import { withKnowledgeMutation } from "./mutation-lock.js";
 import { readNoteBytes, resolveNoteAbsolutePath, type KnowledgeObservationService } from "./observation.js";
+import { persistKnowledgeImage, type KnowledgeImageAsset } from "./assets.js";
 
 export class NoteWriteError extends Error {
 	constructor(readonly code: "invalid_input" | "baseline_conflict" | "too_large", message: string) { super(message); }
@@ -13,7 +14,7 @@ export class NoteWriteError extends Error {
 
 /** Human edits change the registered Markdown file directly; never create an Agent candidate. */
 export async function writeKnowledgeNote(registry: KnowledgeBindingRegistry, observation: KnowledgeObservationService, acceptance: KnowledgeAcceptanceStore,
-	ownerId: string, bindingId: string, input: { path: string; content: string; expectedHash: string }) {
+	ownerId: string, bindingId: string, input: { path: string; content: string; expectedHash: string }, avatarAsset?: KnowledgeImageAsset) {
 	if (typeof input.path !== "string" || typeof input.content !== "string" || !/^[a-f0-9]{64}$/.test(input.expectedHash ?? "")) {
 		throw new NoteWriteError("invalid_input", "保存需要笔记内容和当前文件版本");
 	}
@@ -28,6 +29,10 @@ export async function writeKnowledgeNote(registry: KnowledgeBindingRegistry, obs
 		const before = await lstat(target);
 		if (before.nlink !== 1) throw new NoteWriteError("invalid_input", "此文件为硬链接，请在本地编辑器中修改");
 		if (hashBufferSha256(await readNoteBytes(target)) !== input.expectedHash) throw new NoteWriteError("baseline_conflict", "笔记已被其他操作修改。你的草稿已保留，请重新打开最新版本后再保存");
+		if (avatarAsset) {
+			registry.assertCurrentRevision(ownerId, bindingId, binding);
+			await persistKnowledgeImage(binding, avatarAsset);
+		}
 		const temporary = path.join(path.dirname(target), `.note-edit-${randomUUID()}.tmp`);
 		const contentHash = hashBufferSha256(bytes);
 		let operationId: string | undefined, written = false;
@@ -38,7 +43,7 @@ export async function writeKnowledgeNote(registry: KnowledgeBindingRegistry, obs
 			const latest = await lstat(target);
 			if (latest.dev !== before.dev || latest.ino !== before.ino || latest.nlink !== 1 || latest.mtimeMs !== before.mtimeMs ||
 				hashBufferSha256(await readNoteBytes(target)) !== input.expectedHash) throw new NoteWriteError("baseline_conflict", "笔记在保存期间发生变化。你的草稿已保留，请重新打开最新版本");
-			operationId = await acceptance.prepareManualEdit(bindingId, input.path, input.expectedHash, contentHash, ownerId);
+			operationId = await acceptance.prepareManualEdit(bindingId, input.path, contentHash, ownerId);
 			// Recheck disk after durable intent persistence, before the actual effect.
 			await resolveNoteAbsolutePath(binding, input.path);
 			const finalIdentity = await lstat(target);

@@ -6,8 +6,8 @@ function fixture(): { batch: PublicationBatch; review: ReviewDecision } {
 	const batch: PublicationBatch = {
 		id: "batch-1", revision: 1, bindingId: "binding-1", manifestHash: "", rootIdentity: "device:inode",
 		files: [
-			{ operation: "create", targetPath: "wiki/a.md", expectedHashOrAbsent: null, candidateHash: "a".repeat(64), blobRef: "blob-a" },
-			{ operation: "update", targetPath: "wiki/b.md", expectedHashOrAbsent: "b".repeat(64), candidateHash: "c".repeat(64), blobRef: "blob-b" },
+			{ operation: "create", targetPath: "wiki/a.md", expectedHashOrAbsent: null, candidateHash: "a".repeat(64) },
+			{ operation: "update", targetPath: "wiki/b.md", expectedHashOrAbsent: "b".repeat(64), candidateHash: "c".repeat(64) },
 		],
 		sourceSnapshots: ["source-1"], schemaHash: "schema-1", bindingRevision: 2, trustRevision: 3,
 		dependencyGroups: [["wiki/a.md", "wiki/b.md"]], validationReceipt: "receipt-1", compilerVersion: "1", status: "pending_review",

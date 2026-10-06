@@ -33,7 +33,7 @@ const job = await jobs.create({
   stagingRoot: path.join(root, 'staging'), privateRoot: path.join(root, 'private'),
   compilerRef: '@puddingteams/connector-codex', compilerPackageSha256: probePackageDigest,
   agentId: 'codex', agentRevision: 1, task: 'Read the approved source and answer with OK. Do not access any other directory.',
-  commandPath: command, commandSha256, baseManifestHash: 'b'.repeat(64),
+  commandPath: command, commandSha256,
 });
 const delegations = new DelegationStore(path.join(root, 'state')); await delegations.init();
 const secrets = new InteractionSecretStore(path.join(root, 'state')); await secrets.init();

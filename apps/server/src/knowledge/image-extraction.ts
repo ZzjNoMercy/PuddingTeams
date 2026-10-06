@@ -8,7 +8,7 @@ export interface ImageSegment { text: string; region?: ImageRegion; warnings: st
 export interface ImageExtractionArtifact {
 	version: 1; extractorId: "pi-vision"; extractorVersion: "1"; modelRef: string;
 	originalHash: string; width: number; height: number; segments: ImageSegment[];
-	warnings: string[]; createdAt: string; configHash: string;
+	warnings: string[]; createdAt: string;
 }
 
 /** Inspect dimensions without decoding or executing image content. */
@@ -102,9 +102,6 @@ export async function extractImageWithPi(input: {
 	input.registerAbort?.(() => session.abort());
 	try {
 		if (!session.model?.input.includes("image")) throw new Error("Wiki 管理员当前模型不支持图片，请更换支持视觉的模型后重试");
-		const configHash = createHash("sha256").update(JSON.stringify(["pi-vision-v1", systemPrompt, "region-normalized-v1", "no-tools", "max-segments-100-text-64KiB",
-			{ provider: session.model.provider, id: session.model.id, api: session.model.api, baseUrl: session.model.baseUrl, input: session.model.input, maxTokens: session.model.maxTokens,
-				contextWindow: session.model.contextWindow, reasoning: session.model.reasoning, compat: session.model.compat ?? null }])).digest("hex");
 		const stream = session.agent.streamFunction;
 		session.agent.streamFunction = async (...args) => { await input.assertCurrent(); return stream(...args); };
 		session.agent.shouldStopAfterTurn = () => true;
@@ -118,7 +115,7 @@ export async function extractImageWithPi(input: {
 		const text = message.content.filter((block) => block.type === "text").map((block) => block.type === "text" ? block.text : "").join("");
 		const parsed = parseImageExtraction(text);
 		return { version: 1, extractorId: "pi-vision", extractorVersion: "1", modelRef: `${session.model.provider}/${session.model.id}`, originalHash: input.originalHash,
-			configHash, ...dimensions, ...parsed, warnings: [...parsed.warnings, "视觉模型提取为待核对衍生内容；区域为近似定位，不代表事实已被确认。",
+			...dimensions, ...parsed, warnings: [...parsed.warnings, "视觉模型提取为待核对衍生内容；区域为近似定位，不代表事实已被确认。",
 				...(input.mediaType === "image/gif" ? ["GIF仅作为静态图片提取，不保证覆盖动画中的所有帧。"] : [])], createdAt: new Date().toISOString() };
 	} finally { clearTimeout(timer); input.registerAbort?.(undefined); session.dispose(); }
 }

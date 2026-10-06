@@ -80,13 +80,15 @@ export async function assertImageBatchIntegrity(batch: PublicationBatch, objects
 	const sources = [...(receipt.sources ?? []), ...(receipt.historicalSources ?? [])];
 	const referenced = new Set<string>();
 	for (const asset of assets) {
-		const bytes = await objects.get(asset.blobRef!); assertImageAssetBytes(asset.targetPath, bytes, asset.mediaType);
-		if (hashBufferSha256(bytes) !== asset.candidateHash || !batch.sourceSnapshots.includes(asset.candidateHash!)) throw new Error("图片原件不在固定来源快照内");
+		const bytes = await objects.get(asset.candidateHash!); assertImageAssetBytes(asset.targetPath, bytes, asset.mediaType);
+		// assertImageAssetBytes 已证明 targetPath 内嵌的哈希等于本次字节哈希；再与登记时的 candidateHash 交叉比对。
+		const bytesHash = path.posix.basename(asset.targetPath).replace(/\.[a-z0-9]+$/, "");
+		if (bytesHash !== asset.candidateHash || !batch.sourceSnapshots.includes(asset.candidateHash!)) throw new Error("图片原件不在固定来源快照内");
 		if (!asset.sourceIds?.length || asset.sourceIds.some((id) => !sources.some((source) => source.id === id && ((source.kind === "image" && source.originalHash === asset.candidateHash && source.mediaType === asset.mediaType) || source.assets?.some(image => image.hash === asset.candidateHash && image.mediaType === asset.mediaType))))) throw new Error("图片资产原件来源不一致");
 	}
 	for (const group of batch.dependencyGroups) for (const [index, target] of group.entries()) {
 		const file = batch.files.find((file) => file.targetPath === target)!; if (file.kind === "image" || file.operation === "delete") continue;
-		const content = (await objects.get(file.blobRef!)).toString("utf8");
+		const content = (await objects.get(file.candidateHash!)).toString("utf8");
 		const fields = parseNoteFrontmatterFields(content);
 		for (const image of markdownImageTargets(content)) {
 			const targetPath = resolveImagePath(file.targetPath, image), asset = assets.find((asset) => asset.targetPath === targetPath);

@@ -28,7 +28,6 @@ function buildBatch(files: Array<{ targetPath: string; content: string; operatio
 			operation: file.operation ?? "create",
 			expectedHashOrAbsent: (file.operation ?? "create") === "create" ? null : "b".repeat(64),
 			candidateHash: createHash("sha256").update(file.content).digest("hex"),
-			blobRef: createHash("sha256").update(file.content).digest("hex"),
 		})),
 		sourceSnapshots: ["snapshot-1"],
 		bindingRevision: 1,
@@ -54,7 +53,6 @@ function decideInput(batch: PublicationBatch, overrides: Record<string, unknown>
 		actorId: OWNER,
 		decision: "approve" as const,
 		manifestHash: batch.manifestHash,
-		expectedBatchRevision: 1,
 		reviewedFiles: batch.files.map((file) => file.targetPath),
 		...overrides,
 	};
@@ -82,13 +80,13 @@ test("review-store：候选转正、幂等重放与内容代际失效", async ()
 	assert.equal(bumped.record.status, "pending_review");
 	assert.equal(bumped.record.decidedAt, undefined);
 	assert.equal(bumped.record.decisionId, undefined);
-	// 旧代际三元组被拒：manifestHash 过期 / revision 过期都一样
+	// 旧代际被拒：过期 manifestHash 即拒（批次号已在 manifest 载荷内）
 	await assert.rejects(() => store.decide(decideInput(batch)), (error: unknown) =>
 		error instanceof ReviewStoreError && error.code === "conflict");
-	await assert.rejects(() => store.decide(decideInput(v2, { expectedBatchRevision: 1 })), (error: unknown) =>
+	await assert.rejects(() => store.decide(decideInput(v2, { manifestHash: batch.manifestHash })), (error: unknown) =>
 		error instanceof ReviewStoreError && error.code === "conflict");
 	// 新代际可审
-	const decided = await store.decide(decideInput(v2, { expectedBatchRevision: 2 }));
+	const decided = await store.decide(decideInput(v2));
 	assert.equal(decided.record.status, "approved");
 	assert.equal(decided.record.batch.status, "approved");
 });
@@ -172,14 +170,14 @@ test("review-store：24 小时审核窗，超期转入 conflict 且决定被拒"
 	const listed = await store.list();
 	assert.equal(listed.find((record) => record.batch.id === stale.id)!.status, "conflict");
 	assert.equal(listed.find((record) => record.batch.id === batch.id)!.status, "approved", "已决批次不受超期影响");
-	await assert.rejects(() => store.decide(decideInput(stale, { expectedBatchRevision: 1 })),
+	await assert.rejects(() => store.decide(decideInput(stale)),
 		(error: unknown) => error instanceof ReviewStoreError && error.code === "expired",
 		"懒过期落盘后的 decide 仍应还原为 expired 语义");
 	// 超窗瞬间（恰好在 pending_review 时跨过窗口）decide 抛 expired
 	const expiring = buildBatch([{ targetPath: "c.md", content: "z" }]);
 	await store.registerCandidate(expiring, OWNER);
 	now += 25 * 60 * 60 * 1000;
-	await assert.rejects(() => store.decide(decideInput(expiring, { expectedBatchRevision: 1 })),
+	await assert.rejects(() => store.decide(decideInput(expiring)),
 		(error: unknown) => error instanceof ReviewStoreError && error.code === "expired");
 	assert.equal((await store.get(expiring.id))!.status, "conflict", "expired 决定已把批次落盘为 conflict");
 });
@@ -193,8 +191,6 @@ test("review-store：输入校验与缺失批次", async () => {
 	await assert.rejects(() => store.registerCandidate({ ...batch, manifestHash: "0".repeat(64) }, OWNER));
 	await store.registerCandidate(batch, OWNER);
 	await assert.rejects(() => store.decide(decideInput(batch, { manifestHash: "not-a-hash" })), (error: unknown) =>
-		error instanceof ReviewStoreError && error.code === "invalid_input");
-	await assert.rejects(() => store.decide(decideInput(batch, { expectedBatchRevision: 0 })), (error: unknown) =>
 		error instanceof ReviewStoreError && error.code === "invalid_input");
 });
 

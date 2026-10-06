@@ -381,7 +381,7 @@ Manager 显性规划
         "interruption": {
           "id": "INT1",
           "kind": "server_restart",
-          "fingerprint": "sha256:...",
+          "fingerprint": "server_restart:D3",
           "delegationIds": ["D3"],
           "interruptedAt": "2026-08-21T10:35:00.000Z"
         }

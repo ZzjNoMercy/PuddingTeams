@@ -9,7 +9,7 @@ import type { KnowledgeSourceStore } from "./sources.js";
 
 export interface ChatSourceRefs { operationId: string; sourceIds: string[]; }
 interface Intake extends ChatSourceRefs { ownerId: string; sessionId: string; requestHash: string; userEntryId?: string; unsupportedNames: string[]; }
-const hash = (value: string) => createHash("sha256").update(value).digest("hex");
+const hash = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
 const textOf = (content: unknown): string => Array.isArray(content) ? content.filter((block) => block?.type === "text").map((block) => block.text).join("\n") : typeof content === "string" ? content : "";
 
 /** Host-only intake. Model text and disk paths are never interpreted as sources. */
@@ -28,7 +28,7 @@ export class ChatKnowledgeIntake {
 	async prepare(input: { ownerId: string; sessionId: string; windowId: string; operationId: string; text: string; uploads: StoredUpload[] }): Promise<ChatSourceRefs> {
 		const supported = input.uploads.filter((upload) => /^(text\/(plain|markdown)|image\/(png|jpeg|gif|webp)|application\/pdf)(;|$)/i.test(upload.mediaType) || /\.(md|txt|png|jpe?g|gif|webp|pdf)$/i.test(upload.name));
 		const unsupportedNames = input.uploads.filter((upload) => !supported.includes(upload)).map((upload) => upload.name);
-		const requestHash = hash(JSON.stringify([input.ownerId, input.sessionId, input.windowId, input.text, input.uploads.map((upload) => [upload.name, upload.mediaType, hash(upload.base64)])]));
+		const requestHash = hash(JSON.stringify([input.ownerId, input.sessionId, input.windowId, input.text, input.uploads.map((upload) => [upload.name, upload.mediaType, hash(Buffer.from(upload.base64, "base64"))])]));
 		const previous = await this.get(input.operationId);
 		if (previous) { if (previous.requestHash !== requestHash) throw new Error("消息素材 operationId 冲突"); return { operationId: previous.operationId, sourceIds: previous.sourceIds }; }
 		const origin = { sessionId: input.sessionId, windowId: input.windowId, channel: "user_input" as const };

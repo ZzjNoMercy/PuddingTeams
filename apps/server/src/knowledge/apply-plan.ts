@@ -21,8 +21,8 @@ export async function applyAndAcceptKnowledgePlan(plan: KnowledgePlan, registry:
 			const planned = plan.filesToCreate.find((item) => item.relativePath === receipt.relativePath)!;
 			const bytes = Buffer.from(planned.content, "utf8");
 			if (hashBufferSha256(bytes) !== planned.contentHash) throw new Error("已审核控制文档的内容指纹不一致");
-			const object = await deps.objects.put(bytes);
-			controls.push({ relativePath, contentHash: object.hash, snapshotRef: object.hash, acceptedBy: plan.ownerId });
+			const object = await deps.objects.put(bytes, planned.contentHash);
+			controls.push({ relativePath, contentHash: object.hash, acceptedBy: plan.ownerId });
 		}
 		if (controls.length) {
 			const snapshot = await deps.acceptance.getSnapshot(binding.id);

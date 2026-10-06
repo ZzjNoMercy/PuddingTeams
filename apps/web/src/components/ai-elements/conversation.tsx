@@ -7,18 +7,19 @@ import type { ComponentProps } from "react";
 import { useCallback } from "react";
 import { createPortal } from "react-dom";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
+import { useConversationScroll } from "@/hooks/useConversationScroll";
 
 export type ConversationProps = ComponentProps<typeof StickToBottom>;
 
-export const Conversation = ({ className, ...props }: ConversationProps) => (
-  <StickToBottom
+export const Conversation = ({ className, initial = "smooth", resize = "smooth", mass, damping, stiffness, targetScrollTop, instance, ...props }: ConversationProps) => {
+  const readingScroll = useConversationScroll({ initial, resize, mass, damping, stiffness, targetScrollTop });
+  return <StickToBottom
     className={cn("relative min-w-0 flex-1 overflow-hidden", className)}
-    initial="smooth"
-    resize="smooth"
+    instance={instance ?? readingScroll}
     role="log"
     {...props}
-  />
-);
+  />;
+};
 
 export type ConversationContentProps = ComponentProps<
   typeof StickToBottom.Content

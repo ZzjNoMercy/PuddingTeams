@@ -21,7 +21,7 @@ async function acceptNotes(acceptance: KnowledgeAcceptanceStore, objects: Knowle
 		const { hash } = await objects.put(Buffer.from(content));
 		const idMatch = /---\nid:\s*(\S+)/.exec(content);
 		items.push({
-			relativePath, contentHash: hash, snapshotRef: hash, acceptedBy: "owner",
+			relativePath, contentHash: hash, acceptedBy: "owner",
 			...(idMatch ? { declaredNoteId: idMatch[1] } : {}),
 		});
 	}
@@ -62,7 +62,7 @@ test("缓存复用与失效：acceptanceRevision 变化后重建", async () => {
 	const second = await index.load("b1", ledger);
 	assert.equal(second.fromCache, true);
 	const { acceptanceRevision } = await acceptance.adopt("b1", [
-		{ relativePath: "b.md", contentHash: (await objects.put(Buffer.from("# B\n"))).hash, snapshotRef: (await objects.put(Buffer.from("# B\n"))).hash, acceptedBy: "owner" },
+		{ relativePath: "b.md", contentHash: (await objects.put(Buffer.from("# B\n"))).hash, acceptedBy: "owner" },
 	], 1);
 	ledger = await acceptance.getSnapshot("b1");
 	assert.equal(acceptanceRevision, 2);
@@ -86,7 +86,7 @@ test("快照缺失的条目跳过并记录 diagnostics", async () => {
 	const ledger = await acceptNotes(acceptance, objects, "b1", { "a.md": "# A\n" }, 0);
 	// 伪造一个快照缺失的账本条目：先保存快照后删对象。
 	const { hash } = await objects.put(Buffer.from("# Ghost\n"));
-	await acceptance.adopt("b1", [{ relativePath: "ghost.md", contentHash: hash, snapshotRef: hash, acceptedBy: "owner" }], 1);
+	await acceptance.adopt("b1", [{ relativePath: "ghost.md", contentHash: hash, acceptedBy: "owner" }], 1);
 	await rm(path.join(base, "objects", hash.slice(0, 2), `${hash}.md`));
 	const built = await index.load("b1", await acceptance.getSnapshot("b1"));
 	assert.equal(built.notes.size, 1);

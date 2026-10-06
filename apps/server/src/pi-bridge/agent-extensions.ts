@@ -1200,7 +1200,6 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 										name: item.name,
 										kind: item.kind,
 										size: item.size,
-										contentHash: item.contentHash,
 										producer: item.producer,
 										delegationId: item.delegationId,
 									})),

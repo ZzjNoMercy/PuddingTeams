@@ -230,8 +230,15 @@ export function copySchemaPreset(id: string): TeamsSchemaPreset {
 }
 
 /** 结构哈希：键排序后的稳定 JSON 序列化取 sha256，用于 preset/schemaRef 的防篡改指纹。 */
+const schemaHashCache = new Map<string, string>();
 export function hashTeamsSchema(schema: TeamsSchemaPreset): string {
-	return createHash("sha256").update(stableStringify(schema)).digest("hex");
+	const key = stableStringify(schema);
+	let hash = schemaHashCache.get(key);
+	if (hash === undefined) {
+		hash = createHash("sha256").update(key).digest("hex");
+		schemaHashCache.set(key, hash);
+	}
+	return hash;
 }
 
 function stableStringify(value: unknown): string {

@@ -55,8 +55,7 @@ async function fingerprintBytes(bytes: ArrayBuffer): Promise<string> {
 export async function fingerprintManagerWorkAttachments(files: File[]): Promise<string[]> {
 	return Promise.all(files.map(async (file) => {
 		const contentHash = await fingerprintBytes(await file.arrayBuffer());
-		const identity = new TextEncoder().encode(JSON.stringify([file.name, file.type || "application/octet-stream", file.size, contentHash]));
-		return fingerprintBytes(identity.buffer as ArrayBuffer);
+		return JSON.stringify([file.name, file.type || "application/octet-stream", file.size, contentHash]);
 	}));
 }
 

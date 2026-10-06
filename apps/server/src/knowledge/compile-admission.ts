@@ -54,7 +54,7 @@ export function createCompileAdmission(stores: CompileAdmissionStores): CompileA
 				if (matches.length !== 1) throw new Error("CompileJob accepted source identity changed");
 				const entry = matches[0]!;
 				if (entry.availability !== "current" || entry.noteIdentity.bindingId !== binding.id ||
-					entry.snapshotRef !== ref || entry.contentHash !== ref) {
+					entry.contentHash !== ref) {
 					throw new Error("CompileJob accepted source authority changed");
 				}
 				const live = entry.noteIdentity.declaredNoteId

@@ -42,7 +42,7 @@ export function formatPropertyValue(value: string): string {
 	return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-const propertyLabels: Record<string, string> = { id: "编号", type: "类型", title: "标题", created: "创建时间", updated: "更新时间", sources: "来源", phone: "电话", birthday: "出生年份", location: "所在地" };
+const propertyLabels: Record<string, string> = { id: "编号", type: "类型", title: "标题", created: "创建时间", updated: "更新时间", sources: "来源", phone: "电话", birthday: "出生年份", location: "所在地", occurredAt: "开始时间", endsAt: "结束时间", timeZone: "时区", calendarEventId: "关联日程", calendarRevision: "日程版本" };
 export const propertyLabel = (key: string): string => propertyLabels[key] ?? key;
 
 const IMAGE_EMBED_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "ico"]);

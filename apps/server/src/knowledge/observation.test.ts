@@ -32,7 +32,7 @@ test("外部文件自动同步当前快照与检索，无schema或采纳门；�
   await writeFile(path.join(f.root, "note.md"), "---\nid: note\n---\n新的外部事实\n"); await f.observation.scan(f.binding);
   const b = await f.acceptance.getSnapshot(f.binding.id), next = Object.values(b.entries)[0]!;
   assert.notEqual(next.acceptanceId, first.acceptanceId); assert.equal(next.noteId, first.noteId);
-  assert.match((await f.objects.get(next.snapshotRef)).toString(), /新的外部事实/);
+  assert.match((await f.objects.get(next.contentHash)).toString(), /新的外部事实/);
   assert.equal(searchBuiltIndex(await f.searchIndex.load(f.binding.id, b), "新的外部事实", 10).results.length, 1);
   assert.equal(searchBuiltIndex(await f.searchIndex.load(f.binding.id, b), "原始事实", 10).results.length, 0);
   const events = (await f.history.list(f.binding.id, "note.md")).versions; assert.equal(events.length, 2); assert(events.every(e => e.channel === "external_sync" && e.actorId === "platform-observer" && e.actorName === "平台观察"));
@@ -98,7 +98,7 @@ test("AGENTS/CLAUDE契约不假推进revision，index/log自动同步但不作�
 
 async function publication(f: Awaited<ReturnType<typeof fixture>>, targetPath: string, content: string) {
  const blob = await f.objects.put(Buffer.from(content)), current = Object.values((await f.acceptance.getSnapshot(f.binding.id)).entries).find(e => e.relativePath === targetPath);
- const batch: PublicationBatch = { id: `batch-${targetPath}`, revision: 1, bindingId: f.binding.id, manifestHash: "", rootIdentity: f.binding.rootIdentity, bindingRevision: 1, trustRevision: 1, files: [{ targetPath, operation: current ? "update" : "create", expectedHashOrAbsent: current?.contentHash ?? null, candidateHash: blob.hash, blobRef: blob.hash }], sourceSnapshots: [], dependencyGroups: [[targetPath]], validationReceipt: "{}", compilerVersion: "test", status: "approved" };
+ const batch: PublicationBatch = { id: `batch-${targetPath}`, revision: 1, bindingId: f.binding.id, manifestHash: "", rootIdentity: f.binding.rootIdentity, bindingRevision: 1, trustRevision: 1, files: [{ targetPath, operation: current ? "update" : "create", expectedHashOrAbsent: current?.contentHash ?? null, candidateHash: blob.hash}], sourceSnapshots: [], dependencyGroups: [[targetPath]], validationReceipt: "{}", compilerVersion: "test", status: "approved" };
  batch.manifestHash = publicationManifestHash(batch); return batch;
 }
 
@@ -114,7 +114,7 @@ test("持久未提交平台写入不能洗成外部生效，重启仍保护；�
   assert.equal(Object.values((await f.acceptance.getSnapshot(f.binding.id)).entries)[0]!.acceptanceId, old.acceptanceId);
   assert.equal((await f.history.list(f.binding.id, "a.md")).versions.length, 1);
   await writeFile(path.join(f.root, "a.md"), "外部真正编辑"); assert.equal((await restarted.scan(f.binding)).files.get("a.md")!.state, "current");
-  assert.match((await f.objects.get(Object.values((await f.acceptance.getSnapshot(f.binding.id)).entries)[0]!.snapshotRef)).toString(), /真正编辑/);
+  assert.match((await f.objects.get(Object.values((await f.acceptance.getSnapshot(f.binding.id)).entries)[0]!.contentHash)).toString(), /真正编辑/);
  } finally { await rm(f.base, { recursive: true, force: true }); }
 });
 

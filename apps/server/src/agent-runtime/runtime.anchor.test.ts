@@ -749,7 +749,7 @@ test("P3-1: terminal CAS 阻止 reported_completed 被 cancelled 覆盖", async 
 	const result = { agentId: "slow", status: "completed" as const, content: "done" };
 	const receipt = {
 		schemaVersion: 1 as const, id: `receipt:${delegation.id}`, delegationId: delegation.id, operationId: delegation.id,
-		contractHash: "sha256:test", reportedOutcome: "completed" as const, upstream: {}, reportedEvidence: [], reportedArtifacts: [],
+		reportedOutcome: "completed" as const, upstream: {}, reportedEvidence: [], reportedArtifacts: [],
 		requirementResults: [], artifactCapture: [], collectionStatus: "complete" as const, integrity: "clean" as const, issues: [],
 		workerStarted: true,
 		startedAt: delegation.createdAt, observedAt: delegation.createdAt, observer: { connectorId: "slow", transport: "spawn" as const }, sealedAt: delegation.createdAt,

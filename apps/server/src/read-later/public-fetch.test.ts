@@ -5,7 +5,25 @@ import https from "node:https";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { gzipSync } from "node:zlib";
-import { fetchArticle } from "./public-fetch.js";
+import { decodeArticle, fetchArticle } from "./public-fetch.js";
+
+test("正文编码保留声明、BOM 和 UTF-8，未声明的旧 HTML 回退 Windows-1252", () => {
+  const legacy = Buffer.from("<p>Prot\xe9g\xe9 \xb7 \x93ontology\x94</p>", "latin1");
+  assert.equal(decodeArticle(legacy, "text/html"), "<p>Protégé · “ontology”</p>");
+  assert.equal(decodeArticle(legacy, "text/html; charset=iso-8859-1"), "<p>Protégé · “ontology”</p>");
+  const utf8 = "<p>中文 · Protégé 🧠</p>";
+  assert.equal(decodeArticle(Buffer.from(utf8), "text/html"), utf8);
+  const meta = Buffer.concat([Buffer.from('<meta http-equiv="Content-Type" content="text/html; charset=windows-1252">'), legacy]);
+  assert.match(decodeArticle(meta, "text/html"), /Protégé · “ontology”/);
+  assert.match(decodeArticle(legacy, "text/html; charset=utf-8"), /\uFFFD/);
+  assert.match(decodeArticle(legacy, "text/plain"), /\uFFFD/);
+  const bom = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(utf8)]);
+  assert.equal(decodeArticle(bom, "text/html; charset=windows-1252"), utf8);
+  const utf16 = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(utf8, "utf16le")]);
+  assert.equal(decodeArticle(utf16, "text/html; charset=utf-8"), utf8);
+  const utf16be = Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(utf8, "utf16le").swap16()]);
+  assert.equal(decodeArticle(utf16be, "text/html"), utf8);
+});
 
 test("稍后读沿用Claw请求头：重定向逐跳保留、gzip可解码、私网仍被拒绝", async (t) => {
   const originalProxy = process.env.PUDDINGTEAMS_HTTPS_PROXY;

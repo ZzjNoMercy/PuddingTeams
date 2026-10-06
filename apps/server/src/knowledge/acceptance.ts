@@ -31,7 +31,7 @@ export interface AcceptanceLedger {
 	/** Reviewed navigation/log snapshots are separate from notes and cannot be normal compile sources. */
 	controlEntries?: Record<string, StoredAcceptedControlVersion>;
 	historyOutbox?: NoteHistoryEvent[];
-	pendingManualEdits?: Record<string, { operationId: string; actorId: string; beforeHash: string; contentHash: string }>;
+	pendingManualEdits?: Record<string, { operationId: string; actorId: string; contentHash: string }>;
 }
 
 export interface AdoptNoteItem {
@@ -42,7 +42,6 @@ export interface AdoptNoteItem {
 	declaredNoteId?: string;
 	title?: string;
 	contentHash: string;
-	snapshotRef: string;
 	acceptedBy: string;
 }
 
@@ -219,11 +218,11 @@ export class KnowledgeAcceptanceStore {
 	}
 
 	/** Durable intent lets a post-write scan recover user attribution after a crash or sync failure. */
-	async prepareManualEdit(bindingId: string, relativePath: string, beforeHash: string, contentHash: string, actorId: string): Promise<string> {
+	async prepareManualEdit(bindingId: string, relativePath: string, contentHash: string, actorId: string): Promise<string> {
 		return this.serial(bindingId, async () => {
 			const ledger = structuredClone(await this.load(bindingId)), operationId = randomUUID();
 			ledger.pendingManualEdits ??= {};
-			ledger.pendingManualEdits[relativePath] = { operationId, actorId, beforeHash, contentHash };
+			ledger.pendingManualEdits[relativePath] = { operationId, actorId, contentHash };
 			await this.save(bindingId, ledger); this.cache.set(bindingId, ledger);
 			return operationId;
 		});
@@ -269,14 +268,14 @@ export class KnowledgeAcceptanceStore {
 				const same = previous?.availability === "current" && previous.contentHash === item.contentHash && previous.relativePath === item.relativePath && JSON.stringify(previous.noteIdentity) === JSON.stringify(identity);
 				const record: StoredAcceptedNoteVersion = same ? { ...previous!, diskIdentity: item.diskIdentity } : {
 					noteId: previous?.noteId ?? randomUUID(), noteIdentity: identity, relativePath: item.relativePath, title: item.title,
-					contentHash: item.contentHash, snapshotRef: item.snapshotRef, acceptedBy: edited ? intent.actorId : "platform-observer", acceptedAt: observedAt,
+					contentHash: item.contentHash, acceptedBy: edited ? intent.actorId : "platform-observer", acceptedAt: observedAt,
 					acceptanceId: randomUUID(), sourceRefs: item.sourceIds ?? [], availability: "current", diskIdentity: item.diskIdentity,
 				};
 				if (!same) {
 					changed = true;
 					if (!control) ledger.historyOutbox.push({ id: record.acceptanceId, bindingId, noteId: record.noteId!, relativePath: record.relativePath,
-						...(previous ? { previousPath: previous.relativePath, previousHash: previous.contentHash, previousSnapshotRef: previous.snapshotRef } : {}),
-						contentHash: record.contentHash, snapshotRef: record.snapshotRef, actorId: edited ? intent.actorId : "platform-observer", channel: edited ? "manual_edit" : "external_sync",
+						...(previous ? { previousPath: previous.relativePath, previousHash: previous.contentHash } : {}),
+						contentHash: record.contentHash, actorId: edited ? intent.actorId : "platform-observer", channel: edited ? "manual_edit" : "external_sync",
 						changeKind: !previous ? "create" : previous.relativePath !== record.relativePath ? "rename" : "update", acceptedAt: observedAt,
 						operationId: edited ? intent.operationId : record.acceptanceId, summary: edited ? "用户在知识库页面保存修改" : "平台观察外部文件变化（非人工确认）", sourceIds: record.sourceRefs });
 				}
@@ -298,7 +297,7 @@ export class KnowledgeAcceptanceStore {
 				} else if (!present.has(entry.relativePath)) {
 					if (entry.availability !== "missing" && entry.availability !== "revoked") {
 						changed = true;
-						if (!control) { const id = randomUUID(); ledger.historyOutbox.push({ id, bindingId, noteId: entry.noteId!, relativePath: entry.relativePath, contentHash: entry.contentHash, snapshotRef: entry.snapshotRef, previousHash: entry.contentHash, previousSnapshotRef: entry.snapshotRef,
+						if (!control) { const id = randomUUID(); ledger.historyOutbox.push({ id, bindingId, noteId: entry.noteId!, relativePath: entry.relativePath, contentHash: entry.contentHash, previousHash: entry.contentHash,
 							actorId: "platform-observer", channel: "external_sync", changeKind: "delete", deleted: true, acceptedAt: observedAt, operationId: id, summary: "平台观察到文件已删除（非人工确认）", sourceIds: entry.sourceRefs }); }
 					}
 					target[retainedKey] = { ...retainedEntry, availability: "missing" } as StoredAcceptedControlVersion;
@@ -314,7 +313,7 @@ export class KnowledgeAcceptanceStore {
 	private async adoptBatch(bindingId: string, items: AdoptNoteItem[], expectedRevision: number, published: boolean, context: AcceptanceHistoryContext): Promise<{ acceptanceRevision: number; adopted: AdoptedNote[] }> {
 		if (!Array.isArray(items) || items.length === 0) throw new KnowledgeAcceptanceError("invalid_input", "采纳列表不能为空");
 		for (const item of items) {
-			if (!item.relativePath || !HASH_PATTERN.test(item.contentHash) || !HASH_PATTERN.test(item.snapshotRef)) {
+			if (!item.relativePath || !HASH_PATTERN.test(item.contentHash)) {
 				throw new KnowledgeAcceptanceError("invalid_input", "采纳条目缺少路径或哈希");
 			}
 			// 普通采纳拒绝控制文档；已审核发布的 index/log 独立入 controlEntries，仍不得当笔记来源。
@@ -348,7 +347,6 @@ export class KnowledgeAcceptanceStore {
 					relativePath: item.relativePath,
 					...(item.title ? { title: item.title } : {}),
 					contentHash: item.contentHash,
-					snapshotRef: item.snapshotRef,
 					acceptedBy: item.acceptedBy,
 					acceptedAt,
 					acceptanceId: randomUUID(),
@@ -358,8 +356,8 @@ export class KnowledgeAcceptanceStore {
 				// Explicit adoption renews acceptance authority even for identical bytes.
 				// Only a changed effective page version belongs in history.
 				if (!previous || previous.contentHash !== record.contentHash || previous.relativePath !== record.relativePath) ledger.historyOutbox!.push({ id: record.acceptanceId, bindingId, noteId: record.noteId!, relativePath: record.relativePath,
-					...(previous ? { previousPath: previous.relativePath, previousHash: previous.contentHash, previousSnapshotRef: previous.snapshotRef } : {}),
-					contentHash: record.contentHash, snapshotRef: record.snapshotRef, actorId: item.acceptedBy,
+					...(previous ? { previousPath: previous.relativePath, previousHash: previous.contentHash } : {}),
+					contentHash: record.contentHash, actorId: item.acceptedBy,
 					channel: context.channel ?? "initial", acceptedAt, operationId: context.operationId ?? record.acceptanceId,
 					...(context.batchId ? { batchId: context.batchId, batchRevision: context.batchRevision, decisionId: context.decisionId } : {}),
 					summary: item.summary ?? "内部初始化快照", sourceIds: record.sourceRefs });

@@ -1,6 +1,8 @@
 import { constants as fsConstants } from "node:fs";
-import { lstat, open, realpath } from "node:fs/promises";
+import { link, lstat, mkdir, open, realpath, unlink } from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { assertImageAssetBytes } from "./image-publication.js";
 import type { KnowledgeBinding } from "./contracts.js";
 import { checkedKnowledgeRoot, withinKnowledgeRoot } from "./observation.js";
 import { KnowledgeReadError } from "./reader.js";
@@ -65,4 +67,52 @@ export async function readKnowledgeAsset(binding: KnowledgeBinding, relativePath
 	} finally {
 		await handle.close();
 	}
+}
+
+export interface KnowledgeImageAsset { path: string; bytes: Buffer }
+
+/** Write immutable images completely before exposing the final content-addressed filename. */
+export async function persistKnowledgeImage(binding: KnowledgeBinding, asset: KnowledgeImageAsset): Promise<void> {
+ assertImageAssetBytes(asset.path, asset.bytes);
+ const root = await checkedKnowledgeRoot(binding);
+ let directory = root;
+ const directories: Array<{ path: string; dev: number; ino: number }> = [];
+ const verifyDirectories = async () => {
+  await checkedKnowledgeRoot(binding);
+  for (const item of directories) {
+   const current = await lstat(item.path);
+   if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== item.dev || current.ino !== item.ino || await realpath(item.path) !== item.path) throw new KnowledgeReadError("root_changed", "图片保存目录已变化，请重试");
+  }
+ };
+ for (const part of asset.path.split("/").slice(0, -1)) {
+  await verifyDirectories();
+  directory = path.join(directory, part);
+  await mkdir(directory, { mode: 0o700 }).catch(error => { if (error.code !== "EEXIST") throw error; });
+  const stat = await lstat(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink() || await realpath(directory) !== directory) throw new KnowledgeAssetError("invalid_input", "图片保存目录不可用");
+  directories.push({ path: directory, dev: stat.dev, ino: stat.ino });
+ }
+ await verifyDirectories();
+ const absolute = path.join(root, asset.path), temporary = path.join(directory, `.image-upload-${randomUUID()}.tmp`);
+ const output = await open(temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+ const identity = await output.stat();
+ try {
+  // O_NOFOLLOW protects the leaf; additionally validate parents and the open inode before writing bytes.
+  await verifyDirectories();
+  const check = await lstat(temporary);
+  if (check.isSymbolicLink() || check.ino !== identity.ino || check.dev !== identity.dev || await realpath(temporary) !== temporary) throw new KnowledgeReadError("root_changed", "图片保存位置已变化");
+  await output.writeFile(asset.bytes); await output.sync();
+  await verifyDirectories();
+  const finalCheck = await lstat(temporary);
+  if (finalCheck.ino !== identity.ino || finalCheck.dev !== identity.dev || finalCheck.nlink !== 1 || await realpath(temporary) !== temporary) throw new KnowledgeReadError("root_changed", "图片保存位置已变化");
+  // Exclusive atomic publication: a crash can leave only an unreferenced temp, never a partial final image.
+  await link(temporary, absolute).catch(error => { if (error.code !== "EEXIST") throw error; });
+  await verifyDirectories();
+  const stored = await readKnowledgeAsset(binding, asset.path);
+  if (!stored.content.equals(asset.bytes)) throw new KnowledgeReadError("root_changed", "图片文件已发生变化，请重新选择图片");
+ } finally {
+  await output.close();
+  const leftover = await lstat(temporary).catch(() => null);
+  if (leftover?.ino === identity.ino && leftover.dev === identity.dev && await realpath(temporary).catch(() => "") === temporary) await unlink(temporary).catch(() => undefined);
+ }
 }

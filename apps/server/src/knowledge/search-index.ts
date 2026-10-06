@@ -169,7 +169,7 @@ export class KnowledgeSearchIndex {
 		const notes: IndexedNote[] = [];
 		for (const [identityKey, entry] of Object.entries(ledger.entries)) {
 			if (entry.availability !== "current") continue;
-			const snapshot = await this.objects.get(entry.snapshotRef).catch(() => null);
+			const snapshot = await this.objects.get(entry.contentHash).catch(() => null);
 			if (!snapshot) {
 				diagnostics.push(`missing_snapshot:${identityKey}`);
 				continue;

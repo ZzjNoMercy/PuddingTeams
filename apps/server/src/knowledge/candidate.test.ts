@@ -24,7 +24,7 @@ async function setupFixture(opts: { schemaPresetId?: string } = {}) {
 	const objects = new KnowledgeObjectStore(path.join(root, "objects"));
 	const blob = await objects.put(await readFile(path.join(vault, "a.md")));
 	const acceptance = new KnowledgeAcceptanceStore(path.join(root, "acceptance"));
-	await acceptance.adopt(binding.id, [{ relativePath: "a.md", contentHash: blob.hash, snapshotRef: blob.hash, acceptedBy: "owner" }], 0);
+	await acceptance.adopt(binding.id, [{ relativePath: "a.md", contentHash: blob.hash, acceptedBy: "owner" }], 0);
 	const sourceEntry = Object.values((await acceptance.getSnapshot(binding.id)).entries)[0]! as StoredAcceptedNoteVersion;
 	const jobs = new CompileJobStore(path.join(root, "state"));
 	const sourceSnapshotRoot = path.join(root, "source");
@@ -37,12 +37,11 @@ async function setupFixture(opts: { schemaPresetId?: string } = {}) {
 	const job = await jobs.create({
 		operationId: "compile-op", ownerId: "owner", targetBindingId: binding.id,
 		bindingRevision: binding.bindingRevision, trustRevision: binding.trustRevision, rootIdentity: binding.rootIdentity,
-		sourceAcceptanceIds: [sourceEntry.acceptanceId], sourceSnapshotRefs: [sourceEntry.snapshotRef],
+		sourceAcceptanceIds: [sourceEntry.acceptanceId], sourceSnapshotRefs: [sourceEntry.contentHash],
 		sourceSnapshotRoot, stagingRoot, privateRoot,
 		compilerRef: "@puddingteams/connector-codex", compilerPackageSha256: "a".repeat(64),
 		agentId: "codex", agentRevision: 1, task: "compile",
 		commandPath: path.join(root, "codex-stub"), commandSha256: "b".repeat(64),
-		baseManifestHash: "c".repeat(64),
 		...(opts.schemaPresetId ? { schemaHash: hashTeamsSchema((await resolveEffectiveSchema(binding)).schema!) } : {}),
 	});
 	const outcome = {
@@ -90,7 +89,7 @@ test("候选验证：冻结字节进对象库、计算 create/update 基线、�
 	assert.equal(batch.compilerVersion, `@puddingteams/connector-codex#${"a".repeat(64)}`);
 	assert.deepEqual(batch.files.map((file) => file.targetPath), ["Daily/2026-09-28.md", "a.md"]);
 	assert.deepEqual(batch.dependencyGroups, [["Daily/2026-09-28.md", "a.md"]]);
-	assert.deepEqual(batch.sourceSnapshots, [sourceEntry.snapshotRef]);
+	assert.deepEqual(batch.sourceSnapshots, [sourceEntry.contentHash]);
 	const created = batch.files[0]!;
 	assert.equal(created.operation, "create");
 	assert.equal(created.expectedHashOrAbsent, null);
@@ -99,8 +98,7 @@ test("候选验证：冻结字节进对象库、计算 create/update 基线、�
 	assert.equal(updated.expectedHashOrAbsent, sourceEntry.contentHash);
 	for (const file of batch.files) {
 		assert.match(file.candidateHash ?? "", /^[a-f0-9]{64}$/);
-		assert.equal(file.blobRef, file.candidateHash);
-		const bytes = await objects.get(file.blobRef!);
+		const bytes = await objects.get(file.candidateHash!);
 		assert.ok(bytes.length > 0);
 	}
 	const receipt = JSON.parse(batch.validationReceipt) as Record<string, unknown>;

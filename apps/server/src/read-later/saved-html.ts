@@ -19,7 +19,7 @@ function decodeImage(encoded: string) {
   if (typeof encoded !== "string" || !encoded || encoded.length > 7 * 1024 * 1024 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) invalid("图片编码无效或超过 5 MB");
   const bytes = Buffer.from(encoded, "base64"), mediaType = actualImageMediaType(bytes);
   if (!mediaType || !["image/png", "image/jpeg", "image/gif", "image/webp"].includes(mediaType) || bytes.toString("base64") !== encoded || bytes.length > 5 * 1024 * 1024) invalid("仅支持 PNG、JPEG、GIF、WebP 图片，每张最多 5 MB");
-  return { bytes, mediaType };
+  return { bytes, mediaType, hash: createHash("sha256").update(bytes).digest("hex") };
 }
 /** Processes only explicitly supplied bytes. Never opens a URL or local path. */
 export async function importSavedHtml(store: ReadLaterStore, owner: string, id: string, input: SavedHtmlInput) {
@@ -94,7 +94,7 @@ export async function importSavedHtml(store: ReadLaterStore, owner: string, id: 
     for (const [index, image] of article.images.entries()) {
       const local = supplied.get(image.url);
       if (!local || assets.length >= 32) { missing++; continue; }
-      const hash = createHash("sha256").update(local.bytes).digest("hex");
+      const hash = local.hash;
       const previous = assets.find(asset => asset.hash === hash);
       if (previous) { replacements.set(index, `assets/${previous.path}`); continue; }
       const filename = `${hash}.${IMAGE_ASSET_EXTENSIONS[local.mediaType]}`;
@@ -110,7 +110,7 @@ export async function importSavedHtml(store: ReadLaterStore, owner: string, id: 
     const version: ArticleVersion = { id: versionId, itemId: id, content, contentHash: createHash("sha256").update(content).digest("hex"), assets, warnings,
       coverAssetId: assets.find(asset => asset.role === "cover")?.id, capturedAt: new Date().toISOString(), extractorVersion: "teams-read-later/2",
       captureMethod: "saved_html", sourceFilename: filename };
-    const hash = digest({ id, revision, filename, html: input.html, images: [...files].map(([name, file]) => [name, digest(file.bytes.toString("base64"))]).sort() });
+    const hash = digest({ id, revision, filename, html: input.html, images: [...files].map(([name, file]) => [name, file.hash]).sort() });
     const result = store.importVersion(owner, id, revision, op, hash, { title: article.title, siteName: article.siteName, author: article.author, description: article.description }, version);
     committed = !result.replayed;
     return result;

@@ -2242,7 +2242,7 @@ export class AgentRuntime {
 		return reconciled;
 	}
 
-	async verificationObservations(delegationId: string): Promise<Array<{ id: string; delegationId: string; kind: "tool" | "file" | "search"; title: string; contentHash: string; itemId?: string }>> {
+	async verificationObservations(delegationId: string): Promise<Array<{ id: string; delegationId: string; kind: "tool" | "file" | "search"; title: string; itemId?: string }>> {
 		if (!this.timeline) return [];
 		return (await this.timeline.list(delegationId))
 			.filter((event): event is typeof event & { kind: "tool" | "file" | "search" } =>
@@ -2253,7 +2253,6 @@ export class AgentRuntime {
 				delegationId,
 				kind: event.kind,
 				title: event.title,
-				contentHash: `sha256:${createHash("sha256").update(JSON.stringify({ kind: event.kind, title: event.title, content: event.content, metadata: event.metadata })).digest("hex")}`,
 				...(event.itemId ? { itemId: event.itemId } : {}),
 			}));
 	}

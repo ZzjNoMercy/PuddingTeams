@@ -37,10 +37,10 @@ export interface CuratorJobDiagnostics {
 	stopReason?: string; errorCategory?: "timeout" | "provider_error" | "aborted" | "output_limit" | "no_submission";
 }
 export type CuratorSource = KnowledgeSource;
-interface HistoricalAcceptedSource { id: string; snapshotRef: string; hash: string; path: string }
+interface HistoricalAcceptedSource { id: string; hash: string; path: string }
 export interface CuratorRevision {
 	parentBatchId: string; parentManifestHash: string; feedback: string; sourceIds: string[];
-	candidateFiles: Array<{ path: string; contentHash: string; snapshotRef: string }>;
+	candidateFiles: Array<{ path: string; contentHash: string }>;
 	acceptedSources?: StoredAcceptedNoteVersion[];
 }
 export interface CuratorJob {
@@ -283,7 +283,7 @@ export class WikiCuratorService {
 		const effectiveSchema = await resolveEffectiveSchema(binding);
 		if (!effectiveSchema.schema && effectiveSchema.warnings.some((warning) => warning.startsWith("wiki.schema.json"))) throw new Error("知识库结构声明无法读取，请先处理结构错误");
 		const contract = await readKnowledgeOperationContract(binding);
-		if (contract) await this.deps.objects.put(Buffer.from(contract.content));
+		if (contract) await this.deps.objects.put(Buffer.from(contract.content), contract.hash);
 		const baseline = [...Object.values(ledger.entries), ...Object.values(ledger.controlEntries ?? {})];
 		if (input.revision) {
 			const parent = await this.deps.reviews.get(input.revision.parentBatchId);
@@ -292,21 +292,21 @@ export class WikiCuratorService {
 			if (input.revision.candidateFiles.length !== parent.batch.files.length) throw new Error("退回修订候选文件不完整");
 			const seen = new Set<string>();
 			for (const file of input.revision.candidateFiles) {
-				if (seen.has(file.path) || !parent.batch.files.some((item) => item.targetPath === file.path && item.candidateHash === file.contentHash && item.blobRef === file.snapshotRef)) throw new Error("退回修订候选不匹配旧manifest");
-				seen.add(file.path); await this.deps.objects.get(file.snapshotRef);
+				if (seen.has(file.path) || !parent.batch.files.some((item) => item.targetPath === file.path && item.candidateHash === file.contentHash)) throw new Error("退回修订候选不匹配旧manifest");
+				seen.add(file.path); await this.deps.objects.get(file.contentHash);
 			}
 			const receipt = JSON.parse(parent.batch.validationReceipt) as { readEvidence?: Array<{ noteRef?: string; hash?: string }> };
 			for (const note of input.revision.acceptedSources ?? []) {
-				if (isControlDocument(note.relativePath) || note.noteIdentity.bindingId !== binding.id || !parent.batch.sourceSnapshots.includes(note.snapshotRef) ||
+				if (isControlDocument(note.relativePath) || note.noteIdentity.bindingId !== binding.id || !parent.batch.sourceSnapshots.includes(note.contentHash) ||
 					!receipt.readEvidence?.some((evidence) => evidence.noteRef === note.acceptanceId && evidence.hash === note.contentHash)) throw new Error("退回修订的旧采纳来源不在固定证据链中");
-				await this.deps.objects.get(note.snapshotRef);
+				await this.deps.objects.get(note.contentHash);
 			}
 		}
 		const historicalSources: CuratorSource[] = [];
 		const historicalAcceptedSources: HistoricalAcceptedSource[] = [];
 		const publications = (await this.deps.reviews.list()).filter((record) => record.ownerId === input.ownerId && record.batch.bindingId === binding.id && record.status === "published");
 		for (const entry of baseline.filter((entry) => !isControlDocument(entry.relativePath))) {
-			const fields = parseNoteFrontmatterFields((await this.deps.objects.get(entry.snapshotRef)).toString("utf8"));
+			const fields = parseNoteFrontmatterFields((await this.deps.objects.get(entry.contentHash)).toString("utf8"));
 			for (const id of Array.isArray(fields.sources) ? fields.sources : []) {
 				if (typeof id !== "string" || historicalSources.some((source) => source.id === id)) continue;
 				const source = await this.deps.sources.get(input.ownerId, id);
@@ -320,10 +320,10 @@ export class WikiCuratorService {
 					if (!publication) continue;
 					const receipt = JSON.parse(publication.batch.validationReceipt) as { readEvidence?: Array<{ noteRef?: string; hash?: string; path?: string }>; historicalAcceptedSources?: HistoricalAcceptedSource[] };
 					const evidence = receipt.readEvidence?.find((evidence) => evidence.noteRef === id && evidence.hash && publication.batch.sourceSnapshots.includes(evidence.hash));
-					const prior = receipt.historicalAcceptedSources?.find((source) => source.id === id && publication.batch.sourceSnapshots.includes(source.snapshotRef));
-					const frozen = prior ?? (evidence?.hash ? { id, hash: evidence.hash, snapshotRef: evidence.hash, path: evidence.path ?? id } : undefined);
+					const prior = receipt.historicalAcceptedSources?.find((source) => source.id === id && publication.batch.sourceSnapshots.includes(source.hash));
+					const frozen = prior ?? (evidence?.hash ? { id, hash: evidence.hash, path: evidence.path ?? id } : undefined);
 					if (frozen && !historicalAcceptedSources.some((source) => source.id === id)) {
-						await this.deps.objects.get(frozen.snapshotRef);
+						await this.deps.objects.get(frozen.hash);
 						historicalAcceptedSources.push(frozen);
 					}
 				}
@@ -393,7 +393,7 @@ export class WikiCuratorService {
 			else await this.deps.sources.readOriginal(job.ownerId, source.id);
 		}
 		for (const source of job.historicalAcceptedSources ?? []) {
-			if (sha(await this.deps.objects.get(source.snapshotRef)) !== source.hash) throw new Error("历史采纳来源快照已变化");
+			if (sha(await this.deps.objects.get(source.hash)) !== source.hash) throw new Error("历史采纳来源快照已变化");
 		}
 		this.deps.bindings.assertCurrentRevision(job.ownerId, job.targetBindingId, job);
 	}
@@ -445,7 +445,7 @@ export class WikiCuratorService {
     throw new Error(`控制页必须位于内容区：${job.contentPrefix}index.md 或 ${job.contentPrefix}log.md`);
 			const preservedSources = new Set<string>();
 			if (base && !control) {
-				const prior = parseNoteFrontmatterFields((await this.deps.objects.get(base.snapshotRef)).toString("utf8"));
+				const prior = parseNoteFrontmatterFields((await this.deps.objects.get(base.contentHash)).toString("utf8"));
 				for (const id of Array.isArray(prior.sources) ? prior.sources : []) {
 					if (typeof id === "string" && ((job.historicalSources ?? []).some((source) => source.id === id) || (job.historicalAcceptedSources ?? []).some((source) => source.id === id))) preservedSources.add(id);
 				}
@@ -467,13 +467,13 @@ export class WikiCuratorService {
 				const prior = imageFiles.get(asset.path);
 				if (prior) prior.sourceIds = [...new Set([...prior.sourceIds!, asset.sourceId])].sort();
 				else imageFiles.set(asset.path, { kind: "image", mediaType: asset.mediaType, sourceIds: [asset.sourceId], operation: existing ? "update" : "create",
-					targetPath: asset.path, expectedHashOrAbsent: existing ? asset.hash : null, candidateHash: asset.hash, blobRef: asset.hash });
+					targetPath: asset.path, expectedHashOrAbsent: existing ? asset.hash : null, candidateHash: asset.hash });
 				reasons[asset.path] = "与页面一起审核的已冻结原图；相同哈希已有图只核对复用";
 			}
 			if (!control) for (const id of fields.sources as string[]) usedSources.add(id);
 			if (base && control && job.contractSnapshotRef) {
 				const contract = (await this.deps.objects.get(job.contractSnapshotRef)).toString("utf8");
-				if (/index.*log.*只(允许)?追加|index.*log.*只允许追加/s.test(contract) && !page.content.startsWith((await this.deps.objects.get(base.snapshotRef)).toString("utf8")))
+				if (/index.*log.*只(允许)?追加|index.*log.*只允许追加/s.test(contract) && !page.content.startsWith((await this.deps.objects.get(base.contentHash)).toString("utf8")))
 					throw new Error("操作契约要求索引与日志只追加，候选不得改写既有内容");
 			}
 			// index/log are navigation and audit candidates, not schema entity pages.
@@ -493,7 +493,7 @@ export class WikiCuratorService {
     }
 			}
 			const candidate = await this.deps.objects.put(bytes);
-			files.push({ operation: base ? "update" : "create", targetPath: page.path, expectedHashOrAbsent: base?.contentHash ?? null, candidateHash: candidate.hash, blobRef: candidate.hash });
+			files.push({ operation: base ? "update" : "create", targetPath: page.path, expectedHashOrAbsent: base?.contentHash ?? null, candidateHash: candidate.hash });
 			reasons[page.path] = page.reason;
 		}
 		this.assertExecutionFence(job.id);
@@ -503,16 +503,16 @@ export class WikiCuratorService {
 		const publicationOrder = [...files.filter((file) => file.kind === "image"), ...files.filter((file) => file.kind !== "image")].map((file) => file.targetPath);
 		const batch: PublicationBatch = { id: `wiki-curator:${job.id}`, revision: 1, bindingId: binding.id, manifestHash: "",
 			rootIdentity: job.rootIdentity, files, sourceSnapshots: [...job.sources, ...(job.historicalSources ?? [])].filter((source) => usedSources.has(source.id)).map((source) => source.originalHash)
-				.concat(readableNotes.filter((entry) => usedSources.has(entry.acceptanceId)).map((entry) => entry.snapshotRef)),
+				.concat(readableNotes.filter((entry) => usedSources.has(entry.acceptanceId)).map((entry) => entry.contentHash)),
 			schemaHash: job.schemaHash, bindingRevision: job.bindingRevision, trustRevision: job.trustRevision,
 			contractHash: job.contractHash,
 			...(job.revision ? { parentBatchId: job.revision.parentBatchId, revisionFeedback: job.revision.feedback } : {}),
 			dependencyGroups: [publicationOrder],
 			validationReceipt: JSON.stringify({ version: 1, jobId: job.id, sources: job.sources, historicalSources: job.historicalSources ?? [], historicalAcceptedSources: job.historicalAcceptedSources ?? [], reasons,
-				sourceManifestHash: knowledgeSourceManifestHash(job.sources), targetBaselineManifestHash: sha(JSON.stringify(job.baseline)), readEvidence, revision: job.revision ?? null, origin: job.origin ?? null }),
+				readEvidence, revision: job.revision ?? null, origin: job.origin ?? null }),
 			compilerVersion: "pi-wiki-curator-v1", status: "candidate" };
 		batch.sourceSnapshots.push(...[...imageFiles.values()].map(file => file.candidateHash!));
-		batch.sourceSnapshots.push(...(job.historicalAcceptedSources ?? []).filter((source) => usedSources.has(source.id)).map((source) => source.snapshotRef));
+		batch.sourceSnapshots.push(...(job.historicalAcceptedSources ?? []).filter((source) => usedSources.has(source.id)).map((source) => source.hash));
 		batch.manifestHash = publicationManifestHash(batch);
 		assertPublicationBatchShape(batch);
 		await assertImageBatchIntegrity(batch, this.deps.objects);
@@ -623,7 +623,7 @@ export class WikiCuratorService {
 		const sources = await Promise.all(job.sources.map(async source => ({ ...source, content: (await this.deps.sources.readText(job.ownerId, source.id)).text })));
 		const schema = (await resolveEffectiveSchema(await this.deps.bindings.requireUsable(job.ownerId, job.targetBindingId))).schema;
 			const operationContract = job.contractSnapshotRef ? (await this.deps.objects.get(job.contractSnapshotRef)).toString("utf8") : undefined;
-			const revision = job.revision ? { ...job.revision, candidateFiles: await Promise.all(job.revision.candidateFiles.filter((file) => file.path.endsWith(".md")).map(async (file) => ({ ...file, content: (await this.deps.objects.get(file.snapshotRef)).toString("utf8") }))) } : undefined;
+			const revision = job.revision ? { ...job.revision, candidateFiles: await Promise.all(job.revision.candidateFiles.filter((file) => file.path.endsWith(".md")).map(async (file) => ({ ...file, content: (await this.deps.objects.get(file.contentHash)).toString("utf8") }))) } : undefined;
 			return { task: job.task, sources, schema, operationContract,
     pathRules: { contentPrefix: job.contentPrefix, entityDirectories: schema?.entities.map(entity => ({ type: entity.type, directory: schemaEntityDirectory(job.contentPrefix, entity.directory) })),
      indexPath: `${job.contentPrefix}index.md`, logPath: `${job.contentPrefix}log.md`,

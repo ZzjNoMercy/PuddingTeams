@@ -27,7 +27,7 @@ test("adopt 落盘信封并可跨实例重载；修订号乐观并发", async ()
 	const store = new KnowledgeAcceptanceStore(dir);
 	const contentHash = hashOf("content");
 	const { acceptanceRevision, adopted } = await store.adopt("b1", [
-		{ relativePath: "a.md", contentHash, snapshotRef: contentHash, acceptedBy: "local:tester" },
+		{ relativePath: "a.md", contentHash, acceptedBy: "local:tester" },
 	], 0);
 	assert.equal(acceptanceRevision, 1);
 	assert.deepEqual(adopted, [{ path: "a.md", identityKey: "path:a.md", contentHash }]);
@@ -44,10 +44,10 @@ test("adopt 落盘信封并可跨实例重载；修订号乐观并发", async ()
 	assert.equal(Object.keys(snapshot.entries).length, 1);
 
 	await assert.rejects(() => reloaded.adopt("b1", [
-		{ relativePath: "b.md", contentHash: hashOf("b"), snapshotRef: hashOf("b"), acceptedBy: "local:tester" },
+		{ relativePath: "b.md", contentHash: hashOf("b"), acceptedBy: "local:tester" },
 	], 0), { code: "stale_revision" });
 	const again = await reloaded.adopt("b1", [
-		{ relativePath: "b.md", declaredNoteId: "n-b", title: "B", contentHash: hashOf("b"), snapshotRef: hashOf("b"), acceptedBy: "local:tester" },
+		{ relativePath: "b.md", declaredNoteId: "n-b", title: "B", contentHash: hashOf("b"), acceptedBy: "local:tester" },
 	], 1);
 	assert.equal(again.acceptanceRevision, 2);
 	assert.deepEqual(again.adopted[0], { path: "b.md", identityKey: "id:n-b", contentHash: hashOf("b") });
@@ -56,9 +56,9 @@ test("adopt 落盘信封并可跨实例重载；修订号乐观并发", async ()
 test("adopt 同路径身份键变化时替换旧键；removeEntries 移除并推进修订", async () => {
 	const dir = await mkdtemp(path.join(tmpdir(), "pt-acceptance-rekey-"));
 	const store = new KnowledgeAcceptanceStore(dir);
-	await store.adopt("b1", [{ relativePath: "a.md", contentHash: hashOf("v1"), snapshotRef: hashOf("v1"), acceptedBy: "me" }], 0);
+	await store.adopt("b1", [{ relativePath: "a.md", contentHash: hashOf("v1"), acceptedBy: "me" }], 0);
 	const { adopted } = await store.adopt("b1", [
-		{ relativePath: "a.md", declaredNoteId: "n-a", contentHash: hashOf("v2"), snapshotRef: hashOf("v2"), acceptedBy: "me" },
+		{ relativePath: "a.md", declaredNoteId: "n-a", contentHash: hashOf("v2"), acceptedBy: "me" },
 	], 1);
 	assert.deepEqual(adopted[0]?.identityKey, "id:n-a");
 	let snapshot = await store.getSnapshot("b1");
@@ -86,13 +86,13 @@ test("契约、首页与日志留在文件树里，但不能被采纳成笔记",
 	// 整批拒绝：控制文档一旦混进采纳项就会污染编译来源。
 	for (const relativePath of ["AGENTS.md", "claude.md", "index.md", "log.md"]) {
 		await assert.rejects(
-			() => store.adopt("b1", [{ relativePath, contentHash, snapshotRef: contentHash, acceptedBy: "local:tester" }], 0),
+			() => store.adopt("b1", [{ relativePath, contentHash, acceptedBy: "local:tester" }], 0),
 			{ code: "invalid_input" },
 		);
 	}
 	assert.equal((await store.getSnapshot("b1")).acceptanceRevision, 0, "被拒绝的批次不推进修订号");
 	// 子目录里的同名文件仍是正常笔记。
-	await store.adopt("b1", [{ relativePath: "concepts/index.md", contentHash, snapshotRef: contentHash, acceptedBy: "local:tester" }], 0);
+	await store.adopt("b1", [{ relativePath: "concepts/index.md", contentHash, acceptedBy: "local:tester" }], 0);
 	assert.equal((await store.getSnapshot("b1")).acceptanceRevision, 1);
 });
 
@@ -100,7 +100,7 @@ test("契约、首页与日志留在文件树里，但不能被采纳成笔记",
 test("adoptPublished：index/log与笔记同revision提交，控制快照不混入笔记来源", async () => {
 	const dir = await mkdtemp(path.join(tmpdir(), "pt-controls-"));
 	const store = new KnowledgeAcceptanceStore(dir);
-	const item = (relativePath: string) => ({ relativePath, contentHash: hashOf(relativePath), snapshotRef: hashOf(relativePath), acceptedBy: "owner" });
+	const item = (relativePath: string) => ({ relativePath, contentHash: hashOf(relativePath), acceptedBy: "owner" });
 	await store.adoptPublished("b1", [item("a.md"), item("index.md"), item("log.md")], 0);
 	const ledger = await new KnowledgeAcceptanceStore(dir).getSnapshot("b1");
 	assert.equal(ledger.acceptanceRevision, 1);

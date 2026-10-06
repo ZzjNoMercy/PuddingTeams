@@ -501,6 +501,7 @@ export function ConnectorSection({
 			{conflict ? <div role="alert" className="agent-config-callout is-warning">Connector 绑定已变化。当前表单与密钥输入仍保留；请先核对，再明确读取最新配置。<Button type="button" size="sm" variant="outline" className="ml-3" disabled={reloading} onClick={() => void reloadAfterConflict()}>读取最新配置（丢弃当前输入）</Button></div> : null}
 			<section className="agent-config-card">
 				<div className="agent-config-card-head"><h2>连接插件</h2><p>选择已安装的连接插件；安装与更新在「扩展」页完成。</p></div>
+			<div className="agent-config-connector-stack">
 			{/* 当前绑定 */}
 			{agent.connector ? (
 				<div className="flex flex-wrap items-center gap-2 text-xs">
@@ -585,6 +586,7 @@ export function ConnectorSection({
 			) : null}
 
 			{/* config schema 表单 + secret + 固定版本 */}
+			</div>
 			</section>
 			{contribution ? (
 				<section className="agent-config-card">
@@ -610,7 +612,7 @@ export function ConnectorSection({
 							) : null}
 						</div>
 					) : <p className="text-xs text-muted-foreground">正在确认执行能力…</p>}
-					<div className="flex flex-col gap-4">
+					<div className="agent-config-connector-form">
 						<label className="agent-config-field">
 							<span>传输方式</span>
 						<Select value={selectedTransport} onValueChange={(value) => setTransport(value as AgentConnectorBinding["transport"])}>

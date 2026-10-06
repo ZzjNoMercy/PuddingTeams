@@ -200,9 +200,7 @@ export function NavRail({ view, returnSessionId }: { view: AppView; returnSessio
 						<ChevronRightIcon className="nav-user-chevron size-3" aria-hidden="true" />
 					</button>
 				</DropdownMenuTrigger>
-				{/* 菜单关闭默认会把焦点还给触发器，浏览器启发式判定为键盘焦点，
-				    导致鼠标用完菜单后 :focus-visible 描边一直挂着；拦截焦点归还。 */}
-					<DropdownMenuContent side="top" align="start" className="home-menu w-52" container={homePortalContainer()} onCloseAutoFocus={(event) => event.preventDefault()}>
+				<DropdownMenuContent side="top" align="start" className="home-menu w-52" container={homePortalContainer()}>
 						{identityState.status === "error" ? <DropdownMenuItem onSelect={() => { setIdentityState({ status: "loading", identity: null }); setIdentityRetry((value) => value + 1); }}>重试读取身份</DropdownMenuItem> : null}
 						{identity ? <DropdownMenuItem onSelect={() => setProfileOpen(true)}><UserRoundPenIcon />编辑个人资料</DropdownMenuItem> : null}
 						<DropdownMenuItem onSelect={() => router.push("/settings")}>

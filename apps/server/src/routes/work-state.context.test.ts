@@ -77,7 +77,7 @@ test("页面验收 Git 写 Submission 时先记录意图、提升 change-set，�
 	const receipt: ExecutionReceipt = {
 		id: "receipt-route", delegationId: "D-route", goalId: goal.goalId, workPlanId: planned.plan!.id, workItemId: item.id,
 		goalRevision: planned.goalRevision, workItemRevision: item.revision, goalEpoch: planned.execution.epoch,
-		taskContractHash: workItemContractHash(planned, planned.plan!, item), contractHash: "sha256:runtime-envelope", reportedOutcome: "completed",
+		taskContractHash: workItemContractHash(planned, planned.plan!, item), reportedOutcome: "completed",
 		requirementResults: [{ requirement: "文件存在", status: "provided", evidenceRefs: ["D-route"] }], artifactCapture: [],
 		collectionStatus: "complete", integrity: "clean", issues: [], sealedAt: new Date().toISOString(), workspaceExecutionScopeId: "scope-route",
 	};

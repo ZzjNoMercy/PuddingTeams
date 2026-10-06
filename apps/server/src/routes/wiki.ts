@@ -6,13 +6,13 @@ import path from "node:path";
 import type { FastifyInstance, FastifyReply } from "fastify";
 import type { AgentDriver, InvocationContext } from "../agent-runtime/types.js";
 import { agentRunConfigRevision, type TeamsStore } from "../store/teams.js";
-import type { AcceptanceLedger, KnowledgeAcceptanceStore } from "../knowledge/acceptance.js";
+import type { KnowledgeAcceptanceStore } from "../knowledge/acceptance.js";
 import type { KnowledgeBindingRegistry } from "../knowledge/bindings.js";
 import { composeCompileTask, readCandidateBatch } from "../knowledge/candidate.js";
 import { materializeCompileSource } from "../knowledge/compile-source.js";
 import { resolveEffectiveSchema } from "../knowledge/schema-impact.js";
 import type { CompileJobStore } from "../knowledge/compile-jobs.js";
-import type { CompileJob, KnowledgeBinding, PublicationBatch, ReviewDecision } from "../knowledge/contracts.js";
+import type { CompileJob, PublicationBatch, ReviewDecision } from "../knowledge/contracts.js";
 import { diffNoteContent } from "../knowledge/note-diff.js";
 import type { KnowledgeObjectStore } from "../knowledge/objects.js";
 import type { KnowledgeObservationService } from "../knowledge/observation.js";
@@ -104,13 +104,6 @@ export async function resolveCodexCompileCommand(env: NodeJS.ProcessEnv = proces
 	throw new WikiRouteError("capability_unavailable", "未检测到 Codex CLI，请先安装并完成登录");
 }
 
-function computeBaseManifestHash(binding: KnowledgeBinding, ledger: AcceptanceLedger): string {
-	const entries = Object.values(ledger.entries)
-		.map((entry) => [entry.acceptanceId, entry.relativePath, entry.contentHash])
-		.sort((a, b) => (a[1]! < b[1]! ? -1 : a[1]! > b[1]! ? 1 : a[0]! < b[0]! ? -1 : a[0]! > b[0]! ? 1 : 0));
-	return createHash("sha256").update(JSON.stringify({ bindingId: binding.id, acceptanceRevision: ledger.acceptanceRevision, entries })).digest("hex");
-}
-
 /** 各 Job 的 staging/private/来源目录全局唯一，同 operationId 重放只能做语义比对。 */
 function sameJobRequest(job: CompileJob, request: { ownerId: string; bindingId: string; agentId: string; sourceAcceptanceIds: string[]; rawTask: string }): boolean {
 	return job.ownerId === request.ownerId && job.targetBindingId === request.bindingId && job.agentId === request.agentId &&
@@ -144,7 +137,6 @@ interface ReviewRequestBody {
 	operationId?: string;
 	decision?: string;
 	manifestHash?: string;
-	expectedBatchRevision?: number;
 	reviewedFiles?: string[];
 }
 
@@ -265,7 +257,6 @@ export function registerWikiRoutes(app: FastifyInstance, deps: WikiRouteDeps): v
 					commandPath,
 					commandSha256,
 					...(effectiveSchema.schemaRef?.hash ? { schemaHash: effectiveSchema.schemaRef.hash } : {}),
-					baseManifestHash: computeBaseManifestHash(binding, ledger),
 				});
 				kick(job.id);
 				return reply.code(202).send({ job, replayed: false });
@@ -399,12 +390,12 @@ export function registerWikiRoutes(app: FastifyInstance, deps: WikiRouteDeps): v
 		}
 	});
 
-	app.post<{ Params: { id: string }; Body: { operationId: string; manifestHash: string; expectedBatchRevision: number } }>("/api/wiki/batches/:id/close-conflict", async (req, reply) => {
+	app.post<{ Params: { id: string }; Body: { operationId: string; manifestHash: string } }>("/api/wiki/batches/:id/close-conflict", async (req, reply) => {
 		try {
 			const record = await deps.reviews.get(req.params.id);
 			if (!record || record.ownerId !== ownerId() || !(await deps.bindings.list(ownerId())).some(binding => binding.id === record.batch.bindingId)) throw new WikiRouteError("not_found", "审核批次不存在");
 			const body = req.body;
-			if (!body || typeof body.operationId !== "string" || typeof body.manifestHash !== "string" || !Number.isSafeInteger(body.expectedBatchRevision)) throw new WikiRouteError("invalid_input", "关闭冲突参数无效");
+			if (!body || typeof body.operationId !== "string" || typeof body.manifestHash !== "string") throw new WikiRouteError("invalid_input", "关闭冲突参数无效");
 			const closed = await withKnowledgeMutation(record.batch.bindingId, async () => {
 				const current = (await deps.reviews.get(record.batch.id))!;
 				if (!current.conflictClosure) await assertConflictResolution(current, deps.publications);
@@ -422,8 +413,8 @@ export function registerWikiRoutes(app: FastifyInstance, deps: WikiRouteDeps): v
 			const targetPath = req.query.path ?? "";
 			const file = record.batch.files.find((entry) => entry.targetPath === targetPath);
 			if (!file) throw new WikiRouteError("not_found", "该文件不在批次内");
-			if (!file.blobRef || !file.candidateHash) throw new WikiRouteError("candidate_unavailable", "批次文件缺少候选字节");
-			const candidateBytes = await deps.objects.get(file.blobRef).catch(() => null);
+			if (!file.candidateHash) throw new WikiRouteError("candidate_unavailable", "批次文件缺少候选字节");
+			const candidateBytes = await deps.objects.get(file.candidateHash).catch(() => null);
 			if (!candidateBytes || createHash("sha256").update(candidateBytes).digest("hex") !== file.candidateHash) throw new WikiRouteError("candidate_unavailable", "候选字节缺失或已损坏");
 			if (file.kind === "image") {
 				await assertImageBatchIntegrity(record.batch, deps.objects);
@@ -449,9 +440,9 @@ export function registerWikiRoutes(app: FastifyInstance, deps: WikiRouteDeps): v
 			const record = await deps.reviews.get(req.params.id);
 			if (!record || record.ownerId !== ownerId() || !(await deps.bindings.list(ownerId())).some((binding) => binding.id === record.batch.bindingId)) throw new WikiRouteError("not_found", "批次不存在");
 			const file = record.batch.files.find((file) => file.targetPath === req.query.path && file.kind === "image");
-			if (!file?.blobRef) throw new WikiRouteError("not_found", "图片不在固定候选内");
+			if (!file?.candidateHash) throw new WikiRouteError("not_found", "图片不在固定候选内");
 			await assertImageBatchIntegrity(record.batch, deps.objects);
-			const bytes = await deps.objects.get(file.blobRef), mediaType = assertImageAssetBytes(file.targetPath, bytes, file.mediaType);
+			const bytes = await deps.objects.get(file.candidateHash), mediaType = assertImageAssetBytes(file.targetPath, bytes, file.mediaType);
 			return reply.header("Content-Type", mediaType).header("X-Content-Type-Options", "nosniff").header("Cache-Control", "no-store").send(bytes);
 		} catch (error) { return sendWikiError(reply, error); }
 	});
@@ -463,10 +454,9 @@ export function registerWikiRoutes(app: FastifyInstance, deps: WikiRouteDeps): v
 			const reviewedFiles = Array.isArray(body.reviewedFiles) ? body.reviewedFiles : [];
 			if ((decision !== "approve" && decision !== "reject") ||
 				typeof body.manifestHash !== "string" || !/^[a-f0-9]{64}$/.test(body.manifestHash) ||
-				typeof body.expectedBatchRevision !== "number" || !Number.isSafeInteger(body.expectedBatchRevision) || body.expectedBatchRevision < 1 ||
 				(decision === "approve" && reviewedFiles.length === 0) || !Array.isArray(body.reviewedFiles) || reviewedFiles.some((file) => typeof file !== "string" || !file) ||
 				(body.operationId !== undefined && (typeof body.operationId !== "string" || !body.operationId.trim() || body.operationId.length > 200))) {
-				throw new WikiRouteError("invalid_input", "decision、manifestHash、expectedBatchRevision 与 reviewedFiles 必填（拒绝可为空，批准必须覆盖全部文件）");
+				throw new WikiRouteError("invalid_input", "decision、manifestHash 与 reviewedFiles 必填（拒绝可为空，批准必须覆盖全部文件）");
 			}
 			await syncCandidateBatches(deps, ownerId());
 			const existing = await deps.reviews.get(req.params.id);
@@ -479,7 +469,6 @@ export function registerWikiRoutes(app: FastifyInstance, deps: WikiRouteDeps): v
 					actorId: ownerId(),
 					decision,
 					manifestHash: body.manifestHash!,
-					expectedBatchRevision: body.expectedBatchRevision!,
 					reviewedFiles,
 				});
 			} catch (error) {

@@ -25,7 +25,7 @@ test("生产 CompileAdmission 复核当前绑定、Agent、采纳身份和真实
 	const objects = new KnowledgeObjectStore(path.join(root, "objects"));
 	const blob = await objects.put(Buffer.from("# Accepted\n"));
 	const acceptance = new KnowledgeAcceptanceStore(path.join(root, "acceptance"));
-	await acceptance.adopt(binding.id, [{ relativePath: "a.md", contentHash: blob.hash, snapshotRef: blob.hash, acceptedBy: "owner" }], 0);
+	await acceptance.adopt(binding.id, [{ relativePath: "a.md", contentHash: blob.hash, acceptedBy: "owner" }], 0);
 	const accepted = Object.values((await acceptance.getSnapshot(binding.id)).entries)[0]!;
 	const observation = new KnowledgeObservationService(acceptance, { objects });
 	const snapshotRoot = path.join(root, "snapshot");
@@ -65,7 +65,7 @@ test("生产 CompileAdmission 复核当前绑定、Agent、采纳身份和真实
 	await writeFile(source, "# Changed\n");
 	await assert.rejects(admission.authorizeJob(job), /source is no longer current/);
 	await writeFile(source, "# Accepted\n");
-	await acceptance.adopt(binding.id, [{ relativePath: "a.md", contentHash: blob.hash, snapshotRef: blob.hash, acceptedBy: "owner" }], (await acceptance.getSnapshot(binding.id)).acceptanceRevision);
+	await acceptance.adopt(binding.id, [{ relativePath: "a.md", contentHash: blob.hash, acceptedBy: "owner" }], (await acceptance.getSnapshot(binding.id)).acceptanceRevision);
 	await assert.rejects(admission.authorizeJob(job), /accepted source identity changed/);
 	const latest = Object.values((await acceptance.getSnapshot(binding.id)).entries)[0]!;
 	const reacceptedJob = { ...job, sourceAcceptanceIds: [latest.acceptanceId] };
@@ -74,7 +74,7 @@ test("生产 CompileAdmission 复核当前绑定、Agent、采纳身份和真实
 		jobs: new CompileJobStore(path.join(root, "state")), bindings, acceptance, objects,
 		observation: { scan: async (current) => {
 			const snapshot = await observation.scan(current);
-			await acceptance.adopt(binding.id, [{ relativePath: "a.md", contentHash: blob.hash, snapshotRef: blob.hash, acceptedBy: "owner" }], (await acceptance.getSnapshot(binding.id)).acceptanceRevision);
+			await acceptance.adopt(binding.id, [{ relativePath: "a.md", contentHash: blob.hash, acceptedBy: "owner" }], (await acceptance.getSnapshot(binding.id)).acceptanceRevision);
 			return snapshot;
 		} },
 		teams: { getAgent: async () => ({ name: "codex", description: "Compiler", enabled: true,

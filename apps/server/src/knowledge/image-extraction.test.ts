@@ -28,7 +28,7 @@ test("图片来源：原件不可变、衍生/模型/区域独立固定、取消
  try {
   const objects = new KnowledgeObjectStore(path.join(root,"objects")), store = new KnowledgeSourceStore({stateDir:root,objects});
   const [raw] = await store.createUploads("owner",[{filename:"图.png",mediaType:"image/png",data:png.toString("base64")}]); assert(raw);
-  const artifact: ImageExtractionArtifact = {version:1,extractorId:"pi-vision",extractorVersion:"1",modelRef:"fixture/vision",configHash:"f".repeat(64),
+  const artifact: ImageExtractionArtifact = {version:1,extractorId:"pi-vision",extractorVersion:"1",modelRef:"fixture/vision",
    originalHash:raw.originalHash,width:1,height:1,segments:[{text:"姓名：张三\n日期不清",region:{x:0,y:0,width:1,height:.5},warnings:["需核对日期"]},{text:"第二段",warnings:[]}],warnings:["模型提取"],createdAt:new Date().toISOString()};
   const derived=await store.createImageExtraction("owner",raw.id,artifact);
   assert.notEqual(derived.id,raw.id); assert.equal(derived.derivedFrom,raw.id); assert.equal(derived.originalHash,raw.originalHash);
@@ -36,7 +36,7 @@ test("图片来源：原件不可变、衍生/模型/区域独立固定、取消
   assert.deepEqual(await store.get("owner",raw.id),raw); assert.deepEqual((await store.readOriginal("owner",derived.id)).bytes,png);
   assert.equal((await store.readText("owner",derived.id)).text,"姓名：张三\n日期不清\n\n第二段");
   assert.equal(derived.locations[1]!.startLine,4); assert(derived.warnings.includes("需核对日期"));
-  assert.equal(JSON.parse((await objects.get(derived.extraction!.artifactHash)).toString()).configHash,artifact.configHash);
+  assert.equal(JSON.parse((await objects.get(derived.extraction!.artifactHash)).toString()).originalHash,artifact.originalHash);
   assert.notEqual(knowledgeSourceManifestHash([derived]),knowledgeSourceManifestHash([{...derived,extraction:{...derived.extraction!,modelRef:"changed"}}]));
   await assert.rejects(()=>store.readText("other",derived.id),/不存在/);
   await assert.rejects(()=>store.createImageExtraction("owner",raw.id,{...artifact,originalHash:"wrong"}),/身份/);

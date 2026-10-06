@@ -1,6 +1,7 @@
 "use client";
 
 import { isValidElement, type ComponentProps, type MouseEvent, type ReactNode } from "react";
+import Link from "next/link";
 import { ImageIcon } from "lucide-react";
 import { knowledgeAssetUrl } from "@/lib/api";
 import { parseWikiLinkHref, resolveKnowledgeAssetRef, slugifyHeading } from "./markdown";
@@ -45,6 +46,7 @@ export function buildNoteMarkdownComponents(options: NoteMarkdownHandlers & {
 	};
 	return {
 		a: ({ href, children }: ComponentProps<"a">) => {
+			if (href && /^\/calendar\?event=[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(href)) return <Link href={href}>{children}</Link>;
 			const wikiTarget = parseWikiLinkHref(href);
 			if (wikiTarget !== null) {
 				const broken = options.brokenLinks.has(`wiki:${wikiTarget}`);

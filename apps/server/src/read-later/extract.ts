@@ -244,6 +244,19 @@ export function extractArticle(
       const content = children().trim();
       return content ? `\n- ${content.replace(/\n/g, "\n  ")}` : "";
     }
+    // Word's HTML exports draw bullets using a Symbol-font span inside a p.
+    // Markdown has no font mapping: emit a real list, excluding its decoration.
+    if (tag === "p" && /\bbulletedlist\b/i.test(attr(n, "class"))) {
+      const parts = [...(n.childNodes ?? [])];
+      while (parts[0]?.nodeName === "#text" && !text(parts[0]).trim()) parts.shift();
+      const marker = parts[0];
+      if (marker?.tagName === "span" &&
+          /font-family\s*:\s*["']?Symbol\b/i.test(attr(marker, "style")) &&
+          text(marker).trim() === "·") {
+        const content = parts.slice(1).map(render).join("").trim();
+        return content ? `\n- ${content.replace(/\n/g, "\n  ")}` : "";
+      }
+    }
     if (tag === "blockquote")
       return `\n\n${children()
         .trim()

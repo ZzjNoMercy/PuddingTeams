@@ -26,10 +26,8 @@ export interface ReadingItem {
 export interface ReadingVersion {
   id: string;
   content: string;
-  contentHash: string;
   assets: Array<{
     id: string;
-    hash: string;
     mediaType: string;
     path: string;
     alt: string;

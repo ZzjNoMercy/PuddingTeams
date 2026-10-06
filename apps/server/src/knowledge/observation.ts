@@ -183,8 +183,9 @@ export class KnowledgeObservationService {
 			const items = [];
 			for (const [relativePath, data] of disk) {
 				if (protectedPaths.includes(relativePath)) continue;
-				const snapshot = await this.deps.objects.put(data.bytes), fields = parseNoteFrontmatterFields(data.bytes.toString("utf8"));
-				items.push({ relativePath, contentHash: data.hash, snapshotRef: snapshot.hash, acceptedBy: "platform-observer", diskIdentity: data.diskIdentity,
+				await this.deps.objects.put(data.bytes, data.hash);
+				const fields = parseNoteFrontmatterFields(data.bytes.toString("utf8"));
+				items.push({ relativePath, contentHash: data.hash, acceptedBy: "platform-observer", diskIdentity: data.diskIdentity,
 					...(!duplicateIds.has(data.declaredId ?? "") && data.declaredId ? { declaredNoteId: data.declaredId } : {}), ...(data.title ? { title: data.title } : {}),
 					sourceIds: Array.isArray(fields.sources) ? fields.sources.filter((id): id is string => typeof id === "string") : [] });
 			}

@@ -80,7 +80,7 @@ export class CompileJobStore {
 			!Number.isSafeInteger(input.agentRevision) || input.agentRevision < 1 ||
 			!Number.isSafeInteger(input.bindingRevision) || input.bindingRevision < 1 ||
 			!Number.isSafeInteger(input.trustRevision) || input.trustRevision < 1 ||
-			![input.compilerPackageSha256, input.commandSha256, input.baseManifestHash].every((value) => /^[a-f0-9]{64}$/.test(value)) ||
+			![input.compilerPackageSha256, input.commandSha256].every((value) => /^[a-f0-9]{64}$/.test(value)) ||
 			![input.sourceSnapshotRoot, input.stagingRoot, input.privateRoot, input.commandPath].every(path.isAbsolute)) {
 			throw new Error("invalid CompileJob authority");
 		}

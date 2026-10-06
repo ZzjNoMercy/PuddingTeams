@@ -308,6 +308,12 @@ function BatchDetail({ batchId, vault, bindings }: { batchId: string; vault: str
 	return <div className="flex min-h-0 flex-1 flex-col"><TerminalBatchView batch={namedBatch} vault={vault ?? batch.bindingId} onReload={() => setNonce(value => value + 1)} /><RevisionFollowup batch={namedBatch} /><ReviewWorkspace key={`${batch.id}:${batch.revision}:${batch.manifestHash}`} batch={namedBatch} vault={vault ?? batch.bindingId} onBatchChange={setBatch} onReload={() => setNonce((value) => value + 1)} /></div>;
 }
 
+/** Calendar candidates are corrected at the scheduling authority, without a curation job. */
+function calendarEditHref(batch: WikiBatchDetail): string | null {
+ if (batch.batch.compilerVersion !== "calendar-interaction-v1") return null;
+ try { const id: unknown = JSON.parse(batch.batch.validationReceipt).calendar?.eventId; return typeof id === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(id) ? `/calendar?event=${id}` : null; } catch { return null; }
+}
+
 /** 冲突/退回/已发布等终态的如实展示与引导。 */
 function TerminalBatchView({ batch, vault, onReload }: { batch: WikiBatchDetail; vault: string | null; onReload: () => void }) {
 	const router = useRouter();
@@ -327,7 +333,7 @@ function TerminalBatchView({ batch, vault, onReload }: { batch: WikiBatchDetail;
 			resolutionOperation.current = { action: resolving, feedback: text, id: crypto.randomUUID() };
 		}
 		try {
-			const input = { operationId: resolutionOperation.current.id, manifestHash: batch.manifestHash, expectedBatchRevision: batch.revision };
+			const input = { operationId: resolutionOperation.current.id, manifestHash: batch.manifestHash };
 			if (resolving === "regenerate") await requestWikiRevision(batch.id, { ...input, feedback: text, reviewedFiles: [] });
 			else await closeWikiConflict(batch.id, input);
 			setResolving(null); window.dispatchEvent(new Event(WIKI_REVIEW_CHANGED)); onReload();
@@ -343,7 +349,8 @@ function TerminalBatchView({ batch, vault, onReload }: { batch: WikiBatchDetail;
 		return () => { active = false; };
 	}, [batch.bindingId, batch.id, batch.status]);
 
-	const conflictHint = batch.status === "conflict"
+	const calendarHref = calendarEditHref(batch);
+	const conflictHint = calendarHref && (batch.status === "conflict" || batch.status === "rejected") ? "此往来候选不会发布。请回到日程核对并重新保存，生成新候选后再审核。" : batch.status === "conflict"
 		? batch.conflictClosure ? "此冲突已关闭，已移入已处理记录。旧候选和发布记录保留。" : "这批候选无法继续发布。可以用原始资料按当前知识库重新整理，生成新候选后再审核；也可以关闭此冲突。"
 		: batch.status === "rejected"
 			? "批次已拒绝，不会发布。可回到知识库调整来源后生成新的候选。"
@@ -356,7 +363,7 @@ function TerminalBatchView({ batch, vault, onReload }: { batch: WikiBatchDetail;
 			{batch.conflictBlockedReason ? <p role="status" className="mt-2 text-sm text-destructive">{batch.conflictBlockedReason}</p> : null}
 			<div className="mt-2 flex flex-wrap gap-3 text-sm">
 				{batch.status === "conflict" && !batch.conflictClosure ? <>
-					<button type="button" disabled={Boolean(batch.conflictBlockedReason) || submitting} onClick={() => { setResolutionError(null); setResolving("regenerate"); }} className="rounded bg-primary px-3 py-2 text-primary-foreground disabled:opacity-40">重新整理，生成新候选</button>
+					<>{calendarHref ? <Link href={calendarHref} className="rounded bg-primary px-3 py-2 text-primary-foreground">修改日程</Link> : <button type="button" disabled={Boolean(batch.conflictBlockedReason) || submitting} onClick={() => { setResolutionError(null); setResolving("regenerate"); }} className="rounded bg-primary px-3 py-2 text-primary-foreground disabled:opacity-40">重新整理，生成新候选</button>}</>
 					<button type="button" disabled={Boolean(batch.conflictBlockedReason) || submitting} onClick={() => { setResolutionError(null); setResolving("close"); }} className="rounded border border-border px-3 py-2 disabled:opacity-40">关闭此冲突</button>
 				</> : null}
 				{batch.status === "published" ? <Link href={`/knowledge?vault=${encodeURIComponent(batch.bindingId)}`} className="rounded bg-primary px-3 py-2 text-primary-foreground">查看已发布知识库</Link> : null}
@@ -430,6 +437,7 @@ function ReviewWorkspace({ batch, onBatchChange, onReload }: {
 	onReload: () => void;
 }) {
 	const scopeParams = useSearchParams();
+	const calendarHref = calendarEditHref(batch);
 	const files = useMemo(() => [...batch.batch.files].sort((a, b) => a.targetPath.localeCompare(b.targetPath)), [batch]);
 	const [selectedPath, setSelectedPath] = useState(files[0]?.targetPath ?? "");
 	const [mobileFilesOpen, setMobileFilesOpen] = useState(false);
@@ -494,14 +502,13 @@ function ReviewWorkspace({ batch, onBatchChange, onReload }: {
 			const key = JSON.stringify([decision, batch.manifestHash, batch.revision, reviewedFiles, decision === "return" ? feedback.trim() : null]);
 			if (reviewOperation.current?.key !== key) reviewOperation.current = { key, id: crypto.randomUUID() };
 			if (decision === "return") {
-				await requestWikiRevision(batch.id, { operationId: reviewOperation.current.id, manifestHash: batch.manifestHash, expectedBatchRevision: batch.revision, feedback: feedback.trim(), reviewedFiles });
+				await requestWikiRevision(batch.id, { operationId: reviewOperation.current.id, manifestHash: batch.manifestHash, feedback: feedback.trim(), reviewedFiles });
 				onReload(); setConfirming(null); window.dispatchEvent(new Event(WIKI_REVIEW_CHANGED)); return;
 			}
 			const response = await submitWikiReview(batch.id, {
 				operationId: reviewOperation.current.id,
 				decision,
 				manifestHash: batch.manifestHash,
-				expectedBatchRevision: batch.revision,
 				reviewedFiles,
 			});
 			onBatchChange(response);
@@ -541,7 +548,7 @@ function ReviewWorkspace({ batch, onBatchChange, onReload }: {
 								>
 									确认并发布 {files.length} 项
 								</button>
-								<button type="button" disabled={submitting} onClick={() => requestConfirm("return")} className="rounded border border-border px-3 py-2 text-sm">退回修订</button>
+								{calendarHref ? <Link href={calendarHref} className="rounded border border-border px-3 py-2 text-sm">修改日程</Link> : <button type="button" disabled={submitting} onClick={() => requestConfirm("return")} className="rounded border border-border px-3 py-2 text-sm">退回修订</button>}
 								<button type="button" disabled={submitting} onClick={() => requestConfirm("reject")} className="rounded border border-border px-3 py-2 text-sm">
 									拒绝
 								</button>

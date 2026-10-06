@@ -40,6 +40,7 @@ interface PreparedUpload {
 	name: string;
 	mediaType: string;
 	buffer: Buffer;
+	sha256: string;
 }
 
 export interface UploadIdentity {
@@ -106,7 +107,7 @@ export class UploadStore {
 		if (inputs.length + localFiles.length > MAX_FILES) throw new Error(`单次最多上传 ${MAX_FILES} 个附件`);
 		const identities = identifyUploads(inputs);
 		const prepared: PreparedUpload[] = inputs.map((input, index) => ({
-			buffer: Buffer.from(input.data, "base64"), name: identities[index]!.name, mediaType: identities[index]!.mediaType,
+			buffer: Buffer.from(input.data, "base64"), name: identities[index]!.name, mediaType: identities[index]!.mediaType, sha256: identities[index]!.sha256,
 		}));
 		for (const localFile of localFiles) {
 			const source = typeof localFile === "string" ? localFile : localFile.path;
@@ -128,7 +129,7 @@ export class UploadStore {
 				if (buffer.length === 0 || buffer.length > MAX_FILE_BYTES) throw new Error(`外部文件大小在冻结期间发生变化：${source}`);
 				const after = await handle.stat();
 				if (after.dev !== info.dev || after.ino !== info.ino || after.size !== buffer.length) throw new Error(`外部文件身份在冻结期间发生变化：${source}`);
-				prepared.push({ name: safeName(source), mediaType: mediaTypeFor(source), buffer });
+				prepared.push({ name: safeName(source), mediaType: mediaTypeFor(source), buffer, sha256: createHash("sha256").update(buffer).digest("hex") });
 			} finally {
 				await handle.close();
 			}
@@ -140,8 +141,7 @@ export class UploadStore {
 		const stored: StoredUpload[] = [];
 		try {
 			for (const item of prepared) {
-				const digest = createHash("sha256").update(item.buffer).digest("hex");
-				const target = path.join(directory, `${firstWorkFreezeId ? `firstwork-${firstWorkFreezeId}-` : ""}${randomUUID()}-${digest}-${item.name}`);
+				const target = path.join(directory, `${firstWorkFreezeId ? `firstwork-${firstWorkFreezeId}-` : ""}${randomUUID()}-${item.sha256}-${item.name}`);
 				try { await writeFile(target, item.buffer, { flag: "wx", mode: 0o600 }); }
 				catch (error) {
 					if ((error as NodeJS.ErrnoException).code !== "EEXIST") await unlink(target).catch(() => undefined);

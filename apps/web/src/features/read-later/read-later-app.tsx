@@ -535,38 +535,38 @@ export function ReadLaterApp() {
                       className="rl-row-content"
                       onClick={() => choose(item)}
                     >
-                      <div className="rl-row-heading">
+                      <div className="rl-row-copy">
                         <h2>
                           {item.readingStatus === "unread" && (
                             <i aria-label="未读" />
                           )}
                           {item.title}
                         </h2>
-                        {item.thumbnail && (
-                          <Image
-                            className="rl-thumbnail"
-                            src={readingAssetUrl(item.id, item.thumbnail.versionId, item.thumbnail.assetId)}
-                            alt=""
-                            width={56}
-                            height={56}
-                            unoptimized
-                            loading={item.id === firstThumbnailId ? "eager" : "lazy"}
-                            decoding="async"
-                          />
-                        )}
+                        <TagChips tags={item.tags} />
+                        <div className="rl-row-footer">
+                          <span className="rl-row-meta" title={`${sourceLabel(item)}${item.tags.length ? "" : " · 未分类"} · ${date(item.createdAt)}`}>
+                            <Newspaper size={12} aria-hidden="true" />
+                            <span>{sourceLabel(item)}{item.tags.length ? "" : " · 未分类"} · {date(item.createdAt)}</span>
+                          </span>
+                          <span
+                            className={item.parseStatus === "ready" ? "sr-only" : `rl-status status-${item.parseStatus}`}
+                          >
+                            {statusLabel[item.parseStatus]}
+                          </span>
+                        </div>
                       </div>
-                      <TagChips tags={item.tags} />
-                      <div className="rl-row-footer">
-                        <span className="rl-row-meta" title={`${sourceLabel(item)}${item.tags.length ? "" : " · 未分类"} · ${date(item.createdAt)}`}>
-                          <Newspaper size={12} aria-hidden="true" />
-                          <span>{sourceLabel(item)}{item.tags.length ? "" : " · 未分类"} · {date(item.createdAt)}</span>
-                        </span>
-                        <span
-                          className={item.parseStatus === "ready" ? "sr-only" : `rl-status status-${item.parseStatus}`}
-                        >
-                          {statusLabel[item.parseStatus]}
-                        </span>
-                      </div>
+                      {item.thumbnail && (
+                        <Image
+                          className="rl-thumbnail"
+                          src={readingAssetUrl(item.id, item.thumbnail.versionId, item.thumbnail.assetId)}
+                          alt=""
+                          width={56}
+                          height={56}
+                          unoptimized
+                          loading={item.id === firstThumbnailId ? "eager" : "lazy"}
+                          decoding="async"
+                        />
+                      )}
                     </button>
                   </div>
                 ))

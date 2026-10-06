@@ -20,7 +20,7 @@ async function fixture(memory = false) {
 	const binding = await bindings.create({ ownerId: "owner", rootPath: vault, name: "My Wiki", description: "Notes" });
 	const acceptance = new KnowledgeAcceptanceStore(path.join(root, "acceptance")), selections = new KnowledgeSelectionStore(path.join(root, "state"), bindings, async () => memory ? [binding.id] : []);
 	const text = "# 已采纳\n事实日期为2026-10-23\n[[other]]\n", stored = await objects.put(Buffer.from(text));
-	await acceptance.adopt(binding.id, [{ relativePath: "note.md", contentHash: stored.hash, snapshotRef: stored.hash, acceptedBy: "owner" }], 0);
+	await acceptance.adopt(binding.id, [{ relativePath: "note.md", contentHash: stored.hash, acceptedBy: "owner" }], 0);
 	const currentText = "# 当前外部笔记\n事实日期2026-12-01";
 	await writeFile(path.join(vault, "note.md"), currentText);
 	const observation = new KnowledgeObservationService(acceptance, { objects });
@@ -130,7 +130,7 @@ test("控制文件用于导航而非事实来源，空读和超预算读不授�
 	const f = await fixture();
 	try {
 		const stored = await f.objects.put(Buffer.from("# 索引\n事实见 [[note]]\n"));
-		await f.acceptance.adoptPublished(f.binding.id, [{ relativePath: "index.md", contentHash: stored.hash, snapshotRef: stored.hash, acceptedBy: "owner" }], 1);
+		await f.acceptance.adoptPublished(f.binding.id, [{ relativePath: "index.md", contentHash: stored.hash, acceptedBy: "owner" }], 1);
 		await writeFile(path.join(f.vault, "index.md"), (await f.objects.get(stored.hash)).toString());
 		const surface = await f.runtime.mount(f.scope);
 		const search = await call(surface, "knowledge_search", { bindingId: f.binding.id, query: "事实" });

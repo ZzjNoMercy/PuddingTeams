@@ -31,14 +31,14 @@ export function registerWikiCuratorRoutes(app: FastifyInstance, deps: {
 		if (!record || record.ownerId !== job.ownerId || record.batch.bindingId !== job.targetBindingId) return undefined;
 		return record.status === "returned" && deps.revisions ? { ...record, returnRequest: await deps.revisions.followup(record) } : record;
 	};
-	app.post<{ Params: { id: string }; Body: { operationId?: string; manifestHash?: string; expectedBatchRevision?: number; feedback?: string; reviewedFiles?: string[] } }>("/api/wiki/batches/:id/revisions", async (req, reply) => {
+	app.post<{ Params: { id: string }; Body: { operationId?: string; manifestHash?: string; feedback?: string; reviewedFiles?: string[] } }>("/api/wiki/batches/:id/revisions", async (req, reply) => {
 		const record = await deps.reviews.get(req.params.id), body = req.body;
 		if (!record || record.ownerId !== owner() || !await visible(record.batch.bindingId)) return reply.code(404).send({ error: "审核批次不存在" });
 		if (!deps.revisions) return reply.code(422).send({ error: "退回修改能力尚未装配" });
-		if (!body || typeof body.operationId !== "string" || typeof body.manifestHash !== "string" || typeof body.expectedBatchRevision !== "number" || typeof body.feedback !== "string" || !Array.isArray(body.reviewedFiles)) return reply.code(400).send({ error: "退回修改参数无效" });
+		if (!body || typeof body.operationId !== "string" || typeof body.manifestHash !== "string" || typeof body.feedback !== "string" || !Array.isArray(body.reviewedFiles)) return reply.code(400).send({ error: "退回修改参数无效" });
 		try {
 			const result = await deps.revisions.request({ batchId: record.batch.id, actorId: owner(), operationId: body.operationId,
-				manifestHash: body.manifestHash, expectedBatchRevision: body.expectedBatchRevision, feedback: body.feedback, reviewedFiles: body.reviewedFiles });
+				manifestHash: body.manifestHash, feedback: body.feedback, reviewedFiles: body.reviewedFiles });
 			return reply.code(202).send({ job: presentJob(result.job), replayed: result.replayed });
 		} catch (error) { return reply.code((error as { code?: string }).code === "invalid_input" ? 400 : 409).send({ error: error instanceof Error ? error.message : "退回修改失败" }); }
 	});
@@ -107,7 +107,7 @@ export function registerWikiCuratorRoutes(app: FastifyInstance, deps: {
 		for (const source of job.historicalAcceptedSources ?? []) {
 			sources.push({ id: source.id, ownerId: job.ownerId, kind: "markdown", title: `历史采纳来源：${source.path}`, mediaType: "text/markdown", byteSize: 0,
 				originalHash: source.hash, textHash: source.hash, status: "ready", locations: [], warnings: ["只保留既有页面引用；不代表本次模型读取了该正文"], createdAt: job.createdAt,
-				content: (await deps.objects.get(source.snapshotRef)).toString("utf8") });
+				content: (await deps.objects.get(source.hash)).toString("utf8") });
 		}
 		return { sources, origin: job.origin ? { ...job.origin, sessionAvailable: Boolean(await deps.teams.contextForSession(job.origin.sessionId)) } : null };
 	});

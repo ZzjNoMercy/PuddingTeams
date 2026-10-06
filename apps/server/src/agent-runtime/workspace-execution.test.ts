@@ -331,3 +331,25 @@ test("shared read-only detects mutation and rejects an unenforced admission", as
 		await rm(state, { recursive: true, force: true });
 	}
 });
+
+test("verification environment id is sanitized for use as a directory name", async () => {
+	const root = await temp("pt-execution-sanitize-");
+	const state = await temp("pt-execution-state-");
+	try {
+		await writeFile(path.join(root, "tracked.txt"), "base\n");
+		const coordinator = new WorkspaceExecutionCoordinator(state);
+		await coordinator.init();
+		const scope = await coordinator.begin({ workspacePath: root, mode: "exclusive_write", delegationId: "d-sanitize" });
+		const verificationId = 'verification:sub-1:call*9';
+		const copy = await coordinator.createVerificationCopy(scope.id, verificationId, scope.ownerToken);
+		assert.equal(copy.id, "verify-verification-sub-1-call-9");
+		assert.equal(path.basename(copy.root), copy.id);
+		assert(!/[<>:"/\\|?*]/.test(copy.id), "目录名不得含 Windows 保留字符");
+		const again = await coordinator.createVerificationCopy(scope.id, verificationId, scope.ownerToken);
+		assert.equal(again.id, copy.id, "相同 verificationId 幂等返回同一环境");
+		assert.equal((await coordinator.resolveVerificationTarget(copy.id, verificationId)).id, copy.id);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+		await rm(state, { recursive: true, force: true });
+	}
+});

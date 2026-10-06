@@ -127,6 +127,10 @@ function JsonConfigEditor({
 	return (
 		<div className="flex flex-col gap-1">
 			<Textarea
+				autoComplete="off"
+				autoCapitalize="none"
+				autoCorrect="off"
+				spellCheck={false}
 				value={text}
 				rows={4}
 				className="font-mono text-xs"
@@ -566,6 +570,7 @@ export function ConfigSchemaForm({
 							</span>
 							<Input
 								type="number"
+								autoComplete="off"
 								value={typeof current === "number" ? String(current) : ""}
 								onChange={(e) => {
 									const raw = e.target.value;
@@ -582,6 +587,10 @@ export function ConfigSchemaForm({
 							{mark}
 						</span>
 						<Input
+							autoComplete="off"
+							autoCapitalize="none"
+							autoCorrect="off"
+							spellCheck={false}
 							value={typeof current === "string" ? current : ""}
 							placeholder={prop.description}
 							onChange={(e) => onChange({ ...value, [key]: e.target.value })}
@@ -624,6 +633,10 @@ export function SecretSchemaFields({
 						</span>
 						<Input
 							type="password"
+							autoComplete="new-password"
+							autoCapitalize="none"
+							autoCorrect="off"
+							spellCheck={false}
 							value={values[item.key] ?? ""}
 							placeholder={configured ? "已配置，输入新值覆盖" : "输入密钥值"}
 							className="font-mono text-xs"
@@ -851,6 +864,10 @@ export function SecretsEditor({ agent }: { agent: AgentConfig }) {
 					)}
 					<div className="flex flex-col gap-1.5">
 						<Input
+							autoComplete="off"
+							autoCapitalize="none"
+							autoCorrect="off"
+							spellCheck={false}
 							value={keyName}
 							onChange={(e) => setKeyName(e.target.value)}
 							placeholder="变量名，如 GITHUB_TOKEN"
@@ -859,6 +876,10 @@ export function SecretsEditor({ agent }: { agent: AgentConfig }) {
 						<div className="flex items-center gap-1.5">
 							<Input
 								type="password"
+								autoComplete="new-password"
+								autoCapitalize="none"
+								autoCorrect="off"
+								spellCheck={false}
 								value={value}
 								onChange={(e) => setValue(e.target.value)}
 								placeholder="令牌值"
