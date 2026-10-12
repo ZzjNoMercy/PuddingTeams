@@ -227,6 +227,8 @@ function ComposerInner({
 	stopAvailable,
 	stopping,
 	busyHint,
+	queueHint,
+	hideSessionControls,
 	hasGoal,
 	workspaceLabel,
 	workspacePath,
@@ -250,6 +252,10 @@ function ComposerInner({
 	stopping: boolean;
 	/** run 活跃但 manager 在等 worker（delegate 阻塞中）时的等待文案。 */
 	busyHint?: string;
+	/** worker 执行会话视图：running 不阻断提交，提示消息会排队。 */
+	queueHint?: string;
+	/** worker 执行会话视图：模型/思考强度等会话级控制不适用，隐藏。 */
+	hideSessionControls?: boolean;
 	hasGoal: boolean;
 	workspaceLabel: string;
 	workspacePath: string;
@@ -341,7 +347,7 @@ function ComposerInner({
 		? textInput.value.slice(1).toLowerCase()
 		: null;
 	const visibleCommands = commandQuery === null ? [] : [
-		...(!hasGoal ? [{ name: "goal", description: "创建一个由 manager 持续推进的目标", source: "goal" as const }] : []),
+		...(!hasGoal && !hideSessionControls ? [{ name: "goal", description: "创建一个由 manager 持续推进的目标", source: "goal" as const }] : []),
 		...skillCommands,
 	].filter((command) => command.name.toLowerCase().includes(commandQuery)).slice(0, 8);
 	const chooseSkillCommand = (command: SessionSlashCommand) => {
@@ -392,8 +398,12 @@ function ComposerInner({
 			onError={(error) => toast.error(error.message)}
 			onSubmit={async (message) => {
 				if (disabled || knowledgeSaving || workerModelSaving || stopping) return;
+				if (hideSessionControls && message.files.length > 0) {
+					toast.error("执行会话暂不支持附件");
+					return;
+				}
 				if (message.files.length === 0) {
-					const command = message.text.trim().match(/^\/goal(?:\s+([\s\S]*))?$/i);
+					const command = hideSessionControls ? null : message.text.trim().match(/^\/goal(?:\s+([\s\S]*))?$/i);
 					if (command) {
 						if (hasGoal) {
 							toast.info("当前会话已经是 Goal");
@@ -422,9 +432,11 @@ function ComposerInner({
 			/>
 			<PromptInputFooter>
 				<PromptInputTools>
-					<Button type="button" size="icon" variant="ghost" className="size-8" onClick={() => attachments.openFileDialog()} aria-label="添加附件" title="添加附件（最多 5 个，每个 8MB）">
-						<PaperclipIcon className="size-4" />
-					</Button>
+					{hideSessionControls ? null : (
+						<Button type="button" size="icon" variant="ghost" className="size-8" onClick={() => attachments.openFileDialog()} aria-label="添加附件" title="添加附件（最多 5 个，每个 8MB）">
+							<PaperclipIcon className="size-4" />
+						</Button>
+					)}
 					<Button
 						type="button"
 						size="sm"
@@ -437,11 +449,11 @@ function ComposerInner({
 						<FolderGit2Icon className="size-3.5" />
 						<span className="truncate">{workspaceLabel}</span>
 					</Button>
-					<SessionKnowledgePicker sessionId={sessionId} disabled={disabled || stopAvailable || stopping} onSavingChange={setKnowledgeSaving} />
+					{hideSessionControls ? null : <SessionKnowledgePicker sessionId={sessionId} disabled={disabled || stopAvailable || stopping} onSavingChange={setKnowledgeSaving} />}
 				</PromptInputTools>
-				<span className="home-composer-status">{stopping ? "正在停止并保存结果…" : stopAvailable ? (busyHint ?? "处理中…") : sending ? "正在提交消息…" : ""}</span>
+				<span className="home-composer-status">{stopping ? "正在停止并保存结果…" : stopAvailable ? (busyHint ?? "处理中…") : sending ? "正在提交消息…" : (queueHint ?? "")}</span>
 				<div className="home-composer-send">
-					{directWorkerModel ? (
+					{hideSessionControls ? null : directWorkerModel ? (
 						<WorkerModelPicker key={`${sessionId}:${directWorkerModel.name}`} sessionId={sessionId} workerName={directWorkerModel.name} disabled={disabled || sending || stopping} onSavingChange={setWorkerModelSaving} />
 					) : (
 						<>
@@ -475,6 +487,8 @@ export function Composer({
 	stopAvailable = false,
 	stopping = false,
 	busyHint,
+	queueHint,
+	hideSessionControls = false,
 	hasGoal,
 	workspaceLabel,
 	workspacePath,
@@ -500,6 +514,10 @@ export function Composer({
 	stopAvailable?: boolean;
 	stopping?: boolean;
 	busyHint?: string;
+	/** worker 执行会话视图：running 不阻断提交，提示消息会排队。 */
+	queueHint?: string;
+	/** worker 执行会话视图：隐藏附件/知识库/模型等会话级控制。 */
+	hideSessionControls?: boolean;
 	hasGoal: boolean;
 	workspaceLabel: string;
 	workspacePath: string;
@@ -530,11 +548,13 @@ export function Composer({
 					<ComposerInner
 							sessionId={sessionId}
 							draftScope={draftScope}
-							disabled={disabled}
-							sending={sending}
-							stopAvailable={stopAvailable}
-							stopping={stopping}
+						disabled={disabled}
+						sending={sending}
+						stopAvailable={stopAvailable}
+						stopping={stopping}
 						busyHint={busyHint}
+						queueHint={queueHint}
+						hideSessionControls={hideSessionControls}
 						hasGoal={hasGoal}
 						workspaceLabel={workspaceLabel}
 						workspacePath={workspacePath}

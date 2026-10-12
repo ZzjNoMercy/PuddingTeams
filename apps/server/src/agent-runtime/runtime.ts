@@ -87,6 +87,11 @@ export interface DelegateInput {
 	driver?: AgentDriver;
 	/** Internal resume path for a platform-policy Interaction; never accepted from Manager prompts. */
 	resumeDelegationId?: string;
+	/**
+	 * 排队用户输入通道的锁交接凭据：锁被 `queue:<token>` 持有时，仅携带同一
+	 * token 的 delegate 可认领（用户输入先于后到委派）；其他委派照常 409。
+	 */
+	sessionQueueToken?: string;
 }
 
 export interface RuntimeOutcome {
@@ -276,8 +281,43 @@ export class AgentRuntime {
 		return true;
 	}
 
+	/**
+	 * 排队用户输入的锁交接钩子（worker 执行 session 直接输入）：释放点在同一
+	 * 临界区先询问钩子；钩子返回 token 表示队列已取走队首，锁转由
+	 * `queue:<token>` 持有，后到委派依旧 conflict，先到用户输入先于后到委派。
+	 */
+	private sessionQueueHook?: (sessionHandle: string) => string | undefined;
+
+	setSessionQueueHook(hook: (sessionHandle: string) => string | undefined): void {
+		this.sessionQueueHook = hook;
+	}
+
+	/** 该 sessionHandle 的锁是否被占用（含排队交接中的 queue token）。 */
+	isSessionLocked(sessionHandle: string): boolean {
+		return this.activeRuns.has(sessionHandle);
+	}
+
+	/** 队列通道在非释放点（启动对账/空闲直投）认领空闲锁。 */
+	claimSessionForQueue(sessionHandle: string, token: string): boolean {
+		if (this.activeRuns.has(sessionHandle)) return false;
+		this.activeRuns.set(sessionHandle, `queue:${token}`);
+		return true;
+	}
+
+	/** 释放队列认领但未成功派发的锁；释放时同样先交接给下一个队首。 */
+	releaseSessionQueueClaim(sessionHandle: string, token: string): void {
+		if (this.activeRuns.get(sessionHandle) === `queue:${token}`) this.handoffOrDeleteSession(sessionHandle);
+	}
+
+	private handoffOrDeleteSession(sessionHandle: string): void {
+		const token = this.sessionQueueHook?.(sessionHandle);
+		if (token) this.activeRuns.set(sessionHandle, `queue:${token}`);
+		else this.activeRuns.delete(sessionHandle);
+	}
+
 	private releaseSession(sessionHandle: string, delegationId: string): void {
-		if (this.activeRuns.get(sessionHandle) === delegationId) this.activeRuns.delete(sessionHandle);
+		if (this.activeRuns.get(sessionHandle) !== delegationId) return;
+		this.handoffOrDeleteSession(sessionHandle);
 	}
 
 	private trackRun(delegationId: string): () => void {
@@ -514,9 +554,13 @@ export class AgentRuntime {
 		}
 
 		// 所有可能失败的环境预检完成后再占 Session；否则非法环境会留下
-		// 没有 Delegation 对应的 pending 锁。
+		// 没有 Delegation 对应的 pending 锁。队列交接持有的锁只放行持同一
+		// token 的派发，其余委派照常冲突。
 		if (knownSession) {
-			if (this.activeRuns.has(knownSession)) throw new SessionConflictError(knownSession);
+			const held = this.activeRuns.get(knownSession);
+			const queueToken = held?.startsWith("queue:") ? held.slice("queue:".length) : undefined;
+			const adopted = queueToken !== undefined && input.sessionQueueToken === queueToken;
+			if (held !== undefined && !adopted) throw new SessionConflictError(knownSession);
 			this.activeRuns.set(knownSession, "pending");
 		}
 		let delegation: DelegationRecord;
@@ -576,7 +620,7 @@ export class AgentRuntime {
 				executionCwd: verificationEnvironment?.executionCwd,
 			});
 		} catch (error) {
-			if (knownSession && this.activeRuns.get(knownSession) === "pending") this.activeRuns.delete(knownSession);
+			if (knownSession && this.activeRuns.get(knownSession) === "pending") this.handoffOrDeleteSession(knownSession);
 			throw error;
 		}
 		const readOnlyPolicy = input.workspaceExecutionPolicy?.mode === "read_only_shared" ? input.workspaceExecutionPolicy : undefined;
@@ -598,7 +642,7 @@ export class AgentRuntime {
 				meta: { recoveryAction: "select_compatible_worker", userDecisionRequired: false },
 			};
 			const terminal = await this.sealTerminal(delegation, ["admitted"], "reported_failed", result, { ...ctx, cwd: input.cwdSnapshot });
-			if (knownSession) this.activeRuns.delete(knownSession);
+			if (knownSession) this.handoffOrDeleteSession(knownSession);
 			input.onCreated?.(terminal.record ?? delegation);
 			return { status: "failed", result, delegation: terminal.record ?? delegation };
 		}
@@ -655,7 +699,7 @@ export class AgentRuntime {
 					recoverable: true,
 				};
 				const terminal = await this.sealTerminal(delegation, ["admitted"], "reported_failed", blocked, { ...ctx, cwd: input.cwdSnapshot });
-				if (knownSession) this.activeRuns.delete(knownSession);
+				if (knownSession) this.handoffOrDeleteSession(knownSession);
 				return { status: "failed", result: blocked, delegation: terminal.record ?? delegation };
 			}
 		}
@@ -680,7 +724,7 @@ export class AgentRuntime {
 					recoverable: true,
 				};
 				const terminal = await this.sealTerminal(delegation, ["running"], "reported_failed", blocked, { ...ctx, cwd: input.cwdSnapshot });
-				if (knownSession) this.activeRuns.delete(knownSession);
+				if (knownSession) this.handoffOrDeleteSession(knownSession);
 				return { status: "failed", result: blocked, delegation: terminal.record ?? delegation };
 			}
 		}
@@ -765,7 +809,7 @@ export class AgentRuntime {
 						staleRetried = true;
 						restart = true;
 						this.releaseSession(sessionHandle ?? knownSession, delegation.id);
-						this.activeRuns.delete(knownSession);
+						this.handoffOrDeleteSession(knownSession);
 						sessionHandle = undefined;
 						await this.delegations.updateDelegation(delegation.id, { sessionHandle: undefined });
 						runCtx.onUpdate?.("worker 旧会话已失效，正在以新会话重试…", { running: true });
@@ -796,7 +840,7 @@ export class AgentRuntime {
 			}
 		} catch (err) {
 			if (sessionHandle) this.releaseSession(sessionHandle, delegation.id);
-			else if (knownSession) this.activeRuns.delete(knownSession);
+			else if (knownSession) this.handoffOrDeleteSession(knownSession);
 			if (ctx.signal?.aborted) {
 				const interrupted = await this.settleAbortedDriverStream(delegation, input.agentId, runCtx);
 				this.runControllers.delete(delegation.id);
@@ -837,7 +881,7 @@ export class AgentRuntime {
 		// 驱动没有产生边界事件（协议错误）。
 		await markWorkerStarted(false);
 		if (sessionHandle) this.releaseSession(sessionHandle, delegation.id);
-		else if (knownSession) this.activeRuns.delete(knownSession);
+		else if (knownSession) this.handoffOrDeleteSession(knownSession);
 		if (ctx.signal?.aborted) {
 			const interrupted = await this.settleAbortedDriverStream(delegation, input.agentId, runCtx);
 			this.runControllers.delete(delegation.id);

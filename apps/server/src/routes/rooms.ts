@@ -4,9 +4,13 @@ import { PiSessionStore } from "../pi-bridge/session-store.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import { isWorkspaceDirectoryAvailable, type WorkspaceSummary } from "../store/workspaces.js";
 import type { WorkerBinding } from "../store/teams.js";
+import type { DelegationStore } from "../agent-runtime/delegation-store.js";
+import { listWorkerSessionsForWindow, renameWorkerSession, findWorkerSessionFile, resolveSession, ACTIVE_WORKER_EXECUTION_STATES, type WorkerSessionSummary } from "../agent-runtime/worker-sessions.js";
+import { disposeLiveWorkerSession } from "../agent-runtime/pi-driver.js";
+import type { WorkerInputDispatcher } from "../agent-runtime/worker-input-queue.js";
 import { WorkStateOperationConflictError, type WorkStateStore } from "../store/work-state.js";
 import type { ProductSettingsStore } from "../store/product-settings.js";
-import { readFile, realpath, stat } from "node:fs/promises";
+import { readFile, realpath, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { openNativeFile } from "../platform/native-file-opener.js";
@@ -28,6 +32,13 @@ class DeletedWorkSessionError extends Error {
 	constructor(readonly sessionId: string) {
 		super("此操作原先预约的 Session 已删除；如需继续，请明确作为新工作发起");
 		this.name = "DeletedWorkSessionError";
+	}
+}
+
+class WorkerSessionBusyError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "WorkerSessionBusyError";
 	}
 }
 
@@ -81,6 +92,14 @@ export interface RoomSummary {
 	members: AgentConfig[];
 	sessions: RoomSessionSummary[];
 	activeSession: string;
+	/**
+	 * Worker 执行 session 的平行投影（仅 direct 窗口非空）：委派与直派产生的
+	 * 真实 pi 会话，可切换查看。它们不进 window.sessions（存储层约束），
+	 * 未读/排序仍由容器卡承担。
+	 */
+	workerSessions: WorkerSessionSummary[];
+	/** 正在查看的执行 session handle；null = 看容器 session。 */
+	activeWorkerView: string | null;
 	pinned: boolean;
 	/** Active room Session's per-worker continuation handles. */
 	workerBindings: Record<string, WorkerBinding>;
@@ -105,6 +124,7 @@ async function buildWindowSummary(
 	teams: TeamsStore,
 	w: WindowConfig,
 	projector = new RoomActivityProjector(),
+	workerView?: { delegations: DelegationStore; sessionDir: string },
 ): Promise<RoomSummary> {
 	const list = await sessions.list();
 	const byId = new Map(list.map((s) => [s.id, s]));
@@ -124,6 +144,12 @@ async function buildWindowSummary(
 	const contextAvailable = workspace
 		? workspace.available && workspace.canonicalPath === w.cwdSnapshot
 		: await isWorkspaceDirectoryAvailable(w.cwdSnapshot, w.cwdSnapshot);
+	const workerSessions = workerView
+		? await listWorkerSessionsForWindow(
+			{ delegations: workerView.delegations, teams, defaultSessionDir: workerView.sessionDir },
+			w,
+		)
+		: [];
 	// 窗口名：自定义名优先，否则按类型派生（"与 X 单聊"等）。active session 的
 	// LLM 标题不混入窗口名——侧栏/头部把它作为第二行的会话上下文展示。
 	return {
@@ -151,6 +177,9 @@ async function buildWindowSummary(
 			};
 		}),
 		activeSession: active,
+		workerSessions,
+		// 查看指针可能指向已删除/已消失的执行 session；只投影当前枚举命中的。
+		activeWorkerView: workerSessions.some((item) => item.id === w.activeWorkerView) ? (w.activeWorkerView ?? null) : null,
 		pinned: Boolean(w.pinned),
 		workerBindings: w.workerBindings?.[active] ?? {},
 		prompt: w.prompt ?? "",
@@ -175,11 +204,33 @@ export function registerRoomsRoutes(
 		productSettings?: ProductSettingsStore;
 		activityStatePath?: string;
 		sessionCreationStatePath?: string;
+		/** Worker 执行 session 平行投影的数据源；缺省时 workerSessions 恒为空。 */
+		delegations?: DelegationStore;
+		workerSessionDir?: string;
+		/** Worker 执行 session 直接输入队列（步骤 4/5：取消排队、删除失败化）。 */
+		workerInputQueue?: WorkerInputDispatcher;
 	},
 ): void {
 	const activityProjector = new RoomActivityProjector(localFiles?.activityStatePath);
 	const sessionCreationOperations = localFiles?.sessionCreationStatePath
 		? new SessionCreationOperations(localFiles.sessionCreationStatePath) : null;
+	const workerView = localFiles?.delegations && localFiles?.workerSessionDir
+		? { delegations: localFiles.delegations, sessionDir: localFiles.workerSessionDir }
+		: undefined;
+	const summarize = (w: WindowConfig) => buildWindowSummary(sessions, teams, w, activityProjector, workerView);
+	/** 归属校验后的执行 session 解析：仅当 sid 是本 direct 窗口已列入
+	 *  workerSessions 的委派 session 时命中（直派执行面不单列、也不可管理）。 */
+	const resolveOwnedWorkerSession = async (w: WindowConfig, sid: string) => {
+		if (!workerView || w.type !== "direct") return undefined;
+		const resolved = await resolveSession(
+			{ sessions, delegations: workerView.delegations, teams, defaultSessionDir: workerView.sessionDir },
+			sid,
+		);
+		if (resolved?.kind !== "worker" || resolved.windowId !== w.id) return undefined;
+		const listed = await listWorkerSessionsForWindow(
+			{ delegations: workerView.delegations, teams, defaultSessionDir: workerView.sessionDir }, w);
+		return listed.some((item) => item.id === sid) ? resolved : undefined;
+	};
 	const pendingSessionCreations = new Map<string, Promise<Awaited<ReturnType<PiSessionStore["create"]>>>>();
 	const pendingNewWork = new Map<string, Promise<{ sessionId: string; accepted: boolean }>>();
 	const openLocalFile = localFiles?.open ?? openNativeFile;
@@ -239,7 +290,7 @@ export function registerRoomsRoutes(
 		const windows = await teams.listWindows();
 		for (const w of windows) await ensureWindowAlive(w);
 		const rooms: RoomSummary[] = [];
-		for (const w of windows) rooms.push(await buildWindowSummary(sessions, teams, w, activityProjector));
+		for (const w of windows) rooms.push(await summarize(w));
 		const created = new Map(windows.map((w) => [w.id, w.createdAt]));
 		rooms.sort((a, b) => compareRoomActivity(
 			{ id: a.id, lastActivityAt: a.lastActivityAt, createdAt: created.get(a.id) ?? "" },
@@ -252,7 +303,7 @@ export function registerRoomsRoutes(
 		const w = await teams.getWindow(req.params.id);
 		if (!w) return reply.code(404).send({ error: "window not found" });
 		await ensureWindowAlive(w);
-		return { room: await buildWindowSummary(sessions, teams, w, activityProjector) };
+		return { room: await summarize(w) };
 	});
 
 	/** M1 search includes durable Manager work parked under other Workspaces. */
@@ -297,7 +348,7 @@ export function registerRoomsRoutes(
 			return reply.code(400).send({ error: "sessionId 必须属于该房间" });
 		}
 		try {
-			await buildWindowSummary(sessions, teams, w, activityProjector);
+			await summarize(w);
 			const { activityRevision, read } = await activityProjector.markReadWithStatus(w.id, localViewerIdentity().user.id, req.body.sessionId, req.body.activityRevision!);
 			return { readRevision: read.readRevision, activityRevision, hasUnreadActivity: read.hasUnreadActivity };
 		} catch (error) {
@@ -375,7 +426,7 @@ export function registerRoomsRoutes(
 			if (creationOperation) {
 				try {
 					const previous = await teams.findGroupByCreationOperation(creationOperation.key, creationOperation.requestHash);
-					if (previous) return { room: await buildWindowSummary(sessions, teams, previous, activityProjector), existed: true };
+					if (previous) return { room: await summarize(previous), existed: true };
 				} catch (err) {
 					if (err instanceof RoomCreationOperationConflictError) return reply.code(409).send({ error: err.message, code: "room_operation_conflict" });
 					if (err instanceof RoomCreationOperationGoneError) return reply.code(409).send({ error: err.message, code: "room_operation_gone" });
@@ -425,7 +476,7 @@ export function registerRoomsRoutes(
 							cwd: context.cwdSnapshot,
 						}, reservedId);
 					}, { name: req.body?.name, prompt: req.body?.prompt, cwdSnapshot: context.cwdSnapshot, requireEnabledMember: true, rollbackSession: (id) => sessions.remove(id), journalSession: true });
-					return { room: await buildWindowSummary(sessions, teams, w, activityProjector), existed: !createdHere };
+					return { room: await summarize(w), existed: !createdHere };
 				}
 				let createdHere = false;
 				const w = await teams.createWindow({
@@ -447,7 +498,7 @@ export function registerRoomsRoutes(
 					}, reservedId); },
 					rollbackSession: (id) => sessions.remove(id),
 				});
-				return { room: await buildWindowSummary(sessions, teams, w, activityProjector), existed: !createdHere };
+				return { room: await summarize(w), existed: !createdHere };
 			} catch (err) {
 				if (err instanceof RoomCreationOperationConflictError) return reply.code(409).send({ error: err.message, code: "room_operation_conflict" });
 				if (err instanceof RoomCreationOperationGoneError) return reply.code(409).send({ error: err.message, code: "room_operation_gone" });
@@ -483,7 +534,7 @@ export function registerRoomsRoutes(
 					members: req.body.members,
 					prompt: req.body.prompt,
 				});
-				return { room: await buildWindowSummary(sessions, teams, w, activityProjector) };
+				return { room: await summarize(w) };
 			} catch (err) {
 				if (teams.durabilityUncertain()) {
 					return reply.code(409).send({ error: "房间修改结果未确认；请重启服务并回读房间列表，勿直接重复修改", code: "room_update_uncertain" });
@@ -518,7 +569,7 @@ export function registerRoomsRoutes(
 			if (creationOperation) {
 				try {
 					const previous = await teams.findGroupByCreationOperation(creationOperation.key, creationOperation.requestHash);
-					if (previous) return { room: await buildWindowSummary(sessions, teams, previous, activityProjector), existed: true, restored: true };
+					if (previous) return { room: await summarize(previous), existed: true, restored: true };
 				} catch (err) {
 					if (err instanceof RoomCreationOperationConflictError) return reply.code(409).send({ error: err.message, code: "room_operation_conflict" });
 					if (err instanceof RoomCreationOperationGoneError) return reply.code(409).send({ error: err.message, code: "room_operation_gone" });
@@ -558,7 +609,7 @@ export function registerRoomsRoutes(
 				return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), ...(err instanceof RoomWorkspaceUnavailableError ? { code: "workspace_unavailable" } : {}) });
 			}
 			if (workspaceId === source.workspaceId && target.cwdSnapshot === source.cwdSnapshot) {
-				return { room: await buildWindowSummary(sessions, teams, source, activityProjector), existed: true, restored: true };
+				return { room: await summarize(source), existed: true, restored: true };
 			}
 			if (req.body?.mode === "in_place" && source.type !== "solo") {
 				return reply.code(400).send({ error: "单聊和群聊按项目使用独立窗口，不能替换当前窗口的 Workspace" });
@@ -591,7 +642,7 @@ export function registerRoomsRoutes(
 							},
 							{ name: source.name, prompt: source.prompt, cwdSnapshot: target.cwdSnapshot, requireEnabledMember: true, rollbackSession: (id) => sessions.remove(id), journalSession: true, sourceSnapshot },
 						);
-						return { room: await buildWindowSummary(sessions, teams, next, activityProjector), existed: !createdHere, restored: !createdHere };
+						return { room: await summarize(next), existed: !createdHere, restored: !createdHere };
 					}
 					if (source.type === "solo") {
 						return reply.code(400).send({ error: "solo 项目切换必须使用 in_place" });
@@ -611,7 +662,7 @@ export function registerRoomsRoutes(
 						createSession: (reservedId) => { createdHere = true; return sessions.create(undefined, ctx, reservedId); },
 						rollbackSession: (id) => sessions.remove(id),
 					});
-					return { room: await buildWindowSummary(sessions, teams, next, activityProjector), existed: !createdHere, restored: !createdHere };
+					return { room: await summarize(next), existed: !createdHere, restored: !createdHere };
 				}
 				if (!invoker) throw new Error("in-place workspace switching is unavailable");
 				const switched = await invoker.switchWorkspaceInPlace(
@@ -649,7 +700,7 @@ export function registerRoomsRoutes(
 						).catch(() => undefined);
 					}
 				}
-				return { room: await buildWindowSummary(sessions, teams, current, activityProjector), existed: switched.existed, restored: switched.restored };
+				return { room: await summarize(current), existed: switched.existed, restored: switched.restored };
 			} catch (err) {
 				if (err instanceof RoomCreationOperationConflictError) return reply.code(409).send({ error: err.message, code: "room_operation_conflict" });
 				if (err instanceof RoomCreationOperationGoneError) return reply.code(409).send({ error: err.message, code: "room_operation_gone" });
@@ -705,7 +756,7 @@ export function registerRoomsRoutes(
 	app.get<{ Params: { id: string } }>("/api/rooms/:id/sessions", async (req, reply) => {
 		const w = await teams.getWindow(req.params.id);
 		if (!w) return reply.code(404).send({ error: "window not found" });
-		const summary = await buildWindowSummary(sessions, teams, w, activityProjector);
+		const summary = await summarize(w);
 		return { sessions: summary.sessions, active: summary.activeSession };
 	});
 
@@ -751,7 +802,7 @@ export function registerRoomsRoutes(
 			}
 			try {
 				const contextKey = JSON.stringify([w.workspaceId ?? null, w.cwdSnapshot]);
-				const current = await buildWindowSummary(sessions, teams, w, activityProjector);
+				const current = await summarize(w);
 				const idleCandidate = w.type === "solo" && w.sessions.length === 1 && !current.lastActivityAt
 					? await sessions.open(w.activeSession).catch(() => undefined) : undefined;
 				const preferredSessionId = idleCandidate?.messages.length === 0 ? w.activeSession : undefined;
@@ -919,11 +970,49 @@ export function registerRoomsRoutes(
 		}
 	});
 
-	/** 窗口内删除一个 pi session（最后一个受保护）。 */
+	/** 窗口内删除一个 pi session（最后一个受保护）。sid 命中本窗口执行 session
+	 * 时走执行 session 删除：进行中的委派或排队输入存在 → 409；删 JSONL、清
+	 * binding 与查看指针，delegation 台账保留。 */
 	app.delete<{ Params: { id: string; sid: string } }>(
 		"/api/rooms/:id/sessions/:sid",
 		async (req, reply) => {
 			try {
+				const owner = await teams.getWindow(req.params.id);
+				if (!owner) return reply.code(404).send({ error: "window not found" });
+				if (!owner.sessions.includes(req.params.sid)) {
+					const workerTarget = await resolveOwnedWorkerSession(owner, req.params.sid);
+					if (!workerTarget) return reply.code(404).send({ error: "session not found in window" });
+					const removeWorkerSession = async () => {
+						const records = workerView ? await workerView.delegations.listDelegations(owner.id) : [];
+						if (records.some((record) => record.sessionHandle === workerTarget.sessionHandle && ACTIVE_WORKER_EXECUTION_STATES.has(record.executionState))) {
+							throw new WorkerSessionBusyError("执行会话仍有进行中的任务，不能删除");
+						}
+						if ((localFiles?.workerInputQueue?.queuedItems(workerTarget.sessionHandle).length ?? 0) > 0) {
+							throw new WorkerSessionBusyError("执行会话仍有排队中的输入，请先取消后再删除");
+						}
+						disposeLiveWorkerSession(workerTarget.sessionHandle);
+						const file = await findWorkerSessionFile(workerTarget.sessionHandle, workerTarget.workerSessionDir);
+						if (file) {
+							await unlink(file).catch((err: NodeJS.ErrnoException) => {
+								if (err.code !== "ENOENT") throw err;
+							});
+						}
+						// 竞态兜底：检查到删除之间新入队的输入一律失败化可见。
+						await localFiles?.workerInputQueue?.failQueuedForHandle(workerTarget.sessionHandle, "执行会话已删除");
+						await teams.forgetWorkerSessionHandle(workerTarget.sessionHandle);
+						if (owner.activeWorkerView === workerTarget.sessionHandle) {
+							await teams.setActiveWorkerView(owner.id, null, new Set());
+						}
+					};
+					try {
+						if (invoker) await invoker.withActiveSessionLifecycle(owner.activeSession, removeWorkerSession);
+						else await removeWorkerSession();
+					} catch (err) {
+						if (err instanceof WorkerSessionBusyError) return reply.code(409).send({ error: err.message, code: "worker_session_busy" });
+						throw err;
+					}
+					return reply.code(204).send();
+				}
 				const remove = async () => {
 					const { removed, blocked } = await teams.removeWindowSession(req.params.id, req.params.sid);
 					if (blocked) throw new Error(blocked);
@@ -949,22 +1038,31 @@ export function registerRoomsRoutes(
 		},
 	);
 
-	/** 重命名窗口内的 session；名称写入 session 自身，不改变窗口名称。 */
+	/** 重命名窗口内的 session；名称写入 session 自身，不改变窗口名称。
+	 * sid 命中本窗口执行 session 时写执行 session 自己的 session_info。 */
 	app.patch<{ Params: { id: string; sid: string }; Body: { name?: string } }>(
 		"/api/rooms/:id/sessions/:sid",
 		async (req, reply) => {
 			const w = await teams.getWindow(req.params.id);
 			if (!w) return reply.code(404).send({ error: "window not found" });
-			const { sessions: sessionIds } = await teams.windowSessionList(w.id);
-			if (!sessionIds.includes(req.params.sid)) {
-				return reply.code(404).send({ error: "session not found in window" });
-			}
 			if (typeof req.body?.name !== "string") {
 				return reply.code(400).send({ error: "body must be { name: string }" });
 			}
+			const { sessions: sessionIds } = await teams.windowSessionList(w.id);
+			if (!sessionIds.includes(req.params.sid)) {
+				const workerTarget = await resolveOwnedWorkerSession(w, req.params.sid);
+				if (!workerTarget) return reply.code(404).send({ error: "session not found in window" });
+				try {
+					await renameWorkerSession(workerTarget.sessionHandle, workerTarget.workerSessionDir, req.body.name);
+					const summary = await summarize(w);
+					return { workerSession: summary.workerSessions.find((item) => item.id === workerTarget.sessionHandle) ?? null };
+				} catch (err) {
+					return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+				}
+			}
 			try {
 				await sessions.rename(req.params.sid, req.body.name);
-				const summary = await buildWindowSummary(sessions, teams, w, activityProjector);
+				const summary = await summarize(w);
 				return { session: summary.sessions.find((item) => item.id === req.params.sid)! };
 			} catch (err) {
 				return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
@@ -972,12 +1070,66 @@ export function registerRoomsRoutes(
 		},
 	);
 
-	/** 切换窗口的 active pi session。 */
+	/** 窗口的排队输入列表（queued/failed，FIFO 顺序；web 渲染灰态待发送气泡）。 */
+	app.get<{ Params: { id: string }; Querystring: { sessionHandle?: string } }>(
+		"/api/rooms/:id/input-queue",
+		async (req, reply) => {
+			const w = await teams.getWindow(req.params.id);
+			if (!w) return reply.code(404).send({ error: "window not found" });
+			const queue = localFiles?.workerInputQueue;
+			const items = queue?.listForWindow(req.params.id, req.query.sessionHandle) ?? [];
+			return {
+				items: items.map((item) => ({
+					id: item.id,
+					sessionHandle: item.sessionHandle,
+					text: item.text,
+					displayText: item.displayText,
+					status: item.status,
+					...(item.failureReason ? { failureReason: item.failureReason } : {}),
+					createdAt: item.createdAt,
+					operationId: item.operationId,
+				})),
+			};
+		},
+	);
+
+	/** 取消一条排队中的 worker 输入（已开始派发/不存在的分别 409/404）。 */
+	app.delete<{ Params: { id: string; qid: string } }>(
+		"/api/rooms/:id/input-queue/:qid",
+		async (req, reply) => {
+			const w = await teams.getWindow(req.params.id);
+			if (!w) return reply.code(404).send({ error: "window not found" });
+			const queue = localFiles?.workerInputQueue;
+			if (!queue) return reply.code(404).send({ error: "queue item not found" });
+			const result = await queue.cancel(req.params.id, req.params.qid);
+			if (result === "not_found") return reply.code(404).send({ error: "queue item not found" });
+			if (result === "dispatching") return reply.code(409).send({ error: "该消息已开始派发，不能取消", code: "worker_input_dispatching" });
+			return reply.code(204).send();
+		},
+	);
+
+	/**
+	 * 切换窗口的活跃会话：sid 命中本窗口 workerSessions（执行 session handle）
+	 * 时只置 activeWorkerView，容器 activeSession 不动；sid 为容器 session 时
+	 * 走原逻辑并清掉执行面查看指针。
+	 */
 	app.post<{ Params: { id: string; sid: string } }>(
 		"/api/rooms/:id/sessions/:sid/activate",
 		async (req, reply) => {
 			try {
+				const w = await teams.getWindow(req.params.id);
+				if (w && workerView) {
+					const workerSessions = await listWorkerSessionsForWindow(
+						{ delegations: workerView.delegations, teams, defaultSessionDir: workerView.sessionDir },
+						w,
+					);
+					if (workerSessions.some((item) => item.id === req.params.sid)) {
+						await teams.setActiveWorkerView(w.id, req.params.sid, new Set(workerSessions.map((item) => item.id)));
+						return { ok: true };
+					}
+				}
 				await teams.setActiveWindowSession(req.params.id, req.params.sid);
+				if (w?.activeWorkerView) await teams.setActiveWorkerView(req.params.id, null, new Set());
 				return { ok: true };
 			} catch (err) {
 				return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });

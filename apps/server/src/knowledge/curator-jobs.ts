@@ -231,7 +231,7 @@ export class WikiCuratorService {
 		listSourceMessages?: () => Promise<Array<{ id: string; text: string; createdAt: string }>>;
 		resolveSources?: (toolCallId: string, sourceMessageIds?: string[]) => Promise<{ sourceIds: string[]; operationId: string; windowId?: string }> }): KnowledgeMountSurface {
 		const request = defineTool({ name: "knowledge_request_curation", label: "请求知识整理",
-			description: "把本轮获准的文字交给独立 Wiki 管理员；返回持久任务与jobUrl，必须如实转述status并提供任务链接。queued/running/submitting尚未进入审核；只有pending_review且有reviewUrl才有审核候选。素材冻结、任务受理或候选均不表示原话已入库。目标必须是本轮挂载库。",
+			description: "把本轮获准的文字交给独立 Wiki 管理员；返回持久任务与jobUrl，必须如实转述status，任务与审核链接以Markdown链接给出（如[审核入口](reviewUrl)），不裸贴URL。queued/running/submitting尚未进入审核；只有pending_review且有reviewUrl才有审核候选。素材冻结、任务受理或候选均不表示原话已入库。目标必须是本轮挂载库。",
 			promptSnippet: "请求 Wiki 管理员生成待审核候选。",
 			parameters: Type.Object({ bindingId: Type.String(), task: Type.String({ minLength: 1, maxLength: 20_000 }) }),
 			execute: async (toolCallId, args) => {

@@ -2,6 +2,7 @@
 
 import { KnowledgeJobCard } from "./knowledge-job-card";
 
+import Link from "next/link";
 import { createContext, type ComponentProps, type ReactNode, useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { CheckIcon, ChevronDownIcon, ChevronRightIcon, CircleAlertIcon, CopyIcon, ExternalLinkIcon, FilePenIcon, FileSearchIcon, FileTextIcon, FolderIcon, ListTreeIcon, RotateCcwIcon, SquareIcon, SquareTerminalIcon, UserPlusIcon, UsersIcon, WrenchIcon } from "lucide-react";
 import { useStickToBottomContext } from "use-stick-to-bottom";
@@ -56,6 +57,30 @@ const RoomFileContext = createContext<string | undefined>(undefined);
 
 type QuickActionDraft = (content: string) => void;
 const QuickActionDraftContext = createContext<QuickActionDraft | undefined>(undefined);
+
+/** 委派镜像卡（task_assign/task_result）上的「打开对应会话」跳转：切到
+ *  同窗口的 worker 执行会话（?session=<handle>）。 */
+const WorkerSessionLinkContext = createContext<((sessionHandle: string) => void) | undefined>(undefined);
+
+export function WorkerSessionLinkProvider({ onOpen, children }: { onOpen?: (sessionHandle: string) => void; children: ReactNode }) {
+	return <WorkerSessionLinkContext.Provider value={onOpen}>{children}</WorkerSessionLinkContext.Provider>;
+}
+
+function OpenWorkerSessionButton({ sessionHandle }: { sessionHandle?: string }) {
+	const onOpen = useContext(WorkerSessionLinkContext);
+	if (!sessionHandle || !onOpen) return null;
+	return (
+		<button
+			type="button"
+			className="home-open-worker-session"
+			onClick={() => onOpen(sessionHandle)}
+			title="打开该任务对应的执行会话"
+		>
+			<ExternalLinkIcon />
+			打开对应会话
+		</button>
+	);
+}
 
 /** Bridges settled-message actions to the session composer without making a
  * message action execute an agent run immediately. */
@@ -129,6 +154,22 @@ function MessageQuickActions({
 	);
 }
 
+/** 站内一级路由（与 src/app 下的页面一一对应）。聊天消息里指向这些路由的
+ * href 是应用内导航，不能落入本地文件打开逻辑。 */
+const APP_ROUTE_PREFIXES = ["/agents", "/calendar", "/chats", "/contacts", "/extensions", "/knowledge", "/read-later", "/settings"];
+
+function isAppRoutePath(pathOnly: string): boolean {
+	return APP_ROUTE_PREFIXES.some((route) => pathOnly === route || pathOnly.startsWith(`${route}/`));
+}
+
+/** href 指向站内路由时返回原 href（含查询串），否则 undefined。 */
+function appRouteFromHref(href: string): string | undefined {
+	const value = href.trim();
+	if (!value.startsWith("/") || value.startsWith("//")) return undefined;
+	const pathOnly = value.split(/[?#]/, 1)[0] ?? value;
+	return isAppRoutePath(pathOnly) ? value : undefined;
+}
+
 function localPathFromHref(href: string): string | undefined {
 	const value = href.trim();
 	if (!value || value.startsWith("#") || value.startsWith("?") || value.startsWith("//")) return undefined;
@@ -145,6 +186,7 @@ function localPathFromHref(href: string): string | undefined {
 	// Other URI schemes are browser links. Drive-letter paths are local files.
 	if (/^[a-z][a-z\d+.-]*:/i.test(value) && !/^[a-z]:[\\/]/i.test(value)) return undefined;
 	const pathOnly = value.split(/[?#]/, 1)[0] ?? value;
+	if (isAppRoutePath(pathOnly)) return undefined;
 	try {
 		return decodeURIComponent(pathOnly);
 	} catch {
@@ -177,6 +219,14 @@ async function openLocalPath(roomId: string, localPath: string) {
 function ChatMarkdownLink({ href = "", children, node, ...props }: ComponentProps<"a"> & { node?: unknown }) {
 	void node;
 	const roomId = useContext(RoomFileContext);
+	const appRoute = appRouteFromHref(href);
+	if (appRoute) {
+		return (
+			<Link href={appRoute} className="home-local-file-link">
+				{children}
+			</Link>
+		);
+	}
 	const localPath = localPathFromHref(href);
 	if (localPath && roomId) {
 		return (
@@ -197,6 +247,14 @@ function ChatInlineCode({ children, node, ...props }: ComponentProps<"code"> & {
 	void node;
 	const roomId = useContext(RoomFileContext);
 	const text = typeof children === "string" ? children : undefined;
+	const appRoute = text ? appRouteFromHref(text) : undefined;
+	if (appRoute) {
+		return (
+			<Link href={appRoute} className="home-local-path-code" title="打开站内页面">
+				<code {...props}>{children}</code>
+			</Link>
+		);
+	}
 	const localPath = text ? localPathFromInlineCode(text) : undefined;
 	if (localPath && roomId) {
 		return (
@@ -924,7 +982,7 @@ function CustomMessageEntry({
 					processDetails={details}
 					running
 					timestamp={message.timestamp}
-					actions={<CancelDelegationButton delegationId={details?.delegationId} goalId={details?.goalId} />}
+					actions={<><OpenWorkerSessionButton sessionHandle={details?.sessionHandle} /><CancelDelegationButton delegationId={details?.delegationId} goalId={details?.goalId} /></>}
 				/>
 			);
 		}
@@ -939,6 +997,7 @@ function CustomMessageEntry({
 						<MessageContent>
 							<p className="text-xs text-muted-foreground">Manager 委派</p>
 							<p className="text-sm whitespace-pre-wrap">{message.content}</p>
+							<OpenWorkerSessionButton sessionHandle={details?.sessionHandle} />
 						</MessageContent>
 					</AiMessage>
 					{running ? (
@@ -953,7 +1012,7 @@ function CustomMessageEntry({
 							processDetails={details}
 							running
 							timestamp={message.timestamp}
-							actions={<CancelDelegationButton delegationId={details?.delegationId} goalId={details?.goalId} />}
+							actions={<><OpenWorkerSessionButton sessionHandle={details?.sessionHandle} /><CancelDelegationButton delegationId={details?.delegationId} goalId={details?.goalId} /></>}
 						/>
 					) : null}
 				</>
@@ -964,6 +1023,7 @@ function CustomMessageEntry({
 				<MessageContent>
 					<p className="text-xs text-muted-foreground">派给 {details?.worker ?? "worker"}</p>
 					<p className="text-sm whitespace-pre-wrap">{message.content}</p>
+					<OpenWorkerSessionButton sessionHandle={details?.sessionHandle} />
 					{running ? (
 						<div className="flex items-center gap-2 text-xs text-muted-foreground">
 							<span>执行中…</span>
@@ -985,6 +1045,7 @@ function CustomMessageEntry({
 				isError={Boolean(details?.status && details.status !== "completed" && details.status !== "needs_input")}
 				timestamp={message.timestamp}
 				usage={details?.usage}
+				actions={<OpenWorkerSessionButton sessionHandle={details?.sessionHandle} />}
 			/>
 		);
 	}

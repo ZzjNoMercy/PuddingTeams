@@ -4286,6 +4286,93 @@ button.nav-user:focus-visible:not([data-pointer-focus="true"]) {
 .home-session-menu-new:focus,
 .home-session-menu-new:hover { background: var(--home-soft-hover); color: var(--home-text); }
 .home-session-menu-new svg { width: 13px; height: 13px; color: var(--home-text-3) !important; }
+.home-session-menu-group {
+	padding: 7px 9px 4px;
+	color: var(--home-text-3);
+	font-size: 10px;
+	font-weight: 600;
+	letter-spacing: 0.04em;
+	line-height: 1.4;
+}
+.home-session-menu-dot {
+	flex-shrink: 0;
+	align-self: center;
+	width: 6px;
+	height: 6px;
+	margin: 0 2px;
+	border-radius: 999px;
+	background: var(--home-accent, currentColor);
+	animation: home-session-menu-dot-pulse 1.6s ease-in-out infinite;
+}
+@keyframes home-session-menu-dot-pulse {
+	0%, 100% { opacity: 1; }
+	50% { opacity: 0.35; }
+}
+
+/* 委派镜像卡（task_assign/task_result）上的「打开对应会话」入口。 */
+.home-open-worker-session {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	margin-top: 6px;
+	padding: 3px 8px;
+	border-radius: 7px;
+	color: var(--home-text-3);
+	font-size: 11px;
+	line-height: 1.4;
+	transition: color 120ms ease, background 120ms ease;
+}
+.home-open-worker-session:hover { background: var(--home-soft-hover); color: var(--home-text); }
+.home-open-worker-session svg { width: 12px; height: 12px; }
+
+/* Worker 执行会话视图：排队中的用户输入渲染为灰态待发送气泡（对齐用户气泡侧）。 */
+.home-queued-list {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-end;
+	gap: 8px;
+	margin-top: 8px;
+}
+.home-queued-message {
+	display: flex;
+	align-items: flex-start;
+	gap: 6px;
+	max-width: 560px;
+	padding: 10px 12px;
+	border-radius: 14px;
+	background: var(--home-soft-hover);
+	opacity: 0.72;
+}
+.home-queued-message.is-failed {
+	background: color-mix(in oklab, #db5454 10%, transparent);
+	opacity: 1;
+}
+.home-queued-message-body { min-width: 0; }
+.home-queued-message-status {
+	color: var(--home-text-3);
+	font-size: 10px;
+	line-height: 1.4;
+}
+.home-queued-message.is-failed .home-queued-message-status { color: #db5454; }
+.home-queued-message-text {
+	margin-top: 2px;
+	font-size: 13px;
+	line-height: 1.55;
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+.home-queued-message-cancel {
+	display: grid;
+	flex-shrink: 0;
+	width: 20px;
+	height: 20px;
+	place-items: center;
+	border-radius: 6px;
+	color: var(--home-text-3);
+	transition: color 120ms ease, background 120ms ease;
+}
+.home-queued-message-cancel:hover { background: var(--home-soft-hover); color: var(--home-text); }
+.home-queued-message-cancel svg { width: 12px; height: 12px; }
 
 .home-session-chat { width: 100%; max-width: 100%; min-width: 0; overflow: hidden; }
 .conversation-scroll-viewport {

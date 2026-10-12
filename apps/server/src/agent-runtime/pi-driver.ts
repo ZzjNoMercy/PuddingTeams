@@ -112,6 +112,20 @@ export function liveWorkerSession(handle: string): AgentSession | undefined {
 	return sessionsByHandle.get(handle);
 }
 
+/**
+ * 删除执行 session 时逐出驻留实例（步骤 5）：仍在流式中的拒绝（调用方应先
+ * 按活动 delegation 挡 409）；逐出后 dispose，防止它再往已删除的 JSONL 追加。
+ */
+export function disposeLiveWorkerSession(handle: string): boolean {
+	const session = sessionsByHandle.get(handle);
+	if (!session || session.isStreaming) return false;
+	sessionsByHandle.delete(handle);
+	searchFingerprintByHandle.delete(handle);
+	knowledgeSurfaceByHandle.delete(handle);
+	session.dispose();
+	return true;
+}
+
 function modelRuntime(): Promise<ModelRuntime> {
 	return sharedModelRuntime();
 }

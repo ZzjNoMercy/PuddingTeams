@@ -89,6 +89,7 @@ import { CuratorJobStore, WikiCuratorService, curatorJobFeedback } from "./knowl
 import { KnowledgeSourceStore } from "./knowledge/sources.js";
 import { ChatKnowledgeIntake } from "./knowledge/chat-intake.js";
 import { directTaskId } from "./agent-runtime/direct-dispatch.js";
+import { WorkerInputDispatcher, WorkerInputQueueStore } from "./agent-runtime/worker-input-queue.js";
 import { registerWikiCuratorRoutes } from "./routes/wiki-curator.js";
 import { ReadLaterStore } from "./read-later/store.js";
 import { ReadLaterCaptureService } from "./read-later/capture-service.js";
@@ -331,6 +332,19 @@ const store = new PiSessionStore(
 	mcpServers,
 );
 store.setKnowledgeRuntime(knowledgeRuntime);
+const workerInputQueueStore = new WorkerInputQueueStore(path.join(paths.state, "worker-input-queue.json"));
+await workerInputQueueStore.init();
+const workerInputDispatcher = new WorkerInputDispatcher({
+	queue: workerInputQueueStore,
+	teams,
+	sessions: store,
+	invoker,
+	runtime,
+	delegations,
+	runtimeModelFor: (sessionId) => store.workerRuntimeModel(sessionId),
+	log: (message) => app.log.info(message),
+});
+workerInputDispatcher.attach();
 const calendarScope = async (sessionId: string) => {
  const scope = await knowledgeRuntime.scopeForSession(sessionId);
  if (!scope) throw new Error("当前聊天上下文不可用");
@@ -573,6 +587,11 @@ const reconciledOrphans = await runtime.reconcileOrphanedRuns(async (orphan, res
 	}
 });
 if (reconciledOrphans > 0) app.log.info({ reconciled: reconciledOrphans }, "reconciled orphaned delegations from previous process");
+// 重启后 runtime 锁全空：仍有排队输入的 handle 空闲即补投，窗口/binding 失效的标失败可见。
+const reconciledWorkerInputs = await workerInputDispatcher.reconcileOnBoot();
+if (reconciledWorkerInputs.dispatched > 0 || reconciledWorkerInputs.failed > 0) {
+	app.log.info(reconciledWorkerInputs, "reconciled queued worker session inputs from previous process");
+}
 async function sweepExpiredAdmissions(): Promise<number> {
 	const before = (await runtime.listInteractions())
 		.filter((item) => item.source === "platform_policy" && item.status === "pending")
@@ -776,7 +795,11 @@ const providerDeletion = new ProviderDeletionCoordinator(path.join(paths.secrets
 await registerChatRoutes(app, store, teams, workStates, uploads, invoker, {
 	dataHomeId: puddingTeamsHomeId(paths.home),
 	...(process.env.PUDDINGTEAMS_RUN_ID ? { runId: process.env.PUDDINGTEAMS_RUN_ID } : {}),
-}, providerDeletion, new MessageSubmissionOperations(path.join(paths.state, "message-submission-operations")), chatKnowledgeIntakes);
+}, providerDeletion, new MessageSubmissionOperations(path.join(paths.state, "message-submission-operations")), chatKnowledgeIntakes, {
+	delegations,
+	sessionDir: paths.workerSessions,
+	inputQueue: workerInputDispatcher,
+});
 registerIdentityRoutes(app, localViewerIdentity, paths);
 registerWebResearchSettingsRoutes(app, webResearch);
 registerCalendarRoutes(app, calendarService.store, () => localViewerIdentity().user.id, calendarService);
@@ -866,6 +889,9 @@ await registerRoomsRoutes(app, store, teams, invoker, workStates, {
 	productSettings,
 	activityStatePath: path.join(paths.state, "room-activity.json"),
 	sessionCreationStatePath: path.join(paths.state, "session-creation-operations.json"),
+	delegations,
+	workerSessionDir: paths.workerSessions,
+	workerInputQueue: workerInputDispatcher,
 });
 await registerInteractionsRoutes(app, runtime, invoker, teams, workStates);
 registerArtifactsRoutes(app, artifacts);

@@ -1026,6 +1026,26 @@ export interface DelegationTimelineEvent {
 
 export type WindowType = "solo" | "direct" | "group";
 
+/** Worker 执行 session 的平行投影（不进 window.sessions，见 RoomSummary.workerSessions）。 */
+export interface WorkerSessionSummary {
+	/** Worker 执行 session 的 handle（pi Session id）。 */
+	id: string;
+	/** session_info 里的用户命名优先；缺省取首个 delegation 任务首句。 */
+	name: string;
+	firstMessage: string;
+	modifiedAt: string;
+	origin: "delegation";
+	/** 发起委派的 manager session（本窗口直派产生的执行面不列入枚举）。 */
+	sourceManagerSessionId: string;
+	/** 发起方所属窗口；源 session 已失去窗口归属时为空串。 */
+	sourceWindowId: string;
+	/** solo → "大管家"；群 → 群名。 */
+	sourceWindowName: string;
+	/** 该 handle 最近一次 delegation。 */
+	lastDelegationId: string;
+	running: boolean;
+}
+
 export interface RoomSummary {
 	/** Window id (not a pi session id). */
 	id: string;
@@ -1049,6 +1069,10 @@ export interface RoomSummary {
 	pinned: boolean;
 	/** Active room Session's per-worker continuation handles. */
 	workerBindings: Record<string, { sessionHandle?: string; targetWindowId: string; workspaceId?: string; cwdSnapshot: string; agentRevision: number; updatedAt: string }>;
+	/** Worker 执行 session 平行投影（委派/直派产生；仅 direct 窗口展示）。 */
+	workerSessions: WorkerSessionSummary[];
+	/** 当前查看的执行 session handle；null = 查看容器 activeSession。 */
+	activeWorkerView: string | null;
 	/** User-edited window system prompt ('' = default relay guidance). */
 	prompt: string;
 	/** Window 创建时冻结的实际运行目录；未选项目时用于保持上下文身份。 */

@@ -46,6 +46,13 @@ export interface AgentInvokeParams {
 	message: string;
 	/** "new" starts a fresh worker session; "continue" resumes the recorded one. */
 	mode: "run" | "continue";
+	/**
+	 * 显式指定 continue 的执行 session handle（worker 执行 session 直接输入通道）；
+	 * 缺省时按窗口 binding/台账解析（sessionHandleFor）。
+	 */
+	sessionHandle?: string;
+	/** 内部排队通道的锁交接凭据（runtime sessionQueueToken），宿主路由专属。 */
+	sessionQueueToken?: string;
 	/** Worker-specific business model (e.g. analytics_model_id). */
 	model?: string;
 	/** Host-only direct-chat settings, frozen before admission. */
@@ -524,7 +531,9 @@ export class AgentInvoker {
 				if (managerContext.workspaceId !== window.workspaceId || managerContext.cwdSnapshot !== cwd) {
 					throw new Error("manager Session 与当前执行窗口的 Workspace 不一致，委托被拒绝");
 				}
-				const nextSession = mode === "continue" ? await this.sessionHandleFor(windowId, managerSessionId, freshAgent) : undefined;
+				const nextSession = mode === "continue"
+					? (params.sessionHandle ?? await this.sessionHandleFor(windowId, managerSessionId, freshAgent))
+					: undefined;
 				let createdResolve!: () => void;
 				let createdReject!: (reason: unknown) => void;
 				const created = new Promise<void>((resolve, reject) => {
@@ -572,6 +581,7 @@ export class AgentInvoker {
 						message: messageForWorkspaceExecution(message, params.workspaceExecutionPolicy),
 						mode,
 						sessionHandle: nextSession,
+						sessionQueueToken: params.sessionQueueToken,
 						requestId: params.operationId,
 						options: params.model || params.runtimeModel ? { ...(params.model ? { model: params.model } : {}), ...(params.runtimeModel ? { runtimeModel: { ...params.runtimeModel } } : {}) } : undefined,
 						onCreated: (record) => {

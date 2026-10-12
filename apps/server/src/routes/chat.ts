@@ -10,6 +10,17 @@ import { PiSessionStore } from "../pi-bridge/session-store.js";
 import type { TeamsStore } from "../store/teams.js";
 import { directTaskId, directWorkerFor, dispatchDirectMessage } from "../agent-runtime/direct-dispatch.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
+import type { DelegationStore } from "../agent-runtime/delegation-store.js";
+import {
+	liveWorkerMessages,
+	resolveSession,
+	replayWorkerSessionMessages,
+	subscribeWorkerSession,
+	workerRunningToolCallIds,
+	type LiveWorkerSessionLookup,
+} from "../agent-runtime/worker-sessions.js";
+import type { WorkerInputDispatcher } from "../agent-runtime/worker-input-queue.js";
+import { liveWorkerSession } from "../agent-runtime/pi-driver.js";
 import { config } from "../config.js";
 import type { WorkStateStore } from "../store/work-state.js";
 import { identifyUploads, type UploadInput, type UploadStore } from "../store/uploads.js";
@@ -184,7 +195,21 @@ export async function registerChatRoutes(
 	providerDeletion?: ProviderDeletionCoordinator,
 	messageOperations?: MessageSubmissionOperations,
 	knowledgeIntakes?: ChatKnowledgeIntake,
+	/**
+	 * Worker 执行 session 路由支持：提供后 GET messages / WS 能按 sessionHandle
+	 * 解析执行 session（resolveSession 分流）；inputQueue 提供后 POST 直接输入
+	 * 经排队通道投递（忙碌时 202 排队）。
+	 */
+	workerSessions?: { delegations: DelegationStore; sessionDir: string; liveLookup?: LiveWorkerSessionLookup; inputQueue?: WorkerInputDispatcher },
 ): Promise<void> {
+	const resolveWorkerSession = async (id: string) => {
+		if (!workerSessions || !teams) return undefined;
+		const resolved = await resolveSession(
+			{ sessions: store, delegations: workerSessions.delegations, teams, defaultSessionDir: workerSessions.sessionDir, ...(workerSessions.liveLookup ? { liveLookup: workerSessions.liveLookup } : {}) },
+			id,
+		);
+		return resolved?.kind === "worker" ? resolved : undefined;
+	};
 	const requireActiveSessionContext = async (sessionId: string) => {
 		if (!teams) return undefined;
 		const context = await teams.contextForSession(sessionId);
@@ -438,6 +463,35 @@ export async function registerChatRoutes(
 				return reply.code(400).send({ error: "content or attachments is required" });
 			}
 			if (!Array.isArray(attachments)) return reply.code(400).send({ error: "attachments must be an array" });
+			// Worker 执行 session：直接输入经排队通道投递（dispatcher.submit 内部
+			// 判定空闲直投或 FIFO 入队）；容器 session 落用户卡承担时间线/未读。
+			const workerInputTarget = await resolveWorkerSession(req.params.id);
+			if (workerInputTarget) {
+				const inputQueue = workerSessions?.inputQueue;
+				if (!inputQueue) {
+					return reply.code(400).send({ error: "worker 执行会话的直接输入尚未开放", code: "worker_session_input_unavailable" });
+				}
+				if (!content) return reply.code(400).send({ error: "content is required" });
+				if (attachments.length > 0) return reply.code(400).send({ error: "执行会话暂不支持附件" });
+				const workerOperationKey = typeof req.headers["idempotency-key"] === "string" && req.headers["idempotency-key"].trim()
+					? req.headers["idempotency-key"].trim()
+					: randomUUID();
+				try {
+					const outcome = await inputQueue.submit({
+						windowId: workerInputTarget.windowId,
+						sessionHandle: workerInputTarget.sessionHandle,
+						text: content,
+						displayText: content,
+						operationId: workerOperationKey,
+					});
+					if (outcome.status === "queued") {
+						return reply.code(202).send({ queued: true, queueId: outcome.queueId, accepted: false });
+					}
+					return { accepted: true, queued: false, attachments: [] };
+				} catch (err) {
+					return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+				}
+			}
 			const freezeHeader = req.headers["x-puddingteams-first-work-freeze-id"];
 			const internalFirstWork = typeof freezeHeader === "string" && req.headers["x-puddingteams-first-work-token"] === internalFirstWorkFreezeToken;
 			const operationKey = req.headers["idempotency-key"];
@@ -686,6 +740,24 @@ export async function registerChatRoutes(
 
 	app.get<{ Params: { id: string } }>("/api/sessions/:id/messages", async (req, reply) => {
 		try {
+			const workerTarget = await resolveWorkerSession(req.params.id);
+			if (workerTarget) {
+				// 执行 session：live 注册表优先，否则按台账快照目录回放。
+				// parked/active-context 门禁按 targetWindowId 判定——direct 窗口的
+				// Workspace 身份不可变、无停放上下文，resolveSession 已确认窗口存在。
+				const liveLookup = workerSessions?.liveLookup ?? liveWorkerSession;
+				const messages = liveWorkerMessages(workerTarget.sessionHandle, liveLookup)
+					?? await replayWorkerSessionMessages(workerTarget.sessionHandle, workerTarget.workerSessionDir);
+				if (!messages) return reply.code(404).send({ error: "session not found" });
+				return {
+					messages: messages.map((message) => withWireMessageId(message as Record<string, unknown>)),
+					running: Boolean(liveLookup(workerTarget.sessionHandle)?.isStreaming),
+					unansweredUserMessage: false,
+					unfinishedAssistantTurn: false,
+					runningToolCallIds: workerRunningToolCallIds(workerTarget.sessionHandle, liveLookup),
+					recoveredToolResults: [],
+				};
+			}
 			return await withActiveSessionLifecycle(req.params.id, async () => {
 				const toolCallState = await store.recoverToolCallState(req.params.id);
 				const session = await store.open(req.params.id);
@@ -740,6 +812,37 @@ export async function registerChatRoutes(
 			sockets.add(socket);
 
 			try {
+				const workerTarget = await resolveWorkerSession(sessionId);
+				if (workerTarget) {
+					// live 时桥接执行事件流；非 live 只给 session_ready 快照后保持空闲
+					// （不重放伪装 live——历史由 GET /messages 提供）。
+					socket.send(JSON.stringify({ type: "session_ready", sessionId }));
+					const unsubscribeLive = subscribeWorkerSession(
+						workerTarget.sessionHandle,
+						(event) => {
+							const payload = serializeChatEvent(event);
+							if (payload && socket.readyState === socket.OPEN) socket.send(payload);
+						},
+						workerSessions?.liveLookup ?? liveWorkerSession,
+					);
+					const unsubscribeContext = teams?.onChange(() => {
+						void teams.getWindow(workerTarget.windowId).then((window) => {
+							if (!window && socket.readyState === socket.OPEN) socket.close(1008, "session workspace is not active");
+						}).catch(() => undefined);
+					});
+					const cleanupWorker = () => {
+						unsubscribeLive?.();
+						unsubscribeContext?.();
+						sockets?.delete(socket);
+					};
+					socket.on("close", () => {
+						cleanupWorker();
+					});
+					socket.on("error", () => {
+						cleanupWorker();
+					});
+					return;
+				}
 				await withActiveSessionLifecycle(sessionId, async () => {
 					// open 只为校验存在性并确保实例已物化；订阅走 store 级通道，
 					// runtimeDirty 空闲重建换掉 AgentSession 实例后推送不断流。

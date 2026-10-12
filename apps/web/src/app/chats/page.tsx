@@ -311,8 +311,10 @@ export default function Home() {
 									onRoomUpdated={handleRoomUpdated}
 									onSessionActivated={(updated) => {
 										handleRoomUpdated(updated);
-										setRequestedSessionId(updated.activeSession);
-										const href = chatHref(updated.id, updated.activeSession, returnSessionId);
+										// 查看目标 = activeWorkerView（worker 执行 session）?? 容器 activeSession。
+										const viewed = updated.activeWorkerView ?? updated.activeSession;
+										setRequestedSessionId(viewed);
+										const href = chatHref(updated.id, viewed, returnSessionId);
 										routeQuery.current = href.split("?")[1] ?? "";
 										router.push(href);
 									}}

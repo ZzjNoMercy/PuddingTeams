@@ -45,7 +45,8 @@ export async function preloadChatHistory(sessionId: string): Promise<void> {
 	rememberHistory(sessionId, snapshot.messages);
 }
 
-export function useChat(sessionId: string) {
+export function useChat(sessionId: string, options?: { allowSendWhileRunning?: boolean }) {
+	const allowSendWhileRunning = options?.allowSendWhileRunning === true;
 	// Session 切换会 remount；命中预热/最近访问快照时直接首帧展示，随后仍从
 	// 服务端重对齐，缓存只消除视觉空档，不替代事实源。
 	const cachedHistory = historyCache.get(sessionId);
@@ -265,16 +266,19 @@ export function useChat(sessionId: string) {
 			const content = text.trim();
 			if (!content && attachments.length === 0) throw new Error("请输入消息或添加附件");
 			if (!connectionReadyRef.current) throw new Error("连接正在恢复，请稍后重试");
-			if (running || sendingRef.current) throw new Error("当前会话正在处理消息，请等待后重试");
+			// Worker 执行 session 视图允许 running 时提交（服务端排队通道投递）；
+			// 容器/manager session 保持硬拦截。
+			if ((!allowSendWhileRunning && running) || sendingRef.current) throw new Error("当前会话正在处理消息，请等待后重试");
 			sendingRef.current = true;
 			setSending(true);
 			setError(null);
 			let operationId: string | undefined;
 			try {
 				operationId = await reserveChatSendOperation(sessionId, content, attachments);
-				await sendMessage(sessionId, content, attachments, operationId);
+				const result = await sendMessage(sessionId, content, attachments, operationId);
 				clearChatSendOperation(sessionId, operationId);
 				setUnconfirmedOperation(null);
+				return result;
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
 				setError(message);
@@ -294,7 +298,7 @@ export function useChat(sessionId: string) {
 				setSending(false);
 			}
 		},
-		[sessionId, running],
+		[sessionId, running, allowSendWhileRunning],
 	);
 
 	/** Reconcile durable history with WebSocket events before a viewer acknowledges a room revision. */

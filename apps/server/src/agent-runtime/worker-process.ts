@@ -4,6 +4,7 @@ import type { DelegationRecord, DelegationStore } from "./delegation-store.js";
 import type { TeamsStore } from "../store/teams.js";
 import { liveWorkerSession } from "./pi-driver.js";
 import type { DelegationTimelineEvent, DelegationTimelineStore } from "./delegation-timeline-store.js";
+import { liveWorkerMessages, replayWorkerSessionMessages, subscribeWorkerSession, workerRunningToolCallIds } from "./worker-sessions.js";
 
 /**
  * pi worker 执行过程可视化（只读）：pi worker 的 child session 是完整 pi
@@ -151,26 +152,16 @@ export class WorkerProcessService {
 	/**
 	 * 会话消息历史：live 命中用内存会话（含未落盘的流式尾部）；否则从 JSONL
 	 * 当前分支读 message 条目。返回 pi AgentMessage[]（与 manager 会话的
-	 * /messages 同形）。会话不存在返回 undefined。
+	 * /messages 同形）。会话不存在返回 undefined。读取实现共享自
+	 * worker-sessions.ts（chat 路由的 worker session 分支用同一入口）。
 	 */
 	async messages(delegationId: string, handle: string): Promise<unknown[] | undefined> {
-		const live = liveWorkerSession(handle);
-		if (live?.isStreaming) return [...live.messages];
-		if (live) {
-			return live.sessionManager.getBranch()
-				.filter((entry) => entry.type === "message")
-				.map((entry) => entry.message);
-		}
+		// live 注册表成员身份本身就是执行中的证明；回放才需要台账归属校验。
+		const liveMessages = liveWorkerMessages(handle);
+		if (liveMessages) return liveMessages;
 		const delegation = await this.delegations.getDelegation(delegationId);
 		if (!delegation || delegation.sessionHandle !== handle || (delegation.driverId && delegation.driverId !== "pi")) return undefined;
-		const dir = delegation.workerSessionDir ?? this.defaultSessionDir;
-		const info = (await SessionManager.listAll(dir)).find((s) => s.id === handle);
-		if (!info) return undefined;
-		const sm = SessionManager.open(info.path, dir);
-		return sm
-			.getBranch()
-			.filter((entry) => entry.type === "message")
-			.map((entry) => (entry as { message: unknown }).message);
+		return replayWorkerSessionMessages(handle, delegation.workerSessionDir ?? this.defaultSessionDir);
 	}
 
 	/** A Pi Session can contain several Delegations; unknown timestamps are not attributable. */
@@ -203,8 +194,7 @@ export class WorkerProcessService {
 
 	/** 仅 live 会话可订阅实时事件；非 live 返回 undefined（前端只展示历史）。 */
 	subscribeLive(handle: string, listener: (event: AgentSessionEvent) => void): (() => void) | undefined {
-		const live = liveWorkerSession(handle);
-		return live ? live.subscribe(listener) : undefined;
+		return subscribeWorkerSession(handle, listener);
 	}
 
 	/**
@@ -213,24 +203,6 @@ export class WorkerProcessService {
 	 * /messages 语义一致）。非 live/非流式返回空。
 	 */
 	runningToolCallIds(handle: string): string[] {
-		const live = liveWorkerSession(handle);
-		if (!live || !live.isStreaming) return [];
-		const pending = new Set<string>();
-		for (const message of live.messages) {
-			const m = message as {
-				role?: string;
-				content?: unknown;
-				toolCallId?: string;
-			};
-			if (m.role === "assistant" && Array.isArray(m.content)) {
-				for (const block of m.content) {
-					const b = block as { type?: string; id?: string };
-					if (b?.type === "toolCall" && typeof b.id === "string") pending.add(b.id);
-				}
-			} else if (m.role === "toolResult" && typeof m.toolCallId === "string") {
-				pending.delete(m.toolCallId);
-			}
-		}
-		return [...pending];
+		return workerRunningToolCallIds(handle);
 	}
 }

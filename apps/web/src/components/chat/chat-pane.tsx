@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { ChevronDownIcon, EllipsisIcon, FolderGit2Icon, FolderOpenIcon, InfoIcon, LayersIcon, ListTreeIcon, PanelLeftOpenIcon } from "lucide-react";
+import { ChevronDownIcon, EllipsisIcon, FolderGit2Icon, FolderOpenIcon, InfoIcon, LayersIcon, ListTreeIcon, PanelLeftOpenIcon, XIcon } from "lucide-react";
 import { toast } from "sonner";
 import {
 	Conversation,
@@ -30,25 +30,30 @@ import {
 	createRoomSession,
 	createWorkspace,
 	deleteRoomSession,
+	cancelWorkerInput,
 	fetchRoomDelegationProcesses,
 	getRoom,
+	listWorkerInputQueue,
 	listWorkspaces,
 	markRoomRead,
 	renameRoomSession,
+	renameWorkerSession,
 	setActiveRoomSession,
 	switchRoomWorkspace,
 	updateRoom,
 	RoomCreationOperationConflictError,
 	RoomSelectionStaleError,
 	RoomSourceStaleError,
+	type MessageAttachmentInput,
+	type WorkerInputQueueItem,
 } from "@/lib/api";
 import { clearGroupCreationOperation, groupWorkspaceSwitchFingerprint, reserveGroupCreationOperation } from "@/lib/group-creation-operation";
-import { agentDisplayName, type ChatMessage, type ChatStatus, type RoomSession, type RoomSummary, type WorkspaceRecord } from "@/lib/types";
+import { agentDisplayName, type ChatMessage, type ChatStatus, type RoomSession, type RoomSummary, type WorkerSessionSummary, type WorkspaceRecord } from "@/lib/types";
 import { Composer } from "./composer";
 import { computeSessionStats } from "@/lib/session-stats";
 import { delegateWorker, groupForRender, isDelegateCall } from "@/lib/events";
 import { useAgentLabels } from "@/lib/avatars";
-import { AssistantGroup, Message, MessageQuickActionProvider } from "./message";
+import { AssistantGroup, Message, MessageQuickActionProvider, WorkerSessionLinkProvider } from "./message";
 import { ManagerAvatar, MemberStack, WorkerAvatar } from "./worker-avatar";
 import { DirectoryPickerDialog } from "./directory-picker-dialog";
 import { WorkspaceTrustDialog, needsTrustDecision } from "./workspace-trust-dialog";
@@ -261,6 +266,8 @@ function SessionChat({
 	sessionModifiedAt,
 	emptyHint,
 	windowType,
+	workerView = false,
+	onOpenWorkerSession,
 	onStatus,
 	onOpenWindow,
 	onRoomsMayHaveChanged,
@@ -289,6 +296,10 @@ function SessionChat({
 	sessionModifiedAt?: string;
 	emptyHint?: string;
 	windowType: RoomSummary["type"];
+	/** 当前渲染的是 worker 执行 session（running 不阻断输入，服务端排队投递）。 */
+	workerView?: boolean;
+	/** 委派镜像卡「打开对应会话」：切到同窗口的 worker 执行 session。 */
+	onOpenWorkerSession?: (sessionHandle: string) => void;
 	onStatus: (s: ChatStatus) => void;
 	onOpenWindow?: (windowId: string) => void;
 	/** manager 建房工具落定后回调：侧栏房间列表立即刷新，不等轮询。 */
@@ -315,7 +326,7 @@ function SessionChat({
 	activityRevision: number;
 	onHistoryReady?: (sessionId: string, activityRevision: number) => Promise<boolean>;
 }) {
-	const { messages, historyLoading, historyLoaded, status, running, unansweredUserMessage, unfinishedAssistantTurn, sending, stopping, error, unconfirmedOperation, send, stop, refreshHistory, reviewUnconfirmedHistory, startNewMessageIntent } = useChat(sessionId);
+	const { messages, historyLoading, historyLoaded, status, running, unansweredUserMessage, unfinishedAssistantTurn, sending, stopping, error, unconfirmedOperation, send, stop, refreshHistory, reviewUnconfirmedHistory, startNewMessageIntent } = useChat(sessionId, { allowSendWhileRunning: workerView });
 	const [newMessageIntentOpen, setNewMessageIntentOpen] = useState(false);
 	const initialActivityRevision = useRef(activityRevision);
 	const [presentedActivityRevision, setPresentedActivityRevision] = useState<number | null>(null);
@@ -330,6 +341,49 @@ function SessionChat({
 			toast.error(err instanceof Error ? err.message : String(err));
 		}
 	}, [stop]);
+	// Worker 执行 session 的排队输入：202 入队后本地立即渲染灰态气泡；队列项
+	// 被排空/取消/失败化后由轮询与 running 落定收敛（消息本体经 WS 进入消息流）。
+	const [queueItems, setQueueItems] = useState<WorkerInputQueueItem[]>([]);
+	useEffect(() => {
+		if (!workerView) return;
+		let cancelled = false;
+		const load = () => {
+			void listWorkerInputQueue(roomId, sessionId)
+				.then((items) => { if (!cancelled) setQueueItems(items); })
+				.catch(() => { /* 队列拉取失败不打断聊天；下轮轮询自愈 */ });
+		};
+		load();
+		const timer = setInterval(load, 4000);
+		return () => { cancelled = true; clearInterval(timer); };
+	}, [workerView, roomId, sessionId]);
+	// 排空发生在 running 落定（delegate settle/cancel）时，立即对一次队列，不等轮询。
+	const wasRunningRef = useRef(false);
+	useEffect(() => {
+		const settled = wasRunningRef.current && !running;
+		wasRunningRef.current = running;
+		if (!settled || !workerView) return;
+		void listWorkerInputQueue(roomId, sessionId)
+			.then((items) => setQueueItems(items))
+			.catch(() => undefined);
+	}, [running, workerView, roomId, sessionId]);
+	const refreshQueue = useCallback(async () => {
+		if (!workerView) return;
+		try {
+			setQueueItems(await listWorkerInputQueue(roomId, sessionId));
+		} catch { /* 队列拉取失败不打断聊天；下轮轮询自愈 */ }
+	}, [workerView, roomId, sessionId]);
+	const cancelQueuedInput = useCallback(async (queueId: string) => {
+		try {
+			await cancelWorkerInput(roomId, queueId);
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		}
+		await refreshQueue();
+	}, [roomId, refreshQueue]);
+	const handleSend = useCallback(async (text: string, attachments?: MessageAttachmentInput[]) => {
+		const result = await send(text, attachments);
+		if (result?.queued) await refreshQueue();
+	}, [send, refreshQueue]);
 	const executionTurns = useMemo<SessionExecutionTurn[]>(() => messages
 		.filter((message) => message.role === "user")
 		.map((message, index) => ({
@@ -477,6 +531,7 @@ function SessionChat({
 	return (
 		<div className="home-session-chat relative flex min-h-0 flex-1 flex-col" aria-busy={!layoutReady}>
 			<div className={`flex min-h-0 flex-1 flex-col ${layoutReady ? "visible" : "invisible"}`}>
+				{!workerView ? (
 				<SessionWorkCard
 					roomId={roomId}
 					sessionId={sessionId}
@@ -492,6 +547,8 @@ function SessionChat({
 					runtimeView={runtimeView}
 					onRuntimeViewChange={onRuntimeViewChange}
 				/>
+				) : null}
+				<WorkerSessionLinkProvider onOpen={onOpenWorkerSession}>
 				<MessageQuickActionProvider onDraft={draftFromMessage}>
 					<Conversation initial="instant" resize={layoutReady ? "smooth" : "instant"}>
 						<AtBottomReporter onChange={setAtBottom} />
@@ -523,6 +580,27 @@ function SessionChat({
 									本轮已有工具调用记录，但未找到最终回复。请先核对工具和审批状态，再决定是否发送新指令。
 								</p>
 							) : null}
+							{workerView && queueItems.length > 0 ? (
+								<div className="home-queued-list">
+									{queueItems.map((item) => (
+										<div key={item.id} className={`home-queued-message${item.status === "failed" ? " is-failed" : ""}`}>
+											<div className="home-queued-message-body">
+												<p className="home-queued-message-status">{item.status === "failed" ? `发送失败：${item.failureReason ?? "未知原因"}` : "排队中，将在当前任务结束后发送"}</p>
+												<p className="home-queued-message-text">{item.displayText}</p>
+											</div>
+											<button
+												type="button"
+												className="home-queued-message-cancel"
+												aria-label={item.status === "failed" ? "移除失败消息" : "取消排队"}
+												title={item.status === "failed" ? "移除失败消息" : "取消排队"}
+												onClick={() => void cancelQueuedInput(item.id)}
+											>
+												<XIcon />
+											</button>
+										</div>
+									))}
+								</div>
+							) : null}
 						</ConversationContent>
 						</InlinePiHistoryGate>
 						<ConversationScrollButton
@@ -533,6 +611,7 @@ function SessionChat({
 						/>
 					</Conversation>
 				</MessageQuickActionProvider>
+				</WorkerSessionLinkProvider>
 				{blocked ? (
 					<div className="border-t border-destructive/20 bg-destructive/5 px-4 py-2 text-center text-xs text-destructive">
 						项目路径已失效，重新绑定或切换项目后才能继续对话与派活。
@@ -541,11 +620,13 @@ function SessionChat({
 				<Composer
 					sessionId={sessionId}
 					draftScope={JSON.stringify([draftContextKey, roomId, sessionId])}
-					disabled={status !== "connected" || running || sending || stopping || Boolean(blocked)}
+					disabled={status !== "connected" || (!workerView && running) || sending || stopping || Boolean(blocked)}
 					sending={sending}
-					stopAvailable={running || stopping}
+					stopAvailable={!workerView && (running || stopping)}
 					stopping={stopping}
-					busyHint={busyHint}
+					busyHint={workerView ? undefined : busyHint}
+					queueHint={workerView && running ? "排队中，将在当前任务结束后发送" : undefined}
+					hideSessionControls={workerView}
 					hasGoal={hasGoal}
 					workspaceLabel={workspaceLabel}
 					workspacePath={workspacePath}
@@ -557,7 +638,7 @@ function SessionChat({
 					statsVisible={atBottom}
 					onModelChanged={onSessionModelChange}
 					onThinkingChanged={onSessionThinkingChange}
-					onSend={send}
+					onSend={handleSend}
 					onStop={handleStop}
 					onGoalCommand={openGoalCommand}
 					onOpenWorkspace={onOpenWorkspace}
@@ -672,8 +753,8 @@ export function ChatPane({
 	const [runtimeSummary, setRuntimeSummary] = useState<SessionRuntimeSummary | null>(null);
 	const [requestedDelegationId, setRequestedDelegationId] = useState<string | null>(null);
 	const [requestedFullWorkerSession, setRequestedFullWorkerSession] = useState(false);
-	const [pendingDeleteSession, setPendingDeleteSession] = useState<RoomSession | null>(null);
-	const [renamingSession, setRenamingSession] = useState<RoomSession | null>(null);
+	const [pendingDeleteSession, setPendingDeleteSession] = useState<{ kind: "room"; session: RoomSession } | { kind: "worker"; session: WorkerSessionSummary } | null>(null);
+	const [renamingSession, setRenamingSession] = useState<{ kind: "room"; session: RoomSession } | { kind: "worker"; session: WorkerSessionSummary } | null>(null);
 	const [sessionRenameValue, setSessionRenameValue] = useState("");
 	const [workspaceOpen, setWorkspaceOpen] = useState(false);
 	const [workspaceOptions, setWorkspaceOptions] = useState<WorkspaceRecord[]>([]);
@@ -713,16 +794,19 @@ export function ChatPane({
 				if (cancelled) return;
 				let r = initial;
 				if (requestedSessionId) {
-					if (!r.sessions.some((session) => session.id === requestedSessionId)) {
+					const requestedWorker = r.workerSessions.some((item) => item.id === requestedSessionId);
+					if (!requestedWorker && !r.sessions.some((session) => session.id === requestedSessionId)) {
 						if (requestedSessionActivation === "parent") { onRoomUpdated?.(r); return; }
 						toast.error("目标会话不存在或不属于此对话，已打开当前会话");
 						onInvalidRequestedSession?.(roomId, requestedSessionId);
-					} else if (r.activeSession !== requestedSessionId) {
+					} else if ((requestedWorker ? r.activeWorkerView : r.activeSession) !== requestedSessionId) {
 						if (requestedSessionActivation === "parent") { onRoomUpdated?.(r); return; }
 						try {
 							await setActiveRoomSession(roomId, requestedSessionId);
 							r = await getRoom(roomId);
-							if (r.activeSession !== requestedSessionId || !r.sessions.some((session) => session.id === requestedSessionId)) {
+							const nowWorker = r.workerSessions.some((item) => item.id === requestedSessionId);
+							if ((nowWorker ? r.activeWorkerView : r.activeSession) !== requestedSessionId ||
+								(!nowWorker && !r.sessions.some((session) => session.id === requestedSessionId))) {
 								throw new Error("目标会话已在其他窗口改变，请重试");
 							}
 						} catch (error) {
@@ -739,7 +823,7 @@ export function ChatPane({
 				setRequestedDelegationId(null);
 				setRoom(r);
 				setRoomLoadError(null);
-				setActiveId(r.activeSession || "");
+				setActiveId(r.activeWorkerView ?? (r.activeSession || ""));
 				onRoomUpdated?.(r);
 			})
 			.catch((err: unknown) => {
@@ -764,9 +848,9 @@ export function ChatPane({
 					if (cancelled || pendingSessionSwitches.current > 0 || switchGeneration !== sessionSwitchGeneration.current || (room && preferCurrentRoomSummary(room, r) !== r)) return;
 					setRoom((prev) => (prev ? preferCurrentRoomSummary(prev, r) : prev));
 					setActiveId((current) =>
-						r.sessions.some((session) => session.id === current)
+						r.sessions.some((session) => session.id === current) || r.workerSessions.some((item) => item.id === current)
 						? current
-						: r.activeSession || "",
+						: (r.activeWorkerView ?? (r.activeSession || "")),
 					);
 				})
 				.catch(() => undefined);
@@ -825,9 +909,12 @@ export function ChatPane({
 			setRuntimeView("activity");
 			setRequestedDelegationId(null);
 			void preloadChatHistory(sessionId).catch(() => undefined);
+			// activate 路由同时接受容器 session id 与 worker 执行 session handle
+			// （后者只置 activeWorkerView，容器 activeSession 不动）。
 			await setActiveRoomSession(roomId, sessionId);
 			const updated = await getRoom(roomId);
-			if (updated.activeSession !== sessionId) throw new Error("当前会话已在其他窗口改变，请从会话列表重新打开");
+			const workerTarget = updated.workerSessions.some((item) => item.id === sessionId);
+			if ((workerTarget ? updated.activeWorkerView : updated.activeSession) !== sessionId) throw new Error("当前会话已在其他窗口改变，请从会话列表重新打开");
 			setRoom(updated);
 			setActiveId(sessionId);
 			onSessionActivated?.(updated);
@@ -840,6 +927,10 @@ export function ChatPane({
 		sessionSwitchQueue.current = next;
 		return next;
 	}, [roomId, activeId, onSessionActivated]);
+
+	const openWorkerSession = useCallback((sessionHandle: string) => {
+		void switchSession(sessionHandle);
+	}, [switchSession]);
 
 	const newSession = useCallback(async () => {
 		setWorkerProcessOpen(false);
@@ -870,6 +961,14 @@ export function ChatPane({
 			}
 			setRoom((prev) => {
 				if (!prev) return prev;
+				// Worker 执行 session：删除后服务端清空指向它的 activeWorkerView，
+				// 查看目标回退到容器 activeSession。
+				if (prev.workerSessions.some((item) => item.id === sessionId)) {
+					const workerSessions = prev.workerSessions.filter((item) => item.id !== sessionId);
+					const activeWorkerView = prev.activeWorkerView === sessionId ? null : prev.activeWorkerView;
+					if (prev.activeWorkerView === sessionId) setActiveId(prev.activeSession || "");
+					return { ...prev, workerSessions, activeWorkerView };
+				}
 				const sessions = prev.sessions.filter((s) => s.id !== sessionId);
 				// Mirror the server: a deleted active session falls back to the
 				// first remaining one. setActiveId must follow, otherwise the UI
@@ -883,19 +982,34 @@ export function ChatPane({
 	);
 
 	const openSessionRename = useCallback((session: RoomSession) => {
-		setRenamingSession(session);
+		setRenamingSession({ kind: "room", session });
+		setSessionRenameValue(session.name || session.firstMessage || "新对话");
+	}, []);
+
+	const openWorkerSessionRename = useCallback((session: WorkerSessionSummary) => {
+		setRenamingSession({ kind: "worker", session });
 		setSessionRenameValue(session.name || session.firstMessage || "新对话");
 	}, []);
 
 	const saveSessionRename = useCallback(async () => {
 		if (!renamingSession || !sessionRenameValue.trim()) return;
 		try {
-			const updated = await renameRoomSession(roomId, renamingSession.id, sessionRenameValue.trim());
-			setRoom((prev) =>
-				prev
-					? { ...prev, sessions: prev.sessions.map((session) => (session.id === updated.id ? updated : session)) }
-					: prev,
-			);
+			if (renamingSession.kind === "worker") {
+				const target = renamingSession.session;
+				const updated = await renameWorkerSession(roomId, target.id, sessionRenameValue.trim());
+				setRoom((prev) =>
+					prev
+						? { ...prev, workerSessions: prev.workerSessions.map((item) => (item.id === target.id ? (updated ?? { ...item, name: sessionRenameValue.trim() }) : item)) }
+						: prev,
+				);
+			} else {
+				const updated = await renameRoomSession(roomId, renamingSession.session.id, sessionRenameValue.trim());
+				setRoom((prev) =>
+					prev
+						? { ...prev, sessions: prev.sessions.map((session) => (session.id === updated.id ? updated : session)) }
+						: prev,
+				);
+			}
 			setRenamingSession(null);
 			toast.success("会话已重命名");
 		} catch (err) {
@@ -1079,8 +1193,14 @@ export function ChatPane({
 	}, [roomId, activeId, isSingle, currentPiWorker]);
 	const isGroup = type === "group";
 	const headerTitle = room?.name ?? (roomLoadError ? "对话暂不可用" : "正在加载对话…");
+	// 当前查看目标 = activeWorkerView 命中的执行 session 或容器 session（仅 direct 窗口有执行面）。
+	const workerSessions = type === "direct" ? (room?.workerSessions ?? []) : [];
+	const activeWorkerSession = workerSessions.find((item) => item.id === activeId);
+	const viewingWorker = Boolean(activeWorkerSession);
 	const activeSession = room?.sessions.find((s) => s.active);
-	const sessionTitle = activeSession?.name?.trim() || "";
+	const sessionTitle = activeWorkerSession
+		? (activeWorkerSession.name || activeWorkerSession.firstMessage || "执行会话")
+		: activeSession?.name?.trim() || "";
 	const subtitle =
 		type === "group"
 			? `${members.length} 位 Worker · Manager 在场`
@@ -1133,6 +1253,8 @@ export function ChatPane({
 					</button> : null}
 					<SessionMenu
 						sessions={room?.sessions ?? []}
+						workerSessions={workerSessions}
+						activeWorkerView={viewingWorker ? activeId : null}
 						trigger={(
 							<Button type="button" size="sm" variant="outline" className="home-context-pill">
 								<LayersIcon className="size-3.5" />
@@ -1143,7 +1265,9 @@ export function ChatPane({
 						onSwitch={switchSession}
 						onNew={newSession}
 						onRename={openSessionRename}
-						onDelete={setPendingDeleteSession}
+						onDelete={(session) => setPendingDeleteSession({ kind: "room", session })}
+						onRenameWorker={openWorkerSessionRename}
+						onDeleteWorker={(session) => setPendingDeleteSession({ kind: "worker", session })}
 					/>
 					{runtimeSummary && (runtimeSummary.hasGoal || runtimeSummary.sessionTotal > 0) ? (
 						<Button
@@ -1177,14 +1301,16 @@ export function ChatPane({
 				</div>
 			</header>
 			{activeId && room ? (
-				<InlinePiProcessProvider key={activeId} enabled={canInlinePiProcess && inlinePiProcess} roomId={roomId} sessionId={activeId} openWorkerProcess={openWorkerProcess}>
+				<InlinePiProcessProvider key={activeId} enabled={canInlinePiProcess && inlinePiProcess && !viewingWorker} roomId={roomId} sessionId={activeId} openWorkerProcess={openWorkerProcess}>
 				<SessionChat
 					key={activeId}
 					roomId={roomId}
 					sessionId={activeId}
-					sessionModifiedAt={room.sessions.find((s) => s.id === activeId)?.modifiedAt}
+					sessionModifiedAt={activeWorkerSession?.modifiedAt ?? room.sessions.find((s) => s.id === activeId)?.modifiedAt}
 					emptyHint={emptyHint}
 					windowType={type}
+					workerView={viewingWorker}
+					onOpenWorkerSession={openWorkerSession}
 					onStatus={setStatus}
 					onOpenWindow={(windowId) => onOpenWindow?.(windowId, activeId)}
 					onRoomsMayHaveChanged={onRoomsMayHaveChanged}
@@ -1194,9 +1320,9 @@ export function ChatPane({
 					draftContextKey={JSON.stringify([room.workspace?.id ?? null, room.cwdSnapshot])}
 					onOpenWorkspace={openWorkspaceSwitch}
 					blocked={!room.contextAvailable || status === "gone"}
-					sessionModel={activeSession?.model}
-					sessionThinkingLevel={activeSession?.thinkingLevel}
-					directWorkerModel={isSingle ? { name: members[0]?.name ?? "", model: typeof members[0]?.connector?.config?.model === "string" ? members[0].connector.config.model : undefined } : undefined}
+					sessionModel={viewingWorker ? undefined : activeSession?.model}
+					sessionThinkingLevel={viewingWorker ? undefined : activeSession?.thinkingLevel}
+					directWorkerModel={isSingle && !viewingWorker ? { name: members[0]?.name ?? "", model: typeof members[0]?.connector?.config?.model === "string" ? members[0].connector.config.model : undefined } : undefined}
 					onSessionModelChange={handleSessionModelChange}
 					onSessionThinkingChange={handleSessionThinkingChange}
 					runtimeOpen={goalRuntimeOpen}
@@ -1242,7 +1368,11 @@ export function ChatPane({
 					onSwitchSession={switchSession}
 					onNewSession={newSession}
 					onRenameSession={openSessionRename}
-					onDeleteSession={setPendingDeleteSession}
+					onDeleteSession={(session) => setPendingDeleteSession({ kind: "room", session })}
+					workerSessions={workerSessions}
+					activeWorkerView={viewingWorker ? activeId : null}
+					onRenameWorkerSession={openWorkerSessionRename}
+					onDeleteWorkerSession={(session) => setPendingDeleteSession({ kind: "worker", session })}
 				/>
 			) : null}
 			</> : null}
@@ -1255,7 +1385,7 @@ export function ChatPane({
 					<DialogHeader>
 						<DialogTitle>删除会话</DialogTitle>
 						<DialogDescription>
-							确定删除「{pendingDeleteSession?.firstMessage || "新对话"}」吗？该会话的历史记录将一并删除，无法恢复。
+							确定删除「{pendingDeleteSession?.session.name || pendingDeleteSession?.session.firstMessage || "新对话"}」吗？该会话的历史记录将一并删除，无法恢复。
 						</DialogDescription>
 					</DialogHeader>
 					<DialogFooter>
@@ -1266,7 +1396,7 @@ export function ChatPane({
 							type="button"
 							variant="destructive"
 							onClick={() => {
-								if (pendingDeleteSession) void removeSession(pendingDeleteSession.id);
+								if (pendingDeleteSession) void removeSession(pendingDeleteSession.session.id);
 								setPendingDeleteSession(null);
 							}}
 						>

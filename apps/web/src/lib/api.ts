@@ -42,6 +42,7 @@ import type {
 	WorkspaceResourceKind,
 	WorkspaceTrustState,
 	ViewerIdentity,
+	WorkerSessionSummary,
 } from "./types";
 import { getDesktopBridge } from "./desktop";
 
@@ -1158,7 +1159,13 @@ function sessionApiError(error: string | undefined, fallback: string): string {
 	return error === "session_context_inactive" ? "该会话属于另一个项目，请先切回对应项目" : (error ?? fallback);
 }
 
-export async function sendMessage(sessionId: string, content: string, attachments: MessageAttachmentInput[], operationId: string): Promise<void> {
+export interface SendMessageResult {
+	/** Worker 执行 session 忙碌时消息进入排队通道（202），未立即投递。 */
+	queued: boolean;
+	queueId?: string;
+}
+
+export async function sendMessage(sessionId: string, content: string, attachments: MessageAttachmentInput[], operationId: string): Promise<SendMessageResult> {
 	let res: Response;
 	try {
 		res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/messages`, {
@@ -1177,6 +1184,8 @@ export async function sendMessage(sessionId: string, content: string, attachment
 		if (body?.code === "message_operation_rejected") throw new MessageOperationRejectedError(body.error ?? "消息未通过发送前检查");
 		throw new MessageDeliveryUnconfirmedError(sessionApiError(body?.error, `send message failed: ${res.status}`));
 	}
+	const body = (await res.json().catch(() => null)) as { queued?: boolean; queueId?: string } | null;
+	return { queued: body?.queued === true, ...(body?.queueId ? { queueId: body.queueId } : {}) };
 }
 
 export async function abortSession(sessionId: string): Promise<AbortSessionResult> {
@@ -2607,6 +2616,50 @@ export async function renameRoomSession(roomId: string, sessionId: string, name:
 		throw new Error(body?.error ?? `rename room session failed: ${res.status}`);
 	}
 	return ((await res.json()) as { session: RoomSession }).session;
+}
+
+/** Rename a worker execution session（同一路由，响应走 workerSession 字段）。 */
+export async function renameWorkerSession(roomId: string, sessionHandle: string, name: string): Promise<WorkerSessionSummary | null> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${roomId}/sessions/${sessionHandle}`, {
+		method: "PATCH",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ name }),
+	});
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `rename worker session failed: ${res.status}`);
+	}
+	return ((await res.json()) as { workerSession?: WorkerSessionSummary | null }).workerSession ?? null;
+}
+
+// ---- worker 执行 session 的排队输入（FIFO，web 渲染灰态待发送气泡） ----
+
+export interface WorkerInputQueueItem {
+	id: string;
+	sessionHandle: string;
+	text: string;
+	displayText: string;
+	status: "queued" | "failed";
+	failureReason?: string;
+	createdAt: string;
+	operationId: string;
+}
+
+export async function listWorkerInputQueue(roomId: string, sessionHandle: string): Promise<WorkerInputQueueItem[]> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/input-queue?sessionHandle=${encodeURIComponent(sessionHandle)}`);
+	if (!res.ok) throw new Error(`list worker input queue failed: ${res.status}`);
+	return ((await res.json()) as { items?: WorkerInputQueueItem[] }).items ?? [];
+}
+
+/** 取消排队项（queued）或移除失败项；已开始派发的 409。 */
+export async function cancelWorkerInput(roomId: string, queueId: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/input-queue/${encodeURIComponent(queueId)}`, {
+		method: "DELETE",
+	});
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `cancel worker input failed: ${res.status}`);
+	}
 }
 
 // ---- interactions（HITL 审批，§6.4）----
