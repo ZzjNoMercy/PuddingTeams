@@ -10,6 +10,9 @@
     "patchedDependencies": {
       "@modelcontextprotocol/client@2.0.0": "patches/@modelcontextprotocol__client@2.0.0.patch"
     },
+    "overrides": {
+      "pi-mcp-adapter>@earendil-works/pi-ai": "1.2.0"
+    },
     "onlyBuiltDependencies": [
       "@larksuite/cli",
       "electron",

@@ -4,7 +4,7 @@ import { mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Type } from "typebox";
-import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { TeamsStore, type AgentConfig } from "../store/teams.js";
 import { goalCriterionRefs, WorkStateStore } from "../store/work-state.js";
 import { PiSessionStore } from "./session-store.js";
@@ -395,7 +395,7 @@ test("委托结果正文携带 delegationId，followup 凭它接力成功", asyn
 	setActive([...plan.active]);
 
 	const tool = tools.get(delegateToolName("alpha"))!;
-	const first = await tool.execute("call-1", { task: "第一步" }, undefined, undefined, {} as ExtensionContext);
+	const first = await tool.execute("call-1", { task: "第一步" }, undefined, undefined, {} as ExtensionToolContext);
 	const firstText = (first.content[0] as { text?: string }).text ?? "";
 	// details 里的 delegationId 模型看不到，正文必须带一份，否则 followup 只能瞎填。
 	const m = /delegationId：([0-9a-f-]+)/.exec(firstText);
@@ -407,7 +407,7 @@ test("委托结果正文携带 delegationId，followup 凭它接力成功", asyn
 		{ task: "接力继续", handoffKind: "followup", parentDelegationId: m![1] },
 		undefined,
 		undefined,
-		{} as ExtensionContext,
+		{} as ExtensionToolContext,
 	);
 	const secondText = (second.content[0] as { text?: string }).text ?? "";
 	assert.ok(secondText.includes("done"), `followup 必须被接受并完成：${secondText}`);
@@ -432,7 +432,7 @@ test("HITL 门禁覆盖跨 Worker 委托、计划写入与重复业务决策，�
 		assert.equal(blocked.block, true);
 		assert.equal(blocked.terminate, true);
 		assert.match(blocked.reason, /等待用户在原卡片中回答/);
-		await assert.rejects(() => tools.get(name)!.execute("blocked", {} as never, undefined, undefined, {} as ExtensionContext), /等待用户在原卡片中回答/);
+		await assert.rejects(() => tools.get(name)!.execute("blocked", {} as never, undefined, undefined, {} as ExtensionToolContext), /等待用户在原卡片中回答/);
 	}
 	assert.equal(await hook({ toolName: CORE_TOOL_ABANDON_GOAL }, {}), undefined, "废弃必须能收敛 pending 人工卡");
 	assert.equal(await hook({ toolName: CORE_TOOL_SUPERSEDE_GOAL }, {}), undefined, "更换必须能收敛 pending 人工卡");
@@ -473,7 +473,7 @@ test("正式 Goal 未建立 WorkPlan 时拒绝无 workItemId 委托，且 Worker
 			{ task: "直接写文件", intent: "实现 Goal", expectedOutcome: "文件存在", completionBoundary: "文件可验收" },
 			undefined,
 			undefined,
-			{} as ExtensionContext,
+			{} as ExtensionToolContext,
 		),
 		/必须先建立 WorkPlan 并绑定 workItemId/,
 	);
@@ -485,7 +485,7 @@ test("正式 Goal 未建立 WorkPlan 时拒绝无 workItemId 委托，且 Worker
 			{ task: "改做图片", intent: "新任务", expectedOutcome: "图片", completionBoundary: "图片交付" },
 			undefined,
 			undefined,
-			{} as ExtensionContext,
+			{} as ExtensionToolContext,
 		),
 		/supersede_session_goal.*abandon_session_goal/,
 	);
@@ -546,7 +546,7 @@ test("solo 委托的启动前失败先结束 manager 工具，不被单聊镜像
 		{ task: "inspect only" },
 		undefined,
 		undefined,
-		{} as ExtensionContext,
+		{} as ExtensionToolContext,
 	);
 	await assert.rejects(
 		Promise.race([
@@ -602,7 +602,7 @@ test("群聊委托: 立即持久化 running 投影，且 session:new 真正新�
 		{ task: "绘制完整页面", session: "new" },
 		undefined,
 		undefined,
-		{} as ExtensionContext,
+		{} as ExtensionToolContext,
 	);
 	await new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -637,7 +637,7 @@ test("Phase4: search_agent_tools 纯加法激活，撤权工具不会被重新�
 	setActive(baseline);
 
 	const search = tools.get(CORE_TOOL_SEARCH)!;
-	const first = await search.execute("call-1", { query: "alpha" }, undefined, undefined, {} as ExtensionContext);
+	const first = await search.execute("call-1", { query: "alpha" }, undefined, undefined, {} as ExtensionToolContext);
 	const added = (first.details as { added: string[] }).added;
 	assert.deepEqual(added, [delegateToolName("alpha")], "按 worker 名搜索应激活其委托工具");
 	const activeNow = getActive();
@@ -648,7 +648,7 @@ test("Phase4: search_agent_tools 纯加法激活，撤权工具不会被重新�
 	// 撤权：禁用 alpha 后搜索不再激活它的工具（成员/启用状态每次重读）。
 	await teams.setEnabled("alpha", false);
 	setActive(baseline); // 模拟立即撤权后的 active tools
-	const second = await search.execute("call-2", { query: "alpha" }, undefined, undefined, {} as ExtensionContext);
+	const second = await search.execute("call-2", { query: "alpha" }, undefined, undefined, {} as ExtensionToolContext);
 	assert.deepEqual((second.details as { matches: string[] }).matches, [], "禁用后工具不得再被搜索激活");
 	assert.ok(!getActive().includes(delegateToolName("alpha")));
 });
@@ -674,7 +674,7 @@ test("Phase4: search_agent_tools 空格分词 AND，worker 名 + 职责关键词
 	const search = tools.get(CORE_TOOL_SEARCH)!;
 	// 回归：整串 "alpha 联网检索" 既不是工具名子串也不是描述子串，
 	// 旧实现必然落空；分词后两词分别命中工具名与责任边界描述。
-	const combo = await search.execute("call-1", { query: "alpha 联网检索" }, undefined, undefined, {} as ExtensionContext);
+	const combo = await search.execute("call-1", { query: "alpha 联网检索" }, undefined, undefined, {} as ExtensionToolContext);
 	assert.deepEqual(
 		(combo.details as { matches: string[] }).matches,
 		[delegateToolName("alpha")],
@@ -682,11 +682,11 @@ test("Phase4: search_agent_tools 空格分词 AND，worker 名 + 职责关键词
 	);
 
 	// 单个职责关键词也能命中（描述含责任边界）。
-	const byDuty = await search.execute("call-2", { query: "联网检索" }, undefined, undefined, {} as ExtensionContext);
+	const byDuty = await search.execute("call-2", { query: "联网检索" }, undefined, undefined, {} as ExtensionToolContext);
 	assert.deepEqual((byDuty.details as { matches: string[] }).matches, [delegateToolName("alpha")]);
 
 	// AND 语义：任一词不命中则整体不匹配，不会误激活无关工具。
-	const miss = await search.execute("call-3", { query: "alpha 写代码" }, undefined, undefined, {} as ExtensionContext);
+	const miss = await search.execute("call-3", { query: "alpha 写代码" }, undefined, undefined, {} as ExtensionToolContext);
 	assert.deepEqual((miss.details as { matches: string[] }).matches, []);
 });
 
@@ -705,7 +705,7 @@ test("Phase4: 搜索已激活的工具返回可直接调用，而不是没有匹
 	setActive([...plan.active]);
 
 	const search = tools.get(CORE_TOOL_SEARCH)!;
-	const result = await search.execute("call-1", { query: delegateToolName("alpha") }, undefined, undefined, {} as ExtensionContext);
+	const result = await search.execute("call-1", { query: delegateToolName("alpha") }, undefined, undefined, {} as ExtensionToolContext);
 	const details = result.details as { matches: string[]; added: string[] };
 	assert.deepEqual(details.matches, [delegateToolName("alpha")], "已激活的工具也要能搜到");
 	assert.deepEqual(details.added, [], "已激活的工具不重复激活");
@@ -842,7 +842,7 @@ test("Goal 工具契约: 创建使用条件数组，WorkPlan 只回传条件序�
 		activationReason: "需要串行多 Worker 协作",
 		criteriaOrigin: "user_input",
 		sourceMessageIds: ["user:123"],
-	}, undefined, undefined, {} as ExtensionContext);
+	}, undefined, undefined, {} as ExtensionToolContext);
 	const created = await workStates.getActive("sess-test");
 	assert.ok(created);
 	assert.equal(created.completionBoundary, "后端检查有证据\n前端检查使用后端结论");
@@ -862,7 +862,7 @@ test("Goal 工具契约: 创建使用条件数组，WorkPlan 只回传条件序�
 			{ id: "w1", title: "后端检查", acceptanceCriteria: ["给出证据"], sourceGoalCriterionIndexes: [1] },
 			{ id: "w2", title: "前端检查", dependsOn: ["w1"], acceptanceCriteria: ["使用 W1 结论"], sourceGoalCriterionIndexes: [2] },
 		],
-	}, undefined, undefined, {} as ExtensionContext);
+	}, undefined, undefined, {} as ExtensionToolContext);
 	const planned = await workStates.getActive("sess-test");
 	assert.deepEqual(planned?.plan?.items.w1?.sourceGoalCriteria, ["goal:1:1"]);
 	assert.deepEqual(planned?.plan?.items.w2?.sourceGoalCriteria, ["goal:1:2"]);
@@ -915,7 +915,7 @@ test("review_work_item 绑定 Submission 目标并在无关 Goal 写入后安全
 		verdict: "accepted",
 		summary: "报告符合条件",
 		evidenceRefs: ["message:report"],
-	}, undefined, undefined, {} as ExtensionContext);
+	}, undefined, undefined, {} as ExtensionToolContext);
 	assert.match(result.content.map((entry) => entry.type === "text" ? entry.text : "").join("\n"), new RegExp(`安全对齐全局 revision ${submitted.revision}→${advanced.revision}`));
 	const accepted = (result.details as { workState: import("../store/work-state.js").SessionWorkState }).workState;
 	assert.equal(accepted.plan?.items.W1?.status, "accepted");
@@ -1015,7 +1015,7 @@ test("P3-G: independent Goal 的 resolved 提交先走隔离 reviewer 再原子�
 		{ goalId: goal.goalId, revision: 0, status: "resolved", currentBrief: "页面已生成并验证" },
 		undefined,
 		undefined,
-		{} as ExtensionContext,
+		{} as ExtensionToolContext,
 	);
 	assert.equal(reviewCalls, 1);
 	assert.deepEqual(reviewInput?.managerEvidence, [{
@@ -1088,7 +1088,7 @@ test("manager 建房: solo create_group_window 建成群聊并 fire-and-forget �
 		{ members: ["alpha", "beta"], task: "做一份对比报告", name: "报告组", prompt: "先分工再汇总" },
 		undefined,
 		undefined,
-		{} as ExtensionContext,
+		{} as ExtensionToolContext,
 	);
 	const details = result.details as { windowId: string; members: string[]; name?: string };
 	const window = (await store.getWindow(details.windowId))!;
@@ -1106,16 +1106,16 @@ test("manager 建房: solo create_group_window 建成群聊并 fire-and-forget �
 
 	// 校验：<2 成员 / 未知 worker / 禁用 worker / pinned manager 分别拒绝。
 	await assert.rejects(
-		() => create.execute("call-2", { members: ["alpha"], task: "t" }, undefined, undefined, {} as ExtensionContext),
+		() => create.execute("call-2", { members: ["alpha"], task: "t" }, undefined, undefined, {} as ExtensionToolContext),
 		/至少需要 2 个 worker/,
 	);
 	await assert.rejects(
-		() => create.execute("call-3", { members: ["alpha", "ghost"], task: "t" }, undefined, undefined, {} as ExtensionContext),
+		() => create.execute("call-3", { members: ["alpha", "ghost"], task: "t" }, undefined, undefined, {} as ExtensionToolContext),
 		/ghost.*不能入群/,
 	);
 	await store.setEnabled("beta", false);
 	await assert.rejects(
-		() => create.execute("call-4", { members: ["alpha", "beta"], task: "t" }, undefined, undefined, {} as ExtensionContext),
+		() => create.execute("call-4", { members: ["alpha", "beta"], task: "t" }, undefined, undefined, {} as ExtensionToolContext),
 		/beta.*不能入群/,
 	);
 });
@@ -1137,7 +1137,7 @@ test("manager 建房: roster 校验后停用成员，不创建孤立 Session 或
 		return originalWindowForSession(id);
 	};
 	await assert.rejects(
-		() => tools.get(CORE_TOOL_CREATE_GROUP)!.execute("race-call", { members: ["alpha", "beta"], task: "对比" }, undefined, undefined, {} as ExtensionContext),
+		() => tools.get(CORE_TOOL_CREATE_GROUP)!.execute("race-call", { members: ["alpha", "beta"], task: "对比" }, undefined, undefined, {} as ExtensionToolContext),
 		/beta.*已停用/,
 	);
 	assert.equal(sessionCreates, 0);
@@ -1164,7 +1164,7 @@ test("manager 建房: members 接受显示名并解析为内部 id（name/id 解
 		{ members: ["阿尔法", "Designer"], task: "做一份报告" },
 		undefined,
 		undefined,
-		{} as ExtensionContext,
+		{} as ExtensionToolContext,
 	);
 	const details = result.details as { windowId: string; members: string[] };
 	assert.deepEqual(details.members, ["alpha", "pi-b"], "显示名必须解析为内部 id 落库");
@@ -1189,7 +1189,7 @@ test("manager 建房: create_group_window 在 direct/group 被拒绝；invite_to
 				{ members: ["alpha", "beta"], task: "t" },
 				undefined,
 				undefined,
-				{} as ExtensionContext,
+				{} as ExtensionToolContext,
 			),
 		/仅 solo 对话可用/,
 	);
@@ -1201,7 +1201,7 @@ test("manager 建房: create_group_window 在 direct/group 被拒绝；invite_to
 				{ members: ["beta"] },
 				undefined,
 				undefined,
-				{} as ExtensionContext,
+				{} as ExtensionToolContext,
 			),
 		/仅在群聊窗口可用/,
 	);
@@ -1224,7 +1224,7 @@ test("manager 拉人: group invite_to_group 加入新成员，roster 重算后�
 		{ members: ["gamma", "alpha"] },
 		undefined,
 		undefined,
-		{} as ExtensionContext,
+		{} as ExtensionToolContext,
 	);
 	const details = result.details as { members: string[]; added: string[]; skipped: string[] };
 	assert.deepEqual(details.added, ["gamma"]);
@@ -1239,7 +1239,7 @@ test("manager 拉人: group invite_to_group 加入新成员，roster 重算后�
 	);
 	assert.ok(plan.managed.has(delegateToolName("gamma")), "新成员下一轮必须进入 roster 工具集");
 
-	const again = await invite.execute("call-2", { members: ["gamma"] }, undefined, undefined, {} as ExtensionContext);
+	const again = await invite.execute("call-2", { members: ["gamma"] }, undefined, undefined, {} as ExtensionToolContext);
 	assert.ok((again.content[0] as { text: string }).text.includes("无需重复拉人"));
 	assert.deepEqual((await store.getWindow(window.id))!.members, ["alpha", "beta", "gamma"], "重复拉人不改动成员");
 });
@@ -1319,7 +1319,7 @@ test("solo 派活: worker 单聊绑在其他项目时保留原窗口，并为当
 		{ task: "做个报告" },
 		undefined,
 		undefined,
-		{} as ExtensionContext,
+		{} as ExtensionToolContext,
 	);
 	const details = result.details as { windowId?: string };
 	await new Promise<void>((resolve) => setImmediate(resolve));

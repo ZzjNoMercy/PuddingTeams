@@ -277,7 +277,8 @@ export class KnowledgeRuntimeService {
      return tool.execute(id, args, signal, update, ctx);
     } }));
 			pi.on("before_agent_start", async (event, ctx) => {
-				this.observeChat?.(getSessionId(), event.prompt, event.images);
+				// pi 1.x：triggerTurn 的 custom run 也会触发本事件，用户消息观察仅限 user 变体。
+				if (event.messageType === "user") this.observeChat?.(getSessionId(), event.prompt, event.images);
 				return { systemPrompt: `${event.systemPrompt}\n\n${(await current(ctx, true)).prompt}` };
 			});
 			pi.on("context", async (_event, ctx) => { await current(ctx); await surface?.assertCurrent(); });

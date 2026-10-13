@@ -577,14 +577,16 @@ export class LocalPiDriver implements AgentDriver {
 		outputRecoveryAttempt = 0,
 		workerExecution = knowledgeSurfaceByHandle.get(sessionHandle)?.current.workerExecution,
 	): AsyncIterable<AgentEvent> {
-		const previousStop = session.agent?.shouldStopAfterTurn;
+		// pi 1.x: shouldStopAfterTurn 已移除，finishTurn 返回 { action: "end" } 结束 run。
+		const previousFinishTurn = session.agent?.finishTurn;
 		if (workerExecution) {
 			workerExecution.bind(session);
-			session.agent.shouldStopAfterTurn = async (...args) => {
+			session.agent.finishTurn = async (turn, signal) => {
 				const last = session.agent.state.messages.filter((message) => message.role === "assistant").at(-1);
-				return await workerExecution.shouldStop() ||
-					(last?.role === "assistant" && ["length", "error", "aborted"].includes(last.stopReason)) ||
-					(await previousStop?.(...args) ?? false);
+				const stop = await workerExecution.shouldStop() ||
+					(last?.role === "assistant" && ["length", "error", "aborted"].includes(last.stopReason));
+				if (stop) return { action: "end" as const };
+				return (await previousFinishTurn?.(turn, signal)) as { action: "continue" } | { action: "end" } | undefined;
 			};
 		}
 		const queue: AgentEvent[] = [];
@@ -636,7 +638,7 @@ export class LocalPiDriver implements AgentDriver {
 			ctx.signal?.removeEventListener("abort", onAbort);
 			runningByRunHandle.delete(runHandle);
 			abortByRunHandle.delete(runHandle);
-			if (workerExecution) session.agent.shouldStopAfterTurn = previousStop;
+			if (workerExecution) session.agent.finishTurn = previousFinishTurn;
 		}
 
 		const base = { agentId: this.id, sessionHandle, runHandle };

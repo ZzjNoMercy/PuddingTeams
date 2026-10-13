@@ -269,12 +269,13 @@ async function runWikiLifecycle(options: {
  };
  const session = {
   messages,
-  agent: { state: { messages }, shouldStopAfterTurn: undefined as undefined | ((context: unknown) => Promise<boolean>) },
+  agent: { state: { messages }, finishTurn: undefined as undefined | ((context: unknown) => Promise<{ action: "end" } | undefined>) },
   subscribe: () => () => undefined,
   async prompt() {
    prompts++;
    messages.push({ role: 'assistant', ...(options.ending ?? { stopReason: 'stop', content: [{ type: 'text', text: 'model claims completed' }] }) });
-   const stop = await this.agent.shouldStopAfterTurn?.({});
+   const decision = await this.agent.finishTurn?.({});
+   const stop = decision?.action === 'end';
    if (options.stop && !stop) throw new Error('candidate caused an extra model turn');
   },
   async abort() {},
@@ -295,7 +296,7 @@ test('Wiki committed candidate stops at tool boundary and completes with host re
  const end = result.events.at(-1)!;
  assert.equal(end.type, 'completed');
  if (end.type === 'completed') assert.equal(end.result.content, '候选 batch-1 等待用户审核');
- assert.equal(result.session.agent.shouldStopAfterTurn, undefined);
+ assert.equal(result.session.agent.finishTurn, undefined);
 });
 
 test('Wiki natural language success without submit is a host failure; pure query keeps ordinary result', async () => {
@@ -350,7 +351,7 @@ test('Wiki driver cancellation records host abort without waiting for SDK idle',
  };
  const messages: Array<Record<string, unknown>> = [];
  const session = {
-  messages, agent: { state: { messages }, shouldStopAfterTurn: undefined },
+  messages, agent: { state: { messages }, finishTurn: undefined },
   subscribe: () => () => undefined,
   async prompt() { entered(); await gate; messages.push({ role: 'assistant', stopReason: 'aborted' }); },
   // Uncooperative SDK abort is deliberately left unresolved.

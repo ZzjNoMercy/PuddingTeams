@@ -697,10 +697,11 @@ export class WikiCuratorService {
 		}, this.deps.workerTimeoutMs ?? 15 * 60 * 1000);
 		this.aborters.set(job.id, () => session.abort());
 		try {
-			session.agent.shouldStopAfterTurn = async () => {
+			session.agent.finishTurn = async () => {
 				const last = session.agent.state.messages.filter(message => message.role === "assistant").at(-1);
-				return (await this.deps.jobs.get(job.id))?.status !== "running" ||
+				const stop = (await this.deps.jobs.get(job.id))?.status !== "running" ||
 					(last?.role === "assistant" && ["length", "error", "aborted"].includes(last.stopReason));
+				return stop ? { action: "end" as const } : undefined;
 			};
 			await session.prompt(JSON.stringify(await this.candidateContext(job)));
 			if ((await this.deps.jobs.get(job.id))?.status === "running") {

@@ -389,8 +389,8 @@ test("普通消息仅在 pi 准入确认后返回 accepted，拒绝时保留错�
 			entered();
 			await new Promise<void>((resolve, reject) => {
 				admit = (accepted) => {
-					options.preflightResult(accepted);
-					if (accepted) resolve();
+					// pi 1.x：受理后回调 preflightResult；准入拒绝只抛错，不再回调 false。
+					if (accepted) { options.preflightResult(true); resolve(); }
 					else reject(new Error("模型准入失败"));
 				};
 			});
@@ -423,8 +423,8 @@ test("模型明确拒绝消息且没有新增 user 时回收本次冻结附件",
 	await uploads.init();
 	const session = {
 		messages: [] as Array<{ role: string }>,
-		prompt: async (_text: string, options: { preflightResult: (accepted: boolean) => void }) => {
-			options.preflightResult(false);
+		prompt: async (_text: string, _options: { preflightResult: (accepted: boolean) => void }) => {
+			// pi 1.x：准入拒绝只抛错，不再回调 preflightResult(false)。
 			throw new Error("模型准入失败");
 		},
 	};
@@ -456,9 +456,9 @@ test("准入失败若仍出现新增 user，则保留可能已被引用的冻结
 	await uploads.init();
 	const session = {
 		messages: [] as Array<{ role: string }>,
-		prompt: async (_text: string, options: { preflightResult: (accepted: boolean) => void }) => {
+		prompt: async (_text: string, _options: { preflightResult: (accepted: boolean) => void }) => {
 			session.messages.push({ role: "user" });
-			options.preflightResult(false);
+			// pi 1.x：准入拒绝只抛错，不再回调 preflightResult(false)。
 			throw new Error("模型准入失败");
 		},
 	};

@@ -281,7 +281,7 @@ test("真实 WikiCurator 默认 generate 经 SDK 提交、人审发布，工具�
 test("视觉真实SDK提取后才生成候选；空结果可原件重试；文本模型阻断；契约改变阻断", {timeout:45000}, async()=>{
  const root=await mkdtemp(path.join(tmpdir(),"pt-vision-sdk-")), previous=process.env.PI_CODING_AGENT_DIR;
  process.env.PI_CODING_AGENT_DIR=path.join(root,"agent");
- const png=Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a9sAAAAASUVORK5CYII=","base64");
+ const png=Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAFWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC","base64"); // pi 1.x photon 无法解码旧 1x1 fixture，换成可解码的 8x8 PNG
  let mode="success",error:unknown,active:Awaited<ReturnType<typeof fixture>>;
  const fixtures:Array<Awaited<ReturnType<typeof fixture>>>=[],requests:Array<{mode:string;image:boolean}>=[];
  const server=createServer(async(req,res)=>{try{

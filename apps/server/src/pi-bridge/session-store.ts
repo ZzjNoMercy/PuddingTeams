@@ -563,10 +563,11 @@ export class PiSessionStore {
 		// Stop at the completed tool batch, after toolResults/cards are persisted.
 		// Aborting the Session here would also signal in-flight Worker operations;
 		// a human wait must preserve the pending Interaction and its original Run.
-		const previousStop = session.agent.shouldStopAfterTurn;
-		session.agent.shouldStopAfterTurn = async (context, signal) => {
-			if (await managerHumanWait(session.sessionId, this.invoker, this.workStates)) return true;
-			return await previousStop?.(context, signal) ?? false;
+		// pi 1.x: shouldStopAfterTurn 已移除，finishTurn 返回 { action: "end" } 结束 run。
+		const previousFinishTurn = session.agent.finishTurn;
+		session.agent.finishTurn = async (turn, signal) => {
+			if (await managerHumanWait(session.sessionId, this.invoker, this.workStates)) return { action: "end" as const };
+			return (await previousFinishTurn?.(turn, signal)) as { action: "continue" } | { action: "end" } | undefined;
 		};
 		// 激活策略（§3.3）：基础委托工具全窗口默认激活（省掉 search 轮次）；
 		// capability 扩展工具按绑定策略预注册，searchable 的保持 inactive，
@@ -1250,12 +1251,15 @@ export class PiSessionStore {
 	private appendRecoveredToolResult(session: AgentSession, result: RecoveredToolResult): boolean {
 		if (!this.pendingToolCalls(session).some((call) => call.id === result.toolCallId)) return false;
 		const timestamp = Date.now();
+		// pi 1.x 把 ToolResultMessage.details 收窄为 JsonValue；平台构造的 details
+		// 均为纯 JSON 字面量，这里只做类型层对齐。
+		type ToolResultDetails = Extract<Parameters<SessionManager["appendMessage"]>[0], { role: "toolResult" }>["details"];
 		const message = {
 			role: "toolResult" as const,
 			toolCallId: result.toolCallId,
 			toolName: result.toolName,
 			content: [{ type: "text" as const, text: result.text }],
-			details: result.details,
+			details: result.details as ToolResultDetails,
 			isError: result.isError,
 			timestamp,
 		};

@@ -653,10 +653,13 @@ export async function registerChatRoutes(
 					const preflight = new Promise<boolean>((resolve) => { resolvePreflight = resolve; });
 					const promptOptions = {
 						...(images.length ? { images } : {}),
-						preflightResult: (accepted: boolean) => resolvePreflight?.(accepted),
+						// pi 1.x：preflightResult 只在受理后回调（started/queued/handled 均视为受理）；
+						// 准入拒绝改为 prompt() 直接抛错，由下方 completion.catch 补 resolvePreflight(false)。
+						preflightResult: () => resolvePreflight?.(true),
 					} as PromptOptions;
 					disarmIntake = sourceRefs ? knowledgeIntakes?.armManager(session, sourceRefs, promptText, stored) : undefined;
 					const completion = session.prompt(promptText, promptOptions);
+					void completion.catch(() => resolvePreflight?.(false));
 					void completion.finally(() => disarmIntake?.()).catch(() => {});
 					void completion.catch((err: unknown) => {
 						app.log.error({ err, sessionId: req.params.id }, "prompt failed");

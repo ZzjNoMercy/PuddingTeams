@@ -7,7 +7,7 @@ import {
 	stripUnmanagedPiFff,
 	workspaceSearchKey,
 } from "./code-search.js";
-import type { ExtensionAPI, ExtensionContext, LoadExtensionsResult, SessionShutdownEvent, SessionStartEvent, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionToolContext, LoadExtensionsResult, SessionShutdownEvent, SessionStartEvent, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -123,7 +123,7 @@ test("受控 FFF 将 session_start cwd 钉死为登记的 canonical Workspace", 
 		cwd: wrongRoot,
 		ui: { notify() {}, setStatus() {}, addAutocompleteProvider() {} },
 		sessionManager: { getEntries: () => [] },
-	} as unknown as ExtensionContext;
+	} as unknown as ExtensionToolContext;
 	await start!({ type: "session_start", reason: "startup" }, ctx);
 	try {
 		const grep = tools.get("grep")!;

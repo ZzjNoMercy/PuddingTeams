@@ -104,7 +104,7 @@ export async function extractImageWithPi(input: {
 		if (!session.model?.input.includes("image")) throw new Error("Wiki 管理员当前模型不支持图片，请更换支持视觉的模型后重试");
 		const stream = session.agent.streamFunction;
 		session.agent.streamFunction = async (...args) => { await input.assertCurrent(); return stream(...args); };
-		session.agent.shouldStopAfterTurn = () => true;
+		session.agent.finishTurn = () => ({ action: "end" });
 		await session.prompt(JSON.stringify({ format: { segments: [{ text: "原样文字或可观察图形描述", region: { x: 0, y: 0, width: 1, height: 1 }, warnings: ["辨认不清的具体内容"] }], warnings: [] },
 			regionUnits: "0到1的原图归一化区域，只能近似定位；不能定位则region=null", dimensions,
 			instruction: "保留原文语言、段落顺序和表格信息。只提供图片证据，不总结成知识页。纯装饰或空图无可核对内容时返回segments=[]与原因。" }),

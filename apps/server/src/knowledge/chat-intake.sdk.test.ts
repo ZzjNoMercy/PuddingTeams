@@ -52,7 +52,8 @@ test("实际Manager SDK只委派知识管家；Worker整理引用原话与图片
 		await writeFile(path.join(root, ".pi", "skills", "record", "SKILL.md"), "---\nname: record\ndescription: fixture记录技能\n---\n可信技能展开文本：整理前核对用户资料。\n");
 		await mkdir(path.join(root, ".pi", "prompts"), { recursive: true });
 		await writeFile(path.join(root, ".pi", "prompts", "record.md"), "---\ndescription: fixture记录模板\n---\n\n可信模板展开文本：$ARGUMENTS\n");
-		const image = { name: "camera", mediaType: "image/png", base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aV1sAAAAASUVORK5CYII=", size: 68, path: "/untrusted/never/read" };
+		// pi 1.x 用 photon 规范化 prompt 图片，旧 1x1 fixture 无法被其解码（会被省略并改写 user 文本）；换成可解码的 8x8 PNG。
+		const image = { name: "camera", mediaType: "image/png", base64: "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAFWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC", size: 75, path: "/untrusted/never/read" };
 		for (const { revoke, expand, template } of [{ revoke: false, expand: false, template: false }, { revoke: true, expand: false, template: false }, { revoke: false, expand: true, template: false }, { revoke: false, expand: false, template: true }]) {
 			const userInput = expand ? `/skill:record ${original}` : template ? `/record ${original}` : original;
 			const service = new KnowledgeRuntimeService(deps); let revoked = false;
