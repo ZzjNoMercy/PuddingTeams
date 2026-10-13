@@ -253,6 +253,45 @@ test("执行 session 直接输入：空闲直投、用户卡落容器、结果�
 	}
 });
 
+test("接单落账即出队：执行期间队列项不得再显示为排队中", async () => {
+	const stack = await makeStack();
+	try {
+		const direct = await makeDirectWindow(stack.app);
+		const handle = await makeWorkerSessionWithLedger(stack, direct.id, direct.activeSession);
+
+		const res = await stack.app.inject({
+			method: "POST",
+			url: `/api/sessions/${handle}/messages`,
+			headers: { "idempotency-key": "op-inflight-1" },
+			payload: { content: "这条已经在执行了" },
+		});
+		assert.equal(res.statusCode, 200, res.body);
+		const call = await stack.fake.waitForCall(1);
+		// 运行尚未结束（driver 闸门未放行），但队列项必须在接单落账时就移除——
+		// 否则 web 轮询会在整个执行期间把它渲染成「排队中，将在当前任务结束后发送」。
+		const listed = await stack.app.inject({ method: "GET", url: `/api/rooms/${direct.id}/input-queue` });
+		assert.equal(listed.statusCode, 200, listed.body);
+		assert.deepEqual(listed.json().items, [], "执行中的输入不得再列为排队项");
+		assert.equal(stack.queueStore.list().length, 0, "接单落账后队列项应立即移除");
+
+		call.release("执行完毕");
+		const deadline = Date.now() + 5000;
+		for (;;) {
+			const cards = await containerCards(stack, direct.activeSession);
+			const result = cards.find((card) => card.customType === "pudding:task_result" && card.details?.operationId === "op-inflight-1");
+			if (result) {
+				assert.equal(result.content, "执行完毕");
+				break;
+			}
+			if (Date.now() > deadline) assert.fail("结果卡未在等待期内落盘");
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+	} finally {
+		await stack.sessions.disposeAll();
+		await stack.app.close();
+	}
+});
+
 test("忙碌入队 202 → settle 后 FIFO 自动派发，后到委派依旧 conflict", async () => {
 	const stack = await makeStack();
 	try {

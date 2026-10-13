@@ -564,9 +564,9 @@ function SessionChat({
 							) : (
 								groupForRender(messages).map((item) =>
 									"kind" in item ? (
-										<AssistantGroup key={item.id} roomId={roomId} messages={item.messages} windowType={windowType} onOpenWindow={onOpenWindow} />
+										<AssistantGroup key={item.id} roomId={roomId} sessionId={sessionId} messages={item.messages} windowType={windowType} onOpenWindow={onOpenWindow} />
 									) : (
-										<Message key={item.id} roomId={roomId} message={item} windowType={windowType} onOpenWindow={onOpenWindow} resolvedTaskIds={resolvedTaskIds} />
+										<Message key={item.id} roomId={roomId} sessionId={sessionId} message={item} windowType={windowType} onOpenWindow={onOpenWindow} resolvedTaskIds={resolvedTaskIds} />
 									),
 								)
 							)}

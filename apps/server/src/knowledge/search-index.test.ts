@@ -112,3 +112,16 @@ test("反链表：wiki 与 md 链接双向解析", async () => {
 	assert.match(md?.snippet ?? "", /目标/);
 	assert.deepEqual(built.backlinks.get("ghost"), undefined);
 });
+
+test("反链去重：同一源笔记多次提及同一目标只计一条", async () => {
+	const { acceptance, objects, index } = await fixture("backlinks-dedupe");
+	const ledger = await acceptNotes(acceptance, objects, "b1", {
+		"target.md": "---\ntitle: 目标页\n---\n正文\n",
+		"src.md": "关系行 [[target]]\n\n正文再次提到 [[target|别名]]，还有 [md 链接](target.md)。\n",
+	}, 0);
+	const built = await index.load("b1", ledger);
+	const backlinks = built.backlinks.get("target.md") ?? [];
+	assert.equal(backlinks.length, 1, "同一源笔记的多次提及只产生一条反链");
+	assert.equal(backlinks[0]!.sourcePath, "src.md");
+	assert.match(backlinks[0]!.snippet, /关系行/, "保留首次提及的 snippet");
+});

@@ -4,6 +4,7 @@ import { chmod, mkdtemp, mkdir, realpath, stat, writeFile } from "node:fs/promis
 import { tmpdir, homedir } from "node:os";
 import path from "node:path";
 import { KnowledgeProbeError, KnowledgeProbeStore } from "./probes.js";
+import { fileEntityIdentity } from "./probe.js";
 
 const owner = "owner-1";
 
@@ -45,7 +46,7 @@ test("managed-wiki 标记与四根：contentRoot/linkRoot 指向 wiki/", async (
 	assert.equal(record.canonicalBindingRoot, canonical);
 	assert.equal(record.contentRoot, path.join(canonical, "wiki"));
 	assert.equal(record.linkRoot, path.join(canonical, "wiki"));
-	assert.match(record.rootIdentity!, /^\d+:\d+$/);
+	assert.equal(record.rootIdentity!, fileEntityIdentity(await stat(canonical)));
 	assert.equal(record.capabilities.structuredPrepare, false);
 	assert.equal(record.capabilities.publish, false);
 	// TTL 内可取回同一条记录

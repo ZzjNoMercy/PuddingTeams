@@ -149,8 +149,11 @@ export class KnowledgeSearchIndex {
 		}
 		const backlinks = new Map<string, KnowledgeBacklink[]>();
 		for (const note of notes.values()) {
+			// 同一源笔记对同一目标的多次提及只计一条反链（保留首次出现的 snippet）。
+			const seenTargets = new Set<string>();
 			for (const link of note.outLinks) {
-				if (!link.resolvedPath) continue;
+				if (!link.resolvedPath || seenTargets.has(link.resolvedPath)) continue;
+				seenTargets.add(link.resolvedPath);
 				const list = backlinks.get(link.resolvedPath) ?? [];
 				list.push({ sourcePath: note.path, sourceTitle: note.title, kind: link.kind, snippet: link.context });
 				backlinks.set(link.resolvedPath, list);

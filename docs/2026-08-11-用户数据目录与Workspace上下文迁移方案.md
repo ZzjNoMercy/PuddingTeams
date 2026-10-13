@@ -184,6 +184,8 @@ PUDDINGTEAMS_HOME/
 >
 > Teams 2.0 M2 增量（2026-09-29）：知识域持久化已落地。`state/knowledge/bindings.json` 为绑定登记（含四根映射与 rootIdentity）；`state/knowledge/acceptance/<bindingId>.json` 为采纳账本（固定版本清单，删除/离线/撤权后仍保留供审计）；`state/knowledge/plans/<planId>.json` 为接入计划（probe 结论、拟创建文件字节与 hash，apply 逐项回执）；`state/knowledge/selections.json` 为按 owner + 工作上下文隔离的读取选择，首页通过 `GET/PUT /api/knowledge-selection` 读取与 revision 门禁更新。`knowledge/objects/<sha256前2位>/<sha256>.md` 为采纳版本的内容寻址快照，`cache/knowledge/<bindingId>-index.json` 为可重建检索/反链索引——索引只允许从采纳账本 + 快照重建，缓存失配即重建，绝不把磁盘当前版本重新全量批准。绑定与账本文件均为同卷临时文件 + 原子 rename、0600 权限。编译候选、审核与发布账本（M3+）尚未交付。
 >
+> rootIdentity 语义修正（2026-10-13）：绑定根与磁盘条目的实体身份为 `inode:birthtime`（`fileEntityIdentity`，apps/server/src/knowledge/probe.ts），不再含 st_dev——st_dev 是挂载时分配值，macOS 重启/系统更新后漂移，曾导致未变动的知识库被误判「离线」。inode+birthtime 跨重启稳定，且目录删除重建必然变化，仍满足「同路径换实体必须重新核对」的护栏语义。
+>
 > Teams 2.0 M3/M4 增量（2026-09-28）：审核与发布账本落地。`state/knowledge/reviews/reviews.sqlite` 为人工审核账本（`review_batches` 批次快照 + 状态机 + 24h 审核窗；`review_decisions` 以 operationId 为幂等键的审核决定）；`state/knowledge/operations/operations.sqlite` 为发布操作日志（PublishOperation + 逐文件 {path, operation, candidateHash, baselineHash, beforeImageRef, receipts, 结果态}，idempotencyKey=审核决定 id 防双写）；`state/knowledge/operations/<operationId>/before/<targetPath>` 为 update 写入前的磁盘 before-image（对账回滚的唯一恢复源，0600）。两者均为内置 SQLite（WAL 不启用，`BEGIN IMMEDIATE` + `busy_timeout=5000`），事务为权威边界；compile cache 目录视为可重建，审核/发布只读这两本账。
 
 ## 5. 统一路径契约

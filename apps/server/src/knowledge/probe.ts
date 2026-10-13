@@ -1,6 +1,17 @@
 import { access, lstat, realpath, stat } from "node:fs/promises";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, type Stats } from "node:fs";
 import path from "node:path";
+
+/**
+ * 文件实体身份：inode + 创建时间。回答「这是不是当初那个实体」，必须在
+ * 卷重新挂载、系统重启后保持稳定——st_dev 在 macOS 上是挂载时分配的，
+ * 重启/系统更新后会漂移，不能参与持久身份。APFS 的 inode 单调分配且跨
+ * 重启稳定；birthtime 在实体生命周期内不变，删除重建必然不同，也覆盖
+ * 会回收 inode 的文件系统（如 ext4）。
+ */
+export function fileEntityIdentity(info: Stats): string {
+	return `${info.ino}:${Math.round(info.birthtimeMs)}`;
+}
 
 export interface KnowledgeRootProbe {
 	canonicalRoot: string;
@@ -19,7 +30,7 @@ export async function probeKnowledgeRoot(rootPath: string): Promise<KnowledgeRoo
 	const canonicalRoot = await realpath(rootPath);
 	const rootStat = await stat(canonicalRoot);
 	if (!rootStat.isDirectory()) throw new Error("knowledge root is not a directory");
-	const rootIdentity = `${rootStat.dev}:${rootStat.ino}`;
+	const rootIdentity = fileEntityIdentity(rootStat);
 	const rootReadable = await access(canonicalRoot, fsConstants.R_OK | fsConstants.X_OK).then(() => true, () => false);
 	const entries = {
 		wiki: ["wiki", "directory"], raw: ["raw", "directory"],

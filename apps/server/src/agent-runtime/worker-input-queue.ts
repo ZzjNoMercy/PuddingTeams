@@ -311,7 +311,13 @@ export class WorkerInputDispatcher {
 				sessionHandle,
 				sessionQueueToken: token,
 				runtimeModel,
-				onDelegationCreated: () => onAdmitted?.(),
+				onDelegationCreated: () => {
+					// 接单落账后排队项使命完成：此后崩溃恢复由 delegation 台账幂等兜底
+					//（本函数开头的 existing 检查）。若等执行结束才移除，web 轮询会在
+					// 整个执行期间把这条消息显示为「排队中」，而它其实就是当前任务。
+					void this.deps.queue.remove(itemId).catch(() => undefined);
+					onAdmitted?.();
+				},
 			});
 			await this.deps.queue.remove(item.id);
 			if (result.status === "needs_input") return; // 审批卡已由 invoker 写进容器 session
@@ -338,16 +344,18 @@ export class WorkerInputDispatcher {
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			const failed = await this.deps.queue.markFailed(itemId, message);
-			if (failed) {
-				const window = await this.deps.teams.getWindow(failed.windowId).catch(() => undefined);
+			// 接单落账后队列项已移除，markFailed 落空；此处的失败仍要对用户可见。
+			const failedItem = failed ?? item;
+			if (failedItem) {
+				const window = await this.deps.teams.getWindow(failedItem.windowId).catch(() => undefined);
 				if (window) {
 					await this.deps.sessions.appendCustomMessageIfAbsent(
 						window.activeSession,
-						`worker-input-result:${failed.operationId}`,
+						`worker-input-result:${failedItem.operationId}`,
 						{
 							customType: "pudding:task_result",
 							content: `执行会话输入派发失败：${message}`,
-							details: { operationId: failed.operationId, targetSessionHandle: sessionHandle, windowId: failed.windowId, status: "failed" },
+							details: { operationId: failedItem.operationId, targetSessionHandle: sessionHandle, windowId: failedItem.windowId, status: "failed" },
 						},
 						{ triggerTurn: false },
 					).catch(() => undefined);

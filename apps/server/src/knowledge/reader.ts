@@ -2,6 +2,7 @@ import { constants as fsConstants } from "node:fs";
 import { lstat, open, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import type { KnowledgeBinding } from "./contracts.js";
+import { fileEntityIdentity } from "./probe.js";
 
 const MAX_TREE_ITEMS = 10_000;
 const MAX_DEPTH = 32;
@@ -34,7 +35,7 @@ async function checkedRoot(binding: KnowledgeBinding): Promise<string> {
 		stat(binding.canonicalBindingRoot).catch(() => null),
 	]);
 	if (actual !== root || !info?.isDirectory() || !bindingInfo ||
-		`${bindingInfo.dev}:${bindingInfo.ino}` !== binding.rootIdentity ||
+		fileEntityIdentity(bindingInfo) !== binding.rootIdentity ||
 		!within(binding.canonicalBindingRoot, root)) {
 		throw new KnowledgeReadError("root_changed", "知识库目录已变化，请重新核对绑定");
 	}

@@ -6,6 +6,7 @@ import type { KnowledgeBindingRegistry } from "./bindings.js";
 import { hashBufferSha256, MAX_HASH_BYTES } from "./hashing.js";
 import { parseNoteFrontmatter, parseNoteFrontmatterFields, type KnowledgeAcceptanceStore } from "./acceptance.js";
 import { KnowledgeReadError } from "./reader.js";
+import { fileEntityIdentity } from "./probe.js";
 import { isControlDocument } from "./note-paths.js";
 import type { KnowledgeObjectStore } from "./objects.js";
 import type { PublishJournal } from "./wiki/publish-journal.js";
@@ -53,7 +54,7 @@ export async function checkedKnowledgeRoot(binding: KnowledgeBinding): Promise<s
 		stat(binding.canonicalBindingRoot).catch(() => null),
 	]);
 	if (actual !== root || !info?.isDirectory() || !bindingInfo ||
-		`${bindingInfo.dev}:${bindingInfo.ino}` !== binding.rootIdentity ||
+		fileEntityIdentity(bindingInfo) !== binding.rootIdentity ||
 		!withinKnowledgeRoot(binding.canonicalBindingRoot, root)) {
 		throw new KnowledgeReadError("root_changed", "知识库目录已变化，请重新核对绑定");
 	}
@@ -168,7 +169,7 @@ export class KnowledgeObservationService {
 					await resolveNoteAbsolutePath(binding, file.relative);
 					const frontmatter = parseNoteFrontmatter(bytes.toString("utf8"));
 					disk.set(file.relative, { bytes, hash: hashBufferSha256(bytes), size: bytes.length,
-						diskIdentity: `${after.dev}:${after.ino}`, ...(frontmatter.id ? { declaredId: frontmatter.id } : {}), ...(frontmatter.title ? { title: frontmatter.title } : {}) });
+						diskIdentity: fileEntityIdentity(after), ...(frontmatter.id ? { declaredId: frontmatter.id } : {}), ...(frontmatter.title ? { title: frontmatter.title } : {}) });
 				} catch { unreadable.push(file.relative); }
 			}
 			const pathsById = new Map<string, string[]>();

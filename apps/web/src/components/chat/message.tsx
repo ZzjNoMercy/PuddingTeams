@@ -3,6 +3,7 @@
 import { KnowledgeJobCard } from "./knowledge-job-card";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { createContext, type ComponentProps, type ReactNode, useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { CheckIcon, ChevronDownIcon, ChevronRightIcon, CircleAlertIcon, CopyIcon, ExternalLinkIcon, FilePenIcon, FileSearchIcon, FileTextIcon, FolderIcon, ListTreeIcon, RotateCcwIcon, SquareIcon, SquareTerminalIcon, UserPlusIcon, UsersIcon, WrenchIcon } from "lucide-react";
 import { useStickToBottomContext } from "use-stick-to-bottom";
@@ -25,7 +26,7 @@ import { delegateWorker, groupConsecutiveModelErrors, isDelegateCall } from "@/l
 import { useAgentLabel } from "@/lib/avatars";
 import { formatTokens } from "@/lib/session-stats";
 import { toolSummary } from "@/lib/tool-summary";
-import { cancelDelegation, openRoomFile } from "@/lib/api";
+import { cancelDelegation, getKnowledgeSelection, listKnowledgeBindings, openRoomFile, readKnowledgeNote, type KnowledgeBindingSummary } from "@/lib/api";
 import type { ChatMessage, ToolCallView, WindowType } from "@/lib/types";
 import { toast } from "sonner";
 import { ManagerAvatar, WorkerAvatar } from "./worker-avatar";
@@ -53,7 +54,7 @@ function toolCallIcon(name: string) {
 	return undefined;
 }
 
-const RoomFileContext = createContext<string | undefined>(undefined);
+const RoomFileContext = createContext<{ roomId: string; sessionId?: string } | undefined>(undefined);
 
 type QuickActionDraft = (content: string) => void;
 const QuickActionDraftContext = createContext<QuickActionDraft | undefined>(undefined);
@@ -208,7 +209,44 @@ function localPathFromInlineCode(value: string): string | undefined {
 	return explicitLocalPath || fileLikePath ? localPath : undefined;
 }
 
-async function openLocalPath(roomId: string, localPath: string) {
+const knowledgeVaultCache = new Map<string, Promise<KnowledgeBindingSummary[]>>();
+
+/** 会话挂载的可用知识库（选择集 ∩ available），按会话缓存。 */
+function sessionKnowledgeVaults(sessionId: string): Promise<KnowledgeBindingSummary[]> {
+	let cached = knowledgeVaultCache.get(sessionId);
+	if (!cached) {
+		cached = Promise.all([listKnowledgeBindings(), getKnowledgeSelection(`session:${sessionId}`)])
+			.then(([bindings, selection]) => {
+				const selected = new Set(selection.selectedBindingIds);
+				return bindings.filter((binding) => binding.availability === "available" && selected.has(binding.id));
+			})
+			.catch(() => [] as KnowledgeBindingSummary[]);
+		knowledgeVaultCache.set(sessionId, cached);
+	}
+	return cached;
+}
+
+/** 聊天里的相对 .md 路径若命中会话挂载的知识库笔记，返回站内查看链接。 */
+async function knowledgeNoteHref(sessionId: string | undefined, localPath: string): Promise<string | undefined> {
+	if (!sessionId || !/\.md$/i.test(localPath)) return undefined;
+	if (/^(?:[a-z]:[\\/]|[\\/])/i.test(localPath)) return undefined;
+	for (const vault of await sessionKnowledgeVaults(sessionId)) {
+		try {
+			await readKnowledgeNote(vault.id, localPath);
+			return `/knowledge?vault=${encodeURIComponent(vault.id)}&note=${encodeURIComponent(localPath)}`;
+		} catch { /* 不在这个库，继续试下一个 */ }
+	}
+	return undefined;
+}
+
+async function openLocalPath(roomId: string, localPath: string, sessionId?: string, navigate?: (href: string) => void) {
+	// 知识库笔记优先：worker 引用的 wiki 相对路径按会话挂载库解析，命中走站内查看，
+	// 否则回落到房间工作区文件（open-file 按 cwd 解析）。
+	const noteHref = await knowledgeNoteHref(sessionId, localPath).catch(() => undefined);
+	if (noteHref && navigate) {
+		navigate(noteHref);
+		return;
+	}
 	try {
 		await openRoomFile(roomId, localPath);
 	} catch (error) {
@@ -218,7 +256,8 @@ async function openLocalPath(roomId: string, localPath: string) {
 
 function ChatMarkdownLink({ href = "", children, node, ...props }: ComponentProps<"a"> & { node?: unknown }) {
 	void node;
-	const roomId = useContext(RoomFileContext);
+	const router = useRouter();
+	const fileContext = useContext(RoomFileContext);
 	const appRoute = appRouteFromHref(href);
 	if (appRoute) {
 		return (
@@ -228,13 +267,13 @@ function ChatMarkdownLink({ href = "", children, node, ...props }: ComponentProp
 		);
 	}
 	const localPath = localPathFromHref(href);
-	if (localPath && roomId) {
+	if (localPath && fileContext) {
 		return (
 			<button
 				type="button"
 				className="home-local-file-link"
 				title={`打开本地文件：${localPath}`}
-				onClick={() => void openLocalPath(roomId, localPath)}
+				onClick={() => void openLocalPath(fileContext.roomId, localPath, fileContext.sessionId, router.push)}
 			>
 				{children}
 			</button>
@@ -245,7 +284,8 @@ function ChatMarkdownLink({ href = "", children, node, ...props }: ComponentProp
 
 function ChatInlineCode({ children, node, ...props }: ComponentProps<"code"> & { node?: unknown }) {
 	void node;
-	const roomId = useContext(RoomFileContext);
+	const router = useRouter();
+	const fileContext = useContext(RoomFileContext);
 	const text = typeof children === "string" ? children : undefined;
 	const appRoute = text ? appRouteFromHref(text) : undefined;
 	if (appRoute) {
@@ -256,13 +296,13 @@ function ChatInlineCode({ children, node, ...props }: ComponentProps<"code"> & {
 		);
 	}
 	const localPath = text ? localPathFromInlineCode(text) : undefined;
-	if (localPath && roomId) {
+	if (localPath && fileContext) {
 		return (
 			<button
 				type="button"
 				className="home-local-path-code"
 				title={`用系统默认应用打开：${localPath}`}
-				onClick={() => void openLocalPath(roomId, localPath)}
+				onClick={() => void openLocalPath(fileContext.roomId, localPath, fileContext.sessionId, router.push)}
 			>
 				<code {...props}>{children}</code>
 			</button>
@@ -1193,8 +1233,9 @@ function MessageBody({
 	);
 }
 
-export function Message({ roomId, ...props }: {
+export function Message({ roomId, sessionId, ...props }: {
 	roomId: string;
+	sessionId?: string;
 	message: ChatMessage;
 	windowType?: WindowType;
 	onOpenWindow?: (windowId: string) => void;
@@ -1202,7 +1243,7 @@ export function Message({ roomId, ...props }: {
 	assistantAs?: string;
 }) {
 	return (
-		<RoomFileContext.Provider value={roomId}>
+		<RoomFileContext.Provider value={{ roomId, sessionId }}>
 			<MessageBody {...props} />
 		</RoomFileContext.Provider>
 	);
@@ -1442,15 +1483,16 @@ function AssistantGroupBody({
 }
 
 /** groupForRender 分组的 assistant 段集合，渲染入口与 Message 对齐（RoomFileContext）。 */
-export function AssistantGroup({ roomId, ...props }: {
+export function AssistantGroup({ roomId, sessionId, ...props }: {
 	roomId: string;
+	sessionId?: string;
 	messages: ChatMessage[];
 	windowType?: WindowType;
 	onOpenWindow?: (windowId: string) => void;
 	assistantAs?: string;
 }) {
 	return (
-		<RoomFileContext.Provider value={roomId}>
+		<RoomFileContext.Provider value={{ roomId, sessionId }}>
 			<AssistantGroupBody {...props} />
 		</RoomFileContext.Provider>
 	);

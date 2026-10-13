@@ -7,6 +7,7 @@ import { KnowledgeBindingRegistry } from "./bindings.js";
 import { hashBufferSha256 } from "./hashing.js";
 import { applyKnowledgePlan, buildKnowledgePlan, cleanupPlannedFiles, KnowledgePlanStore, type KnowledgePlan, type ApplyReceipt } from "./plans.js";
 import { KnowledgeProbeStore, type KnowledgeProbeRecord } from "./probes.js";
+import { fileEntityIdentity } from "./probe.js";
 import { copySchemaPreset } from "./schema-presets.js";
 import { schemaPresetAgents } from "./schema-guidance.js";
 
@@ -357,7 +358,7 @@ test("createRootDir：plan→apply 端到端创建根目录与脚手架，绑定
 	const canonical = await realpath(target);
 	const info = await stat(canonical);
 	assert.equal(binding.canonicalBindingRoot, canonical);
-	assert.equal(binding.rootIdentity, `${info.dev}:${info.ino}`);
+	assert.equal(binding.rootIdentity, fileEntityIdentity(info));
 	assert.equal(binding.schemaRef?.originPresetId, "project");
 	assert.equal((await fixtureResult.registry.list(owner)).length, 1);
 });
