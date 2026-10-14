@@ -1,3 +1,4 @@
+import { delegationOwnerIds } from "./workspace-execution.js";
 import path from "node:path";
 import type { DelegationRecord } from "./delegation-store.js";
 import type { WorkspaceChangeSet, WorkspaceExecutionScope } from "./workspace-execution.js";
@@ -10,7 +11,7 @@ export function workspaceHandoffNote(
 	scope: WorkspaceExecutionScope | undefined,
 ): string {
 	if (!changeSet || !scope || changeSet.executionScopeId !== scope.id
-		|| delegation.workspaceExecutionScopeId !== scope.id || !changeSet.delegationIds.includes(delegation.id)) return "";
+		|| delegation.workspaceExecutionScopeId !== scope.id || !delegationOwnerIds(changeSet).includes(delegation.id)) return "";
 	const paths = changeSet.changedPaths.filter((name) => {
 		const parts = name.split("/");
 		return !path.isAbsolute(name) && !parts.includes("..") && !parts.includes(".")

@@ -12,7 +12,7 @@ import type { TeamsStore } from "../store/teams.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import { MessageSubmissionOperations } from "../store/message-submission-operations.js";
 import { directTaskId } from "../agent-runtime/direct-dispatch.js";
-import { registerChatRoutes } from "./chat.js";
+import { registerChatRoutes } from "./chat-test-port.js";
 
 test("ordinary pi message key replays accepted after response loss and restart without a second user", async () => {
 	const dir = mkdtempSync(path.join(tmpdir(), "pt-chat-operation-"));
@@ -25,14 +25,14 @@ test("ordinary pi message key replays accepted after response loss and restart w
 		messages: [{ role: "user" }],
 		sessionFile,
 		sessionManager: { getBranch: () => branch },
-		prompt: async (text: string, options: { preflightResult: (accepted: boolean) => void }) => {
+		prompt: async (text: string, options: { preflightResult: (accepted: "started" | "queued" | "handled") => void }) => {
 			promptCalls += 1;
 			const message = { role: "user" as const, content: [{ type: "text" as const, text }] };
 			const entry = { type: "message" as const, id: randomUUID(), message };
 			branch.push(entry);
 			for (const listener of listeners) listener({ type: "message_end", message });
 			writeFileSync(sessionFile, `${branch.map((item) => JSON.stringify(item)).join("\n")}\n`);
-			options.preflightResult(true);
+			options.preflightResult("started");
 		},
 	};
 	const store = {
@@ -76,7 +76,7 @@ test("ordinary pi message key replays accepted after response loss and restart w
 		assert.equal(branch.length, 1);
 		assert.equal((JSON.parse(readFileSync(ledgerFile, "utf8")) as { state: string }).state, "accepted");
 		const missingMarkerKey = randomUUID();
-		const requestHash = createHash("sha256").update(JSON.stringify({ content: "hello", attachments: [] })).digest("hex");
+		const requestHash = createHash("sha256").update(JSON.stringify({ content: "hello", attachments: [], delivery: "auto" })).digest("hex");
 		const contextHash = createHash("sha256").update(JSON.stringify({ windowId: null, workspaceId: null, cwdSnapshot: null })).digest("hex");
 		assert.equal(await new MessageSubmissionOperations(operationsDir).reserve(missingMarkerKey, "existing", requestHash, contextHash), "new");
 		const missing = await post(restartedApp, "hello", missingMarkerKey);
@@ -262,7 +262,7 @@ test("restart recovers a reserved direct operation only from matching JSONL card
 	const windowId = "direct-window";
 	const workspaceId = "workspace";
 	const content = "重启后核对";
-	const requestHash = createHash("sha256").update(JSON.stringify({ content, attachments: [] })).digest("hex");
+	const requestHash = createHash("sha256").update(JSON.stringify({ content, attachments: [], delivery: "auto" })).digest("hex");
 	const contextHash = createHash("sha256").update(JSON.stringify({ windowId, workspaceId, cwdSnapshot: dir })).digest("hex");
 	const acceptedKey = randomUUID();
 	const missingCardKey = randomUUID();

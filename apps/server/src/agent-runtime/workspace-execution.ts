@@ -28,12 +28,21 @@ export function requiresReadOnlyEnforcement(policy: WorkspaceExecutionPolicy): b
 		&& (policy.readOnlyRequirement ?? (policy.source === "user" ? "enforced" : "best_effort")) === "enforced";
 }
 
+export type ExecutionOwner =
+	| { kind: "delegation"; delegationId: string }
+	| { kind: "native_session"; sessionId: string; turnId: string; workItemId?: string }
+	| { kind: "verification_environment"; verificationId: string };
+
+export function delegationOwnerIds(value: { ownerRefs: ExecutionOwner[] }): string[] {
+	return value.ownerRefs.flatMap((owner) => owner.kind === "delegation" ? [owner.delegationId] : []);
+}
+
 export interface WorkspaceExecutionRequest {
 	workspacePath: string;
 	workspaceId?: string;
 	gitRoot?: string;
 	mode: WorkspaceAccessMode;
-	delegationId: string;
+	owner: ExecutionOwner;
 	goalId?: string;
 	goalEpoch?: number;
 	/** Reuse this id for a WorkItem's continue/follow-up attempts. */
@@ -48,7 +57,7 @@ export interface WorkspaceLease {
 	key: string;
 	canonicalRoot: string;
 	executionScopeId: string;
-	delegationIds: string[];
+	ownerRefs: ExecutionOwner[];
 	goalId?: string;
 	goalEpoch?: number;
 	ownerToken: string;
@@ -68,7 +77,7 @@ export interface WorkspaceExecutionScope {
 	/** The exact cwd handed to the Driver. */
 	executionCwd: string;
 	mode: WorkspaceAccessMode;
-	delegationIds: string[];
+	ownerRefs: ExecutionOwner[];
 	goalId?: string;
 	goalEpoch?: number;
 	baselineFingerprint: string;
@@ -83,7 +92,7 @@ export interface WorkspaceExecutionScope {
 export interface WorkspaceChangeSet {
 	id: string;
 	executionScopeId: string;
-	delegationIds: string[];
+	ownerRefs: ExecutionOwner[];
 	workspaceId?: string;
 	mode: WorkspaceAccessMode;
 	baselineFingerprint: string;
@@ -123,7 +132,7 @@ interface ScopeRecord extends WorkspaceExecutionScope {
 }
 
 interface StateFile {
-	version: 2;
+	version: 3;
 	scopes: Record<string, ScopeRecord>;
 	leases: Record<string, WorkspaceLease>;
 	changeSets: Record<string, WorkspaceChangeSet>;
@@ -198,6 +207,14 @@ function fileDigest(data: Buffer): string {
 }
 
 function now(): string { return new Date().toISOString(); }
+
+function rootsOverlap(left: string, right: string): boolean {
+	const contains = (root: string, target: string) => {
+		const relative = path.relative(root, target);
+		return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+	};
+	return contains(left, right) || contains(right, left);
+}
 
 // verificationId 形如 verification:<submissionId>:<toolCallId>；id 兼作磁盘目录名，需避开 Windows 保留字符。
 function verificationEnvironmentId(verificationId: string): string {
@@ -487,6 +504,8 @@ export class WorkspaceExecutionCoordinator {
 	private readonly worktreeRoot: string;
 	private leaseTimeoutMs: number;
 	private readonly clock: () => number;
+	private ownerClosed?: (owner: ExecutionOwner) => Promise<boolean>;
+	setOwnerClosedResolver(resolver: (owner: ExecutionOwner) => Promise<boolean>): void { this.ownerClosed = resolver; }
 	private readonly promotionCheckpoint?: (scope: WorkspaceExecutionScope) => Promise<void>;
 	private readonly promotionInstallCheckpoint?: (relative: string, backup: string) => Promise<void>;
 	private queue: Promise<unknown> = Promise.resolve();
@@ -518,11 +537,11 @@ export class WorkspaceExecutionCoordinator {
 	private async load(): Promise<StateFile> {
 		try {
 			const value = JSON.parse(await readFile(this.file, "utf8")) as Partial<StateFile>;
-			if (value.version !== 2) throw new Error(`workspace-execution.json 必须使用 v2：${this.file}`);
-			return { version: 2, scopes: value.scopes ?? {}, leases: value.leases ?? {}, changeSets: value.changeSets ?? {}, verificationCopies: value.verificationCopies ?? {} };
+			if (value.version !== 3) throw new Error(`workspace-execution.json 必须使用 v3：${this.file}`);
+			return { version: 3, scopes: value.scopes ?? {}, leases: value.leases ?? {}, changeSets: value.changeSets ?? {}, verificationCopies: value.verificationCopies ?? {} };
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			return { version: 2, scopes: {}, leases: {}, changeSets: {}, verificationCopies: {} };
+			return { version: 3, scopes: {}, leases: {}, changeSets: {}, verificationCopies: {} };
 		}
 	}
 
@@ -547,7 +566,12 @@ export class WorkspaceExecutionCoordinator {
 	}
 
 	async begin(input: WorkspaceExecutionRequest): Promise<WorkspaceExecutionScope> {
-		if (!input.delegationId?.trim()) throw new WorkspaceExecutionError("invalid_policy", "delegationId is required");
+		const owner = input.owner;
+		if (!owner || (owner.kind === "delegation" ? !owner.delegationId?.trim()
+			: owner.kind === "native_session" ? !owner.sessionId?.trim() || !owner.turnId?.trim()
+			: owner.kind === "verification_environment" ? !owner.verificationId?.trim() : true)) {
+			throw new WorkspaceExecutionError("invalid_policy", "a valid execution owner is required");
+		}
 		if (input.mode === "read_only_shared" && input.readOnlyEnforcement !== "strong") throw new WorkspaceExecutionError("invalid_policy", "read_only_shared requires a Driver-enforced read-only boundary");
 		return this.serialize(async () => {
 			const state = await this.load();
@@ -581,10 +605,14 @@ export class WorkspaceExecutionCoordinator {
 				if (existing.ownerToken && input.ownerToken !== existing.ownerToken) throw new WorkspaceExecutionError("lease_conflict", "execution scope owner token mismatch");
 				if (input.mode === "exclusive_write" && existing.lease && existing.lease.state !== "active") throw new WorkspaceExecutionError("lease_fenced", "execution scope lease is fenced or released");
 				if (input.mode === "exclusive_write" && existing.lease && new Date(existing.lease.expiresAt).getTime() <= this.clock()) throw new WorkspaceExecutionError("lease_fenced", "expired lease must be reconciled before scope reuse");
-				if (!existing.delegationIds.includes(input.delegationId)) existing.delegationIds.push(input.delegationId);
+				if (existing.ownerRefs.some((ref) => ref.kind !== owner.kind
+					|| ref.kind === "native_session" && owner.kind === "native_session" && (ref.sessionId !== owner.sessionId || ref.workItemId !== owner.workItemId))) {
+					throw new WorkspaceExecutionError("scope_conflict", "execution owner kind/session binding is immutable");
+				}
+				if (!existing.ownerRefs.some((ref) => stable(ref) === stable(owner))) existing.ownerRefs.push(structuredClone(owner));
 				existing.updatedAt = now();
 				if (existing.lease) {
-					existing.lease.delegationIds = [...existing.delegationIds];
+					existing.lease.ownerRefs = structuredClone(existing.ownerRefs);
 						existing.lease.expiresAt = new Date(this.clock() + this.leaseTimeoutMs).toISOString();
 					existing.lease.updatedAt = existing.updatedAt;
 						if (existing.leaseKey) state.leases[existing.leaseKey] = existing.lease;
@@ -592,8 +620,18 @@ export class WorkspaceExecutionCoordinator {
 				await this.write(state);
 				return structuredClone(existing);
 			}
-			if (input.mode === "exclusive_write") {
-				const occupied = Object.values(state.leases).find((lease) => lease.state !== "released" && (lease.key === key || lease.canonicalRoot === canonicalRoot));
+			if (input.mode !== "read_only_shared") {
+				let occupied = Object.values(state.leases).find((lease) => lease.state !== "released" && (lease.key === key || rootsOverlap(lease.canonicalRoot, canonicalRoot)));
+				if (occupied?.state === "active" && this.ownerClosed && state.scopes[occupied.executionScopeId]?.state === "active"
+					&& occupied.ownerRefs.length && (await Promise.all(occupied.ownerRefs.map(this.ownerClosed))).every(Boolean)) {
+					// Terminal observations plus durable WorkItem closure, never age alone.
+					occupied.state = "released"; occupied.updatedAt = now();
+					const previous = state.scopes[occupied.executionScopeId]!;
+					previous.state = "released"; previous.updatedAt = now();
+					if (previous.lease) previous.lease = structuredClone(occupied);
+					await this.write(state);
+					occupied = undefined;
+				}
 				if (occupied) {
 					if (occupied.state === "fenced") throw new WorkspaceExecutionError("lease_fenced", `workspace lease is fenced: ${canonicalRoot}`);
 					if (new Date(occupied.expiresAt).getTime() <= this.clock()) {
@@ -629,7 +667,7 @@ export class WorkspaceExecutionCoordinator {
 				executionRoot,
 				executionCwd,
 				mode: input.mode,
-				delegationIds: [input.delegationId],
+				ownerRefs: [structuredClone(owner)],
 				...(input.goalId ? { goalId: input.goalId } : {}),
 				...(input.goalEpoch === undefined ? {} : { goalEpoch: input.goalEpoch }),
 				baselineFingerprint,
@@ -647,7 +685,7 @@ export class WorkspaceExecutionCoordinator {
 					key,
 					canonicalRoot,
 					executionScopeId: id,
-					delegationIds: [input.delegationId],
+					ownerRefs: [structuredClone(owner)],
 					...(input.goalId ? { goalId: input.goalId } : {}),
 					...(input.goalEpoch === undefined ? {} : { goalEpoch: input.goalEpoch }),
 					ownerToken,
@@ -667,6 +705,15 @@ export class WorkspaceExecutionCoordinator {
 		});
 	}
 
+	async listScopes(): Promise<WorkspaceExecutionScope[]> {
+		return Object.values((await this.load()).scopes).map((scope) => structuredClone(scope));
+	}
+
+	async assertLeaseActive(scopeId: string, ownerToken: string): Promise<void> {
+		const scope = (await this.load()).scopes[scopeId];
+		if (!scope || scope.state !== "active" || scope.ownerToken !== ownerToken || scope.lease && (scope.lease.state !== "active" || new Date(scope.lease.expiresAt).getTime() <= this.clock())) throw new WorkspaceExecutionError("lease_fenced", "native tool lease is inactive or expired; reconcile before writing");
+	}
+
 	async get(scopeId: string): Promise<WorkspaceExecutionScope | undefined> {
 		const state = await this.load();
 		const scope = state.scopes[scopeId];
@@ -678,7 +725,7 @@ export class WorkspaceExecutionCoordinator {
 		const key = this.leaseKey(workspaceId, canonicalRoot);
 		const state = await this.load();
 		const lease = Object.values(state.leases).find((candidate) =>
-			candidate.state !== "released" && (candidate.key === key || candidate.canonicalRoot === canonicalRoot)
+			candidate.state !== "released" && (candidate.key === key || rootsOverlap(candidate.canonicalRoot, canonicalRoot))
 		);
 		const scope = lease ? state.scopes[lease.executionScopeId] : undefined;
 		return scope ? structuredClone(scope) : undefined;
@@ -710,7 +757,7 @@ export class WorkspaceExecutionCoordinator {
 		return this.serialize(async () => {
 			const state = await this.load();
 			const scope = state.scopes[scopeId];
-			if (!scope || scope.state === "released") throw new WorkspaceExecutionError("scope_not_found", `execution scope not found: ${scopeId}`);
+			if (!scope || scope.state === "fenced" || scope.state === "released" && !scope.ownerRefs.every((owner) => owner.kind === "native_session")) throw new WorkspaceExecutionError("scope_not_found", `execution scope not found: ${scopeId}`);
 			if (scope.ownerToken && ownerToken !== scope.ownerToken) throw new WorkspaceExecutionError("lease_conflict", "execution scope owner token mismatch");
 			const id = verificationEnvironmentId(verificationId);
 			const existing = state.verificationCopies[id];
@@ -718,6 +765,11 @@ export class WorkspaceExecutionCoordinator {
 			const root = path.join(this.worktreeRoot, id);
 			await rm(root, { recursive: true, force: true });
 			const current = await this.currentEntries(scope);
+			if (scope.ownerRefs.every((owner) => owner.kind === "native_session")) {
+				const last = state.changeSets[scope.latestChangeSetId ?? ""];
+				if (!last || last.outputFingerprint !== current.fingerprint) throw new WorkspaceExecutionError("baseline_changed", "NativeExecution output changed before verification");
+				if (Object.values(state.leases).some((lease) => lease.canonicalRoot === scope.canonicalRoot && lease.executionScopeId !== scope.id && lease.state !== "released")) throw new WorkspaceExecutionError("lease_conflict", "another writer owns verification input");
+			}
 			let executionCwd = root;
 			let kind: VerificationEnvironmentCopy["kind"] = "filesystem_copy";
 			if (scope.mode === "isolated_worktree") {
@@ -754,7 +806,7 @@ export class WorkspaceExecutionCoordinator {
 			workspacePath: canonical,
 			workspaceId: input.workspaceId,
 			mode: gitRepository ? "isolated_worktree" : "exclusive_write",
-			delegationId: `verification-source:${input.verificationId}`,
+			owner: { kind: "verification_environment", verificationId: input.verificationId },
 			goalId: input.goalId,
 			goalEpoch: input.goalEpoch,
 			readOnlyEnforcement: "none",
@@ -830,7 +882,7 @@ export class WorkspaceExecutionCoordinator {
 		return { inputFingerprint: copy.inputFingerprint, outputFingerprint, changedPaths: changedPaths(before, after) };
 	}
 
-	async capture(scopeId: string, ownerToken?: string, options: { readOnlyExpected?: boolean } = {}): Promise<WorkspaceChangeSet> {
+	async capture(scopeId: string, ownerToken?: string, options: { readOnlyExpected?: boolean; readOnlyBaselineFingerprint?: string } = {}): Promise<WorkspaceChangeSet> {
 		return this.serialize(async () => {
 			const state = await this.load();
 			const scope = state.scopes[scopeId];
@@ -839,12 +891,12 @@ export class WorkspaceExecutionCoordinator {
 			const current = await this.currentEntries(scope);
 			const paths = changedPaths(scope.baselineEntries, current.entries);
 			const changeSet: WorkspaceChangeSet = {
-				id: randomUUID(), executionScopeId: scope.id, delegationIds: [...scope.delegationIds],
+				id: randomUUID(), executionScopeId: scope.id, ownerRefs: structuredClone(scope.ownerRefs),
 				...(scope.workspaceId ? { workspaceId: scope.workspaceId } : {}), mode: scope.mode,
 				baselineFingerprint: scope.baselineFingerprint, outputFingerprint: current.fingerprint,
 				changedPaths: paths,
 				promotionState: scope.mode === "isolated_worktree" ? "pending" : "not_required",
-				createdAt: now(), integrity: (scope.mode === "read_only_shared" || options.readOnlyExpected) && paths.length ? "violation" : "clean",
+				createdAt: now(), integrity: (scope.mode === "read_only_shared" && paths.length || options.readOnlyExpected && (options.readOnlyBaselineFingerprint ? current.fingerprint !== options.readOnlyBaselineFingerprint : paths.length > 0)) ? "violation" : "clean",
 			};
 			state.changeSets[changeSet.id] = changeSet;
 			scope.latestChangeSetId = changeSet.id;
@@ -861,6 +913,9 @@ export class WorkspaceExecutionCoordinator {
 			if (!scope || scope.state === "released") throw new WorkspaceExecutionError("scope_not_found", `execution scope not found: ${scopeId}`);
 			if (scope.ownerToken && ownerToken !== scope.ownerToken) throw new WorkspaceExecutionError("lease_conflict", "execution scope owner token mismatch");
 			if (scope.mode !== "isolated_worktree") throw new WorkspaceExecutionError("invalid_policy", "only isolated_worktree scopes can be promoted");
+			if (Object.values(state.leases).some((lease) => lease.state !== "released" && rootsOverlap(lease.canonicalRoot, scope.canonicalRoot))) {
+				throw new WorkspaceExecutionError("lease_conflict", "target Workspace has an active or fenced writer; cannot promote");
+			}
 			const promotionLockDir = path.join(this.stateDir, "promotion-locks");
 			await mkdir(promotionLockDir, { recursive: true });
 			const promotionLockPath = path.join(promotionLockDir, `${createHash("sha256").update(scope.canonicalRoot).digest("hex")}.lock`);

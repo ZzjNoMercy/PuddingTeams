@@ -65,6 +65,12 @@ export class RoomSourceChangedError extends Error {
 	}
 }
 
+/** A group narrows delegation, independently of the Manager's own tools/MCP. */
+export function eligibleWorkers(agents: AgentConfig[], context?: { type: WindowType; members: string[] }): AgentConfig[] {
+	return agents.filter((agent) => agent.enabled !== false && !agent.pinned && agent.invoke?.type !== "pi"
+		&& (!context || context.type === "solo" || context.members.includes(agent.name)));
+}
+
 export interface CommandInvoke {
 	type: "command";
 	/** Executable name/path spawned for every worker call. */
@@ -84,7 +90,7 @@ export type AgentInvoke = CommandInvoke | PiInvoke;
 
 /** Pi manager 的可编辑配置（§10.5，挂在 pinned 条目上）。 */
 export interface PiManagerSettings {
-	/** Manager 独立搜索策略；默认 off。relay 窗口始终关闭。 */
+	/** Manager solo/group 搜索策略；默认 builtin。direct relay 暂时关闭。 */
 	codeSearch?: ManagerCodeSearchProvider;
 	/** 默认模型（"provider/modelId"）；新建会话时应用。 */
 	model?: string;
@@ -360,100 +366,23 @@ function contextContainingSession(
 	return undefined;
 }
 
+export interface WindowSessionRef {
+ sessionId: string; ownerAgentId: string; sourceSnapshotId?: string; createdAt: string;
+ provider?: { driverId: string; agentRevision: number; providerSessionHandle?: string };
+}
+
 interface WindowsFile {
+ sessionRefs: Record<string, WindowSessionRef>;
 	version: number;
 	windows: Record<string, WindowConfig>;
 	/** A deleted Room must not release its old creation key for replay. */
 	retiredCreationOperations?: Record<string, string>;
 }
 
-const WINDOWS_FILE_VERSION = 2;
+const WINDOWS_FILE_VERSION = 3;
 
 function recordValue(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function looksLikeWorkerBinding(value: Record<string, unknown>): boolean {
-	return typeof value.sessionHandle === "string"
-		|| typeof value.targetWindowId === "string"
-		|| typeof value.cwdSnapshot === "string"
-		|| typeof value.agentRevision === "number";
-}
-
-/**
- * One-shot v1 -> v2 upgrade. v1 kept worker bindings at Window scope and had
- * no parkedContexts field. Preserve every Session id and map those handles to
- * the then-active Session; v2 runtime code only consumes the normalized shape.
- */
-function upgradeWindowsFile(data: WindowsFile): boolean {
-	if (data.version > WINDOWS_FILE_VERSION) {
-		throw new Error(`windows.json version ${data.version} is newer than supported version ${WINDOWS_FILE_VERSION}`);
-	}
-	if (data.version === WINDOWS_FILE_VERSION) return false;
-	let changed = true;
-	const targetWindowFor = (owner: WindowConfig, agentId: string): string => {
-		if (owner.type !== "solo") return owner.id;
-		return Object.values(data.windows).find((candidate) =>
-			candidate.type === "direct"
-			&& candidate.members[0] === agentId
-			&& candidate.workspaceId === owner.workspaceId
-			&& candidate.cwdSnapshot === owner.cwdSnapshot,
-		)?.id ?? owner.id;
-	};
-	for (const window of Object.values(data.windows)) {
-		const rawWindow = window as WindowConfig & { parkedContexts?: unknown; workerBindings?: unknown };
-		if (!recordValue(rawWindow.parkedContexts)) {
-			rawWindow.parkedContexts = {};
-			changed = true;
-		}
-		if (rawWindow.workerBindings === undefined) continue;
-		if (!recordValue(rawWindow.workerBindings)) {
-			throw new Error(`window "${window.id ?? "unknown"}" has invalid workerBindings`);
-		}
-		const normalized: SessionWorkerBindings = {};
-		for (const [key, rawValue] of Object.entries(rawWindow.workerBindings)) {
-			if (!recordValue(rawValue)) throw new Error(`window "${window.id}" has invalid worker binding: ${key}`);
-			if (!looksLikeWorkerBinding(rawValue)) {
-				if (!window.sessions.includes(key)) {
-					throw new Error(`window "${window.id}" has worker bindings for foreign session: ${key}`);
-				}
-				const bucket: Record<string, WorkerBinding> = {};
-				for (const [agentId, rawBinding] of Object.entries(rawValue)) {
-					if (!recordValue(rawBinding) || !looksLikeWorkerBinding(rawBinding)) {
-						throw new Error(`window "${window.id}" has invalid worker binding: ${key}/${agentId}`);
-					}
-					bucket[agentId] = {
-						...(typeof rawBinding.sessionHandle === "string" ? { sessionHandle: rawBinding.sessionHandle } : {}),
-						targetWindowId: typeof rawBinding.targetWindowId === "string" && rawBinding.targetWindowId ? rawBinding.targetWindowId : targetWindowFor(window, agentId),
-						...(typeof rawBinding.workspaceId === "string" && rawBinding.workspaceId ? { workspaceId: rawBinding.workspaceId } : window.workspaceId ? { workspaceId: window.workspaceId } : {}),
-						cwdSnapshot: typeof rawBinding.cwdSnapshot === "string" && rawBinding.cwdSnapshot ? rawBinding.cwdSnapshot : window.cwdSnapshot,
-						agentRevision: typeof rawBinding.agentRevision === "number" ? rawBinding.agentRevision : 0,
-						updatedAt: typeof rawBinding.updatedAt === "string" && rawBinding.updatedAt ? rawBinding.updatedAt : window.createdAt,
-					};
-				}
-				normalized[key] = bucket;
-				continue;
-			}
-			// Legacy v1 shape: workerBindings[agentId] = WorkerBinding. That binding
-			// belonged to the active room Session at the time of the upgrade.
-			const bucket = normalized[window.activeSession] ?? {};
-			bucket[key] = {
-				...(typeof rawValue.sessionHandle === "string" ? { sessionHandle: rawValue.sessionHandle } : {}),
-				targetWindowId: typeof rawValue.targetWindowId === "string" && rawValue.targetWindowId ? rawValue.targetWindowId : targetWindowFor(window, key),
-				...(typeof rawValue.workspaceId === "string" && rawValue.workspaceId ? { workspaceId: rawValue.workspaceId } : window.workspaceId ? { workspaceId: window.workspaceId } : {}),
-				cwdSnapshot: typeof rawValue.cwdSnapshot === "string" && rawValue.cwdSnapshot ? rawValue.cwdSnapshot : window.cwdSnapshot,
-				agentRevision: typeof rawValue.agentRevision === "number" ? rawValue.agentRevision : 0,
-				updatedAt: typeof rawValue.updatedAt === "string" && rawValue.updatedAt ? rawValue.updatedAt : window.createdAt,
-			};
-			normalized[window.activeSession] = bucket;
-		}
-		if (JSON.stringify(normalized) !== JSON.stringify(rawWindow.workerBindings)) {
-			rawWindow.workerBindings = normalized;
-			changed = true;
-		}
-	}
-	data.version = WINDOWS_FILE_VERSION;
-	return changed;
 }
 
 export interface WorkerProbeResult {
@@ -715,17 +644,8 @@ export class TeamsStore {
 		await this.credentials?.removeRetiredAgentSecrets(this.retiredAgentIds);
 		// Workspace selection is optional. When present it must be a non-empty
 		// identity; absence is the intentional legacy/default-cwd chat mode.
-		const loadedWindows = await this.loadWindowsFile();
-		const windows = structuredClone(loadedWindows);
-		const upgraded = upgradeWindowsFile(windows);
-		// Validate the complete candidate before touching the source file. A bad
-		// v1 registry must remain byte-for-byte recoverable without manual rollback.
+		const windows = await this.loadWindowsFile();
 		await this.validateWindowsFile(windows);
-		if (upgraded && existsSync(this.windowsFile)) {
-			const source = await readFile(this.windowsFile);
-			await this.ensureWindowsUpgradeBackup(source);
-			await this.writeWindows(windows);
-		}
 		this.windowsPromise = Promise.resolve(windows);
 	}
 
@@ -791,6 +711,8 @@ export class TeamsStore {
 					}
 				}
 				for (const sessionId of context.sessions) {
+					const ref = windows.sessionRefs[sessionId];
+					if (!ref || ref.sessionId !== sessionId || !ref.ownerAgentId || !ref.createdAt || (window.type === "direct" ? ref.ownerAgentId !== window.members[0] : ref.ownerAgentId !== MANAGER_AGENT_NAME)) throw new Error(`invalid native session owner: ${sessionId}`);
 					const owner = sessionOwners.get(sessionId);
 					if (owner) throw new Error(`session "${sessionId}" belongs to multiple window contexts: ${owner}, ${window.id}`);
 					sessionOwners.set(sessionId, window.id);
@@ -802,37 +724,6 @@ export class TeamsStore {
 				if (duplicate) throw new Error(`duplicate direct window context: ${duplicate}, ${window.id}`);
 				directIdentities.set(identity, window.id);
 			}
-		}
-	}
-
-	private async ensureWindowsUpgradeBackup(source: Buffer): Promise<string> {
-		const base = `${this.windowsFile}.v1.bak`;
-		let target = base;
-		if (existsSync(base)) {
-			const existing = await readFile(base);
-			if (existing.equals(source)) return base;
-			const digest = createHash("sha256").update(source).digest("hex").slice(0, 16);
-			target = `${this.windowsFile}.v1.${digest}.bak`;
-			if (existsSync(target)) {
-				const sameVersion = await readFile(target);
-				if (!sameVersion.equals(source)) throw new Error(`windows.json backup hash collision: ${target}`);
-				return target;
-			}
-		}
-		const temporary = `${target}.${randomUUID().slice(0, 8)}.tmp`;
-		let handle: Awaited<ReturnType<typeof open>> | undefined;
-		try {
-			handle = await open(temporary, "wx", 0o600);
-			await handle.writeFile(source);
-			await handle.sync();
-			await handle.close();
-			handle = undefined;
-			await rename(temporary, target);
-			return target;
-		} catch (error) {
-			await handle?.close().catch(() => undefined);
-			await unlink(temporary).catch(() => undefined);
-			throw error;
 		}
 	}
 
@@ -1588,11 +1479,12 @@ export class TeamsStore {
 		try {
 			const raw = await readFile(this.windowsFile, "utf-8");
 			const parsed = JSON.parse(raw) as Partial<WindowsFile>;
-			return { version: typeof parsed.version === "number" ? parsed.version : 1, windows: parsed.windows ?? {}, retiredCreationOperations: parsed.retiredCreationOperations };
+			if (parsed.version !== WINDOWS_FILE_VERSION || !recordValue(parsed.sessionRefs)) throw new Error("windows.json requires v3 native session identities; old development data is not migrated");
+			return { version: parsed.version, windows: parsed.windows ?? {}, sessionRefs: parsed.sessionRefs, retiredCreationOperations: parsed.retiredCreationOperations };
 		} catch (err: unknown) {
 			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
 			// 决策 20：无兼容、无历史数据迁移。旧 rooms.json 直接忽略。
-			return { version: WINDOWS_FILE_VERSION, windows: {} };
+			return { version: WINDOWS_FILE_VERSION, windows: {}, sessionRefs: {} };
 		}
 	}
 
@@ -1605,6 +1497,13 @@ export class TeamsStore {
 	}
 
 	private async writeWindows(data: WindowsFile): Promise<void> {
+ const owned = new Set(Object.values(data.windows).flatMap(window => [...window.sessions,...Object.values(window.parkedContexts).flatMap(context => context.sessions)]));
+ for(const id of Object.keys(data.sessionRefs)) if(!owned.has(id)) delete data.sessionRefs[id];
+ for(const ref of Object.values(data.sessionRefs)) if(!ref.provider) {
+  const owner=await this.getAgent(ref.ownerAgentId);
+  if(owner && (owner.pinned || owner.connector?.connectorId === "pi")) ref.provider={driverId:"pi-native",agentRevision:agentRunConfigRevision(owner),providerSessionHandle:ref.sessionId};
+ }
+ await this.validateWindowsFile(data);
 		await this.writeJsonFile(this.windowsFile, data);
 		this.windowsPromise = Promise.resolve(data);
 	}
@@ -1803,6 +1702,7 @@ export class TeamsStore {
 				parkedContexts: {},
 				createdAt: new Date().toISOString(),
 			};
+			data.sessionRefs[window.activeSession] = { sessionId: window.activeSession, ownerAgentId: window.type === "direct" ? window.members[0]! : MANAGER_AGENT_NAME, createdAt: new Date().toISOString() };
 			data.windows[window.id] = window;
 			try {
 				await this.writeWindows(data);
@@ -1889,6 +1789,7 @@ export class TeamsStore {
 					if (survives.some(Boolean)) return solo;
 				}
 				const created = await createSession(solo.workspaceId, solo.cwdSnapshot);
+				data.sessionRefs[created.id] = { sessionId: created.id, ownerAgentId: MANAGER_AGENT_NAME, createdAt: new Date().toISOString() };
 				solo.sessions = [created.id];
 				solo.activeSession = created.id;
 				solo.workerBindings = {};
@@ -1908,6 +1809,7 @@ export class TeamsStore {
 				pinned: true,
 				createdAt: new Date().toISOString(),
 			};
+			data.sessionRefs[created.id] = { sessionId: created.id, ownerAgentId: MANAGER_AGENT_NAME, createdAt: new Date().toISOString() };
 			data.windows["solo"] = fresh;
 			await this.writeWindows(data);
 			return fresh;
@@ -1943,7 +1845,8 @@ export class TeamsStore {
 		createSession: (reservedId?: string) => Promise<{ id: string }>;
 		rollbackSession?: (id: string) => Promise<unknown>;
 	})): Promise<WindowConfig> {
-		const { type, members, workspaceId, cwdSnapshot, name, prompt } = opts;
+		const { type, members: requestedMembers, workspaceId, cwdSnapshot, name, prompt } = opts;
+		const members = [...new Set(requestedMembers)];
 		if (type === "solo") throw new Error("solo 窗口由系统创建，不能手动发起");
 		// §5.2：Direct 只有平台固定 relay，拒绝自定义协作提示词。
 		if (type === "direct" && prompt?.trim()) throw new Error("单聊窗口不支持自定义协作提示词（固定 relay）");
@@ -1964,7 +1867,9 @@ export class TeamsStore {
 			if (cwdSnapshot !== undefined && cwdSnapshot !== context.cwdSnapshot) {
 				throw new Error("Window cwdSnapshot does not match its context");
 			}
-			if (opts.requireEnabledMembers) await this.assertRoomMembersAvailable(members);
+			if (type === "group" && members.length < 2) throw new Error("群聊至少需要 2 个可委派 Worker");
+			if (type === "direct" && members.length !== 1) throw new Error("单聊必须有且仅有一个 Worker");
+			await this.assertRoomMembersAvailable(members);
 			const created = opts.createSession
 				? await this.createRoomSession(opts.createSession, opts.journalSession === true, opts.rollbackSession)
 				: { id: opts.sessionId! };
@@ -1983,6 +1888,7 @@ export class TeamsStore {
 				createdAt: new Date().toISOString(),
 				...(opts.creationOperation ? { creationOperationId: opts.creationOperation.key, creationRequestHash: opts.creationOperation.requestHash } : {}),
 			};
+			data.sessionRefs[window.activeSession] = { sessionId: window.activeSession, ownerAgentId: window.type === "direct" ? window.members[0]! : MANAGER_AGENT_NAME, createdAt: new Date().toISOString() };
 			data.windows[window.id] = window;
 			try {
 				await this.writeWindows(data);
@@ -2039,7 +1945,7 @@ export class TeamsStore {
 					if (duplicate) throw new Error("该 worker 在当前项目已有单聊窗口");
 					w.members = members;
 				} else {
-					if (members.length < 2) throw new Error("群聊窗口至少需要 2 个 worker");
+					if (members.length < 2) throw new Error("群聊至少需要 2 个可委派 Worker");
 					w.members = members;
 				}
 			}
@@ -2099,6 +2005,7 @@ export class TeamsStore {
 				restored = true;
 			} else {
 				if (!sessionId) throw new Error("new workspace context requires a manager Session");
+				data.sessionRefs[sessionId] = { sessionId, ownerAgentId: MANAGER_AGENT_NAME, createdAt: new Date().toISOString() };
 				assignActiveWindowContext(w, {
 					...(workspaceId ? { workspaceId } : {}),
 					cwdSnapshot: target.cwdSnapshot,
@@ -2135,11 +2042,15 @@ export class TeamsStore {
 	}
 
 	/** Create a new pi session inside a window and make it active. */
-	async addWindowSession(windowId: string, sessionId: string): Promise<void> {
+	async addWindowSession(windowId: string, sessionId: string, snapshot?: { sourceSnapshotId: string; ownerAgentId: string }): Promise<void> {
 		await this.serialize(async () => {
 			const data = await this.loadWindowsFile();
 			const w = data.windows[windowId];
 			if (!w) throw new Error(`window not found: ${windowId}`);
+			const ownerAgentId = w.type === "direct" ? w.members[0]! : MANAGER_AGENT_NAME;
+			if (snapshot && snapshot.ownerAgentId !== ownerAgentId) throw new Error("session owner mismatch");
+			data.sessionRefs[sessionId] ??= { sessionId, ownerAgentId, createdAt: new Date().toISOString(), ...(snapshot ? { sourceSnapshotId: snapshot.sourceSnapshotId } : {}) };
+			if(snapshot) { if(data.sessionRefs[sessionId]!.sourceSnapshotId && data.sessionRefs[sessionId]!.sourceSnapshotId !== snapshot.sourceSnapshotId) throw new Error("snapshot identity mismatch"); data.sessionRefs[sessionId]!.sourceSnapshotId=snapshot.sourceSnapshotId; }
 			if (!w.sessions.includes(sessionId)) w.sessions.unshift(sessionId);
 			w.activeSession = sessionId;
 			await this.writeWindows(data);
@@ -2232,13 +2143,22 @@ export class TeamsStore {
 	/** The pi sessions belonging to a window, plus the active one. */
 	async windowSessionList(windowId: string): Promise<{ sessions: string[]; active: string }> {
 		const w = await this.getWindow(windowId);
-		if (!w) return { sessions: [], active: "" };
+		if (!w) throw new Error("window_not_found");
+		if (!w.sessions.length) throw new Error("window_has_no_session");
 		const sessions = w.sessions.length ? w.sessions : [windowId];
 		const active = w.activeSession && sessions.includes(w.activeSession) ? w.activeSession : sessions[0]!;
 		return { sessions, active };
 	}
 
-	/** Enabled workers a window may delegate to. solo always resolves to []. */
+	async sessionRef(sessionId: string): Promise<WindowSessionRef | undefined> { return (await this.windowsFileData()).sessionRefs[sessionId]; }
+	async ownerAgentOfSession(sessionId: string): Promise<AgentConfig | undefined> { const ref = await this.sessionRef(sessionId); return ref ? this.getAgent(ref.ownerAgentId) : undefined; }
+	async sessionsOwnedBy(agentId: string): Promise<WindowSessionRef[]> { return Object.values((await this.windowsFileData()).sessionRefs).filter(ref => ref.ownerAgentId === agentId); }
+
+	async eligibleWorkersFor(window: Pick<WindowConfig, "type" | "members">): Promise<AgentConfig[]> {
+		return eligibleWorkers(await this.listAgents(), window);
+	}
+
+	/** Configured members for room presentation; solo has no member list. */
 	async windowMembers(windowId: string): Promise<AgentConfig[]> {
 		const agents = await this.listAgents();
 		const enabled = agents.filter((a) => a.enabled !== false && !a.pinned);

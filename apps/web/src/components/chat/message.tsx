@@ -57,6 +57,7 @@ function toolCallIcon(name: string) {
 const RoomFileContext = createContext<{ roomId: string; sessionId?: string } | undefined>(undefined);
 
 type QuickActionDraft = (content: string) => void;
+const CanDelegateContext = createContext(true);
 const QuickActionDraftContext = createContext<QuickActionDraft | undefined>(undefined);
 
 /** 委派镜像卡（task_assign/task_result）上的「打开对应会话」跳转：切到
@@ -67,26 +68,13 @@ export function WorkerSessionLinkProvider({ onOpen, children }: { onOpen?: (sess
 	return <WorkerSessionLinkContext.Provider value={onOpen}>{children}</WorkerSessionLinkContext.Provider>;
 }
 
-function OpenWorkerSessionButton({ sessionHandle }: { sessionHandle?: string }) {
-	const onOpen = useContext(WorkerSessionLinkContext);
-	if (!sessionHandle || !onOpen) return null;
-	return (
-		<button
-			type="button"
-			className="home-open-worker-session"
-			onClick={() => onOpen(sessionHandle)}
-			title="打开该任务对应的执行会话"
-		>
-			<ExternalLinkIcon />
-			打开对应会话
-		</button>
-	);
+function OpenWorkerSessionButton(props: { sessionHandle?: string }) { void props; return null;
 }
 
 /** Bridges settled-message actions to the session composer without making a
  * message action execute an agent run immediately. */
-export function MessageQuickActionProvider({ onDraft, children }: { onDraft: QuickActionDraft; children: ReactNode }) {
-	return <QuickActionDraftContext.Provider value={onDraft}>{children}</QuickActionDraftContext.Provider>;
+export function MessageQuickActionProvider({ onDraft, canDelegate = true, children }: { onDraft: QuickActionDraft; canDelegate?: boolean; children: ReactNode }) {
+	return <CanDelegateContext.Provider value={canDelegate}><QuickActionDraftContext.Provider value={onDraft}>{children}</QuickActionDraftContext.Provider></CanDelegateContext.Provider>;
 }
 
 function MessageQuickActions({
@@ -101,6 +89,7 @@ function MessageQuickActions({
 	processDetails?: unknown;
 }) {
 	const onDraft = useContext(QuickActionDraftContext);
+ const canDelegate = useContext(CanDelegateContext);
 	const { openWorkerProcess } = useWorkerProcessDrawer();
 	const [copied, setCopied] = useState(false);
 	const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -131,17 +120,17 @@ function MessageQuickActions({
 					<button type="button" className="home-message-action" onClick={() => onDraft("请基于上面的结论继续推进，下一步是：")} title="继续推进" aria-label="继续推进">
 						<ChevronRightIcon />
 					</button>
-					<button type="button" className="home-message-action" onClick={() => onDraft("请基于上面的结论，选择合适的 Worker 执行：")} title="交给 Worker" aria-label="交给 Worker">
+					{canDelegate ? <button type="button" className="home-message-action" onClick={() => onDraft("请基于上面的结论，选择合适的 Worker 执行：")} title="交给 Worker" aria-label="交给 Worker">
 						<UserPlusIcon />
-					</button>
+					</button> : null}
 				</>
 			) : null}
 			{kind === "worker" && onDraft ? (
 				<>
-					<button type="button" className="home-message-action" onClick={() => onDraft(`请让 ${worker} 继续处理上一项委托${delegationRef}：`)} title="继续追问这个 Worker" aria-label="继续追问这个 Worker">
+					<button type="button" className="home-message-action" onClick={() => onDraft(canDelegate ? `请让 ${worker} 继续处理上一项委托${delegationRef}：` : "请基于上面的结果继续推进：")} title={canDelegate ? "继续追问这个 Worker" : "继续推进"} aria-label={canDelegate ? "继续追问这个 Worker" : "继续推进"}>
 						<ChevronRightIcon />
 					</button>
-					<button type="button" className="home-message-action" onClick={() => onDraft(`请让 ${worker} 返工上一项委托${delegationRef}，修改要求：`)} title="要求返工" aria-label="要求返工">
+					<button type="button" className="home-message-action" onClick={() => onDraft(canDelegate ? `请让 ${worker} 返工上一项委托${delegationRef}，修改要求：` : "请修改上面的结果，要求：")} title="要求返工" aria-label="要求返工">
 						<RotateCcwIcon />
 					</button>
 				</>
@@ -794,16 +783,7 @@ function DelegateCard({ call, onOpenWindow, timestamp }: { call: ToolCallView; o
 				<div className="flex shrink-0 items-center gap-2">
 					<ProcessViewButton details={call.details} />
 					{call.status === "running" || resumedRunning ? <CancelDelegationButton delegationId={details?.delegationId} goalId={details?.goalId} /> : null}
-					{details?.synced && details.windowId ? (
-						<button
-							type="button"
-							onClick={() => onOpenWindow?.(details.windowId!)}
-							className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-						>
-							已同步到单聊
-							<ExternalLinkIcon className="size-3" />
-						</button>
-					) : null}
+
 					{statusBadge(call, timestamp)}
 				</div>
 			</div>
@@ -992,6 +972,8 @@ function CustomMessageEntry({
 				requests?: Array<{ requestId: string; prompt: string; command?: string; path?: string; risk?: string; options?: string[] }>;
 		  }
 		| undefined;
+
+	if (message.customType === "pudding:session_goal" && (message.details as {historical?:boolean})?.historical) return <div className="rounded-lg border p-3 text-sm whitespace-pre-wrap">{message.content}</div>;
 
 	if (message.customType === "pudding:knowledge_job") {
 		return <KnowledgeJobCard content={message.content} details={details} />;

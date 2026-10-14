@@ -41,7 +41,7 @@ export interface WorkspaceExecutionPolicy {
 export interface WorkspaceChangeSet {
 	id: string;
 	executionScopeId: string;
-	delegationIds: string[];
+	ownerRefs: import("../agent-runtime/workspace-execution.js").ExecutionOwner[];
 	workspaceId?: string;
 	mode: WorkspaceAccessMode;
 	baselineFingerprint: string;
@@ -163,6 +163,7 @@ export interface WorkItemSubmission {
 		| { kind: "manager_summary"; evidenceRefs: string[] };
 	artifactIds: string[];
 	/** Worker execution submissions carry the sealed receipt; manager read-only submissions do not. */
+	nativeExecutions?: import("../pi-bridge/native-tool-execution.js").NativeExecution[];
 	executionReceiptId?: string;
 	executionReceipt?: ExecutionReceipt;
 	workspaceChangeSetId?: string;
@@ -412,6 +413,8 @@ function deriveReady(plan: GoalWorkPlan): void {
 export class WorkStateStore {
 	private readonly file: string;
 	private queue: Promise<unknown> = Promise.resolve();
+	private nativeExecutionReader?: (sessionId: string, goalId: string, itemId: string) => Promise<import("../pi-bridge/native-tool-execution.js").NativeExecution[]>;
+	setNativeExecutionReader(reader: NonNullable<WorkStateStore["nativeExecutionReader"]>): void { this.nativeExecutionReader = reader; }
 	private operationRetentionDays = 30;
 	private maxOperationsPerSession = 512;
 	private goalVerificationDefaults = defaultGoalVerificationPolicy();
@@ -1038,7 +1041,6 @@ export class WorkStateStore {
 			const item = plan.items[workItemId];
 			if (!item) throw new Error("WorkItem 不存在");
 			if (item.assignedAgentId !== state.responsibleAgentId) throw new Error(`WorkItem ${workItemId} 不是 Manager 自己的工作项`);
-			if (item.workspaceExecutionPolicy.mode !== "read_only_shared") throw new Error(`WorkItem ${workItemId} 需要写入或副作用，必须走 Worker Delegation`);
 			if (item.activeDelegationId) throw new Error(`WorkItem ${workItemId} 已有活动 Delegation，不能按 Manager 工作项推进`);
 			const timestamp = now();
 			if (input.status === "in_progress") {
@@ -1048,11 +1050,17 @@ export class WorkStateStore {
 			} else {
 				if (!["ready", "revision", "in_progress"].includes(item.status)) throw new Error(`WorkItem ${workItemId} 当前状态 ${item.status}，不能提交`);
 				const summary = requiredText(input.summary, "summary");
-				const evidenceRefs = strings(input.evidenceRefs ?? [], "evidenceRefs");
+				const nativeExecutions = (await this.nativeExecutionReader?.(sessionId, state.goalId, item.id) ?? []).filter((entry) => entry.goalEpoch === state.execution.epoch && entry.goalRevision === state.goalRevision && entry.workItemRevision === item.revision && entry.attempt === item.submissions.length + 1);
+				if (nativeExecutions.some((entry) => !entry.sealedAt || entry.status === "started" || entry.status === "unknown" || entry.integrity !== "clean" || entry.contractHash !== workItemContractHash(state, plan, item))) throw new Error("NativeExecution 尚未封存、效果未知或不匹配当前契约，不能提交");
+				if (item.workspaceExecutionPolicy.mode !== "read_only_shared" && !nativeExecutions.some((entry) => entry.status === "completed" && ["bash", "edit", "write"].includes(entry.toolName))) throw new Error("Manager 写 Submission 缺少实际 NativeExecution 证据");
+				const last = [...nativeExecutions].reverse().find((entry) => entry.changeSet);
+				const evidenceRefs = strings([...new Set([...(input.evidenceRefs ?? []), ...nativeExecutions.map((entry) => entry.id)])], "evidenceRefs");
 				item.submissions.push({
 					id: randomUUID(), attempt: item.submissions.length + 1, source: "manager",
+					...(nativeExecutions.length ? { nativeExecutions: copy(nativeExecutions) } : {}),
+					...(last?.changeSet ? { workspaceChangeSetId: last.changeSet.id, workspaceChangeSet: copy(last.changeSet) } : {}),
 					resultRef: { kind: "manager_summary", evidenceRefs }, artifactIds: [], summary, submittedAt: timestamp,
-					submittedStateRevision: state.revision + 1, goalRevision: state.goalRevision, workItemRevision: item.revision, inputFingerprint: hash({ goalId: state.goalId, workPlanId: plan.id, workItemId: item.id, revision: item.revision, summary, evidenceRefs }), verifications: [],
+					submittedStateRevision: state.revision + 1, goalRevision: state.goalRevision, workItemRevision: item.revision, inputFingerprint: hash({ goalId: state.goalId, workPlanId: plan.id, workItemId: item.id, revision: item.revision, summary, evidenceRefs, nativeExecutions }), verifications: [],
 				});
 				item.status = "submitted";
 			}
@@ -1094,7 +1102,9 @@ export class WorkStateStore {
 				throw new Error("manager_review accepted 必须引用至少一条 Delegation、Artifact、消息或只读观察证据");
 			}
 		} else if (item.workspaceExecutionPolicy.mode !== "read_only_shared") {
-			throw new Error("Manager Submission 只能来自 read_only_shared WorkItem");
+			const executions = submission.nativeExecutions;
+			if (!executions?.length || executions.some((entry) => !entry.sealedAt || entry.status === "unknown" || entry.status === "started" || entry.integrity !== "clean" || entry.sessionId !== state.sessionId || entry.goalId !== state.goalId || entry.goalEpoch !== state.execution.epoch || entry.workItemId !== item.id || entry.contractHash !== workItemContractHash(state, plan, { ...item, revision: submission.workItemRevision }))) throw new Error("Manager Submission 缺少匹配、完整的 NativeExecution 证据");
+			if (!managerEvidenceRefs.length) throw new Error("Manager accepted 必须引用实际执行或产物证据");
 		}
 		if (verificationRank[mode] > verificationRank.manager_review) {
 			const verification = [...submission.verifications].reverse().find((entry) => entry.status === "passed");
@@ -1229,7 +1239,7 @@ export class WorkStateStore {
 			const item = next.plan!.items[workItemId];
 			if (!item || item.status !== "submitted") throw new Error("只有 submitted WorkItem 可以结算 change-set");
 			const submission = [...item.submissions].reverse().find((entry) => !entry.review);
-			if (!submission?.workspaceChangeSetId || submission.workspaceChangeSetId !== changeSet.id || changeSet.executionScopeId !== submission.executionReceipt?.workspaceExecutionScopeId) throw new Error("WorkspaceChangeSet 与当前 Submission/Receipt 不匹配");
+			if (!submission?.workspaceChangeSetId || submission.workspaceChangeSetId !== changeSet.id || changeSet.executionScopeId !== (submission.executionReceipt?.workspaceExecutionScopeId ?? submission.workspaceChangeSet?.executionScopeId)) throw new Error("WorkspaceChangeSet 与当前 Submission/Receipt 不匹配");
 			if (!submission.acceptanceIntent) throw new Error("Workspace 提升前缺少已冻结的 Manager accepted 意图");
 			if (stable(submission.workspaceChangeSet) === stable(changeSet)) {
 				this.commit(data, sessionId, operationId, next.execution.epoch, "workspace_promotion", payload, next, next.revision, state.goalId);

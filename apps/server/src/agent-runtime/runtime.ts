@@ -1,3 +1,4 @@
+import { delegationOwnerIds } from "./workspace-execution.js";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { DelegationStore, type DelegationRecord, type InteractionRecord } from "./delegation-store.js";
@@ -44,6 +45,8 @@ export interface DelegateInput {
 	cwdSnapshot: string;
 	managerSessionId: string;
 	managerToolCallId?: string;
+	invocationKind?: "manager_tool" | "direct_chat";
+	requestHash?: string;
 	contractHash?: string;
 	purpose?: "execution" | "verification" | "knowledge_compile";
 	compileJobId?: string;
@@ -174,10 +177,13 @@ export class AgentRuntime {
 	/** 正在执行的 respond（per-interaction 防并发，M3）。 */
 	private readonly responding = new Set<string>();
 	private readonly broker: InteractionBroker;
-	private workspaceOwnerClosed?: (owner: DelegationRecord) => Promise<boolean>;
 
 	setWorkspaceOwnerClosedResolver(resolver: (owner: DelegationRecord) => Promise<boolean>): void {
-		this.workspaceOwnerClosed = resolver;
+		this.workspaceExecution?.setOwnerClosedResolver(async (ref) => {
+			if (ref.kind !== "delegation") return false;
+			const owner = await this.delegations.getDelegation(ref.delegationId);
+			return !!owner?.receipt && ["reported_completed", "reported_failed", "cancelled"].includes(owner.executionState) && await resolver(owner);
+		});
 	}
 
 	constructor(
@@ -438,6 +444,8 @@ export class AgentRuntime {
 		return { result, delegation: current ?? delegation };
 	}
 
+	private readonly toolCalls = new Map<string, { hash: string; outcome: Promise<RuntimeOutcome> }>();
+
 	async delegate(input: DelegateInput, ctx: InvocationContext): Promise<RuntimeOutcome> {
 		// Only the platform CompileJob coordinator may eventually issue this authority.
 		// A normal Manager/Invoker call cannot turn a worker into a protected compiler
@@ -446,7 +454,30 @@ export class AgentRuntime {
 		if (input.purpose !== undefined && input.purpose !== "execution" && input.purpose !== "verification") {
 			throw new Error("unsupported delegation purpose");
 		}
-		return this.delegateInternal(input, ctx);
+		if (input.invocationKind !== "manager_tool" || input.resumeDelegationId) return this.delegateInternal(input, ctx);
+		if (!input.managerToolCallId) throw new Error("manager_tool requires toolCallId");
+		const operationId = "delegation:" + createHash("sha256").update(input.managerSessionId + "\0" + input.managerToolCallId).digest("hex");
+		const hash = input.requestHash ?? createHash("sha256").update(JSON.stringify({ agent: input.agentId, task: input.message, window: input.windowId, cwd: input.cwdSnapshot,
+			parent: input.parentDelegationId, goal: input.goalId, epoch: input.goalEpoch, workItem: input.workItemId, intent: input.intent,
+			expectedOutcome: input.expectedOutcome, evidenceRequirements: input.evidenceRequirements, completionBoundary: input.completionBoundary })).digest("hex");
+		const active = this.toolCalls.get(operationId);
+		if (active) {
+			if (active.hash !== hash) throw new Error("delegation_call_conflict: 同一工具调用内容不同");
+			return active.outcome;
+		}
+		const outcome = (async () => {
+			const existing = (await this.delegations.listDelegations()).find(record => record.operationId === operationId);
+			if (existing) {
+				if (existing.requestHash !== hash) throw new Error("delegation_call_conflict: 同一工具调用内容不同");
+				input.onCreated?.(existing);
+				const interaction = (await this.delegations.listInteractions()).find(item => item.delegationId === existing.id && item.status === "pending");
+				if (existing.result) return { status: existing.executionState === "reported_completed" ? "completed" : interaction ? "needs_input" : "failed", result: existing.result, delegation: existing, interaction } as RuntimeOutcome;
+				throw new Error("delegation_call_unconfirmed: 已受理的调用结果尚未确认，禁止重跑");
+			}
+			return this.delegateInternal({ ...input, requestId: operationId, requestHash: hash, mode: "run", sessionHandle: undefined, sessionQueueToken: undefined }, ctx);
+		})();
+		this.toolCalls.set(operationId, { hash, outcome });
+		try { return await outcome; } finally { this.toolCalls.delete(operationId); }
 	}
 
 	/** The only Runtime entry for a protected local compiler. Authority is loaded
@@ -573,6 +604,8 @@ export class AgentRuntime {
 				delegation = existing;
 			} else delegation = await this.delegations.createDelegation({
 				operationId: requestId,
+			invocationKind: input.invocationKind,
+			requestHash: input.requestHash,
 			contractHash: input.contractHash,
 			windowId: input.windowId,
 			workspaceId: input.workspaceId,
@@ -660,24 +693,13 @@ export class AgentRuntime {
 					// permission upgrade or a claim of enforced read-only behavior.
 					mode = "exclusive_write";
 				}
-				if (mode === "exclusive_write" && !inherited && this.workspaceOwnerClosed) {
-					const blocking = await this.workspaceExecution.getBlockingScope(input.workspaceId, input.cwdSnapshot);
-					if (blocking?.state === "active") {
-						const owners = await Promise.all(blocking.delegationIds.map((id) => this.delegations.getDelegation(id)));
-						// Completion alone does not close a WorkItem. Reconcile against
-						// durable acceptance/cancellation, including a crash after review.
-						if (owners.length && owners.every((owner): owner is DelegationRecord => !!owner?.receipt && ["reported_completed", "reported_failed", "cancelled"].includes(owner.executionState))
-							&& (await Promise.all(owners.map((owner) => this.workspaceOwnerClosed!(owner)))).every(Boolean)) {
-							await this.workspaceExecution.release(blocking.id, { ownerToken: blocking.ownerToken, cleanup: false });
-						}
-					}
-				}
+
 				if (mode === "isolated_worktree" && driverCapabilities.workspace?.honorsInvocationCwd !== true) throw new Error("Connector 不保证使用平台注入 cwd，不能进入隔离 worktree");
 				const scope = await this.workspaceExecution.begin({
 					workspacePath: input.cwdSnapshot,
 					workspaceId: input.workspaceId,
 					mode,
-					delegationId: delegation.id,
+					owner: { kind: "delegation", delegationId: delegation.id },
 					goalId: input.goalId,
 					goalEpoch: input.goalEpoch,
 					executionScopeId: inheritedScopeId,
@@ -1281,8 +1303,8 @@ export class AgentRuntime {
 		if (!id) return undefined;
 		const scope = await this.workspaceExecution!.get(id);
 		if (!scope) throw new Error(`execution scope not found: ${id}`);
-		const owners = await Promise.all(scope.delegationIds.map((ownerId) => this.delegations.getDelegation(ownerId)));
-		if (!owners.length || !owners.every(sameOwner)) throw new Error(`execution scope ownership mismatch: ${id}`);
+		const owners = await Promise.all(delegationOwnerIds(scope).map((ownerId) => this.delegations.getDelegation(ownerId)));
+		if (scope.ownerRefs.some((ref) => ref.kind !== "delegation") || !owners.length || !owners.every(sameOwner)) throw new Error(`execution scope ownership mismatch: ${id}`);
 		if (!explicit && (scope.state === "released" || scope.state === "promoted")) return undefined;
 		if (scope.state !== "active") throw new Error(`execution scope is ${scope.state}: ${id}`);
 		if (owners.some((owner) => !["reported_completed", "reported_failed", "cancelled"].includes(owner.executionState))) {
@@ -1298,6 +1320,8 @@ export class AgentRuntime {
 			cwdSnapshot: delegation.cwdSnapshot,
 			managerSessionId: delegation.managerSessionId,
 			managerToolCallId: delegation.managerToolCallId,
+			invocationKind: delegation.invocationKind,
+			requestHash: delegation.requestHash,
 			contractHash: delegation.contractHash,
 			purpose: delegation.purpose,
 			verificationId: delegation.verificationId,

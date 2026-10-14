@@ -59,7 +59,7 @@ test("真实 pi 循环：HITL 工具结果落盘后结束本轮，聊天继续�
 			const message = {
 				role: "assistant" as const,
 				content: modelCalls < 3
-					? [{ type: "toolCall" as const, id: `call-${modelCalls}`, name: modelCalls === 1 ? "agent_alpha__delegate" : "agent_beta__delegate", arguments: { task: "检查交付文件" } }]
+					? [{ type: "toolCall" as const, id: `call-${modelCalls}`, name: "delegation", arguments: { workerId: modelCalls === 1 ? "alpha" : "beta", task: "检查交付文件" } }]
 					: [{ type: "text" as const, text: "已完成" }],
 				api: model.api, provider: model.provider, model: model.id,
 				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },

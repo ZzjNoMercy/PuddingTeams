@@ -158,11 +158,14 @@ test("Phase5: thinking level 新建会话即生效，运行中会话即时 setTh
 	await sessions.disposeAll();
 });
 
-test("Manager 代码搜索默认关闭，Solo 显式 builtin 才激活 grep/find", async () => {
+test("Manager solo/group 默认启用 grep/find，显式 off 关闭搜索", async () => {
 	const { teams, sessions, dir } = await makeStack();
 	const context = { type: "solo" as const, members: [], cwd: dir };
 	const disabled = await sessions.create(undefined, context);
-	assert.ok(!((await sessions.open(disabled.id)).getActiveToolNames().includes("grep")));
+	assert.ok((await sessions.open(disabled.id)).getActiveToolNames().includes("grep"));
+	await teams.updateManager({ manager: { codeSearch: "off" } });
+	const off = await sessions.create(undefined, context);
+	assert.ok(!(await sessions.open(off.id)).getActiveToolNames().includes("grep"));
 	await teams.updateManager({ manager: { codeSearch: "builtin" } });
 	const enabled = await sessions.create(undefined, context);
 	const active = (await sessions.open(enabled.id)).getActiveToolNames();
@@ -171,14 +174,21 @@ test("Manager 代码搜索默认关闭，Solo 显式 builtin 才激活 grep/find
 	await sessions.disposeAll();
 });
 
-test("Manager 在所有窗口都没有 bash/write/edit 写入通道，Solo 只恢复只读工具", async () => {
-	const { sessions, dir } = await makeStack();
+test("Manager solo/group 恢复原生工具，显式 builtinTools=false 保留禁用边界", async () => {
+	const { teams, sessions, dir } = await makeStack();
 	const summary = await sessions.create(undefined, { type: "solo", members: [], cwd: dir });
 	const tools = (await sessions.open(summary.id)).getAllTools().map((tool) => tool.name);
 	assert.ok(tools.includes("read") && tools.includes("ls"));
-	assert.ok(!tools.includes("bash"));
-	assert.ok(!tools.includes("write"));
-	assert.ok(!tools.includes("edit"));
+	assert.ok(tools.includes("bash"));
+	assert.ok(tools.includes("write"));
+	assert.ok(tools.includes("edit"));
+	const group = await sessions.create(undefined, { type: "group", members: ["puddingclaw"], cwd: dir });
+	const groupTools = (await sessions.open(group.id)).getAllTools().map((tool) => tool.name);
+	for (const name of ["read", "ls", "grep", "find", "bash", "edit", "write"]) assert.ok(groupTools.includes(name));
+	await teams.updateManager({ manager: { builtinTools: false } });
+	const restricted = await sessions.create(undefined, { type: "group", members: [], cwd: dir });
+	const restrictedTools = (await sessions.open(restricted.id)).getAllTools().map((tool) => tool.name);
+	for (const name of ["read", "ls", "grep", "find", "bash", "edit", "write"]) assert.ok(!restrictedTools.includes(name));
 	await sessions.disposeAll();
 });
 
@@ -207,7 +217,7 @@ test("Phase5: 受影响 manager Session 统计（active_now / reload_pending）"
 	const session = await sessions.open(summary.id);
 	const tools = session.getAllTools().map((t) => t.name);
 	assert.ok(tools.includes(delegateToolName("puddingclaw")));
-	assert.ok(!tools.includes(delegateToolName("manager")), "pinned manager 不得成为可委托 worker");
+	assert.ok(!(session.getAllTools().find(tool => tool.name === "delegation")!.parameters as { properties: { workerId: { enum: string[] } } }).properties.workerId.enum.includes("manager"));
 
 	// 配置变更前：无受影响标记。
 	let stats = sessions.agentSessionStats("puddingclaw");
@@ -221,7 +231,7 @@ test("Phase5: 受影响 manager Session 统计（active_now / reload_pending）"
 	assert.equal(stats.affectedSessions, 1);
 	assert.equal(stats.activeNow, 1);
 	assert.equal(stats.reloadPending, 1);
-	assert.ok(!session.getActiveToolNames().includes(delegateToolName("puddingclaw")), "撤权后工具立即从 active 移除");
+	assert.ok(session.getActiveToolNames().includes("delegation"), "还有其他 Worker 可用，统一入口保留；执行期拒绝已停用目标");
 
 	// 无关 Agent 的统计为零。
 	assert.equal(sessions.agentSessionStats("nonexistent").affectedSessions, 0);
@@ -234,7 +244,7 @@ test("fresh Session 首条消息前配置新增 Worker，下一次 open 重建�
 	await teams.ensureSoloWindow(async () => ({ id: summary.id }), async () => true);
 	const before = await sessions.open(summary.id);
 	assert.ok(summary.sessionFile && existsSync(summary.sessionFile), "新 Session 必须立即落盘，不能等首条 assistant 消息");
-	assert.ok(!before.getAllTools().some((tool) => tool.name === delegateToolName("late-worker")));
+	assert.ok(!(before.getAllTools().find(tool => tool.name === "delegation")!.parameters as { properties: { workerId: { enum: string[] } } }).properties.workerId.enum.includes("late-worker"));
 
 	await teams.upsertAgent({
 		name: "late-worker",
@@ -245,7 +255,7 @@ test("fresh Session 首条消息前配置新增 Worker，下一次 open 重建�
 	await sessions.syncAgentConfigChange();
 	const rebuilt = await sessions.open(summary.id);
 	assert.notEqual(rebuilt, before, "配置变更后的空闲 Session 必须在下一次 open 重建");
-	assert.ok(rebuilt.getActiveToolNames().includes(delegateToolName("late-worker")), "首条 provider 请求前必须含新 Worker 委托工具");
+	assert.ok((rebuilt.getAllTools().find(tool => tool.name === "delegation")!.parameters as { properties: { workerId: { enum: string[] } } }).properties.workerId.enum.includes("late-worker"));
 	await sessions.disposeAll();
 });
 
@@ -382,6 +392,8 @@ test("P3-1: manager 与 worker 在显式 Workspace 和未选项目模式都使�
 
 test("产品验收冻结: 共享 sessionDir 可发现并恢复不同 Workspace 的 manager Session", async () => {
 	const { teams, sessions, dir } = await makeStack();
+	await teams.upsertAgent({ name: "beta", description: "", invoke: { type: "command", command: "echo", runArgs: [] }, enabled: true });
+	await teams.upsertAgent({ name: "alpha", description: "", invoke: { type: "command", command: "echo", runArgs: [] }, enabled: true });
 	const workspaceA = await teams.workspaces.createManaged("A");
 	const workspaceB = await teams.workspaces.createManaged("B");
 	const sessionDir = path.join(dir, "sessions");
@@ -586,7 +598,8 @@ test("solo 委托到 direct 执行窗口时，Worker handle 归属来源房间 S
 	await teams.addWindowSession(solo.id, "solo-room-b");
 	assert.equal(await invoker.sessionHandleFor(direct.id, "solo-room-b", agent), undefined, "同一执行窗口也不得跨房间 Session 续接");
 
-	const group = await teams.createWindow({ type: "group", members: ["alpha"], sessionId: "group-room" });
+	await teams.upsertAgent({ ...agent, name: "beta" });
+	const group = await teams.createWindow({ type: "group", members: ["alpha", "beta"], sessionId: "group-room" });
 	await teams.rememberWorkerSession(
 		direct.id,
 		"group-room",
@@ -883,7 +896,8 @@ test("first user message and completed assistant reply advance durable activity,
 test("group running 投影直接追加为隐藏 custom entry，不进入展示消息流", async () => {
 	const { teams, sessions } = await makeStack();
 	const summary = await sessions.create();
-	await teams.createWindow({ type: "group", members: ["puddingclaw"], sessionId: summary.id });
+	await teams.upsertAgent({ ...(await teams.getAgent("puddingclaw"))!, name: "beta" });
+	await teams.createWindow({ type: "group", members: ["puddingclaw", "beta"], sessionId: summary.id });
 	const liveEvents: AgentSessionEvent[] = [];
 	const unsubscribe = sessions.subscribe(summary.id, (event) => liveEvents.push(event));
 
@@ -970,7 +984,7 @@ test("started已持久但房间绑定未更新时，重启续聊从执行账本�
 		assert.equal(await newer.sessionHandleFor(window.id, "resume-chat", agent), "worker-second", "旧房间绑定不能遮住较新的started记录");
 		await teams.rememberWorkerSession(window.id, "resume-chat", agent.name, "worker-first", undefined, cwd, agent.extensionRevision ?? 0);
 		assert.equal(await newer.sessionHandleFor(window.id, "resume-chat", agent), "worker-second", "旧轮次迟到的绑定写入不能遮住实际最新启动");
-		const other = await teams.createWindow({ type: "direct", members: [agent.name], sessionId: "other-chat" });
+		const other = await teams.createWindow({ type: "group", members: [agent.name, "pi-b"], sessionId: "other-chat" });
 		assert.equal(await newer.sessionHandleFor(other.id, "other-chat", agent), undefined);
 		assert.equal(await newer.sessionHandleFor(other.id, "resume-chat", agent), undefined);
 		const changed = await teams.upsertAgent({ ...agent, description: "new-config" });

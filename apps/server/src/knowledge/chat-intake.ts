@@ -78,7 +78,9 @@ export class ChatKnowledgeIntake {
 		const images = Array.isArray(entry.message.content) ? entry.message.content.filter((block) => block.type === "image").map((block) => hash(block.data)) : [];
 		if (JSON.stringify(images) !== JSON.stringify(pending.images)) throw new Error("本轮用户附件与聊天素材不匹配");
 		await this.bind(session, pending.refs, entry.id);
+		if (this.armed.get(session.sessionId) === pending) this.armed.delete(session.sessionId);
 	}
+	async admitQueued(session: AgentSession, refs: ChatSourceRefs, userEntryId: string): Promise<void> { await this.bind(session, refs, userEntryId); }
 	async admitDirect(session: AgentSession, refs: ChatSourceRefs): Promise<void> {
 		const entries = session.sessionManager.getBranch().filter((entry) => entry.type === "custom_message" && entry.customType === "pudding:user_message" && (entry.details as { operationId?: string; sourceRefs?: ChatSourceRefs } | undefined)?.operationId === refs.operationId &&
 			JSON.stringify((entry.details as { sourceRefs?: ChatSourceRefs }).sourceRefs) === JSON.stringify(refs));

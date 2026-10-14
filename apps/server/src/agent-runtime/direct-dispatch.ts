@@ -38,7 +38,7 @@ export async function directWorkerFor(
 	const workerName = window.members[0];
 	if (!workerName) return undefined;
 	const agent = await teams.getAgent(workerName);
-	if (!agent || agent.pinned || agent.invoke?.type === "pi") return undefined;
+	if (!agent || agent.pinned || (agent.invoke?.type === "pi" || agent.connector?.connectorId === "pi")) return undefined;
 	// Every delegation has an append-only activity timeline; pi additionally
 	// resolves this entry to its full AgentSession view.
 	return { window, workerName, processView: true };

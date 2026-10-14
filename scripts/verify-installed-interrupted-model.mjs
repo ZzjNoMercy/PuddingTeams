@@ -20,8 +20,19 @@ const model = createHttpServer(async (req, res) => {
   modelRequests += 1;
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
-  const body = Buffer.concat(chunks).toString('utf8');
-  modelCalls.push({ phase, hasUserIntent: body.includes(content), size: body.length });
+  const raw = Buffer.concat(chunks).toString('utf8');
+  const body = JSON.parse(raw);
+  const title = body.messages.some(message => message.role === 'system' && JSON.stringify(message.content).includes('你是对话标题生成器'));
+  modelCalls.push({ phase, kind: title ? 'title' : 'main', hasUserIntent: raw.includes(content), size: raw.length });
+  // Title generation is separate best-effort work. Only the real conversation
+  // request is held open; counting exactly one total request races the title.
+  if (title) {
+    const chunk = (delta, finishReason = null) => JSON.stringify({ id: 'title', object: 'chat.completion.chunk', created: 1780000000, model: 'fixture-model', choices: [{ index: 0, delta, finish_reason: finishReason }] });
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(`data: ${chunk({ role: 'assistant', content: '模型中断验证' })}\n\n`);
+    res.write(`data: ${chunk({}, 'stop')}\n\n`);
+    res.end('data: [DONE]\n\n');
+  }
 });
 model.on('connection', (socket) => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
 await new Promise((resolve, reject) => { model.once('error', reject); model.listen(0, '127.0.0.1', resolve); });
@@ -51,7 +62,9 @@ try {
   const sessionId = solo.activeSession;
   await ok('POST', `/api/sessions/${sessionId}/model`, { model: 'fixture/fixture-model' });
   await ok('POST', `/api/sessions/${sessionId}/messages`, { content }, { 'idempotency-key': key });
-  await waitFor(() => modelCalls.length === 1, 'first complete model request');
+  await waitFor(() => modelCalls.some(call => call.kind === 'main' && call.hasUserIntent), 'complete main conversation request');
+  await waitFor(() => modelCalls.some(call => call.kind === 'title'), 'separate title request');
+  assert.equal(modelCalls.filter(call => call.kind === 'main').length, 1, 'exactly one main request before interruption');
   const live = await ok('GET', `/api/sessions/${sessionId}/messages`);
   assert.equal(live.running, true);
   const pid = JSON.parse(await readFile(path.join(home, 'run', 'server.pid'), 'utf8')).pid;
@@ -75,6 +88,7 @@ try {
   assert.equal(cold.unansweredUserMessage, true);
   assert.equal(assistants.length, 0);
   assert.equal(modelRequests, requestsBeforeRestart, 'cold read and same-key replay must not request the model');
+  assert.equal(modelCalls.filter(call => call.kind === 'main').length, 1);
   console.log(JSON.stringify({ home, cli, sessionId, modelRequests, modelCalls, liveRunning: live.running, coldRunning: cold.running, coldUnansweredUserMessage: cold.unansweredUserMessage, coldUsers: users.length, coldAssistants: assistants.length, replayAccepted: replay.accepted, coldCustomTypes: cold.messages.filter((message) => message.customType).map((message) => message.customType) }, null, 2));
 } finally {
   if (started) await run(cli, ['stop'], { env, timeout: 20_000 }).catch(() => undefined);

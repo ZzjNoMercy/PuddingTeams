@@ -14,7 +14,7 @@ import { AgentInvoker } from "../agent-runtime/invoker.js";
 import { PiSessionStore } from "../pi-bridge/session-store.js";
 import { modelsJsonPath } from "../pi-bridge/custom-providers.js";
 import { ProviderDeletionCoordinator } from "../pi-bridge/provider-deletion.js";
-import { registerChatRoutes } from "./chat.js";
+import { registerChatRoutes } from "./chat-test-port.js";
 import { registerProvidersRoutes } from "./providers.js";
 import { UploadStore } from "../store/uploads.js";
 import type { AgentDriver } from "../agent-runtime/types.js";
@@ -383,14 +383,14 @@ test("普通消息仅在 pi 准入确认后返回 accepted，拒绝时保留错�
 	let promptCalls = 0;
 	const fakeSession = {
 		messages: [{ role: "user" }],
-		prompt: async (_text: string, options: { preflightResult: (accepted: boolean) => void }) => {
+		prompt: async (_text: string, options: { preflightResult: (accepted: "started" | "queued" | "handled") => void }) => {
 			promptCalls += 1;
-			if (promptCalls === 2) { options.preflightResult(true); return; }
+			if (promptCalls === 2) { options.preflightResult("started"); return; }
 			entered();
 			await new Promise<void>((resolve, reject) => {
 				admit = (accepted) => {
 					// pi 1.x：受理后回调 preflightResult；准入拒绝只抛错，不再回调 false。
-					if (accepted) { options.preflightResult(true); resolve(); }
+					if (accepted) { options.preflightResult("started"); resolve(); }
 					else reject(new Error("模型准入失败"));
 				};
 			});
@@ -423,7 +423,7 @@ test("模型明确拒绝消息且没有新增 user 时回收本次冻结附件",
 	await uploads.init();
 	const session = {
 		messages: [] as Array<{ role: string }>,
-		prompt: async (_text: string, _options: { preflightResult: (accepted: boolean) => void }) => {
+		prompt: async (_text: string, _options: { preflightResult: (accepted: "started" | "queued" | "handled") => void }) => {
 			// pi 1.x：准入拒绝只抛错，不再回调 preflightResult(false)。
 			throw new Error("模型准入失败");
 		},
@@ -456,7 +456,7 @@ test("准入失败若仍出现新增 user，则保留可能已被引用的冻结
 	await uploads.init();
 	const session = {
 		messages: [] as Array<{ role: string }>,
-		prompt: async (_text: string, _options: { preflightResult: (accepted: boolean) => void }) => {
+		prompt: async (_text: string, _options: { preflightResult: (accepted: "started" | "queued" | "handled") => void }) => {
 			session.messages.push({ role: "user" });
 			// pi 1.x：准入拒绝只抛错，不再回调 preflightResult(false)。
 			throw new Error("模型准入失败");
@@ -570,7 +570,7 @@ test("强制只读能力缺口刷新补回 blocked，不能投影成等待用户
 	const session = await sessions.open(summary.id);
 	const assistant = {
 		role: "assistant" as const,
-		content: [{ type: "toolCall" as const, id: "call-admission", name: "agent_claude-code__delegate", arguments: { task: "只读查询" } }],
+		content: [{ type: "toolCall" as const, id: "call-admission", name: "delegation", arguments: { workerId: "claude-code", task: "只读查询" } }],
 		api: "openai", provider: "openai", model: "fake",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 		stopReason: "toolUse" as const,
@@ -617,7 +617,7 @@ test("并行工具一项失败后停止并刷新：原错误与 Delegation 终�
 		role: "assistant" as const,
 		content: [
 			{ type: "toolCall" as const, id: "call-bash", name: "bash", arguments: { command: "git branch --show-current" } },
-			{ type: "toolCall" as const, id: "call-delegate", name: "agent_claude-code__delegate", arguments: { task: "查询分支" } },
+			{ type: "toolCall" as const, id: "call-delegate", name: "delegation", arguments: { workerId: "claude-code", task: "查询分支" } },
 		],
 		api: "openai",
 		provider: "openai",
@@ -744,6 +744,7 @@ test("GET /api/sessions/:id/messages 对非「不存在」错误保持 500 穿�
 test("消息入口把 Workspace 外绝对文件冻结为会话附件，外部目录拒绝隐式挂载", async () => {
 	const { teams, dir } = await makeStack();
 	const sessionId = "freeze-session";
+	await teams.upsertAgent({ name: "puddingclaw", description: "fixture Worker", invoke: { type: "command", command: "echo", runArgs: [] }, enabled: true });
 	await teams.createWindow({ type: "direct", members: ["puddingclaw"], sessionId });
 	const sourceRoot = mkdtempSync(path.join(tmpdir(), "pt-chat-external-"));
 	const source = path.join(sourceRoot, "notes.txt");
@@ -751,9 +752,9 @@ test("消息入口把 Workspace 外绝对文件冻结为会话附件，外部目
 	let received = "";
 	const fakeSession = {
 		messages: [],
-		prompt: async (text: string, options: { preflightResult: (accepted: boolean) => void }) => {
+		prompt: async (text: string, options: { preflightResult: (accepted: "started" | "queued" | "handled") => void }) => {
 			received = text;
-			options.preflightResult(true);
+			options.preflightResult("started");
 		},
 	};
 	const fakeStore = {

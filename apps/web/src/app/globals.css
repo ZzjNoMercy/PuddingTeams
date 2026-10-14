@@ -6570,3 +6570,29 @@ textarea.knowledge-json-input:focus-visible:not([data-pointer-focus="true"]) { o
 .network-provider-body { padding-top: 18px; padding-bottom: 12px; }
 .network-provider-heading { margin-bottom: 18px; }
 .network-workers .network-worker-row { padding-block: 11px; }
+
+/* Keep native followUp/steer controls usable in narrow chat columns. */
+@media (max-width: 767px) {
+  .m1-app-shell .home-composer [data-slot="input-group-addon"][data-align="block-end"] {
+    flex-wrap: wrap;
+    row-gap: 5px;
+  }
+  .m1-app-shell .home-composer [data-slot="input-group-addon"][data-align="block-end"] > div:first-child {
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+  }
+  .m1-app-shell .home-composer [data-slot="input-group-addon"][data-align="block-end"] > .home-composer-status {
+    flex: 1 1 100%;
+  }
+  .m1-app-shell .home-composer [data-slot="input-group-addon"][data-align="block-end"] > .home-composer-send {
+    min-width: 0;
+    max-width: 100%;
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  .m1-app-shell .home-composer .model-picker-trigger,
+  .m1-app-shell .home-composer .thinking-picker-trigger {
+    max-width: min(34vw, 100%);
+  }
+}

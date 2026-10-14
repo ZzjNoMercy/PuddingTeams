@@ -41,6 +41,7 @@ const model = createServer(async (req, res) => {
   const send = (delta, finish_reason = null) => res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: 1780000000, model: 'fixture-model', choices: [{ index: 0, delta, finish_reason }] })}\n\n`);
   res.writeHead(200, { 'content-type': 'text/event-stream' });
   send({ role: 'assistant', content: '流式片段' });
+  if (prompt.includes('请为下面这段对话')) { send({ content: '活动验证标题' }); send({}, 'stop'); res.end('data: [DONE]\n\n'); return; }
   pending.push({ prompt, release: () => { send({ content: '最终回答' }); send({}, 'stop'); res.end('data: [DONE]\n\n'); } });
 });
 const modelPort = await listen(model);
@@ -72,8 +73,8 @@ try {
   await ok('PUT', '/api/agents/pi-b/connector', { ...worker.connector, config: { ...worker.connector.config, model: 'fixture/fixture-model' }, expectedRevision: worker.extensionRevision });
   const configuredWorker = (await ok('GET', '/api/agents')).agents.find((agent) => agent.name === 'pi-b');
   assert.equal(configuredWorker?.connector?.config?.model, 'fixture/fixture-model');
-  const direct = (await ok('POST', '/api/rooms', { type: 'group', members: ['pi-b', 'puddingclaw'], name: '活动测试群 A' })).room;
-  const group = (await ok('POST', '/api/rooms', { type: 'group', members: ['pi-b', 'puddingclaw'], name: '活动测试群 B' })).room;
+  const direct = (await ok('POST', '/api/rooms', { type: 'group', members: ['pi-b', 'codex'], name: '活动测试群 A' })).room;
+  const group = (await ok('POST', '/api/rooms', { type: 'group', members: ['pi-b', 'codex'], name: '活动测试群 B' })).room;
   await ok('POST', `/api/sessions/${direct.activeSession}/model`, { model: 'fixture/fixture-model' });
   await ok('POST', `/api/sessions/${group.activeSession}/model`, { model: 'fixture/fixture-model' });
   const sendDirect = ok('POST', `/api/sessions/${direct.activeSession}/messages`, { content: '群聊 A 第一条业务消息' });

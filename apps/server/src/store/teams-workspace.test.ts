@@ -9,6 +9,7 @@ async function makeStore(): Promise<{ store: TeamsStore; dir: string }> {
 	const dir = mkdtempSync(path.join(tmpdir(), "pt-workspace-"));
 	const store = new TeamsStore({ state: dir, assets: dir, managedWorkspaces: path.join(dir, "managed") }, dir);
 	await store.init();
+	for (const name of ["alpha", "beta"]) await store.upsertAgent({ name, description: "fixture Worker", invoke: { type: "command", command: "echo", runArgs: [] }, enabled: true });
 	return { store, dir };
 }
 
@@ -57,100 +58,24 @@ test("Window 不选项目时使用默认 cwd，worker binding 仍冻结该上下
 	});
 });
 
-test("windows v1 无损升级：保留 Session 历史并把旧 Window 级 binding 归入 active Session", async () => {
-	const { store, dir } = await makeStore();
-	const project = await store.workspaces.createManaged("legacy-project");
-	const window = await store.createWindow({
-		type: "direct",
-		members: ["alpha"],
-		workspaceId: project.id,
-		sessionId: "legacy-session-1",
-	});
-	await store.addWindowSession(window.id, "legacy-session-2");
-	const agent = await store.upsertAgent({
-		name: "alpha",
-		description: "alpha",
-		invoke: { type: "command", command: "echo", runArgs: [] },
-	});
-	await store.rememberWorkerSession(
-		window.id,
-		"legacy-session-2",
-		"alpha",
-		"legacy-worker-handle",
-		project.id,
-		project.canonicalPath,
-		agent.extensionRevision ?? 0,
-	);
-
-	const windowsPath = path.join(dir, "windows.json");
-	const legacy = JSON.parse(readFileSync(windowsPath, "utf8")) as {
-		version: number;
-		windows: Record<string, Record<string, unknown>>;
-	};
-	const legacyWindow = legacy.windows[window.id]!;
-	const nested = legacyWindow.workerBindings as Record<string, Record<string, unknown>>;
-	legacyWindow.workerBindings = nested["legacy-session-2"];
-	delete legacyWindow.parkedContexts;
-	legacy.version = 1;
-	writeFileSync(windowsPath, `${JSON.stringify(legacy, null, 2)}\n`, "utf8");
-
-	const restarted = new TeamsStore({ state: dir, assets: dir, managedWorkspaces: path.join(dir, "managed") }, dir);
-	await restarted.init();
-	const upgraded = (await restarted.getWindow(window.id))!;
-	assert.deepEqual(upgraded.sessions, ["legacy-session-2", "legacy-session-1"]);
-	assert.equal(upgraded.activeSession, "legacy-session-2");
-	assert.deepEqual(upgraded.parkedContexts, {});
-	assert.equal(upgraded.workerBindings?.["legacy-session-2"]?.alpha?.sessionHandle, "legacy-worker-handle");
-	assert.equal(upgraded.workerBindings?.["legacy-session-2"]?.alpha?.targetWindowId, window.id);
-	const persisted = JSON.parse(readFileSync(windowsPath, "utf8")) as { version: number };
-	assert.equal(persisted.version, 2);
-	assert.ok(existsSync(`${windowsPath}.v1.bak`), "升级前必须保留一份原始 windows.json 备份");
-	assert.doesNotMatch(readFileSync(`${windowsPath}.v1.bak`, "utf8"), /parkedContexts/);
+test("windows v1/v2 被拒绝，原文件和既有备份不变", async () => {
+ for(const version of [1,2]) {
+  const {store,dir}=await makeStore();await store.createWindow({type:"group",members:["alpha","beta"],sessionId:"session"});
+  const file=path.join(dir,"windows.json"),data=JSON.parse(readFileSync(file,"utf8"));data.version=version;
+  const bytes=JSON.stringify(data);writeFileSync(file,bytes);writeFileSync(`${file}.v1.bak`,"existing backup");
+  const restarted=new TeamsStore({state:dir,assets:dir,managedWorkspaces:path.join(dir,"managed")},dir);
+  await assert.rejects(()=>restarted.init(),/requires v3/);
+  assert.equal(readFileSync(file,"utf8"),bytes);assert.equal(readFileSync(`${file}.v1.bak`,"utf8"),"existing backup");
+ }
 });
 
-test("windows v1 升级候选必须先完整校验，失败时主文件与备份目录均不变", async () => {
-	const { store, dir } = await makeStore();
-	const first = await store.createWindow({ type: "group", members: ["alpha"], sessionId: "shared-session" });
-	const second = await store.createWindow({ type: "group", members: ["beta"], sessionId: "other-session" });
-	const windowsPath = path.join(dir, "windows.json");
-	const legacy = JSON.parse(readFileSync(windowsPath, "utf8")) as {
-		version: number;
-		windows: Record<string, Record<string, unknown>>;
-	};
-	for (const window of Object.values(legacy.windows)) delete window.parkedContexts;
-	legacy.windows[second.id]!.sessions = ["shared-session"];
-	legacy.windows[second.id]!.activeSession = "shared-session";
-	legacy.version = 1;
-	const original = `${JSON.stringify(legacy, null, 2)}\n`;
-	writeFileSync(windowsPath, original, "utf8");
-
-	const restarted = new TeamsStore({ state: dir, assets: dir, managedWorkspaces: path.join(dir, "managed") }, dir);
-	await assert.rejects(() => restarted.init(), /belongs to multiple window contexts/);
-	assert.equal(readFileSync(windowsPath, "utf8"), original, "校验失败前不得覆盖 v1 主文件");
-	assert.equal(existsSync(`${windowsPath}.v1.bak`), false, "无效候选不应伪造可升级备份");
-	void first;
-});
-
-test("windows v1 升级遇到旧备份时为当前源生成内容寻址的新备份", async () => {
-	const { store, dir } = await makeStore();
-	const window = await store.createWindow({ type: "group", members: ["alpha"], sessionId: "current-session" });
-	const windowsPath = path.join(dir, "windows.json");
-	const legacy = JSON.parse(readFileSync(windowsPath, "utf8")) as {
-		version: number;
-		windows: Record<string, Record<string, unknown>>;
-	};
-	delete legacy.windows[window.id]!.parkedContexts;
-	legacy.version = 1;
-	const currentSource = `${JSON.stringify(legacy, null, 2)}\n`;
-	writeFileSync(windowsPath, currentSource, "utf8");
-	writeFileSync(`${windowsPath}.v1.bak`, "stale-backup\n", "utf8");
-
-	const restarted = new TeamsStore({ state: dir, assets: dir, managedWorkspaces: path.join(dir, "managed") }, dir);
-	await restarted.init();
-	assert.equal(readFileSync(`${windowsPath}.v1.bak`, "utf8"), "stale-backup\n", "不得覆盖无法证明对应当前源的旧备份");
-	const versioned = readdirSync(dir).filter((name) => /^windows\.json\.v1\.[0-9a-f]{16}\.bak$/.test(name));
-	assert.equal(versioned.length, 1);
-	assert.equal(readFileSync(path.join(dir, versioned[0]!), "utf8"), currentSource);
+test("v3 会话负责人是单一持久身份，缺失/错配拒绝，不从成员猜测",async()=>{
+ const {store,dir}=await makeStore();const room=await store.createWindow({type:"direct",members:["alpha"],sessionId:"session"});
+ await store.addWindowSession(room.id,"second");assert.equal((await store.sessionRef("session"))?.ownerAgentId,"alpha");
+ assert.equal((await store.sessionRef("second"))?.ownerAgentId,"alpha");
+ const file=path.join(dir,"windows.json"),data=JSON.parse(readFileSync(file,"utf8"));delete data.sessionRefs.session;
+ writeFileSync(file,JSON.stringify(data));const restarted=new TeamsStore({state:dir,assets:dir,managedWorkspaces:path.join(dir,"managed")},dir);
+ await assert.rejects(()=>restarted.init(),/invalid native session owner/);
 });
 
 test("无项目 Window 的 cwdSnapshot 跨重启保持，新的默认 cwd 使用独立 direct 身份", async () => {
@@ -290,4 +215,27 @@ test("Direct 窗口拒绝自定义协作提示词（§5.2 固定 relay）；Grou
 	assert.equal(group.prompt, "群规");
 	const updated = await store.updateWindow(group.id, { prompt: "新群规" });
 	assert.equal(updated.prompt, "新群规");
+});
+
+
+test("P1 group 创建与更新去重后至少两位 Worker；可用范围不改变群聊类型", async () => {
+	const { store } = await makeStore();
+	for (const members of [[], ["alpha"], ["alpha", "alpha"]]) {
+		await assert.rejects(() => store.createWindow({ type: "group", members, sessionId: "invalid" }), /至少需要 2 个/);
+	}
+	const group = await store.createWindow({ type: "group", members: ["alpha", "beta"], sessionId: "two" });
+	for (const members of [[], ["alpha"], ["alpha", "alpha"]]) {
+		await assert.rejects(() => store.updateWindow(group.id, { name: "invalid", members }), /至少需要 2 个/);
+		assert.deepEqual((await store.getWindow(group.id))!.members, ["alpha", "beta"]);
+		assert.equal((await store.getWindow(group.id))!.name, undefined);
+	}
+	await store.setEnabled("alpha", false);
+	assert.deepEqual((await store.eligibleWorkersFor(group)).map((agent) => agent.name), ["beta"]);
+	const solo = (await store.eligibleWorkersFor({ type: "solo", members: [] })).map((agent) => agent.name);
+	assert.ok(solo.includes("beta"));
+	assert.ok(!solo.includes("alpha") && !solo.includes("manager"));
+	await store.setEnabled("beta", false);
+	assert.deepEqual(await store.eligibleWorkersFor(group), []);
+	assert.equal((await store.getWindow(group.id))!.type, "group");
+	assert.deepEqual((await store.getWindow(group.id))!.members, ["alpha", "beta"]);
 });

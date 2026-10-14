@@ -127,7 +127,7 @@ export function ChatInfoDialog({
 		: (activeSession?.name || activeSession?.firstMessage || "新会话");
 	const workspaceName = room.workspace?.name ?? "默认目录";
 	const profileDescription = isGroup
-		? `${room.members.length} 位 Worker 共同协作，Manager 负责分工与汇总。`
+		? `Manager 负责对话，可委派 ${room.members.length} 位 Worker；也可直接执行工作。`
 		: isDirect
 			? directMember?.description || "执行具体任务并返回结果。"
 			: "负责理解消息、安排任务并汇总结果。";
@@ -164,7 +164,7 @@ export function ChatInfoDialog({
 
 					{isGroup ? (
 						<section className="chat-info-section">
-							<div className="chat-info-section-label">成员 · {room.members.length + 1}</div>
+							<div className="chat-info-section-label">可委派 Worker · {room.members.length}</div>
 							<div className="chat-member-grid">
 								<div className="chat-member-item"><ManagerAvatar size={34} className="chat-manager-avatar small" /><span>Manager</span></div>
 								{room.members.map((member) => (

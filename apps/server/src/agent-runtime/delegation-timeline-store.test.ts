@@ -98,3 +98,10 @@ test("递归脱敏保留 token 用量统计，仅隐藏凭证字段", () => {
 		OPENAI_API_KEY: "[redacted]",
 	});
 });
+
+test("长无凭据正文不阻塞脱敏，末尾带前缀的凭据仍被移除", () => {
+	const body = "x".repeat(200_000);
+	const start = performance.now();
+	assert.equal(redactText(body + " OPENAI_API_KEY=fixture-secret"), body + " OPENAI_API_KEY=[redacted]");
+	assert.ok(performance.now() - start < 5_000, "200k 连续正文不应进入逐字符回溯，阻塞请求超时");
+});

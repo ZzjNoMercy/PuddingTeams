@@ -98,7 +98,7 @@ function makeDriver(variant: "completed" | "failed" | "blocked" | "needs_input")
 	};
 }
 
-async function makeStack(variant: "completed" | "failed" | "blocked" | "needs_input", managerSessionId = "manager-sess-1", prestartBlocked = false, twoWorkspaces = false, driverOverride?: (dir: string) => AgentDriver) {
+async function makeStack(variant: "completed" | "failed" | "blocked" | "needs_input", managerSessionId = "manager-sess-1", prestartBlocked = false, twoWorkspaces = false, driverOverride?: (dir: string) => AgentDriver, ownerType: "direct" | "group" = "direct") {
 	const dir = freshDir("pt-fanout-");
 	const teams = new TeamsStore({ state: dir, assets: dir, managedWorkspaces: path.join(dir, "managed") }, dir);
 	await teams.init();
@@ -110,9 +110,10 @@ async function makeStack(variant: "completed" | "failed" | "blocked" | "needs_in
 	};
 	await teams.upsertAgent(agent);
 	const savedAgent = await teams.getAgent("puddingclaw");
+	if (ownerType === "group") for (const name of ["beta", "gamma"]) await teams.upsertAgent({ ...agent, name });
 	const projectA = twoWorkspaces ? await teams.workspaces.createManaged("project-a") : undefined;
 	const projectB = twoWorkspaces ? await teams.workspaces.createManaged("project-b") : undefined;
-	const window = await teams.createWindow({ type: "direct", members: ["puddingclaw"], sessionId: "direct-sess-1", ...(projectA ? { workspaceId: projectA.id } : {}) });
+	const window = await teams.createWindow({ type: ownerType, members: ownerType === "group" ? ["puddingclaw", "beta"] : ["puddingclaw"], sessionId: "direct-sess-1", ...(projectA ? { workspaceId: projectA.id } : {}) });
 	if (managerSessionId !== window.activeSession) {
 		await teams.ensureSoloWindow(async () => ({ id: projectA ? "manager-default-sess" : managerSessionId }), async () => true);
 		if (projectA) await teams.replaceWindowWorkspace("solo", projectA.id, managerSessionId);
@@ -171,7 +172,7 @@ test("待审批取消无法确认上游终止时，历史须如实标记失去�
 	const { invoker, delegationId, runtime, sent } = await makeStack("completed");
 	await invoker.cancel(delegationId);
 	assert.equal((await runtime.getDelegation(delegationId))?.executionState, "observation_lost");
-	await waitForSent(sent, 4);
+	await waitForSent(sent, 2);
 	for (const message of sent) {
 		assert.equal(message.status, "observation_lost");
 		assert.doesNotMatch(message.content, /已终止|已由用户取消/);
@@ -186,7 +187,7 @@ test("待审批取消经 Driver 确认后，历史才可标记已取消", async 
 	}));
 	await invoker.cancel(delegationId);
 	assert.equal((await runtime.getDelegation(delegationId))?.executionState, "cancelled");
-	await waitForSent(sent, 4);
+	await waitForSent(sent, 2);
 	assert.ok(sent.every((message) => message.status === "cancelled"));
 	assert.ok(sent.every((message) => message.content.includes("已确认取消")));
 });
@@ -216,9 +217,9 @@ test("T06 双 Workspace: A 的审批在 B 停放，返回 A 后续跑并扇出�
 	assert.equal(restored.window.cwdSnapshot, projectA.canonicalPath);
 	const outcome = await invoker.respond(interactionId, approve);
 	assert.equal(outcome.status, "approved");
-	await waitForSent(sent, 4);
+	await waitForSent(sent, 2);
 	assert.deepEqual(sent.filter((item) => item.sessionId === "manager-sess-1").map((item) => item.customType), ["pudding:interaction_resolved", "pudding:task_result"]);
-	assert.deepEqual(sent.filter((item) => item.sessionId === "direct-sess-1").map((item) => item.customType), ["pudding:interaction_resolved", "pudding:task_result"]);
+	assert.deepEqual(sent.filter((item) => item.sessionId === "direct-sess-1"), []);
 	assert.equal(sent.some((item) => item.sessionId === "manager-sess-b"), false);
 });
 
@@ -255,7 +256,7 @@ test("T06 子进程 Driver: A→B→A 审批只在 A 的 cwd 续跑", async () =
 	assert.equal((await runtime.getInteraction(interactionId))?.status, "pending");
 	await teams.replaceWindowWorkspace("solo", projectA.id, undefined);
 	assert.equal((await invoker.respond(interactionId, approve)).status, "approved");
-	await waitForSent(sent, 4);
+	await waitForSent(sent, 2);
 	assert.equal(readFileSync(path.join(dir, "respond-cwd.txt"), "utf8").trim(), projectA.canonicalPath);
 	const response = JSON.parse(readFileSync(path.join(dir, "respond-input.json"), "utf8")) as { continuation_token?: string };
 	assert.equal(response.continuation_token, "private-continuation");
@@ -330,13 +331,13 @@ async function waitForSent(sent: Sent[], count: number): Promise<void> {
 	assert.equal(sent.length, count, "后台扇出应在期限内完成");
 }
 
-test("两边同步: 受理即返回 approved，completed 扇出 manager（唤醒汇总）+ 单聊（仅展示）", async () => {
+test("owner 单边: 受理即返回 approved，completed 只投 manager 并唤醒汇总", async () => {
 	const { invoker, interactionId, delegationId, sent } = await makeStack("completed");
 	const outcome = await invoker.respond(interactionId, approve);
 	assert.equal(outcome.status, "approved", "approve 受理后立即返回，不等 worker 续跑落定");
 	assert.equal(outcome.details.admitted, true);
 
-	await waitForSent(sent, 4);
+	await waitForSent(sent, 2);
 	const manager = sent.filter((s) => s.sessionId === "manager-sess-1");
 	const direct = sent.filter((s) => s.sessionId === "direct-sess-1");
 	assert.deepEqual(
@@ -349,11 +350,7 @@ test("两边同步: 受理即返回 approved，completed 扇出 manager（唤醒
 	assert.match(manager[1]!.content, new RegExp(`delegationId：${delegationId}`), "审批续跑的终态正文必须暴露 delegationId，供同 Run followup 使用");
 	assert.equal(manager[1]!.options.triggerTurn, true, "manager 需要被唤醒做汇总");
 	assert.equal(manager[1]!.options.deliverAs, "followUp");
-	assert.deepEqual(
-		direct.map((s) => s.customType),
-		["pudding:interaction_resolved", "pudding:task_result"],
-		"单聊窗口必须同步看到审批通过与 worker 结果",
-	);
+	assert.deepEqual(direct, [], "direct 不接收 Manager 委派投影");
 	assert.ok(direct.every((s) => s.options.triggerTurn === false), "单聊只展示不唤醒");
 });
 
@@ -363,7 +360,7 @@ test("停用并保留待审批 Run 后仍可按原配置完成审批", async () 
 	assert.equal((await runtime.getInteraction(interactionId))?.status, "pending");
 	const outcome = await invoker.respond(interactionId, approve);
 	assert.equal(outcome.status, "approved");
-	await waitForSent(sent, 4);
+	await waitForSent(sent, 2);
 	assert.equal((await runtime.getInteraction(interactionId))?.status, "approved");
 });
 
@@ -375,7 +372,7 @@ test("停用后若 Worker 配置再变化，旧 Run 仍不得按新配置恢复"
 	assert.equal((await runtime.getInteraction(interactionId))?.status, "pending");
 });
 
-test("两边同步: rejected 扇出 manager + 单聊（任务取消）", async () => {
+test("owner 单边: rejected 只投 manager（任务取消）", async () => {
 	const { invoker, interactionId, sent } = await makeStack("completed");
 	const outcome = await invoker.respond(interactionId, {
 		requestId: "ui-rej",
@@ -384,7 +381,7 @@ test("两边同步: rejected 扇出 manager + 单聊（任务取消）", async (
 	});
 	assert.equal(outcome.status, "cancelled");
 
-	for (const sessionId of ["manager-sess-1", "direct-sess-1"]) {
+	for (const sessionId of ["manager-sess-1"]) {
 		const messages = sent.filter((s) => s.sessionId === sessionId);
 		assert.deepEqual(
 			messages.map((s) => s.customType),
@@ -396,11 +393,11 @@ test("两边同步: rejected 扇出 manager + 单聊（任务取消）", async (
 	}
 });
 
-test("两边同步: 主动取消待审批任务会通知并唤醒 manager 闭环", async () => {
+test("owner 单边: 主动取消待审批任务会通知并唤醒 manager 闭环", async () => {
 	const { invoker, delegationId, sent } = await makeStack("completed");
 	await invoker.cancel(delegationId);
 
-	await waitForSent(sent, 4);
+	await waitForSent(sent, 2);
 	const manager = sent.filter((s) => s.sessionId === "manager-sess-1");
 	assert.deepEqual(manager.map((s) => s.customType), ["pudding:interaction_resolved", "pudding:task_result"]);
 	assert.equal(manager[0]!.status, "observation_lost");
@@ -410,33 +407,33 @@ test("两边同步: 主动取消待审批任务会通知并唤醒 manager 闭环
 	assert.equal(manager[1]!.options.deliverAs, "followUp");
 
 	const direct = sent.filter((s) => s.sessionId === "direct-sess-1");
-	assert.deepEqual(direct.map((s) => s.customType), ["pudding:interaction_resolved", "pudding:task_result"]);
+	assert.deepEqual(direct, [], "只投原 owner，direct 无镜像");
 	assert.ok(direct.every((s) => s.options.triggerTurn === false), "worker 单聊只同步展示，不启动 manager 回合");
 });
 
-test("两边同步: failed 也会通知两边（不再静默）", async () => {
+test("owner 单边: failed 通知原 owner（不再静默）", async () => {
 	const { invoker, interactionId, sent } = await makeStack("failed");
 	const outcome = await invoker.respond(interactionId, approve);
 	assert.equal(outcome.status, "approved", "受理即返回；失败结果走后台扇出");
 
-	await waitForSent(sent, 4);
+	await waitForSent(sent, 2);
 	const manager = sent.filter((s) => s.sessionId === "manager-sess-1");
 	assert.deepEqual(manager.map((s) => s.customType), ["pudding:interaction_resolved", "pudding:task_result"]);
 	assert.equal(manager[0]!.status, "approved", "审批受理时先恢复任务卡为执行中");
 	assert.equal(manager[1]!.status, "failed");
 	assert.equal(manager[1]!.options.triggerTurn, true, "失败同样唤醒 manager 汇总");
 	const direct = sent.filter((s) => s.sessionId === "direct-sess-1");
-	assert.deepEqual(direct.map((s) => s.customType), ["pudding:interaction_resolved", "pudding:task_result"]);
+	assert.deepEqual(direct, [], "只投原 owner，direct 无镜像");
 	assert.ok(direct.every((s) => s.options.triggerTurn === false));
 });
 
-test("两边同步: 多轮 needs_input 投影新审批卡到两边（不唤醒）", async () => {
+test("owner 单边: 多轮 needs_input 投影新审批卡到原 owner（不唤醒）", async () => {
 	const { invoker, interactionId, sent } = await makeStack("needs_input");
 	const outcome = await invoker.respond(interactionId, approve);
 	assert.equal(outcome.status, "approved", "受理即返回；新一轮审批卡走后台扇出");
 
-	await waitForSent(sent, 4);
-	for (const sessionId of ["manager-sess-1", "direct-sess-1"]) {
+	await waitForSent(sent, 2);
+	for (const sessionId of ["manager-sess-1"]) {
 		const messages = sent.filter((s) => s.sessionId === sessionId);
 		assert.deepEqual(
 			messages.map((s) => s.customType),
@@ -449,7 +446,7 @@ test("两边同步: 多轮 needs_input 投影新审批卡到两边（不唤醒�
 	}
 });
 
-test("两边同步: manager session 与单聊 active session 相同则只发一次", async () => {
+test("owner 单边: manager session 与单聊 active session 相同则只发一次", async () => {
 	const { invoker, interactionId, sent } = await makeStack("completed", "direct-sess-1");
 	const outcome = await invoker.respond(interactionId, approve);
 	assert.equal(outcome.status, "approved");
@@ -465,9 +462,9 @@ test("两边同步: manager session 与单聊 active session 相同则只发一�
 test("审批后 blocked 的真实错误和执行事实进入 Manager 正文，Worker meta 不能覆盖平台状态", async () => {
 	const { invoker, interactionId, delegationId, sent } = await makeStack("blocked");
 	await invoker.respond(interactionId, approve);
-	await waitForSent(sent, 4);
+	await waitForSent(sent, 2);
 	const results = sent.filter((message) => message.customType === "pudding:task_result");
-	assert.equal(results.length, 2);
+	assert.equal(results.length, 1);
 	for (const result of results) {
 		assert.match(result.content, /execution scope is released: old-scope/);
 		assert.match(result.content, /workspace_policy_blocked/);
@@ -495,4 +492,20 @@ test("未配置 MCP 时平台联网工厂仍进入 Pi Worker", async () => {
  assert.deepEqual((await factoriesFor()).map(factory => factory.name), ["web-webpi"]);
  const fingerprintFor = config?.managedExtensionsFingerprintFor as () => Promise<string>;
  assert.equal(await fingerprintFor(), "permissions-webpi");
+});
+
+
+test("P1 group 范围收缩阻止新调用，已接单的审批按冻结生命周期完成", async () => {
+	const { teams, window, invoker, interactionId, runtime, delegationId, sent } = await makeStack("completed", "direct-sess-1", false, false, undefined, "group");
+	const agent = (await teams.getAgent("puddingclaw"))!;
+	await teams.updateWindow(window.id, { members: ["beta", "gamma"] });
+	assert.equal((await teams.getWindow(window.id))!.type, "group");
+	assert.deepEqual((await teams.eligibleWorkersFor((await teams.getWindow(window.id))!)).map((worker) => worker.name), ["beta", "gamma"]);
+	for (const purpose of ["execution", "verification"] as const) {
+		await assert.rejects(() => invoker.delegate({ windowId: window.id, managerSessionId: window.activeSession, agent, message: "new", mode: "run", purpose }), /不是当前窗口的成员/);
+	}
+	const result = await invoker.respond(interactionId, approve);
+	assert.equal(result.status, "approved");
+	await waitForSent(sent, 2);
+	assert.equal((await runtime.getDelegation(delegationId))!.executionState, "reported_completed");
 });

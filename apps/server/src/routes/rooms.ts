@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { TeamsStore, WindowSessionCleanupError, RoomCreationOperationConflictError, RoomCreationOperationGoneError, RoomWorkerUnavailableError, RoomWorkspaceUnavailableError, RoomSourceUnavailableError, RoomSourceChangedError, agentDisplayName, type AgentConfig, type RoomSourceSnapshot, type WindowConfig, type WindowType } from "../store/teams.js";
 import { PiSessionStore } from "../pi-bridge/session-store.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
@@ -50,6 +51,23 @@ function userMessageText(content: unknown): string {
 		.map((part) => part.text).join("\n").trim();
 }
 
+/** SDK setup and an empty, zero-usage failure are not an accepted first work.
+ * Any response, tool call/result, usage or uncertain cancellation still fences
+ * retries when no durable user entry can establish the original intent. */
+function firstWorkHasExecutionEvidence(entries: SessionEntry[]): boolean {
+	return entries.some((entry) => {
+		if (entry.type === "custom_message" || entry.type === "compaction" || entry.type === "branch_summary") return true;
+		if (entry.type !== "message") return false;
+		const message = entry.message;
+		if (message.role === "system") return false;
+		if (message.role !== "assistant" || message.stopReason !== "error" || !message.errorMessage?.trim()) return true;
+		if (!Array.isArray(message.content) || message.content.some(block => block.type !== "text" || block.text.trim())) return true;
+		const nestedCalls = (message as typeof message & { nestedCalls?: unknown }).nestedCalls;
+		if (nestedCalls !== undefined && (!Array.isArray(nestedCalls) || nestedCalls.length)) return true;
+		return !message.usage || [message.usage.input, message.usage.output, message.usage.cacheRead, message.usage.cacheWrite, message.usage.totalTokens].some(value => value !== 0);
+	});
+}
+
 async function durableUserMessageText(sessionFile: string | undefined, entryId: string): Promise<string | null> {
 	if (!sessionFile) return null;
 	try {
@@ -65,6 +83,7 @@ async function durableUserMessageText(sessionFile: string | undefined, entryId: 
 }
 
 export interface RoomSessionSummary {
+ ownerAgentId?: string; sourceSnapshotId?: string; leafEntryId?: string;
 	id: string;
 	/** LLM-generated title, else the first message text. */
 	name: string;
@@ -172,6 +191,7 @@ async function buildWindowSummary(
 				firstMessage: info?.firstMessage ?? "新对话",
 				modifiedAt: info?.modifiedAt ?? "",
 				active: id === active,
+				ownerAgentId: info?.ownerAgentId, sourceSnapshotId: info?.sourceSnapshotId, leafEntryId: info?.leafEntryId,
 				model: info?.model,
 				thinkingLevel: info?.thinkingLevel,
 			};
@@ -200,6 +220,7 @@ export function registerRoomsRoutes(
 		additionalRoots?: readonly string[];
 		/** Platform attachment root; access is narrowed to this window's Session subdirectories. */
 		attachmentRoot?: string;
+  snapshotAssetRoot?: string;
 		uploads?: UploadStore;
 		productSettings?: ProductSettingsStore;
 		activityStatePath?: string;
@@ -385,8 +406,12 @@ export function registerRoomsRoutes(
 						realpath(path.join(attachmentRoot, sessionId.replace(/[^A-Za-z0-9_-]/g, "_"))).catch(() => undefined),
 					))
 					: [];
+    const sourceSnapshotId=(await teams.sessionRef?.(window.activeSession))?.sourceSnapshotId;
+    const snapshotRoot=localFiles?.snapshotAssetRoot && sourceSnapshotId && /^[A-Za-z0-9-]+$/.test(sourceSnapshotId)
+     ? await realpath(path.join(localFiles.snapshotAssetRoot,sourceSnapshotId,"assets")).catch(()=>undefined) : undefined;
 				const allowedRoots = [
 					workspaceRoot,
+     ...(snapshotRoot ? [snapshotRoot] : []),
 					...extraRoots.filter((root): root is string => Boolean(root)),
 					...attachmentRoots.filter((root): root is string => Boolean(root)),
 				];
@@ -453,7 +478,7 @@ export function registerRoomsRoutes(
 				return reply.code(400).send({ error: "单聊需要恰好 1 个 worker" });
 			}
 			if (type === "group" && members.length < 2) {
-				return reply.code(400).send({ error: "群聊至少需要 2 个 worker" });
+				return reply.code(400).send({ error: "群聊至少需要 2 个可委派 Worker" });
 			}
 			const agents = await teams.listAgents();
 			const byName = new Map(agents.map((agent) => [agent.name, agent]));
@@ -937,7 +962,7 @@ export function registerRoomsRoutes(
 				}
 				if (!firstUserEntry && !session.messages.some((message) => message.role === "user")) {
 					if (sessions.isRunning(sessionId)) throw new Error("首次发送仍在处理，请保留原操作键稍后重试");
-					if (session.sessionManager.getBranch().some((entry) => entry.type === "message")) throw new FirstWorkMessageConflictError();
+					if (firstWorkHasExecutionEvidence(session.sessionManager.getBranch())) throw new FirstWorkMessageConflictError();
 					await localFiles?.uploads?.discardUnacceptedFirstWork(sessionId, freezeId);
 					const selectedModel = modelRef ? await sessions.setModel(sessionId, modelRef) : session.model;
 					if (!selectedModel || !(await sessions.hasModelAuth(selectedModel.provider))) {
@@ -1073,39 +1098,13 @@ export function registerRoomsRoutes(
 	/** 窗口的排队输入列表（queued/failed，FIFO 顺序；web 渲染灰态待发送气泡）。 */
 	app.get<{ Params: { id: string }; Querystring: { sessionHandle?: string } }>(
 		"/api/rooms/:id/input-queue",
-		async (req, reply) => {
-			const w = await teams.getWindow(req.params.id);
-			if (!w) return reply.code(404).send({ error: "window not found" });
-			const queue = localFiles?.workerInputQueue;
-			const items = queue?.listForWindow(req.params.id, req.query.sessionHandle) ?? [];
-			return {
-				items: items.map((item) => ({
-					id: item.id,
-					sessionHandle: item.sessionHandle,
-					text: item.text,
-					displayText: item.displayText,
-					status: item.status,
-					...(item.failureReason ? { failureReason: item.failureReason } : {}),
-					createdAt: item.createdAt,
-					operationId: item.operationId,
-				})),
-			};
-		},
+		async (_req, reply) => reply.code(410).send({ error: "Delegation 执行上下文不接受持续输入", code: "delegation_trace_only" }),
 	);
 
 	/** 取消一条排队中的 worker 输入（已开始派发/不存在的分别 409/404）。 */
 	app.delete<{ Params: { id: string; qid: string } }>(
 		"/api/rooms/:id/input-queue/:qid",
-		async (req, reply) => {
-			const w = await teams.getWindow(req.params.id);
-			if (!w) return reply.code(404).send({ error: "window not found" });
-			const queue = localFiles?.workerInputQueue;
-			if (!queue) return reply.code(404).send({ error: "queue item not found" });
-			const result = await queue.cancel(req.params.id, req.params.qid);
-			if (result === "not_found") return reply.code(404).send({ error: "queue item not found" });
-			if (result === "dispatching") return reply.code(409).send({ error: "该消息已开始派发，不能取消", code: "worker_input_dispatching" });
-			return reply.code(204).send();
-		},
+		async (_req, reply) => reply.code(410).send({ error: "Delegation 输入队列已关闭", code: "delegation_trace_only" }),
 	);
 
 	/**

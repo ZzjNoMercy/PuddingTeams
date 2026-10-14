@@ -8,7 +8,7 @@ import Fastify from "fastify";
 import { CustomProviderDurabilityError, deleteCustomProvider, listCustomProvidersSnapshot, setModelsDirectorySyncForTests, upsertCustomProvider } from "./custom-providers.js";
 import { ProviderDeletionCoordinator, ProviderRecoveryRequiredError, type ProviderCredentialPort } from "./provider-deletion.js";
 import { registerProvidersRoutes } from "../routes/providers.js";
-import { registerChatRoutes } from "../routes/chat.js";
+import { registerChatRoutes } from "../routes/chat-test-port.js";
 import type { PiSessionStore } from "./session-store.js";
 
 test("models.json rename 后目录同步失败：PUT 返回 503 并封锁同进程后续写入", async () => {

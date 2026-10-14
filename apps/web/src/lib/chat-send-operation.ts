@@ -15,8 +15,8 @@ function storageKey(sessionId: string): string {
 	return `puddingteams:message-operation:v1:${sessionId}`;
 }
 
-async function requestHash(content: string, attachments: MessageAttachmentInput[]): Promise<string> {
-	const bytes = new TextEncoder().encode(JSON.stringify({ content, attachments }));
+async function requestHash(content: string, attachments: MessageAttachmentInput[], delivery?: string): Promise<string> {
+	const bytes = new TextEncoder().encode(JSON.stringify({ content, attachments, delivery }));
 	const digest = await crypto.subtle.digest("SHA-256", bytes);
 	return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
@@ -27,8 +27,9 @@ export async function reserveChatSendOperation(
 	content: string,
 	attachments: MessageAttachmentInput[],
 	storage: () => OperationStorage = () => sessionStorage,
+ delivery?: string,
 ): Promise<string> {
-	const hash = await requestHash(content, attachments);
+	const hash = await requestHash(content, attachments, delivery);
 	let existing = volatileOperations.get(sessionId);
 	if (existing === undefined) {
 		try {

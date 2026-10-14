@@ -23,7 +23,7 @@ test("非安全上下文没有 SubtleCrypto 时仍能比较同附件，服务器
 		const original = await fingerprintManagerWorkAttachments([new File(["one"], "same.txt")]);
 		const reselected = await fingerprintManagerWorkAttachments([new File(["one"], "same.txt")]);
 		const changed = await fingerprintManagerWorkAttachments([new File(["two"], "same.txt")]);
-		assert.match(original[0]!, /^fnv64-[a-f0-9]{16}$/);
+		assert.match(JSON.parse(original[0]!)[3], /^fnv64-[a-f0-9]{16}$/);
 		assert.equal(sameManagerWorkAttachments(reselected, original), true);
 		assert.equal(sameManagerWorkAttachments(changed, original), false);
 	} finally {

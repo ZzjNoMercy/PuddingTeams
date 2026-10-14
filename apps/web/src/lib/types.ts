@@ -537,7 +537,7 @@ export interface AgentConfig {
 	/** Host-owned knowledge curator role; not an arbitrary user Agent classification. */
 	builtinId?: "wiki";
 	codeSearch?: "inherit" | "builtin" | "fff";
-	/** 不可变内部 id（委托工具名 agent_<id>__delegate、URL 参数、存储键）。创建后不可改。 */
+	/** 不可变内部 id（delegation 的 workerId、URL 参数、存储键）。创建后不可改。 */
 	name: string;
 	/** 用户可见显示名，可随时改；缺省时展示回退 name。 */
 	displayName?: string;
@@ -703,6 +703,7 @@ export interface ConflictRun {
 }
 
 export interface RoomSession {
+ ownerAgentId?: string; sourceSnapshotId?: string; leafEntryId?: string;
 	id: string;
 	/** LLM-generated title (set on first query), else firstMessage. */
 	name?: string;
@@ -755,7 +756,7 @@ export interface VerificationRecord {
 export interface WorkspaceChangeSet {
 	id: string;
 	executionScopeId: string;
-	delegationIds: string[];
+	ownerRefs: Array<{ kind: "delegation"; delegationId: string } | { kind: "native_session"; sessionId: string; turnId: string; workItemId?: string } | { kind: "verification_environment"; verificationId: string }>;
 	workspaceId?: string;
 	mode: WorkspaceAccessMode;
 	baselineFingerprint: string;
@@ -1121,3 +1122,5 @@ export interface WorkspaceDirectoryListing {
 	parent: string;
 	directories: Array<{ name: string; path: string }>;
 }
+
+export interface NativeInputCapability { ownerAgentId: string; connectorId: string; nativePi: boolean; readOnly: boolean; busyInput: { modes: Array<"followUp" | "steer"> }; waiting: string[]; pendingMessageCount: number; unconfirmedInput?: boolean; leafEntryId?: string; sourceSnapshotId?: string; }

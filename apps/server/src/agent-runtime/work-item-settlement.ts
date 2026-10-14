@@ -59,7 +59,7 @@ export async function settleWorkItemReview(input: {
 				evidenceRefs: review.evidenceRefs,
 			}, `${operationId}:acceptance-intent`, expectedEpoch, goalId);
 			revision = intentState.revision;
-			const scopeId = submission.executionReceipt?.workspaceExecutionScopeId;
+			const scopeId = submission.executionReceipt?.workspaceExecutionScopeId ?? submission.workspaceChangeSet?.executionScopeId;
 			const changeSetId = submission.workspaceChangeSetId;
 			if (!scopeId || !changeSetId) throw new Error("isolated_worktree Submission 缺少可提升 change-set");
 			const promoted = await input.promoteWorkspaceChangeSet(scopeId, changeSetId);

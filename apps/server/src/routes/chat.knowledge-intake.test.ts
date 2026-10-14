@@ -13,7 +13,7 @@ import { MessageSubmissionOperations } from "../store/message-submission-operati
 import { KnowledgeSourceStore } from "../knowledge/sources.js";
 import { KnowledgeObjectStore } from "../knowledge/objects.js";
 import { ChatKnowledgeIntake } from "../knowledge/chat-intake.js";
-import { registerChatRoutes } from "./chat.js";
+import { registerChatRoutes } from "./chat-test-port.js";
 import { localViewerIdentity } from "./identity.js";
 
 for (const command of ["/skill:record", "/record"]) test(`Manager HTTP ${command} 可信展开接收；提前未落盘事件不误确认，原话/重放不重复`, async () => {
@@ -24,7 +24,7 @@ for (const command of ["/skill:record", "/record"]) test(`Manager HTTP ${command
 	const original = `${command} 用户原话10月23日`, expanded = "\n<skill>可信技能展开正文</skill>\n用户原话10月23日\n";
 	const branch: unknown[] = [], listeners = new Set<(event: unknown) => void>(); let calls = 0;
 	const session = { sessionId, sessionFile: path.join(root, "session.jsonl"), messages: [], promptTemplates: [{ name: "record" }], sessionManager: { getBranch: () => branch },
-		prompt: async (_text: string, options: { preflightResult(accepted: boolean): void }) => {
+		prompt: async (_text: string, options: { preflightResult(accepted: "started" | "queued" | "handled"): void }) => {
 			calls++;
 			for (const listener of listeners) listener({ type: "message_end", message: { role: "user", content: [{ type: "text", text: original }] } });
 			await Promise.resolve(); // A missing durable entry must not resolve the waiter with undefined.
@@ -33,7 +33,7 @@ for (const command of ["/skill:record", "/record"]) test(`Manager HTTP ${command
 			branch.push({ id: "accepted-user", type: "message", message });
 			for (const listener of listeners) listener({ type: "message_end", message });
 			writeFileSync(session.sessionFile, branch.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
-			await intake.admitManager(session as unknown as AgentSession); options.preflightResult(true);
+			await intake.admitManager(session as unknown as AgentSession); options.preflightResult("started");
 		} };
 	const store = { open: async () => session, generateSessionTitle: async () => {}, subscribe: (_id: string, listener: (event: unknown) => void) => { listeners.add(listener); return () => listeners.delete(listener); },
 		appendMessageAdmission: async (_id: string, details: unknown) => appendFileSync(session.sessionFile, JSON.stringify({ id: "admission", type: "custom_message", customType: "pudding:message_admission", display: false, details }) + "\n") } as unknown as PiSessionStore;

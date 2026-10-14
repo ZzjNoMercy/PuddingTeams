@@ -18,6 +18,8 @@ export interface DelegationRecord {
 	cwdSnapshot: string;
 	managerSessionId: string;
 	managerToolCallId?: string;
+	invocationKind?: "manager_tool" | "direct_chat";
+	requestHash?: string;
 	purpose: "execution" | "verification" | "knowledge_compile";
 	/** Immutable link to the platform-owned CompileJob journal. */
 	compileJobId?: string;
@@ -278,7 +280,7 @@ export class DelegationStore {
 			"goalRevision", "workItemRevision", "task", "intent", "expectedOutcome",
 			"evidenceRequirements", "completionBoundary", "agentId", "agentRevision", "driverId", "workerSessionDir",
 			"driverTransport", "operation", "sessionHandle", "runHandle", "executionState", "result",
-			"receipt", "requestedWorkspaceExecutionScopeId", "workspaceExecutionScopeId", "workspaceChangeSetId", "purpose",
+			"requestHash", "invocationKind", "receipt", "requestedWorkspaceExecutionScopeId", "workspaceExecutionScopeId", "workspaceChangeSetId", "purpose",
 			"workspaceExecutionPolicy", "executionCwd",
 			"workspaceCapabilities", "capabilityFingerprint", "readOnlyAssessment", "admissionInteractionId", "workerStarted", "options",
 			"replacementAdmissionReady",

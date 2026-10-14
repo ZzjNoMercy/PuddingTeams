@@ -37,11 +37,11 @@ function updateLabel(session: Pick<RoomSession, "modifiedAt">): string {	const m
 
 export function SessionMenu({
 	sessions,
-	workerSessions,
 	activeWorkerView,
 	trigger,
 	onSwitch,
 	onNew,
+ onFork,
 	onRename,
 	onDelete,
 	onRenameWorker,
@@ -55,6 +55,7 @@ export function SessionMenu({
 	activeWorkerView?: string | null;
 	trigger: ReactElement;
 	onSwitch: (sessionId: string) => void | Promise<void>;
+	onFork?: () => void;
 	onNew?: () => void | Promise<void>;
 	onRename: (session: RoomSession) => void;
 	onDelete: (session: RoomSession) => void;
@@ -62,14 +63,15 @@ export function SessionMenu({
 	onDeleteWorker?: (session: WorkerSessionSummary) => void;
 	align?: "start" | "center" | "end";
 }) {
-	const delegated = workerSessions ?? [];
+	const delegated: WorkerSessionSummary[] = [];
 	const grouped = delegated.length > 0;
 	// 查看执行面时，容器 activeSession 不是当前查看目标，对勾要让位。
-	const containerActive = (session: RoomSession) => !activeWorkerView && session.active;
+	const containerActive = (session: RoomSession) => session.active;
 	return (
 		<DropdownMenu>
 			<DropdownMenuTrigger asChild>{trigger}</DropdownMenuTrigger>
 			<DropdownMenuContent align={align} sideOffset={8} className="home-session-menu" container={homePortalContainer()}>
+				{onFork ? <DropdownMenuItem onSelect={onFork}>Fork 到 Worker</DropdownMenuItem> : null}
 				<div className="home-session-menu-count">{sessions.length + delegated.length} 个会话</div>
 				{grouped ? <div className="home-session-menu-group">直接对话</div> : null}
 				{sessions.map((session) => (

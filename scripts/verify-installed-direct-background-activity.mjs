@@ -1,3 +1,4 @@
+import { registerPuddingClawFixture } from './installed-worker-fixture.mjs';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
@@ -50,6 +51,7 @@ let reconnected;
 try {
   await run(cli, ['start', '--port', String(port)], { env, timeout: 30_000 });
   started = true;
+  await registerPuddingClawFixture(base);
   const agent = (await ok('GET', '/api/agents')).agents.find((item) => item.name === 'puddingclaw');
   assert.ok(agent);
   await ok('PUT', '/api/agents/puddingclaw/connector', { extensionId: 'puddingclaw', connectorId: 'puddingclaw', transport: 'spawn', config: { command: worker }, expectedRevision: agent.extensionRevision });
@@ -73,7 +75,7 @@ try {
   assert.notEqual(next.id, originalSession);
   assert.equal(roomOf(await rooms(), direct.id).activeSession, next.id);
   await writeFile(path.join(home, 'release-worker'), 'go\n');
-  const liveResult = await waitFor(() => live.frames.find((event) => event.type === 'message_start' && event.message?.customType === 'pudding:task_result'), 'WS task result');
+  const liveResult = await waitFor(() => live.frames.find((event) => event.type === 'message_start' && event.message?.customType === 'pudding:task_result' && event.message?.content?.includes('后台 Worker 已完成')), 'WS task result');
   const completed = await waitFor(async () => {
     const room = roomOf(await rooms(), direct.id);
     return room.activityRevision > before.activityRevision ? room : undefined;

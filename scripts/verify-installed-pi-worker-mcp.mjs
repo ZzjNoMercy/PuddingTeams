@@ -57,7 +57,7 @@ const model = createServer(async (req, res) => {
   const body = JSON.parse(Buffer.concat(chunks).toString());
   const names = (body.tools ?? []).map((tool) => tool.function?.name).filter(Boolean);
   toolSurfaces.push(names);
-  const delegate = names.find((name) => name === 'agent_pi-b__delegate');
+  const delegate = names.includes('delegation') ? 'delegation' : undefined;
   const ping = names.find((name) => name.includes('ping'));
   const secondPrompt = JSON.stringify(body.messages ?? []).includes('再次委托 Designer');
   const thirdPrompt = JSON.stringify(body.messages ?? []).includes('第三次委托 Designer');
@@ -79,7 +79,7 @@ const model = createServer(async (req, res) => {
     return;
   }
   if (tool) {
-    send({ role: 'assistant', tool_calls: [{ index: 0, id: `call-${modelCalls}`, type: 'function', function: { name: tool, arguments: JSON.stringify(tool === ping ? {} : { task: `调用 Docs MCP ping 并报告结果，委托编号 ${managerDelegations}` }) } }] });
+    send({ role: 'assistant', tool_calls: [{ index: 0, id: `call-${modelCalls}`, type: 'function', function: { name: tool, arguments: JSON.stringify(tool === ping ? {} : { workerId: 'pi-b', task: `调用 Docs MCP ping 并报告结果，委托编号 ${managerDelegations}` }) } }] });
     send({}, 'tool_calls');
   } else {
     send({ role: 'assistant', content: ping ? 'Pi Worker 已完成 MCP 调用。' : 'Manager 收到 Pi Worker 结果。' });
@@ -124,7 +124,7 @@ try {
   assert.ok(changed);
   await ok('POST', `/api/sessions/${room.activeSession}/messages`, { content: '再次委托 Designer 调用 Docs MCP 工具。' });
   await waitFor(() => mcpSeen.some((entry) => entry.method === 'tools/call' && entry.token === 'Bearer new-token'), 'new Pi Worker MCP tool call');
-  assert.ok(toolSurfaces.some((names) => names.some((name) => name.endsWith('__delegate'))));
+  assert.ok(toolSurfaces.some((names) => names.includes('delegation')));
   assert.ok(toolSurfaces.some((names) => names.some((name) => name.includes('ping'))));
   const processes = (await ok('GET', `/api/rooms/${solo.id}/delegation-processes?managerSessionId=${room.activeSession}`)).delegations;
   assert.ok(processes.length >= 2, 'two Pi Worker delegations should be discoverable');

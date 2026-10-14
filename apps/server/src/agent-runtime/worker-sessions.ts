@@ -90,75 +90,8 @@ export async function listWorkerSessionsForWindow(
 	},
 	window: WindowConfig,
 ): Promise<WorkerSessionSummary[]> {
-	if (window.type !== "direct") return [];
-	const liveLookup = deps.liveLookup ?? liveWorkerSession;
-	const records = (await deps.delegations.listDelegations(window.id))
-		.filter((record) => record.sessionHandle && (!record.driverId || record.driverId === "pi"));
-	if (records.length === 0) return [];
-	const groups = new Map<string, DelegationRecord[]>();
-	for (const record of records) {
-		const handle = record.sessionHandle!;
-		const bucket = groups.get(handle) ?? [];
-		bucket.push(record);
-		groups.set(handle, bucket);
-	}
-	const dirCache = new Map<string, Promise<Awaited<ReturnType<typeof SessionManager.listAll>>>>();
-	const listDir = (dir: string) => {
-		let cached = dirCache.get(dir);
-		if (!cached) {
-			cached = SessionManager.listAll(dir).catch(() => []);
-			dirCache.set(dir, cached);
-		}
-		return cached;
-	};
-	const agents = await deps.teams.listAgents();
-	const sourceCache = new Map<string, Promise<{ id: string; name: string }>>();
-	const sourceFor = (managerSessionId: string) => {
-		let cached = sourceCache.get(managerSessionId);
-		if (!cached) {
-			cached = deps.teams.windowForSession(managerSessionId).then((owner) =>
-				owner
-					? { id: owner.id, name: sourceWindowDisplayName(owner, agents) }
-					: { id: "", name: "已删除房间" });
-			sourceCache.set(managerSessionId, cached);
-		}
-		return cached;
-	};
-	const summaries: WorkerSessionSummary[] = [];
-	for (const [handle, group] of groups) {
-		const ordered = [...group].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
-		const first = ordered[0]!;
-		const latest = ordered[ordered.length - 1]!;
-		// 本窗口直派的执行面与「直接对话」容器会话是同一段对话，不重复列出。
-		const source = await sourceFor(first.managerSessionId);
-		if (source.id === window.id) continue;
-		const live = liveLookup(handle);
-		const dirs = [...new Set(ordered.map((record) => record.workerSessionDir ?? deps.defaultSessionDir))];
-		let fileInfo: Awaited<ReturnType<typeof SessionManager.listAll>>[number] | undefined;
-		for (const dir of dirs) {
-			fileInfo = (await listDir(dir)).find((info) => info.id === handle);
-			if (fileInfo) break;
-		}
-		// 台账保留审计事实，但执行 session 文件已删除且不在内存：不再列出。
-		if (!live && !fileInfo) continue;
-		const taskName = taskDerivedName(ordered.map((record) => record.task).find((task) => task?.trim()));
-		summaries.push({
-			id: handle,
-			name: fileInfo?.name?.trim() || taskName,
-			firstMessage: fileInfo?.firstMessage
-				?? userTextOf((live?.messages.find((message) => message.role === "user") as { content?: unknown } | undefined)?.content)
-				?? "",
-			modifiedAt: fileInfo?.modified.toISOString() ?? new Date().toISOString(),
-			origin: "delegation",
-			sourceManagerSessionId: first.managerSessionId,
-			sourceWindowId: source.id,
-			sourceWindowName: source.name,
-			lastDelegationId: latest.id,
-			running: group.some((record) => ACTIVE_WORKER_EXECUTION_STATES.has(record.executionState)),
-		});
-	}
-	summaries.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt) || a.id.localeCompare(b.id));
-	return summaries;
+	// P2: execution contexts are exposed only by delegationId, never as chats.
+	return [];
 }
 
 /**
@@ -192,21 +125,6 @@ export async function resolveSession(
 ): Promise<ResolvedSession | undefined> {
 	if (deps.sessions.isOpen(id) || (await deps.sessions.list()).some((session) => session.id === id)) {
 		return { kind: "manager", sessionId: id };
-	}
-	const liveLookup = deps.liveLookup ?? liveWorkerSession;
-	const records = (await deps.delegations.listDelegations())
-		.filter((record) => record.sessionHandle === id && (!record.driverId || record.driverId === "pi"))
-		.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id));
-	for (const record of records) {
-		const window = await deps.teams.getWindow(record.windowId);
-		if (!window || window.type !== "direct") continue;
-		const live = liveLookup(id);
-		const dir = record.workerSessionDir ?? deps.defaultSessionDir;
-		const onDisk = live
-			? true
-			: await SessionManager.listAll(dir).then((list) => list.some((info) => info.id === id), () => false);
-		if (!onDisk) continue;
-		return { kind: "worker", sessionHandle: id, windowId: window.id, delegationId: record.id, workerSessionDir: dir, live: Boolean(live) };
 	}
 	return undefined;
 }

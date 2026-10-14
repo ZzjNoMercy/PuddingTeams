@@ -396,7 +396,7 @@ test("启动对账: W1 提升意图冻结时 W2 重启失败不阻断启动，�
 	const first = planned.plan!.items.W1!;
 	const receipt = { ...sealedReceipt(planned, first, "D-W1"), workspaceExecutionScopeId: "scope-W1" };
 	const changeSet = {
-		id: "cs-W1", executionScopeId: "scope-W1", delegationIds: ["D-W1"], mode: "isolated_worktree" as const,
+		id: "cs-W1", executionScopeId: "scope-W1", ownerRefs: [{ kind: "delegation" as const, delegationId: "D-W1" }], mode: "isolated_worktree" as const,
 		baselineFingerprint: "base", outputFingerprint: "out", changedPaths: ["result.txt"],
 		promotionState: "pending" as const, createdAt: new Date().toISOString(),
 	};
@@ -791,7 +791,7 @@ test("Goal v6: sealed Receipt、VerificationRecord 与 isolated worktree 提升�
 		upsertItems: [{ id: "W1", title: "实现并测试", acceptanceCriteria: ["测试通过"], sourceGoalCriteria: ["goal:1:1"], verificationPolicy: { mode: "environment_verified", trigger: "manager_request", source: "manager_derived", reason: "需要环境复验" }, workspaceExecutionPolicy: { mode: "isolated_worktree", source: "harness_default", reason: "代码隔离执行", baselineStrategy: "git_tree", promoteOnAcceptance: true } }], reason: "建立 v6 计划",
 	}, "plan-v6");
 	const item = planned.plan!.items.W1!;
-	const changeSet = { id: "cs-v6", executionScopeId: "scope-v6", delegationIds: ["D-v6"], mode: "isolated_worktree" as const, baselineFingerprint: "base", outputFingerprint: "out", changedPaths: ["src/a.ts"], promotionState: "applied" as const, createdAt: new Date().toISOString(), promotedAt: new Date().toISOString() };
+	const changeSet = { id: "cs-v6", executionScopeId: "scope-v6", ownerRefs: [{ kind: "delegation" as const, delegationId: "D-v6" }], mode: "isolated_worktree" as const, baselineFingerprint: "base", outputFingerprint: "out", changedPaths: ["src/a.ts"], promotionState: "applied" as const, createdAt: new Date().toISOString(), promotedAt: new Date().toISOString() };
 	const submitted = await store.noteDelegation("v6", { goalId: goal.goalId, workItemId: "W1", delegationId: "D-v6", delegationStatus: "completed", goalEpoch: 1, executionReceipt: sealedReceipt(planned, item, "D-v6"), workspaceChangeSet: changeSet }, "boundary-v6");
 	await assert.rejects(() => store.reviewWorkItem("v6", "W1", submitted.revision, { ...reviewTarget(submitted, "W1"), verdict: "accepted", summary: "先验收" }, "review-before-v6", 1, goal.goalId), /VerificationRecord/);
 	const submission = submitted.plan!.items.W1!.submissions[0]!;

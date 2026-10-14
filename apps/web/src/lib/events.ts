@@ -163,7 +163,7 @@ function renderCustom(m: PiCustomMessage): ChatMessage {
  * (or interactionId) so an admitted approval stops rendering as waiting.
  */
 function reconcileDelegationStatus(list: ChatMessage[], next: ChatMessage): ChatMessage[] {
-	const details = next.details as { taskId?: string; delegationId?: string; interactionId?: string; status?: string } | undefined;
+	const details = next.details as { toolCallId?: string; taskId?: string; delegationId?: string; interactionId?: string; status?: string } | undefined;
 	if (!details) return list;
 	let status: string | undefined;
 	if (next.customType === "pudding:task_assign") status = details.status ?? "running";
@@ -171,7 +171,7 @@ function reconcileDelegationStatus(list: ChatMessage[], next: ChatMessage): Chat
 	else if (next.customType === "pudding:interaction_resolved") {
 		status = details.status === "approved" ? "running" : details.status;
 	} else if (next.customType === "pudding:task_result") status = details.status;
-	if (!status || (!details.taskId && !details.delegationId && !details.interactionId)) return list;
+	if (!status || (!details.toolCallId && !details.taskId && !details.delegationId && !details.interactionId)) return list;
 
 	let changed = false;
 	const reconciled = list.map((message) => {
@@ -193,18 +193,19 @@ function reconcileDelegationStatus(list: ChatMessage[], next: ChatMessage): Chat
 			if (!isDelegateCall(call)) return call;
 			const callDetails = call.details as { delegationId?: string; interactionId?: string; status?: string } | undefined;
 			const matches = Boolean(
-				(details.taskId && call.id === details.taskId)
+				(details.toolCallId && call.id === details.toolCallId) || (details.taskId && call.id === details.taskId)
 				|| (details.delegationId && callDetails?.delegationId === details.delegationId)
 				|| (details.interactionId && callDetails?.interactionId === details.interactionId),
 			);
 			if (!matches) return call;
 			changed = true;
 			const previousStatus = callDetails?.status;
-			const nextStatus = next.customType === "pudding:task_assign" && ["completed", "failed", "cancelled"].includes(previousStatus ?? "")
+			const nextStatus = next.customType === "pudding:task_assign" && ["completed", "failed", "cancelled", "observation_lost"].includes(previousStatus ?? "")
 				? previousStatus
 				: status;
 			return {
 				...call,
+				...(next.customType === "pudding:task_result" ? { result: next.content, status: "done" as const, isError: !["completed"].includes(status) } : {}),
 				details: {
 					...(callDetails ?? {}),
 					...(next.details && typeof next.details === "object" ? next.details as Record<string, unknown> : {}),
@@ -223,6 +224,10 @@ function reconcileDelegationStatus(list: ChatMessage[], next: ChatMessage): Chat
  * 历史回放与实时事件走同一去重，避免一张变两张。
  */
 function upsertCustomMessage(list: ChatMessage[], next: ChatMessage): ChatMessage[] {
+	if (next.customType === "pudding:task_result") {
+		const details = next.details as { toolCallId?: string } | undefined;
+		if (details?.toolCallId && list.some(message => message.toolCalls.some(call => isDelegateCall(call) && call.id === details.toolCallId))) return reconcileDelegationStatus(list, next);
+	}
 	if (next.customType === "pudding:knowledge_job") {
 		const details = next.details as { jobId?: string; status?: string; recoveryRevision?: number } | undefined;
 		const index = details?.jobId ? list.findIndex(message => message.customType === next.customType &&
@@ -550,11 +555,9 @@ function extractToolResult(result: unknown): { text: string; details?: unknown }
 }
 
 /** per-agent 委托工具名（agent_<id>__delegate，Phase 4 起取代 team_task）。 */
-const DELEGATE_TOOL_RE = /^agent_(.+)__delegate$/;
-
 /** 是否为 per-agent 委托工具调用。 */
 export function isDelegateCall(call: ToolCallView): boolean {
-	return DELEGATE_TOOL_RE.test(call.name);
+	return call.name === "delegation";
 }
 
 /** The worker a delegate call was sent to (result details first, else tool name). */
@@ -562,7 +565,8 @@ export function delegateWorker(call: ToolCallView): string | undefined {
 	if (!isDelegateCall(call)) return undefined;
 	const details = call.details as { worker?: string } | undefined;
 	if (details?.worker) return details.worker;
-	return DELEGATE_TOOL_RE.exec(call.name)?.[1];
+	const args = call.args as { workerId?: unknown } | undefined;
+	return typeof args?.workerId === "string" ? args.workerId : undefined;
 }
 
 /**

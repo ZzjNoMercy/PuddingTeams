@@ -32,7 +32,7 @@ function WindowRow({
 	const directMemberName = members[0]?.name ?? "Worker";
 	const active = room.sessions.find((session) => session.active);
 	const fallback = room.type === "group"
-		? `${members.length} 位 Worker 共同协作`
+		? `Manager 对话 · ${members.length} 位可委派 Worker`
 		: room.type === "direct"
 			? members[0]?.description || `与 ${members[0] ? agentDisplayName(members[0]) : "Worker"} 单聊`
 			: "理解消息、组织协作并汇总结果";

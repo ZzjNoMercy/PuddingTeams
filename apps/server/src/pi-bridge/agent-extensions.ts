@@ -1,7 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { projectDelegationResult } from "../agent-runtime/delegation-result-projection.js";
+import { createHash, randomUUID } from "node:crypto";
 import { Type, type Static } from "typebox";
 import type { ExtensionAPI, InlineExtension } from "@earendil-works/pi-coding-agent";
-import { agentDisplayName, type TeamsStore, type AgentConfig, type WindowConfig, type WindowType } from "../store/teams.js";
+import { eligibleWorkers, agentDisplayName, type TeamsStore, type AgentConfig, type WindowConfig, type WindowType } from "../store/teams.js";
 import { WorkStateConflictError, WorkStateOperationConflictError, goalCriterionRefs, workItemContractHash, type WorkStateStore } from "../store/work-state.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import {
@@ -44,6 +45,7 @@ const MAX_RESULT_CHARS = 30_000;
  * result is still returned with `synced: false`.
  */
 const SYNC_IDLE_TIMEOUT_MS = 15_000;
+export const CORE_TOOL_DELEGATION = "delegation";
 
 export const CORE_TOOL_SEARCH = "search_agent_tools";
 export const CORE_TOOL_UPDATE_WORK_STATE = "update_session_work_state";
@@ -117,11 +119,11 @@ export async function planManagerTools(
 	ctx: ManagerWindowContext | undefined,
 ): Promise<ManagedToolPlan> {
 	// pinned 内置 manager 不是可委托的 worker（§10.5），不进 roster。
-	const enabled = (await store.listAgents()).filter((a) => a.enabled !== false && !a.pinned);
 	const solo = !ctx || ctx.type === "solo";
-	const agents = solo ? enabled : enabled.filter((a) => ctx.members.includes(a.name));
+	const agents = eligibleWorkers(await store.listAgents(), ctx);
 	const managed = new Set<string>([
 		CORE_TOOL_SEARCH,
+		CORE_TOOL_DELEGATION,
 		CORE_TOOL_UPDATE_WORK_STATE,
 		CORE_TOOL_REQUEST_DECISION,
 		CORE_TOOL_CREATE_GOAL,
@@ -151,7 +153,7 @@ export async function planManagerTools(
 	if (solo) active.add(CORE_TOOL_CREATE_GROUP);
 	if (ctx?.type === "group") active.add(CORE_TOOL_INVITE);
 	for (const agent of agents) {
-		const delegate = delegateToolName(agent.name);
+		const delegate = CORE_TOOL_DELEGATION;
 		managed.add(delegate);
 		// 委托工具全窗口默认激活：schema 常驻成本远低于「先 search 激活再调用」
 		// 的整轮上下文重发；search 只留给数量不确定的 capability 扩展工具。
@@ -198,11 +200,8 @@ export function buildManagerExtensionFactories(
 	deps: ManagerExtensionDeps,
 ): InlineExtension[] {
 	const factories: InlineExtension[] = [{ name: "pudding-core-roster", factory: coreRosterFactory(deps) }];
+	factories.push({ name: "pudding-delegation", factory: agentDelegationFactory(plan.agents, deps) });
 	for (const agent of plan.agents) {
-		factories.push({
-			name: `agent-${toolSafeId(agent.name)}-delegation`,
-			factory: agentDelegationFactory(agent, deps),
-		});
 		for (const binding of agent.capabilityExtensions ?? []) {
 			if (!binding.enabled) continue;
 			const module = deps.catalog.get(binding.extensionId);
@@ -336,7 +335,7 @@ const UpdateWorkPlanParams = Type.Object({
 			reason: Type.String({ minLength: 1 }),
 			baselineStrategy: Type.Union([Type.Literal("git_tree"), Type.Literal("filesystem_manifest"), Type.Literal("external_snapshot")]),
 			promoteOnAcceptance: Type.Boolean(),
-		}, { description: "工作区所有权策略。代码写入优先 isolated_worktree；非 Git 写入使用 exclusive_write；Manager 自己只能 read_only_shared。" })),
+		}, { description: "工作区所有权策略。代码写入优先 isolated_worktree；非 Git 写入使用 exclusive_write；Manager 可按同一策略直接执行自己的 WorkItem。" })),
 		sourceGoalCriterionIndexes: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), {
 			uniqueItems: true,
 			description: "本 WorkItem 服务的 Goal 完成条件序号，只填写 context 中的 index（从 1 开始）；内部引用由后端生成。",
@@ -397,13 +396,15 @@ const RequestDecisionParams = Type.Object({
 });
 
 const CreateGroupParams = Type.Object({
-	members: Type.Array(Type.String(), { description: "群聊成员：≥2 个已启用 worker，填内部 id 或显示名（roster 中括号标注的 id 为准）。" }),
-	task: Type.String({ description: "下达给房间 manager 的首条整体任务（它会再拆分给成员）。" }),
+	members: Type.Array(Type.String(), { description: "可委派 Worker：≥2 个已启用 worker，填内部 id 或显示名（roster 中括号标注的 id 为准）。" }),
+	task: Type.Optional(Type.String({ description: "仅用户明确要求创建后立即执行时，填写首条任务；否则留空。" })),
+	sourceMessageId: Type.String({ description: "用户明确要求创建群聊的真实消息引用 user:<timestamp>；普通多 Worker 任务不代表建群授权。" }),
 	name: Type.Optional(Type.String({ description: "群聊名称（可选，留空由首条任务自动生成）。" })),
 	prompt: Type.Optional(Type.String({ description: "群聊协作提示词：只给该房间 manager 的分工/交接/汇总规则（可选）。" })),
 });
 
 const InviteToGroupParams = Type.Object({
+	sourceMessageId: Type.String({ description: "用户明确要求扩大本群可委派范围的真实消息引用 user:<timestamp>。" }),
 	members: Type.Array(Type.String(), { description: "要拉入本群的已启用 worker（≥1），填内部 id 或显示名。" }),
 });
 
@@ -462,7 +463,8 @@ export async function verifyWorkItemSubmission(
 		let verifierAgentId = params.verifierAgentId?.trim() || settings?.harness.verification.reviewers.cliAgentId.trim() || undefined;
 		let environment: Awaited<ReturnType<AgentInvoker["createVerificationEnvironment"]>> | undefined;
 		try {
-			if (!submission.executionReceipt?.workspaceExecutionScopeId) throw new Error("environment_verified 需要 ExecutionReceipt 绑定 Workspace execution scope");
+			const scopeId = submission.executionReceipt?.workspaceExecutionScopeId ?? submission.workspaceChangeSet?.executionScopeId;
+			if (!scopeId) throw new Error("environment_verified 需要实际执行证据绑定 Workspace scope");
 			const executor = submission.delegationId ? await deps.invoker.getDelegation(submission.delegationId) : undefined;
 			verifierAgentId ||= executor?.agentId;
 			if (!verifierAgentId) throw new Error("无法确定 Verifier Worker；请在 Harness 设置 CLI Verifier Worker");
@@ -477,9 +479,7 @@ export async function verifyWorkItemSubmission(
 			const owner = await deps.store.windowForSession(sessionId);
 			if (!owner) throw new Error("Manager Session 不属于窗口");
 			if (settings?.harness.verification.reviewers.requireRoomMember && owner.type !== "solo" && !owner.members.includes(verifierAgentId)) throw new Error(`Harness 要求 Verifier ${verifierAgentId} 先加入 Room`);
-			const target = owner.type === "solo"
-				? await deps.store.findDirectWindow(verifierAgentId, owner.workspaceId, await deps.store.workspaceFor(owner.id))
-				: owner;
+			const target = owner;
 			if (!target) throw new Error(`Verifier Agent ${verifierAgentId} 没有绑定当前 Workspace 的执行窗口`);
 			const reviewInput: VerificationReviewInput = {
 				verificationId, mode: "environment_verified", goalId: current.goalId, workPlanId: current.plan.id,
@@ -496,7 +496,7 @@ export async function verifyWorkItemSubmission(
 				evidenceRefs: [], integrity: "unknown", createdAt: timestamp, updatedAt: timestamp,
 			};
 			const runningState = await deps.workStates.recordVerification(sessionId, current.revision, runningRecord, `${toolCallId}:running`, current.execution.epoch, current.goalId);
-			environment = await deps.invoker.createVerificationEnvironment(submission.executionReceipt.workspaceExecutionScopeId, verificationId, environmentMode);
+			environment = await deps.invoker.createVerificationEnvironment(scopeId, verificationId, environmentMode);
 			const result = await deps.invoker.delegate({
 				windowId: target.id, managerSessionId: sessionId, managerToolCallId: toolCallId,
 				goalId: current.goalId, workPlanId: current.plan.id, workItemId: item.id,
@@ -612,13 +612,13 @@ export async function verifyWorkItemSubmission(
 export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowContext | undefined): string {
 	if (plan.agents.length === 0) {
 		return (
-			"当前没有可委托的 worker。请先在智能体管理中启用 worker" +
+			"当前没有可委派 Worker；Manager 可以使用自己已启用的原生工具完成工作。如需委派，请用户在智能体管理中启用 Worker" +
 			(ctx && ctx.type !== "solo" ? "，并确认它是本窗口成员。" : "。") +
-			"不要承诺派活。"
+			"不要承诺派活，不要自行扩大范围。"
 		);
 	}
 	const lines = plan.agents.map((a) => {
-		const tools = [...plan.managed].filter((n) => n.startsWith(`agent_${toolSafeId(a.name)}__`));
+		const tools = ["delegation", ...[...plan.managed].filter((n) => n.startsWith(`agent_${toolSafeId(a.name)}__`))];
 		const identity = a.responsibility?.identity ? `（${a.responsibility.identity}）` : "";
 		const caps = a.capabilities?.length ? `｜能力：${a.capabilities.join("、")}` : "";
 		const responsibility = a.responsibility
@@ -634,7 +634,7 @@ export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowCon
 		// 显示名与内部 id 不同则标注 id：create_group_window / invite_to_group
 		// 的 members 以 id 为准，manager 必须能自己完成映射。
 		const idNote = label !== a.name ? `（id：${a.name}）` : "";
-		return `- ${label}${idNote}${identity}：${a.description || "（无描述）"}${caps}${responsibility}\n  工具：${toolList}`;
+		return `- ${label}${idNote}${identity}：${a.description || "（无描述）"}${caps}${responsibility}\n  工具：${toolList}；delegation 的 workerId=${a.name}`;
 	});
 	const soloCtx = !ctx || ctx.type === "solo";
 	return [
@@ -644,22 +644,21 @@ export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowCon
 		"Worker 的原生 input_required/respond 是同一个 WorkItem、同一个 Delegation、同一个 Run 内的暂停与恢复：WorkPlan 必须把询问与用户回答后的继续执行建成一个 WorkItem，不得拆成询问前/后两个 WorkItem。用户在审批卡提交业务选择后，Runtime 会自动恢复原 Delegation；不得再发 followup、验证委托或替代委托来完成、提交或验收该流程。",
 		"最少用户介入：先沿用用户已授权的范围与现有偏好，平台可验证的事实自行检查，常规可逆实现选择自行决定。普通查阅按 best_effort 自动执行；用户明确要求不得写入时设 readOnlyRequirement=enforced。workspace_policy_blocked 是可恢复的能力缺口，先按任务职责改派合适 Worker、保持原约束，不要索要无效只读准入确认。只有缺少必要授权、用户独有信息或影响交付的真实业务取舍且无法按现有偏好解决时才询问；同一问题集中询问一次，不因重试/改派再次索要已有授权。实际发布和破坏性操作仍遵守原门禁。",
 		MANAGER_HUMAN_WAIT_INSTRUCTION,
-		...(soloCtx
-			? [
-					`只要任务需要两个及以上 worker——包括串行交接（一个 worker 的产出是另一个的输入，如"先查数据再做 PPT"）——就用 ${CORE_TOOL_CREATE_GROUP} 建群聊并把整体任务下达给房间 manager，让 worker 在群里直接交接、用户全程旁观。不要在 solo 里逐个单聊派活、自己搬运中间结果。只有纯单 worker 任务才直接委托该 worker。`,
-				]
-			: []),
-		...(ctx?.type === "group"
-			? [`当前协作人手不够时，用 ${CORE_TOOL_INVITE} 把其他已启用 worker 拉进本群（新成员下一轮进入 worker 清单）。`]
-			: []),
+		"Manager 可直接使用原生工具完成工作。先开始自己的 WorkItem，再执行并提交真实 NativeExecution 证据；不需要为了写操作伪造委派。群聊只限制可委派 Worker 的范围，不要求多方共享上下文。",
+		...(soloCtx ? [`只有用户明确要求创建群聊时才用 ${CORE_TOOL_CREATE_GROUP}；只有用户明确要求建群后立即执行，才填写 task。普通多 Worker 工作可在当前对话执行。`] : []),
+		...(ctx?.type === "group" ? [`只有用户明确要求扩大范围时才用 ${CORE_TOOL_INVITE}；范围不足时先自行执行或向用户说明，不能自动加人。`] : []),
 	].join("\n");
 }
 
 function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => void {
 	return (pi) => {
 		let latestUserSourceIds = new Set<string>();
+		let explicitGroupMessages = new Set<string>();
+		let explicitInviteMessages = new Set<string>();
+		let explicitStartMessages = new Set<string>();
 		pi.on("tool_call", async (event) => {
 			if (event.toolName === CORE_TOOL_ABANDON_GOAL || event.toolName === CORE_TOOL_SUPERSEDE_GOAL) return;
+			if (event.toolName === CORE_TOOL_DELEGATION && await deps.invoker.toolCallRecord(deps.getSessionId(), event.toolCallId)) return;
 			const waiting = await managerHumanWait(deps.getSessionId(), deps.invoker, deps.workStates);
 			if (waiting) return { block: true, reason: waiting, terminate: true };
 		});
@@ -709,6 +708,17 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 					return `user:${timestamp}`;
 				});
 			latestUserSourceIds = new Set(sourceMessageIds);
+			explicitGroupMessages = new Set(); explicitInviteMessages = new Set(); explicitStartMessages = new Set();
+			const userMessages = modelMessages.filter((entry) => entry.role === "user").slice(-5);
+			userMessages.forEach((entry, index) => {
+				const text = typeof entry.content === "string" ? entry.content : entry.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+				const id = sourceMessageIds[index]!;
+				// Conservative intent check: ambiguous natural language stays in the
+				// current room, with UI configuration available to the user.
+				if (!/(不要|别|无需|不需要|do not|don't)/i.test(text) && /(创建|新建|建个|建一|建群|create|new).{0,24}(群聊|群|group)|(群聊|group).{0,24}(创建|新建|create)/i.test(text)) explicitGroupMessages.add(id);
+				if (!/(不要|别|无需|不需要|do not|don't)/i.test(text) && /(邀请|拉入|加到|加入|添加|invite|add).{0,40}(群|worker|成员|范围|group)/i.test(text)) explicitInviteMessages.add(id);
+				if (/(执行|开跑|开始|下达|run|start)/i.test(text)) explicitStartMessages.add(id);
+			});
 			const planLines = workState?.plan
 				? Object.values(workState.plan.items)
 					.filter((item) => item.status !== "accepted" && item.status !== "cancelled")
@@ -731,7 +741,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 						`等待：${workState.waitingOn || "无"}`,
 						`下一步：${workState.nextAction || "尚未记录"}`,
 						`冻结 Goal 完成条件（update_work_plan 的 sourceGoalCriterionIndexes 只填写 index）：\n${JSON.stringify(goalCriterionRefs(workState).map((item, index) => ({ index: index + 1, criterion: item.text })))}`,
-						...(harness ? [`Harness 新 WorkItem 默认：verification=${harness.verification.defaultWorkItemMode}/${harness.verification.trigger}；Git 写任务 workspace=${harness.workspaceExecution.gitWriteDefault}；非 Git 写任务 workspace=${harness.workspaceExecution.nonGitWriteDefault}。创建/修改 WorkItem 时必须按任务事实显式填写 verificationPolicy 与 workspaceExecutionPolicy：讨论/拆解可 manager_review+read_only_shared；调研证据至少 independent_evidence_review；代码、构建、页面和真实交付提高到 environment_verified；Git 写入按 Harness 默认 isolated_worktree/exclusive_write，非 Git 写入用 exclusive_write。不得把写任务声明成 Manager 自执行。`] : []),
+						...(harness ? [`Harness 新 WorkItem 默认：verification=${harness.verification.defaultWorkItemMode}/${harness.verification.trigger}；Git 写任务 workspace=${harness.workspaceExecution.gitWriteDefault}；非 Git 写任务 workspace=${harness.workspaceExecution.nonGitWriteDefault}。创建/修改 WorkItem 时必须按任务事实显式填写 verificationPolicy 与 workspaceExecutionPolicy：讨论/拆解可 manager_review+read_only_shared；调研证据至少 independent_evidence_review；代码、构建、页面和真实交付提高到 environment_verified；Git 写入按 Harness 默认 isolated_worktree/exclusive_write，非 Git 写入用 exclusive_write。Manager 可以自执行写任务，必须先开始自己的 WorkItem，保留真实 NativeExecution/ChangeSet，并遵守同样的冻结验收策略。`] : []),
 						...(workState.plan ? [`Manager WorkPlan（覆盖 Goal r${workState.plan.coveredGoalRevision}${workState.plan.needsReconcile ? "，必须先对账当前 Goal 契约" : ""}）：\n${planLines.join("\n") || "（全部已验收）"}`] : ["Manager WorkPlan：尚未建立。多步骤、依赖或多 Worker 任务先调用 update_work_plan。"]),
 						`Goal 状态写操作必须串行：一次只调用一个 ${CORE_TOOL_UPDATE_WORK_PLAN}/${CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM}/${CORE_TOOL_REVIEW_WORK_ITEM}/${CORE_TOOL_UPDATE_WORK_STATE}/${CORE_TOOL_ABANDON_GOAL}/${CORE_TOOL_SUPERSEDE_GOAL}，拿到新 revision 后再调用下一个，禁止在同一轮并行提交多个写操作。`,
 						`revision 只能来自本段权威工作上下文或上一个写工具的成功结果，禁止推算、递增猜测或复用委托开始前的 revision。${CORE_TOOL_REVIEW_WORK_ITEM} 必须原样携带当前 WorkItem 的 itemRevision、submissionId 和 Goal epoch；全局 revision 变化但验收目标未变时 Store 会安全对齐，目标或契约变化时必须重新阅读最新 Submission 后再判断。`,
@@ -785,6 +795,10 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 					.getAllTools()
 					.filter((t) => {
 						if (!plan.managed.has(t.name)) return false;
+						if (t.name === CORE_TOOL_DELEGATION) return plan.agents.some(agent => {
+							const searchable = `delegation ${agent.name} ${agentDisplayName(agent)} ${agent.description} ${JSON.stringify(agent.responsibility ?? {})}`.toLowerCase();
+							return tokens.every(token => searchable.includes(token));
+						});
 						const haystack = `${t.name}\n${t.description}`.toLowerCase();
 						return tokens.every((tok) => haystack.includes(tok));
 					})
@@ -952,7 +966,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 		pi.registerTool({
 			name: CORE_TOOL_UPDATE_WORK_PLAN,
 			label: "Update Work Plan",
-			description: "创建或更新当前 Goal 的 WorkItem DAG。验收条件只能从冻结 Goal 条件、步骤产物和下游依赖派生；同时显式分类验证强度和工作区所有权。代码写入优先 isolated_worktree，非 Git 写入使用 exclusive_write，Manager 自己不得写工作区。",
+			description: "创建或更新当前 Goal 的 WorkItem DAG。验收条件只能从冻结 Goal 条件、步骤产物和下游依赖派生；同时显式分类验证强度和工作区所有权。代码写入优先 isolated_worktree，非 Git 写入使用 exclusive_write，Manager 可按同一策略直接执行自己的 WorkItem。",
 			parameters: UpdateWorkPlanParams,
 			async execute(toolCallId, params: Static<typeof UpdateWorkPlanParams>, signal) {
 				await assertManagerNotWaiting(deps);
@@ -1316,7 +1330,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 			name: CORE_TOOL_CREATE_GROUP,
 			label: "Create Group Window",
 			description:
-				"创建多 worker 群聊房间，并把任务作为首条消息直接下达给房间 manager 开跑。需要拆分、并行、交接、裁决的多 worker 协作时使用；单 worker 任务请直接用该 worker 的 delegate 工具。仅 solo 对话可用。",
+				"仅在用户明确要求时创建群聊以限制 Manager 可委派 Worker 范围（至少两位）。task 只用于用户明确要求的首发执行。普通多 Worker 任务不自动建群。仅 solo 对话可用。",
 			parameters: CreateGroupParams,
 			async execute(_toolCallId, params: Static<typeof CreateGroupParams>) {
 				await assertManagerNotWaiting(deps);
@@ -1324,8 +1338,10 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 				const ctx = await deps.resolveContext();
 				if (!ctx) throw new Error("当前 manager Session 不属于任何窗口，不能建群聊");
 				if (ctx.type !== "solo") throw new Error(`${CORE_TOOL_CREATE_GROUP} 仅 solo 对话可用`);
+				if (!explicitGroupMessages.has(params.sourceMessageId)) throw new Error("创建群聊需要当前用户的明确建群请求；普通任务不授予建群权限");
+				if (params.task?.trim() && !explicitStartMessages.has(params.sourceMessageId)) throw new Error("用户未明确要求建群后立即执行；请省略 task");
 				const refs = [...new Set(params.members.map((m) => m.trim()).filter(Boolean))];
-				if (refs.length < 2) throw new Error("群聊至少需要 2 个 worker");
+				if (refs.length < 2) throw new Error("群聊至少需要 2 个可委派 Worker");
 				const memberAgents: AgentConfig[] = [];
 				for (const ref of refs) {
 					const agent = await resolveWorkerRef(deps.store, ref);
@@ -1363,19 +1379,22 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 				});
 				// fire-and-forget 开跑（chat.ts 首发消息同款）：房间 manager 在自己
 				// 窗口里干活，本工具不等执行结果；标题异步生成。
+				if (params.task?.trim()) {
+				const task = params.task.trim();
 				void deps.sessions
 					.open(window.activeSession)
-					.then((session) => session.prompt(params.task))
+					.then((session) => session.prompt(task))
 					.catch((err: unknown) =>
 						deps.log?.(`create_group_window 首发任务失败: ${err instanceof Error ? err.message : String(err)}`),
 					);
-				void deps.sessions.generateSessionTitle(window.activeSession, params.task).catch(() => undefined);
+				void deps.sessions.generateSessionTitle(window.activeSession, task).catch(() => undefined);
+				}
 				const displayName = window.name ?? memberLabels.join("、");
 				return {
 					content: [
 						{
 							type: "text",
-							text: `已创建群聊「${displayName}」（成员：${memberLabels.join("、")}），任务已下达，房间 manager 开始执行。用户可在左侧群聊区查看进度；如需追加指令，让用户直接在群聊窗口里发言。`,
+							text: `已创建群聊「${displayName}」（可委派 Worker：${memberLabels.join("、")}）。${params.task?.trim() ? "已下达用户指定的首条任务。" : "尚未下达任务。"}Manager 负责该对话。`,
 						},
 					],
 					details: { windowId: window.id, members, ...(window.name ? { name: window.name } : {}), roomJump: true },
@@ -1393,6 +1412,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 				await assertManagerNotWaiting(deps);
 				const ctx = await deps.resolveContext();
 				if (ctx?.type !== "group") throw new Error(`${CORE_TOOL_INVITE} 仅在群聊窗口可用`);
+				if (!explicitInviteMessages.has(params.sourceMessageId)) throw new Error("扩大 Worker 范围需要当前用户的明确请求");
 				const window = await deps.store.windowForSession(deps.getSessionId());
 				if (!window || window.type !== "group") throw new Error("当前 Session 不属于群聊窗口");
 				const requested = [...new Set(params.members.map((m) => m.trim()).filter(Boolean))];
@@ -1438,28 +1458,20 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 
 const DelegateParams = Type.Object(
 	{
-		task: Type.String({ description: "委托给该 worker 的任务。" }),
+		workerId: Type.String({ description: "当前 roster 中目标 Worker 的内部 id；必须在可委派范围内。" }),
+		task: Type.String({ description: "此次独立任务与明确提供的材料。不会继承该 Worker 上次上下文。" }),
+		contextRefs: Type.Optional(Type.Array(Type.String(), { description: "本次明确提供的材料路径或结果引用；不隐式导入父委派上下文。" })),
 		workItemId: Type.Optional(Type.String({ description: "当前 Goal WorkPlan 中要推进的 WorkItem id。" })),
 		parentDelegationId: Type.Optional(
-			Type.String({ description: "若这是接力/追问，填写上一次委托返回文本中给出的 delegationId。" }),
-		),
-		handoffKind: Type.Optional(
-			Type.Union([Type.Literal("request"), Type.Literal("followup")], {
-				description: "request=新的有返回义务的子任务；followup=沿 parentDelegationId 继续。",
-			}),
+			Type.String({ description: "仅记录当前会话既有委派的因果引用；不会续接或自动导入其结果、附件或历史。" }),
 		),
 		intent: Type.Optional(Type.String({ description: "本次委托为何是实现 Session Goal 的必要步骤。" })),
 		expectedOutcome: Type.Optional(Type.String({ description: "期望 worker 返回的可验证结果。" })),
 		evidenceRequirements: Type.Optional(Type.Array(Type.String(), { description: "结果必须附带的证据。" })),
 		completionBoundary: Type.Optional(Type.String({ description: "本次子任务何时算完成。" })),
-		session: Type.Optional(
-			Type.Union([Type.Literal("new"), Type.Literal("continue")], {
-				description:
-					'"continue"（默认）续接该窗口中该 worker 的会话；任务与现有会话无关时传 "new" 新开会话。',
-			}),
-		),
+
 	},
-	{ description: "把任务委托给这个 worker 并返回最终结果。" },
+	{ additionalProperties: false, description: "一次 fresh 委派；结果只回原会话。" },
 );
 
 type DelegateInput = Static<typeof DelegateParams>;
@@ -1489,35 +1501,28 @@ async function resolveDirectWindowForDelegation(
  * 没有 agent 字段，无法改投其他 Agent；启用状态与成员关系由 AgentInvoker
  * 入口二次校验。
  */
-function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps): (pi: ExtensionAPI) => void {
-	const solo = !deps.ctx || deps.ctx.type === "solo";
-
-	const baseDescription = [
-		`把任务委托给 worker「${agentDisplayName(agent)}」（${agent.responsibility?.identity ? `${agent.responsibility.identity}；` : ""}${agent.description || "无描述"}）并返回最终结果。`,
-		agent.responsibility
-			? `责任领域：${agent.responsibility.domain}；负责：${agent.responsibility.owns.join("、") || "未细分"}；不负责：${agent.responsibility.excludes.join("、") || "未声明"}。`
-			: "",
-		"当用户的请求属于这个 worker 的职责时使用，不要自己动手执行。",
-		"当 worker 需要审批才能继续时，结果会报告一个待处理的审批；不要重试任务——审批卡会处理它。",
-		MANAGER_HUMAN_WAIT_INSTRUCTION,
-	].filter(Boolean).join(" ");
-
+function agentDelegationFactory(agents: AgentConfig[], deps: ManagerExtensionDeps): (pi: ExtensionAPI) => void {
+	const baseDescription = "委派一次独立 Worker 任务并返回结果，每次调用创建 fresh 上下文。通过 workerId 选择当前 roster 成员；需要持续单独处理时使用独立会话/快照 fork。审批恢复原调用，不重跑任务。";
 	return (pi) => {
 		pi.registerTool({
-			name: delegateToolName(agent.name),
-			label: `${agentDisplayName(agent)} · 委托`,
-			get description() {
-				if (!solo) return baseDescription;
-				return [
-					baseDescription,
-					"当前是 solo 对话：派活会自动路由到该 worker 的单聊窗口（没有则自动创建），并把任务与结果同步到该单聊的消息流。",
-					'参数 `session`：默认 "continue" 只续接当前房间 Session 与该 worker 的上下文；任务与当前对话无关时传 "new"。单聊窗口仅镜像任务与结果。',
-				].join(" ");
-			},
-			parameters: DelegateParams,
+			name: CORE_TOOL_DELEGATION,
+			label: "Delegation",
+			description: baseDescription + " 可选 Worker：" + agents.map(agent => `${agent.name}（${agentDisplayName(agent)}）：${agent.description}`).join("；"),
+			parameters: { ...DelegateParams, properties: { ...DelegateParams.properties, workerId: Type.String({ enum: agents.map(agent => agent.name) }) } },
 			async execute(toolCallId, params: DelegateInput, signal, onUpdate) {
-				await assertManagerNotWaiting(deps);
 				const sessionId = deps.getSessionId();
+				const requestHash = createHash("sha256").update(JSON.stringify([params.workerId, params.task, params.workItemId ?? null, params.parentDelegationId ?? null, params.contextRefs ?? [], params.intent ?? null, params.expectedOutcome ?? null, params.evidenceRequirements ?? [], params.completionBoundary ?? null])).digest("hex");
+				const existing = await deps.invoker.toolCallRecord(sessionId, toolCallId);
+				if (existing) {
+					if (existing.requestHash !== requestHash) throw new Error("delegation_call_conflict: 同一工具调用内容不同");
+					const result = await deps.invoker.replayToolCall(existing);
+					const projection = await projectDelegationResult({ delegationId: result.delegationId, rootDelegationId: existing.id, toolCallId, worker: String(result.details.worker ?? existing.agentId), status: result.status, content: result.content, details: result.details }, deps.largeResults, deps.productSettings);
+					return { content: [{ type: "text", text: projection.text }], details: projection.details, isError: ["failed", "cancelled", "observation_lost"].includes(result.status) };
+				}
+				await assertManagerNotWaiting(deps);
+				const agent = await deps.store.getAgent(params.workerId);
+				const context = await deps.resolveContext();
+				if (!agent || !eligibleWorkers(await deps.store.listAgents(), context).some(candidate => candidate.name === agent.name)) throw new Error("worker_out_of_scope: Worker 不在当前可委派范围内");
 				const goal = deps.workStates ? await deps.workStates.getActive(sessionId) : undefined;
 				if (goal && !params.workItemId) {
 					if (goal.execution.status === "interrupted") throw new Error("当前 Goal 已暂停：若要继续旧目标请先恢复；若新任务取代旧目标，请先调用 supersede_session_goal；若旧目标不再继续，请调用 abandon_session_goal");
@@ -1531,47 +1536,17 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 				if (goal && (!params.intent?.trim() || !params.expectedOutcome?.trim() || !params.completionBoundary?.trim())) {
 					throw new Error("Goal Session 的委托必须声明 intent、expectedOutcome 与 completionBoundary，避免无因果派活。");
 				}
-				if (params.handoffKind === "followup" && !params.parentDelegationId) {
-					throw new Error("followup 委托必须填写 parentDelegationId");
-				}
-				// 撤权前置校验（执行期重读，AgentInvoker 入口还有第二道）：
-				// 禁用/删除的 Agent 不能发起新委托，也不为它自动创建单聊窗口。
-				const fresh = await deps.store.getAgent(agent.name);
-				if (!fresh || fresh.enabled === false) {
-					throw new Error(`worker「${agent.name}」不存在或已被禁用，委托被拒绝。`);
-				}
 				const window = await deps.store.windowForSession(sessionId);
-				// Sessions outside any window behave like solo: the task routes to
-				// the worker's direct window (auto-created if missing).
-				const isSoloContext = !window || window.type === "solo";
-				if (!isSoloContext && !window.members.includes(agent.name)) {
-					throw new Error(`worker「${agent.name}」不在当前窗口的成员中，委托被拒绝。`);
-				}
-
-				// §4.1: solo tasks execute in the worker's direct window for visibility,
-				// while continuation remains owned by this source manager Session.
-				let targetWindow = window;
-				if (isSoloContext) {
-					if (!window) throw new Error("当前 manager Session 不属于任何窗口，不能派活");
-					const workspaceId = window.workspaceId;
-					const cwd = await deps.store.workspaceFor(window.id);
-					targetWindow = await resolveDirectWindowForDelegation(deps, agent.name, workspaceId, cwd);
-				}
-
-				deps.log?.(`${delegateToolName(agent.name)}: ${sessionId} → ${agent.name} (task len ${params.task.length})`);
-
-				const taskId = toolCallId || randomUUID();
-				// §4.4 派活即镜像：delegate 阻塞期间 direct 窗口先出现 running 态
-				// 指派卡；结果/审批卡由 syncToWindow 在 outcome 后补写。
-				if (isSoloContext && targetWindow) {
-					await announceToWindow(deps, targetWindow, taskId, agent.name, params.task);
-				}
+				if (!window) throw new Error("当前 manager Session 不属于任何窗口，不能派活");
+				const targetWindow = window;
+				const taskId = toolCallId;
+				if (!taskId) throw new Error("delegation requires a real toolCallId");
 				let mirroredDelegation = false;
 				let mirroredProcess = false;
 				let projectedRunning = false;
 				const scoped = new ScopedAgentInvoker(agent.name, deps.invoker);
 				const result = await scoped.delegate({
-					message: params.task,
+					message: params.contextRefs?.length ? `${params.task}\n\n显式材料引用：\n${params.contextRefs.join("\n")}` : params.task,
 					windowId: targetWindow?.id ?? "",
 					managerSessionId: sessionId,
 					managerToolCallId: taskId,
@@ -1585,12 +1560,14 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 					contractHash: goal?.plan && workItem ? workItemContractHash(goal, goal.plan, workItem) : undefined,
 					workspaceExecutionPolicy: workItem?.workspaceExecutionPolicy,
 					parentDelegationId: params.parentDelegationId,
-					handoffKind: params.handoffKind ?? (params.parentDelegationId ? "followup" : "request"),
+					handoffKind: "request",
+					invocationKind: "manager_tool",
+					requestHash,
 					intent: params.intent,
 					expectedOutcome: params.expectedOutcome,
 					evidenceRequirements: workItem?.acceptanceCriteria ?? params.evidenceRequirements,
 					completionBoundary: params.completionBoundary,
-					mode: params.session === "new" ? "run" : "continue",
+					mode: "run",
 					signal,
 					onUpdate: (content, details) => {
 						const updateDetails = details as { delegationId?: string; sessionHandle?: string } | undefined;
@@ -1625,22 +1602,9 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 							agent.name,
 							params.task,
 							runningDetails,
-							isSoloContext ? "solo" : "group",
+							"group",
 						);
-						if (isSoloContext) {
-							// The visible mirror belongs to the worker direct window, but the
-							// originating solo manager tool card also needs durable process
-							// metadata so a session switch does not erase its drawer entry.
-							void appendManagerRunningProjection(
-								deps,
-								sessionId,
-								targetWindow.id,
-								taskId,
-								agent.name,
-								params.task,
-								runningDetails,
-							);
-						}
+
 					},
 				});
 
@@ -1684,108 +1648,9 @@ function agentDelegationFactory(agent: AgentConfig, deps: ManagerExtensionDeps):
 						deps.log?.(`ignored stale Goal epoch callback for Delegation ${result.delegationId}`);
 					}
 				}
-				// §4.4: mirror into the direct window's message stream. Best-effort —
-				// a busy target session yields synced:false instead of blocking.
-				const sync = async (
-					status: string,
-					text: string,
-					interaction?: { interactionId: string; kind?: "permission" | "question" | "confirmation"; revision?: number; requests?: unknown[] },
-					extraDetails?: Record<string, unknown>,
-				): Promise<boolean> => {
-					if (!isSoloContext || !targetWindow) return false;
-					const ok = await syncToWindow(
-						deps,
-						targetWindow,
-						taskId,
-						agent.name,
-						status,
-						text,
-						interaction,
-						{
-							delegationId: result.delegationId,
-							sessionHandle: result.sessionHandle,
-							processView: true,
-							...(goal ? { goalId: goal.goalId } : {}),
-							...extraDetails,
-						},
-					);
-					return ok;
-				};
-				const soloMeta = async (
-					status: string,
-					text: string,
-					interaction?: { interactionId: string; kind?: "permission" | "question" | "confirmation"; revision?: number; requests?: unknown[] },
-					extraDetails?: Record<string, unknown>,
-				) => {
-					if (!isSoloContext || !targetWindow) return {};
-					const synced = await sync(status, text, interaction, extraDetails);
-					return { taskId, windowId: targetWindow.id, synced };
-				};
-				const syncNote = (synced: boolean | undefined) =>
-					synced === undefined
-						? ""
-						: synced
-							? `\n\n（已同步到与 ${agent.name} 的单聊）`
-							: `\n\n（未能同步到与 ${agent.name} 的单聊：对方会话忙碌）`;
-
-				// HITL（§6.2）：needs_input 时保存待处理 Interaction，返回“等待审批”
-				// 结构；宿主在工具结果落盘后停止本轮，绝不指导它重跑任务。
-				if (result.status === "needs_input" || result.status === "conflict") {
-					const text = `${result.content}\n\n${MANAGER_HUMAN_WAIT_INSTRUCTION}`;
-					const interaction =
-						result.interactionId && result.status === "needs_input"
-							? {
-									interactionId: result.interactionId,
-									kind: (picked as { kind?: "permission" | "question" | "confirmation" }).kind,
-									revision: (picked as { revision?: number }).revision,
-									requests: (picked as { requests?: unknown[] }).requests,
-								}
-							: undefined;
-					const extra = await soloMeta(result.status, text, interaction);
-					return {
-						content: [{ type: "text", text: `${text}${syncNote(extra.synced as boolean | undefined)}` }],
-						details: { ...meta, ...picked, ...extra },
-					};
-				}
-
-				if (result.status === "failed") {
-					const text = result.content;
-					// The Delegation/Receipt is already terminal.  End the manager tool
-					// immediately so pi persists the failing toolResult; mirroring that
-					// result into a possibly-busy worker direct Session is best-effort UI
-					// work and must not keep the source card falsely "running".
-					void soloMeta("failed", text);
-					throw new Error(text);
-				}
-
-				const projection = result.delegationId && deps.largeResults && deps.productSettings
-					? await deps.largeResults.project(result.delegationId, result.content, (await deps.productSettings.get()).harness.workerResults)
-					: {
-							text: truncate(result.content),
-							offloaded: result.content.length > MAX_RESULT_CHARS,
-							originalChars: result.content.length,
-							estimatedTokens: Math.ceil(result.content.length / 4),
-							delegationId: result.delegationId ?? "",
-							estimation: "ceil(chars/4)" as const,
-						};
-				const text = projection.text;
-				// §15.6 接力：交付物清单附在结果文本末尾（传路径不传内容），
-				// details 里已有结构化 artifacts（invoker 投影），供 manager 在
-				// 接力任务文本中按路径引用。
-				const artifacts = (picked as { artifacts?: Array<{ name: string; path: string }> }).artifacts;
-				const artifactNote = artifacts?.length
-					? `\n\n交付物（可在接力任务中按路径引用）：\n${artifacts.map((a) => `- ${a.name}：${a.path}`).join("\n")}`
-					: "";
-				// delegationId 必须进正文：details 只给 UI，模型看不到，没有它
-				// followup 只能瞎填（实测填过工具名）。
-				const delegationNote = result.delegationId
-					? `\n\n（delegationId：${result.delegationId}——需要该 worker 接力/追问时，用 handoffKind="followup" 并把它填进 parentDelegationId）`
-					: "";
-				const extra = await soloMeta(result.status, projection.text, undefined, picked.usage ? { usage: picked.usage } : undefined);
-				return {
-					content: [{ type: "text", text: `${text}${artifactNote}${delegationNote}${syncNote(extra.synced as boolean | undefined)}` }],
-					details: { ...meta, ...picked, ...extra, largeResult: projection },
-				};
+				if (result.delegationId) await deps.invoker.prepareTerminalDelivery(result.delegationId);
+				const projection = await projectDelegationResult({ delegationId: result.delegationId, toolCallId: taskId, worker: agent.name, status: result.status, content: result.content, details: { ...meta, ...picked } }, deps.largeResults, deps.productSettings);
+				return { content: [{ type: "text", text: projection.text }], details: projection.details, isError: ["failed", "cancelled", "observation_lost"].includes(result.status) };
 			},
 		});
 	};

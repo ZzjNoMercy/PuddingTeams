@@ -134,11 +134,11 @@ function ManagerFields({
 				<div className="flex flex-col gap-1">
 					<label className="agent-config-field">
 						<span>代码搜索</span>
-						<Select value={draft.manager.codeSearch ?? "off"} onValueChange={(value) => onChange({ manager: { ...draft.manager, codeSearch: value as PiManagerSettings["codeSearch"] } })}>
-							<SelectTrigger className="w-full"><SelectValue placeholder="关闭（默认）" /></SelectTrigger>
-							<SelectContent><SelectItem value="off">关闭（默认）</SelectItem><SelectItem value="builtin">Pi 内置 grep/find</SelectItem><SelectItem value="fff">FFF Workspace 索引</SelectItem></SelectContent>
+						<Select value={draft.manager.codeSearch ?? "builtin"} onValueChange={(value) => onChange({ manager: { ...draft.manager, codeSearch: value as PiManagerSettings["codeSearch"] } })}>
+							<SelectTrigger className="w-full"><SelectValue placeholder="Pi 内置 grep/find（默认）" /></SelectTrigger>
+							<SelectContent><SelectItem value="off">关闭</SelectItem><SelectItem value="builtin">Pi 内置 grep/find（默认）</SelectItem><SelectItem value="fff">FFF Workspace 索引</SelectItem></SelectContent>
 						</Select>
-						<small>仅 Solo Manager 生效；Direct/Group relay 始终关闭搜索。</small>
+						<small>Solo 与群聊 Manager 生效；Worker 单聊按自己的配置执行。</small>
 					</label>
 					<ToggleRow
 						label="启用内置工具"
@@ -227,7 +227,7 @@ export function ModelSection({
 					<span>代码搜索</span>
 					<Select value={draft.codeSearch} onValueChange={(value) => onChange({ codeSearch: value as ConfigDraft["codeSearch"] })}>
 						<SelectTrigger className="w-full"><SelectValue placeholder="继承 Harness 默认" /></SelectTrigger>
-						<SelectContent><SelectItem value="inherit">继承 Harness 默认</SelectItem><SelectItem value="builtin">Pi 内置 grep/find</SelectItem><SelectItem value="fff">FFF Workspace 索引</SelectItem></SelectContent>
+						<SelectContent><SelectItem value="inherit">继承 Harness 默认</SelectItem><SelectItem value="builtin">Pi 内置 grep/find（默认）</SelectItem><SelectItem value="fff">FFF Workspace 索引</SelectItem></SelectContent>
 					</Select>
 					<small>FFF 只索引当前已信任 Workspace，并按 Workspace 独立保存状态。</small>
 				</label>

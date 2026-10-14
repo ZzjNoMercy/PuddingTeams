@@ -306,7 +306,7 @@ function CreateAgentDialog({
 					<label className="worker-create-field">
 						<span className="worker-create-label">标识（可选）</span>
 						<Input value={identifier} onChange={(e) => setIdentifier(e.target.value)} placeholder="留空按名称自动生成" className="font-mono" />
-						<span className="worker-create-hint">内部 id（字母/数字/连字符），创建后不可改；委托工具名为 agent_&lt;标识&gt;__delegate。</span>
+						<span className="worker-create-hint">内部 id（字母/数字/连字符），创建后不可改；Manager 通过 delegation 的 workerId 选择它。</span>
 					</label>
 					<label className="worker-create-field">
 						<span className="worker-create-label">描述</span>

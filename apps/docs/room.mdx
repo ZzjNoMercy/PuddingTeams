@@ -3,13 +3,16 @@ title: 协作模式
 description: solo、单聊和群聊分别由谁接收消息、怎样续接和何时使用。
 ---
 
+> 会话收敛 P3：Pi Worker 单聊使用自己的原生会话；Manager delegation 是独立单次任务。运行中追加走 SDK followUp/steer，持续接力可以 Fork 已提交对话快照。其他 Connector 保留原直派通道。
+
+
 <Status>1.0 STABLE</Status>
 
 PuddingTeams 把侧栏里的持续关系称为 Window。协作模式不由界面风格决定，而由一个更基本的问题决定：**用户的这条消息应该由谁先理解，是否需要路由，以及结果应回到哪段持续会话。**
 
 | 模式 | 成员 | 首个接收者 | 适合 |
 | --- | --- | --- | --- |
-| solo | 用户 + pi Manager | Manager | 自由讨论、跨 Agent 路由、自动组队 |
+| solo | 用户 + pi Manager | Manager | 自由讨论、原生执行、跨 Agent 委派 |
 | 单聊 direct | 用户 + 1 个 Worker | 唯一 Worker | 与同一 Agent 持续工作，不需要二次路由 |
 | 群聊 group | 用户 + Manager + 2 个以上 Worker | Manager | 多角色拆分、并行、接力和统一验收 |
 
@@ -17,33 +20,33 @@ PuddingTeams 把侧栏里的持续关系称为 Window。协作模式不由界面
 
 Solo 是全局置顶单例，不可删除。Manager 每轮看到全部已启用 Worker 的最新路由卡，包括描述、责任边界、能力事实和真实可用的委托工具。
 
-当任务适合一个 Worker 时，Manager 发起 Delegation，并把派活和结果镜像到该 Worker 的单聊窗口。没有对应单聊时平台自动创建；这让后台委托仍然拥有一个可继续对话的归属窗口。
+Manager 可以直接使用原生工具，也可以用 delegation 向 Worker 委派一次任务。每次独立执行，任务、结果和审批只归当前 Manager 对话；过程通过 delegationId 查询。
 
-当任务需要两个以上 Worker，或存在明显的跨 Worker 接力时，Manager 可以创建群聊并把整体任务交给群聊继续执行，而不是在 solo 里充当人工复制粘贴中间结果的中转站。
+多 Worker 工作可以在当前 solo 完成。只有用户明确要求限制 Worker 范围时才创建群聊，至少选择两位；建群不默认执行首条任务。
 
 Solo 适合“我知道目标，但不想先决定用谁”。如果你已经知道只需要某个 Worker，直接打开单聊更短。
 
 ## 单聊
 
-单聊是**纯 Worker 通道**。用户消息由服务端直接派给窗口唯一 Worker，不经过 Manager relay，也不再做 Agent 选择。
+Pi Worker 单聊由 Worker 自己负责，模型、指令、工具和 MCP 使用它的配置，历史和执行共用一段原生对话。它不获得 Manager 的委派和 Goal 控制权限。内置 Wiki 使用受限知识工具；其他 Connector 本阶段仍使用原直派通道。
 
-这带来几条明确边界：
+同一 Worker/Workspace 保持一个 Window，其中可以新建多段对话。切换项目打开目标项目的窗口，保留原历史。负责人停用或删除后，旧对话保留只读。
 
-- 同一个 Worker 在同一 Workspace 只有一个单聊 Window；重复发起会打开该项目已有窗口；
-- Worker 的 `sessionHandle` 由 Window binding 保存，用于后续 `continue`；
-- 单聊不提供群聊协作提示词；Worker 行为由自己的运行指令或上游配置决定；
-- HITL 交互、结果和执行过程直接回到当前单聊；
-- 单聊也可以设置 Session Goal，但没有 Manager WorkPlan，不伪造一层不存在的 Manager Todo。
+## 运行中追加与 Fork
 
-Workspace 是单聊 Window 身份的一部分。切换项目会打开该 Worker 在目标项目的已有窗口或创建新窗口，不会覆盖当前窗口。Workspace、cwd 快照或 Agent 修订不一致时，Runtime 拒绝直接续接旧 binding。
+Pi 原生对话运行中可继续输入，默认追加为 followUp；“调整执行方向”将下一条作为 steer 投递。SDK 在合适的执行边界消费它；steer 不承诺立即打断工具。等待审批时追加只入队，不能代替回答审批卡。
+
+“已受理并排队”表示输入尚未落成模型对话。未消费输入不保证跨重启恢复；无法核对时界面保留未知状态，不能自动重发。停止会清除队列并保留附件。其他 Connector 运行中不支持这两种投递。
+
+对话菜单的“Fork 到 Worker”复制当前已提交分支为独立快照，在当前 Worker 范围内选择支持导入的目标。目标创建一段新对话，采用自己的配置并沿用项目目录；不会自动开始任务。历史工具只供阅读，活动 Goal 和审批权限不复制。来源删除后，快照附件仍可读。执行中、等待审批、有未消费输入或超出导入预算时，先完成或停止并核对来源对话。
 
 ## 群聊
 
-群聊包含 Manager 和两个以上 Worker。用户仍对一个对话窗口发言，由 Manager 在当前成员集合内拆分、并行、接力、裁决和汇总。
+群聊由 Manager 负责，是用户对可委派 Worker 范围的配置。创建与成员编辑都必须至少选择两位不同的有效 Worker；成员停用导致可用范围减少时，它仍是 Manager 对话。Manager 可以直接使用 Pi 原生工具执行工作，也可以在有效范围内委派。人数不会让群聊自动变成 Worker 单聊。
 
 群聊可以配置一段只给 Manager 的“群聊协作提示词”，用于说明分工方式、交接规则或汇总格式。它不会传给 Worker，也不能替代每个 Worker 自己的运行指令。
 
-Manager 可以在执行中邀请新的已启用 Worker。删除成员、删除房间等会影响运行中任务的动作仍由用户显式操作。
+只有用户明确要求时，Manager 才能邀请 Worker 扩大范围或创建新群。用户在创建窗口时明确选择 Worker 单聊或 Manager 群聊；普通多 Worker 工作不会自动建群。范围收缩阻止新委派，原调用和审批仍按已接单契约处理。
 
 ## Window 与 Session 不是同一个对象
 
@@ -52,12 +55,12 @@ Window：一段长期关系
   ├─ 成员与类型
   ├─ 当前 Workspace 与协作配置
   ├─ Solo 离开项目的 parked contexts
-  ├─ Worker bindings
+  ├─ 持久的 Session 负责人和快照来源
   └─ 多个 Session
 
 Session：Window 中的一段连贯对话
   ├─ 消息历史
-  ├─ 可选的活动 Goal
+  ├─ Manager 的可选活动 Goal
   └─ 相关 Delegation / Decision / Artifact
 ```
 
@@ -65,20 +68,11 @@ Session：Window 中的一段连贯对话
 
 ## 一次委托怎样流动
 
-```text
-用户消息
-  → solo/group Manager 或 direct Worker
-  → Agent Runtime 创建 Delegation
-  → Driver run / continue
-  → progress / input_required / completed / failed
-  → 当前 Window 消息流 + 执行 Inspector
-```
-
-对 solo 委托，执行归属和展示归属可以不同：任务在 Worker 的 direct Window 绑定下续接，但 solo Session 仍保留委托卡和跳转入口。平台用明确的 Delegation ID 连接两边，不按“窗口看起来像谁”猜测执行事实。
+Manager 的 delegation 创建独立 Worker 调用，结果和审批回原 Manager Session，过程按 delegationId 查询。调用不会自动创建 Worker 单聊，也不向另一段对话复制结果。需要持续 Worker 对话时，打开它的原生单聊，或从 Manager 的已提交对话 Fork。
 
 ## 怎样选择
 
 - 任务对象未知或可能需要多 Agent：用 solo。
 - 已经明确某个 Agent，想保持连续上下文：用单聊。
-- 需要多个专业角色共享目标、依赖和验收：用群聊。
+- 希望限制 Manager 可选择的 Worker 范围：用群聊，至少选择两位 Worker。
 - 只是临时并发几个无关联请求：分别使用单聊，不必人为制造群聊。

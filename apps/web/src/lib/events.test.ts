@@ -15,7 +15,7 @@ test("历史回放保留 running 投影里的 Delegation 与执行过程入口",
 	const messages = [
 		{
 			role: "assistant",
-			content: [{ type: "toolCall", id: "call-1", name: "agent_pi-b__delegate", arguments: { task: "检查前端" } }],
+			content: [{ type: "toolCall", id: "call-1", name: "delegation", arguments: { workerId: "pi-b", task: "检查前端" } }],
 			timestamp: 1,
 		},
 		{
@@ -29,7 +29,7 @@ test("历史回放保留 running 投影里的 Delegation 与执行过程入口",
 		{
 			role: "toolResult",
 			toolCallId: "call-1",
-			toolName: "agent_pi-b__delegate",
+			toolName: "delegation",
 			content: [{ type: "text", text: "上游限流" }],
 			isError: true,
 			timestamp: 3,
@@ -186,15 +186,15 @@ test("延迟 HTTP 历史响应重放请求期间的 WS 失败事件，不覆盖�
 test("实时 tool 终态不会抹掉先到的执行过程元数据", () => {
 	let rendered = renderHistory([{
 		role: "assistant",
-		content: [{ type: "toolCall", id: "call-live", name: "agent_pi-b__delegate", arguments: { task: "检查前端" } }],
+		content: [{ type: "toolCall", id: "call-live", name: "delegation", arguments: { workerId: "pi-b", task: "检查前端" } }],
 		timestamp: 1,
 	}] as unknown as PiMessage[]);
-	rendered = reducePiEvent(rendered, { type: "tool_execution_start", toolCallId: "call-live", toolName: "agent_pi-b__delegate", args: { task: "检查前端" } });
+	rendered = reducePiEvent(rendered, { type: "tool_execution_start", toolCallId: "call-live", toolName: "delegation", args: { workerId: "pi-b", task: "检查前端" } });
 	rendered = reducePiEvent(rendered, {
-		type: "tool_execution_update", toolCallId: "call-live", toolName: "agent_pi-b__delegate",
+		type: "tool_execution_update", toolCallId: "call-live", toolName: "delegation",
 		partialResult: { content: [{ type: "text", text: "运行中" }], details: { delegationId: "D-live", processView: true, status: "running" } },
 	});
-	rendered = reducePiEvent(rendered, { type: "tool_execution_end", toolCallId: "call-live", toolName: "agent_pi-b__delegate", isError: true, result: "429" });
+	rendered = reducePiEvent(rendered, { type: "tool_execution_end", toolCallId: "call-live", toolName: "delegation", isError: true, result: "429" });
 	const call = rendered[0]?.toolCalls[0];
 	assert.equal(call?.status, "error");
 	assert.deepEqual(call?.details, { delegationId: "D-live", processView: true, status: "failed" });
@@ -203,7 +203,7 @@ test("实时 tool 终态不会抹掉先到的执行过程元数据", () => {
 test("结果先到、富化指派后到时仍补齐执行过程入口", () => {
 	let rendered = renderHistory([{
 		role: "assistant",
-		content: [{ type: "toolCall", id: "call-race", name: "agent_pi-b__delegate", arguments: { task: "检查前端" } }],
+		content: [{ type: "toolCall", id: "call-race", name: "delegation", arguments: { workerId: "pi-b", task: "检查前端" } }],
 		timestamp: 1,
 	}] as unknown as PiMessage[]);
 	rendered = reducePiEvent(rendered, {
@@ -340,4 +340,20 @@ test("恢复轮次允许同一整理任务续跑，历史和实时投影均拒�
 		assert.equal(messages.length, 1);
 		assert.deepEqual(messages[0]?.details, { jobId: "resumed-job", status: "pending_review", recoveryRevision: 1 });
 	}
+});
+
+
+test("P2 阶段工具结果与终态事件在历史/实时均归并一张 delegation 卡；wake 隐藏", () => {
+ const base = [
+  { role: "assistant", content: [{ type: "toolCall", id: "call", name: "delegation", arguments: { workerId: "alpha", task: "一次任务" } }], timestamp: 1 },
+  { role: "toolResult", toolCallId: "call", toolName: "delegation", content: [{ type: "text", text: "等待批准" }], details: { delegationId: "root", status: "needs_input", worker: "alpha" }, isError: false, timestamp: 2 },
+ ] as unknown as PiMessage[];
+ const terminal = { role: "custom", customType: "pudding:task_result", content: "独立终态内容", display: true, details: { toolCallId: "call", delegationId: "replacement", rootDelegationId: "root", status: "completed", worker: "beta" }, timestamp: 3 } as unknown as PiMessage;
+ const wake = { role: "custom", customType: "pudding:delegation_wake", content: "恢复处理", display: false, details: { terminalEventId: "event", hidden: true }, timestamp: 4 } as unknown as PiMessage;
+ for (const rendered of [renderHistory([...base, terminal, wake]), reducePiEvent(reducePiEvent(renderHistory(base), { type: "message_start", message: terminal }), { type: "message_start", message: wake })]) {
+  assert.equal(rendered.filter(message => message.customType === "pudding:task_result" || message.customType === "pudding:delegation_wake").length, 0);
+  const calls = rendered.flatMap(message => message.toolCalls); assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.result, "独立终态内容"); assert.equal((calls[0]!.details as { status: string }).status, "completed");
+  assert.equal((calls[0]!.details as { rootDelegationId: string }).rootDelegationId, "root");
+ }
 });

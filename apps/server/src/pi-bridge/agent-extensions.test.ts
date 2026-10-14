@@ -132,7 +132,7 @@ function mockPi() {
 			handlers.set(event, list);
 		},
 		registerTool(def: ToolDefinition) {
-			tools.set(def.name, def);
+			tools.set(def.name, def.name === "delegation" ? { ...def, execute: (id, params, signal, onUpdate, ctx) => def.execute(id, { workerId: "alpha", ...(params as Record<string, unknown>) }, signal, onUpdate, ctx) } : def);
 		},
 		getActiveTools: () => [...active],
 		getAllTools: () =>
@@ -186,10 +186,10 @@ test("Phase4: 窗口内只有成员的工具可见（direct 非成员 Agent 不�
 	const directCtx: ManagerWindowContext = { type: "direct", members: ["alpha"] };
 	const plan = await planManagerTools(teams, catalog, directCtx);
 	assert.ok(plan.managed.has(delegateToolName("alpha")), "成员的委托工具必须在工具集中");
-	assert.ok(!plan.managed.has(delegateToolName("beta")), "非成员 Agent 的工具不得出现在该窗口工具集");
+	assert.deepEqual(plan.agents.map(agent => agent.name), ["alpha"]);
 	assert.ok(plan.active.has(delegateToolName("alpha")), "direct 默认激活该 Agent 的基础委托工具");
 	assert.deepEqual(
-		[...plan.active].filter((n) => !n.startsWith("agent_")),
+		[...plan.active].filter((n) => !n.startsWith("agent_") && n !== "delegation"),
 		[
 			CORE_TOOL_SEARCH,
 			CORE_TOOL_READ_DELEGATION_RESULT,
@@ -214,7 +214,7 @@ test("Phase4: 窗口内只有成员的工具可见（direct 非成员 Agent 不�
 	assert.ok(tools.has(delegateToolName("alpha")));
 	assert.ok(tools.has(CORE_TOOL_SEARCH));
 	assert.ok(!tools.has("list_agents"), "roster 不做成工具（由 prompt 注入取代）");
-	assert.ok(!tools.has(delegateToolName("beta")), "非成员 Agent 的工具不得注册进 manager Session");
+	assert.deepEqual((tools.get("delegation")!.parameters as { properties: { workerId: { enum: string[] } } }).properties.workerId.enum, ["alpha"], "统一工具仅列当前成员");
 	assert.deepEqual([...tools.keys()].sort(), [...plan.managed].sort());
 });
 
@@ -239,7 +239,7 @@ test("Phase4: 激活策略——委托工具全窗口默认激活，capability �
 	];
 	assert.deepEqual(
 		[...group.active],
-		[...core, CORE_TOOL_INVITE, delegateToolName("alpha"), delegateToolName("beta")],
+		[...core, CORE_TOOL_INVITE, "delegation"],
 		"group 默认激活 core + 拉人工具 + 成员委托工具（省掉 search 轮次）",
 	);
 
@@ -249,22 +249,13 @@ test("Phase4: 激活策略——委托工具全窗口默认激活，capability �
 	assert.ok(solo.managed.has(delegateToolName("alpha")) && solo.managed.has(delegateToolName("beta")));
 	assert.deepEqual(
 		[...solo.active],
-		[
-			...core,
-			CORE_TOOL_CREATE_GROUP,
-			delegateToolName("alpha"),
-			delegateToolName("beta"),
-			delegateToolName("claude-code"),
-			delegateToolName("codex"),
-			delegateToolName("pi-b"),
-			delegateToolName("wiki"),
-		],
+		[...core, CORE_TOOL_CREATE_GROUP, "delegation"],
 	);
 
 	// 禁用 beta 后掉出 roster（装配期即不可见）。
 	await teams.setEnabled("beta", false);
 	const after = await planManagerTools(teams, catalog, { type: "group", members: ["alpha", "beta"] });
-	assert.ok(!after.managed.has(delegateToolName("beta")), "禁用的 Agent 工具不得出现在工具集中");
+	assert.deepEqual(after.agents.map(agent => agent.name), ["alpha"], "禁用成员不得进入 Worker 范围");
 });
 
 test("Phase4: 专属 Capability Extension 按绑定装配并使用命名空间", async () => {
@@ -380,7 +371,7 @@ test("Phase4: 非成员窗口的委托被 Invoker 成员校验拒绝", async () 
 	);
 });
 
-test("委托结果正文携带 delegationId，followup 凭它接力成功", async () => {
+test("委托结果正文携带 delegationId，后续独立委派仅保留因果引用", async () => {
 	const teams = await makeTeams([agentConfig("alpha")]);
 	const invoker = await makeInvoker(teams, "alpha");
 	const catalog = new ExtensionCatalog();
@@ -398,13 +389,13 @@ test("委托结果正文携带 delegationId，followup 凭它接力成功", asyn
 	const first = await tool.execute("call-1", { task: "第一步" }, undefined, undefined, {} as ExtensionToolContext);
 	const firstText = (first.content[0] as { text?: string }).text ?? "";
 	// details 里的 delegationId 模型看不到，正文必须带一份，否则 followup 只能瞎填。
-	const m = /delegationId：([0-9a-f-]+)/.exec(firstText);
+	const m = /delegationId=([0-9a-f-]+)/.exec(firstText);
 	assert.ok(m, `委托结果正文必须携带 delegationId：${firstText}`);
 	assert.equal((first.details as { delegationId?: string }).delegationId, m![1]);
 
 	const second = await tool.execute(
 		"call-2",
-		{ task: "接力继续", handoffKind: "followup", parentDelegationId: m![1] },
+		{ task: "独立后续任务", parentDelegationId: m![1] },
 		undefined,
 		undefined,
 		{} as ExtensionToolContext,
@@ -507,6 +498,8 @@ test("solo 委托的启动前失败先结束 manager 工具，不被单聊镜像
 			waitingInput: false,
 		}),
 		delegationsForManagerSession: async () => [],
+		prepareTerminalDelivery: async () => {},
+		toolCallRecord: async () => undefined,
 	} as unknown as AgentInvoker;
 
 	let mirrorStarted = false;
@@ -548,26 +541,19 @@ test("solo 委托的启动前失败先结束 manager 工具，不被单聊镜像
 		undefined,
 		{} as ExtensionToolContext,
 	);
-	await assert.rejects(
-		Promise.race([
-			execute,
-			new Promise<never>((_resolve, reject) =>
-				setTimeout(() => reject(new Error("manager tool remained running")), 250),
-			),
-		]),
-		/Connector 无法强制只读/,
-	);
-	await new Promise<void>((resolve) => setImmediate(resolve));
-	assert.equal(mirrorStarted, true, "终态镜像仍应在后台尝试");
+	const failed = await Promise.race([execute, new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("manager tool remained running")), 250))]);
+	assert.equal(failed.isError, true);
+	assert.match((failed.content[0] as { text: string }).text, /Connector 无法强制只读/);
+	assert.equal(mirrorStarted, false, "不再尝试 direct 镜像");
 	releaseMirror();
 });
 
 test("群聊委托: 立即持久化 running 投影，且 session:new 真正新开 worker 会话", async () => {
-	const teams = await makeTeams([agentConfig("alpha")]);
+	const teams = await makeTeams([agentConfig("alpha"), agentConfig("beta")]);
 	const invoker = await makeInvoker(teams, "alpha");
 	const catalog = new ExtensionCatalog();
-	const ctx: ManagerWindowContext = { type: "group", members: ["alpha"] };
-	await teams.createWindow({ type: "group", members: ["alpha"], sessionId: "sess-test" });
+	const ctx: ManagerWindowContext = { type: "group", members: ["alpha", "beta"] };
+	await teams.createWindow({ type: "group", members: ["alpha", "beta"], sessionId: "sess-test" });
 	const projections: Array<{
 		sessionId: string;
 		message: { customType: string; content: string; details?: Record<string, unknown> };
@@ -643,7 +629,7 @@ test("Phase4: search_agent_tools 纯加法激活，撤权工具不会被重新�
 	const activeNow = getActive();
 	for (const name of baseline) assert.ok(activeNow.includes(name), "纯加法：原有工具不得被移除");
 	assert.ok(activeNow.includes(delegateToolName("alpha")));
-	assert.ok(!activeNow.includes(delegateToolName("beta")), "未匹配的工具保持 inactive");
+	assert.ok(activeNow.includes("delegation"), "统一入口被激活，目标仍由 workerId 和服务端范围门控制");
 
 	// 撤权：禁用 alpha 后搜索不再激活它的工具（成员/启用状态每次重读）。
 	await teams.setEnabled("alpha", false);
@@ -707,7 +693,7 @@ test("Phase4: 搜索已激活的工具返回可直接调用，而不是没有匹
 	const search = tools.get(CORE_TOOL_SEARCH)!;
 	const result = await search.execute("call-1", { query: delegateToolName("alpha") }, undefined, undefined, {} as ExtensionToolContext);
 	const details = result.details as { matches: string[]; added: string[] };
-	assert.deepEqual(details.matches, [delegateToolName("alpha")], "已激活的工具也要能搜到");
+	assert.ok(details.matches.includes("delegation"), "已激活统一委派入口可搜索");
 	assert.deepEqual(details.added, [], "已激活的工具不重复激活");
 	const text = (result.content[0] as { text: string }).text;
 	assert.ok(text.includes("可直接调用"), `应明确提示可直接调用，实际：${text}`);
@@ -775,7 +761,7 @@ test("Phase4: rosterPromptSection 空 roster 时明确提示没有 worker", asyn
 		{ managed: new Set([CORE_TOOL_SEARCH]), active: new Set([CORE_TOOL_SEARCH]), agents: [] },
 		{ type: "group", members: [] },
 	);
-	assert.ok(empty.includes("没有可委托的 worker"));
+	assert.ok(empty.includes("没有可委派 Worker"));
 });
 
 test("产品验收冻结: Goal 上下文在 custom-message turn 前按最新状态刷新", async () => {
@@ -1057,12 +1043,20 @@ function makeRoomDeps(
 }
 
 /** 只注册 core factory（roster/search/建房/拉人），避开需要 invoker 的 delegate factory。 */
-async function registerCoreTools(deps: ManagerExtensionDeps) {
+async function registerCoreTools(deps: ManagerExtensionDeps, userText = "请创建群聊，邀请 Worker 加入群，并开始执行任务") {
 	const plan = await planManagerTools(deps.store, deps.catalog, deps.ctx);
-	const { pi, tools } = mockPi();
+	const { pi, tools, handlers } = mockPi();
 	const core = buildManagerExtensionFactories(plan, deps)[0]!;
 	const factory = typeof core === "function" ? core : core.factory;
 	await factory(pi);
+	await handlers.get("context")?.[0]?.({ messages: [{ role: "user", content: userText, timestamp: 1 }] }, {});
+	// Test caller declares the real message authorization, as the model must.
+	for (const name of [CORE_TOOL_CREATE_GROUP, CORE_TOOL_INVITE]) {
+		const tool = tools.get(name);
+		if (!tool) continue;
+		const execute = tool.execute;
+		tool.execute = (id, params, ...args) => execute(id, { sourceMessageId: "user:1", ...params as object }, ...args);
+	}
 	return tools;
 }
 
@@ -1106,8 +1100,8 @@ test("manager 建房: solo create_group_window 建成群聊并 fire-and-forget �
 
 	// 校验：<2 成员 / 未知 worker / 禁用 worker / pinned manager 分别拒绝。
 	await assert.rejects(
-		() => create.execute("call-2", { members: ["alpha"], task: "t" }, undefined, undefined, {} as ExtensionToolContext),
-		/至少需要 2 个 worker/,
+		() => create.execute("call-2", { members: [], task: "t" }, undefined, undefined, {} as ExtensionToolContext),
+		/至少需要 2 个可委派 Worker/,
 	);
 	await assert.rejects(
 		() => create.execute("call-3", { members: ["alpha", "ghost"], task: "t" }, undefined, undefined, {} as ExtensionToolContext),
@@ -1321,41 +1315,37 @@ test("solo 派活: worker 单聊绑在其他项目时保留原窗口，并为当
 		undefined,
 		{} as ExtensionToolContext,
 	);
-	const details = result.details as { windowId?: string };
 	await new Promise<void>((resolve) => setImmediate(resolve));
-	assert.notEqual(details.windowId, direct.id, "不同项目必须使用不同单聊窗口，不能挪用旧窗口");
-	const target = (await store.getWindow(details.windowId!))!;
-	assert.equal(target.workspaceId, undefined, "新单聊必须绑定 solo 当前上下文（未选项目）");
 	const preserved = (await store.getWindow(direct.id))!;
-	assert.equal(preserved.workspaceId, wsA.id, "原项目单聊必须保留原绑定");
-	assert.equal(preserved.activeSession, "sess-alpha", "原项目 Session 历史不得被替换");
-	assert.equal(createdIds.length, 1, "当前项目只创建一个新的单聊 Session");
-	assert.match(createdIds[0]!, /^[0-9a-f-]{36}$/);
-	assert.deepEqual(removedIds, [], "切换项目不得删除旧项目 Session");
-	assert.equal((await store.listWindows()).filter((w) => w.type === "direct" && w.members[0] === "alpha").length, 2, "同一 worker 可按项目拥有独立单聊");
+	assert.equal(preserved.workspaceId, wsA.id);
+	assert.equal(preserved.activeSession, "sess-alpha");
+	assert.deepEqual(createdIds, [], "Manager 委派不创建单聊");
+	assert.deepEqual(removedIds, []);
+	assert.equal((await store.listWindows()).filter(w => w.type === "direct").length, 1);
+	assert.deepEqual(visibleMessages, [], "不向 direct 镜像");
+	assert.ok(projections.some(item => item.sessionId === "sess-solo" && item.message.details?.delegationId === (result.details as { delegationId: string }).delegationId), "owner 保留恢复投影");
+});
 
-	const visibleAssign = visibleMessages.find((item) =>
-		item.message.customType === "pudding:task_assign" && item.message.details?.taskId === "call-1"
-	);
-	assert.ok(visibleAssign, "solo 派活开始时必须立即把任务镜像到 worker 单聊");
-	assert.equal(visibleAssign.sessionId, createdIds[0]);
-	assert.equal(visibleAssign.message.details?.from, "solo");
 
-	const enriched = projections.at(-1);
-	assert.ok(enriched, "solo manager 来源 Session 必须持久化隐藏 running 投影");
-	assert.equal(enriched.sessionId, "sess-solo");
-	assert.equal(enriched.message.customType, "pudding:task_assign");
-	assert.equal(enriched.message.details?.taskId, "call-1");
-	assert.equal(enriched.message.details?.from, "solo");
-	assert.equal(enriched.message.details?.windowId, target.id);
-	assert.equal(enriched.message.details?.delegationId, (result.details as { delegationId?: string }).delegationId);
-	assert.equal(enriched.message.details?.processView, true);
-	assert.equal(enriched.message.details?.sessionHandle, "alpha-sess");
-
-	const completed = targetMessages.find((item) => item.message.customType === "pudding:task_result");
-	assert.ok(completed, "solo worker 落定后必须向单聊写结果卡");
-	assert.equal(completed.sessionId, createdIds[0]);
-	assert.equal(completed.message.details?.delegationId, (result.details as { delegationId?: string }).delegationId);
-	assert.equal(completed.message.details?.processView, true, "完成态结果卡仍必须保留执行过程入口");
-	assert.equal(completed.message.details?.sessionHandle, "alpha-sess");
+test("P1 不自动建群；至少两位 Worker 才能建群且无首发请求时不执行任务", async () => {
+	const { store, cwd } = await makeTeamsWithCwd([agentConfig("alpha"), agentConfig("beta")]);
+	let created = 0; let prompted = 0;
+	const sessions = { create: async (_model: unknown, _window: unknown, id: string) => { created++; return { id }; }, remove: async () => true, open: async () => { prompted++; return { prompt: async () => {} }; }, generateSessionTitle: async () => undefined };
+	const deps = makeRoomDeps(store, { type: "solo", members: [], cwd }, sessions);
+	for (const text of ["两个 Worker 配合处理任务", "不要创建群聊"]) {
+		const tools = await registerCoreTools(deps, text);
+		await assert.rejects(() => tools.get(CORE_TOOL_CREATE_GROUP)!.execute("auto", { members: ["alpha"] }, undefined, undefined, {} as ExtensionToolContext), /明确建群请求/);
+	}
+	assert.equal(created, 0);
+	const tools = await registerCoreTools(deps, "请创建群聊");
+	await assert.rejects(() => tools.get(CORE_TOOL_CREATE_GROUP)!.execute("unrequested-task", { members: ["alpha"], task: "执行" }, undefined, undefined, {} as ExtensionToolContext), /未明确要求.*立即执行/);
+	for (const members of [[], ["alpha"], ["alpha", "alpha"]]) {
+		await assert.rejects(() => tools.get(CORE_TOOL_CREATE_GROUP)!.execute("invalid-members", { members }, undefined, undefined, {} as ExtensionToolContext), /至少需要 2 个/);
+	}
+	assert.equal(created, 0);
+	const result = await tools.get(CORE_TOOL_CREATE_GROUP)!.execute("empty-task", { members: ["alpha", "beta"] }, undefined, undefined, {} as ExtensionToolContext);
+	const window = (await store.getWindow((result.details as { windowId: string }).windowId))!;
+	assert.equal(window.type, "group"); assert.deepEqual(window.members, ["alpha", "beta"]);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(created, 1); assert.equal(prompted, 0);
 });

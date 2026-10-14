@@ -220,6 +220,7 @@ function ThinkingLevelPicker({
 }
 
 function ComposerInner({
+ canSteer, hideGoal,
 	sessionId,
 	draftScope,
 	disabled,
@@ -244,6 +245,7 @@ function ComposerInner({
 	onOpenWorkspace,
 	draft,
 }: {
+ canSteer?: boolean; hideGoal?: boolean;
 	sessionId: string;
 	draftScope: string;
 	disabled: boolean;
@@ -267,13 +269,14 @@ function ComposerInner({
 	directWorkerModel?: { name: string; model?: string };
 	onModelChanged?: (sessionId: string, model: string) => void;
 	onThinkingChanged?: (sessionId: string, level: string) => void;
-	onSend: (text: string, attachments?: MessageAttachmentInput[]) => void | Promise<void>;
+	onSend: (text: string, attachments?: MessageAttachmentInput[], delivery?: "normal" | "followUp" | "steer") => void | Promise<void>;
 	onStop: () => void | Promise<void>;
 	onGoalCommand: (initialGoal: string) => void;
 	onOpenWorkspace: () => void;
 	draft?: { id: number; content: string };
 }) {
 	const { textInput, attachments } = usePromptInputController();
+ const [steering,setSteering] = useState(false);
 	const [knowledgeSaving, setKnowledgeSaving] = useState(false);
 	const [workerModelSaving, setWorkerModelSaving] = useState(false);
 	const currentTextRef = useRef(textInput.value);
@@ -342,12 +345,13 @@ function ComposerInner({
 		return () => { cancelled = true; };
 	}, [sessionId]);
 	const canSend = textInput.value.trim().length > 0 || attachments.files.length > 0;
-	const status: ChatStatus = stopAvailable ? "streaming" : sending ? "submitted" : "idle";
+	const canAppend = Boolean(canSteer || queueHint);
+ const status: ChatStatus = stopAvailable && !canAppend ? "streaming" : sending ? "submitted" : "idle";
 	const commandQuery = !disabled && attachments.files.length === 0 && /^\/[^\s]*$/.test(textInput.value)
 		? textInput.value.slice(1).toLowerCase()
 		: null;
 	const visibleCommands = commandQuery === null ? [] : [
-		...(!hasGoal && !hideSessionControls ? [{ name: "goal", description: "创建一个由 manager 持续推进的目标", source: "goal" as const }] : []),
+		...(!hideGoal && !hasGoal && !hideSessionControls ? [{ name: "goal", description: "创建一个由 manager 持续推进的目标", source: "goal" as const }] : []),
 		...skillCommands,
 	].filter((command) => command.name.toLowerCase().includes(commandQuery)).slice(0, 8);
 	const chooseSkillCommand = (command: SessionSlashCommand) => {
@@ -403,7 +407,7 @@ function ComposerInner({
 					return;
 				}
 				if (message.files.length === 0) {
-					const command = hideSessionControls ? null : message.text.trim().match(/^\/goal(?:\s+([\s\S]*))?$/i);
+					const command = hideSessionControls || hideGoal ? null : message.text.trim().match(/^\/goal(?:\s+([\s\S]*))?$/i);
 					if (command) {
 						if (hasGoal) {
 							toast.info("当前会话已经是 Goal");
@@ -414,7 +418,8 @@ function ComposerInner({
 					}
 				}
 				const encoded = await Promise.all(message.files.map(encodeAttachment));
-				await onSend(message.text.trim(), encoded);
+				await onSend(message.text.trim(), encoded, canSteer && steering ? "steer" : undefined);
+ setSteering(false);
 				if (draftKey && hydratedDraftKey === draftKey) {
 					clearSubmittedChatDraft(draftKey, message.text, currentTextRef.current, () => localStorage);
 					removeSubmittedChatAttachments(draftKey, message.files.flatMap(({ file }) => file ? [file] : []), currentAttachmentsRef.current);
@@ -432,6 +437,7 @@ function ComposerInner({
 			/>
 			<PromptInputFooter>
 				<PromptInputTools>
+ {canSteer ? <Button type="button" size="sm" variant={steering?"secondary":"ghost"} aria-pressed={steering} title="调整下一回合方向，不强制终止正在执行的命令" onClick={()=>setSteering(!steering)}>调整执行方向</Button> : null}
 					{hideSessionControls ? null : (
 						<Button type="button" size="icon" variant="ghost" className="size-8" onClick={() => attachments.openFileDialog()} aria-label="添加附件" title="添加附件（最多 5 个，每个 8MB）">
 							<PaperclipIcon className="size-4" />
@@ -461,12 +467,13 @@ function ComposerInner({
 							<ThinkingLevelPicker sessionId={sessionId} sessionModel={sessionModel} sessionThinkingLevel={sessionThinkingLevel} onChanged={onThinkingChanged} />
 						</>
 					)}
-					<PromptInputSubmit
+					{stopAvailable && canAppend ? <Button type="button" size="sm" variant="ghost" aria-label="停止" disabled={stopping} onClick={()=>void onStop()}>停止</Button> : null}
+     <PromptInputSubmit
 						status={status}
-						disabled={stopping || (!stopAvailable && (disabled || knowledgeSaving || workerModelSaving || !canSend))}
-						aria-label={stopping ? "正在停止" : stopAvailable ? "停止" : "发送"}
+						disabled={stopping || ((!stopAvailable || canAppend) && (disabled || knowledgeSaving || workerModelSaving || !canSend))}
+						aria-label={stopping ? "正在停止" : stopAvailable && !canAppend ? "停止" : "发送"}
 						onClick={(e) => {
-							if (stopAvailable && !stopping) {
+							if (stopAvailable && !canAppend && !stopping) {
 								e.preventDefault();
 								void onStop();
 							}
@@ -480,6 +487,7 @@ function ComposerInner({
 }
 
 export function Composer({
+ canSteer, hideGoal,
 	sessionId,
 	draftScope,
 	disabled,
@@ -507,6 +515,7 @@ export function Composer({
 	scrollButtonHostRef,
 	draft,
 }: {
+ canSteer?: boolean; hideGoal?: boolean;
 	sessionId: string;
 	draftScope: string;
 	disabled: boolean;
@@ -531,7 +540,7 @@ export function Composer({
 	statsVisible?: boolean;
 	onModelChanged?: (sessionId: string, model: string) => void;
 	onThinkingChanged?: (sessionId: string, level: string) => void;
-	onSend: (text: string, attachments?: MessageAttachmentInput[]) => void | Promise<void>;
+	onSend: (text: string, attachments?: MessageAttachmentInput[], delivery?: "normal" | "followUp" | "steer") => void | Promise<void>;
 	onStop: () => void | Promise<void>;
 	onGoalCommand: (initialGoal: string) => void;
 	onOpenWorkspace: () => void;
@@ -546,6 +555,7 @@ export function Composer({
 				<div ref={scrollButtonHostRef} className="home-scroll-to-bottom-host" />
 				<PromptInputProvider key={draftScope}>
 					<ComposerInner
+ canSteer={canSteer} hideGoal={hideGoal}
 							sessionId={sessionId}
 							draftScope={draftScope}
 						disabled={disabled}

@@ -16,7 +16,7 @@ test("handoff observation uses execution root for subdirectory workspaces and do
 	const git = (...args: string[]) => execFileSync("git", ["-C", root, ...args], { stdio: "pipe" });
 	git("init"); git("add", "."); git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base");
 	const scopes = new WorkspaceExecutionCoordinator(temp(), { worktreeRoot: temp() }); await scopes.init();
-	const scope = await scopes.begin({ workspacePath: path.join(root, "sub"), mode: "isolated_worktree", delegationId: "d" });
+	const scope = await scopes.begin({ workspacePath: path.join(root, "sub"), mode: "isolated_worktree", owner: { kind: "delegation", delegationId: "d" } });
 	unlinkSync(path.join(scope.executionCwd, ".pudding/handoff/old.json"));
 	writeFileSync(path.join(scope.executionCwd, ".pudding/handoff/new.json"), "{}");
 	const changes = await scopes.capture(scope.id, scope.ownerToken);

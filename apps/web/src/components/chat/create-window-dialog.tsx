@@ -19,8 +19,8 @@ const DESIGN_DESCRIPTIONS: Record<string, string> = {
 	codex: "代码实现、调试与工程协作",
 };
 
-function createLabel(count: number): string {
-	return count > 1 ? "创建群聊" : "打开单聊";
+function createLabel(group: boolean): string {
+	return group ? "创建群聊" : "打开单聊";
 }
 
 export function CreateWindowDialog({
@@ -34,6 +34,7 @@ export function CreateWindowDialog({
 	onCreated?: (room: RoomSummary, existed: boolean) => void;
 	initialWorkspaceId?: string | null;
 }) {
+	const [conversationType, setConversationType] = useState<"direct" | "group">("direct");
 	const [agents, setAgents] = useState<AgentConfig[]>([]);
 	const [workspaces, setWorkspaces] = useState<WorkspaceRecord[]>([]);
 	const [workspaceId, setWorkspaceId] = useState("");
@@ -94,24 +95,27 @@ export function CreateWindowDialog({
 		setChecked((current) => {
 			const next = new Set(current);
 			if (next.has(name)) next.delete(name);
-			else next.add(name);
+			else {
+				if (conversationType === "direct") next.clear();
+				next.add(name);
+			}
 			return next;
 		});
-	}, []);
+	}, [conversationType]);
 
 	const handleCreate = useCallback(async () => {
-		if (checked.size === 0 || workspaceUnavailable || loading || loadError || savingRef.current) return;
+		if (checked.size < (conversationType === "group" ? 2 : 1) || workspaceUnavailable || loading || loadError || savingRef.current) return;
 		savingRef.current = true;
 		setSaving(true);
 		const members = [...checked];
-		const group = members.length > 1;
+		const group = conversationType === "group";
 		const fingerprint = group ? groupCreationFingerprint(members, workspaceId) : "";
 		let storage: Storage | null = null;
 		try { storage = window.sessionStorage; } catch { /* Same-tab memory fallback. */ }
 		const operationId = group ? reserveGroupCreationOperation(fingerprint, storage) : undefined;
 		try {
 			const { room, existed } = await createRoom({
-				type: members.length === 1 ? "direct" : "group",
+				type: conversationType,
 				members,
 				...(workspaceId ? { workspaceId } : {}),
 			}, operationId);
@@ -138,7 +142,7 @@ export function CreateWindowDialog({
 			savingRef.current = false;
 			setSaving(false);
 		}
-	}, [checked, closeDialog, loadError, loading, onCreated, workspaceId, workspaceUnavailable]);
+	}, [conversationType, checked, closeDialog, loadError, loading, onCreated, workspaceId, workspaceUnavailable]);
 
 	return (
 		<Dialog
@@ -158,7 +162,11 @@ export function CreateWindowDialog({
 			>
 				<DialogHeader className="home-create-head">
 					<DialogTitle>发起对话</DialogTitle>
-					<p>选择一位 Worker 发起单聊，或选择多位创建群聊。</p>
+					<p>{conversationType === "group" ? "由 Manager 负责对话，选择可委派 Worker 范围，至少两位。" : "选择一位 Worker 发起单聊。"}</p>
+					<div className="flex gap-2" role="group" aria-label="对话负责人">
+						<Button type="button" variant={conversationType === "direct" ? "default" : "outline"} onClick={() => { setConversationType("direct"); setChecked(new Set()); }}>Worker 单聊</Button>
+						<Button type="button" variant={conversationType === "group" ? "default" : "outline"} onClick={() => { setConversationType("group"); setChecked(new Set()); }}>Manager 群聊</Button>
+					</div>
 				</DialogHeader>
 
 				{loading ? (
@@ -182,7 +190,7 @@ export function CreateWindowDialog({
 								{workspaceId && !selectedWorkspace ? <option value={workspaceId} disabled>原工作空间已移除，请重新选择</option> : null}
 								{workspaces.map((workspace) => <option key={workspace.id} value={workspace.id} disabled={!workspace.available}>{workspace.name}{workspace.available ? "" : "（目录不可用）"}</option>)}
 							</select>
-							<small>单聊按 Worker 与工作空间复用；群聊在所选工作空间中创建。</small>
+							<small>单聊按 Worker 与工作空间复用；群聊在所选工作空间中创建，Worker 选择只限制委派范围。</small>
 							{workspaceUnavailable ? <small role="alert">此工作空间目录不可用，请重新选择。</small> : null}
 						</label>
 						<div className="home-worker-picker">
@@ -211,8 +219,8 @@ export function CreateWindowDialog({
 
 				<DialogFooter className="home-create-footer">
 					<Button type="button" variant="secondary" disabled={saving} onClick={closeDialog}>取消</Button>
-					<Button type="button" disabled={loading || Boolean(loadError) || checked.size === 0 || workspaceUnavailable || saving} onClick={handleCreate}>
-						{saving ? "发起中…" : createLabel(checked.size)}
+					<Button type="button" disabled={loading || Boolean(loadError) || checked.size < (conversationType === "group" ? 2 : 1) || workspaceUnavailable || saving} onClick={handleCreate}>
+						{saving ? "发起中…" : createLabel(conversationType === "group")}
 					</Button>
 				</DialogFooter>
 			</DialogContent>

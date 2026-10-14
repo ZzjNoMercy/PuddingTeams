@@ -54,7 +54,7 @@ for (const strong of [false, true]) {
 		assert.equal(next.delegation.workerStarted, true);
 		assert.notEqual(next.delegation.workspaceExecutionScopeId, old?.id);
 		assert.deepEqual(s.cwdSeen, [s.root, s.root]);
-		assert.deepEqual((await s.scopes.get(old!.id))?.delegationIds, [first.delegation.id]);
+		assert.deepEqual((await s.scopes.get(old!.id))?.ownerRefs, [{ kind: "delegation", delegationId: first.delegation.id }]);
 	});
 }
 
@@ -97,7 +97,7 @@ test("fenced scope cannot be bypassed, and an unresolved co-owner prevents reuse
 	const first = await s.run();
 	const scope = (await s.scopes.get(first.delegation.workspaceExecutionScopeId!))!;
 	const pending = await s.store.createDelegation({ windowId: "w", cwdSnapshot: s.root, managerSessionId: "s", agentId: "worker", agentRevision: 1, driverId: "worker", operation: "run", workspaceId: "workspace", goalId: "g", goalEpoch: 1, workPlanId: "p", workItemId: "i", workspaceExecutionPolicy: s.input.workspaceExecutionPolicy });
-	await s.scopes.begin({ workspacePath: s.root, workspaceId: "workspace", goalId: "g", goalEpoch: 1, mode: scope.mode, executionScopeId: scope.id, ownerToken: scope.ownerToken, delegationId: pending.id });
+	await s.scopes.begin({ workspacePath: s.root, workspaceId: "workspace", goalId: "g", goalEpoch: 1, mode: scope.mode, executionScopeId: scope.id, ownerToken: scope.ownerToken, owner: { kind: "delegation", delegationId: pending.id } });
 	const busy = await s.run({ parentDelegationId: first.delegation.id });
 	assert.equal(busy.status, "failed");
 	assert.match("error" in busy.result ? busy.result.error : "", /active or unresolved owner/);
@@ -111,7 +111,7 @@ test("fenced scope cannot be bypassed, and an unresolved co-owner prevents reuse
 
 test("explicit foreign or stale scope requests fail before start and never acquire, capture, or release ownership", async () => {
 	const s = await stack();
-	const foreign = await s.scopes.begin({ workspacePath: s.root, mode: "exclusive_write", delegationId: "foreign", goalId: "foreign", goalEpoch: 1 });
+	const foreign = await s.scopes.begin({ workspacePath: s.root, mode: "exclusive_write", owner: { kind: "delegation" as const, delegationId: "foreign" }, goalId: "foreign", goalEpoch: 1 });
 	for (const id of [foreign.id, "missing-scope"]) {
 		const pending = await s.runtime.delegate({ ...s.input, workspaceExecutionScopeId: id }, s.ctx);
 		assert.equal(pending.status, "failed");
@@ -141,13 +141,13 @@ test("promoted parent starts a new scope; explicit stale ids and binding changes
 	assert.equal(explicit.status, "failed");
 	assert.equal(explicit.delegation.workspaceExecutionScopeId, undefined);
 	const active = (await s.scopes.get(next.delegation.workspaceExecutionScopeId!))!;
-	const request = { workspacePath: s.root, workspaceId: "workspace", goalId: "g", goalEpoch: 1, mode: active.mode, executionScopeId: active.id, ownerToken: active.ownerToken, delegationId: "intruder" };
+	const request = { workspacePath: s.root, workspaceId: "workspace", goalId: "g", goalEpoch: 1, mode: active.mode, executionScopeId: active.id, ownerToken: active.ownerToken, owner: { kind: "delegation" as const, delegationId: "intruder" } };
 	for (const patch of [{ goalId: "other" }, { goalEpoch: 2 }, { workspaceId: "other" }]) {
 		await assert.rejects(() => s.scopes.begin({ ...request, ...patch }), /binding is immutable/);
 	}
 	await s.scopes.fence(active.id, active.ownerToken);
 	await assert.rejects(() => s.scopes.begin(request), /fenced/);
-	assert.deepEqual((await s.scopes.get(active.id))?.delegationIds, [next.delegation.id]);
+	assert.deepEqual((await s.scopes.get(active.id))?.ownerRefs, [{ kind: "delegation", delegationId: next.delegation.id }]);
 });
 
 
@@ -163,7 +163,7 @@ test("standalone exclusive Runs close their own lease at terminal without WorkIt
 test("even a closed WorkItem cannot release a scope with an unresolved owner", async () => {
 	const s = await stack("exclusive_write");
 	const pending = await s.store.createDelegation({ windowId: "w", cwdSnapshot: s.root, managerSessionId: "s", agentId: "worker", agentRevision: 1, driverId: "worker", operation: "run", workItemId: "i" });
-	const scope = await s.scopes.begin({ workspacePath: s.root, mode: "exclusive_write", delegationId: pending.id });
+	const scope = await s.scopes.begin({ workspacePath: s.root, mode: "exclusive_write", owner: { kind: "delegation", delegationId: pending.id } });
 	s.runtime.setWorkspaceOwnerClosedResolver(async () => true);
 	const next = await s.run({ workItemId: "other" });
 	assert.equal(next.status, "failed");

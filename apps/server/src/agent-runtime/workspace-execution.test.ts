@@ -46,7 +46,7 @@ test("isolated_worktree materializes clean, staged, unstaged, and non-ignored un
 		await writeFile(path.join(root, "new.txt"), "untracked\n");
 		const coordinator = new WorkspaceExecutionCoordinator(state);
 		await coordinator.init();
-		const scope = await coordinator.begin({ workspacePath: root, workspaceId: "ws-1", mode: "isolated_worktree", delegationId: "d-1" });
+		const scope = await coordinator.begin({ workspacePath: root, workspaceId: "ws-1", mode: "isolated_worktree", owner: { kind: "delegation", delegationId: "d-1" } });
 		assert.notEqual(scope.executionCwd, root);
 		assert.equal(await readFile(path.join(scope.executionCwd, "tracked.txt"), "utf8"), "base\nstaged\nunstaged\n");
 		assert.equal(await readFile(path.join(scope.executionCwd, "new.txt"), "utf8"), "untracked\n");
@@ -75,14 +75,14 @@ test("isolated_worktree rejects non-Git projects and nested repositories", async
 		const coordinator = new WorkspaceExecutionCoordinator(state);
 		await coordinator.init();
 		await assert.rejects(
-			() => coordinator.begin({ workspacePath: root, mode: "isolated_worktree", delegationId: "d-1" }),
+			() => coordinator.begin({ workspacePath: root, mode: "isolated_worktree", owner: { kind: "delegation", delegationId: "d-1" } }),
 			(error: unknown) => error instanceof WorkspaceExecutionError && error.code === "unsupported_layout",
 		);
 		const repo = await gitRepo();
 		await mkdir(path.join(repo, "nested"));
 		await git(path.join(repo, "nested"), ["init"]);
 		await assert.rejects(
-			() => coordinator.begin({ workspacePath: repo, mode: "isolated_worktree", delegationId: "d-2" }),
+			() => coordinator.begin({ workspacePath: repo, mode: "isolated_worktree", owner: { kind: "delegation", delegationId: "d-2" } }),
 			(error: unknown) => error instanceof WorkspaceExecutionError && error.code === "unsupported_layout",
 		);
 		await rm(repo, { recursive: true, force: true });
@@ -105,7 +105,7 @@ test("isolated_worktree ignores package-manager symlinks under ignored directori
 		);
 		const coordinator = new WorkspaceExecutionCoordinator(state);
 		await coordinator.init();
-		const scope = await coordinator.begin({ workspacePath: root, mode: "isolated_worktree", delegationId: "d-pnpm" });
+		const scope = await coordinator.begin({ workspacePath: root, mode: "isolated_worktree", owner: { kind: "delegation", delegationId: "d-pnpm" } });
 		assert.notEqual(scope.executionCwd, root);
 		assert.equal(await readFile(path.join(scope.executionCwd, "tracked.txt"), "utf8"), "base\n");
 		await assert.rejects(() => readFile(path.join(scope.executionCwd, "node_modules", "linked-package")));
@@ -132,7 +132,7 @@ test("filesystem manifests exclude nested dependency links but capture ignored h
 		await mkdir(path.join(root, ".pudding/handoff"), { recursive: true });
 		const coordinator = new WorkspaceExecutionCoordinator(state);
 		await coordinator.init();
-		const scope = await coordinator.begin({ workspacePath: root, mode: "exclusive_write", delegationId: "d-pnpm" });
+		const scope = await coordinator.begin({ workspacePath: root, mode: "exclusive_write", owner: { kind: "delegation", delegationId: "d-pnpm" } });
 		await writeFile(path.join(root, "tracked.txt"), "worker\n");
 		await writeFile(path.join(root, ".pudding/handoff/result.json"), "{}\n");
 		const restarted = new WorkspaceExecutionCoordinator(state);
@@ -168,11 +168,11 @@ test("filesystem manifests still reject source links and detect shared read-only
 		const coordinator = new WorkspaceExecutionCoordinator(state);
 		await coordinator.init();
 		await assert.rejects(
-			() => coordinator.begin({ workspacePath: root, mode: "exclusive_write", delegationId: "rejected" }),
+			() => coordinator.begin({ workspacePath: root, mode: "exclusive_write", owner: { kind: "delegation", delegationId: "rejected" } }),
 			(error: unknown) => error instanceof WorkspaceExecutionError && error.code === "unsupported_layout",
 		);
 		await rm(path.join(root, "source-link"));
-		const scope = await coordinator.begin({ workspacePath: root, mode: "read_only_shared", readOnlyEnforcement: "strong", delegationId: "readonly" });
+		const scope = await coordinator.begin({ workspacePath: root, mode: "read_only_shared", readOnlyEnforcement: "strong", owner: { kind: "delegation", delegationId: "readonly" } });
 		await writeFile(path.join(root, "source.txt"), "changed\n");
 		const changes = await coordinator.capture(scope.id);
 		assert.equal(changes.integrity, "violation");
@@ -190,12 +190,12 @@ test("exclusive_write has a persistent, fail-closed lease and captures write-set
 		await writeFile(path.join(root, "state.txt"), "before\n");
 		const coordinator = new WorkspaceExecutionCoordinator(state, { leaseTimeoutMs: 60_000 });
 		await coordinator.init();
-		const first = await coordinator.begin({ workspacePath: root, workspaceId: "ws-lease", mode: "exclusive_write", delegationId: "d-1" });
+		const first = await coordinator.begin({ workspacePath: root, workspaceId: "ws-lease", mode: "exclusive_write", owner: { kind: "delegation", delegationId: "d-1" } });
 		assert.ok(first.lease?.ownerToken);
 		const restartedCoordinator = new WorkspaceExecutionCoordinator(state, { leaseTimeoutMs: 60_000 });
 		await restartedCoordinator.init();
 		await assert.rejects(
-			() => restartedCoordinator.begin({ workspacePath: root, workspaceId: "ws-lease", mode: "exclusive_write", delegationId: "d-2" }),
+			() => restartedCoordinator.begin({ workspacePath: root, workspaceId: "ws-lease", mode: "exclusive_write", owner: { kind: "delegation", delegationId: "d-2" } }),
 			(error: unknown) => error instanceof WorkspaceExecutionError && error.code === "lease_conflict",
 		);
 		await writeFile(path.join(root, "state.txt"), "after\n");
@@ -203,7 +203,7 @@ test("exclusive_write has a persistent, fail-closed lease and captures write-set
 		const changes = await coordinator.capture(first.id, first.lease!.ownerToken);
 		assert.deepEqual(changes.changedPaths, ["created.txt", "state.txt"]);
 		await coordinator.release(first.id, { ownerToken: first.lease!.ownerToken });
-		const second = await restartedCoordinator.begin({ workspacePath: root, workspaceId: "ws-lease", mode: "exclusive_write", delegationId: "d-2" });
+		const second = await restartedCoordinator.begin({ workspacePath: root, workspaceId: "ws-lease", mode: "exclusive_write", owner: { kind: "delegation", delegationId: "d-2" } });
 		assert.ok(second.lease);
 	} finally {
 		await rm(root, { recursive: true, force: true });
@@ -217,7 +217,7 @@ test("promotion fences instead of overwriting a target changed after admission",
 	try {
 		const coordinator = new WorkspaceExecutionCoordinator(state);
 		await coordinator.init();
-		const scope = await coordinator.begin({ workspacePath: root, workspaceId: "ws-conflict", mode: "isolated_worktree", delegationId: "d-1" });
+		const scope = await coordinator.begin({ workspacePath: root, workspaceId: "ws-conflict", mode: "isolated_worktree", owner: { kind: "delegation", delegationId: "d-1" } });
 		await writeFile(path.join(scope.executionCwd, "tracked.txt"), "worker\n");
 		const changes = await coordinator.capture(scope.id, scope.ownerToken);
 		await writeFile(path.join(root, "tracked.txt"), "external\n");
@@ -239,7 +239,7 @@ test("promotion detects a target change after the workspace fingerprint check", 
 			promotionCheckpoint: async () => { await writeFile(path.join(root, "tracked.txt"), "racing-editor\n"); },
 		});
 		await coordinator.init();
-		const scope = await coordinator.begin({ workspacePath: root, workspaceId: "ws-race", mode: "isolated_worktree", delegationId: "d-race" });
+		const scope = await coordinator.begin({ workspacePath: root, workspaceId: "ws-race", mode: "isolated_worktree", owner: { kind: "delegation", delegationId: "d-race" } });
 		await writeFile(path.join(scope.executionCwd, "tracked.txt"), "worker\n");
 		const changes = await coordinator.capture(scope.id, scope.ownerToken);
 		const result = await coordinator.promote(scope.id, changes.id, scope.ownerToken);
@@ -265,7 +265,7 @@ test("promotion preserves an external replacement and the original backup after 
 			},
 		});
 		await coordinator.init();
-		const scope = await coordinator.begin({ workspacePath: root, workspaceId: "ws-install-race", mode: "isolated_worktree", delegationId: "d-race" });
+		const scope = await coordinator.begin({ workspacePath: root, workspaceId: "ws-install-race", mode: "isolated_worktree", owner: { kind: "delegation", delegationId: "d-race" } });
 		await writeFile(path.join(scope.executionCwd, "tracked.txt"), "worker\n");
 		const changes = await coordinator.capture(scope.id, scope.ownerToken);
 		const result = await coordinator.promote(scope.id, changes.id, scope.ownerToken);
@@ -292,7 +292,7 @@ test("promotion restores the original when installation fails after rename witho
 			},
 		});
 		await coordinator.init();
-		const scope = await coordinator.begin({ workspacePath: root, workspaceId: "ws-install-failure", mode: "isolated_worktree", delegationId: "d-failure" });
+		const scope = await coordinator.begin({ workspacePath: root, workspaceId: "ws-install-failure", mode: "isolated_worktree", owner: { kind: "delegation", delegationId: "d-failure" } });
 		executionRoot = scope.executionCwd;
 		await writeFile(path.join(executionRoot, "tracked.txt"), "worker\n");
 		const changes = await coordinator.capture(scope.id, scope.ownerToken);
@@ -314,14 +314,14 @@ test("shared read-only detects mutation and rejects an unenforced admission", as
 		const coordinator = new WorkspaceExecutionCoordinator(state);
 		await coordinator.init();
 		await assert.rejects(
-			() => coordinator.begin({ workspacePath: root, mode: "read_only_shared", readOnlyEnforcement: "none", delegationId: "d-0" }),
+			() => coordinator.begin({ workspacePath: root, mode: "read_only_shared", readOnlyEnforcement: "none", owner: { kind: "delegation", delegationId: "d-0" } }),
 			(error: unknown) => error instanceof WorkspaceExecutionError && error.code === "invalid_policy",
 		);
 		await assert.rejects(
-			() => coordinator.begin({ workspacePath: root, mode: "read_only_shared", readOnlyEnforcement: "mutation_guard", delegationId: "d-guard" }),
+			() => coordinator.begin({ workspacePath: root, mode: "read_only_shared", readOnlyEnforcement: "mutation_guard", owner: { kind: "delegation", delegationId: "d-guard" } }),
 			(error: unknown) => error instanceof WorkspaceExecutionError && error.code === "invalid_policy",
 		);
-		const scope = await coordinator.begin({ workspacePath: root, mode: "read_only_shared", readOnlyEnforcement: "strong", delegationId: "d-1" });
+		const scope = await coordinator.begin({ workspacePath: root, mode: "read_only_shared", readOnlyEnforcement: "strong", owner: { kind: "delegation", delegationId: "d-1" } });
 		await writeFile(path.join(root, "a.txt"), "mutated\n");
 		const changes = await coordinator.capture(scope.id);
 		assert.equal(changes.integrity, "violation");
@@ -339,7 +339,7 @@ test("verification environment id is sanitized for use as a directory name", asy
 		await writeFile(path.join(root, "tracked.txt"), "base\n");
 		const coordinator = new WorkspaceExecutionCoordinator(state);
 		await coordinator.init();
-		const scope = await coordinator.begin({ workspacePath: root, mode: "exclusive_write", delegationId: "d-sanitize" });
+		const scope = await coordinator.begin({ workspacePath: root, mode: "exclusive_write", owner: { kind: "delegation", delegationId: "d-sanitize" } });
 		const verificationId = 'verification:sub-1:call*9';
 		const copy = await coordinator.createVerificationCopy(scope.id, verificationId, scope.ownerToken);
 		assert.equal(copy.id, "verify-verification-sub-1-call-9");

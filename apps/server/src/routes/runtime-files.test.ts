@@ -22,7 +22,7 @@ async function makeStack() {
 	});
 	const scopes = new WorkspaceExecutionCoordinator(state, { worktreeRoot: mkdtempSync(path.join(tmpdir(), "pt-runtime-files-scopes-")) });
 	await scopes.init();
-	const scope = await scopes.begin({ workspacePath: workspace, workspaceId: "workspace-1", mode: "exclusive_write", delegationId: delegation.id });
+	const scope = await scopes.begin({ workspacePath: workspace, workspaceId: "workspace-1", mode: "exclusive_write", owner: { kind: "delegation", delegationId: delegation.id } });
 	await delegations.updateDelegation(delegation.id, { workspaceExecutionScopeId: scope.id, executionCwd: scope.executionCwd });
 	const opened: string[] = [];
 	const app = Fastify({ logger: false });

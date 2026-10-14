@@ -224,6 +224,8 @@ export interface VerificationInvocationProfile {
 }
 
 export interface DriverCapabilities {
+ /** Declaration requires a tested import implementation by the conversation provider. */
+ snapshotImport?: { formatVersion: 1; maxTranscriptBytes?: number };
 	/** Driver supports per-turn LLM overrides on both run and continue. */
 	runtimeModel?: { effortLevels: string[] };
 	operations: Array<"run" | "continue" | "respond" | "cancel">;

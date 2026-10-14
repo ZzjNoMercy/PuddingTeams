@@ -20,6 +20,12 @@ export function registerWorkStateRoutes(
 	runtime?: AgentRuntime,
 	productSettings?: ProductSettingsStore,
 ): void {
+ app.addHook("preHandler", async (req,reply) => {
+  if(["GET","HEAD","OPTIONS"].includes(req.method))return;
+  const match=/^\/api\/sessions\/([^/?]+)\/(?:work-state|goals|work-plan|work-items|decisions|goal)/.exec(req.url);
+  const ref=match && await teams.sessionRef?.(match[1]!);
+  if(ref && !(await teams.getAgent(ref.ownerAgentId))?.pinned)return reply.code(403).send({error:"Worker 单聊不具备 Manager Goal 控制权限",code:"manager_control_required"});
+ });
 	const requireOwnedSession = async (sessionId: string) => {
 		const window = await teams.windowForSession(sessionId);
 		if (!window) throw new Error("session not found");

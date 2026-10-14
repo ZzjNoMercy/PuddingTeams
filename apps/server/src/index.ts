@@ -1,3 +1,11 @@
+import { NativeInput } from "./pi-bridge/native-input.js";
+import { SessionForks } from "./agent-runtime/session-forks.js";
+import { ForkOperations } from "./store/fork-operations.js";
+import { ConversationSnapshots } from "./store/conversation-snapshots.js";
+import { registerSessionForkRoutes } from "./routes/session-forks.js";
+import { DelegationDeliveryStore } from "./store/delegation-delivery.js";
+import { DelegationDelivery } from "./agent-runtime/delegation-delivery.js";
+import { NativeToolExecution } from "./pi-bridge/native-tool-execution.js";
 import { directConversationHistory } from "./agent-runtime/direct-history.js";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
@@ -317,6 +325,9 @@ const invoker = new AgentInvoker(
 	mcpServers,
 );
 
+const nativeExecutions = new NativeToolExecution(paths.state, workspaceExecution, teams, workStates);
+await nativeExecutions.init();
+invoker.setNativeExecutionGuard((sessionId) => nativeExecutions.assertDelegationReady(sessionId));
 const store = new PiSessionStore(
 	defaultCwd,
 	paths.sessions,
@@ -330,8 +341,11 @@ const store = new PiSessionStore(
 	capabilityStateRoot,
 	fffStateRoot,
 	mcpServers,
+	nativeExecutions,
 );
 store.setKnowledgeRuntime(knowledgeRuntime);
+const messageOperations = new MessageSubmissionOperations(path.join(paths.state, "message-submission-operations"));
+const nativeInputController = new NativeInput(store,messageOperations,chatKnowledgeIntakes);
 const workerInputQueueStore = new WorkerInputQueueStore(path.join(paths.state, "worker-input-queue.json"));
 await workerInputQueueStore.init();
 const workerInputDispatcher = new WorkerInputDispatcher({
@@ -344,7 +358,7 @@ const workerInputDispatcher = new WorkerInputDispatcher({
 	runtimeModelFor: (sessionId) => store.workerRuntimeModel(sessionId),
 	log: (message) => app.log.info(message),
 });
-workerInputDispatcher.attach();
+// P2: delegated contexts are trace-only; no queue consumption is attached.
 const calendarScope = async (sessionId: string) => {
  const scope = await knowledgeRuntime.scopeForSession(sessionId);
  if (!scope) throw new Error("当前聊天上下文不可用");
@@ -407,6 +421,16 @@ invoker.setKnowledgeRuntime(async (agent, ctx, _message) => {
 	if (agent.builtinId === "wiki") return curatedSurface;
 	const ordinary = withReadLater(curatedSurface, localViewerIdentity().user.id, readLaterStore, readLaterCapture);
 	return { ...ordinary, tools: [...ordinary.tools, ...calendarTools(calendarService, () => calendarScope(sessionId ?? ""))] };
+});
+store.setNativeKnowledgeSurface(async(sessionId,agent,operationId)=>{
+ const surface=await knowledgeRuntime.forSession(sessionId),scope=await knowledgeRuntime.scopeForSession(sessionId);
+ if(!scope)return surface;
+ const memory=await memorySetup.status(scope.ownerId);
+ const defaultMemory=memory.status==="configured"?{bindingId:memory.binding.id,assertCurrent:async()=>{const current=await memorySetup.status(scope.ownerId);if(current.status!=="configured"||current.binding.id!==memory.binding.id)throw new Error("默认 memory 已变化，请重新开始本轮");}}:undefined;
+ const curated=wikiCurator.workerSurface(surface,{...scope,operationId,
+  listSourceMessages:async()=>chatKnowledgeIntakes.messages(await store.open(sessionId),scope.ownerId),
+  resolveSources:async(toolCallId,ids)=>ids?chatKnowledgeIntakes.resolveMessages(await store.open(sessionId),scope.ownerId,ids):chatKnowledgeIntakes.resolve(await store.open(sessionId),scope.ownerId,{toolCallId})},agent.builtinId,defaultMemory);
+ return agent.builtinId==="wiki"?curated:withReadLater(curated,scope.ownerId,readLaterStore,readLaterCapture);
 });
 const extensionMutationJournal = new ExtensionMutationJournal(path.join(paths.state, "extension-mutation-pending.json"));
 const recoveredExtensionAgents = await extensionMutationJournal.recover(async (name) => {
@@ -487,19 +511,10 @@ async function reconcileWorkAndScheduleVerification(): Promise<void> {
 	await run;
 }
 invoker.setDelegationStateObserver(reconcileWorkAndScheduleVerification);
-invoker.setReplacementWindowResolver(async (delegation, agent) => {
-	const window = await teams.ensureDirectWindow(
-		agent.name,
-		delegation.workspaceId,
-		(reservedId) => store.create(undefined, {
-			type: "direct",
-			members: [agent.name],
-			workspaceId: delegation.workspaceId,
-			cwd: delegation.cwdSnapshot,
-		}, reservedId),
-		{ cwdSnapshot: delegation.cwdSnapshot, requireEnabledMember: true, rollbackSession: (id) => store.remove(id), journalSession: true },
-	);
-	return window.id;
+invoker.setReplacementWindowResolver(async (delegation) => {
+	const owner = await teams.windowForSession(delegation.managerSessionId);
+	if (!owner) throw new Error("replacement owner Session missing");
+	return owner.id;
 });
 invoker.setReplacementStateGuard(async (original, replacement, agent, replacementWindowId) => {
 	const [owner, target] = await Promise.all([
@@ -542,56 +557,10 @@ if (syncedWikiCandidates.unavailable.length > 0) app.log.warn(syncedWikiCandidat
 // 发布对账包含 approve 落账后、journal 创建前的崩溃空窗。
 const reconciledPublications = await wikiPublisher.reconcileInterrupted();
 if (reconciledPublications.length > 0) app.log.warn({ count: reconciledPublications.length }, "reconciled interrupted wiki publish operations");
-const reconciledOrphans = await runtime.reconcileOrphanedRuns(async (orphan, result) => {
-	await reconcileWorkAndScheduleVerification();
-	if (!orphan.managerToolCallId) return;
-	const errorCode = result.status === "failed" ? result.errorCode : undefined;
-	const text = result.status === "completed"
-		? `PuddingTeams 启动对账确认 worker「${orphan.agentId}」的远端 Run 已完成，已按原 Delegation 封存 Receipt。`
-		: errorCode === "observation_lost"
-			? `PuddingTeams 无法继续观察 worker「${orphan.agentId}」的远端 Run；执行效果未知，相关写 scope 已 fence。请先人工对账，禁止直接重试副作用任务。`
-			: `PuddingTeams 服务重启，该任务运行中断（${errorCode ?? "server_restart"}）。worker「${orphan.agentId}」的本地执行已终止；交接目录 ${orphan.cwdSnapshot}/.pudding/handoff/${orphan.id} 中可能保留了部分进展。`;
-	const wrote = await store.appendToolResultIfPending(orphan.managerSessionId, {
-		toolCallId: orphan.managerToolCallId,
-		toolName: `agent_${orphan.agentId}__delegate`,
-		text,
-		details: { status: result.status, ...(errorCode ? { errorCode } : {}), delegationId: orphan.id, executionState: orphan.executionState },
-	});
-	if (!wrote) {
-		await store.sendCustomMessage(
-			orphan.managerSessionId,
-			{
-				customType: "pudding:task_result",
-				content: text,
-				details: { taskId: orphan.managerToolCallId, worker: orphan.agentId, windowId: orphan.windowId, status: result.status, executionState: orphan.executionState },
-			},
-			{ triggerTurn: false },
-		);
-	}
-	// A Solo delegation is also visible in the Worker direct window. Startup
-	// reconciliation must close that mirror as well; otherwise its durable
-	// running card keeps the composer disabled even though the Delegation is
-	// already terminal.
-	const executionWindow = await teams.getWindow(orphan.windowId);
-	if (executionWindow?.activeSession && executionWindow.activeSession !== orphan.managerSessionId) {
-		await store.appendCustomMessageIfAbsent(
-			executionWindow.activeSession,
-			`startup-worker-result:${orphan.id}:${orphan.revision}`,
-			{
-				customType: "pudding:task_result",
-				content: text,
-				details: { taskId: orphan.managerToolCallId, delegationId: orphan.id, worker: orphan.agentId, windowId: orphan.windowId, status: result.status, executionState: orphan.executionState },
-			},
-			{ triggerTurn: false },
-		);
-	}
-});
-if (reconciledOrphans > 0) app.log.info({ reconciled: reconciledOrphans }, "reconciled orphaned delegations from previous process");
-// 重启后 runtime 锁全空：仍有排队输入的 handle 空闲即补投，窗口/binding 失效的标失败可见。
-const reconciledWorkerInputs = await workerInputDispatcher.reconcileOnBoot();
-if (reconciledWorkerInputs.dispatched > 0 || reconciledWorkerInputs.failed > 0) {
-	app.log.info(reconciledWorkerInputs, "reconciled queued worker session inputs from previous process");
-}
+const delegationDelivery = new DelegationDelivery(new DelegationDeliveryStore(path.join(paths.state, "delegation-delivery.json")), runtime, store, teams, largeWorkerResults, productSettings);
+invoker.setTerminalPublisher(record => delegationDelivery.publish(record));
+const reconciledOrphans = await runtime.reconcileOrphanedRuns(async () => { await reconcileWorkAndScheduleVerification(); });
+if (reconciledOrphans > 0) app.log.info({ reconciled: reconciledOrphans }, "reconciled orphaned delegations");
 async function sweepExpiredAdmissions(): Promise<number> {
 	const before = (await runtime.listInteractions())
 		.filter((item) => item.source === "platform_policy" && item.status === "pending")
@@ -603,17 +572,7 @@ async function sweepExpiredAdmissions(): Promise<number> {
 	for (const delegation of delegations) {
 		if (!before.includes(delegation.id) || delegation.executionState !== "cancelled") continue;
 		if (!delegation.result || !("errorCode" in delegation.result) || delegation.result.errorCode !== "admission_expired") continue;
-		const owner = await teams.windowForSession(delegation.managerSessionId);
-		await store.appendCustomMessageIfAbsent(
-			delegation.managerSessionId,
-			`admission-expired:${delegation.id}:${delegation.revision}`,
-			{
-				customType: "pudding:task_result",
-				content: `Teams 准入请求已过期，worker「${delegation.agentId}」未启动，任务已取消。`,
-				details: { delegationId: delegation.id, worker: delegation.agentId, status: "cancelled", errorCode: "admission_expired", workerStarted: false },
-			},
-			owner?.type === "direct" ? { triggerTurn: false } : { triggerTurn: true, deliverAs: "followUp" },
-		);
+		await delegationDelivery.publish(delegation);
 	}
 	return expired;
 }
@@ -621,47 +580,10 @@ const expiredAdmissions = await sweepExpiredAdmissions();
 if (expiredAdmissions > 0) app.log.info({ expiredAdmissions }, "expired stale Teams admission requests");
 const reconciledAdmissions = await runtime.reconcileAdmissionApplications();
 if (reconciledAdmissions > 0) app.log.info({ reconciledAdmissions }, "reconciled Teams admission application journals");
-async function projectDurableReplacementOutcomes(): Promise<number> {
-	let projected = 0;
-	const [delegations, interactions] = await Promise.all([runtime.listDelegations(), runtime.listInteractions()]);
-	for (const delegation of delegations) {
-		if (!delegation.parentDelegationId || !["reported_completed", "reported_failed", "cancelled", "observation_lost"].includes(delegation.executionState)) continue;
-		const interaction = interactions.find((item) =>
-			item.delegationId === delegation.parentDelegationId
-			&& item.source === "platform_policy"
-			&& item.decision?.chosenAction === "select_another_worker"
-			&& item.application?.replacementDelegationId === delegation.id,
-		);
-		if (!interaction) continue;
-		const owner = await teams.windowForSession(delegation.managerSessionId);
-		const executionWindow = await teams.getWindow(delegation.windowId).catch(() => undefined);
-		const directSessionId = executionWindow?.activeSession && executionWindow.activeSession !== delegation.managerSessionId
-			? executionWindow.activeSession
-			: undefined;
-		const completed = delegation.executionState === "reported_completed";
-		const content = completed
-			? delegation.result?.status === "completed" ? delegation.result.content ?? "改派后的 Worker 已完成任务。" : "改派后的 Worker 已完成任务。"
-			: delegation.result && "error" in delegation.result ? `改派后的 worker「${delegation.agentId}」执行失败：${delegation.result.error}` : `改派后的 worker「${delegation.agentId}」未完成任务。`;
-		await store.appendCustomMessageIfAbsent(
-			delegation.managerSessionId,
-			`replacement-result:${delegation.id}:${delegation.revision}`,
-			{ customType: "pudding:task_result", content, details: { interactionId: interaction.id, delegationId: delegation.id, worker: delegation.agentId, status: completed ? "completed" : "failed", replacement: true } },
-			owner?.type === "direct" ? { triggerTurn: false } : { triggerTurn: true, deliverAs: "followUp" },
-		);
-		if (directSessionId) {
-			await store.appendCustomMessageIfAbsent(
-				directSessionId,
-				`replacement-result:${delegation.id}:${delegation.revision}`,
-				{ customType: "pudding:task_result", content, details: { interactionId: interaction.id, delegationId: delegation.id, worker: delegation.agentId, status: completed ? "completed" : "failed", replacement: true } },
-				{ triggerTurn: false },
-			);
-		}
-		projected++;
-	}
-	return projected;
-}
-const recoveredReplacementResults = await projectDurableReplacementOutcomes();
-if (recoveredReplacementResults > 0) app.log.info({ recoveredReplacementResults }, "recovered durable replacement outcomes");
+await delegationDelivery.recover(false);
+const deliveryTimer = setInterval(() => { void delegationDelivery.recover().catch(error => app.log.warn({ error }, "delegation delivery pending")); }, 2_000);
+deliveryTimer.unref();
+app.addHook("onClose", async () => { clearInterval(deliveryTimer); });
 // Crash window repair: a Delegation/Interaction boundary may already be durable
 // while the manager JSONL still lacks its single delegate toolResult. Repair both
 // terminal outcomes and waiting_admission (needs_input) before HTTP opens.
@@ -775,10 +697,6 @@ const admissionExpiryTimer = setInterval(() => {
 	void sweepExpiredAdmissions().catch((error) => app.log.warn({ error }, "failed to sweep expired Teams admission requests"));
 }, 5_000);
 admissionExpiryTimer.unref();
-const replacementOutcomeTimer = setInterval(() => {
-	void projectDurableReplacementOutcomes().catch((error) => app.log.warn({ error }, "failed to project replacement outcomes"));
-}, 5_000);
-replacementOutcomeTimer.unref();
 // §1/§2 产品模型：solo 窗口是置顶单例，服务端启动即保证存在。
 await teams.ensureSoloWindow(
 	async (workspaceId, cwdSnapshot) => {
@@ -795,11 +713,11 @@ const providerDeletion = new ProviderDeletionCoordinator(path.join(paths.secrets
 await registerChatRoutes(app, store, teams, workStates, uploads, invoker, {
 	dataHomeId: puddingTeamsHomeId(paths.home),
 	...(process.env.PUDDINGTEAMS_RUN_ID ? { runId: process.env.PUDDINGTEAMS_RUN_ID } : {}),
-}, providerDeletion, new MessageSubmissionOperations(path.join(paths.state, "message-submission-operations")), chatKnowledgeIntakes, {
+}, providerDeletion, messageOperations, chatKnowledgeIntakes, {
 	delegations,
 	sessionDir: paths.workerSessions,
 	inputQueue: workerInputDispatcher,
-});
+}, nativeInputController);
 registerIdentityRoutes(app, localViewerIdentity, paths);
 registerWebResearchSettingsRoutes(app, webResearch);
 registerCalendarRoutes(app, calendarService.store, () => localViewerIdentity().user.id, calendarService);
@@ -883,8 +801,13 @@ app.addHook("onClose", async () => { await readLaterCapture.close(); });
 readLaterCapture.start();
 await wikiCurator.recover();
 await wikiRevisions.recover();
+const conversationSnapshots = new ConversationSnapshots(path.join(paths.state, "conversation-snapshots"));
+const sessionForks = new SessionForks(teams, store, invoker, conversationSnapshots, new ForkOperations(path.join(paths.state,"fork-operations.json")), [paths.uploads,path.join(paths.state,"large-worker-results"),conversationSnapshots.root]);
+await sessionForks.recover();
+registerSessionForkRoutes(app,sessionForks);
 await registerRoomsRoutes(app, store, teams, invoker, workStates, {
 	attachmentRoot: paths.uploads,
+ snapshotAssetRoot:conversationSnapshots.root,
 	uploads,
 	productSettings,
 	activityStatePath: path.join(paths.state, "room-activity.json"),
@@ -952,7 +875,6 @@ async function shutdown(): Promise<void> {
 	app.log.info("shutting down");
 	clearInterval(goalOutboxTimer);
 	clearInterval(admissionExpiryTimer);
-	clearInterval(replacementOutcomeTimer);
 	knowledgeObservation.stop();
 	await goalOutboxDrain;
 	await store.disposeAll();

@@ -4,12 +4,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { abortSession, fetchMessages, sendMessage, sessionWsUrl, MessageDeliveryUnconfirmedError, MessageOperationRejectedError, SessionMessagesError, type MessageAttachmentInput } from "@/lib/api";
 import { ChatSendIntentChangedError, clearChatSendOperation, reserveChatSendOperation } from "@/lib/chat-send-operation";
 import { applyRecoveredToolResults, markRunningToolCalls, reducePiEvent, renderHistory, replayPiEvents } from "@/lib/events";
-import type { ChatMessage, ChatStatus, PiMessage } from "@/lib/types";
+import type { NativeInputCapability, ChatMessage, ChatStatus, PiMessage } from "@/lib/types";
 
 const HISTORY_CACHE_LIMIT = 8;
 const historyCache = new Map<string, ChatMessage[]>();
 
 interface HistorySnapshot {
+ inputCapability?: NativeInputCapability;
 	messages: ChatMessage[];
 	hasRunning: boolean;
 	unansweredUserMessage: boolean;
@@ -28,11 +29,12 @@ function rememberHistory(sessionId: string, messages: ChatMessage[]): ChatMessag
 }
 
 async function loadHistorySnapshot(sessionId: string): Promise<HistorySnapshot> {
-	const { messages, running, unansweredUserMessage, unfinishedAssistantTurn, runningToolCallIds, recoveredToolResults } = await fetchMessages(sessionId);
+	const inputCapability = await fetchMessages(sessionId);
+ const { messages, running, unansweredUserMessage, unfinishedAssistantTurn, runningToolCallIds, recoveredToolResults } = inputCapability;
 	const rendered = renderHistory(messages as PiMessage[]);
 	const reconciled = markRunningToolCalls(applyRecoveredToolResults(rendered, recoveredToolResults), runningToolCallIds);
 	return {
-		messages: reconciled,
+		inputCapability, messages: reconciled,
 		hasRunning: running || reconciled.some((message) => message.toolCalls.some((call) => call.status === "running")),
 		unansweredUserMessage,
 		unfinishedAssistantTurn,
@@ -46,7 +48,8 @@ export async function preloadChatHistory(sessionId: string): Promise<void> {
 }
 
 export function useChat(sessionId: string, options?: { allowSendWhileRunning?: boolean }) {
-	const allowSendWhileRunning = options?.allowSendWhileRunning === true;
+	const [inputCapability, setInputCapability] = useState<NativeInputCapability>();
+ const allowSendWhileRunning = options?.allowSendWhileRunning === true || Boolean(inputCapability?.busyInput.modes.length);
 	// Session 切换会 remount；命中预热/最近访问快照时直接首帧展示，随后仍从
 	// 服务端重对齐，缓存只消除视觉空档，不替代事实源。
 	const cachedHistory = historyCache.get(sessionId);
@@ -89,6 +92,7 @@ export function useChat(sessionId: string, options?: { allowSendWhileRunning?: b
 		wsEventsRef.current = wsEventsRef.current.filter((entry) => entry.seq > cutoffSeq);
 		rememberHistory(sessionId, messages);
 		setMessages(messages);
+		if (snapshot.inputCapability) setInputCapability(snapshot.inputCapability);
 		setUnansweredUserMessage(snapshot.unansweredUserMessage);
 		setUnfinishedAssistantTurn(snapshot.unfinishedAssistantTurn);
 		return {
@@ -209,7 +213,10 @@ export function useChat(sessionId: string, options?: { allowSendWhileRunning?: b
 					activityVersionRef.current += 1;
 					setRunning(true);
 				}
-				if (event.type === "agent_settled" || event.type === "error") {
+				if (event.type === "queue_update" || event.type === "agent_settled") {
+     void fetchMessages(sessionId).then(snapshot => { if (!disposed) setInputCapability(snapshot); }).catch(() => {});
+    }
+    if (event.type === "agent_settled" || event.type === "error") {
 					activityVersionRef.current += 1;
 					setRunning(false);
 				}
@@ -262,7 +269,7 @@ export function useChat(sessionId: string, options?: { allowSendWhileRunning?: b
 	}, [applyHistorySnapshot, beginHistorySnapshot, markGone, sessionId]);
 
 	const send = useCallback(
-		async (text: string, attachments: MessageAttachmentInput[] = []) => {
+		async (text: string, attachments: MessageAttachmentInput[] = [], delivery?: "normal" | "followUp" | "steer") => {
 			const content = text.trim();
 			if (!content && attachments.length === 0) throw new Error("请输入消息或添加附件");
 			if (!connectionReadyRef.current) throw new Error("连接正在恢复，请稍后重试");
@@ -274,10 +281,11 @@ export function useChat(sessionId: string, options?: { allowSendWhileRunning?: b
 			setError(null);
 			let operationId: string | undefined;
 			try {
-				operationId = await reserveChatSendOperation(sessionId, content, attachments);
-				const result = await sendMessage(sessionId, content, attachments, operationId);
+				operationId = await reserveChatSendOperation(sessionId, content, attachments, undefined, delivery);
+				const result = await sendMessage(sessionId, content, attachments, operationId, delivery);
 				clearChatSendOperation(sessionId, operationId);
 				setUnconfirmedOperation(null);
+    void fetchMessages(sessionId).then(snapshot => setInputCapability(snapshot)).catch(() => {});
 				return result;
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
@@ -371,5 +379,5 @@ export function useChat(sessionId: string, options?: { allowSendWhileRunning?: b
 		}
 	}, [applyHistorySnapshot, beginHistorySnapshot, sessionId]);
 
-	return { messages, historyLoading, historyLoaded, status, running, unansweredUserMessage, unfinishedAssistantTurn, sending, stopping, error, unconfirmedOperation, send, stop, refreshHistory, reviewUnconfirmedHistory, startNewMessageIntent };
+	return { inputCapability, messages, historyLoading, historyLoaded, status, running, unansweredUserMessage, unfinishedAssistantTurn, sending, stopping, error, unconfirmedOperation, send, stop, refreshHistory, reviewUnconfirmedHistory, startNewMessageIntent };
 }

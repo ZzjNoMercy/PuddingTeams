@@ -17,7 +17,7 @@ const port = reserve.address().port;
 await new Promise((resolve) => reserve.close(resolve));
 const base = `http://127.0.0.1:${port}`;
 const key = randomUUID();
-const payload = { type: 'group', members: ['pi-b', 'puddingclaw'], name: '响应丢失回放' };
+const payload = { type: 'group', members: ['pi-b', 'codex'], name: '响应丢失回放' };
 const request = async (method, route, body, operationId) => {
   const response = await fetch(base + route, {
     method,

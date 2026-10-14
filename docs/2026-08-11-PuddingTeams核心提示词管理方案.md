@@ -1,5 +1,31 @@
 # PuddingTeams 核心提示词管理方案
 
+## 2026-10-14 P3：原生 Worker 对话与快照
+
+Manager 继续使用 Pi 1.2.0 SDK，增加 delegation/Goal；Pi Worker 单聊也使用原生 SDK，但按持久负责人装配自己的指令、模型、工具、MCP 白名单、Capability 和知识授权。单聊只有一份可发送的 Session，不创建委派来承载每条输入，不获得 Manager delegation/Goal/日历控制。内置 Wiki 保持受限知识工具面，使用既有 prepare/submit 候选管线，提交即停并等待审核；任意原生写工具、扩展、MCP 与 Workspace 指令不进入它。普通 Worker 保持知识读取、默认 memory 待审核请求和已授权能力。全新会话在 Window 负责人落盘后注册知识工具；真实用户 JSONL 与素材绑定在 provider 发送前完成，SDK Skill/模板展开只改变执行文本，不改原始素材。其他 Connector 本阶段仍用既有直派通道，不宣称支持原生忙碌输入或快照。
+
+`windows.json` v3 在同一次原子写中保存 `windows` 和 `sessionRefs[sessionId]={sessionId,ownerAgentId,createdAt,sourceSnapshotId?,provider?}`；`sessions[]` 保留成员 ID 索引。provider 对 Pi 原生会话记录 `driverId:"pi-native"`、负责人配置修订和 SDK sessionId。打开时按 ownerAgentId 装配；成员数量不改变负责人。一个 Worker/Workspace 保持一个 direct Window，里面可以有多段原生对话。旧 v1/v2 开发状态显式拒绝，不迁移、不删除；缺负责人记录拒绝，已删除或停用负责人保留只读历史。
+
+Pi Manager/Worker 运行中缺省 followUp、显式 steer；空闲时正常启动，返回真实 delivery。HITL 等待独立于 running，追加走 followUp 入队、不启动 run、不提交卡片。返回 disposition=started/queued/handled 与 persistence=durable/pending/not_applicable；queued 202 只承诺 SDK 受理，不等于模型已消费。原操作键重试不再次入队；正文/附件/delivery 改变冲突。SDK 不携带输入 operationId；同文案多次、展开改写等无法唯一关联时保持未知，不能伪造精确消费身份。回执不保存自动重放正文，不新增平台 FIFO。待消费 SDK 队列或未终结回执阻止淘汰、重建、模型/思考切换、项目切换和 fork；Stop 清队列并标记 cancelled_unconfirmed，附件保留。确定的 compaction 拒绝返回 session_compacting，允许原键原消息再受理；不确定错误不自动重发。
+
+Fork 冻结当前已提交分支，由 `ConversationSnapshots` 保存不可变 manifest 与独立资产；hash 使用递归排序键的 JSON，覆盖版本、创建时间、来源、分支、cwd、transcript 和资产清单，读时核验文件 bytes/hash。保留配对完整的历史工具消息、compaction 和展示卡；排除 Manager 指令、roster、配置、审批权限与运行控制，Goal 仅保留历史文字投影。委派内部 trace 不混入。平台外置结果改为快照中的文件引用，目标用 read 读取；不继承 read_delegation_result 权限。
+
+目标必须在当前有效范围，且会话提供方明确支持格式1。本阶段只有 native Pi provider 声明导入能力，委派 Driver 不声明；不以 Connector 名字推测其他 Driver 能力。目标 SDK 重新编写 entryId、消息传输 ID 和 compaction 引用，使用自己的模型/思考设置；不调用会复制控制记录的 SDK forkFrom，不触发 prompt、不复制活动 Goal、不重放工具。预算为 UTF-8 serialized entries 的保守上界：min(2MB, 已配置模型 contextWindow/2)，模型未配置时64KB；预算超限显式拒绝，不静默摘要。单资产64MB、总资产128MB。
+
+一个 `fork-operations.json` v1 账本预约 snapshotId/sessionId，依次 reserved→snapshot_saved→session_saved→attached。快照 hash、导入标记和窗口唯一性负责冷恢复；同键相同意图返回同一目标，改来源/Worker/leaf 冲突。快照完成后源删除可继续；目标删除成为 gone，不重建。冻结前需当前 leaf、不忙碌、不等待、不含待确认输入且执行证据已封存；恢复也校验这些事实。UI 仅在原生对话菜单提供 Fork，显示来源快照；未确认时保留原键，仅服务器确认尚无操作后允许用户重新选择。
+
+本节是 P3 当前行为；下文标注 P3 前的 direct relay/双会话/Window binding/单聊 Goal 描述仅作为历史背景。P4 的旧执行面 helper 和失效字段的物理删除与全矩阵收口尚未实施。
+
+
+> 2026-10-14 P2 实现更新（开发与本阶段验证完成）：Manager 核心委派统一为 `delegation({workerId, task, contextRefs?, parentDelegationId?, ...Goal字段})`。每次 fresh run，因果引用不自动导入历史；结果/审批只回原 owner Session，不自动建 direct、不写双边镜像。调用去重复用 DelegationStore 的稳定 operationId 和不可变 requestHash，同调用不同内容拒绝。direct 多轮在 P3 前保持原通道；委派 handle 不作为普通聊天枚举或输入，按 delegationId 查只读过程/取消。下文旧双 Session、逐 Worker 工具名与委派续接是 P2 前说明，以本段和审核方案为准。
+
+## 2026-10-14 P1 运行指令修订
+
+Manager 是原生 Pi SDK 会话，附加 Goal/委派能力；保留 SDK 内嵌默认提示词与 append-only 装配。solo/group 均可直接执行原生工具，移除“Manager 永不写”“任务执行一律交给 Worker”及“多个 Worker 必须另建群”的指令。Manager 自执行需要开始自己的 WorkItem，再引用实际 NativeExecution/ChangeSet 提交和验收，冻结验证等级不降低。
+
+群聊 guidance 只解释可委派 Worker 范围。仅用户明确要求才建群或邀请；首发 task 可省略，用户明确要求才执行。原 human wait 门禁仍阻断工具/推进：普通“继续”不能回答审批卡，也不能放行未知效果。受限知识 profile 与批准字节发布职责保持原边界。
+
+
 > 日期：2026-08-11  
 > 状态：**PuddingTeams 提示词管理核心事实源**；目标方案已落地（2026-08-11，见 §8）。  
 > 适用范围：基于 Pi 的 Manager 提示词装配、Pi Worker 运行指令、Window 协作、Global/Workspace context，以及非 Pi Worker 向 Pi manager 暴露的路由信息。  

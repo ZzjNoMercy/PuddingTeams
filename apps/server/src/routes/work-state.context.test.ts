@@ -81,9 +81,9 @@ test("页面验收 Git 写 Submission 时先记录意图、提升 change-set，�
 		requirementResults: [{ requirement: "文件存在", status: "provided", evidenceRefs: ["D-route"] }], artifactCapture: [],
 		collectionStatus: "complete", integrity: "clean", issues: [], sealedAt: new Date().toISOString(), workspaceExecutionScopeId: "scope-route",
 	};
-	const changeSet = { id: "cs-route", executionScopeId: "scope-route", delegationIds: ["D-route"], mode: "isolated_worktree" as const,
+	const changeSet = { id: "cs-route", executionScopeId: "scope-route", ownerRefs: [{ kind: "delegation" as const, delegationId: "D-route" }], mode: "isolated_worktree" as const,
 		baselineFingerprint: "base", outputFingerprint: "out", changedPaths: ["result.txt"], promotionState: "pending" as const, createdAt: new Date().toISOString() };
-	const conflictChangeSet = { ...changeSet, id: "cs-conflict", executionScopeId: "scope-conflict", delegationIds: ["D-conflict"] };
+	const conflictChangeSet = { ...changeSet, id: "cs-conflict", executionScopeId: "scope-conflict", ownerRefs: [{ kind: "delegation" as const, delegationId: "D-conflict" }] };
 	const submitted = await stack.workStates.noteDelegation(sessionId, { goalId: goal.goalId, workItemId: "W1", delegationId: "D-route",
 		delegationStatus: "completed", goalEpoch: 1, executionReceipt: receipt, workspaceChangeSet: changeSet }, "submit-route");
 	const target = submitted.plan!.items.W1!;

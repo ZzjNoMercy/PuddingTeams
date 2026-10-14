@@ -1,3 +1,4 @@
+import type { NativeInputCapability } from "./types";
 import type {
 	ExtensionAuthorizationSession,
 	AgentCapabilityBinding,
@@ -1109,11 +1110,12 @@ export class SessionMessagesError extends Error {
 	}
 }
 
-export async function fetchMessages(sessionId: string): Promise<{ messages: unknown[]; running: boolean; unansweredUserMessage: boolean; unfinishedAssistantTurn: boolean; runningToolCallIds: string[]; recoveredToolResults: RecoveredToolResult[] }> {
+export async function fetchMessages(sessionId: string): Promise<NativeInputCapability & { messages: unknown[]; running: boolean; unansweredUserMessage: boolean; unfinishedAssistantTurn: boolean; runningToolCallIds: string[]; recoveredToolResults: RecoveredToolResult[] }> {
 	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/messages`);
-	const body = (await res.json()) as { messages?: unknown[]; running?: boolean; unansweredUserMessage?: boolean; unfinishedAssistantTurn?: boolean; runningToolCallIds?: string[]; recoveredToolResults?: RecoveredToolResult[]; error?: string };
+	const body = (await res.json()) as Partial<NativeInputCapability> & { messages?: unknown[]; running?: boolean; unansweredUserMessage?: boolean; unfinishedAssistantTurn?: boolean; runningToolCallIds?: string[]; recoveredToolResults?: RecoveredToolResult[]; error?: string };
 	if (!res.ok) throw new SessionMessagesError(sessionApiError(body.error, `fetch messages failed: ${res.status}`), res.status, body.error);
 	return {
+		ownerAgentId: body.ownerAgentId ?? "manager", connectorId: body.connectorId ?? "pi", nativePi: body.nativePi === true, readOnly: body.readOnly === true, busyInput: body.busyInput ?? {modes:[]}, waiting: body.waiting ?? [], pendingMessageCount: body.pendingMessageCount ?? 0, unconfirmedInput: body.unconfirmedInput === true, leafEntryId: body.leafEntryId, sourceSnapshotId: body.sourceSnapshotId,
 		messages: body.messages ?? [],
 		running: body.running === true,
 		unansweredUserMessage: body.unansweredUserMessage === true,
@@ -1162,16 +1164,17 @@ function sessionApiError(error: string | undefined, fallback: string): string {
 export interface SendMessageResult {
 	/** Worker 执行 session 忙碌时消息进入排队通道（202），未立即投递。 */
 	queued: boolean;
+ disposition?: "started" | "queued" | "handled"; persistence?: "durable" | "pending" | "not_applicable";
 	queueId?: string;
 }
 
-export async function sendMessage(sessionId: string, content: string, attachments: MessageAttachmentInput[], operationId: string): Promise<SendMessageResult> {
+export async function sendMessage(sessionId: string, content: string, attachments: MessageAttachmentInput[], operationId: string, delivery?: "normal" | "followUp" | "steer"): Promise<SendMessageResult> {
 	let res: Response;
 	try {
 		res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/messages`, {
 			method: "POST",
 			headers: { "content-type": "application/json", "idempotency-key": operationId },
-			body: JSON.stringify({ content, attachments }),
+			body: JSON.stringify({ content, attachments, delivery }),
 		});
 	} catch (error) {
 		throw new MessageDeliveryUnconfirmedError(error instanceof Error ? error.message : String(error));
@@ -1184,8 +1187,8 @@ export async function sendMessage(sessionId: string, content: string, attachment
 		if (body?.code === "message_operation_rejected") throw new MessageOperationRejectedError(body.error ?? "消息未通过发送前检查");
 		throw new MessageDeliveryUnconfirmedError(sessionApiError(body?.error, `send message failed: ${res.status}`));
 	}
-	const body = (await res.json().catch(() => null)) as { queued?: boolean; queueId?: string } | null;
-	return { queued: body?.queued === true, ...(body?.queueId ? { queueId: body.queueId } : {}) };
+	const body = (await res.json().catch(() => null)) as { queued?: boolean; queueId?: string; disposition?: SendMessageResult["disposition"]; persistence?: SendMessageResult["persistence"] } | null;
+	return { disposition: body?.disposition, persistence: body?.persistence, queued: body?.disposition === "queued", ...(body?.queueId ? { queueId: body.queueId } : {}) };
 }
 
 export async function abortSession(sessionId: string): Promise<AbortSessionResult> {

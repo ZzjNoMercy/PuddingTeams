@@ -13,7 +13,7 @@ export function redactText(value: string): string {
 		.replace(/\b(Authorization)\s*:\s*(?:Bearer\s+)?(?:\[redacted\][\]]*|[A-Za-z0-9._~+\/-]+=*)(?:\s+\[redacted\][\]]*)*/gi, "$1: [redacted]")
 		.replace(/\b(Bearer)\s+(?!\[redacted\])([A-Za-z0-9._~+\/-]+=*)/gi, "$1 [redacted]")
 		.replace(/\b(sk-[A-Za-z0-9_-]{6,})\b/g, "[redacted]")
-		.replace(/((?:[A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|AUTHORIZATION|COOKIE|CREDENTIAL|PRIVATE[_-]?KEY)[A-Z0-9_]*)\s*[=:]\s*)(?!\[redacted\])([^\s,;\]}"'`]+)/gi, "$1[redacted]")
+		.replace(/\b((?:[A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|AUTHORIZATION|COOKIE|CREDENTIAL|PRIVATE[_-]?KEY)[A-Z0-9_]*)\s*[=:]\s*)(?!\[redacted\])([^\s,;\]}"'`]+)/gi, "$1[redacted]")
 		.replace(/("[^"]*(?:api[_-]?key|token|secret|password|passwd|authorization|cookie|credential|private[_-]?key)[^"]*"\s*:\s*")(?!\[redacted\]")[^"]*(")/gi, "$1[redacted]$2")
 		.replace(/\[redacted\][\]]+/g, "[redacted]");
 }

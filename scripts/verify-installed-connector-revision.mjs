@@ -1,3 +1,4 @@
+import { registerPuddingClawFixture } from './installed-worker-fixture.mjs';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdtemp } from 'node:fs/promises';
@@ -30,6 +31,7 @@ let started = false;
 try {
   await run(cli, ['start', '--port', String(port)], { env, timeout: 30000 });
   started = true;
+  await registerPuddingClawFixture(base);
   const initial = await request('GET', '/api/agents');
   assert.equal(initial.status, 200);
   const agent = initial.body.agents.find((item) => item.name === 'puddingclaw');

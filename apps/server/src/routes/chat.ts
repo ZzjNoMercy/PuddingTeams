@@ -1,3 +1,4 @@
+import { NativeInput } from "../pi-bridge/native-input.js";
 import type { FastifyInstance } from "fastify";
 import type { WebSocket } from "@fastify/websocket";
 import { fileURLToPath } from "node:url";
@@ -77,7 +78,18 @@ const socketsBySession = new Map<string, Set<WebSocket>>();
 const wireMessageIds = new WeakMap<object, string>();
 
 function withWireMessageId<T extends object>(message: T): T & { puddingMessageId: string } {
-	let id = wireMessageIds.get(message);
+	// pi 1.x 的 _refreshFinalizedContext 会重建 state.messages，WS 事件对象与
+	// 历史读取对象不再共享引用；携带耐用标识的消息直接用它作线上 id，保证实时
+	// 事件与历史重放是同一张卡：eventId（委派终态投递）或 customType+taskId
+	//（direct 的 assign/result 卡天然同 taskId，前端本就按它去重）。
+	const details = (message as { details?: { eventId?: unknown; taskId?: unknown } }).details;
+	const eventId = details?.eventId;
+	const taskId = details?.taskId;
+	const customType = (message as { customType?: unknown }).customType;
+	const durable = typeof eventId === "string" ? `event:${eventId}`
+		: typeof customType === "string" && typeof taskId === "string" ? `${customType}:${taskId}`
+		: undefined;
+	let id = (message as { puddingMessageId?: string }).puddingMessageId ?? durable ?? wireMessageIds.get(message);
 	if (!id) { id = randomUUID(); wireMessageIds.set(message, id); }
 	return { ...message, puddingMessageId: id };
 }
@@ -201,7 +213,18 @@ export async function registerChatRoutes(
 	 * 经排队通道投递（忙碌时 202 排队）。
 	 */
 	workerSessions?: { delegations: DelegationStore; sessionDir: string; liveLookup?: LiveWorkerSessionLookup; inputQueue?: WorkerInputDispatcher },
+ inputController?: NativeInput,
 ): Promise<void> {
+	const nativeInput = inputController ?? new NativeInput(store, messageOperations, knowledgeIntakes);
+	// Directory placement never grants a delegated Context ordinary chat capabilities.
+	app.addHook("preHandler", async (req, reply) => {
+		const match = /^\/api\/sessions\/([^/?]+)(?:[/?]|$)/.exec(req.url);
+		if (!match || !workerSessions || !teams) return;
+		const id = decodeURIComponent(match[1]!);
+		if (!(await teams.contextForSession(id)) && (await workerSessions.delegations.listDelegations()).some(record => record.sessionHandle === id)) {
+			return reply.code(410).send({ error: "Delegation 仅提供按 delegationId 查询的过程", code: "delegation_trace_only" });
+		}
+	});
 	const resolveWorkerSession = async (id: string) => {
 		if (!workerSessions || !teams) return undefined;
 		const resolved = await resolveSession(
@@ -432,7 +455,9 @@ export async function registerChatRoutes(
 			try {
 				return await withActiveSessionLifecycle(req.params.id, async () => ({ model: await store.setModel(req.params.id, model) }));
 			} catch (err) {
-				return reply.code(inactiveContextError(err) ? 409 : 400).send({ error: inactiveContextError(err) ? "session_context_inactive" : err instanceof Error ? err.message : String(err) });
+				const message=err instanceof Error?err.message:String(err);
+    const code=message.startsWith("session_rebuild_blocked")?"session_rebuild_blocked":message==="session_owner_unavailable"?"session_owner_unavailable":inactiveContextError(err)?"session_context_inactive":undefined;
+    return reply.code(code==="session_owner_unavailable"?403:code?409:400).send({error:code??message,code});
 			}
 		},
 	);
@@ -448,49 +473,27 @@ export async function registerChatRoutes(
 			try {
 				return await withActiveSessionLifecycle(req.params.id, async () => ({ thinkingLevel: await store.setThinkingLevel(req.params.id, thinkingLevel) }));
 			} catch (err) {
-				return reply.code(inactiveContextError(err) ? 409 : 400).send({ error: inactiveContextError(err) ? "session_context_inactive" : err instanceof Error ? err.message : String(err) });
+				const message=err instanceof Error?err.message:String(err);
+    const code=message.startsWith("session_rebuild_blocked")?"session_rebuild_blocked":message==="session_owner_unavailable"?"session_owner_unavailable":inactiveContextError(err)?"session_context_inactive":undefined;
+    return reply.code(code==="session_owner_unavailable"?403:code?409:400).send({error:code??message,code});
 			}
 		},
 	);
 
-	app.post<{ Params: { id: string }; Body: { content?: string; attachments?: UploadInput[] } }>(
+	app.post<{ Params: { id: string }; Body: { content?: string; attachments?: UploadInput[]; delivery?: "normal" | "followUp" | "steer" } }>(
 		"/api/sessions/:id/messages",
 		{ bodyLimit: 28 * 1024 * 1024 },
 		async (req, reply) => {
+			const requestedDelivery = req.body?.delivery;
+			if (requestedDelivery !== undefined && !["normal", "followUp", "steer"].includes(requestedDelivery)) return reply.code(400).send({ error: "invalid delivery", code: "invalid_delivery" });
 			const content = req.body?.content?.trim();
 			const attachments = req.body?.attachments ?? [];
 			if (!content && attachments.length === 0) {
 				return reply.code(400).send({ error: "content or attachments is required" });
 			}
 			if (!Array.isArray(attachments)) return reply.code(400).send({ error: "attachments must be an array" });
-			// Worker 执行 session：直接输入经排队通道投递（dispatcher.submit 内部
-			// 判定空闲直投或 FIFO 入队）；容器 session 落用户卡承担时间线/未读。
-			const workerInputTarget = await resolveWorkerSession(req.params.id);
-			if (workerInputTarget) {
-				const inputQueue = workerSessions?.inputQueue;
-				if (!inputQueue) {
-					return reply.code(400).send({ error: "worker 执行会话的直接输入尚未开放", code: "worker_session_input_unavailable" });
-				}
-				if (!content) return reply.code(400).send({ error: "content is required" });
-				if (attachments.length > 0) return reply.code(400).send({ error: "执行会话暂不支持附件" });
-				const workerOperationKey = typeof req.headers["idempotency-key"] === "string" && req.headers["idempotency-key"].trim()
-					? req.headers["idempotency-key"].trim()
-					: randomUUID();
-				try {
-					const outcome = await inputQueue.submit({
-						windowId: workerInputTarget.windowId,
-						sessionHandle: workerInputTarget.sessionHandle,
-						text: content,
-						displayText: content,
-						operationId: workerOperationKey,
-					});
-					if (outcome.status === "queued") {
-						return reply.code(202).send({ queued: true, queueId: outcome.queueId, accepted: false });
-					}
-					return { accepted: true, queued: false, attachments: [] };
-				} catch (err) {
-					return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
-				}
+			if (teams && !(await teams.contextForSession(req.params.id)) && workerSessions && (await workerSessions.delegations.listDelegations()).some(record => record.sessionHandle === req.params.id)) {
+				return reply.code(410).send({ error: "Delegation 仅可按 delegationId 查询过程，不能作为聊天续写", code: "delegation_trace_only" });
 			}
 			const freezeHeader = req.headers["x-puddingteams-first-work-freeze-id"];
 			const internalFirstWork = typeof freezeHeader === "string" && req.headers["x-puddingteams-first-work-token"] === internalFirstWorkFreezeToken;
@@ -499,7 +502,7 @@ export async function registerChatRoutes(
 				return reply.code(428).send({ error: "发送消息需要 Idempotency-Key", code: "message_operation_required" });
 			}
 			const operationHash = messageOperations && typeof operationKey === "string"
-				? createHash("sha256").update(JSON.stringify({ content: content ?? "", attachments })).digest("hex")
+				? createHash("sha256").update(JSON.stringify({ content: content ?? "", attachments, delivery: requestedDelivery ?? "auto" })).digest("hex")
 				: undefined;
 			let operationReserved = false;
 			let operationContextHash: string | undefined;
@@ -508,6 +511,7 @@ export async function registerChatRoutes(
 			let sourceRefs: ChatSourceRefs | undefined;
 			try {
 				const context = await requireActiveSessionContext(req.params.id);
+				await store.nativeInputAllowed(req.params.id);
 				if (teams && !context) throw new Error("会话已失去项目归属，请重新打开会话");
 				if (messageOperations && typeof operationKey === "string" && operationHash) {
 					const contextHash = createHash("sha256").update(JSON.stringify({
@@ -517,7 +521,7 @@ export async function registerChatRoutes(
 					})).digest("hex");
 					operationContextHash = contextHash;
 					const reservation = await messageOperations.reserve(operationKey, req.params.id, operationHash, contextHash);
-					if (reservation === "accepted") return { accepted: true, attachments: [] };
+					if (reservation === "accepted") { const receipt = await nativeInput.replay(operationKey); return { accepted: true, attachments: [], ...(receipt ?? {}) }; }
 					if (typeof reservation === "object") return reply.code(400).send({ error: reservation.rejected, code: "message_operation_rejected" });
 					if (reservation === "unconfirmed") {
 						const recovered = await (async () => {
@@ -541,8 +545,10 @@ export async function registerChatRoutes(
 				// undergo ordinary path preflight. Unknown absolute paths stay checked.
 				const command = /^\/([A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)?)(?=\s|$)/.exec(promptContent);
 				let pathInput = promptContent;
-				if (command && context?.window.type !== "direct" && (command[1]!.startsWith("skill:") ||
-					(context && (await store.open(req.params.id)).promptTemplates?.some((template) => template.name === command[1])))) pathInput = promptContent.slice(command[0].length);
+				if (command && (context?.window.type !== "direct" || (await store.nativeSessionCapability(req.params.id)).nativePi)) {
+     const session=await store.open(req.params.id);
+     if(command[1]!.startsWith("skill:") || session.promptTemplates?.some(template=>template.name===command[1]) || session.extensionRunner?.getRegisteredCommands().some(item=>item.invocationName===command[1])) pathInput=promptContent.slice(command[0].length);
+    }
 				for (const reference of localPathReferences(pathInput)) {
 					const canonicalPath = await realpath(reference.absolutePath).catch(() => undefined);
 					if (!canonicalPath) throw new MessagePreflightRejectionError(`绝对路径不存在或不可访问，未交给 Agent：${reference.absolutePath}`);
@@ -584,6 +590,7 @@ export async function registerChatRoutes(
 			}
 			try {
 				if (teams && invoker && await directWorkerFor(teams, req.params.id)) {
+					if (store.isRunning(req.params.id) || (await invoker.delegationsForManagerSession(req.params.id)).some(d => ["running", "waiting_input", "waiting_admission"].includes(d.executionState))) return reply.code(409).send({ error: "该 Connector 运行中不支持追加", code: "native_input_unsupported" });
 					const attachmentText = stored.length
 						? `\n\n用户附件（平台冻结路径，可按需读取并在委托任务中原样传递）：\n${stored.map((item) => `- ${item.name} (${item.mediaType}, ${item.size} bytes): ${item.path}`).join("\n")}`
 						: "";
@@ -613,7 +620,10 @@ export async function registerChatRoutes(
 						.map((item) => ({ type: "image" as const, data: item.base64, mimeType: item.mediaType }));
 					// 第一条消息到达时，异步调 LLM 生成会话标题（session_info），
 					// 不阻塞消息发送本身。
-					const isFirstMessage = session.messages.length === 0;
+					const isFirstMessage = !session.messages.some(message => message.role === "user");
+					const capability = await store.nativeSessionCapability(req.params.id);
+					const waiting = capability.waiting.length > 0;
+					const delivery = waiting ? "followUp" : !session.isIdle ? (requestedDelivery === "steer" ? "steer" : "followUp") : "normal";
 					const generateTitle = () => {
 						void store.generateSessionTitle(req.params.id, content || stored.map((item) => item.name).join("、")).catch((err: unknown) => {
 							app.log.warn({ err, sessionId: req.params.id }, "title generation failed");
@@ -649,36 +659,45 @@ export async function registerChatRoutes(
 							queueMicrotask(() => { const persisted = newUserIsDurable(); if (persisted) resolveUserEntry?.(persisted); });
 						}
 					}) : undefined;
-					let resolvePreflight: ((accepted: boolean) => void) | undefined;
-					const preflight = new Promise<boolean>((resolve) => { resolvePreflight = resolve; });
+					let preflightError: unknown;
+					let resolvePreflight: ((accepted: "started" | "queued" | "handled" | false) => void) | undefined;
+					const preflight = new Promise<"started" | "queued" | "handled" | false>((resolve) => { resolvePreflight = resolve; });
 					const promptOptions = {
 						...(images.length ? { images } : {}),
 						// pi 1.x：preflightResult 只在受理后回调（started/queued/handled 均视为受理）；
 						// 准入拒绝改为 prompt() 直接抛错，由下方 completion.catch 补 resolvePreflight(false)。
-						preflightResult: () => resolvePreflight?.(true),
+						streamingBehavior: delivery === "steer" ? "steer" : "followUp",
+						preflightResult: disposition => resolvePreflight?.(disposition),
 					} as PromptOptions;
-					disarmIntake = sourceRefs ? knowledgeIntakes?.armManager(session, sourceRefs, promptText, stored) : undefined;
-					const completion = session.prompt(promptText, promptOptions);
-					void completion.catch(() => resolvePreflight?.(false));
+					disarmIntake = sourceRefs && delivery === "normal" ? knowledgeIntakes?.armManager(session, sourceRefs, promptText, stored) : undefined;
+     if (delivery !== "normal" && typeof operationKey === "string" && operationHash && operationContextHash) { nativeInput.track(session, { key: operationKey, hash: operationHash, contextHash: operationContextHash, text: promptText, refs: sourceRefs, delivery }); nativeInput.watch(req.params.id); }
+     const completion = waiting ? session.followUp(promptText, images).then(disposition => { resolvePreflight?.(disposition); }) : session.prompt(promptText, promptOptions);
+					void completion.catch(error => { preflightError = error; resolvePreflight?.(false); });
 					void completion.finally(() => disarmIntake?.()).catch(() => {});
 					void completion.catch((err: unknown) => {
 						app.log.error({ err, sessionId: req.params.id }, "prompt failed");
 						forwardError(req.params.id, err instanceof Error ? err.message : String(err));
 					});
 					let timeout: ReturnType<typeof setTimeout> | undefined;
+     let pollStopped=false;
 					try {
-						if (!(await preflight)) {
-							try { await completion; }
-							finally {
-								if (stored.length && session.messages.filter((message) => message.role === "user").length === priorUserCount) {
-									await uploads?.discard(req.params.id, stored).catch((error: unknown) => app.log.warn({ error, sessionId: req.params.id }, "failed to discard rejected message attachments"));
-								}
-							}
-							throw new Error("消息未通过模型准入");
-						}
+						const disposition = await Promise.race([preflight, new Promise<false>(resolve => { timeout = setTimeout(() => resolve(false), 5000); })]);
+      if (!disposition) {
+       if (!preflightError) throw new MessageSubmissionUnconfirmedError();
+       if (typeof operationKey === "string") nativeInput.reject(req.params.id,operationKey);
+       if (stored.length && session.messages.filter(message => message.role === "user").length === priorUserCount) await uploads?.discard(req.params.id, stored);
+       throw preflightError;
+      }
+      if (timeout) { clearTimeout(timeout); timeout = undefined; }
+
+      if (disposition === "queued" || disposition === "handled") {
+       const receipt = typeof operationKey === "string" && operationHash ? await nativeInput.accept(req.params.id, operationKey, operationHash, { disposition, delivery, persistence: disposition === "queued" ? "pending" : "not_applicable" }) : { operationId: "", disposition, delivery, persistence: disposition === "queued" ? "pending" : "not_applicable" };
+       return reply.code(disposition === "queued" ? 202 : 200).send({ accepted: true, attachments: stored.map(({ base64: _base64, ...item }) => item), ...receipt });
+      }
 						if (awaitDurableUser) {
 							const deadline = new Promise<undefined>((resolve) => { timeout = setTimeout(() => resolve(undefined), 5000); });
-							const persisted = await Promise.race([userEntry!, completion.then(newUserIsDurable), deadline]);
+							const poll=new Promise<string|undefined>(resolve=>{const check=()=>{const found=newUserIsDurable();if(found)resolve(found);else if(!pollStopped)setTimeout(check,25);else resolve(undefined);};check();});
+       const persisted = await Promise.race([userEntry!, poll, completion.then(newUserIsDurable), deadline]);
 							if (!persisted) throw new Error("首次发送尚未写入会话记录，请保留原操作键重试");
 							if (operationReserved && typeof operationKey === "string" && operationHash && operationContextHash) {
 								await store.appendMessageAdmission(req.params.id, { operationId: operationKey, requestHash: operationHash, contextHash: operationContextHash, userEntryId: persisted });
@@ -686,13 +705,21 @@ export async function registerChatRoutes(
 						}
 					} finally {
 						if (timeout) clearTimeout(timeout);
+						pollStopped=true;
 						unsubscribeUser?.();
 					}
-					if (messageOperations && typeof operationKey === "string" && operationHash) await messageOperations.markAccepted(operationKey, req.params.id, operationHash);
+					const receipt = typeof operationKey === "string" && operationHash ? await nativeInput.accept(req.params.id, operationKey, operationHash, { disposition: "started", delivery, persistence: "durable", userEntryId: newUserIsDurable() }) : { disposition: "started", delivery, persistence: "durable" };
 					if (isFirstMessage) generateTitle();
-					return { accepted: true, attachments: stored.map(({ base64: _base64, ...item }) => item) };
+					return { accepted: true, attachments: stored.map(({ base64: _base64, ...item }) => item), ...receipt };
 				});
 			} catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/compaction is in progress/.test(message)) {
+     if(typeof operationKey === "string") nativeInput.reject(req.params.id,operationKey);
+     if(operationReserved && typeof operationKey === "string" && operationHash) await messageOperations?.markRetryable(operationKey,req.params.id,operationHash);
+     return reply.code(409).send({ error: "会话正在压缩，请稍后使用同一消息重试", code: "session_compacting" });
+    }
+    if (/session_owner_unavailable/.test(message)) return reply.code(403).send({ error: "负责 Agent 不可用，会话为只读", code: "session_owner_unavailable" });
 				if (operationReserved) return reply.code(409).send({ error: new MessageSubmissionUnconfirmedError().message, code: "message_delivery_unconfirmed" });
 				return reply.code(inactiveContextError(err) ? 409 : 400).send({
 					error: inactiveContextError(err) ? "session_context_inactive" : err instanceof Error ? err.message : String(err),
@@ -764,7 +791,9 @@ export async function registerChatRoutes(
 			return await withActiveSessionLifecycle(req.params.id, async () => {
 				const toolCallState = await store.recoverToolCallState(req.params.id);
 				const session = await store.open(req.params.id);
-				const running = store.isRunning?.(req.params.id) ?? false;
+				const nativeRunning = store.isRunning?.(req.params.id) ?? false;
+    const directOwner = teams && await directWorkerFor(teams, req.params.id);
+    const running = nativeRunning || Boolean(directOwner && (await teams?.getAgent(directOwner.workerName))?.connector?.connectorId !== "pi" && invoker && (await invoker.delegationsForManagerSession(req.params.id)).some(item => ["running","waiting_admission","waiting_input","cancel_requested","reconciling"].includes(item.executionState)));
 				const branch = session.sessionManager.getBranch();
 				const lastConversationEntry = [...branch].reverse().find((entry) =>
 					entry.type === "message" && (entry.message.role === "user" || entry.message.role === "assistant"));
@@ -774,7 +803,7 @@ export async function registerChatRoutes(
 					&& lastConversationEntry.message.stopReason === "toolUse"
 					&& branch.some((entry) => entry.type === "message" && entry.message.role === "user")
 					&& messageEntryPersisted(session.sessionFile, lastConversationEntry.id, "assistant");
-				return { messages: session.messages.map(withWireMessageId), running, unansweredUserMessage, unfinishedAssistantTurn, ...toolCallState };
+				return { ...await store.nativeSessionCapability(req.params.id), messages: (await store.wireMessages(req.params.id)).map(withWireMessageId), running, unansweredUserMessage, unfinishedAssistantTurn, ...toolCallState };
 			});
 		} catch (err) {
 			if (inactiveContextError(err)) return reply.code(409).send({ error: "session_context_inactive" });
@@ -819,7 +848,7 @@ export async function registerChatRoutes(
 				if (workerTarget) {
 					// live 时桥接执行事件流；非 live 只给 session_ready 快照后保持空闲
 					// （不重放伪装 live——历史由 GET /messages 提供）。
-					socket.send(JSON.stringify({ type: "session_ready", sessionId }));
+					socket.send(JSON.stringify({ type: "session_ready", sessionId, ...await store.nativeSessionCapability(sessionId) }));
 					const unsubscribeLive = subscribeWorkerSession(
 						workerTarget.sessionHandle,
 						(event) => {
@@ -850,7 +879,7 @@ export async function registerChatRoutes(
 					// open 只为校验存在性并确保实例已物化；订阅走 store 级通道，
 					// runtimeDirty 空闲重建换掉 AgentSession 实例后推送不断流。
 					await store.open(sessionId);
-					socket.send(JSON.stringify({ type: "session_ready", sessionId }));
+					socket.send(JSON.stringify({ type: "session_ready", sessionId, ...await store.nativeSessionCapability(sessionId) }));
 					const unsubscribe = store.subscribe(sessionId, (event) => {
 						const payload = serializeChatEvent(event);
 						if (payload && socket.readyState === socket.OPEN) socket.send(payload);

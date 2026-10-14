@@ -44,7 +44,7 @@ test("Manager仅取得授权库路由元数据，知识检索与整理均委派�
 		assert.deepEqual(manager.tools, []);
 		assert.notEqual(manager.fingerprint, worker.fingerprint, "工具职责收敛不能复用旧Manager上下文");
 		assert.ok(manager.prompt.includes(f.binding.id)); assert.ok(manager.prompt.includes("My Wiki"));
-		assert.ok(manager.prompt.includes("agent_wiki__delegate"));
+		assert.ok(manager.prompt.includes("delegation"));
 		assert(!manager.prompt.includes("knowledge_read")); assert(!manager.prompt.includes(f.vault));
 		assert(!manager.prompt.includes("事实日期2026-12-01"));
 		assert.ok(worker.tools.some(tool => tool.name === "knowledge_read"));

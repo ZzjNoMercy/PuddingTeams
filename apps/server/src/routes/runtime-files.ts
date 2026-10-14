@@ -1,3 +1,4 @@
+import { delegationOwnerIds } from "../agent-runtime/workspace-execution.js";
 import type { FastifyInstance } from "fastify";
 import { constants } from "node:fs";
 import { open, realpath, stat } from "node:fs/promises";
@@ -47,10 +48,10 @@ async function changedPathsFor(
 ): Promise<{ scope: WorkspaceExecutionScope; paths: string[] } | undefined> {
 	if (!delegation?.workspaceExecutionScopeId) return undefined;
 	const scope = await workspaceExecution.get(delegation.workspaceExecutionScopeId);
-	if (!scope || !scope.delegationIds.includes(delegation.id)) return undefined;
+	if (!scope || !delegationOwnerIds(scope).includes(delegation.id)) return undefined;
 	if (delegation.workspaceChangeSetId) {
 		const changeSet = await workspaceExecution.getChangeSet(delegation.workspaceChangeSetId);
-		if (changeSet?.executionScopeId === scope.id && changeSet.delegationIds.includes(delegation.id)) {
+		if (changeSet?.executionScopeId === scope.id && delegationOwnerIds(changeSet).includes(delegation.id)) {
 			return { scope, paths: changeSet.changedPaths };
 		}
 	}

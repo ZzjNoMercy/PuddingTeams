@@ -147,7 +147,10 @@ try {
   const sessionFiles = (await readdir(path.join(home, 'sessions'))).filter((name) => name.includes(sessionId));
   assert.equal(sessionFiles.length, 1);
   const before = (await readFile(path.join(home, 'sessions', sessionFiles[0]), 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line));
-  assert.equal(before.filter((entry) => entry.type === 'message').length, 0);
+  // Pi 1.x persists a system entry and may record the stream-fence error even
+  // though the injected user append failed. The intent, not setup, must be absent.
+  assert.equal(before.filter((entry) => entry.type === 'message' && entry.message?.role === 'user').length, 0);
+  assert.equal(modelRequests, 0, 'an unpersisted first intent must not reach the provider');
   if (mode === 'drop') {
     const inFlight = await send();
     assert.equal(inFlight.status, 400, JSON.stringify(inFlight.body));
@@ -165,6 +168,16 @@ try {
   const replay = await send();
   assert.equal(replay.status, 200, JSON.stringify(replay.body));
   assert.equal(replay.body.sessionId, sessionId);
+  const replyDeadline = Date.now() + 20000;
+  let finalReply = false;
+  while (Date.now() < replyDeadline) {
+    const history = await request(`/api/sessions/${sessionId}/messages`);
+    finalReply = history.body.messages?.some(message => message.role === 'assistant' && JSON.stringify(message.content).includes('retry accepted')) ?? false;
+    if (finalReply) break;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert.equal(finalReply, true, 'retry must complete the real model turn, not only persist a user');
+  assert.ok(modelRequests > 0);
   const retained = await readdir(uploadDir);
   assert.equal(retained.length, 1);
   assert.notEqual(retained[0], abandoned[0]);
@@ -174,7 +187,7 @@ try {
   const entries = (await readFile(session.sessionFile, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
   const users = entries.filter((entry) => entry.type === 'message' && entry.message?.role === 'user');
   assert.equal(users.length, 1);
-  console.log(JSON.stringify({ home, sessionId, mode, firstStatus, liveRetryStatus, replayStatus: replay.status, uploadsAfterFirst: abandoned.length, uploadsAfterReplay: retained.length, abandonedRemoved: true, durableUsers: users.length, modelRequests, injectedCrash: true }, null, 2));
+  console.log(JSON.stringify({ home, sessionId, mode, firstStatus, liveRetryStatus, replayStatus: replay.status, uploadsAfterFirst: abandoned.length, uploadsAfterReplay: retained.length, abandonedRemoved: true, durableUsers: users.length, modelRequests, finalReply, injectedCrash: true }, null, 2));
   }
 } finally {
   if (started) await run(cli, ['stop'], { env, timeout: 30000 }).catch(() => undefined);

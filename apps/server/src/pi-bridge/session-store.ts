@@ -1,5 +1,15 @@
+import path from "node:path";
+import type { ConversationSnapshot } from "../store/conversation-snapshots.js";
+import { randomUUID } from "node:crypto";
+import { piSessionOwner, piSessionResourceLoader } from "./pi-session-factory.js";
+import { projectDelegationResult, delegationStatus } from "../agent-runtime/delegation-result-projection.js";
+import type { NativeToolExecution } from "./native-tool-execution.js";
 import {
 	createAgentSession,
+	createBashToolDefinition,
+	createEditToolDefinition,
+	createWriteToolDefinition,
+	type ToolDefinition,
 	createFindToolDefinition,
 	createGrepToolDefinition,
 	createLsToolDefinition,
@@ -14,9 +24,9 @@ import {
 	type CreateAgentSessionOptions,
 	type InlineExtension,
 } from "@earendil-works/pi-coding-agent";
-import { readFile, realpath, unlink } from "node:fs/promises";
+import { readFile, realpath, unlink, mkdir, rename, rm, open as openFile } from "node:fs/promises";
 import { closeSync, existsSync, fsyncSync, openSync, readFileSync, writeFileSync } from "node:fs";
-import { agentDisplayName, MANAGER_AGENT_NAME } from "../store/teams.js";
+import { agentRunConfigRevision, agentDisplayName, MANAGER_AGENT_NAME } from "../store/teams.js";
 import type { PiManagerSettings, PiResourceConfig, TeamsStore } from "../store/teams.js";
 import type { WorkStateStore } from "../store/work-state.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
@@ -65,6 +75,7 @@ import type { McpServerStore } from "../store/mcp-servers.js";
 import { buildManagedMcpExtension } from "./mcp-runtime.js";
 
 export interface SessionSummary {
+ ownerAgentId?: string; sourceSnapshotId?: string; leafEntryId?: string;
 	id: string;
 	sessionFile: string;
 	firstMessage: string;
@@ -232,7 +243,7 @@ function delegationToolResult(delegation: DelegationRecord): RecoveredToolResult
 		text,
 		details: {
 			worker: delegation.agentId,
-			status: completed ? "completed" : cancelled ? "cancelled" : "failed",
+			status: delegationStatus(delegation),
 			reportedStatus,
 			delegationId: delegation.id,
 			executionState: delegation.executionState,
@@ -266,6 +277,7 @@ export class PiSessionStore {
 	private active = new Map<string, AgentSession>();
 	private readonly catalog: ExtensionCatalog;
 	/** 装配时已注册到会话的受管工具名（撤权时据此识别“该会话自己的”工具）。 */
+	private assembledWorkers = new Map<string, Set<string>>();
 	private assembledManaged = new Map<string, Set<string>>();
 	/** 配置变化标记（§3.3.5）：Session 空闲时重建 ResourceLoader/AgentSession。 */
 	private runtimeDirty = new Set<string>();
@@ -323,6 +335,7 @@ export class PiSessionStore {
 		private readonly capabilityStateRoot?: string,
 		private readonly fffStateRoot?: string,
 		private readonly mcpServers?: McpServerStore,
+		readonly nativeExecutions?: NativeToolExecution,
 	) {
 		this.catalog = catalog ?? new ExtensionCatalog();
 		if (this.teamsStore && this.invoker) {
@@ -335,7 +348,17 @@ export class PiSessionStore {
 			});
 		}
 	}
+	private wireTurns = new Map<string, string>();
+	private beforeNativeStream?: (session: AgentSession) => Promise<void>;
+	setBeforeNativeStream(hook: (session: AgentSession) => Promise<void>): void { this.beforeNativeStream = hook; }
+	private pendingInputGate?: (id: string) => Promise<boolean>;
+	private cancelNativeInputs?: (id: string) => Promise<void>;
+	setNativeInputLifecycle(pending: (id: string) => Promise<boolean>, cancel: (id: string) => Promise<void>): void { this.pendingInputGate = pending; this.cancelNativeInputs = cancel; }
+	async hasPendingInputs(id: string): Promise<boolean> { return Boolean(this.active.get(id)?.pendingMessageCount || await this.pendingInputGate?.(id)); }
+	async assertNoPendingInputs(id: string): Promise<void> { if (await this.hasPendingInputs(id)) throw new Error("session_rebuild_blocked: 尚有未确认消费的输入，请先停止并核对"); }
 	private knowledgeRuntime: import("../knowledge/runtime-service.js").KnowledgeRuntimeService | undefined;
+ private nativeKnowledgeSurface?: (id:string,agent:import("../store/teams.js").AgentConfig,operationId:string)=>Promise<import("../knowledge/runtime-service.js").KnowledgeMountSurface>;
+ setNativeKnowledgeSurface(factory:NonNullable<PiSessionStore["nativeKnowledgeSurface"]>) {this.nativeKnowledgeSurface=factory;}
 	setKnowledgeRuntime(service: import("../knowledge/runtime-service.js").KnowledgeRuntimeService): void { this.knowledgeRuntime = service; }
 	private webResearchExtension?: (agentId: string) => InlineExtension;
 	setWebResearchExtension(factory: (agentId: string) => InlineExtension): void { this.webResearchExtension = factory; }
@@ -352,7 +375,7 @@ export class PiSessionStore {
 	static resolveGuidance(ctx: ManagerWindowContext | undefined, _legacySettings?: PiManagerSettings): string | undefined {
 		if (!ctx || ctx.type === "solo") return undefined;
 		const members = ctx.members.filter(Boolean);
-		if (members.length === 0) return undefined;
+		if (members.length === 0 && ctx.type === "direct") return undefined;
 		if (ctx.type === "group" && ctx.prompt?.trim()) return ctx.prompt.trim();
 		// 成员在提示词里渲染显示名（id → displayName 快照，缺省回退 id）；
 		// 工具名仍含 id，与 roster 段的工具清单一一对应。
@@ -369,13 +392,13 @@ export class PiSessionStore {
 			].join("\n");
 		}
 		return [
-			`当前是群聊窗口，pi manager 是调度者，成员：${members.map(label).join("、")}。多个 worker 需要配合完成用户的整体目标。`,
+			`当前是群聊窗口，Manager 负责当前对话，可委派 Worker 范围：${members.map(label).join("、") || "空"}。`,
 			"规则：",
-			`1. 把用户的整体目标拆解成可执行的子任务；成员的委托工具（agent_<id>__delegate）默认已激活，直接按 roster 里的工具名逐个委托给最合适的 worker（可调用多个 worker、可分多步执行）。`,
+			`1. 把用户的整体目标拆解成可执行的子任务；delegation 默认已激活，按 roster 的 Worker 内部 id 填写 workerId，每次独立委派给最合适的 Worker（可调用多个 worker、可分多步执行）。`,
 			"2. 用户指名 worker 时，优先把相关子任务委托给它。",
-			"3. 结合之前 worker 返回的结果决定下一步：后续子任务可引用/续接先前结果，需要接力时安排好 worker 之间的顺序。",
+			"3. 结合之前 worker 返回的结果决定下一步：后续子任务须显式引用材料，每次创建 fresh 委派，需要接力时安排好 worker 之间的顺序。",
 			"4. 需求或关键参数模糊时先向用户澄清，不要自行臆测。",
-			"5. 所有子任务完成后，把综合结论汇报给用户；调度与决策由你负责，但任务执行一律交给 worker，不要自己动手执行任务本身。",
+			"5. 所有子任务完成后，把综合结论汇报给用户；你可以使用原生工具直接执行工作；仅向本群范围内的 Worker 委派。不得自行扩大范围。",
 		].join("\n");
 	}
 
@@ -387,6 +410,105 @@ export class PiSessionStore {
 	private async managerResources(): Promise<PiResourceConfig | undefined> {
 		return (await this.teamsStore?.getManager())?.piResources;
 	}
+
+ private async sessionOwner(id: string, birth?: ManagerWindowContext) {
+  const ref = await this.teamsStore?.sessionRef?.(id);
+  if (ref) return piSessionOwner(await this.teamsStore?.getAgent(ref.ownerAgentId));
+  if (birth) return piSessionOwner(birth.type === "direct" ? await this.teamsStore?.getAgent(birth.members[0]!) : await this.teamsStore?.getManager());
+  if (this.teamsStore && await this.teamsStore.contextForSession(id)) throw new Error("native session owner is missing");
+  return piSessionOwner(this.teamsStore ? await this.teamsStore.getManager() : { name: "manager", description: "", pinned: true, invoke: { type: "pi" } });
+ }
+ async nativeSessionCapability(id: string) {
+  const ref = await this.teamsStore?.sessionRef?.(id);
+  const owner = await this.sessionOwner(id);
+  const session = await this.open(id);
+  const waiting = owner.role === "manager" ? await managerHumanWait(id, this.invoker, this.workStates) : undefined;
+  return { ownerAgentId: ref?.ownerAgentId ?? owner.agent?.name ?? "manager", connectorId: owner.agent?.connector?.connectorId ?? (owner.role === "manager" ? "pi" : "unavailable"), nativePi: owner.nativePi || !this.teamsStore,
+   readOnly: Boolean(this.teamsStore && (!owner.agent || owner.agent.enabled === false)),
+   busyInput: { modes: owner.nativePi || !this.teamsStore ? ["followUp", "steer"] : [] }, waiting: waiting ? [waiting] : [],
+   pendingMessageCount: session.pendingMessageCount, unconfirmedInput: Boolean(await this.pendingInputGate?.(id)), leafEntryId: session.sessionManager.getLeafId(), sourceSnapshotId: ref?.sourceSnapshotId };
+ }
+ async wireMessages(id: string) {
+  const session = await this.open(id);
+  for (const projected of session.sessionManager.buildSessionProjection().entries) for (const message of projected.messages) {
+   const value = message as typeof message & { puddingMessageId?: string };
+   if (["user","assistant","system","toolResult"].includes(message.role)) value.puddingMessageId ??= `entry:${id}:${projected.sourceEntry.id}`;
+  }
+  return session.messages;
+ }
+ async messageAdmission(id: string, key: string, hash: string, contextHash: string): Promise<string | undefined> {
+  const file=(await SessionManager.listAll(this.sessionDir)).find(item=>item.id===id)?.path;
+  if(!file)return;
+  const entries=readFileSync(file,"utf8").split("\n").filter(Boolean).map(line=>JSON.parse(line));
+  for(const entry of entries){const facts=entry.details;
+   if(entry.customType==="pudding:message_admission"&&facts?.operationId===key&&facts.requestHash===hash&&facts.contextHash===contextHash&&entries.some(user=>user.id===facts.userEntryId&&user.type==="message"&&user.message?.role==="user"))return facts.userEntryId;
+  }
+ }
+ async committedBranch(id:string) {
+  const session=await this.open(id),file=session.sessionFile;
+  if(!file||!existsSync(file))throw new Error("fork_source_uncommitted");
+  const entries=new Map<string,import("@earendil-works/pi-coding-agent").SessionEntry>();
+  try{for(const line of readFileSync(file,"utf8").split("\n").filter(Boolean)){const entry=JSON.parse(line);if(entry.type==="session")continue;if(entries.has(entry.id))throw new Error("duplicate entry");entries.set(entry.id,entry);}}
+  catch{throw new Error("snapshot_incompatible_history: invalid source JSONL");}
+  return session.sessionManager.getBranch().map(entry=>{const durable=entries.get(entry.id);if(!durable)throw new Error("fork_source_uncommitted");return durable;});
+ }
+ async historicalGoalEntries(id: string) {
+  return (await this.workStates?.listSessionGoals(id) ?? []).map(goal => ({type:"custom_message" as const, id:`history-goal-${goal.goalId}`,parentId:null,timestamp:goal.updatedAt,customType:"pudding:session_goal",display:true,content:`来源 Goal（历史）：${goal.goal}\n状态：${goal.status}；完成边界：${goal.completionBoundary}`,details:{historical:true}}));
+ }
+ async snapshotImportCapability(workerId:string) {
+  const owner=piSessionOwner(await this.teamsStore?.getAgent(workerId));
+  return owner.provider?.snapshotImport ? {...owner.provider.snapshotImport,providerId:owner.provider.id,maxTranscriptBytes:await this.snapshotImportBudget(workerId)} : undefined;
+ }
+ async snapshotImportBudget(workerId: string) {
+  const owner=piSessionOwner(await this.teamsStore?.getAgent(workerId));
+  const model=owner.settings.model ? await this.resolveModel(owner.settings.model) : undefined;
+  // Conservative UTF-8 bound, reserving half the context for target instructions and continued work.
+  return Math.min(2_000_000, model ? Math.floor(model.contextWindow / 2) : 64_000);
+ }
+ private async snapshotTargetSelection(workerId:string,cwd:string) {
+  const owner=piSessionOwner(await this.teamsStore?.getAgent(workerId));
+  const loader=await piSessionResourceLoader({cwd,settings:{...owner.settings,noExtensions:true},resources:owner.resources,factories:[],restricted:owner.restricted});
+  // Let Pi choose target defaults against an empty branch. A source assistant
+  // message also carries its model, and must never become the target selection.
+  const {session}=await createAgentSession({cwd,sessionManager:SessionManager.inMemory(cwd),resourceLoader:loader,modelRuntime:await this.runtime(),noTools:"all",
+   ...(owner.settings.model?{model:await this.resolveModel(owner.settings.model)}:{}),...(owner.settings.thinkingLevel?{thinkingLevel:owner.settings.thinkingLevel}:{})});
+  try{if(!session.model)throw new Error("snapshot_target_model_unavailable");return {model:session.model,thinkingLevel:session.thinkingLevel};}finally{session.dispose();}
+ }
+ async importSnapshot(snapshot: ConversationSnapshot, workerId: string, id: string, expectedRevision?:number) {
+  const existing=(await SessionManager.listAll(this.sessionDir)).find(file=>file.id===id);
+  if(existing){const sm=SessionManager.open(existing.path);if(!sm.getEntries().some(entry=>entry.type==="custom"&&entry.customType==="pudding:snapshot_import"&&(entry.data as {snapshotId?:string;transcriptHash?:string}).snapshotId===snapshot.id&&(entry.data as {transcriptHash?:string}).transcriptHash===snapshot.transcriptHash))throw new Error("fork_operation_uncertain");return {id};}
+  const owner=piSessionOwner(await this.teamsStore?.getAgent(workerId));
+  if(!owner.nativePi||owner.role!=="worker")throw new Error("snapshot_import_unsupported");
+  const selection=await this.snapshotTargetSelection(workerId,snapshot.cwdSnapshot);
+  if(Buffer.byteLength(JSON.stringify(snapshot.entries), "utf8")>Math.min(await this.snapshotImportBudget(workerId),Math.floor(selection.model.contextWindow/2)))throw new Error("snapshot_too_large");
+  const temp=path.join(this.sessionDir,`.fork-import-${id}`);
+  await rm(temp,{recursive:true,force:true});await mkdir(temp,{recursive:true});
+  try{
+   const sm=SessionManager.create(snapshot.cwdSnapshot,temp,{id}),ids=new Map<string,string>();
+   for(const entry of snapshot.entries){let fresh:string|undefined;
+    if(entry.type==="message"){const message=structuredClone(entry.message) as typeof entry.message&{puddingMessageId?:string};message.puddingMessageId=randomUUID();fresh=sm.appendMessage(message as Parameters<SessionManager["appendMessage"]>[0]);}
+    else if(entry.type==="custom_message")fresh=sm.appendCustomMessageEntry(entry.customType,entry.content,entry.display,{historical:true});
+    else if(entry.type==="compaction"){const kept=entry.firstKeptEntryId?ids.get(entry.firstKeptEntryId):null;if(entry.firstKeptEntryId&&!kept)throw new Error("snapshot_incompatible_history");fresh=sm.appendCompaction(entry.summary,kept??null,entry.tokensBefore);}
+    if(fresh)ids.set(entry.id,fresh);
+   }
+   sm.appendModelChange(selection.model.provider,selection.model.id);
+   sm.appendThinkingLevelChange(selection.thinkingLevel);
+   sm.appendCustomEntry("pudding:snapshot_import",{snapshotId:snapshot.id,transcriptHash:snapshot.transcriptHash,formatVersion:1});
+   const file=sm.getSessionFile()!;
+   if(!existsSync(file))writeFileSync(file,[sm.getHeader(),...sm.getEntries()].map(entry=>JSON.stringify(entry)).join("\n")+"\n",{flag:"wx",mode:0o600});
+   const fd=await openFile(file,"r");try{await fd.sync();}finally{await fd.close();}
+   if(expectedRevision!==undefined){const current=await this.teamsStore?.getAgent(workerId);if(!current||agentRunConfigRevision(current)!==expectedRevision)throw new Error("fork_target_configuration_changed");}
+   await rename(file,path.join(this.sessionDir,path.basename(file)));
+   const dir=await openFile(this.sessionDir,"r");try{await dir.sync();}finally{await dir.close();}
+   return {id};
+  }finally{await rm(temp,{recursive:true,force:true});}
+ }
+ async nativeInputAllowed(id: string): Promise<void> {
+  const ref = await this.teamsStore?.sessionRef?.(id);
+  if (!ref && this.teamsStore && await this.teamsStore.contextForSession(id)) throw new Error("native session owner is missing");
+  const agent = ref ? await this.teamsStore?.getAgent(ref.ownerAgentId) : undefined;
+  if (ref && (!agent || agent.enabled === false)) throw new Error("session_owner_unavailable");
+ }
 
 	/**
 	 * manager Session 的统一装配（§3.3）：对 solo/direct/group 创建同一类
@@ -406,11 +528,15 @@ export class PiSessionStore {
 		plan: ManagedToolPlan;
 		capabilityRuntime: Awaited<ReturnType<typeof resolveAgentCapabilityRuntime>> | undefined;
 		codeSearch: ManagerCodeSearchProvider;
+  assertKnowledge?:()=>Promise<void>;
+  knowledgeExecution?:()=>import("../knowledge/runtime-service.js").KnowledgeWorkerExecution|undefined;
 	}> {
-		const agentDir = getAgentDir();
+		const owner = await this.sessionOwner(getSessionId(), ctx);
 		let plan: ManagedToolPlan = { managed: new Set(), active: new Set(), agents: [] };
 		let factories: InlineExtension[] = [];
-		if (this.teamsStore && this.invoker) {
+  let assertKnowledge: (()=>Promise<void>) | undefined;
+  let knowledgeExecution:(()=>import("../knowledge/runtime-service.js").KnowledgeWorkerExecution|undefined)|undefined;
+		if (owner.role === "manager" && this.teamsStore && this.invoker) {
 			plan = await planManagerTools(this.teamsStore, this.catalog, ctx);
 			factories = buildManagerExtensionFactories(plan, {
 				store: this.teamsStore,
@@ -427,17 +553,17 @@ export class PiSessionStore {
 				log: (msg) => this.debugLog?.(msg),
 			});
 		}
-		const guidance = PiSessionStore.resolveGuidance(ctx);
-		if (this.webResearchExtension && (!ctx || ctx.type === "solo")) factories.push(this.webResearchExtension((await this.teamsStore?.getManager())?.name ?? "manager"));
-		if (this.calendarExtension && (!ctx || ctx.type !== "direct")) factories.push(this.calendarExtension(getSessionId));
+		const guidance = owner.role === "manager" ? PiSessionStore.resolveGuidance(ctx) : owner.restricted ? "你是知识 Worker。使用本会话授权知识工具检索；整理先用 knowledge_prepare_candidate 冻结来源与基线，再用 knowledge_submit_candidate 提交完整候选，无修改时提交 pages=[]。提交后等待用户审核，只有平台 Publisher 回执才表示发布；不直接写工作区或绕过审核。" : owner.agent?.description;
+		if (owner.agent?.enabled !== false && owner.nativePi && this.webResearchExtension && (owner.role === "worker" || !ctx || ctx.type === "solo")) factories.push(this.webResearchExtension(owner.agent?.name ?? "manager"));
+		if (owner.role === "manager" && this.calendarExtension && (!ctx || ctx.type !== "direct")) factories.push(this.calendarExtension(getSessionId));
 		// 信任门（§7.2/§6.3）：服务端按窗口 workspaceId 计算三类放行，
 		// 与 manager 自己的资源开关取与；无 workspaceId = 全关。
 		const workspaceAccess = this.teamsStore
 			? await this.teamsStore.workspaces.resourceAccessFor(ctx?.workspaceId)
 			: undefined;
-		// Manager 搜索仅在 solo 生效；direct/group 的 relay 权限边界始终只有委托工具。
-		const codeSearch: ManagerCodeSearchProvider = ctx?.type === "solo"
-			? (settings?.codeSearch ?? "off")
+		// Manager solo/group 使用同一搜索策略，direct relay 在 P3 切换。
+		const codeSearch: ManagerCodeSearchProvider = (!ctx || owner.nativePi) && settings?.builtinTools !== false
+			? (settings?.codeSearch ?? "builtin")
 			: "off";
 		if (codeSearch === "fff" && ctx?.workspaceId && this.teamsStore && this.fffStateRoot) {
 			const workspace = await this.teamsStore.workspaces.get(ctx.workspaceId);
@@ -452,11 +578,11 @@ export class PiSessionStore {
 				}));
 			}
 		}
-		const manager = await this.teamsStore?.getManager();
-		if (manager && this.mcpServers) {
+		const manager = owner.agent;
+		if (!owner.restricted && owner.nativePi && manager?.enabled !== false && manager && this.mcpServers) {
 			factories.push(await buildManagedMcpExtension(this.mcpServers, manager.mcpServerIds ?? []));
 		}
-		const capabilityRuntime = manager && this.capabilityStateRoot
+		const capabilityRuntime = !owner.restricted && owner.nativePi && manager && this.capabilityStateRoot
 			? await resolveAgentCapabilityRuntime({
 				agent: manager,
 				catalog: this.catalog,
@@ -474,22 +600,38 @@ export class PiSessionStore {
 					skillPaths: [...new Set([...(resources?.skillPaths ?? []), ...capabilityRuntime.skillPaths])],
 				}
 			: resources;
-		const loader = new DefaultResourceLoader({
-			cwd,
-			agentDir,
-			settingsManager: SettingsManager.create(cwd, agentDir),
-			extensionFactories: [...factories, ...(this.knowledgeRuntime ? [this.knowledgeRuntime.managerExtension(getSessionId)] : [])],
-			...piResourceLoaderOptions(sessionResources, cwd, agentDir, workspaceAccess),
-			// noExtensions 只控制 pi-native Extension；平台 inline core/delegation
-			// factories 不受影响。Skills/templates/context 全部由 piResources 决定。
-			...(settings?.noExtensions ? { noExtensions: true } : {}),
-			extensionsOverride: stripUnmanagedPiFff,
-			// append-only（提示词管理方案 §3）：manager 运行指令与窗口 guidance
-			// 追加到 pi 原生 append 之后，不覆盖 pi 内嵌默认提示词。
-			appendSystemPromptOverride: (base) => appendPiPrompts(base, sessionResources, guidance),
-		});
-		await loader.reload();
-		return { loader, plan, capabilityRuntime, codeSearch };
+  if (owner.role === "worker" && this.knowledgeRuntime && owner.nativePi) factories.push(async pi => {
+   let surface=await this.knowledgeRuntime!.forSession(getSessionId()),userId:string|undefined;
+   let admitted:import("../knowledge/runtime-service.js").KnowledgeMountSurface|undefined;
+   let bound=false;let refreshing=Promise.resolve();const registered=new Set<string>();
+   assertKnowledge=async()=>{bound=true;await refresh();await admitted?.assertCurrent();};
+   knowledgeExecution=()=>surface.workerExecution;
+   const refresh=()=>{
+    const action=async()=>{
+     const session=this.active.get(getSessionId());
+     const user=session?.sessionManager.getBranch().reverse().find(entry=>entry.type==="message"&&entry.message.role==="user");
+     if(user?.id!==userId || !admitted && await this.knowledgeRuntime!.scopeForSession(getSessionId())) {
+      await surface.workerExecution?.finish("worker_no_submission");
+      userId=user?.id;
+      surface=this.nativeKnowledgeSurface && owner.agent && await this.knowledgeRuntime!.scopeForSession(getSessionId()) ? await this.nativeKnowledgeSurface(getSessionId(),owner.agent,`native:${getSessionId()}:${userId ?? "bootstrap"}`) : await this.knowledgeRuntime!.forSession(getSessionId());
+      admitted=await this.knowledgeRuntime!.scopeForSession(getSessionId())?surface:undefined;
+      if(session)surface.workerExecution?.bind(session);
+     }
+     await surface.assertCurrent();
+     for(const tool of surface.tools) if(!registered.has(tool.name)) {
+      registered.add(tool.name);pi.registerTool({...tool,execute:async(...args:Parameters<typeof tool.execute>)=>{await refresh();const current=surface.tools.find(item=>item.name===tool.name);if(!current)throw new Error("知识工具已撤销");await surface.assertCurrent();return current.execute(...args);}});
+     }
+     if(bound && registered.size){const allowed=new Set(surface.tools.map(tool=>tool.name)),active=pi.getActiveTools();if(active.some(name=>registered.has(name)&&!allowed.has(name)))pi.setActiveTools(active.filter(name=>!registered.has(name)||allowed.has(name)));}
+    };
+    const next=refreshing.then(action,action);refreshing=next.catch(()=>{});return next;
+   };
+   await refresh();
+   pi.on("before_agent_start",async event=>{bound=true;if(event.messageType==="user")this.knowledgeRuntime!.observeNativeChat(getSessionId(),event.prompt,event.images);await refresh();return {systemPrompt:`${event.systemPrompt}\n\n${surface.prompt}`};});
+   pi.on("context",async()=>{bound=true;await refresh();});
+   pi.on("agent_end",async event=>{const last=[...event.messages].reverse().find(message=>message.role==="assistant");await surface.workerExecution?.finish(last?.role==="assistant"&&last.stopReason==="aborted"?"cancelled":last?.role==="assistant"&&last.stopReason==="error"?"model_error":"worker_no_submission");});
+  });
+  const loader = await piSessionResourceLoader({ cwd, settings, resources: sessionResources, workspaceAccess, factories: [...factories, ...(owner.role === "manager" && this.knowledgeRuntime ? [this.knowledgeRuntime.managerExtension(getSessionId)] : [])], guidance, restricted: owner.restricted });
+		return { loader, plan, capabilityRuntime, codeSearch, assertKnowledge, knowledgeExecution };
 	}
 
 	/** create()/open() 共用的会话装配：loader + 初始 active tools 策略。 */
@@ -506,28 +648,35 @@ export class PiSessionStore {
 		 *  thinking_level_change 为准，不用 manager 默认档位覆盖（§10.6）。 */
 		preferRecordedThinkingLevel?: boolean;
 	}): Promise<AgentSession> {
-		const settings = await this.managerSettings();
-		const resources = await this.managerResources();
-		const { loader, plan, capabilityRuntime, codeSearch } = await this.managerResourceLoader(
+		const owner = await this.sessionOwner(opts.getSessionId(), opts.ctx);
+		const settings = owner.settings;
+		const resources = owner.resources;
+		const { loader, plan, capabilityRuntime, codeSearch, assertKnowledge, knowledgeExecution } = await this.managerResourceLoader(
 			opts.ctx,
 			opts.getSessionId,
 			opts.cwd,
 			settings,
 			resources,
 		);
-		// Manager is an orchestrator, never a Workspace writer. Pi's builtin set
-		// couples read with bash/edit/write, so remove it in every window and add
-		// back only bounded read-only tools for solo inspection. This is an
-		// execution boundary, not a prompt convention: Goal and non-Goal turns
-		// receive the same no-mutation surface.
-		const isRelay = opts.ctx !== undefined && opts.ctx.type !== "solo";
-		const readOnlyManagerTools = !isRelay && settings?.builtinTools !== false
-			? [
-					createReadToolDefinition(opts.cwd),
-					createLsToolDefinition(opts.cwd),
-					...(codeSearch === "builtin" ? [createGrepToolDefinition(opts.cwd), createFindToolDefinition(opts.cwd)] : []),
-				]
-			: [];
+		// Direct keeps its existing relay until P3. Solo/group are native Manager
+		// sessions; explicit builtinTools:false still removes the whole surface.
+		const nativeTools: ToolDefinition<any, any>[] = [];
+		if ((owner.nativePi || !this.teamsStore) && settings?.builtinTools !== false && owner.agent?.enabled !== false) {
+			const factories = [createReadToolDefinition, createLsToolDefinition,
+				...(codeSearch === "builtin" ? [createGrepToolDefinition, createFindToolDefinition] : []),
+				createBashToolDefinition, createEditToolDefinition, createWriteToolDefinition];
+			for (const factory of factories) {
+				const make: (cwd: string) => ToolDefinition<any, any> = factory === createBashToolDefinition && capabilityRuntime
+					? (cwd) => createBashToolDefinition(cwd, { spawnHook: (context) => ({ ...context, env: { ...capabilityRuntime.env, ...context.env, ...Object.fromEntries(Object.entries(capabilityRuntime.env).filter(([name, value]) => value !== process.env[name])) } }) })
+					: factory;
+				nativeTools.push(this.nativeExecutions
+					? this.nativeExecutions.wrap(make, opts.cwd, () => ({ sessionId: opts.getSessionId(), turnId: opts.sessionManager.getLeafId() ?? "initial" }))
+					: { ...make(opts.cwd), execute: async (...args) => {
+						if (["bash", "edit", "write"].includes(make(opts.cwd).name)) throw new Error("Native execution coordinator 未装配，写工具被拒绝");
+						return make(opts.cwd).execute(...args);
+					} });
+			}
+		}
 		// §10.5 默认模型：显式选择的模型优先，否则用 manager 配置的默认模型
 		// （解析失败不阻断建会话，回退 SDK 默认）。重开会话会把 JSONL 中
 		// 最后一条 model_change 显式解析后传入；preferRecordedModel 仅禁止
@@ -550,23 +699,37 @@ export class PiSessionStore {
 			...(thinkingLevel ? { thinkingLevel } : {}),
 			resourceLoader: loader,
 			noTools: "builtin" as const,
-			excludeTools: ["bash", "edit", "write"],
-			...(readOnlyManagerTools.length
-				? { customTools: readOnlyManagerTools as NonNullable<CreateAgentSessionOptions["customTools"]> }
+			excludeTools: (!owner.nativePi && this.teamsStore !== undefined) || settings?.builtinTools === false
+				? ["read", "ls", "grep", "find", "bash", "edit", "write", "powershell"]
+				: ["powershell", ...(codeSearch === "off" ? ["grep", "find"] : [])],
+			...(nativeTools.length
+				? { customTools: nativeTools as NonNullable<CreateAgentSessionOptions["customTools"]> }
 				: {}),
 		});
 		// createAgentSession() only constructs registered extensions. Embedded
 		// hosts must bind them explicitly so session_start receives this Session's
 		// cwd (FFF uses it as the index root).
 		await session.bindExtensions({ mode: "rpc" });
-		this.knowledgeRuntime?.guardManagerSession(session);
+  const rawStream = session.agent.streamFunction;
+  session.agent.streamFunction = async (...args) => {
+   await this.nativeInputAllowed(session.sessionId);
+   if (owner.role === "worker" && owner.agent && this.teamsStore && (await this.teamsStore.getAgent(owner.agent.name))?.extensionRevision !== owner.agent.extensionRevision) throw new Error("native_owner_configuration_changed");
+   await assertKnowledge?.();
+   await this.beforeNativeStream?.(session);
+   return rawStream(...args);
+  };
+		if (owner.role === "manager") this.knowledgeRuntime?.guardManagerSession(session);
 		// Stop at the completed tool batch, after toolResults/cards are persisted.
 		// Aborting the Session here would also signal in-flight Worker operations;
 		// a human wait must preserve the pending Interaction and its original Run.
 		// pi 1.x: shouldStopAfterTurn 已移除，finishTurn 返回 { action: "end" } 结束 run。
 		const previousFinishTurn = session.agent.finishTurn;
 		session.agent.finishTurn = async (turn, signal) => {
-			if (await managerHumanWait(session.sessionId, this.invoker, this.workStates)) return { action: "end" as const };
+			if(owner.role === "worker" && await knowledgeExecution?.()?.shouldStop())return {action:"end" as const};
+   // End the SDK turn from its persisted phase result even if a very fast
+			// approval completed before this boundary. Terminal delivery resumes independently.
+			if (turn.toolResults.some(result => result.toolName === "delegation" && ["needs_input", "conflict"].includes((result.details as { status?: string } | undefined)?.status ?? ""))) return { action: "end" as const };
+			if (owner.role === "manager" && await managerHumanWait(session.sessionId, this.invoker, this.workStates)) return { action: "end" as const };
 			return (await previousFinishTurn?.(turn, signal)) as { action: "continue" } | { action: "end" } | undefined;
 		};
 		// 激活策略（§3.3）：基础委托工具全窗口默认激活（省掉 search 轮次）；
@@ -591,6 +754,7 @@ export class PiSessionStore {
 		const next = current.filter((n) => !plan.managed.has(n) || plan.active.has(n) || replayed.has(n));
 		session.setActiveToolsByName([...new Set(next)]);
 		this.assembledManaged.set(session.sessionId, plan.managed);
+		this.assembledWorkers.set(session.sessionId, new Set(owner.role === "worker" && owner.agent ? [owner.agent.name] : plan.agents.map(agent => agent.name)));
 		this.attachForwarder(session);
 		return session;
 	}
@@ -604,6 +768,13 @@ export class PiSessionStore {
 
 	/** Forward SDK and platform-authored projection events through the same WS bus. */
 	private forwardEvent(id: string, event: AgentSessionEvent): void {
+  if ((event.type === "message_start" || event.type === "message_update" || event.type === "message_end") && ["user", "assistant", "system", "toolResult"].includes(event.message.role)) {
+   const message = event.message as typeof event.message & { puddingMessageId?: string; toolCallId?: string };
+   const key = `${id}:${message.role}:${message.toolCallId ?? ""}`;
+   if (event.type === "message_start") this.wireTurns.set(key, randomUUID());
+   message.puddingMessageId = this.wireTurns.get(key) ?? message.puddingMessageId ?? randomUUID();
+   if (event.type === "message_end") this.wireTurns.delete(key);
+  }
 		this.captureToolExecutionEvent(id, event);
 		this.emitEvent(id, event);
 	}
@@ -676,15 +847,16 @@ export class PiSessionStore {
 	private async revokeChangedTools(): Promise<void> {
 		this.configEpoch++;
 		if (!this.teamsStore) return;
-		const settings = await this.managerSettings();
 		for (const [id, session] of this.active) {
 			const ctx = await this.windowContextOf(id);
-			const plan = await planManagerTools(this.teamsStore, this.catalog, ctx);
+			const owner = await this.sessionOwner(id);
+			const settings = owner.settings;
+			const plan = owner.role === "manager" ? await planManagerTools(this.teamsStore, this.catalog, ctx) : { managed: new Set<string>(), active: new Set<string>() };
 			const assembled = this.assembledManaged.get(id) ?? new Set<string>();
 			const active = session.getActiveToolNames();
 			const next = active.filter((n) => !assembled.has(n) || plan.active.has(n));
 			if (next.length !== active.length) session.setActiveToolsByName(next);
-			if (!this.thinkingOverrides.has(id)) {
+			if (!this.thinkingOverrides.has(id) && !await this.hasPendingInputs(id)) {
 				const fallback = this.sdkDefaultThinkingLevel(session);
 				const target = (settings?.thinkingLevel ?? fallback) as PiThinkingLevel;
 				if (target && session.thinkingLevel !== target) {
@@ -747,7 +919,7 @@ export class PiSessionStore {
 			if (!this.active.has(id)) continue;
 			// Manager 自身的 Session runtime（Skills/CLI 环境）不产生 agent_*
 			// 命名空间工具，但其 Capability 变更仍影响所有活跃 manager Session。
-			if (agentName !== MANAGER_AGENT_NAME && ![...assembled].some((n) => n.startsWith(prefix))) continue;
+			if (agentName !== MANAGER_AGENT_NAME && !this.assembledWorkers.get(id)?.has(agentName) && ![...assembled].some((n) => n.startsWith(prefix))) continue;
 			affectedSessions++;
 			if (this.runtimeDirty.has(id)) reloadPending++;
 		}
@@ -923,6 +1095,7 @@ export class PiSessionStore {
 	 */
 	private async healPlaceholderModelSessions(providerId: string): Promise<void> {
 		const targets = [...this.active.values()].filter((s) => {
+			if (this.teamsStore && !(this.assembledWorkers.has(s.sessionId))) return false;
 			const m = s.model as PiModel | undefined;
 			return !m || m.provider === "unknown";
 		});
@@ -937,10 +1110,9 @@ export class PiSessionStore {
 		model ??= (await rt.getAvailable(providerId))[0] as PiModel | undefined;
 		if (!model) return;
 		await Promise.all(
-			targets.map((s) =>
-				s.setModel(model as PiModel).catch((err: unknown) => {
+			targets.map(async (s) => { if ((await this.sessionOwner(s.sessionId)).role !== "manager") return; return s.setModel(model as PiModel).catch((err: unknown) => {
 					this.debugLog?.(`会话 ${s.sessionId} 模型自愈失败：${err instanceof Error ? err.message : String(err)}`);
-				}),
+				}); },
 			),
 		);
 	}
@@ -1022,6 +1194,7 @@ export class PiSessionStore {
 			if (epoch === this.configEpoch) { session = candidate; break; }
 			candidate.dispose();
 			this.assembledManaged.delete(candidate.sessionId);
+			this.assembledWorkers.delete(candidate.sessionId);
 		}
 		if (!session) throw new Error("Manager 配置在会话装配期间持续变化，请重试");
 		binding.sessionId = session.sessionId;
@@ -1042,8 +1215,10 @@ export class PiSessionStore {
 		// Workspaces invisible after restart (and can also miss macOS /tmp ->
 		// /private/tmp canonical-path aliases). Discover by the owned directory;
 		// Window ownership remains the authority when a session is opened.
-		const sessions = await SessionManager.listAll(this.sessionDir);
-		const summaries = await Promise.all(
+		const delegated = await this.invoker?.delegatedSessionHandles?.() ?? new Set<string>();
+		const owned = this.teamsStore ? new Set((await this.teamsStore.listWindows()).flatMap(window => [...window.sessions, ...Object.values(window.parkedContexts).flatMap(context => context.sessions)])) : new Set<string>();
+		const sessions = (await SessionManager.listAll(this.sessionDir)).filter(info => !delegated.has(info.id) || owned.has(info.id));
+		const summaries: SessionSummary[] = await Promise.all(
 			sessions.map(async (info) => ({
 				id: info.id,
 				sessionFile: info.path,
@@ -1079,6 +1254,7 @@ export class PiSessionStore {
 				thinkingLevel: PiSessionStore.thinkingLevelOf(session),
 			});
 		}
+		for (const summary of summaries) { const ref = await this.teamsStore?.sessionRef?.(summary.id); summary.ownerAgentId = ref?.ownerAgentId; summary.sourceSnapshotId = ref?.sourceSnapshotId; const active = this.active.get(summary.id); summary.leafEntryId = active?.sessionManager.getLeafId() ?? (summary.sessionFile ? SessionManager.open(summary.sessionFile).getLeafId() ?? undefined : undefined); }
 		return summaries;
 	}
 
@@ -1134,6 +1310,7 @@ export class PiSessionStore {
 
 	/** Return the live AgentSession for a session id, opening it from file if needed. */
 	async open(id: string): Promise<AgentSession> {
+		if ((await this.invoker?.delegatedSessionHandles?.())?.has(id) && !(await this.teamsStore?.contextForSession(id))) throw new Error("delegation_trace_only: 执行上下文不是原生聊天会话");
 		const existing = this.active.get(id);
 		if (existing) {
 			// 空闲安全 reload（§3.3.6）：配置变化标记过 runtimeDirty 的会话在
@@ -1146,10 +1323,11 @@ export class PiSessionStore {
 				existing.isIdle &&
 				Boolean(existing.sessionFile) &&
 				existsSync(existing.sessionFile!);
-			if (!rebuildable) return existing;
+			if (!rebuildable || await this.hasPendingInputs(id)) return existing;
 			existing.dispose();
 			this.active.delete(id);
 			this.assembledManaged.delete(id);
+			this.assembledWorkers.delete(id);
 		}
 		this.runtimeDirty.delete(id);
 
@@ -1185,6 +1363,7 @@ export class PiSessionStore {
 			if (epoch === this.configEpoch) { session = candidate; break; }
 			candidate.dispose();
 			this.assembledManaged.delete(candidate.sessionId);
+			this.assembledWorkers.delete(candidate.sessionId);
 		}
 		if (!session) throw new Error("Manager 配置在会话装配期间持续变化，请重试");
 		this.active.set(session.sessionId, session);
@@ -1201,7 +1380,7 @@ export class PiSessionStore {
 		if (this.thinkingOverrides.has(id)) return;
 		const recorded = PiSessionStore.thinkingLevelOf(session);
 		if (!recorded || !isPiThinkingLevel(recorded)) return;
-		const settings = await this.managerSettings();
+		const settings = (await this.sessionOwner(id)).settings;
 		const expectedDefault: PiThinkingLevel = settings?.thinkingLevel ?? this.sdkDefaultThinkingLevel(session);
 		const expected = PiSessionStore.clampThinkingLevel(session, expectedDefault);
 		if (recorded !== expected) this.thinkingOverrides.set(id, recorded);
@@ -1278,15 +1457,28 @@ export class PiSessionStore {
 		return true;
 	}
 
+	async delegationDeliveryState(id: string, toolCallId: string | undefined, eventId: string) {
+		const session = await this.open(id);
+		const entries = session.sessionFile ? readFileSync(session.sessionFile, "utf8").split("\n").filter(Boolean).flatMap(line => { try { return [JSON.parse(line)]; } catch { return []; } }) : [];
+		const messages = entries.filter(entry => entry.type === "message").map(entry => entry.message);
+		const result = messages.find(message => message.role === "toolResult" && message.toolCallId === toolCallId);
+		const waiting = ["needs_input", "conflict", "waiting_admission"].includes(result?.details?.status);
+		const eventIndex = entries.findIndex(entry => entry.type === "custom_message" && entry.details?.eventId === eventId);
+		return { streaming: !session.isIdle, toolResult: result ? waiting ? "waiting" as const : "terminal" as const : "none" as const,
+			hasCall: messages.some(message => message.role === "assistant" && Array.isArray(message.content) && message.content.some((part: { type?: string; id?: string }) => part.type === "toolCall" && part.id === toolCallId)),
+			eventPresent: eventIndex >= 0, observed: eventIndex >= 0 && entries.slice(eventIndex + 1).some(entry => entry.type === "message" && entry.message?.role === "assistant") };
+	}
+
 	private async terminalDelegationResults(
 		managerSessionId: string,
 		pendingCalls: Map<string, string>,
 	): Promise<Map<string, RecoveredToolResult>> {
 		const recovered = new Map<string, RecoveredToolResult>();
 		if (!this.invoker || pendingCalls.size === 0) return recovered;
-		const recoverableStates = new Set(["waiting_admission", "reported_completed", "reported_failed", "cancelled", "observation_lost"]);
+		const recoverableStates = new Set(["waiting_admission", "waiting_input", "reported_completed", "reported_failed", "cancelled", "observation_lost"]);
 		const grouped = new Map<string, DelegationRecord[]>();
-		for (const delegation of await this.invoker.delegationsForManagerSession(managerSessionId)) {
+		const all = await this.invoker.delegationsForManagerSession(managerSessionId);
+		for (const delegation of all) {
 			const callId = delegation.managerToolCallId;
 			const expectedName = callId ? pendingCalls.get(callId) : undefined;
 			if (!callId || !expectedName || expectedName !== delegateToolName(delegation.agentId) || !recoverableStates.has(delegation.executionState)) continue;
@@ -1296,21 +1488,20 @@ export class PiSessionStore {
 		}
 		for (const [callId, delegations] of grouped) {
 			if (delegations.length === 1) {
-				const delegation = delegations[0]!;
-				let result = delegationToolResult(delegation);
-				if (delegation.executionState === "reported_completed" && delegation.result?.status === "completed" && this.largeResults && this.productSettings) {
-					const projection = await this.largeResults.project(
-						delegation.id,
-						delegation.result.content ?? "",
-						(await this.productSettings.get()).harness.workerResults,
-					);
-					result = {
-						...result,
-						text: `${projection.text}\n\n（delegationId：${delegation.id}——需要该 worker 接力/追问时，用 handoffKind="followup" 并把它填进 parentDelegationId）`,
-						details: { ...(result.details ?? {}), ...projection },
-					};
+				const root = delegations[0]!;
+				let delegation = root;
+				const seen = new Set<string>();
+				while (delegation.result && "errorCode" in delegation.result && delegation.result.errorCode === "admission_replaced") {
+					if (seen.has(delegation.id)) throw new Error("delegation_projection_conflict: replacement cycle"); seen.add(delegation.id);
+					const children = all.filter(item => item.parentDelegationId === delegation.id && item.operationId === `admission-replacement:${delegation.id}`);
+					if (children.length !== 1) throw new Error("delegation_projection_conflict: ambiguous replacement");
+					delegation = children[0]!;
 				}
-				recovered.set(callId, result);
+				if (!recoverableStates.has(delegation.executionState)) continue;
+				const base = delegationToolResult({ ...delegation, managerToolCallId: callId });
+				const projection = await projectDelegationResult({ delegationId: delegation.id, rootDelegationId: root.id, toolCallId: callId,
+					worker: delegation.agentId, status: delegationStatus(delegation), content: base.text, details: { ...base.details, executionReceipt: delegation.receipt, artifacts: delegation.result?.artifacts, usage: delegation.result?.usage } }, this.largeResults, this.productSettings);
+				recovered.set(callId, { ...base, text: projection.text, details: projection.details });
 				continue;
 			}
 			recovered.set(callId, {
@@ -1382,6 +1573,9 @@ export class PiSessionStore {
 	}
 
 	async abort(id: string): Promise<AbortSessionResult> {
+		const hadPending = await this.hasPendingInputs(id);
+		this.active.get(id)?.clearQueue();
+		await this.cancelNativeInputs?.(id);
 		const session = this.active.get(id);
 		const wasRunning = Boolean(session && (session.isStreaming || !session.isIdle));
 		let abortError: unknown;
@@ -1410,7 +1604,7 @@ export class PiSessionStore {
 		if (!session) {
 			const recovered = cancelledDelegations > 0 ? await this.recoverToolCallState(id) : undefined;
 			if (abortError) throw abortError;
-			return { aborted: cancelledDelegations > 0, reconciledToolResults: recovered?.recoveredToolResults.length ?? 0 };
+			return { aborted: hadPending || cancelledDelegations > 0, reconciledToolResults: recovered?.recoveredToolResults.length ?? 0 };
 		}
 
 		return this.serializeToolRepair(id, async () => {
@@ -1438,12 +1632,14 @@ export class PiSessionStore {
 			}
 			if (reconciledToolResults > 0) await this.ensureSessionFile(id);
 			if (abortError) throw abortError;
-			return { aborted: wasRunning || cancelledDelegations > 0, reconciledToolResults };
+			return { aborted: hadPending || wasRunning || cancelledDelegations > 0, reconciledToolResults };
 		});
 	}
 
 	/** Switch the model of a live session (pi SDK supports runtime setModel). */
 	async setModel(id: string, modelRef: string): Promise<ModelSummary> {
+  await this.nativeInputAllowed(id);
+		await this.assertNoPendingInputs(id);
 		await this.requireActiveContext(id);
 		const session = await this.open(id);
 		const model = await this.resolveModel(modelRef);
@@ -1458,6 +1654,8 @@ export class PiSessionStore {
 	 * 返回会话实际生效的档位（clamp 后的值）。
 	 */
 	async setThinkingLevel(id: string, level: string): Promise<string> {
+  await this.nativeInputAllowed(id);
+  await this.assertNoPendingInputs(id);
 		await this.requireActiveContext(id);
 		if (!isPiThinkingLevel(level)) {
 			throw new Error(`thinkingLevel 必须是 ${PI_THINKING_LEVELS.join(" | ")}`);
@@ -1502,7 +1700,10 @@ export class PiSessionStore {
 	}
 
 	/** Dispose the session (aborting an in-flight run) and delete its JSONL file. */
-	async remove(id: string): Promise<boolean> {		const session = this.active.get(id);
+	async remove(id: string): Promise<boolean> {
+		if ((await this.invoker?.delegatedSessionHandles?.())?.has(id) && !(await this.teamsStore?.contextForSession(id))) throw new Error("delegation_trace_only: 不能通过聊天删除执行事实");		await this.cancelNativeInputs?.(id);
+  this.active.get(id)?.clearQueue();
+  const session = this.active.get(id);
 		if (session?.isStreaming) {
 			await session.abort().catch(() => undefined);
 		}
@@ -1519,6 +1720,7 @@ export class PiSessionStore {
 
 	/** Stop and unload a Session while preserving its JSONL for workspace restoration. */
 	async suspend(id: string): Promise<void> {
+  await this.assertNoPendingInputs(id);
 		const session = this.active.get(id);
 		if (session?.isStreaming) await session.abort().catch(() => undefined);
 		await this.dispose(id);
@@ -1538,6 +1740,7 @@ export class PiSessionStore {
 
 	/** Persist a possibly fileless live Session before its context is parked. */
 	async prepareForParking(id: string): Promise<void> {
+		await this.assertNoPendingInputs(id);
 		await this.requireActiveContext(id);
 		const session = await this.open(id);
 		if (session.isStreaming) await session.abort();
@@ -1561,12 +1764,14 @@ export class PiSessionStore {
 	}
 
 	async dispose(id: string): Promise<void> {
+  await this.assertNoPendingInputs(id);
 		const session = this.active.get(id);
 		if (session) {
 			session.dispose();
 			this.active.delete(id);
 		}
 		this.assembledManaged.delete(id);
+		this.assembledWorkers.delete(id);
 		this.runtimeDirty.delete(id);
 		this.toolExecutions.delete(id);
 	}
@@ -1654,7 +1859,7 @@ export class PiSessionStore {
 					? undefined
 					: "nextTurn";
 			await session.sendCustomMessage(
-				{ customType: message.customType, content: message.content, display: true, details: message.details },
+				{ customType: message.customType, content: message.content, display: message.details?.hidden !== true, details: message.details },
 				{ ...effectiveOptions, deliverAs },
 			);
 			await this.ensureSessionFile(id);
@@ -2106,6 +2311,7 @@ export class PiSessionStore {
 			this.active.delete(id);
 		}
 		this.assembledManaged.clear();
+		this.assembledWorkers.clear();
 		this.runtimeDirty.clear();
 	}
 

@@ -28,6 +28,7 @@ async function makeStack(
 	attachmentRoot?: string,
 	withChat = false,
 	existingDir?: string,
+ snapshotAssetRoot?: string,
 ) {
 	const dir = existingDir ?? mkdtempSync(path.join(tmpdir(), "pt-workspace-routes-"));
 	process.env.PI_CODING_AGENT_DIR = path.join(dir, "agent-dir");
@@ -53,6 +54,7 @@ async function makeStack(
 	registerRoomsRoutes(app, sessions, teams, invoker, undefined, {
 		open: fileOpener,
 		attachmentRoot,
+  snapshotAssetRoot,
 		uploads,
 		activityStatePath: path.join(dir, "state", "room-activity.json"),
 		sessionCreationStatePath: path.join(dir, "state", "session-creation-operations.json"),
@@ -1841,6 +1843,69 @@ test("Manager 首发准入但没有 user 条目时不假报成功，原键仍可
 	}
 });
 
+test("Manager 首发冷恢复忽略 SDK setup/零用量空错误，但执行证据仍阻断重发", async () => {
+	const emptyFailure = {
+		role: "assistant", content: [{ type: "text", text: "" }], api: "openai-completions",
+		provider: "fixture", model: "fixture-model", stopReason: "error", errorMessage: "聊天素材对应消息未落盘", timestamp: 1,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+	};
+	const cases = [
+		{ label: "system", prior: [], allowed: true },
+		{ label: "empty error", prior: [emptyFailure], allowed: true },
+		{ label: "text", prior: [{ ...emptyFailure, content: [{ type: "text", text: "已经执行" }] }], allowed: false },
+		{ label: "tool call", prior: [{ ...emptyFailure, content: [{ type: "toolCall", id: "write-1", name: "write", arguments: {} }] }], allowed: false },
+		{ label: "tool result", prior: [{ role: "toolResult", toolCallId: "write-1", toolName: "write", content: [], isError: false, timestamp: 1 }], allowed: false },
+		{ label: "usage", prior: [{ ...emptyFailure, usage: { ...emptyFailure.usage, input: 1, totalTokens: 1 } }], allowed: false },
+		{ label: "unknown usage", prior: [{ ...emptyFailure, usage: undefined }], allowed: false },
+		{ label: "cancelled", prior: [{ ...emptyFailure, stopReason: "aborted" }], allowed: false },
+	];
+	for (const scenario of cases) {
+		const { app, sessions } = await makeStack(undefined, undefined, undefined, true);
+		try {
+			const solo = (await app.inject({ method: "GET", url: "/api/rooms" })).json().rooms.find((room: { type: string }) => room.type === "solo");
+			const key = `first-work-setup-${scenario.label.replaceAll(" ", "-")}`;
+			const payload = { content: "继续未接纳首发", workspaceId: solo.workspace?.id ?? null, cwdSnapshot: solo.cwdSnapshot };
+			sessions.hasModelAuth = async () => false;
+			const reservation = await app.inject({ method: "POST", url: `/api/rooms/${solo.id}/new-work`, headers: { "idempotency-key": key }, payload });
+			assert.equal(reservation.statusCode, 400, reservation.body);
+			const id = reservation.json().sessionId;
+			const initial = await sessions.open(id);
+			initial.sessionManager.appendMessage({ role: "system", content: "SDK setup" } as never);
+			for (const message of scenario.prior) initial.sessionManager.appendMessage(message as never);
+			await sessions.dispose(id);
+			const recovered = await sessions.open(id);
+			let prompts = 0;
+			sessions.hasModelAuth = async () => true;
+			Object.defineProperty(sessions, "generateSessionTitle", { value: async () => undefined, configurable: true });
+			Object.defineProperty(recovered, "prompt", { value: async (text: string, options?: { preflightResult?: (accepted: boolean) => void }) => {
+				prompts++;
+				const user = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
+				recovered.sessionManager.appendMessage(user as never);
+				recovered.state.messages.push(user as never);
+				options?.preflightResult?.(true);
+			}, configurable: true });
+			const sent = await app.inject({ method: "POST", url: `/api/rooms/${solo.id}/new-work`, headers: { "idempotency-key": key }, payload });
+			assert.equal(sent.statusCode, scenario.allowed ? 200 : 409, `${scenario.label}: ${sent.body}`);
+			assert.equal(prompts, scenario.allowed ? 1 : 0, scenario.label);
+			assert.equal(sent.json().sessionId, id);
+			if (!scenario.allowed) assert.equal(sent.json().code, "first_message_conflict");
+			if (scenario.allowed) {
+				// A durable custom outcome cannot be mistaken for SDK setup after a
+				// user entry is lost. The old work must be inspected before any retry.
+				const file = recovered.sessionFile!;
+				const entries = readFileSync(file, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line));
+				writeFileSync(file, entries.filter(entry => !(entry.type === "message" && entry.message?.role === "user")).map(entry => JSON.stringify(entry)).join("\n") + "\n");
+				await sessions.dispose(id);
+				const withoutUser = await sessions.open(id);
+				withoutUser.sessionManager.appendCustomMessageEntry("pudding:task_result", "已经完成一次委派", true, { delegationId: "prior-result" });
+				const blocked = await app.inject({ method: "POST", url: `/api/rooms/${solo.id}/new-work`, headers: { "idempotency-key": key }, payload });
+				assert.equal(blocked.statusCode, 409, blocked.body);
+				assert.equal(blocked.json().code, "first_message_conflict");
+			}
+		} finally { await sessions.disposeAll(); await app.close(); }
+	}
+});
+
 test("Manager 首发成功后同进程重试仍须复核已落盘 user", async () => {
 	const { app, sessions } = await makeStack(undefined, undefined, undefined, true);
 	try {
@@ -2222,4 +2287,21 @@ test("双 Workspace 的 Manager/Direct 归属、业务活动与操作键跨重�
 		await restarted.sessions.disposeAll();
 		await restarted.app.close();
 	}
+});
+
+
+test("P3 open-file only opens the active session's snapshot assets, not another snapshot or parked history",async()=>{
+ const root=mkdtempSync(path.join(tmpdir(),"pt-snapshot-open-")),opened:string[]=[];
+ for(const id of ["owned-snapshot","other-snapshot"]){mkdirSync(path.join(root,id,"assets"),{recursive:true});writeFileSync(path.join(root,id,"assets","proof.txt"),id);}
+ const {app,teams,sessions}=await makeStack(undefined,async file=>{opened.push(file);},undefined,false,undefined,root);
+ try{
+  const room=await teams.createWindow({type:"direct",members:["alpha"],createSession:()=>sessions.create(undefined,{type:"direct",members:["alpha"]})});
+  await teams.addWindowSession(room.id,room.activeSession,{ownerAgentId:"alpha",sourceSnapshotId:"owned-snapshot"});
+  const open=(file:string)=>app.inject({method:"POST",url:`/api/rooms/${room.id}/open-file`,payload:{path:file}});
+  const own=path.join(root,"owned-snapshot","assets","proof.txt"),other=path.join(root,"other-snapshot","assets","proof.txt");
+  assert.equal((await open(own)).statusCode,200);assert.equal((await open(other)).statusCode,400);
+  symlinkSync(other,path.join(root,"owned-snapshot","assets","escape.txt"));assert.equal((await open(path.join(root,"owned-snapshot","assets","escape.txt"))).statusCode,400);
+  const next=await sessions.create(undefined,{type:"direct",members:["alpha"]});await teams.addWindowSession(room.id,next.id);
+  assert.equal((await open(own)).statusCode,400);assert.deepEqual(opened,[realpathSync(own)]);
+ }finally{await sessions.disposeAll();await app.close();}
 });

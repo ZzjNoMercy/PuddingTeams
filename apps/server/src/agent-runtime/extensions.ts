@@ -341,8 +341,8 @@ export function toolSafeId(id: string): string {
 }
 
 /** 基础委托工具：agent_<agentId>__delegate。 */
-export function delegateToolName(agentId: string): string {
-	return `agent_${toolSafeId(agentId)}__delegate`;
+export function delegateToolName(_agentId?: string): string {
+	return "delegation";
 }
 
 /** 专属 Extension 工具：agent_<agentId>__<extensionId>__<toolName>。 */
@@ -375,6 +375,8 @@ export function delegationManifest(agent: AgentConfig): ExtensionManifest {
 // ---- ScopedAgentInvoker（§3.2，决策 15） ----
 
 export interface ScopedDelegateInput {
+	invocationKind?: "manager_tool" | "direct_chat";
+	requestHash?: string;
 	windowId: string;
 	managerSessionId: string;
 	managerToolCallId?: string;

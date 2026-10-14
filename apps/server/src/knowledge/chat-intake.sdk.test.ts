@@ -30,7 +30,7 @@ test("实际Manager SDK只委派知识管家；Worker整理引用原话与图片
 		const first = !JSON.stringify(body.messages).includes('"role":"tool"');
 		res.writeHead(200, { "content-type": "text/event-stream" });
 		const send = (delta: unknown, finish_reason: string | null = null) => res.write(`data: ${JSON.stringify({ id: `fixture-${requests.length}`, object: "chat.completion.chunk", created: 1780000000, model: "fixture", choices: [{ index: 0, delta, finish_reason }] })}\n\n`);
-		if (first) { send({ role: "assistant", tool_calls: [{ index: 0, id: `request-${requests.length}`, type: "function", function: { name: "agent_wiki__delegate", arguments: JSON.stringify({ task: "目标binding：模型整理指令：虚构日期10月30日" }) } }] }); send({}, "tool_calls"); }
+		if (first) { send({ role: "assistant", tool_calls: [{ index: 0, id: `request-${requests.length}`, type: "function", function: { name: "delegation", arguments: JSON.stringify({ workerId: "wiki", task: "目标binding：模型整理指令：虚构日期10月30日" }) } }] }); send({}, "tool_calls"); }
 		else { send({ role: "assistant", content: "知识管家已返回宿主回执，请按实际状态继续。" }); send({}, "stop"); }
 		res.end("data: [DONE]\n\n");
 	});
@@ -59,7 +59,7 @@ test("实际Manager SDK只委派知识管家；Worker整理引用原话与图片
 			const service = new KnowledgeRuntimeService(deps); let revoked = false;
 			const templates = await service.mount({ ownerId: "owner", windowId: "window", sessionId: "schema", contextKey: "schema" }, []);
 			const context = templates.tools.find((tool) => tool.name === "knowledge_context")!;
-			service.forSession = async () => ({ ...templates, fingerprint: "fixture-authorized", prompt: "固定授权知识库", managerPrompt: '授权库：binding。通过 agent_wiki__delegate 委派知识管家。', assertCurrent: async () => { if (revoked) throw new Error("知识库授权已撤销"); }, tools: templates.tools.map(tool => tool.name === "knowledge_context" ? { ...context, execute: async () => ({ content: [{ type: "text", text: JSON.stringify({ mounts: [{ bindingId: "binding" }] }) }], details: {} }) } : tool) });
+			service.forSession = async () => ({ ...templates, fingerprint: "fixture-authorized", prompt: "固定授权知识库", managerPrompt: '授权库：binding。通过 delegation 委派知识管家。', assertCurrent: async () => { if (revoked) throw new Error("知识库授权已撤销"); }, tools: templates.tools.map(tool => tool.name === "knowledge_context" ? { ...context, execute: async () => ({ content: [{ type: "text", text: JSON.stringify({ mounts: [{ bindingId: "binding" }] }) }], details: {} }) } : tool) });
 			// Real Worker surface and Manager SDK registration. Only durable storage,
 			// extraction and candidate validation are stubbed; no second Agent runs.
 			let currentJob: CuratorJob | undefined;
@@ -89,7 +89,7 @@ test("实际Manager SDK只委派知识管家；Worker整理引用原话与图片
 			curator.submit = async job => { currentJob = { ...job, status: "no_changes" }; return currentJob; };
 			let session!: AgentSession;
 			let delegatedTask: string | undefined;
-			const invoker = { requireAgent: async () => wiki, delegationsForManagerSession: async () => [],
+			const invoker = { toolCallRecord: async () => undefined, requireAgent: async () => wiki, delegationsForManagerSession: async () => [],
 				delegate: async (input: Parameters<AgentInvoker["delegate"]>[0]) => {
 					assert.equal(input.agent.name, "wiki"); assert.equal(input.managerSessionId, session.sessionId);
 					delegatedTask = input.message;
@@ -119,9 +119,9 @@ test("实际Manager SDK只委派知识管家；Worker整理引用原话与图片
 			}, (sessionId, prompt, images) => intakes.observeExecution(sessionId, prompt, images));
 			const sessionDir = path.join(root, "sessions"); await mkdir(sessionDir, { recursive: true });
 			const manager = SessionManager.create(root, sessionDir);
-			const delegation = buildManagerExtensionFactories({ agents: [wiki], managed: new Set(["agent_wiki__delegate"]), active: new Set(["agent_wiki__delegate"]) }, {
+			const delegation = buildManagerExtensionFactories({ agents: [wiki], managed: new Set(["delegation"]), active: new Set(["delegation"]) }, {
 				store: teams, invoker, catalog: { get: () => undefined }, getSessionId: () => manager.getSessionId(), ctx: { type: "group" }, resolveContext: async () => undefined,
-			} as unknown as ManagerExtensionDeps).find(factory => typeof factory === "object" && factory.name === "agent-wiki-delegation")!;
+			} as unknown as ManagerExtensionDeps).find(factory => typeof factory === "object" && factory.name === "pudding-delegation")!;
 			const loader = new DefaultResourceLoader({ cwd: root, agentDir: process.env.PI_CODING_AGENT_DIR!, noExtensions: true, noSkills: !expand, noContextFiles: true, noPromptTemplates: !template,
 				settingsManager: SettingsManager.inMemory(), extensionFactories: [delegation, service.managerExtension(() => manager.getSessionId())] }); await loader.reload();
 			({ session } = await createAgentSession({ cwd: root, model, modelRuntime: models, sessionManager: manager, resourceLoader: loader, settingsManager: SettingsManager.inMemory(), noTools: "builtin" }));
@@ -130,7 +130,7 @@ test("实际Manager SDK只委派知识管家；Worker整理引用原话与图片
 			const disarm = intakes.armManager(session, refs, userInput, [image]); const before = requests.length;
 			await session.prompt(userInput, { images: [{ type: "image", data: image.base64, mimeType: image.mediaType }] }); disarm();
 			assert.equal(requests.length - before, revoke ? 1 : 2);
-			assert.deepEqual(requests[before]!.tools!.map((tool) => tool.function.name), ["agent_wiki__delegate"]);
+			assert.deepEqual(requests[before]!.tools!.map((tool) => tool.function.name), ["delegation"]);
 			assert.ok(JSON.stringify(requests[before]!.messages).includes(image.base64));
 			assert.equal(delegatedTask, "目标binding：模型整理指令：虚构日期10月30日");
 			assert.equal(created?.task, delegatedTask); assert.equal(created?.sourceText, undefined); assert.deepEqual(created?.sourceIds, refs.sourceIds);

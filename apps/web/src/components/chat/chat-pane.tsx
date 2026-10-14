@@ -1,7 +1,10 @@
 "use client";
 
+import { SnapshotOrigin } from "./snapshot-origin";
+import { ForkSessionDialog } from "./fork-session-dialog";
+
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { ChevronDownIcon, EllipsisIcon, FolderGit2Icon, FolderOpenIcon, InfoIcon, LayersIcon, ListTreeIcon, PanelLeftOpenIcon, XIcon } from "lucide-react";
+import { ChevronDownIcon, EllipsisIcon, FolderGit2Icon, FolderOpenIcon, InfoIcon, LayersIcon, ListTreeIcon, PanelLeftOpenIcon } from "lucide-react";
 import { toast } from "sonner";
 import {
 	Conversation,
@@ -30,10 +33,8 @@ import {
 	createRoomSession,
 	createWorkspace,
 	deleteRoomSession,
-	cancelWorkerInput,
 	fetchRoomDelegationProcesses,
 	getRoom,
-	listWorkerInputQueue,
 	listWorkspaces,
 	markRoomRead,
 	renameRoomSession,
@@ -45,7 +46,6 @@ import {
 	RoomSelectionStaleError,
 	RoomSourceStaleError,
 	type MessageAttachmentInput,
-	type WorkerInputQueueItem,
 } from "@/lib/api";
 import { clearGroupCreationOperation, groupWorkspaceSwitchFingerprint, reserveGroupCreationOperation } from "@/lib/group-creation-operation";
 import { agentDisplayName, type ChatMessage, type ChatStatus, type RoomSession, type RoomSummary, type WorkerSessionSummary, type WorkspaceRecord } from "@/lib/types";
@@ -326,7 +326,7 @@ function SessionChat({
 	activityRevision: number;
 	onHistoryReady?: (sessionId: string, activityRevision: number) => Promise<boolean>;
 }) {
-	const { messages, historyLoading, historyLoaded, status, running, unansweredUserMessage, unfinishedAssistantTurn, sending, stopping, error, unconfirmedOperation, send, stop, refreshHistory, reviewUnconfirmedHistory, startNewMessageIntent } = useChat(sessionId, { allowSendWhileRunning: workerView });
+	const { inputCapability, messages, historyLoading, historyLoaded, status, running, unansweredUserMessage, unfinishedAssistantTurn, sending, stopping, error, unconfirmedOperation, send, stop, refreshHistory, reviewUnconfirmedHistory, startNewMessageIntent } = useChat(sessionId, { allowSendWhileRunning: workerView });
 	const [newMessageIntentOpen, setNewMessageIntentOpen] = useState(false);
 	const initialActivityRevision = useRef(activityRevision);
 	const [presentedActivityRevision, setPresentedActivityRevision] = useState<number | null>(null);
@@ -341,49 +341,10 @@ function SessionChat({
 			toast.error(err instanceof Error ? err.message : String(err));
 		}
 	}, [stop]);
-	// Worker 执行 session 的排队输入：202 入队后本地立即渲染灰态气泡；队列项
-	// 被排空/取消/失败化后由轮询与 running 落定收敛（消息本体经 WS 进入消息流）。
-	const [queueItems, setQueueItems] = useState<WorkerInputQueueItem[]>([]);
-	useEffect(() => {
-		if (!workerView) return;
-		let cancelled = false;
-		const load = () => {
-			void listWorkerInputQueue(roomId, sessionId)
-				.then((items) => { if (!cancelled) setQueueItems(items); })
-				.catch(() => { /* 队列拉取失败不打断聊天；下轮轮询自愈 */ });
-		};
-		load();
-		const timer = setInterval(load, 4000);
-		return () => { cancelled = true; clearInterval(timer); };
-	}, [workerView, roomId, sessionId]);
-	// 排空发生在 running 落定（delegate settle/cancel）时，立即对一次队列，不等轮询。
-	const wasRunningRef = useRef(false);
-	useEffect(() => {
-		const settled = wasRunningRef.current && !running;
-		wasRunningRef.current = running;
-		if (!settled || !workerView) return;
-		void listWorkerInputQueue(roomId, sessionId)
-			.then((items) => setQueueItems(items))
-			.catch(() => undefined);
-	}, [running, workerView, roomId, sessionId]);
-	const refreshQueue = useCallback(async () => {
-		if (!workerView) return;
-		try {
-			setQueueItems(await listWorkerInputQueue(roomId, sessionId));
-		} catch { /* 队列拉取失败不打断聊天；下轮轮询自愈 */ }
-	}, [workerView, roomId, sessionId]);
-	const cancelQueuedInput = useCallback(async (queueId: string) => {
-		try {
-			await cancelWorkerInput(roomId, queueId);
-		} catch (err) {
-			toast.error(err instanceof Error ? err.message : String(err));
-		}
-		await refreshQueue();
-	}, [roomId, refreshQueue]);
-	const handleSend = useCallback(async (text: string, attachments?: MessageAttachmentInput[]) => {
-		const result = await send(text, attachments);
-		if (result?.queued) await refreshQueue();
-	}, [send, refreshQueue]);
+	const handleSend = useCallback(async (text: string, attachments?: MessageAttachmentInput[], delivery?: "normal" | "followUp" | "steer") => {
+		const result = await send(text, attachments, delivery);
+ if(result.queued) toast.info("已受理，尚未写入对话历史");
+	}, [send]);
 	const executionTurns = useMemo<SessionExecutionTurn[]>(() => messages
 		.filter((message) => message.role === "user")
 		.map((message, index) => ({
@@ -531,7 +492,7 @@ function SessionChat({
 	return (
 		<div className="home-session-chat relative flex min-h-0 flex-1 flex-col" aria-busy={!layoutReady}>
 			<div className={`flex min-h-0 flex-1 flex-col ${layoutReady ? "visible" : "invisible"}`}>
-				{!workerView ? (
+				{!workerView && inputCapability?.ownerAgentId === "manager" ? (
 				<SessionWorkCard
 					roomId={roomId}
 					sessionId={sessionId}
@@ -549,13 +510,14 @@ function SessionChat({
 				/>
 				) : null}
 				<WorkerSessionLinkProvider onOpen={onOpenWorkerSession}>
-				<MessageQuickActionProvider onDraft={draftFromMessage}>
+				<MessageQuickActionProvider onDraft={draftFromMessage} canDelegate={inputCapability?.ownerAgentId === "manager"}>
 					<Conversation initial="instant" resize={layoutReady ? "smooth" : "instant"}>
 						<AtBottomReporter onChange={setAtBottom} />
 						<ConversationScrollMemory roomId={roomId} sessionId={sessionId} ready={transcriptReady} />
 						<InlinePiHistoryGate ids={inlineHistoryIds} historyLoading={historyLoading} onReady={handleTranscriptReady} onReadinessChange={handleTranscriptReadinessChange}>
 						<QueryInputAxis items={queryAxisItems} />
 						<ConversationContent className="home-message-column">
+       {inputCapability?.sourceSnapshotId ? <SnapshotOrigin sessionId={sessionId} snapshotId={inputCapability.sourceSnapshotId} /> : null}
 							{sessionModifiedAt ? <div className="home-session-marker"><span />{compactDay(sessionModifiedAt)}<span /></div> : null}
 							{messages.length === 0 ? (
 								<div className="flex flex-1 items-center justify-center pt-20 text-sm text-muted-foreground">
@@ -564,9 +526,9 @@ function SessionChat({
 							) : (
 								groupForRender(messages).map((item) =>
 									"kind" in item ? (
-										<AssistantGroup key={item.id} roomId={roomId} sessionId={sessionId} messages={item.messages} windowType={windowType} onOpenWindow={onOpenWindow} />
+										<AssistantGroup key={item.id} roomId={roomId} sessionId={sessionId} messages={item.messages} assistantAs={inputCapability?.ownerAgentId !== "manager" ? inputCapability?.ownerAgentId : undefined} windowType={windowType} onOpenWindow={onOpenWindow} />
 									) : (
-										<Message key={item.id} roomId={roomId} sessionId={sessionId} message={item} windowType={windowType} onOpenWindow={onOpenWindow} resolvedTaskIds={resolvedTaskIds} />
+										<Message key={item.id} roomId={roomId} sessionId={sessionId} message={item} assistantAs={inputCapability?.ownerAgentId !== "manager" ? inputCapability?.ownerAgentId : undefined} windowType={windowType} onOpenWindow={onOpenWindow} resolvedTaskIds={resolvedTaskIds} />
 									),
 								)
 							)}
@@ -580,27 +542,7 @@ function SessionChat({
 									本轮已有工具调用记录，但未找到最终回复。请先核对工具和审批状态，再决定是否发送新指令。
 								</p>
 							) : null}
-							{workerView && queueItems.length > 0 ? (
-								<div className="home-queued-list">
-									{queueItems.map((item) => (
-										<div key={item.id} className={`home-queued-message${item.status === "failed" ? " is-failed" : ""}`}>
-											<div className="home-queued-message-body">
-												<p className="home-queued-message-status">{item.status === "failed" ? `发送失败：${item.failureReason ?? "未知原因"}` : "排队中，将在当前任务结束后发送"}</p>
-												<p className="home-queued-message-text">{item.displayText}</p>
-											</div>
-											<button
-												type="button"
-												className="home-queued-message-cancel"
-												aria-label={item.status === "failed" ? "移除失败消息" : "取消排队"}
-												title={item.status === "failed" ? "移除失败消息" : "取消排队"}
-												onClick={() => void cancelQueuedInput(item.id)}
-											>
-												<XIcon />
-											</button>
-										</div>
-									))}
-								</div>
-							) : null}
+
 						</ConversationContent>
 						</InlinePiHistoryGate>
 						<ConversationScrollButton
@@ -620,20 +562,22 @@ function SessionChat({
 				<Composer
 					sessionId={sessionId}
 					draftScope={JSON.stringify([draftContextKey, roomId, sessionId])}
-					disabled={status !== "connected" || (!workerView && running) || sending || stopping || Boolean(blocked)}
+					disabled={status !== "connected" || (running && !inputCapability?.busyInput.modes.length) || sending || stopping || Boolean(blocked) || inputCapability?.readOnly === true}
 					sending={sending}
-					stopAvailable={!workerView && (running || stopping)}
+					stopAvailable={running || stopping || (Boolean(inputCapability?.pendingMessageCount) || inputCapability?.unconfirmedInput === true)}
+ canSteer={running && !inputCapability?.waiting.length && inputCapability?.busyInput.modes.includes("steer")}
+ hideGoal={inputCapability?.ownerAgentId !== "manager"}
 					stopping={stopping}
 					busyHint={workerView ? undefined : busyHint}
-					queueHint={workerView && running ? "排队中，将在当前任务结束后发送" : undefined}
-					hideSessionControls={workerView}
+					queueHint={inputCapability?.waiting.length ? "等待审批，追加消息只入队" : undefined}
+					hideSessionControls={workerView || inputCapability?.readOnly === true}
 					hasGoal={hasGoal}
 					workspaceLabel={workspaceLabel}
 					workspacePath={workspacePath}
 					workspaceAvailable={workspaceAvailable}
 					sessionModel={sessionModel}
 					sessionThinkingLevel={sessionThinkingLevel}
-					directWorkerModel={directWorkerModel}
+					directWorkerModel={inputCapability && !inputCapability.nativePi && !inputCapability.readOnly ? directWorkerModel : undefined}
 					stats={sessionStats}
 					statsVisible={atBottom}
 					onModelChanged={onSessionModelChange}
@@ -722,6 +666,7 @@ export function ChatPane({
 	onOpenRoomList?: () => void;
 	onRoomsMayHaveChanged?: () => void;
 }) {
+ const [forkOpen,setForkOpen] = useState(false);
 	const [room, setRoom] = useState<RoomSummary | null>(null);
 	const [roomLoadError, setRoomLoadError] = useState<string | null>(null);
 	const [roomLoadNonce, setRoomLoadNonce] = useState(0);
@@ -1178,7 +1123,7 @@ export function ChatPane({
 	const type = room?.type ?? "solo";
 	const isSingle = type === "direct";
 	const currentPiWorker = isSingle && members[0]?.connector?.connectorId === "pi";
-	const canInlinePiProcess = isSingle && (currentPiWorker || (historicalPiProcess?.roomId === roomId && historicalPiProcess.sessionId === activeId && historicalPiProcess.available));
+	const canInlinePiProcess = isSingle && !currentPiWorker && (historicalPiProcess?.roomId === roomId && historicalPiProcess.sessionId === activeId && historicalPiProcess.available);
 	useEffect(() => {
 		if (!isSingle || currentPiWorker || !activeId) return;
 		let current = true;
@@ -1251,7 +1196,9 @@ export function ChatPane({
 						onClick={toggleInlinePiProcess}>
 						<span>执行过程</span><span className={`flex h-4 w-7 items-center rounded-full p-0.5 transition-colors ${inlinePiProcess ? "bg-primary" : "bg-muted-foreground/30"}`}><span className={`size-3 rounded-full bg-background transition-transform ${inlinePiProcess ? "translate-x-3" : ""}`} /></span>
 					</button> : null}
+					<ForkSessionDialog sourceId={activeId} open={forkOpen} onOpenChange={setForkOpen} />
 					<SessionMenu
+ onFork={!isSingle || currentPiWorker ? ()=>setForkOpen(true) : undefined}
 						sessions={room?.sessions ?? []}
 						workerSessions={workerSessions}
 						activeWorkerView={viewingWorker ? activeId : null}

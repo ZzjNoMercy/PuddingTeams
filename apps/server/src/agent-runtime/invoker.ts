@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { delegationStatus } from "./delegation-result-projection.js";
 import { TeamsStore, agentDisplayName, agentRunConfigRevision, type AgentConfig, type WindowConfig } from "../store/teams.js";
 import { CredentialsStore } from "../store/credentials.js";
 import { AgentRuntime, SessionConflictError } from "./runtime.js";
@@ -22,6 +24,8 @@ export interface AgentInvokeParams {
 	windowId: string;
 	managerSessionId: string;
 	managerToolCallId?: string;
+	invocationKind?: "manager_tool" | "direct_chat";
+	requestHash?: string;
 	goalId?: string;
 	workPlanId?: string;
 	workItemId?: string;
@@ -141,6 +145,33 @@ export class AgentInvoker {
 				options: { triggerTurn: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 		  ) => Promise<void>)
 		| undefined;
+	private terminalPublisher?: (record: DelegationRecord) => Promise<void>;
+	setTerminalPublisher(publisher: (record: DelegationRecord) => Promise<void>): void { this.terminalPublisher = publisher; }
+	async toolCallRecord(sessionId: string, toolCallId: string): Promise<DelegationRecord | undefined> {
+		const operationId = "delegation:" + createHash("sha256").update(sessionId + "\0" + toolCallId).digest("hex");
+		return (await this.runtime.listDelegations()).find(record => record.operationId === operationId);
+	}
+	async replayToolCall(root: DelegationRecord): Promise<AgentInvokeResult> {
+		const all = await this.runtime.listDelegations(); let record = root; const seen = new Set<string>();
+		while (record.result && "errorCode" in record.result && record.result.errorCode === "admission_replaced") {
+			if (seen.has(record.id)) throw new Error("delegation_projection_conflict"); seen.add(record.id);
+			const children = all.filter(item => item.operationId === `admission-replacement:${record.id}` && item.parentDelegationId === record.id);
+			if (children.length !== 1) throw new Error("delegation_projection_conflict"); record = children[0]!;
+		}
+		const interaction = (await this.runtime.listInteractions()).find(item => item.delegationId === record.id && item.status === "pending");
+		const { workspaceChangeSet, note } = await this.runtime.getWorkspaceResultContext(record);
+		const status = delegationStatus(record);
+		return { status, content: (record.result?.status === "completed" ? record.result.content ?? "Worker 已完成。" : record.result && "error" in record.result ? record.result.error : `原委派 ${status}；不会重新启动。`) + note,
+			details: { worker: record.agentId, rootDelegationId: root.id, executionState: record.executionState, executionReceipt: record.receipt, workspaceChangeSet,
+				artifacts: record.result?.artifacts, usage: record.result?.usage, interactionId: interaction?.id, requests: interaction?.requests, kind: interaction?.kind, source: interaction?.source, workerStarted: record.workerStarted, readOnlyAssessment: record.readOnlyAssessment, revision: interaction?.revision },
+			delegationId: record.id, interactionId: interaction?.id, waitingInput: status === "needs_input" };
+	}
+	async prepareTerminalDelivery(id: string): Promise<void> {
+		const record = await this.runtime.getDelegation(id);
+		if (record && this.terminalPublisher) await this.terminalPublisher(record);
+	}
+	private nativeExecutionGuard?: (sessionId: string) => Promise<void>;
+	setNativeExecutionGuard(guard: (sessionId: string) => Promise<void>): void { this.nativeExecutionGuard = guard; }
 	private delegationStateObserver: (() => Promise<void>) | undefined;
 	private knowledgeFor: ((agent: AgentConfig, ctx: InvocationContext, message: string) => Promise<import("../knowledge/runtime-service.js").KnowledgeMountSurface>) | undefined;
 	private replacementWindowResolver:
@@ -293,6 +324,10 @@ export class AgentInvoker {
 	/** 该窗口可委托的 Agent（启用的成员）。 */
 	async windowAgents(windowId: string): Promise<AgentConfig[]> {
 		return this.teams.windowMembers(windowId);
+	}
+
+	async delegatedSessionHandles(): Promise<Set<string>> {
+		return new Set((await this.runtime.listDelegations()).flatMap(record => record.sessionHandle ? [record.sessionHandle] : []));
 	}
 
 	async activeDelegations(windowId: string) {
@@ -491,7 +526,9 @@ export class AgentInvoker {
 
 	/** 发起一次委托（run/continue）。 */
 	async delegate(params: AgentInvokeParams): Promise<AgentInvokeResult> {
-		const { windowId, managerSessionId, message, mode } = params;
+		const { windowId, managerSessionId, message } = params;
+		const mode = params.invocationKind === "manager_tool" ? "run" : params.mode;
+		await this.nativeExecutionGuard?.(managerSessionId);
 		let agent: AgentConfig | undefined;
 		let sessionHandle: string | undefined;
 		let delegation;
@@ -516,7 +553,8 @@ export class AgentInvoker {
 				}
 				const managerContext = await this.teams.contextForSession(managerSessionId);
 				if (!managerContext?.active) throw new Error("该会话所属项目未激活，请先切换回对应项目");
-				if (params.purpose !== "verification" && window.type !== "solo" && !window.members.includes(freshAgent.name)) {
+				if (!(await this.teams.eligibleWorkersFor(freshManagerOwner)).some((agent) => agent.name === freshAgent.name)
+					|| params.purpose !== "verification" && window.type !== "solo" && !window.members.includes(freshAgent.name)) {
 					throw new Error(`agent「${freshAgent.name}」不是当前窗口的成员，委托被拒绝`);
 				}
 				const registeredDriver = this.drivers.get(freshAgent.name);
@@ -552,6 +590,8 @@ export class AgentInvoker {
 						cwdSnapshot: cwd,
 						managerSessionId,
 						managerToolCallId: params.managerToolCallId,
+						invocationKind: params.invocationKind,
+						requestHash: params.requestHash,
 						goalId: params.goalId,
 						workPlanId: params.workPlanId,
 						workItemId: params.workItemId,
@@ -723,7 +763,7 @@ export class AgentInvoker {
 				const err = result && "error" in result ? result.error : "worker 执行失败";
 				return {
 					...base,
-					status: cancelled ? "cancelled" : "failed",
+					status: d.executionState === "observation_lost" ? "observation_lost" : cancelled ? "cancelled" : "failed",
 					content: cancelled ? `worker「${agentDisplayName(agent)}」任务已取消。` : `worker「${agentDisplayName(agent)}」执行出错：${err}`,
 					details: {
 						...(result?.meta ?? {}),
@@ -789,7 +829,7 @@ export class AgentInvoker {
 					this.teams.getWindow(delegation.windowId),
 				]);
 				const currentOwner = currentContext?.window;
-				const legalTarget = currentOwner?.type === "solo"
+				const legalTarget = delegation.invocationKind === "manager_tool" ? currentTarget?.id === currentOwner?.id : currentOwner?.type === "solo"
 					? currentTarget?.type === "direct" && currentTarget.members.includes(delegation.agentId)
 					: currentTarget?.id === currentOwner?.id;
 				if (
@@ -1003,14 +1043,6 @@ export class AgentInvoker {
 		// applied, a transient projection error must not rewrite it to failed while
 		// the replacement Worker continues running.
 		await this.reconcileDelegationState().catch(() => undefined);
-		const replacementWindow = await this.teams.getWindow(replacementWindowId);
-		if (replacementWindow?.activeSession && replacementWindow.activeSession !== original.managerSessionId) {
-			this.sendOutcome(replacementWindow.activeSession, {
-				customType: "pudding:task_assign",
-				content: `Teams 已将任务改派给 worker「${candidate.displayName}」。`,
-				details: { taskId: replacement.id, delegationId: replacement.id, worker: replacement.agentId, status: "running", replacement: true, parentDelegationId: original.id, processView: true },
-			}, { triggerTurn: false });
-		}
 
 		const originalLabel = agentDisplayName(originalAgent ?? { name: original.agentId });
 		const targets = await this.outcomeTargets(original);
@@ -1066,7 +1098,8 @@ export class AgentInvoker {
 		};
 		if (targets.manager) {
 			const options = owner?.type === "direct" ? { triggerTurn: false } as const : { triggerTurn: true, deliverAs: "followUp" } as const;
-			if (this.durableManagerSender) await this.durableManagerSender(targets.manager, `replacement-result:${delegation.id}:${delegation.revision}`, message, options);
+			if (this.terminalPublisher) await this.terminalPublisher(delegation);
+			else if (this.durableManagerSender) await this.durableManagerSender(targets.manager, `replacement-result:${delegation.id}:${delegation.revision}`, message, options);
 			else this.sendOutcome(targets.manager, message, options);
 		}
 		if (targets.direct) {
@@ -1086,7 +1119,8 @@ export class AgentInvoker {
 			details: { delegationId, worker: delegation.agentId, status: "failed", replacement: true },
 		};
 		if (targets.manager) {
-			if (this.durableManagerSender) await this.durableManagerSender(targets.manager, `replacement-result:${delegation.id}:${delegation.revision}`, message, { triggerTurn: true, deliverAs: "followUp" });
+			if (this.terminalPublisher) await this.terminalPublisher(delegation);
+			else if (this.durableManagerSender) await this.durableManagerSender(targets.manager, `replacement-result:${delegation.id}:${delegation.revision}`, message, { triggerTurn: true, deliverAs: "followUp" });
 			else this.sendOutcome(targets.manager, message, { triggerTurn: true, deliverAs: "followUp" });
 		}
 		if (targets.direct) {
@@ -1096,6 +1130,7 @@ export class AgentInvoker {
 	}
 
 	private async projectReplacementStartFailure(original: DelegationRecord, interactionId: string, replacementAgentId: string, error: unknown, replacement?: DelegationRecord): Promise<void> {
+		if (replacement && this.terminalPublisher) return this.terminalPublisher(replacement);
 		if (!this.durableManagerSender) return;
 		const owner = await this.teams.windowForSession(original.managerSessionId);
 		await this.durableManagerSender(
@@ -1115,16 +1150,7 @@ export class AgentInvoker {
 	 * active session（单聊镜像）。两者相同则只发 manager，窗口读取失败仅跳过镜像。
 	 */
 	private async outcomeTargets(d: DelegationRecord): Promise<{ manager?: string; direct?: string }> {
-		const manager = d.managerSessionId || undefined;
-		let direct: string | undefined;
-		try {
-			const window = await this.teams.getWindow(d.windowId);
-			const active = window?.activeSession;
-			if (active && active !== manager) direct = active;
-		} catch {
-			// 镜像目标解析失败不影响主流程。
-		}
-		return { manager, direct };
+		return { manager: d.managerSessionId || undefined };
 	}
 
 	/** managerSender 的容错封装：通知失败不影响审批结果返回。 */
@@ -1133,6 +1159,11 @@ export class AgentInvoker {
 		message: { customType: string; content: string; details?: Record<string, unknown> },
 		options: { triggerTurn: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): void {
+		const delegationId = message.details?.delegationId;
+		if (message.customType === "pudding:task_result" && typeof delegationId === "string" && this.terminalPublisher) {
+			void this.prepareTerminalDelivery(delegationId).catch(error => { console.error("delegation terminal delivery pending", delegationId, error); });
+			return;
+		}
 		if (!this.managerSender) return;
 		void this.managerSender(sessionId, message, options).catch(() => undefined);
 	}
@@ -1225,7 +1256,7 @@ export class AgentInvoker {
 				// through the original delegate tool, so this resumed terminal projection
 				// must carry the Delegation id in-band as well.  Otherwise a required
 				// followup cannot fill parentDelegationId and cannot resume the same Run.
-				const delegationNote = `\n\n（delegationId：${d.id}——需要该 worker 接力/追问时，用 handoffKind="followup" 并把它填进 parentDelegationId）`;
+				const delegationNote = `\n\n（delegationId：${d.id}；后续任务请创建新的独立 delegation 并显式提供材料）`;
 				const taskResult = {
 					customType: "pudding:task_result",
 					content: `${outcome.result.content ?? ""}${note}${delegationNote}`,
@@ -1516,7 +1547,7 @@ export class AgentInvoker {
 	}
 
 	private rememberSession(delegation: { windowId: string; managerSessionId: string; agentId: string; sessionHandle?: string; workspaceId?: string; cwdSnapshot: string; agentRevision: number }): void {
-		if (!delegation.sessionHandle) return;
+		if (!delegation.sessionHandle || (delegation as DelegationRecord).invocationKind === "manager_tool") return;
 		void this.teams.rememberWorkerSession(
 			delegation.windowId,
 			delegation.managerSessionId,

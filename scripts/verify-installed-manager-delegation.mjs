@@ -1,16 +1,17 @@
+import { registerPuddingClawFixture } from './installed-worker-fixture.mjs';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { createServer, request as httpRequest } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
-import { mkdtemp, readFile, writeFile, chmod, access } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, chmod, access, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
 // Installed-package protocol rehearsal. All state and both mock peers are isolated.
 const cli = process.argv[2];
 const mode = process.argv[3] ?? 'approve';
-if (!cli || !path.isAbsolute(cli) || !['approve', 'pending-switch', 'browser-pending'].includes(mode)) throw new Error('Usage: node scripts/verify-installed-manager-delegation.mjs /absolute/path/to/puddingteams [approve|pending-switch|browser-pending]');
+if (!cli || !path.isAbsolute(cli) || !['approve', 'approve-large', 'approve-large-recovery', 'pending-switch', 'browser-pending'].includes(mode)) throw new Error('Usage: node scripts/verify-installed-manager-delegation.mjs /absolute/path/to/puddingteams [approve|pending-switch|browser-pending]');
 const run = promisify(execFile);
 const home = await mkdtemp('/private/tmp/puddingteams-manager-chain-');
 const env = { ...process.env, PATH: '/opt/homebrew/bin:/usr/bin:/bin', HOME: home, PUDDINGTEAMS_HOME: home, PI_CODING_AGENT_DIR: path.join(home, 'agent-dir'), PI_OFFLINE: '1' };
@@ -22,9 +23,10 @@ if [ "$2" = run ]; then
   /bin/pwd > '${home}/worker-run-cwd.txt'
   printf '%s\\n' '{"status":"needs_input","run_id":"fixture-run","session_id":"fixture-session","continuation_token":"private-fixture-token","needs_input":{"type":"permission","request_id":"fixture-permission","prompt":"允许继续？","options":[{"id":"once"},{"id":"reject"}]}}'
 elif [ "$2" = respond ]; then
+  printf '%s\\n' respond >> '${home}/worker-dispatches.log'
   /bin/cat > '${home}/worker-respond.json'
   /bin/pwd > '${home}/worker-respond-cwd.txt'
-  printf '%s\\n' '{"status":"completed","run_id":"fixture-run","session_id":"fixture-session","final_response":"Worker 已完成"}'
+  ${mode.includes('large') ? "/opt/homebrew/bin/node -e 'console.log(JSON.stringify({status: \"completed\", run_id: \"fixture-run\", session_id: \"fixture-session\", final_response: \"Worker 已完成\" + \"x\".repeat(100000)}))'" : "printf '%s\\n' '{\"status\":\"completed\",\"run_id\":\"fixture-run\",\"session_id\":\"fixture-session\",\"final_response\":\"Worker 已完成\"}'"}
 elif [ "$2" = continue ]; then
   printf '%s\\n' continue >> '${home}/worker-dispatches.log'
   /bin/cat > '${home}/worker-continue.json'
@@ -45,12 +47,12 @@ const mock = createServer(async (req, res) => {
   const body = JSON.parse(Buffer.concat(chunks).toString());
   const names = (body.tools ?? []).map((tool) => tool.function?.name).filter(Boolean);
   modelTools.push(names);
-  const callTool = names.includes('agent_puddingclaw__delegate') && !(body.messages ?? []).some((message) => message.role === 'tool');
+  const callTool = names.includes('delegation') && !(body.messages ?? []).some((message) => message.role === 'tool');
   const id = `fixture-${++modelCalls}`;
   const send = (delta, finish_reason = null) => res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: 1780000000, model: 'fixture-model', choices: [{ index: 0, delta, finish_reason }] })}\n\n`);
   res.writeHead(200, { 'content-type': 'text/event-stream' });
   if (callTool) {
-    send({ role: 'assistant', tool_calls: [{ index: 0, id: `call-${modelCalls}`, type: 'function', function: { name: 'agent_puddingclaw__delegate', arguments: JSON.stringify({ task: '执行安装态委托审批验证' }) } }] });
+    send({ role: 'assistant', tool_calls: [{ index: 0, id: `call-${modelCalls}`, type: 'function', function: { name: 'delegation', arguments: JSON.stringify({ workerId: 'puddingclaw', task: '执行安装态委托审批验证' }) } }] });
     send({}, 'tool_calls');
   } else {
     send({ role: 'assistant', content: 'Manager 收到 Worker 结果。' });
@@ -69,7 +71,8 @@ const base = `http://127.0.0.1:${port}`;
 const request = async (method, route, body, operationKey) => {
   const headers = body === undefined ? {} : { 'content-type': 'application/json' };
   if (method === 'POST' && /^\/api\/sessions\/[^/]+\/messages$/.test(route)) headers['idempotency-key'] = operationKey ?? randomUUID();
-  const response = await fetch(base + route, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(15000) });
+  let response;
+  try { response = await fetch(base + route, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(15000) }); } catch (error) { throw new Error(`${method} ${route}: ${error}`, { cause: error }); }
   return { status: response.status, body: await response.json() };
 };
 const loseResponse = async (route, body, operationKey) => {
@@ -111,6 +114,7 @@ let started = false;
 try {
   await run(cli, ['start', '--port', String(port)], { env, timeout: 30000 });
   started = true;
+  await registerPuddingClawFixture(base);
   assert.deepEqual((await ok('GET', '/api/rooms/solo/work-index')).works, [], 'first-open search must not invent a work item');
   const rooms = (await ok('GET', '/api/rooms')).rooms;
   const solo = rooms.find((room) => room.type === 'solo');
@@ -129,14 +133,15 @@ try {
   await ok('POST', `/api/sessions/${sessionId}/model`, { model: 'fixture/fixture-model' });
   await ok('POST', `/api/sessions/${sessionId}/messages`, { content: '请委托 PuddingClaw Worker 完成工作并处理审批。' });
   const interaction = await waitFor(async () => (await ok('GET', '/api/interactions')).interactions[0], 'pending interaction');
-  const direct = await waitFor(async () => (await ok('GET', '/api/rooms')).rooms.find((room) => room.type === 'direct'), 'direct window');
-  const wrong = await request('POST', `/api/interactions/${interaction.id}/responses`, { requestId: 'fixture-response-wrong', revision: interaction.revision, windowId: solo.id, responses: [{ requestId: 'fixture-permission', action: 'approve', scope: 'once' }] });
+  assert.equal((await ok('GET', '/api/rooms')).rooms.some(room => room.type === 'direct'), false, 'delegation must not create a direct chat');
+  const direct = (await ok('POST', '/api/rooms', { type: 'direct', members: ['puddingclaw'], workspaceId: a.id })).room;
+  const wrong = await request('POST', `/api/interactions/${interaction.id}/responses`, { requestId: 'fixture-response-wrong', revision: interaction.revision, windowId: direct.id, responses: [{ requestId: 'fixture-permission', action: 'approve', scope: 'once' }] });
   assert.equal(wrong.status, 403);
   const runCwd = (await readFile(path.join(home, 'worker-run-cwd.txt'), 'utf8')).trim();
   assert.equal(runCwd, a.canonicalPath);
   const runInput = JSON.parse(await readFile(path.join(home, 'worker-run.json'), 'utf8'));
   assert.equal(runInput.workspace_path, a.canonicalPath);
-  assert.ok(modelTools.some((names) => names.includes('agent_puddingclaw__delegate')));
+  assert.ok(modelTools.some((names) => names.includes('delegation')));
   if (mode === 'browser-pending') {
     console.log(JSON.stringify({ ready: true, home, base, workspaceA: a.id, workspaceB: b.id, managerSession: sessionId, directWindow: direct.id, interaction: interaction.id }, null, 2));
     await new Promise((resolve) => {
@@ -146,12 +151,28 @@ try {
     });
   } else {
   let approved;
-  if (mode === 'approve') {
-    approved = await ok('POST', `/api/interactions/${interaction.id}/responses`, { requestId: 'fixture-response-correct', revision: interaction.revision, windowId: direct.id, responses: [{ requestId: 'fixture-permission', action: 'approve', scope: 'once' }] });
+  let recoverySnapshot;
+  let recoverySessionFile;
+  if (mode.startsWith('approve')) {
+    if (mode.includes('recovery')) {
+      recoverySessionFile = (await readdir(path.join(home, 'sessions'))).map(name => path.join(home, 'sessions', name)).find(name => name.includes(sessionId));
+      recoverySnapshot = await waitFor(async () => { const text = await readFile(recoverySessionFile, 'utf8'); return text.includes('\"role\":\"toolResult\"') ? text : undefined; }, 'durable waiting toolResult snapshot');
+    }
+    approved = await ok('POST', `/api/interactions/${interaction.id}/responses`, { requestId: 'fixture-response-correct', revision: interaction.revision, windowId: solo.id, responses: [{ requestId: 'fixture-permission', action: 'approve', scope: 'once' }] });
     assert.equal(approved.outcome.status, 'approved');
     await waitFor(async () => (await ok('GET', `/api/sessions/${sessionId}/messages`)).messages.some((message) => message.role === 'assistant' && JSON.stringify(message.content).includes('Manager 收到 Worker 结果')), 'Manager final response');
     const respondCwd = (await readFile(path.join(home, 'worker-respond-cwd.txt'), 'utf8')).trim();
     assert.equal(respondCwd, a.canonicalPath);
+    const history = (await ok('GET', `/api/sessions/${sessionId}/messages`)).messages;
+    const terminals = history.filter(message => message.customType === 'pudding:task_result' && message.details?.delegationId === interaction.delegationId);
+    assert.equal(terminals.length, 1); assert(terminals[0].details.toolCallId); assert(terminals[0].content.includes(interaction.delegationId));
+    const record = Object.values(JSON.parse(await readFile(path.join(home, 'state', 'delegations.json'), 'utf8')).delegations).find(record => record.id === interaction.delegationId);
+    const jsonl = await readFile((await readdir(path.join(home, 'sessions'))).map(name => path.join(home, 'sessions', name)).find(name => name.includes(sessionId)), 'utf8');
+    const entries = jsonl.split('\n').filter(Boolean).map(line => JSON.parse(line));
+    assert.equal(entries.filter(entry => entry.type === 'message' && entry.message?.role === 'toolResult' && entry.message.toolCallId === record.managerToolCallId).length, 1);
+    if (mode.includes('large')) { assert(record.result.content.length > 100000); assert(terminals[0].content.length < 40000); assert.equal((await readFile(path.join(home, 'state', 'large-worker-results', record.id + '.txt'), 'utf8')).length, record.result.content.length); }
+    const directMessages = (await ok('GET', `/api/sessions/${direct.activeSession}/messages`)).messages;
+    assert.equal(directMessages.some(message => message.details?.delegationId === interaction.delegationId), false, 'no terminal mirror into direct');
   }
   const toB = (await ok('POST', `/api/rooms/${solo.id}/switch-workspace`, { workspaceId: b.id, mode: 'in_place' })).room;
   assert.notEqual(toB.activeSession, sessionId);
@@ -167,7 +188,7 @@ try {
     const old = (await ok('GET', `/api/interactions/${interaction.id}`)).interaction;
     assert.equal(old.status, 'expired');
     assert.equal((await ok('GET', '/api/interactions')).interactions.length, 0);
-    inactive = await request('POST', `/api/interactions/${interaction.id}/responses`, { requestId: 'fixture-response-while-b', revision: interaction.revision, windowId: direct.id, responses: [{ requestId: 'fixture-permission', action: 'approve', scope: 'once' }] });
+    inactive = await request('POST', `/api/interactions/${interaction.id}/responses`, { requestId: 'fixture-response-while-b', revision: interaction.revision, windowId: solo.id, responses: [{ requestId: 'fixture-permission', action: 'approve', scope: 'once' }] });
     assert.equal(inactive.status, 409, JSON.stringify(inactive.body));
     assert.equal(inactive.body.code, 'interaction_context_inactive');
   }
@@ -183,14 +204,29 @@ try {
     }, 'honest cancellation cards');
     assert.deepEqual(cards.map((message) => message.details?.status), ['observation_lost', 'observation_lost']);
     assert.ok(cards.every((message) => !/已终止|已由用户取消/.test(message.content)));
-    stale = await request('POST', `/api/interactions/${interaction.id}/responses`, { requestId: 'fixture-response-after-return', revision: interaction.revision, windowId: direct.id, responses: [{ requestId: 'fixture-permission', action: 'approve', scope: 'once' }] });
+    stale = await request('POST', `/api/interactions/${interaction.id}/responses`, { requestId: 'fixture-response-after-return', revision: interaction.revision, windowId: solo.id, responses: [{ requestId: 'fixture-permission', action: 'approve', scope: 'once' }] });
     assert.equal(stale.status, 409, JSON.stringify(stale.body));
     assert.equal(stale.body.code, 'not_pending');
     await assert.rejects(access(path.join(home, 'worker-respond.json')));
   }
   await run(cli, ['stop'], { env, timeout: 20000 });
   started = false;
+  if (mode.includes('recovery')) {
+    // Fault snapshot: receipt is sealed but owner JSONL/outbox restore to the pre-delivery boundary.
+    await writeFile(recoverySessionFile, recoverySnapshot);
+    const outboxPath = path.join(home, 'state', 'delegation-delivery.json');
+    const outbox = JSON.parse(await readFile(outboxPath, 'utf8'));
+    for (const delivery of outbox.deliveries) if (delivery.delegationId === interaction.delegationId) { delivery.state = 'pending'; delete delivery.lastError; }
+    await writeFile(outboxPath, JSON.stringify(outbox));
+  }
   await run(cli, ['start', '--port', String(port)], { env, timeout: 30000 });
+  if (mode.includes('recovery')) {
+    await waitFor(async () => (await ok('GET', `/api/sessions/${sessionId}/messages`)).messages.some(message => message.role === 'assistant' && JSON.stringify(message.content).includes('Manager 收到 Worker 结果')), 'cold recovery wake');
+    assert.equal((await readFile(path.join(home, 'worker-dispatches.log'), 'utf8')).split('\n').filter(value => value === 'run').length, 1);
+    assert.equal((await readFile(path.join(home, 'worker-dispatches.log'), 'utf8')).split('\n').filter(value => value === 'respond').length, 1);
+    const restoredHistory = (await ok('GET', `/api/sessions/${sessionId}/messages`)).messages;
+    assert.equal(restoredHistory.filter(message => message.customType === 'pudding:task_result' && message.details?.delegationId === interaction.delegationId).length, 1);
+  }
   started = true;
   const coldRoom = (await ok('GET', `/api/rooms/${solo.id}`)).room;
   const coldHistory = (await ok('GET', `/api/sessions/${sessionId}/messages`)).messages;
@@ -199,8 +235,8 @@ try {
   const coldWork = (await ok('GET', `/api/rooms/${solo.id}/work-index`)).works.find((work) => work.sessionId === sessionId);
   assert.equal(coldWork?.active, true);
   assert.equal(coldWork?.firstMessage, '请委托 PuddingClaw Worker 完成工作并处理审批。');
-  assert.equal(coldInteraction.status, mode === 'approve' ? 'approved' : 'expired');
-  if (mode === 'approve') assert.ok(coldHistory.some((message) => message.role === 'assistant' && JSON.stringify(message.content).includes('Manager 收到 Worker 结果')));
+  assert.equal(coldInteraction.status, (mode.startsWith('approve')) ? 'approved' : 'expired');
+  if (mode.startsWith('approve')) assert.ok(coldHistory.some((message) => message.role === 'assistant' && JSON.stringify(message.content).includes('Manager 收到 Worker 结果')));
   else {
     assert.equal((await ok('GET', '/api/interactions')).interactions.length, 0);
     const process = await ok('GET', `/api/delegations/${interaction.delegationId}/process`);
@@ -213,7 +249,7 @@ try {
   let directColdReplayStatus;
   let directReservedRecoveryStatus;
   let directDispatches;
-  if (mode === 'approve') {
+  if (mode.startsWith('approve')) {
     const directAfterRestart = (await ok('GET', `/api/rooms/${direct.id}`)).room;
     const directSessionId = directAfterRestart.activeSession;
     assert.ok(directSessionId);

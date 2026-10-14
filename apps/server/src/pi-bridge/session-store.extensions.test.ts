@@ -67,6 +67,7 @@ test("Phase4 集成: 真实 manager Session 只暴露成员工具，禁用后立
 	await teams.init();
 	await teams.upsertAgent(agentConfig("alpha"));
 	await teams.upsertAgent(agentConfig("beta"));
+ await teams.upsertAgent(agentConfig("gamma"));
 
 	const delegations = new DelegationStore(path.join(dir, "rt"));
 	await delegations.init();
@@ -82,18 +83,20 @@ test("Phase4 集成: 真实 manager Session 只暴露成员工具，禁用后立
 
 	try {
 		// direct 窗口（成员 alpha）：真实会话的工具集不含非成员 beta 的工具。
-		const summary = await sessions.create(undefined, { type: "direct", members: ["alpha"] });
+		const summary = await sessions.create(undefined, { type: "group", members: ["alpha", "gamma"] });
+		await teams.createWindow({ type: "group", members: ["alpha", "gamma"], sessionId: summary.id });
 		const session = await sessions.open(summary.id);
 		const allNames = session.getAllTools().map((t) => t.name);
 		assert.ok(allNames.includes(delegateToolName("alpha")), "成员工具必须注册进 manager Session");
 		assert.ok(allNames.includes(CORE_TOOL_SEARCH));
 		assert.ok(!allNames.includes("list_agents"), "roster 不做成工具（由 prompt 注入取代）");
-		assert.ok(!allNames.includes(delegateToolName("beta")), "非成员 Agent 的工具不在该窗口 Session 的工具集里");
+		assert.deepEqual((session.getAllTools().find(tool => tool.name === "delegation")!.parameters as { properties: { workerId: { enum: string[] } } }).properties.workerId.enum, ["alpha", "gamma"]);
 		const active = session.getActiveToolNames();
 		assert.ok(active.includes(delegateToolName("alpha")), "direct 默认激活该 Agent 的基础委托工具");
 
 		// 撤权（§3.3.6）：禁用 alpha 后活跃会话立即从 active tools 移除该工具。
 		await teams.setEnabled("alpha", false);
+  await teams.setEnabled("gamma", false);
 		let removed = false;
 		for (let i = 0; i < 50; i++) {
 			if (!session.getActiveToolNames().includes(delegateToolName("alpha"))) {
