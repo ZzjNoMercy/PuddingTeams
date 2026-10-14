@@ -3,7 +3,7 @@ import type { InlineExtension } from "@earendil-works/pi-coding-agent";
 import type { McpServerStore } from "../store/mcp-servers.js";
 
 export const MANAGED_MCP_EXTENSION_NAME = "puddingteams-mcp-adapter";
-export const MANAGED_MCP_ADAPTER_VERSION = "2.31.0";
+export const MANAGED_MCP_ADAPTER_VERSION = "5.3.0";
 
 export const MANAGED_MCP_SETTINGS = {
 	hostConfigDiscovery: "off",
