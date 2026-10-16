@@ -15,6 +15,11 @@ appId: com.puddingteams.app
 productName: PuddingTeams
 forceCodeSigning: true
 afterPack: scripts/after-pack.mjs
+# 会话深链：注册 puddingteams://（mac 写 Info.plist，win 写注册表）。
+protocols:
+  - name: PuddingTeams
+    schemes:
+      - puddingteams
 directories:
   output: release
   buildResources: build

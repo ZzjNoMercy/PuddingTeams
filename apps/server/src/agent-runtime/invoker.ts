@@ -6,6 +6,7 @@ import { AgentRuntime, SessionConflictError } from "./runtime.js";
 import type { DelegationRecord } from "./delegation-store.js";
 import { DriverRegistry } from "./driver-registry.js";
 import { PuddingClawDriver } from "./puddingclaw-driver.js";
+import type { SessionReadService } from "../pi-bridge/session-read.js";
 import type { AgentDriver, DriverCapabilities, InvocationContext, NormalizedResult } from "./types.js";
 import { ExtensionCatalog, resolveAgentCapabilityRuntime } from "./extensions.js";
 import type { ProductSettingsStore } from "../store/product-settings.js";
@@ -215,6 +216,8 @@ export class AgentInvoker {
 	private webResearchFingerprint?: (agentId: string) => Promise<string>;
 	private webResearchTools?: (agentId: string) => Promise<ToolDefinition[]>;
 	setWebResearchExtension(factory: (agentId: string) => InlineExtension, fingerprint?: (agentId: string) => Promise<string>, tools?: (agentId: string) => Promise<ToolDefinition[]>): void { this.webResearchExtension = factory; this.webResearchFingerprint = fingerprint; this.webResearchTools = tools; }
+	private sessionRead?: SessionReadService;
+	setSessionRead(service: SessionReadService): void { this.sessionRead = service; }
 
 	setReplacementWindowResolver(resolver: (delegation: DelegationRecord, agent: AgentConfig) => Promise<string>): void {
 		this.replacementWindowResolver = resolver;
@@ -1629,6 +1632,12 @@ export class AgentInvoker {
 											agent.mcpServerIds ?? [],
 										)] : []),
 									],
+								}
+								: {}),
+							...(this.sessionRead
+								? {
+									sessionReadFor: (ctx: { workspaceId?: string }, ownUserText: () => Promise<string>) =>
+										this.sessionRead!.executionExtension(() => ctx.workspaceId, ownUserText),
 								}
 								: {}),
 						}

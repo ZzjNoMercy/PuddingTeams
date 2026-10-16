@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { TeamsStore } from "../store/teams.js";
-import { agentRunConfigRevision } from "../store/teams.js";
+import { agentDisplayName, agentRunConfigRevision } from "../store/teams.js";
 import type { PiSessionStore } from "../pi-bridge/session-store.js";
 import type { AgentInvoker } from "./invoker.js";
 import { ConversationSnapshots } from "../store/conversation-snapshots.js";
@@ -101,7 +101,9 @@ export class SessionForks {
   if(!ref.sourceSnapshotId)return null;
   const snapshot=await this.snapshots.load(ref.sourceSnapshotId),sourceContext=await this.teams.contextForSession(snapshot.sourceSessionId);
   const sourceExists=Boolean(sourceContext && (await this.sessions.list()).some(session=>session.id===snapshot.sourceSessionId));
-  return {snapshotId:snapshot.id,sourceSessionId:snapshot.sourceSessionId,sourceLeafEntryId:snapshot.sourceLeafEntryId,createdAt:snapshot.createdAt,sourceExists,
+  const sourceRef=sourceExists ? await this.teams.sessionRef(snapshot.sourceSessionId) : undefined;
+  const sourceAgent=sourceRef ? await this.teams.getAgent(sourceRef.ownerAgentId) : undefined;
+  return {sourceAgentName:sourceRef?.ownerAgentId==="manager"?"Manager":sourceAgent?agentDisplayName(sourceAgent):undefined, snapshotId:snapshot.id,sourceSessionId:snapshot.sourceSessionId,sourceLeafEntryId:snapshot.sourceLeafEntryId,createdAt:snapshot.createdAt,sourceExists,
    sourceRoomId:sourceExists?sourceContext?.window.id:undefined,sourceActive:sourceExists&&sourceContext?.active===true};
  }
  async canStartNewIntent(key:string) {const record=await this.operations.get(key);return !record||record.terminal==="configuration_changed";}

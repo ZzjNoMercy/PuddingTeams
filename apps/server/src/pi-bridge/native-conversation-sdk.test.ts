@@ -158,6 +158,18 @@ test("P3 real SDK: Worker owns one conversation; followUp/steer, duplicate inten
   const leaf=sourceSession.sessionManager.getLeafId()!,modelBefore=requests.length;
   const fork=await forks.fork("native-fork-0001",source.id,"worker",leaf);assert.notEqual(fork.sessionId,sid);assert.equal(fork.roomId,workerRoom.id);assert.equal(requests.length,modelBefore);
   const origin=await forks.origin(fork.sessionId);assert.equal(origin?.sourceExists,true);assert.equal(origin?.sourceSessionId,source.id);
+  assert.equal(origin?.sourceAgentName,"Manager");
+  const inherited=await sessions.wireMessages(fork.sessionId);
+  const oldAssistant=inherited.filter(message=>message.role==="assistant");
+  assert(oldAssistant.length>0);
+  assert(oldAssistant.every(message=>(message as {puddingHistorical?:boolean}).puddingHistorical===true));
+  assert((await sessions.wireMessages(source.id)).every(message=>!(message as {puddingHistorical?:boolean}).puddingHistorical));
+  const targetForPresentation=await sessions.open(fork.sessionId);
+  targetForPresentation.sessionManager.appendMessage({role:"user",content:"new instruction in branch",timestamp:Date.now()});
+  const projectedAfterNew=await sessions.wireMessages(fork.sessionId);
+  assert.equal((projectedAfterNew.find(message=>message.role==="user"&&message.content==="new instruction in branch") as {puddingHistorical?:boolean})?.puddingHistorical,undefined);
+  assert(!targetForPresentation.sessionManager.getBranch().some(entry=>entry.type==="message"&&(entry.message as {puddingHistorical?:boolean}).puddingHistorical),"wire provenance must not mutate the SDK transcript");
+
   const snapshot=await snapshots.load(fork.snapshotId);assert(!JSON.stringify(snapshot).includes("NEVER_COPY_MANAGER"));assert(JSON.stringify(snapshot).includes("来源 Goal（历史）"));assert.equal(snapshot.assets.length,1);
   const forked=await sessions.open(fork.sessionId);assert.equal(forked.model?.id,"worker-model");assert.equal(await states.getActive(fork.sessionId),undefined);
   assert.equal(forked.sessionManager.getBranch().find(entry=>entry.type==="message"&&entry.message.role==="user")?.type,"message");

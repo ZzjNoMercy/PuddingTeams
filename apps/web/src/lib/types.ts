@@ -141,6 +141,7 @@ export interface PiUserMessage {
 	content: string | PiContentBlock[];
 	timestamp?: number;
 	puddingMessageId?: string;
+	puddingHistorical?: boolean;
 }
 
 /** pi assistant 消息上的逐轮用量（provider 返回、pi-ai 归一化）；cost 由 pi 按模型价目表换算。 */
@@ -158,6 +159,7 @@ export interface PiAssistantMessage {
 	role: "assistant";
 	content: PiContentBlock[];
 	puddingMessageId?: string;
+	puddingHistorical?: boolean;
 	provider?: string;
 	model?: string;
 	stopReason?: string;
@@ -254,6 +256,7 @@ export interface ChatMessage {
 	id: string;
 	role: ChatMessageRole;
 	puddingMessageId?: string;
+	puddingHistorical?: boolean;
 	content: string;
 	/** role === "user"：随消息发送的图片附件（已从展示文本中分离）。 */
 	images?: ChatMessageImage[];
@@ -491,6 +494,7 @@ export interface PiResourcePreview {
 			| "pi-native-append"
 			| "agent-instructions"
 			| "window-collaboration"
+			| "current-date"
 			| "global-context"
 			| "workspace-context";
 		path?: string;
@@ -1145,6 +1149,7 @@ export interface AgentToolPreview {
 
 
 export interface ChatNavigationItem {
+ sourceSnapshotId?: string;
  roomId: string; sessionId: string; ownerAgentId: string; agentName: string; agentEnabled: boolean;
  roomType: WindowType; roomName: string; title: string; firstMessage: string; modifiedAt: string;
  workspaceId: string | null; workspaceName: string; cwdSnapshot: string; contextActive: boolean;

@@ -105,6 +105,10 @@ export function piExtensionHooks(defaults: { sessionDir?: string; fffStateRoot?:
 					typeof config.managedExtensionFactoriesFor === "function"
 						? (config.managedExtensionFactoriesFor as LocalPiDriverOptions["managedExtensionFactoriesFor"])
 						: undefined,
+				sessionReadFor:
+					typeof config.sessionReadFor === "function"
+						? (config.sessionReadFor as LocalPiDriverOptions["sessionReadFor"])
+						: undefined,
 				managedExtensionsFingerprintFor: typeof config.managedExtensionsFingerprintFor === "function"
 					? config.managedExtensionsFingerprintFor as LocalPiDriverOptions["managedExtensionsFingerprintFor"] : undefined,
 				webResearchToolsFor: typeof config.webResearchToolsFor === "function"

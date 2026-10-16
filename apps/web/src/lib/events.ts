@@ -125,6 +125,7 @@ export function renderPiMessage(m: PiAssistantMessage): {
 	toolCalls: ToolCallView[];
 	usage?: PiUsage;
 	puddingMessageId?: string;
+	puddingHistorical?: boolean;
 	piStopReason?: string;
 	error?: boolean;
 	modelError?: ModelErrorPresentation;
@@ -152,6 +153,7 @@ export function renderPiMessage(m: PiAssistantMessage): {
 		toolCalls,
 		usage: m.usage,
 		puddingMessageId: m.puddingMessageId,
+		...(m.puddingHistorical ? { puddingHistorical: true } : {}),
 		piStopReason: m.stopReason,
 		error: friendlyError ? true : undefined,
 		modelError: friendlyError ? { ...friendlyError.presentation, ...(content ? { partialContent: content } : {}) } : undefined,
@@ -359,7 +361,7 @@ export function groupForRender(messages: ChatMessage[]): RenderItem[] {
 			continue;
 		}
 		const last = out[out.length - 1];
-		if (last && "kind" in last && last.kind === "assistantGroup") {
+		if (last && "kind" in last && last.kind === "assistantGroup" && Boolean(last.messages[0]?.puddingHistorical) === Boolean(m.puddingHistorical)) {
 			last.messages.push(m);
 			continue;
 		}
@@ -437,6 +439,7 @@ export function renderHistory(msgs: PiMessage[]): ChatMessage[] {
 				content: parts.text,
 				...(parts.images?.length ? { images: parts.images } : {}),
 				puddingMessageId: m.puddingMessageId,
+		...(m.puddingHistorical ? { puddingHistorical: true } : {}),
 				toolCalls: [],
 				timestamp: m.timestamp ?? Date.now(),
 				streaming: false,
@@ -678,6 +681,7 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 						content: parts.text,
 						...(parts.images?.length ? { images: parts.images } : {}),
 						puddingMessageId: m.puddingMessageId,
+		...(m.puddingHistorical ? { puddingHistorical: true } : {}),
 						toolCalls: [],
 						timestamp: m.timestamp ?? Date.now(),
 						streaming: false,

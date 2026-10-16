@@ -18,6 +18,7 @@ import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-ag
 import { config } from "./config.js";
 import { acquireLease, ensurePaths, puddingTeamsHomeId, resolvePuddingTeamsPaths } from "./paths.js";
 import { PiSessionStore } from "./pi-bridge/session-store.js";
+import { SessionReadService } from "./pi-bridge/session-read.js";
 import { CredentialsStore } from "./store/credentials.js";
 import { mkdir } from "node:fs/promises";
 import QRCode from "qrcode";
@@ -363,6 +364,9 @@ const store = new PiSessionStore(
 	mcpServers,
 	nativeExecutions,
 );
+// 会话深链（docs/2026-10-16-会话深链交接方案.md）：manager/worker 单聊由
+// PiSessionStore 自行装配，Worker 委派执行会话经 invoker 注入。
+invoker.setSessionRead(new SessionReadService(teams, paths.sessions, (msg) => app.log.warn({ component: "session-read" }, msg)));
 store.setKnowledgeRuntime(knowledgeRuntime);
 // 诊断与运行时活动的出口。`setDebugLog` 此前只有埋点、没有调用方（11 处写进空气）；
 // 那些消息都是降级/失败（能力装配失败、模型自愈失败、投递失败），按 warn 落地。
@@ -854,6 +858,7 @@ await registerRoomsRoutes(app, store, teams, invoker, workStates, {
 	productSettings,
 	activityStatePath: path.join(paths.state, "room-activity.json"),
 	sessionCreationStatePath: path.join(paths.state, "session-creation-operations.json"),
+	chatNavigationStatePath: path.join(paths.state, "chat-navigation.json"),
 });
 await registerInteractionsRoutes(app, runtime, invoker, teams, workStates);
 registerArtifactsRoutes(app, artifacts);

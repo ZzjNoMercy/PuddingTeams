@@ -12,6 +12,7 @@ import {
 	resolvePuddingTeamsHome,
 } from "./runtime.js";
 import { assertValidObsidianUri } from "./obsidian-uri.js";
+import { deepLinkToAppUrl } from "./deep-link.js";
 
 /**
  * PuddingTeams 桌面宿主。
@@ -48,6 +49,26 @@ let mainWindow: BrowserWindow | null = null;
 let currentAppUrl: string | null = null;
 let trustedOrigin: string | null = null;
 let quitting = false;
+let pendingDeepLink: string | null = null;
+
+function resolveDeepLink(raw: string): string | undefined {
+	return currentAppUrl ? deepLinkToAppUrl(raw, currentAppUrl) : undefined;
+}
+
+function handleDeepLink(raw: string): void {
+	const target = resolveDeepLink(raw);
+	if (!target) {
+		if (!currentAppUrl) pendingDeepLink = raw;
+		return;
+	}
+	if (!mainWindow) mainWindow = createWindow(target);
+	else {
+		void mainWindow.loadURL(target);
+		if (mainWindow.isMinimized()) mainWindow.restore();
+		mainWindow.show();
+		mainWindow.focus();
+	}
+}
 
 function resolveServerBundle(): string | undefined {
 	const candidates = app.isPackaged
@@ -353,11 +374,17 @@ function registerIpc(): void {
 	});
 }
 
+function consumePendingDeepLink(): string | undefined {
+	const pending = pendingDeepLink;
+	pendingDeepLink = null;
+	return pending ? resolveDeepLink(pending) : undefined;
+}
+
 async function bootstrap(): Promise<void> {
 	registerIpc();
 	if (DEV) {
 		currentAppUrl = DEV_WEB_URL;
-		mainWindow = createWindow(currentAppUrl);
+		mainWindow = createWindow(consumePendingDeepLink() ?? currentAppUrl);
 		return;
 	}
 	try {
@@ -365,7 +392,7 @@ async function bootstrap(): Promise<void> {
 		const expectedHomeId = dataHomeId(home);
 		const port = await reuseExistingServer(home, expectedHomeId) ?? await spawnProductionServer(home, expectedHomeId);
 		currentAppUrl = `http://127.0.0.1:${port}`;
-		mainWindow = createWindow(currentAppUrl);
+		mainWindow = createWindow(consumePendingDeepLink() ?? currentAppUrl);
 	} catch (error) {
 		const detail = error instanceof Error ? error.message : String(error);
 		dialog.showErrorBox("PuddingTeams 启动失败", `${detail}\n\n桌面日志：${desktopLogPath()}`);
@@ -378,14 +405,27 @@ async function bootstrap(): Promise<void> {
 // 保留 Electron 标准 --user-data-dir 覆盖，便于并行预览/自动化使用隔离的
 // Chromium profile；它不会改变 PUDDINGTEAMS_HOME。
 app.setName(APP_NAME);
+// 会话深链（docs/2026-10-16-会话深链交接方案.md §P3）：注册 puddingteams://
+// scheme。打包态由 electron-builder 的 protocols 写入 Info.plist / Windows
+// 注册表；源码开发态此调用对当前二进制生效。
+app.setAsDefaultProtocolClient("puddingteams");
 if (!app.commandLine.hasSwitch("user-data-dir")) {
 	app.setPath("userData", path.join(app.getPath("appData"), APP_NAME));
 }
 
+// macOS：点击 puddingteams:// 链接由系统投递 open-url。
+app.on("open-url", (event, url) => {
+	event.preventDefault();
+	handleDeepLink(url);
+});
+
 if (!app.requestSingleInstanceLock()) {
 	app.quit();
 } else {
-	app.on("second-instance", () => {
+	app.on("second-instance", (_event, argv) => {
+		// Windows/Linux：深链以第二实例命令行参数到达。
+		const deepLink = argv.find((arg) => arg.startsWith("puddingteams://"));
+		if (deepLink) handleDeepLink(deepLink);
 		if (!mainWindow && currentAppUrl) mainWindow = createWindow(currentAppUrl);
 		if (mainWindow) {
 			if (mainWindow.isMinimized()) mainWindow.restore();
@@ -400,6 +440,9 @@ if (!app.requestSingleInstanceLock()) {
 			// 客户区；PuddingTeams 的所有入口都在页面内，彻底移除避免多一行。
 			Menu.setApplicationMenu(null);
 		}
+		// Windows/Linux 冷启动深链：首实例启动参数里直接带着链接。
+		const coldDeepLink = process.argv.find((arg) => arg.startsWith("puddingteams://"));
+		if (coldDeepLink) pendingDeepLink = coldDeepLink;
 		return bootstrap();
 	});
 }

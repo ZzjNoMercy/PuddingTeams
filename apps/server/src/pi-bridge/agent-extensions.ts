@@ -19,6 +19,7 @@ import type { LargeWorkerResultStore } from "../store/large-worker-result.js";
 import type { ProductSettingsStore } from "../store/product-settings.js";
 import { ENVIRONMENT_OBSERVATION_REF, bindEnvironmentObservations, buildVerificationPrompt, parseVerificationOutput, type VerificationReviewInput } from "../agent-runtime/verification-review.js";
 import { managerHumanWait, MANAGER_HUMAN_WAIT_INSTRUCTION } from "./manager-human-wait.js";
+import { SESSION_READ_MANAGER_HINT, extractSessionRefs } from "./session-read.js";
 import { settleWorkItemReview } from "../agent-runtime/work-item-settlement.js";
 
 /**
@@ -569,7 +570,8 @@ export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowCon
 		return (
 			"当前没有可委派 Worker；Manager 可以使用自己已启用的原生工具完成工作。如需委派，请用户在智能体管理中启用 Worker" +
 			(ctx && ctx.type !== "solo" ? "，并确认它是本窗口成员。" : "。") +
-			"不要承诺派活，不要自行扩大范围。"
+			"不要承诺派活，不要自行扩大范围。\n" +
+			SESSION_READ_MANAGER_HINT
 		);
 	}
 	const lines = plan.agents.map((a) => {
@@ -600,6 +602,7 @@ export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowCon
 		"最少用户介入：先沿用用户已授权的范围与现有偏好，平台可验证的事实自行检查，常规可逆实现选择自行决定。普通查阅按 best_effort 自动执行；用户明确要求不得写入时设 readOnlyRequirement=enforced。workspace_policy_blocked 是可恢复的能力缺口，先按任务职责改派合适 Worker、保持原约束，不要索要无效只读准入确认。只有缺少必要授权、用户独有信息或影响交付的真实业务取舍且无法按现有偏好解决时才询问；同一问题集中询问一次，不因重试/改派再次索要已有授权。实际发布和破坏性操作仍遵守原门禁。",
 		MANAGER_HUMAN_WAIT_INSTRUCTION,
 		"Manager 可直接使用原生工具完成工作。先开始自己的 WorkItem，再执行并提交真实 NativeExecution 证据；不需要为了写操作伪造委派。群聊只限制可委派 Worker 的范围，不要求多方共享上下文。",
+		SESSION_READ_MANAGER_HINT,
 		...(soloCtx ? [`只有用户明确要求创建群聊时才用 ${CORE_TOOL_CREATE_GROUP}；只有用户明确要求建群后立即执行，才填写 task。普通多 Worker 工作可在当前对话执行。`] : []),
 		...(ctx?.type === "group" ? [`只有用户明确要求扩大范围时才用 ${CORE_TOOL_INVITE}；范围不足时先自行执行或向用户说明，不能自动加人。`] : []),
 	].join("\n");
@@ -1320,7 +1323,7 @@ const DelegateParams = Type.Object(
 	{
 		workerId: Type.String({ description: "当前 roster 中目标 Worker 的内部 id；必须在可委派范围内。" }),
 		task: Type.String({ description: "此次独立任务与明确提供的材料。不会继承该 Worker 上次上下文。" }),
-		contextRefs: Type.Optional(Type.Array(Type.String(), { description: "本次明确提供的材料路径或结果引用；不隐式导入父委派上下文。" })),
+		contextRefs: Type.Optional(Type.Array(Type.String(), { description: "本次明确提供的材料路径、结果引用或会话深链（/chats?room=…&session=… 或 puddingteams://rooms/…/sessions/…）；会话链接即授予 Worker 对该会话的只读回读权限。不隐式导入父委派上下文。" })),
 		workItemId: Type.Optional(Type.String({ description: "当前 Goal WorkPlan 中要推进的 WorkItem id。" })),
 		parentDelegationId: Type.Optional(
 			Type.String({ description: "仅记录当前会话既有委派的因果引用；不会续接或自动导入其结果、附件或历史。" }),
@@ -1405,8 +1408,13 @@ function agentDelegationFactory(agents: AgentConfig[], deps: ManagerExtensionDep
 				let mirroredProcess = false;
 				let projectedRunning = false;
 				const scoped = new ScopedAgentInvoker(agent.name, deps.invoker);
+				// 深链路由材料（2026-10-16 方案 §4）：contextRefs 里出现会话链接时，
+				// 明说它可以用 session_read 回读——引用即授权的授权侧是任务文本本身。
+				const sessionRefNote = (params.contextRefs ?? []).some((ref) => extractSessionRefs(ref).length > 0)
+					? "\n（其中的会话链接可用 session_read 工具按需只读回读；只有这些被引用的会话可读。）"
+					: "";
 				const result = await scoped.delegate({
-					message: params.contextRefs?.length ? `${params.task}\n\n显式材料引用：\n${params.contextRefs.join("\n")}` : params.task,
+					message: params.contextRefs?.length ? `${params.task}\n\n显式材料引用：\n${params.contextRefs.join("\n")}${sessionRefNote}` : params.task,
 					windowId: targetWindow?.id ?? "",
 					managerSessionId: sessionId,
 					managerToolCallId: taskId,

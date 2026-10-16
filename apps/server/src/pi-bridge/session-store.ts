@@ -3,6 +3,7 @@ import type { ConversationSnapshot } from "../store/conversation-snapshots.js";
 import { randomUUID } from "node:crypto";
 import { piSessionOwner, piSessionResourceLoader } from "./pi-session-factory.js";
 import { sessionActivity, type ActivityState, type SessionActivity } from "./session-activity.js";
+import { SessionReadService, SESSION_READ_WORKER_HINT } from "./session-read.js";
 import { projectDelegationResult, delegationStatus } from "../agent-runtime/delegation-result-projection.js";
 import type { NativeToolExecution } from "./native-tool-execution.js";
 import {
@@ -383,6 +384,11 @@ export class PiSessionStore {	private active = new Map<string, AgentSession>();
 	setWebResearchExtension(factory: (agentId: string, opts?: { exposure?: "direct" | "deferred" }) => InlineExtension): void { this.webResearchExtension = factory; }
 	private calendarExtension?: (sessionId: () => string, opts?: { exposure?: "direct" | "deferred" }) => InlineExtension;
 	setCalendarExtension(factory: (sessionId: () => string, opts?: { exposure?: "direct" | "deferred" }) => InlineExtension): void { this.calendarExtension = factory; }
+	private sessionReadLazy?: SessionReadService;
+	private sessionReadService(): SessionReadService {
+		if (!this.sessionReadLazy) this.sessionReadLazy = new SessionReadService(this.teamsStore!, this.sessionDir, (msg) => this.debugLog?.(msg));
+		return this.sessionReadLazy;
+	}
 
 	/**
 	 * System-prompt shaping for a window's manager sessions（提示词管理方案 §5）：
@@ -450,11 +456,20 @@ export class PiSessionStore {	private active = new Map<string, AgentSession>();
  }
  async wireMessages(id: string) {
   const session = await this.open(id);
+  const branch = session.sessionManager.getBranch();
+  const boundary = branch.findIndex(entry => entry.type === "custom" && entry.customType === "pudding:snapshot_import");
+  const inheritedEntries = new Set(boundary < 0 ? [] : branch.slice(0, boundary).map(entry => entry.id));
+  const inheritedMessages = new Set<string>();
   for (const projected of session.sessionManager.buildSessionProjection().entries) for (const message of projected.messages) {
    const value = message as typeof message & { puddingMessageId?: string };
    if (["user","assistant","system","toolResult"].includes(message.role)) value.puddingMessageId ??= `entry:${id}:${projected.sourceEntry.id}`;
+   if (inheritedEntries.has(projected.sourceEntry.id) && value.puddingMessageId) inheritedMessages.add(value.puddingMessageId);
   }
-  return session.messages;
+  // Presentation provenance belongs to the HTTP projection, never the SDK transcript.
+  return session.messages.map(message => {
+   const messageId = (message as typeof message & { puddingMessageId?: string }).puddingMessageId;
+   return messageId && inheritedMessages.has(messageId) ? { ...message, puddingHistorical: true } : message;
+  });
  }
  async messageAdmission(id: string, key: string, hash: string, contextHash: string): Promise<string | undefined> {
   const file=(await SessionManager.listAll(this.sessionDir)).find(item=>item.id===id)?.path;
@@ -482,8 +497,10 @@ export class PiSessionStore {	private active = new Map<string, AgentSession>();
  async snapshotImportBudget(workerId: string) {
   const owner=piSessionOwner(await this.teamsStore?.getAgent(workerId));
   const model=owner.settings.model ? await this.resolveModel(owner.settings.model) : undefined;
-  // Conservative UTF-8 bound, reserving half the context for target instructions and continued work.
-  return Math.min(2_000_000, model ? Math.floor(model.contextWindow / 2) : 64_000);
+  // contextWindow is tokens, the snapshot is measured in UTF-8 bytes; mixed
+  // JSON/CJK transcripts run ≈4 bytes per token. Half the context stays
+  // reserved for target instructions and continued work.
+  return Math.min(2_000_000, model ? Math.floor(model.contextWindow / 2) * 4 : 64_000);
  }
  private async snapshotTargetSelection(workerId:string,cwd:string) {
   const owner=piSessionOwner(await this.teamsStore?.getAgent(workerId));
@@ -500,7 +517,7 @@ export class PiSessionStore {	private active = new Map<string, AgentSession>();
   const owner=piSessionOwner(await this.teamsStore?.getAgent(workerId));
   if(!owner.nativePi||owner.role!=="worker")throw new Error("snapshot_import_unsupported");
   const selection=await this.snapshotTargetSelection(workerId,snapshot.cwdSnapshot);
-  if(Buffer.byteLength(JSON.stringify(snapshot.entries), "utf8")>Math.min(await this.snapshotImportBudget(workerId),Math.floor(selection.model.contextWindow/2)))throw new Error("snapshot_too_large");
+  if(Buffer.byteLength(JSON.stringify(snapshot.entries), "utf8")>Math.min(await this.snapshotImportBudget(workerId),Math.floor(selection.model.contextWindow/2)*4))throw new Error("snapshot_too_large");
   const temp=path.join(this.sessionDir,`.fork-import-${id}`);
   await rm(temp,{recursive:true,force:true});await mkdir(temp,{recursive:true});
   try{
@@ -573,7 +590,12 @@ export class PiSessionStore {	private active = new Map<string, AgentSession>();
 				log: (msg) => this.debugLog?.(msg),
 			});
 		}
-		const guidance = owner.role === "manager" ? PiSessionStore.resolveGuidance(ctx) : owner.restricted ? "你是知识 Worker。使用本会话授权知识工具检索；整理先用 knowledge_prepare_candidate 冻结来源与基线，再用 knowledge_submit_candidate 提交完整候选，无修改时提交 pages=[]。提交后等待用户审核，只有平台 Publisher 回执才表示发布；不直接写工作区或绕过审核。" : owner.agent?.description;
+		let guidance = owner.role === "manager" ? PiSessionStore.resolveGuidance(ctx) : owner.restricted ? "你是知识 Worker。使用本会话授权知识工具检索；整理先用 knowledge_prepare_candidate 冻结来源与基线，再用 knowledge_submit_candidate 提交完整候选，无修改时提交 pages=[]。提交后等待用户审核，只有平台 Publisher 回执才表示发布；不直接写工作区或绕过审核。" : owner.agent?.description;
+		// 会话深链（2026-10-16 方案）：manager 与 native pi worker 的单聊都装
+		// session_read；Worker 的引用即授权规则随 guidance 进提示词。
+		const sessionRead = !owner.restricted && owner.nativePi && owner.agent?.enabled !== false && this.teamsStore;
+		if (sessionRead) factories.push(this.sessionReadService().chatExtension(getSessionId, owner.role));
+		if (sessionRead && owner.role === "worker") guidance = [guidance, SESSION_READ_WORKER_HINT].filter(Boolean).join("\n");
 		if (owner.agent?.enabled !== false && owner.nativePi && this.webResearchExtension && (owner.role === "worker" || !ctx || ctx.type === "solo")) factories.push(this.webResearchExtension(owner.agent?.name ?? "manager", owner.role === "manager" ? { exposure: "deferred" } : undefined));
 		if (owner.role === "manager" && this.calendarExtension && (!ctx || ctx.type !== "direct")) factories.push(this.calendarExtension(getSessionId, { exposure: "deferred" }));
 		// 信任门（§7.2/§6.3）：服务端按窗口 workspaceId 计算三类放行，

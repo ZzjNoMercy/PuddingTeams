@@ -5,7 +5,7 @@ import { KnowledgeJobCard } from "./knowledge-job-card";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { createContext, type ComponentProps, type ReactNode, useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { CheckIcon, ChevronDownIcon, ChevronRightIcon, CircleAlertIcon, CopyIcon, ExternalLinkIcon, FilePenIcon, FileSearchIcon, FileTextIcon, FolderIcon, ListTreeIcon, PauseIcon, PlayIcon, RotateCcwIcon, SquareIcon, SquareTerminalIcon, UserPlusIcon, UsersIcon, WrenchIcon } from "lucide-react";
+import { CheckIcon, ChevronDownIcon, ChevronRightIcon, CircleAlertIcon, CopyIcon, ExternalLinkIcon, FilePenIcon, FileSearchIcon, FileTextIcon, FolderIcon, HistoryIcon, ListTreeIcon, PauseIcon, PlayIcon, RotateCcwIcon, SquareIcon, SquareTerminalIcon, UserPlusIcon, UsersIcon, WrenchIcon } from "lucide-react";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
 	Message as AiMessage,
@@ -1235,13 +1235,13 @@ function MessageBody({
 		<>
 			{showBubble && (
 				<div className="home-assistant-message">
-					{assistantAs ? (
+					{message.puddingHistorical ? <HistoryIcon className="home-manager-avatar size-[34px] shrink-0 p-2 text-muted-foreground" aria-label="来源历史" /> : assistantAs ? (
 						<WorkerAvatar name={assistantAs} size={34} className="home-manager-avatar" />
 					) : (
 						<ManagerAvatar size={34} className="home-manager-avatar" />
 					)}
 					<div className="home-assistant-body">
-						<div className="home-message-meta"><strong>{assistantAs ? assistantLabel : "Manager"}</strong><span>{time}</span></div>
+						<div className="home-message-meta"><strong>{message.puddingHistorical ? "来源历史" : assistantAs ? assistantLabel : "Manager"}</strong><span>{time}</span></div>
 						{showThinking && (
 							<AssistantReasoning streaming={message.streaming} thinking={message.thinking} startedAt={message.timestamp} />
 						)}
@@ -1472,14 +1472,14 @@ function AssistantGroupBody({
 				});
 				return (
 					<div key={node.merged[0]!.id} className="home-assistant-message">
-						{assistantAs ? (
+						{messages[0]?.puddingHistorical ? <HistoryIcon className="home-manager-avatar size-[34px] shrink-0 p-2 text-muted-foreground" aria-label="来源历史" /> : assistantAs ? (
 							<WorkerAvatar name={assistantAs} size={34} className="home-manager-avatar" />
 						) : (
 							<ManagerAvatar size={34} className="home-manager-avatar" />
 						)}
 						<div className="home-assistant-body">
 							<div className="home-message-meta">
-								<strong>{assistantAs ? assistantLabel : "Manager"}</strong>
+								<strong>{messages[0]?.puddingHistorical ? "来源历史" : assistantAs ? assistantLabel : "Manager"}</strong>
 								<span>{lastTime}</span>
 							</div>
 							<div className="flex w-full flex-col gap-3">

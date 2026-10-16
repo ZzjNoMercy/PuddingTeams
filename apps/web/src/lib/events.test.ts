@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyRecoveredToolResults, friendlyModelError, groupConsecutiveModelErrors, markRunningToolCalls, recoveredReplyIndex, reducePiEvent, renderHistory, replayPiEvents } from "./events";
+import { applyRecoveredToolResults, friendlyModelError, groupForRender, groupConsecutiveModelErrors, markRunningToolCalls, recoveredReplyIndex, reducePiEvent, renderHistory, replayPiEvents } from "./events";
 import type { PiMessage } from "./types";
 
 test("知识上下文变化指向会话菜单的新建入口，不误报模型故障或建议切模型重试", () => {
@@ -370,4 +370,20 @@ test("P2 阶段工具结果与终态事件在历史/实时均归并一张 delega
   assert.equal(calls[0]!.result, "独立终态内容"); assert.equal((calls[0]!.details as { status: string }).status, "completed");
   assert.equal((calls[0]!.details as { rootDelegationId: string }).rootDelegationId, "root");
  }
+});
+
+
+test("fork history keeps provenance and cannot merge with current Worker replies", () => {
+ const messages = renderHistory([
+  {role:"user",content:"original Manager question",puddingHistorical:true,timestamp:1},
+  {role:"assistant",content:[{type:"text",text:"original reply"}],puddingHistorical:true,timestamp:2},
+  {role:"assistant",content:[{type:"text",text:"current Worker reply"}],timestamp:3},
+ ] as PiMessage[]);
+ assert.equal(messages[0]?.puddingHistorical,true);
+ assert.equal(messages[1]?.puddingHistorical,true);
+ assert.equal(messages[2]?.puddingHistorical,undefined);
+ const groups=groupForRender(messages);
+ assert.equal(groups.length,3,"inherited and current assistant replies need separate identity groups");
+ assert.equal("kind" in groups[1]! && groups[1].messages.length,1);
+ assert.equal("kind" in groups[2]! && groups[2].messages.length,1);
 });
