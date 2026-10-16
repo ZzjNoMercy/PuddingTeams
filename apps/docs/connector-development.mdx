@@ -201,3 +201,8 @@ capabilities 可以诚实声明 `transport: "http"`，但不要假设平台会�
 - 文档明确上游 CLI、账号、登录和数据保留依赖。
 
 当前社区安装、签名和官方发布渠道尚未产品化；发布包仍需自行分发和审查。
+
+
+## 原生会话与单次委派
+
+snapshotImport 是原生会话提供方对完整格式导入的真实能力。当前仅 native Pi provider 实现；委派 Driver 不因拥有 continue 就获得此能力。未支持的 Connector 不开放 Fork 或 SDK followUp/steer，不能截断历史或用隐式摘要冒充完整导入。双宿主包的 pi 门面只依赖 ExtensionAPI，Driver 适配只依赖 Driver SPI。

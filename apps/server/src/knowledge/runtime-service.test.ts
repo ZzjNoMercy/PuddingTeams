@@ -35,19 +35,20 @@ async function call(surface: KnowledgeMountSurface, name: string, args: unknown)
 	return JSON.parse((result.content[0] as { text: string }).text);
 }
 
-test("Manager仅取得授权库路由元数据，知识检索与整理均委派，撤权仍阻断", async () => {
+test("Manager取得完整知识工具面（自查+候选管线），不泄正文，撤权仍阻断", async () => {
 	const f = await fixture();
 	try {
 		f.runtime.forSession = async () => f.runtime.mount(f.scope);
+		f.runtime.scopeForSession = async () => f.scope;
 		const worker = await f.runtime.forSession("test");
 		const manager = await f.runtime.forManagerSession("test");
-		assert.deepEqual(manager.tools, []);
-		assert.notEqual(manager.fingerprint, worker.fingerprint, "工具职责收敛不能复用旧Manager上下文");
+		assert.ok(manager.tools.some(tool => tool.name === "knowledge_read"));
+		assert.ok(manager.tools.some(tool => tool.name === "knowledge_search"));
+		assert.notEqual(manager.fingerprint, worker.fingerprint, "Manager 工具面有独立指纹版本");
 		assert.ok(manager.prompt.includes(f.binding.id)); assert.ok(manager.prompt.includes("My Wiki"));
-		assert.ok(manager.prompt.includes("delegation"));
-		assert(!manager.prompt.includes("knowledge_read")); assert(!manager.prompt.includes(f.vault));
+		assert.ok(manager.prompt.includes("tool_search"), "Manager 提示词引导渐进加载");
+		assert(!manager.prompt.includes(f.vault));
 		assert(!manager.prompt.includes("事实日期2026-12-01"));
-		assert.ok(worker.tools.some(tool => tool.name === "knowledge_read"));
 		await f.selections.set("owner", f.scope.contextKey, 1, []);
 		await assert.rejects(manager.assertCurrent(), /失效/);
 	} finally { await rm(f.root, { recursive: true, force: true }); }
@@ -147,7 +148,7 @@ test("控制文件用于导航而非事实来源，空读和超预算读不授�
 });
 
 
-test("Manager实际注册只读整理状态工具，不授予检索或提交能力", async () => {
+test("Manager注册完整知识工具：状态通道 direct，检索与整理 deferred 渐进加载，撤权即失效", async () => {
  const f = await fixture();
  try {
   f.runtime.forSession = async () => f.runtime.mount(f.scope);
@@ -161,11 +162,16 @@ test("Manager实际注册只读整理状态工具，不授予检索或提交能�
   const extension = f.runtime.managerExtension(() => "test"); assert.equal(typeof extension, "function");
   if (typeof extension !== "function") throw new Error("expected factory");
   await extension({ on() {}, registerTool(tool: KnowledgeMountSurface["tools"][number]) { tools.push(tool); }, appendEntry() {} } as never);
-  assert.deepEqual(tools.map(tool => tool.name), ["knowledge_curation_status"]);
+  assert.deepEqual(tools.map(tool => tool.name), ["knowledge_context", "knowledge_search", "knowledge_glob", "knowledge_read", "knowledge_links", "knowledge_curation_status"]);
+  const exposure = (name: string) => (tools.find(tool => tool.name === name) as unknown as { exposure?: string })?.exposure;
+  assert.equal(exposure("knowledge_curation_status"), undefined, "状态通道 direct 默认激活");
+  assert.equal(exposure("knowledge_read"), "deferred", "检索/阅读由 tool_search 渐进加载");
+  assert.equal(exposure("knowledge_search"), "deferred");
   const manager = await f.runtime.forManagerSession("test");
-  assert.deepEqual(manager.tools.map(tool => tool.name), ["knowledge_curation_status"]);
+  assert.ok(manager.tools.some(tool => tool.name === "knowledge_read"));
   const ctx = { sessionManager: { getEntries: () => [] } } as never;
-  const result = await tools[0]!.execute("read", { jobId: "one" }, undefined, undefined, ctx);
+  const statusTool = tools.find(tool => tool.name === "knowledge_curation_status")!;
+  const result = await statusTool.execute("read", { jobId: "one" }, undefined, undefined, ctx);
   assert.equal(JSON.parse((result.content[0] as { text: string }).text).status, "running"); assert.equal(reads, 1);
   const output = JSON.parse((result.content[0] as { text: string }).text);
   assert.equal(output.diagnostics.modelId.length, 200); assert.equal(output.diagnostics.modelTurns, 0);
@@ -173,7 +179,7 @@ test("Manager实际注册只读整理状态工具，不授予检索或提交能�
   assert.deepEqual(output.diagnostics.validationErrors, ["invalid:created"]);
   assert(JSON.stringify(output).length < 4000);
   await f.selections.set("owner", f.scope.contextKey, 1, []);
-  await assert.rejects(tools[0]!.execute("read", { jobId: "one" }, undefined, undefined, ctx), /变化|失效/);
+  await assert.rejects(statusTool.execute("read", { jobId: "one" }, undefined, undefined, ctx), /变化|失效/);
  } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 

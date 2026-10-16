@@ -47,9 +47,9 @@ export async function preloadChatHistory(sessionId: string): Promise<void> {
 	rememberHistory(sessionId, snapshot.messages);
 }
 
-export function useChat(sessionId: string, options?: { allowSendWhileRunning?: boolean }) {
+export function useChat(sessionId: string) {
 	const [inputCapability, setInputCapability] = useState<NativeInputCapability>();
- const allowSendWhileRunning = options?.allowSendWhileRunning === true || Boolean(inputCapability?.busyInput.modes.length);
+ const allowSendWhileRunning = Boolean(inputCapability?.busyInput.modes.length);
 	// Session 切换会 remount；命中预热/最近访问快照时直接首帧展示，随后仍从
 	// 服务端重对齐，缓存只消除视觉空档，不替代事实源。
 	const cachedHistory = historyCache.get(sessionId);

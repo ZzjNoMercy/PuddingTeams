@@ -133,3 +133,8 @@ Goal 的 execution 带递增 epoch。Server 重启、Manager 中断或外部副�
 3. 要求关键 Submission 引用 Delegation 或 Artifact，不只写口头摘要。
 4. 修改 Goal 契约后，先让 WorkPlan 对账新条件，再继续执行。
 5. 在 Inspector 看 Goal、WorkPlan 和证据；聊天主区域继续用来沟通，不把状态面板当第二套聊天。
+
+
+## 原生会话与单次委派
+
+Manager 可以直接开始自己的写 WorkItem，原生工具经过 scope/lease 并封存 NativeExecution 与 ChangeSet；Submission 引用 nativeExecutionIds，按冻结策略验收。只有说明文字时不能伪造执行证据。Goal 属于 Manager 会话，不是 Workspace 身份，Fork 不继承其活动控制权。

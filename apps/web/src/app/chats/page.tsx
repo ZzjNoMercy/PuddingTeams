@@ -12,10 +12,12 @@ import { NavRail } from "@/components/chat/nav-rail";
 import { QueryRouteObserver } from "@/components/chat/query-route-observer";
 import { DesktopTitlebar, toggleAppSidebar, useAppSidebarHidden } from "@/components/desktop-titlebar";
 import { SectionTopbar } from "@/components/section-topbar";
-import { deleteRoom, listRooms } from "@/lib/api";
+import { deleteRoom, getManagerSessionLocation, getRoom, listRooms, setActiveRoomSession, switchRoomWorkspace } from "@/lib/api";
 import { invalidChatSessionReplacement, selectChatRoomFromRoute } from "@/lib/chat-route-selection";
 import { preferCurrentRoomSummary, reconcileRoomList, sortRoomsByActivity } from "@/lib/room-order";
-import type { RoomSummary } from "@/lib/types";
+import { LatestSerialQueue } from "@/lib/latest-serial-queue";
+import type { NewChatTarget } from "@/lib/chat-navigation";
+import type { ChatNavigationItem, RoomSummary } from "@/lib/types";
 
 const ACTIVE_ROOM_STORAGE_KEY = "puddingteams:active-room";
 
@@ -77,6 +79,9 @@ export default function Home() {
 	const routeQuery = useRef(currentQuery());
 	const [selectionNonce, setSelectionNonce] = useState(0);
 	const [createOpen, setCreateOpen] = useState(false);
+	const [createTarget, setCreateTarget] = useState<NewChatTarget>({});
+	const selectionQueue = useRef(new LatestSerialQueue());
+	const pendingNavigation = useRef<string | null>(null);
 	const [loadError, setLoadError] = useState<string | null>(null);
 	const [hasLoadedRooms, setHasLoadedRooms] = useState(false);
 	const [roomListRetry, setRoomListRetry] = useState(0);
@@ -86,6 +91,7 @@ export default function Home() {
 	useEffect(() => { roomsRef.current = rooms; }, [rooms]);
 	useEffect(() => { selectedIdRef.current = selectedId; }, [selectedId]);
 	const selectRoom = useCallback((id: string | null) => {
+		selectionQueue.current.invalidate();
 		selectedIdRef.current = id;
 		setSelectedId(id);
 		setRequestedSessionId(null);
@@ -94,25 +100,65 @@ export default function Home() {
 		routeQuery.current = href.split("?")[1] ?? "";
 		router.push(href);
 	}, [router, returnSessionId]);
-	const selectActivityRoom = useCallback((room: RoomSummary) => {
-		const sessionId = room.activitySessionId && room.sessions.some((session) => session.id === room.activitySessionId)
-			? room.activitySessionId : null;
-		selectedIdRef.current = room.id;
-		setSelectedId(room.id);
-		setRequestedSessionId(sessionId);
-		setSelectionNonce((value) => value + 1);
-		persistActiveRoomId(room.id);
-		const href = chatHref(room.id, sessionId, returnSessionId);
-		routeQuery.current = href.split("?")[1] ?? "";
-		router.push(href);
+	const selectSession = useCallback((item: Pick<ChatNavigationItem, "roomType" | "roomId" | "sessionId">, options?: { returnId: string | null; replace: boolean }) => {
+		const navigationKey = `${item.roomId}:${item.sessionId}`;
+		pendingNavigation.current = navigationKey;
+		selectionQueue.current.invalidate();
+		void selectionQueue.current.enqueue(async (isCurrent) => {
+			try {
+				if (item.roomType === "solo") {
+					const location = await getManagerSessionLocation(item.roomId, item.sessionId);
+					if (!isCurrent()) return;
+					if (!location.active) await switchRoomWorkspace(item.roomId, location.workspaceId, "in_place");
+				}
+				if (!isCurrent()) return;
+				let room = await getRoom(item.roomId);
+				if (!isCurrent()) return;
+				if (!room.sessions.some(session => session.id === item.sessionId)) throw new Error("聊天所在项目已变化，请刷新列表后重试");
+				if (room.activeSession !== item.sessionId) {
+					await setActiveRoomSession(room.id, item.sessionId);
+					room = await getRoom(room.id);
+				}
+				if (!isCurrent()) return;
+				roomListRequest.current++;
+				setRooms(previous => sortRoomsByActivity(previous.map(current => current.id === room.id ? room : current)));
+				selectedIdRef.current = room.id;
+				setSelectedId(room.id);
+				setRequestedSessionId(item.sessionId);
+				setSelectionNonce(value => value + 1);
+				persistActiveRoomId(room.id);
+				const href = chatHref(room.id, item.sessionId, options ? options.returnId : returnSessionId);
+				routeQuery.current = href.split("?")[1] ?? "";
+				if (options?.replace) router.replace(href); else router.push(href);
+			} catch (error) {
+				if (!isCurrent()) return;
+				toast.error(error instanceof Error ? error.message : String(error));
+				if (options?.replace && (error as { status?: number }).status === 404) {
+					selectedIdRef.current = item.roomId;
+					setSelectedId(item.roomId);
+					setRequestedSessionId(null);
+					const href = chatHref(item.roomId, null, options.returnId);
+					routeQuery.current = href.split("?")[1] ?? "";
+					router.replace(href);
+				}
+			} finally { if (pendingNavigation.current === navigationKey) pendingNavigation.current = null; }
+		});
 	}, [router, returnSessionId]);
+	useEffect(() => () => selectionQueue.current.invalidate(), []);
 
 	const onRouteChange = useCallback((query: string) => {
 		if (routeQuery.current === query) return;
+		selectionQueue.current.invalidate();
 		routeQuery.current = query;
 		const params = new URLSearchParams(query);
 		const roomId = params.get("room");
 		const returnId = params.get("returnSession");
+		const sessionId = params.get("session");
+		if (roomId && sessionId && roomsRef.current.some(room => room.id === roomId && room.type === "solo")) {
+			setReturnSessionId(returnId);
+			selectSession({ roomId, sessionId, roomType: "solo" }, { returnId, replace: true });
+			return;
+		}
 		if (roomsRef.current.length) {
 			const { roomId: fallback, staleLink } = selectChatRoomFromRoute(roomsRef.current, selectedIdRef.current, roomId, storedActiveRoomId(), false);
 			if (staleLink || (!roomId && params.has("session"))) {
@@ -143,7 +189,7 @@ export default function Home() {
 		setReturnSessionId(returnId);
 		setSelectionNonce((value) => value + 1);
 		if (roomId) persistActiveRoomId(roomId);
-	}, [router]);
+	}, [router, selectSession]);
 	const onInvalidRequestedSession = useCallback((roomId: string, sessionId: string) => {
 		if (selectedIdRef.current !== roomId || routeQuery.current !== currentQuery()) return;
 		const href = invalidChatSessionReplacement(currentQuery(), roomId, sessionId);
@@ -172,6 +218,12 @@ export default function Home() {
 					const linked = linkedRoomId();
 					const navigationPending = currentQuery() !== routeQuery.current;
 					const { roomId: next, staleLink } = selectChatRoomFromRoute(rooms, previous, linked, stored, navigationPending);
+					const linkedSession = linkedSessionId();
+					const target = rooms.find(room => room.id === next);
+					if (!navigationPending && !staleLink && linkedSession && target?.type === "solo" && !target.sessions.some(session => session.id === linkedSession)) {
+						if (pendingNavigation.current !== `${target.id}:${linkedSession}`) selectSession({ roomId: target.id, sessionId: linkedSession, roomType: "solo" }, { returnId: linkedReturnSessionId(), replace: true });
+						return;
+					}
 					persistActiveRoomId(next);
 					selectedIdRef.current = next;
 					setSelectedId(next);
@@ -195,7 +247,7 @@ export default function Home() {
 			cancelled = true;
 			clearInterval(timer);
 		};
-	}, [router, roomListRetry]);
+	}, [router, roomListRetry, selectSession]);
 
 	const upsertRoom = useCallback((room: RoomSummary) => {
 		roomListRequest.current += 1;
@@ -209,7 +261,11 @@ export default function Home() {
 		selectRoom(room.id);
 	}, [selectRoom]);
 
-	const handleNew = useCallback(() => setCreateOpen(true), []);
+	const handleNew = useCallback((target?: NewChatTarget) => {
+		const selected = roomsRef.current.find(room => room.id === selectedIdRef.current);
+		setCreateTarget({ agentId: selected?.type === "solo" ? "manager" : selected?.type === "direct" ? selected.members[0]?.name : undefined, workspaceId: selected?.workspace?.id ?? null, ...target });
+		setCreateOpen(true);
+	}, []);
 
 	// Open a window from inside the chat (e.g. solo DelegateCard "已同步到单聊"
 	// link). The window may be brand-new (auto-created by solo routing), so the
@@ -280,7 +336,7 @@ export default function Home() {
 			<Suspense fallback={null}><QueryRouteObserver onChange={onRouteChange} /></Suspense>
 			<DesktopTitlebar />
 			<div className="desktop-app-body">
-				{roomsOpen && !sidebarHidden ? <button type="button" className="home-rooms-backdrop fixed inset-0 z-30 bg-black/30 md:hidden" aria-label="关闭对话列表" onClick={() => setRoomsOpen(false)} /> : null}
+				{roomsOpen && !sidebarHidden ? <button type="button" className="chat-navigation-backdrop home-rooms-backdrop fixed inset-0 z-30 bg-black/30 md:hidden" aria-label="关闭对话列表" onClick={() => setRoomsOpen(false)} /> : null}
 				<div className="desktop-sidebar-stack desktop-sidebar-nav-only" data-app-sidebar-shell>
 					<NavRail view="chat" />
 				</div>
@@ -290,7 +346,9 @@ export default function Home() {
 						<SessionList
 							rooms={rooms}
 							selectedId={selectedId}
-							onSelect={selectActivityRoom}
+							selectedSessionId={requestedSessionId ?? rooms.find(room => room.id === selectedId)?.activeSession ?? null}
+							onSelectSession={selectSession}
+							onRoomUpdated={handleRoomUpdated}
 							onNew={handleNew}
 							onDelete={handleDelete}
 							loadError={loadError}
@@ -311,8 +369,8 @@ export default function Home() {
 									onRoomUpdated={handleRoomUpdated}
 									onSessionActivated={(updated) => {
 										handleRoomUpdated(updated);
-										// 查看目标 = activeWorkerView（worker 执行 session）?? 容器 activeSession。
-										const viewed = updated.activeWorkerView ?? updated.activeSession;
+										// 路由只指向普通会话。
+										const viewed = updated.activeSession;
 										setRequestedSessionId(viewed);
 										const href = chatHref(updated.id, viewed, returnSessionId);
 										routeQuery.current = href.split("?")[1] ?? "";
@@ -342,7 +400,9 @@ export default function Home() {
 				open={createOpen}
 				onOpenChange={setCreateOpen}
 				onCreated={upsertRoom}
-				initialWorkspaceId={rooms.find((room) => room.id === selectedId)?.workspace?.id}
+				initialWorkspaceId={createTarget.workspaceId}
+				initialAgentId={createTarget.agentId}
+				newSessionOnExisting
 			/>
 		</div>
 	);

@@ -1,110 +1,60 @@
 ---
 title: Session 与连续性
-description: Window、Manager Session、Worker Session 和 Delegation handle 怎样共同维持上下文。
+description: 原生会话、单次委派、运行中输入与不可变快照 Fork 的边界。
 ---
 
 <Status>1.0 STABLE</Status>
 
-Session 的第一职责不是“保存聊天记录”，而是让下一次动作知道应该继续什么。PuddingTeams 为此把用户可见会话、Worker 私有会话和单次委托分开建模。
+Window 保存成员、项目目录和多段普通会话。每段 Session 有持久的负责人；Manager 与 Pi Worker 都使用 Pi SDK 原生消息历史。Workspace 是项目资源，Goal 是某段 Manager 会话的执行契约。
 
-## 三个时间尺度
+## 委派是单次工具调用
 
-| 对象 | 生命周期 | 保存什么 |
-| --- | --- | --- |
-| Window | 长期 | 成员、Workspace、多个 Session，以及各 Session 的 Worker binding |
-| Session | 一段连贯对话 | 消息、可选 Goal、相关委托引用 |
-| Delegation | 一次 Worker Run | 输入、状态、handle、归一化结果与执行时间线 |
-
-Worker Session 不等于 Delegation。第一次 `run` 可以返回 `sessionHandle`；下一次 `continue` 在同一个 Worker Session 中创建新的 Delegation。这样每次执行都可审计，又不会丢失上游 Agent 的多轮上下文。
-
-## Delegate 如何续接
-
-Manager 通过目标 Worker 的 `agent_<worker>__delegate` 工具发起每一轮。普通追问的标准输入如下：
+Manager 使用统一工具：
 
 ```json
 {
-  "task": "继续核对第三条新闻，并给出原始来源",
-  "parentDelegationId": "上一轮的 delegationId",
-  "handoffKind": "followup",
-  "session": "continue"
+  "workerId": "researcher",
+  "task": "核对第三条新闻，必要材料见项目中的 sources.md",
+  "parentDelegationId": "前一调用的 delegationId",
+  "handoffKind": "followup"
 }
 ```
 
-这四个字段不是一回事：
+每次调用都是 fresh Context，没有业务续聊参数。`parentDelegationId` 只表达当前 Manager 会话中的因果，不自动复制父结果、附件或上游私有历史；Manager 必须明确传入本轮所需材料。`delegationId` 标识单次执行，结果进入原 Manager 上下文。需要审批时通过同调用的 `respond` 恢复，不新建任务替代原调用。
 
-| 字段 | 作用 |
-| --- | --- |
-| `task` | 真正发送给目标 Worker 的新消息 |
-| `parentDelegationId` | 记录本轮源自当前 Manager Session 中的哪次委托 |
-| `handoffKind` | `followup` 表示追问/返修；带 parent 的 `request` 表示派生出的新下游任务 |
-| `session` | `continue` 使用当前房间 Session 对该 Worker 的 binding；`new` 新开 Worker Session |
+执行过程、Receipt、产物和单次取消位于工具详情；执行 handle 不是可切换、输入、重命名或删除的普通会话。全局搜索将执行记录与原生会话分开，支持按调用 ID、Worker、来源会话、项目 ID 与 Goal ID 查执行记录。
 
-`session` 缺省为 `continue`。PuddingTeams 负责选择并校验 `workerBindings[managerSessionId][agentId].sessionHandle`，再交给 Driver 恢复会话；Worker 不会临场自行选择 handle。某些 CLI Connector 每轮都会 spawn 新进程，但带 resume handle 时仍是同一个逻辑 Worker Session。当前房间 Session 没有有效 binding 时从新 Worker Session 开始。
+## 原生 Worker 单聊
 
-`parentDelegationId` 不会自动注入父结果，也不会决定使用哪个 `sessionHandle`。跨 Worker 接力时，Manager 必须把必要摘要、回读内容或 Workspace/Artifact 路径写进 `task`。parent 只能属于当前 Manager Session；新开房间 Session 后既不能继续旧因果链，也不会继承旧 Worker Session。切回旧房间 Session 时，才恢复它自己的 binding。
+Pi Worker 使用自己的模型、指令、工具、MCP 白名单与知识授权，不获得 Manager 的 delegation 或 Goal 控制。一个 Worker/项目拥有一个 Window，里面可以新建多段独立会话。新建会话不会继承旧对话；切回原会话继续它自己的历史。负责人失效时历史保留只读。
 
-## 谁拥有哪份会话
+非 Pi Connector 的单聊仍由 Driver 管理上游 handle，核对房间、项目、cwd 和配置修订后续接。Driver 的 continue/respond 是连接器协议能力，不表示 Manager 单次委派拥有续聊能力。未支持原生忙碌输入或快照导入的连接器不开放相应操作。
 
-- Manager 和本地 pi Worker 的完整消息历史由 pi Session JSONL 保存。
-- spawn/HTTP 等外部 Worker 的 Session 正文归上游 Agent；PuddingTeams 只保存不透明 `sessionHandle`。
-- Window 的 `workerBindings[managerSessionId][agentId]` 只保存“这个房间 Session 下次续接该 Worker 用哪个 handle”的指针，不复制 Worker 历史。
-- 每次 Delegation 仍保留它当时的 handle 和结果，因此新指针不会改写旧记录。
+## 运行中输入
 
-默认路径：
+聊天输入框的模型菜单显示当前会话的提供方、完整模型 ID 和配置端点；同名模型可能通过不同提供方调用。设置页的“全局后备”仅用于未明确指定模型的新会话，已有会话和 Manager、Worker 的明确模型配置优先。
 
-```text
-<PUDDINGTEAMS_HOME>/sessions/          # Manager Session JSONL
-<PUDDINGTEAMS_HOME>/sessions/workers/  # 本地 pi Worker Session JSONL
-<PUDDINGTEAMS_HOME>/state/windows.json
-<PUDDINGTEAMS_HOME>/state/delegations.json
-```
+Pi 原生会话运行中可直接回车追加，消息以 `followUp` 排队，并立即在转录底部显示为“等待中”气泡。气泡上的“引导”把该消息转为 `steer`（在 SDK 可处理的工具/回合边界插队消费，不强制终止在飞命令）；“删除”把它移出队列。followUp 在自然收尾时消费。真正停止走输入框的停止按钮——运行中发送键即停止键。
 
-## 什么时候可以 Continue
+返回 `disposition=queued`、`persistence=pending` 仅表示 SDK 受理，尚不等于消息写入历史或模型已消费。相同操作键重试不重复入队。无法唯一核对消费身份时保留未知状态，不自动重发。待消费输入阻止 Fork、切模型或重建；停止清理 SDK 队列并保留附件。重启不自动重放丢失的内存队列。等待人工审批时，追加不能代替卡片上的批准或修改 Worker 内部上下文，此时也不能引导插队。含图片附件的排队消息不支持引导或单条删除（SDK 队列重建只携带文本）。
 
-续接不是“只要有 handle 就继续”。PuddingTeams 同时核对：
+## Fork 是不可变快照
 
-- Window 与 Worker 身份；
-- 当前房间 Session 的归属；
-- binding 冻结的实际执行窗口；
-- 显式 `workspaceId`；
-- 委托时冻结的 `cwdSnapshot`；
-- Agent 配置修订；
-- Driver 是否声明 `continue`；
-- 目标 Session 当前是否空闲。
+“Fork 到 Worker”冻结当前已提交分支、历史工具消息和附件，建立新身份的独立聊天；来源只作追溯。目标按自己的模型、指令和权限运行，创建后不自动执行。来源后续发言或删除不改变快照；目标发言也不自动回流。
 
-其中任一运行边界变化，旧 handle 都可能指向错误的项目、权限或工具集合。平台会拒绝不安全的直接续接，并按 Driver 能力与当前动作决定新建或报出明确错误。
+活动 Goal、批准权限、运行控制与来源 Manager 的配置不复制。已完成 Goal/审批展示卡可作为历史阅读。目标必须在当前有效 Worker 范围内并明确支持 snapshotImport；超出完整导入预算时拒绝，不静默摘要。源有活动执行、等待审批或未消费输入时阻止创建。
 
-同一 Worker Session 同时最多一条活动或等待输入的 Run。`waiting_input` 仍占用原 Run；用户回答后必须走 `respond` 恢复它，不能再发一个 `run` 冒充继续。
-
-## 消息记录与权威状态
-
-pi JSONL 中除了 user/assistant/toolResult，还可能出现 PuddingTeams custom message，用于展示派活镜像、结果、Goal 恢复提示等。这些消息让重开 Session 后 UI 能恢复时间线，但不是所有领域状态的权威来源。
+## 权威记录与重启
 
 | 内容 | 权威来源 |
 | --- | --- |
-| 对话顺序与模型可见 tool result | Session JSONL |
-| Delegation 状态和完整归一化结果 | `state/delegations.json` |
-| spawn Worker 的逐事件过程 | `state/delegation-timelines/*.jsonl` |
+| 原生对话与模型工具结果 | Session JSONL |
+| 会话负责人、provider、快照来源 | `state/windows.json` v3 的 sessionRefs |
+| 单次委派、完整归一化结果与 Receipt | `state/delegations.json` |
+| 非 Pi 执行过程 | `state/delegation-timelines/*.jsonl` |
 | Goal、WorkPlan、Decision | `state/work-states.json` |
-| Artifact 元数据和冻结快照 | `state/artifacts.json` 与 `artifacts/blobs/` |
+| 快照 | ConversationSnapshots 的 manifest 与独立资产 |
 
-显示用 custom message 不能反向覆盖这些事实源。比如 `pudding:work_plan_update` 只是隐藏的恢复投影，不能据此重建 WorkPlan。
+展示卡不能反向覆盖权威状态。重启后未知执行效果先对账，不伪造运行中或成功。旧 Worker 输入队列不读取、不补投；显式诊断接口只列文件元数据，清理须另行明确操作。
 
-## 中断和重启
-
-普通 Session 历史可以直接从 JSONL 回放。正在执行的 OS 进程或模型请求则不会因为 Server 重启而继续存活，平台不会伪造“原 Run 仍在运行”。
-
-对于活动 Goal，恢复语义是：保留同一 Session 和 Goal，从最后一个可确认的原子安全点开启新的 execution epoch；已验收工作和冻结 Artifact 可以复用，外部副作用不明的步骤先要求对账。详见[Session Goal](/docs/goals/)。
-
-## 删除边界
-
-- 删除一个 Session：清理其 Goal/工作状态和关联运行控制面；Window 保留。
-- Window 至少保留一个 Session，删除最后一个会被拒绝或以新空 Session 替代。
-- 删除非 solo Window：取消其活动/等待 Delegation，令 Interaction 失效，再清理 Session 和 binding。
-- solo 是固定单例，不允许删除。
-
-删除聊天记录不等于删除外部 Agent 自己保存的历史。Connector 若在上游创建了 Session，应在自己的产品或 Driver 里说明数据保留策略。
-
-## 设计结论
-
-PuddingTeams 不把“模型上下文”误当成“平台记忆”。模型上下文可以截断、压缩或由上游托管；平台仍以稳定 ID、状态文件和 Artifact 保存协作事实。这是不同 Agent 能够接力、恢复和验收的前提。
+删除普通会话不等于删除上游 Agent 的私有历史或审计台账。Window 至少保留一个会话，solo 是不可删除单例。

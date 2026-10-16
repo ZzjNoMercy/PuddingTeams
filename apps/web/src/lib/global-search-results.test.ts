@@ -105,3 +105,13 @@ test("Manager 工作改名后仍可按首条任务摘要检索", () => {
 	const result = filterSearchResults(managerWorkResults(works), "安装包");
 	assert.equal(result[0]?.href, "/?session=old-a");
 });
+
+test("execution results open read-only process details and search ledger identities", async () => {
+ const {executionResults}=await import("./global-search-results.js");
+ const record={delegationId:"dlg-123",managerSessionId:"source-456",agentId:"worker-a",workspaceId:"workspace-789",goalId:"goal-012",task:"Review UI",executionState:"reported_completed"} as import("./api.js").WorkerProcessListItem;
+ const results=executionResults([record]);
+ for(const query of ["dlg-123","source-456","worker-a","workspace-789","goal-012"]) {
+  const result=filterSearchResults(results,query)[0]!;
+  assert.equal(result.kind,"execution");assert.equal(result.execution?.delegationId,"dlg-123");assert.equal(result.href,"");
+ }
+});

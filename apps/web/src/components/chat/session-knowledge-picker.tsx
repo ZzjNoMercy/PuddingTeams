@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ChevronDownIcon, Layers3Icon, RefreshCwIcon } from "lucide-react";
-import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { ChevronDownIcon, Layers3Icon } from "lucide-react";
+import { KnowledgePickerMenu } from "./knowledge-picker-menu";
 import { getKnowledgeSelection, listKnowledgeBindings, updateKnowledgeSelection, type KnowledgeBindingSummary, type KnowledgeSelectionSummary } from "@/lib/api";
 import { MEMORY_SETUP_COMPLETED_EVENT } from "@/features/knowledge/memory-onboarding";
 
@@ -60,9 +60,7 @@ export function SessionKnowledgePicker({ sessionId, disabled, onSavingChange }: 
 	};
 
 	const label = saving ? "保存知识库…" : loading ? "读取知识库…" : selected.size > 0 ? `${selected.size} 个知识库` : "选择知识库";
-	return <DropdownMenu><DropdownMenuTrigger asChild><button type="button" className="m1-workbench-knowledge session-knowledge-trigger" disabled={disabled || loading || saving} aria-label={`会话知识库：${label}`} title="当前会话可访问的知识库"><Layers3Icon size={14} /><span>{label}</span><ChevronDownIcon size={12} /></button></DropdownMenuTrigger><DropdownMenuContent align="start" className="m1-workbench-knowledge-menu">
-		{error ? <><DropdownMenuItem disabled>{error}</DropdownMenuItem><DropdownMenuItem onSelect={() => setNonce((previous) => previous + 1)}><RefreshCwIcon size={13} />重试读取知识库</DropdownMenuItem></> : null}
-		{current?.bindings.length === 0 ? <DropdownMenuItem disabled>还没有已接入的知识库</DropdownMenuItem> : null}
-		{current?.bindings.map((binding) => <DropdownMenuCheckboxItem key={binding.id} checked={selected.has(binding.id)} disabled={saving || disabled || (binding.availability !== "available" && !selected.has(binding.id))} onSelect={(event) => event.preventDefault()} onCheckedChange={(checked) => void toggle(binding.id, checked === true)}><span className="m1-workbench-knowledge-item"><strong>{binding.name}{binding.availability !== "available" ? " · 离线" : ""}</strong>{binding.description ? <small>{binding.description}</small> : null}</span></DropdownMenuCheckboxItem>)}
-	</DropdownMenuContent></DropdownMenu>;
+	return <KnowledgePickerMenu bindings={current?.bindings ?? []} selected={selected} disabled={disabled} saving={saving} error={error} allowDeselectUnavailable onToggle={(id, checked) => void toggle(id, checked)} onRetry={() => setNonce(previous => previous + 1)}>
+		<button type="button" className="m1-workbench-knowledge session-knowledge-trigger" disabled={disabled || loading || saving} aria-label={`会话知识库：${label}`} title="当前会话可访问的知识库"><Layers3Icon size={14} /><span>{label}</span><ChevronDownIcon size={12} /></button>
+	</KnowledgePickerMenu>;
 }

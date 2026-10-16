@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyRecoveredToolResults, friendlyModelError, groupConsecutiveModelErrors, markRunningToolCalls, reducePiEvent, renderHistory, replayPiEvents } from "./events";
+import { applyRecoveredToolResults, friendlyModelError, groupConsecutiveModelErrors, markRunningToolCalls, recoveredReplyIndex, reducePiEvent, renderHistory, replayPiEvents } from "./events";
 import type { PiMessage } from "./types";
 
 test("知识上下文变化指向会话菜单的新建入口，不误报模型故障或建议切模型重试", () => {
@@ -301,6 +301,20 @@ test("pi SDK 连续自动重试错误合并为一个渲染组", () => {
 	assert.equal(groups.length, 2);
 	assert.equal(groups[0]?.length, 4);
 	assert.equal(groups[1]?.[0]?.id, "success");
+});
+
+test("旧错误段只在后续有完整答复且之后不再失败时才算重试成功", () => {
+	const error = { error: true, streaming: false, content: "" };
+	const reply = { error: false, streaming: false, content: "ok" };
+	const toolOnly = { error: false, streaming: false, content: "" };
+	const streamingReply = { error: false, streaming: true, content: "ok" };
+	assert.equal(recoveredReplyIndex([error, reply]), 1);
+	assert.deepEqual([error, reply].map((_, i) => i < recoveredReplyIndex([error, reply])), [true, false]);
+	assert.equal(recoveredReplyIndex([error, toolOnly]), -1, "工具段不算恢复");
+	assert.equal(recoveredReplyIndex([error, streamingReply]), -1, "流式中的答复不算完成");
+	assert.equal(recoveredReplyIndex([error, reply, error]), -1, "之后再次失败不粉饰旧错误");
+	assert.equal(recoveredReplyIndex([error, toolOnly, reply]), 2, "工具段之后的完整答复算恢复");
+	assert.equal(recoveredReplyIndex([reply]), 0);
 });
 
 

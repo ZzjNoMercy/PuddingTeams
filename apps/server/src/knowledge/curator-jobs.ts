@@ -154,7 +154,7 @@ function pathsInTree(nodes: KnowledgeTreeNode[]): string[] { return nodes.flatMa
 export function curatorJobFeedback(job: CuratorJob) {
 	const messages: Record<CuratorJobStatus, string> = {
 		queued: "知识整理请求已受理，准备启动；尚未生成审核候选，后台会继续执行，不要重复提交或据此判失败。正式知识库尚未修改。",
-		running: job.executionMode === "worker" ? "当前知识管家正在整理，尚未生成审核候选；请查看本次执行过程。正式知识库尚未修改。" : "知识整理正在运行，尚未生成审核候选；后台会继续执行，不要重复提交或据此判失败。正式知识库尚未修改。",
+		running: job.executionMode === "worker" ? "当前对话正在整理，尚未生成审核候选；请查看本次执行过程。正式知识库尚未修改。" : "知识整理正在运行，尚未生成审核候选；后台会继续执行，不要重复提交或据此判失败。正式知识库尚未修改。",
 		submitting: "正在固定并登记候选，尚未进入审核；正式知识库尚未修改。",
 		pending_review: job.candidateBatchId ? "候选已生成，请进入候选详情查看当前审核与发布状态；整理回执不能代替 Publisher 回执。" : "任务缺少审核批次，请查看任务详情；不能声称已进入审核。",
 		no_changes: "知识整理完成，无需修改正式知识库。",
@@ -366,7 +366,7 @@ export class WikiCuratorService {
 			const claimed = await this.deps.jobs.transition(old.id, [old.status], { status: "submitting", failureCode: undefined });
 			return { job: await this.completeSubmission(claimed), replayed: false };
 		}
-		if (old.executionMode === "worker") throw new Error("此任务由聊天中的知识管家执行，请返回来源对话继续整理");
+		if (old.executionMode === "worker") throw new Error("此任务由来源对话执行，请返回来源对话继续整理");
 		return this.create({ ownerId, operationId, bindingId: old.targetBindingId, agentId: old.agentId, task: old.task,
 			origin: old.origin, sourceIds: old.sources.map((source) => source.id), revision: old.revision, retryOf: old.id });
 	}

@@ -12,16 +12,6 @@ import type { TeamsStore } from "../store/teams.js";
 import { directTaskId, directWorkerFor, dispatchDirectMessage } from "../agent-runtime/direct-dispatch.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import type { DelegationStore } from "../agent-runtime/delegation-store.js";
-import {
-	liveWorkerMessages,
-	resolveSession,
-	replayWorkerSessionMessages,
-	subscribeWorkerSession,
-	workerRunningToolCallIds,
-	type LiveWorkerSessionLookup,
-} from "../agent-runtime/worker-sessions.js";
-import type { WorkerInputDispatcher } from "../agent-runtime/worker-input-queue.js";
-import { liveWorkerSession } from "../agent-runtime/pi-driver.js";
 import { config } from "../config.js";
 import type { WorkStateStore } from "../store/work-state.js";
 import { identifyUploads, type UploadInput, type UploadStore } from "../store/uploads.js";
@@ -207,32 +197,20 @@ export async function registerChatRoutes(
 	providerDeletion?: ProviderDeletionCoordinator,
 	messageOperations?: MessageSubmissionOperations,
 	knowledgeIntakes?: ChatKnowledgeIntake,
-	/**
-	 * Worker 执行 session 路由支持：提供后 GET messages / WS 能按 sessionHandle
-	 * 解析执行 session（resolveSession 分流）；inputQueue 提供后 POST 直接输入
-	 * 经排队通道投递（忙碌时 202 排队）。
-	 */
-	workerSessions?: { delegations: DelegationStore; sessionDir: string; liveLookup?: LiveWorkerSessionLookup; inputQueue?: WorkerInputDispatcher },
+	/** Ledger identity guard: delegated execution handles never become chat ids. */
+	executionRecords?: { delegations: DelegationStore },
  inputController?: NativeInput,
 ): Promise<void> {
 	const nativeInput = inputController ?? new NativeInput(store, messageOperations, knowledgeIntakes);
 	// Directory placement never grants a delegated Context ordinary chat capabilities.
 	app.addHook("preHandler", async (req, reply) => {
 		const match = /^\/api\/sessions\/([^/?]+)(?:[/?]|$)/.exec(req.url);
-		if (!match || !workerSessions || !teams) return;
+		if (!match || !executionRecords || !teams) return;
 		const id = decodeURIComponent(match[1]!);
-		if (!(await teams.contextForSession(id)) && (await workerSessions.delegations.listDelegations()).some(record => record.sessionHandle === id)) {
+		if (!(await teams.contextForSession(id)) && (await executionRecords.delegations.listDelegations()).some(record => record.sessionHandle === id)) {
 			return reply.code(410).send({ error: "Delegation 仅提供按 delegationId 查询的过程", code: "delegation_trace_only" });
 		}
 	});
-	const resolveWorkerSession = async (id: string) => {
-		if (!workerSessions || !teams) return undefined;
-		const resolved = await resolveSession(
-			{ sessions: store, delegations: workerSessions.delegations, teams, defaultSessionDir: workerSessions.sessionDir, ...(workerSessions.liveLookup ? { liveLookup: workerSessions.liveLookup } : {}) },
-			id,
-		);
-		return resolved?.kind === "worker" ? resolved : undefined;
-	};
 	const requireActiveSessionContext = async (sessionId: string) => {
 		if (!teams) return undefined;
 		const context = await teams.contextForSession(sessionId);
@@ -492,7 +470,7 @@ export async function registerChatRoutes(
 				return reply.code(400).send({ error: "content or attachments is required" });
 			}
 			if (!Array.isArray(attachments)) return reply.code(400).send({ error: "attachments must be an array" });
-			if (teams && !(await teams.contextForSession(req.params.id)) && workerSessions && (await workerSessions.delegations.listDelegations()).some(record => record.sessionHandle === req.params.id)) {
+			if (teams && !(await teams.contextForSession(req.params.id)) && executionRecords && (await executionRecords.delegations.listDelegations()).some(record => record.sessionHandle === req.params.id)) {
 				return reply.code(410).send({ error: "Delegation 仅可按 delegationId 查询过程，不能作为聊天续写", code: "delegation_trace_only" });
 			}
 			const freezeHeader = req.headers["x-puddingteams-first-work-freeze-id"];
@@ -670,7 +648,7 @@ export async function registerChatRoutes(
 						preflightResult: disposition => resolvePreflight?.(disposition),
 					} as PromptOptions;
 					disarmIntake = sourceRefs && delivery === "normal" ? knowledgeIntakes?.armManager(session, sourceRefs, promptText, stored) : undefined;
-     if (delivery !== "normal" && typeof operationKey === "string" && operationHash && operationContextHash) { nativeInput.track(session, { key: operationKey, hash: operationHash, contextHash: operationContextHash, text: promptText, refs: sourceRefs, delivery }); nativeInput.watch(req.params.id); }
+     if (delivery !== "normal" && typeof operationKey === "string" && operationHash && operationContextHash) { nativeInput.track(session, { key: operationKey, hash: operationHash, contextHash: operationContextHash, text: promptText, refs: sourceRefs, delivery, attachmentNames: stored.map(item => item.name), hasImages: images.length > 0 }); nativeInput.watch(req.params.id); }
      const completion = waiting ? session.followUp(promptText, images).then(disposition => { resolvePreflight?.(disposition); }) : session.prompt(promptText, promptOptions);
 					void completion.catch(error => { preflightError = error; resolvePreflight?.(false); });
 					void completion.finally(() => disarmIntake?.()).catch(() => {});
@@ -728,6 +706,58 @@ export async function registerChatRoutes(
 		},
 	);
 
+	// Convert a queued followUp into a steer, or drop it from the SDK queue.
+	// pi 1.x has no per-item queue removal, so the queue is rebuilt via
+	// clearQueue(); rebuild only carries text, hence the hasImages guard.
+	app.post<{ Params: { id: string; key: string }; Body: { action?: string } }>("/api/sessions/:id/queued-inputs/:key", async (req, reply) => {
+		try {
+			await requireActiveSessionContext(req.params.id);
+			const action = req.body?.action;
+			if (action !== "steer" && action !== "cancel") return reply.code(400).send({ error: "invalid action", code: "invalid_action" });
+			const queued = nativeInput.queued(req.params.id);
+			const item = queued.find((entry) => entry.key === req.params.key);
+			if (!item) return reply.code(404).send({ error: "排队消息不存在或已投递", code: "queued_input_gone" });
+			if (queued.some((entry) => entry.hasImages)) return reply.code(409).send({ error: "含图片附件的排队消息不支持调整，请先停止任务再重发", code: "queued_input_has_images" });
+			const session = await store.open(req.params.id);
+			if (session.isIdle) return reply.code(409).send({ error: "会话已空闲，排队消息即将投递", code: "session_idle" });
+			if (action === "steer") {
+				if (item.delivery === "steer") return { ok: true, delivery: "steer" };
+				const capability = await store.nativeSessionCapability(req.params.id);
+				if (capability.waiting.length > 0) return reply.code(409).send({ error: "等待审批期间不能插队引导", code: "queued_input_waiting" });
+			}
+			const captured = session.clearQueue();
+			const sameKind = queued.filter((entry) => entry.delivery === item.delivery);
+			const index = sameKind.findIndex((entry) => entry.key === item.key);
+			const source = [...(item.delivery === "steer" ? captured.steering : captured.followUp)];
+			const restore = async () => {
+				session.clearQueue();
+				for (const text of captured.steering) await session.steer(text).catch(() => {});
+				for (const text of captured.followUp) await session.followUp(text).catch(() => {});
+			};
+			if (index < 0 || index >= source.length) {
+				await restore();
+				return reply.code(409).send({ error: "排队状态已变化，请刷新后重试", code: "queued_input_mismatch" });
+			}
+			const [text] = source.splice(index, 1);
+			const steering = item.delivery === "steer" ? source : [...captured.steering];
+			const followUp = item.delivery === "steer" ? [...captured.followUp] : source;
+			if (action === "steer") steering.push(text!);
+			try {
+				for (const entryText of steering) await session.steer(entryText);
+				for (const entryText of followUp) await session.followUp(entryText);
+			} catch (err) {
+				await restore();
+				throw err;
+			}
+			if (action === "cancel") await nativeInput.dropQueued(req.params.id, item.key);
+			else await nativeInput.resteerQueued(req.params.id, item.key);
+			return { ok: true, delivery: action === "steer" ? "steer" : item.delivery };
+		} catch (err) {
+			if (inactiveContextError(err)) return reply.code(409).send({ error: "session_context_inactive" });
+			return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+		}
+	});
+
 	app.post<{ Params: { id: string } }>("/api/sessions/:id/abort", async (req, reply) => {
 		try {
 			await requireActiveSessionContext(req.params.id);
@@ -770,24 +800,6 @@ export async function registerChatRoutes(
 
 	app.get<{ Params: { id: string } }>("/api/sessions/:id/messages", async (req, reply) => {
 		try {
-			const workerTarget = await resolveWorkerSession(req.params.id);
-			if (workerTarget) {
-				// 执行 session：live 注册表优先，否则按台账快照目录回放。
-				// parked/active-context 门禁按 targetWindowId 判定——direct 窗口的
-				// Workspace 身份不可变、无停放上下文，resolveSession 已确认窗口存在。
-				const liveLookup = workerSessions?.liveLookup ?? liveWorkerSession;
-				const messages = liveWorkerMessages(workerTarget.sessionHandle, liveLookup)
-					?? await replayWorkerSessionMessages(workerTarget.sessionHandle, workerTarget.workerSessionDir);
-				if (!messages) return reply.code(404).send({ error: "session not found" });
-				return {
-					messages: messages.map((message) => withWireMessageId(message as Record<string, unknown>)),
-					running: Boolean(liveLookup(workerTarget.sessionHandle)?.isStreaming),
-					unansweredUserMessage: false,
-					unfinishedAssistantTurn: false,
-					runningToolCallIds: workerRunningToolCallIds(workerTarget.sessionHandle, liveLookup),
-					recoveredToolResults: [],
-				};
-			}
 			return await withActiveSessionLifecycle(req.params.id, async () => {
 				const toolCallState = await store.recoverToolCallState(req.params.id);
 				const session = await store.open(req.params.id);
@@ -844,37 +856,6 @@ export async function registerChatRoutes(
 			sockets.add(socket);
 
 			try {
-				const workerTarget = await resolveWorkerSession(sessionId);
-				if (workerTarget) {
-					// live 时桥接执行事件流；非 live 只给 session_ready 快照后保持空闲
-					// （不重放伪装 live——历史由 GET /messages 提供）。
-					socket.send(JSON.stringify({ type: "session_ready", sessionId, ...await store.nativeSessionCapability(sessionId) }));
-					const unsubscribeLive = subscribeWorkerSession(
-						workerTarget.sessionHandle,
-						(event) => {
-							const payload = serializeChatEvent(event);
-							if (payload && socket.readyState === socket.OPEN) socket.send(payload);
-						},
-						workerSessions?.liveLookup ?? liveWorkerSession,
-					);
-					const unsubscribeContext = teams?.onChange(() => {
-						void teams.getWindow(workerTarget.windowId).then((window) => {
-							if (!window && socket.readyState === socket.OPEN) socket.close(1008, "session workspace is not active");
-						}).catch(() => undefined);
-					});
-					const cleanupWorker = () => {
-						unsubscribeLive?.();
-						unsubscribeContext?.();
-						sockets?.delete(socket);
-					};
-					socket.on("close", () => {
-						cleanupWorker();
-					});
-					socket.on("error", () => {
-						cleanupWorker();
-					});
-					return;
-				}
 				await withActiveSessionLifecycle(sessionId, async () => {
 					// open 只为校验存在性并确保实例已物化；订阅走 store 级通道，
 					// runtimeDirty 空闲重建换掉 AgentSession 实例后推送不断流。

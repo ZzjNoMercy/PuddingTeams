@@ -28,14 +28,12 @@ import {
 	CORE_TOOL_SEARCH,
 	CORE_TOOL_UPDATE_WORK_STATE,
 	CORE_TOOL_REQUEST_DECISION,
-	CORE_TOOL_CREATE_GOAL,
 	CORE_TOOL_UPDATE_WORK_PLAN,
 	CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM,
 	CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION,
 	CORE_TOOL_REVIEW_WORK_ITEM,
 	CORE_TOOL_READ_DELEGATION_RESULT,
 	CORE_TOOL_ABANDON_GOAL,
-	CORE_TOOL_SUPERSEDE_GOAL,
 	CORE_TOOL_CREATE_GROUP,
 	CORE_TOOL_INVITE,
 	type ManagerExtensionDeps,
@@ -200,7 +198,6 @@ test("Phase4: 窗口内只有成员的工具可见（direct 非成员 Agent 不�
 			CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION,
 			CORE_TOOL_REVIEW_WORK_ITEM,
 			CORE_TOOL_ABANDON_GOAL,
-			CORE_TOOL_SUPERSEDE_GOAL,
 		],
 		"Goal 状态机工具必须在 provider 请求前常驻，执行期再校验 durable Goal",
 	);
@@ -234,8 +231,6 @@ test("Phase4: 激活策略——委托工具全窗口默认激活，capability �
 		CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION,
 		CORE_TOOL_REVIEW_WORK_ITEM,
 		CORE_TOOL_ABANDON_GOAL,
-		CORE_TOOL_SUPERSEDE_GOAL,
-		CORE_TOOL_CREATE_GOAL,
 	];
 	assert.deepEqual(
 		[...group.active],
@@ -426,7 +421,6 @@ test("HITL 门禁覆盖跨 Worker 委托、计划写入与重复业务决策，�
 		await assert.rejects(() => tools.get(name)!.execute("blocked", {} as never, undefined, undefined, {} as ExtensionToolContext), /等待用户在原卡片中回答/);
 	}
 	assert.equal(await hook({ toolName: CORE_TOOL_ABANDON_GOAL }, {}), undefined, "废弃必须能收敛 pending 人工卡");
-	assert.equal(await hook({ toolName: CORE_TOOL_SUPERSEDE_GOAL }, {}), undefined, "更换必须能收敛 pending 人工卡");
 	assert.equal((await workStates.listDecisions("sess-test", goal.goalId)).length, 1);
 	const context = await handlers.get("context")![0]!({ messages: [{ role: "user", content: "继续上一任务", timestamp: 1 }] }, {}) as { messages: Array<{ content: string }> };
 	assert.match(context.messages.at(-1)!.content, /普通聊天中的“继续”不等于已提交卡片/);
@@ -478,7 +472,7 @@ test("正式 Goal 未建立 WorkPlan 时拒绝无 workItemId 委托，且 Worker
 			undefined,
 			{} as ExtensionToolContext,
 		),
-		/supersede_session_goal.*abandon_session_goal/,
+		/请用户通过 \/goal 或界面创建新 Goal.*abandon_session_goal/,
 	);
 	assert.equal((await invoker.delegationsForManagerSession("sess-test")).length, 0);
 });
@@ -773,7 +767,7 @@ test("产品验收冻结: Goal 上下文在 custom-message turn 前按最新状�
 	const ctx: ManagerWindowContext = { type: "solo", members: ["alpha"] };
 	const deps = { ...makeDeps(teams, invoker, catalog, ctx), workStates };
 	const plan = await planManagerTools(teams, catalog, ctx);
-	const { pi, handlers, getActive, setActive } = mockPi();
+	const { pi, handlers, tools, getActive, setActive } = mockPi();
 	for (const ext of buildManagerExtensionFactories(plan, deps)) {
 		const factory = typeof ext === "function" ? ext : ext.factory;
 		await factory(pi);
@@ -785,11 +779,12 @@ test("产品验收冻结: Goal 上下文在 custom-message turn 前按最新状�
 		const result = await context!({ messages: [] }, {}) as { messages: Array<{ content?: unknown }> };
 		return String(result.messages.at(-1)?.content);
 	};
-	assert.match(await textOf(), /尚未设置 Goal/);
-	assert.ok(getActive().includes(CORE_TOOL_CREATE_GOAL));
-	assert.ok(getActive().includes(CORE_TOOL_UPDATE_WORK_PLAN), "同一 provider turn 创建 Goal 后必须仍可建立 WorkPlan");
+	assert.match(await textOf(), /没有进行中的 Goal/);
+	assert.match(await textOf(), /Goal 只能由用户通过 \/goal 或界面显式创建/);
+	assert.ok(!tools.has("create_session_goal"), "Manager 工具面不得有 Goal 创建入口");
+	assert.ok(!tools.has("supersede_session_goal"), "Manager 工具面不得有 Goal 更换入口");
+	assert.ok(getActive().includes(CORE_TOOL_UPDATE_WORK_PLAN), "用户创建 Goal 后 WorkPlan 工具必须已常驻激活");
 	assert.ok(getActive().includes(CORE_TOOL_ABANDON_GOAL));
-	assert.ok(getActive().includes(CORE_TOOL_SUPERSEDE_GOAL));
 	await workStates.create({
 		sessionId: "sess-test",
 		goal: "冻结验收",
@@ -797,13 +792,12 @@ test("产品验收冻结: Goal 上下文在 custom-message turn 前按最新状�
 		participantAgentIds: ["alpha"],
 	});
 	assert.match(await textOf(), /目标：冻结验收/);
-	assert.doesNotMatch(await textOf(), /尚未设置 Goal/);
-	assert.ok(!getActive().includes(CORE_TOOL_CREATE_GOAL));
+	assert.doesNotMatch(await textOf(), /没有进行中的 Goal/);
 	assert.ok(getActive().includes(CORE_TOOL_UPDATE_WORK_PLAN));
-	assert.match(await textOf(), /supersede_session_goal/);
+	assert.match(await textOf(), /需要用户通过 \/goal 或界面显式创建/);
 });
 
-test("Goal 工具契约: 创建使用条件数组，WorkPlan 只回传条件序号", async () => {
+test("Goal 契约: WorkPlan 只回传条件序号", async () => {
 	const teams = await makeTeams([agentConfig("alpha")]);
 	const catalog = new ExtensionCatalog();
 	const invoker = await makeInvoker(teams, "alpha");
@@ -819,16 +813,16 @@ test("Goal 工具契约: 创建使用条件数组，WorkPlan 只回传条件序�
 	}
 	const context = handlers.get("context")?.[0];
 	assert.ok(context);
-	await context!({ messages: [{ role: "user", content: "建立两步检查", timestamp: 123 }] }, {});
-	const create = tools.get(CORE_TOOL_CREATE_GOAL)!;
-	await create.execute("create-criteria", {
+	// Goal 只能由用户通过 /goal 或界面创建（服务端路由）；这里直接落库等价于用户操作。
+	await workStates.create({
+		sessionId: "sess-test",
 		goal: "完成两步检查",
-		completionCriteria: ["后端检查有证据", "前端检查使用后端结论"],
-		completionReviewMode: "manager",
-		activationReason: "需要串行多 Worker 协作",
-		criteriaOrigin: "user_input",
-		sourceMessageIds: ["user:123"],
-	}, undefined, undefined, {} as ExtensionToolContext);
+		completionBoundary: "后端检查有证据\n前端检查使用后端结论",
+		reviewMode: "manager",
+		participantAgentIds: ["alpha"],
+		contractProvenance: { criteriaOrigin: "user_input", sourceMessageIds: [] },
+		operationId: "create-criteria",
+	});
 	const created = await workStates.getActive("sess-test");
 	assert.ok(created);
 	assert.equal(created.completionBoundary, "后端检查有证据\n前端检查使用后端结论");

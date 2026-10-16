@@ -143,7 +143,7 @@
 - Verification Delegation 不生成业务 Submission；
 - `passed + clean` 前 `accepted` 被门禁阻止。
 
-### T04：Manager 自执行写入必须 fail closed
+### T04：Manager 自执行写入必须有执行证据
 
 ```text
 请创建正式 Goal：创建 docs/e2e-pcp-manager-write-bypass.md，内容为“manager-direct-write”。
@@ -153,10 +153,10 @@
 
 预期：
 
-- 系统拒绝这条绕过路径，或 Manager 明确说明写任务必须委派 Worker；
-- 文件不应由 Manager 直接写入；
+- Manager 可以直接写入，但必须先开始自己的 WorkItem，并取得合法 scope/lease；
+- NativeExecution 与 ChangeSet 捕获实际修改，Submission 引用 nativeExecutionIds；
 - 不产生伪造的 Worker Receipt/Submission；
-- Goal 不得被标记为完成。
+- 只有冻结策略与 Goal 最终复核满足后才可完成。
 
 ### T05：缺少必需 Artifact 时保留执行事实但拒绝验收
 
@@ -541,18 +541,20 @@
 
 ### R01：默认 Worker、动态工具同步、Goal 工具连续性与 Manager 写门禁（D01、D05、D07、D08、D11、D12）
 
+> 2026-10-15 修订：`manager_explicit` 已删除，Manager 不再有 `create_session_goal`。本组改为：先由用户通过 `/goal` 或界面显式创建 Goal，再发送下列指令；预期中"同一 tool chain"指用户创建 Goal 后 Manager 下一轮即可调用 `update_work_plan`（Goal 工具常驻激活）。
+
 先在已有 Manager Session 中新建一个 `{{临时 Worker}}`，保存后不要新建 Manager Session，直接发送：
 
 ```text
-请立即创建正式 Goal，并在 create_session_goal 成功后的同一条工具链中紧接着创建 WorkPlan，不要停下来重复解释调用顺序。
+请基于当前 Goal 立即创建 WorkPlan，不要停下来重复解释调用顺序。
 
 W1：把“只读查询当前分支与 HEAD”委派给刚创建的 {{临时 Worker}}，策略 read_only_shared，验收方式 manager_review。
-W2：创建 docs/e2e-regression-manager-write.md，必须由可写 Worker 在 isolated_worktree 完成；Manager 自己不得调用 bash、edit、write 或任何等价写工具。
+W2：创建 docs/e2e-regression-manager-write.md，必须由可写 Worker 在 isolated_worktree 完成；本场景按用户约束委派 Worker；另设 Manager 原生写场景验证 bash/edit/write 和 NativeExecution，不把该测试约束当成平台限制。
 
 没有 WorkItem ID 时禁止发起任何正式 Goal Delegation。若工具不可用或门禁拒绝，原样报告错误，不得用普通写工具绕过。
 ```
 
-预期：新 Worker 在当前 Manager Session 立即可调用；Goal 后同一 tool chain 可调用 `update_work_plan`；Manager 实际工具面无 `bash/edit/write`；所有正式 Delegation 都有 `goalId/workItemId`；不能产生孤儿写入。
+预期：新 Worker 在当前 Manager Session 立即可调用；Goal 后同一 tool chain 可调用 `update_work_plan`；Manager 实际工具面含 `bash/edit/write`，并记录 NativeExecution/ChangeSet；所有正式 Delegation 都有 `goalId/workItemId`；不能产生孤儿写入。
 
 ### R02：ignored 依赖、独立 Git checkout、Receipt/Artifact 与受控提升（D02、D06、D10）
 

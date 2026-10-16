@@ -4,6 +4,7 @@ import type {
 	AgentCapabilityBinding,
 	AgentConfig,
 	AgentConnectorBinding,
+	AgentToolPreview,
 	AgentProbeResult,
 	BindingProbeResult,
 	CatalogEntry,
@@ -43,7 +44,6 @@ import type {
 	WorkspaceResourceKind,
 	WorkspaceTrustState,
 	ViewerIdentity,
-	WorkerSessionSummary,
 } from "./types";
 import { getDesktopBridge } from "./desktop";
 
@@ -1115,7 +1115,7 @@ export async function fetchMessages(sessionId: string): Promise<NativeInputCapab
 	const body = (await res.json()) as Partial<NativeInputCapability> & { messages?: unknown[]; running?: boolean; unansweredUserMessage?: boolean; unfinishedAssistantTurn?: boolean; runningToolCallIds?: string[]; recoveredToolResults?: RecoveredToolResult[]; error?: string };
 	if (!res.ok) throw new SessionMessagesError(sessionApiError(body.error, `fetch messages failed: ${res.status}`), res.status, body.error);
 	return {
-		ownerAgentId: body.ownerAgentId ?? "manager", connectorId: body.connectorId ?? "pi", nativePi: body.nativePi === true, readOnly: body.readOnly === true, busyInput: body.busyInput ?? {modes:[]}, waiting: body.waiting ?? [], pendingMessageCount: body.pendingMessageCount ?? 0, unconfirmedInput: body.unconfirmedInput === true, leafEntryId: body.leafEntryId, sourceSnapshotId: body.sourceSnapshotId,
+		ownerAgentId: body.ownerAgentId ?? "manager", connectorId: body.connectorId ?? "pi", nativePi: body.nativePi === true, readOnly: body.readOnly === true, busyInput: body.busyInput ?? {modes:[]}, waiting: body.waiting ?? [], queuedInputs: body.queuedInputs ?? [], pendingMessageCount: body.pendingMessageCount ?? 0, unconfirmedInput: body.unconfirmedInput === true, leafEntryId: body.leafEntryId, sourceSnapshotId: body.sourceSnapshotId,
 		messages: body.messages ?? [],
 		running: body.running === true,
 		unansweredUserMessage: body.unansweredUserMessage === true,
@@ -1189,6 +1189,19 @@ export async function sendMessage(sessionId: string, content: string, attachment
 	}
 	const body = (await res.json().catch(() => null)) as { queued?: boolean; queueId?: string; disposition?: SendMessageResult["disposition"]; persistence?: SendMessageResult["persistence"] } | null;
 	return { disposition: body?.disposition, persistence: body?.persistence, queued: body?.disposition === "queued", ...(body?.queueId ? { queueId: body.queueId } : {}) };
+}
+
+/** Convert a queued followUp into a steer, or drop it from the queue. */
+export async function actOnQueuedInput(sessionId: string, key: string, action: "steer" | "cancel"): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/queued-inputs/${encodeURIComponent(key)}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ action }),
+	});
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(sessionApiError(body?.error, `queued input action failed: ${res.status}`));
+	}
 }
 
 export async function abortSession(sessionId: string): Promise<AbortSessionResult> {
@@ -1265,6 +1278,8 @@ export interface WorkerProcessInfo {
 }
 
 export interface WorkerProcessListItem extends WorkerProcessInfo {
+	sourceRoomId?: string;
+	workspaceId?: string;
 	updatedAt: string;
 	task?: string;
 	intent?: string;
@@ -1490,10 +1505,9 @@ export interface HarnessSettings {
 		readChunkTokens: number;
 	};
 	goalActivation: {
-		solo: "manager_explicit" | "user_explicit" | "disabled";
-		group: "manager_explicit" | "user_explicit" | "disabled";
+		solo: "user_explicit" | "disabled";
+		group: "user_explicit" | "disabled";
 		direct: "user_explicit" | "disabled";
-		confirmWhenAmbiguous: boolean;
 	};
 	goalRecovery: {
 		mode: "safe_auto" | "manual";
@@ -1551,6 +1565,33 @@ export async function setHarnessSettings(settings: Partial<HarnessSettings>, exp
 	if (!res.ok || !body.harness || !body.revision) throw new Error(body.error ?? "update harness settings failed");
 	return { harness: body.harness, revision: body.revision };
 }
+
+// ---- 日志设置（设置 → 日志）----
+
+export type LogLevel = "error" | "warn" | "info" | "debug";
+
+export interface LoggingSettingsSnapshot {
+	logging: { enabled: boolean; level: LogLevel };
+	/** 后端 logger 当前实际生效的级别；关闭开关时是 silent。 */
+	effectiveLevel: LogLevel | "silent";
+	/** 启动器重定向出的日志文件；开发态为 null（日志只到终端）。 */
+	logFile: string | null;
+}
+
+async function loggingSettingsRequest(path = "", init?: RequestInit): Promise<LoggingSettingsSnapshot> {
+	const res = await fetch(`${SERVER_URL}/api/settings/logging${path}`, { ...init, cache: "no-store" });
+	const body = (await res.json()) as Partial<LoggingSettingsSnapshot> & { error?: string };
+	if (!res.ok || !body.logging || !body.effectiveLevel) throw new Error(body.error ?? "日志设置请求失败");
+	return { logging: body.logging, effectiveLevel: body.effectiveLevel, logFile: body.logFile ?? null };
+}
+
+export const getLoggingSettings = () => loggingSettingsRequest();
+
+export const setLoggingSettings = (input: { enabled?: boolean; level?: LogLevel }) => loggingSettingsRequest("", {
+	method: "PUT",
+	headers: { "content-type": "application/json" },
+	body: JSON.stringify(input),
+});
 
 // ---- agents registry (teams.json) ----
 
@@ -1995,6 +2036,14 @@ export async function previewAgentPiResources(name: string, workspaceId?: string
 	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}/pi-resources/preview${query}`);
 	const body = (await res.json()) as { preview?: PiResourcePreview; error?: string };
 	if (!res.ok) throw new Error(body.error ?? `preview pi resources failed: ${res.status}`);
+	return body.preview!;
+}
+
+/** 只读工具面预览（配置页「工具」分区）。 */
+export async function fetchAgentToolPreview(name: string): Promise<AgentToolPreview> {
+	const res = await fetch(`${SERVER_URL}/api/agents/${encodeURIComponent(name)}/tool-preview`);
+	const body = (await res.json()) as { preview?: AgentToolPreview; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `fetch tool preview failed: ${res.status}`);
 	return body.preview!;
 }
 
@@ -2452,7 +2501,7 @@ export async function markRoomRead(roomId: string, sessionId: string, activityRe
 export async function getManagerSessionLocation(roomId: string, sessionId: string): Promise<{ roomId: string; sessionId: string; workspaceId: string | null; active: boolean }> {
 	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(sessionId)}/location`);
 	const body = (await res.json()) as { roomId?: string; sessionId?: string; workspaceId?: string | null; active?: boolean; error?: string };
-	if (!res.ok || body.roomId !== roomId || body.sessionId !== sessionId) throw new Error(body.error ?? `locate Manager session failed: ${res.status}`);
+	if (!res.ok || body.roomId !== roomId || body.sessionId !== sessionId) throw Object.assign(new Error(body.error ?? `locate Manager session failed: ${res.status}`), { status: res.status });
 	return { roomId: body.roomId, sessionId: body.sessionId, workspaceId: body.workspaceId ?? null, active: body.active === true };
 }
 
@@ -2621,50 +2670,6 @@ export async function renameRoomSession(roomId: string, sessionId: string, name:
 	return ((await res.json()) as { session: RoomSession }).session;
 }
 
-/** Rename a worker execution session（同一路由，响应走 workerSession 字段）。 */
-export async function renameWorkerSession(roomId: string, sessionHandle: string, name: string): Promise<WorkerSessionSummary | null> {
-	const res = await fetch(`${SERVER_URL}/api/rooms/${roomId}/sessions/${sessionHandle}`, {
-		method: "PATCH",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ name }),
-	});
-	if (!res.ok) {
-		const body = (await res.json().catch(() => null)) as { error?: string } | null;
-		throw new Error(body?.error ?? `rename worker session failed: ${res.status}`);
-	}
-	return ((await res.json()) as { workerSession?: WorkerSessionSummary | null }).workerSession ?? null;
-}
-
-// ---- worker 执行 session 的排队输入（FIFO，web 渲染灰态待发送气泡） ----
-
-export interface WorkerInputQueueItem {
-	id: string;
-	sessionHandle: string;
-	text: string;
-	displayText: string;
-	status: "queued" | "failed";
-	failureReason?: string;
-	createdAt: string;
-	operationId: string;
-}
-
-export async function listWorkerInputQueue(roomId: string, sessionHandle: string): Promise<WorkerInputQueueItem[]> {
-	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/input-queue?sessionHandle=${encodeURIComponent(sessionHandle)}`);
-	if (!res.ok) throw new Error(`list worker input queue failed: ${res.status}`);
-	return ((await res.json()) as { items?: WorkerInputQueueItem[] }).items ?? [];
-}
-
-/** 取消排队项（queued）或移除失败项；已开始派发的 409。 */
-export async function cancelWorkerInput(roomId: string, queueId: string): Promise<void> {
-	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/input-queue/${encodeURIComponent(queueId)}`, {
-		method: "DELETE",
-	});
-	if (!res.ok) {
-		const body = (await res.json().catch(() => null)) as { error?: string } | null;
-		throw new Error(body?.error ?? `cancel worker input failed: ${res.status}`);
-	}
-}
-
 // ---- interactions（HITL 审批，§6.4）----
 
 export interface InteractionRequestView {
@@ -2806,4 +2811,25 @@ export async function testAndSaveWebResearchProvider(provider:WebSearchProvider,
  const result=await knowledgeResponse<WebResearchView>(await fetch(`${SERVER_URL}/api/settings/web-research/${provider}/test-and-save`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(value)}));
  publishWebResearchChange(result.revision);
  return result;
+}
+
+/** Read-only execution index; filters address ledger facts, never chat handles. */
+export async function fetchDelegationRecords(filters: { sourceSessionId?: string; workerId?: string; workspaceId?: string; goalId?: string } = {}): Promise<WorkerProcessListItem[]> {
+ const params = new URLSearchParams(Object.entries(filters).filter((entry): entry is [string,string] => typeof entry[1] === "string"));
+ const res = await fetch(`${SERVER_URL}/api/delegation-records?${params}`);
+ if (!res.ok) throw new Error(`list execution records failed: ${res.status}`);
+ return (await res.json()).delegations;
+}
+
+
+export async function listChatNavigation(): Promise<import("./types").ChatNavigationIndex> {
+ const res = await fetch(`${SERVER_URL}/api/chat-navigation`);
+ if (!res.ok) throw new Error("聊天列表暂时无法加载");
+ return res.json();
+}
+export async function updateChatNavigation(roomId: string, sessionId: string, patch: { pinned?: boolean; archived?: boolean }): Promise<{ revision: number; flags: { pinned: boolean; archived: boolean } }> {
+ const res = await fetch(`${SERVER_URL}/api/chat-navigation/${encodeURIComponent(roomId)}/${encodeURIComponent(sessionId)}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(patch) });
+ const body = await res.json();
+ if (!res.ok) throw new Error(body.error ?? "更新聊天列表失败");
+ return body;
 }

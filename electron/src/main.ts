@@ -1,6 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from "electron";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, truncateSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -183,7 +183,11 @@ function logToFile(line: string): void {
 	try {
 		const file = desktopLogPath();
 		mkdirSync(path.dirname(file), { recursive: true });
-		if (existsSync(file) && statSync(file).size > 5 * 1024 * 1024) truncateSync(file, 0);
+		// 超过上限时保留一份历史再继续写：直接截断会让崩溃现场消失。
+		if (existsSync(file) && statSync(file).size > 5 * 1024 * 1024) {
+			rmSync(`${file}.1`, { force: true });
+			renameSync(file, `${file}.1`);
+		}
 		appendFileSync(file, line);
 	} catch {
 		// 日志失败不影响运行。
@@ -229,6 +233,8 @@ async function spawnProductionServer(home: string, expectedHomeId: string): Prom
 			PORT: String(port),
 			HOST: "127.0.0.1",
 			PUDDINGTEAMS_HOME: home,
+			PUDDINGTEAMS_LOG_FILE: desktopLogPath(),
+			PUDDINGTEAMS_VERSION: app.getVersion(),
 			PATH: executablePath,
 		},
 		stdio: ["ignore", "pipe", "pipe"],

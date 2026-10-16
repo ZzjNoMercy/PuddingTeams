@@ -1,6 +1,7 @@
+import type { WorkerProcessListItem } from "./api";
 import { agentDisplayName, type AgentConfig, type ManagerWorkIndexItem, type RoomSummary } from "./types";
 
-export type SearchResult = { id: string; title: string; description: string; href: string; kind: "work" | "chat" | "agent"; haystack: string };
+export type SearchResult = { id: string; title: string; description: string; href: string; kind: "work" | "chat" | "agent" | "execution"; haystack: string; execution?: WorkerProcessListItem };
 
 export function sessionTitle(name: string | undefined, firstMessage: string): string | null {
 	return [name, firstMessage]
@@ -66,4 +67,13 @@ export function withManagerReturn(href: string, returnSessionId: string | null):
 	const params = new URLSearchParams(href.slice("/chats?".length));
 	params.set("returnSession", returnSessionId);
 	return `/chats?${params.toString()}`;
+}
+
+export function executionResults(records: WorkerProcessListItem[]): SearchResult[] {
+ return records.map(record => ({
+  id: `execution:${record.delegationId}`, title: record.task || record.delegationId,
+  description: `执行记录 · ${record.agentId} · ${record.executionState} · 来源 ${record.managerSessionId}${record.goalId ? ` · Goal ${record.goalId}` : ""}`,
+  href: "", kind: "execution", execution: record,
+  haystack: [record.delegationId,record.task,record.agentId,record.managerSessionId,record.workspaceId,record.goalId].filter(Boolean).join(" "),
+ }));
 }

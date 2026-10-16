@@ -15,15 +15,10 @@ import { AgentInvoker, type AgentInvokeResult } from "../agent-runtime/invoker.j
 import { PiSessionStore } from "../pi-bridge/session-store.js";
 import { registerRoomsRoutes, type RoomSummary } from "./rooms.js";
 import { registerChatRoutes } from "./chat.js";
-import { WorkerInputDispatcher, WorkerInputQueueStore } from "../agent-runtime/worker-input-queue.js";
 import type { AgentDriver, AgentEvent, DriverCapabilities } from "../agent-runtime/types.js";
 import type { ContinueInput, RunInput } from "../agent-runtime/types.js";
 
-/**
- * Worker 执行 session 直接输入（步骤 4）与重命名/删除（步骤 5）：
- * 排队 FIFO、锁交接优先于后到委派、幂等防双投、启动 reconcile、
- * 重命名落 session_info、删除清 binding/查看指针且台账保留。
- */
+/** Removed delegation input endpoints and retained Connector direct continuity. */
 
 interface FakeCall {
 	mode: "run" | "continue";
@@ -100,25 +95,15 @@ async function makeStack() {
 	const invoker = new AgentInvoker(teams, runtime, drivers, undefined, dir);
 	const sessions = new PiSessionStore(dir, path.join(dir, "sessions"), teams, invoker);
 	const workerSessionDir = path.join(dir, "worker-sessions");
-	const queueStore = new WorkerInputQueueStore(path.join(dir, "state", "worker-input-queue.json"));
-	await queueStore.init();
-	const dispatcher = new WorkerInputDispatcher({
-		queue: queueStore, teams, sessions, invoker, runtime, delegations,
-		log: () => undefined,
-	});
-	dispatcher.attach();
 	const app = Fastify({ logger: false });
 	await app.register(websocket);
 	await registerChatRoutes(app, sessions, teams, undefined, undefined, invoker, undefined, undefined, undefined, undefined,
-		{ delegations, sessionDir: workerSessionDir, inputQueue: dispatcher });
+		{ delegations });
 	registerRoomsRoutes(app, sessions, teams, invoker, undefined, {
 		activityStatePath: path.join(dir, "state", "room-activity.json"),
 		sessionCreationStatePath: path.join(dir, "state", "session-creation-operations.json"),
-		delegations,
-		workerSessionDir,
-		workerInputQueue: dispatcher,
 	});
-	return { app, teams, sessions, delegations, invoker, runtime, dispatcher, queueStore, dir, workerSessionDir, fake };
+	return { app, teams, sessions, delegations, invoker, runtime, dir, workerSessionDir, fake };
 }
 
 async function makeDirectWindow(app: ReturnType<typeof Fastify>) {
@@ -184,33 +169,6 @@ async function makeWorkerSessionWithLedger(
 	return handle;
 }
 
-/** 占用一个执行 session：发起 continue 委派并等 driver 接单（锁已持有）。 */
-async function occupySession(
-	stack: Awaited<ReturnType<typeof makeStack>>,
-	windowId: string,
-	containerSessionId: string,
-	handle: string,
-): Promise<{ done: Promise<AgentInvokeResult>; release: () => void }> {
-	const agent = (await stack.teams.getAgent("alpha"))!;
-	const done = stack.invoker.delegate({
-		agent,
-		windowId,
-		managerSessionId: containerSessionId,
-		message: "占位任务",
-		mode: "continue",
-		sessionHandle: handle,
-	});
-	const call = await stack.fake.waitForCall(stack.fake.calls.length + 1);
-	return { done, release: () => call.release() };
-}
-
-async function containerCards(stack: Awaited<ReturnType<typeof makeStack>>, sessionId: string) {
-	const session = await stack.sessions.open(sessionId);
-	return session.sessionManager.getBranch()
-		.filter((entry) => entry.type === "custom_message")
-		.map((entry) => entry as { type: "custom_message"; customType: string; content: string; details?: Record<string, unknown> });
-}
-
 test("P2 执行 handle 输入与队列端点关闭，不创建新 Run、不消耗旧队列", async () => {
 	const stack = await makeStack();
 	try {
@@ -224,7 +182,7 @@ test("P2 执行 handle 输入与队列端点关闭，不创建新 Run、不消�
 			{ method: "DELETE" as const, url: `/api/rooms/${room.id}/input-queue/old` },
 		]) {
 			const result = await stack.app.inject(operation);
-			assert.equal(result.statusCode, 410, result.body);
+			assert.equal(result.statusCode, operation.url.includes("input-queue") ? 404 : 410, result.body);
 		}
 		assert.equal(stack.fake.calls.length, 0);
 		assert.deepEqual(await stack.delegations.listDelegations(), before);

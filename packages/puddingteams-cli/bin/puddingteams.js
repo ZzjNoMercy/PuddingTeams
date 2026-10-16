@@ -10,7 +10,7 @@
  */
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
@@ -39,6 +39,8 @@ const USAGE = `puddingteams v${PKG.version}
   puddingteams stop                 停止后台 server
   puddingteams restart [--port N]   重启
   puddingteams status               查看运行状态
+  puddingteams logs [--tail N]      查看日志位置与尾部（默认 120 行）
+  puddingteams logs --export [--out FILE]  导出诊断包（需后端在运行）
   puddingteams open                 在浏览器中打开（未运行则提示先 start）
   puddingteams extension init|validate …   Extension 包脚手架与校验
   puddingteams version              版本号
@@ -124,6 +126,116 @@ function delegateToCliBundle(args) {
 	});
 }
 
+/** 单份轮转：超过上限就把当前日志挪成 `.1`（只保留一份历史，避免无限增长）。 */
+function rotateLogFile(file, maxBytes) {
+	try {
+		if (existsSync(file) && statSync(file).size > maxBytes) {
+			rmSync(`${file}.1`, { force: true });
+			renameSync(file, `${file}.1`);
+		}
+	} catch {
+		// 轮转失败不阻塞启动。
+	}
+}
+
+/** 日志级别取自「设置 → 日志」持久化的 product.json；缺失即默认值。 */
+function readLoggingSettings() {
+	const defaults = { enabled: true, level: "info" };
+	try {
+		const parsed = JSON.parse(readFileSync(path.join(HOME, "config", "product.json"), "utf-8"));
+		const level = ["error", "warn", "info", "debug"].includes(parsed?.logging?.level) ? parsed.logging.level : defaults.level;
+		return { enabled: parsed?.logging?.enabled !== false, level };
+	} catch {
+		return defaults;
+	}
+}
+
+function logFileCandidates() {
+	const explicit = process.env.PUDDINGTEAMS_LOG_FILE?.trim();
+	return explicit ? [explicit, `${explicit}.1`] : [LOG_FILE, `${LOG_FILE}.1`];
+}
+
+function describeFile(file) {
+	try {
+		const info = statSync(file);
+		return `${file}（${(info.size / 1024).toFixed(1)} KiB，最后修改 ${info.mtime.toISOString()}）`;
+	} catch {
+		return `${file}（不存在）`;
+	}
+}
+
+/** 探测正在运行的后端（同数据目录指纹），返回端口或 undefined。 */
+async function runningServerPort() {
+	const state = readRunState();
+	if (state.port && await ownsRunningServer(state)) return state.port;
+	// 桌面 App / 源码开发态起的后端不在 CLI 的 pidfile 里：用健康检查确认身份。
+	const candidate = Number(process.env.PORT) || DEFAULT_PORT;
+	const health = await healthInfo(candidate);
+	return health && health.dataHomeId === DATA_HOME_ID ? candidate : undefined;
+}
+
+/** 从运行中的后端取内存里的最近日志（开发态没有日志文件时使用）。 */
+async function recentLogFromServer() {
+	try {
+		const port = await runningServerPort();
+		if (!port) return undefined;
+		const res = await fetch(`http://127.0.0.1:${port}/api/diagnostics/logs/bundle`, { signal: AbortSignal.timeout(10_000) });
+		if (!res.ok) return undefined;
+		const bundle = await res.json();
+		const text = bundle?.logs?.["recent.log"]?.text;
+		return typeof text === "string" && text ? text : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** 只看日志：不要求后端在运行，直接读启动器重定向出的文件。 */
+async function cmdLogs(args) {
+	const { flags } = parseFlags(args, new Set(["tail", "export", "out"]));
+	const logging = readLoggingSettings();
+	const [file, previous] = logFileCandidates();
+	if (flags.export !== undefined) {
+		const port = await runningServerPort();
+		if (!port) {
+			fail("导出诊断包需要后端正在运行（包格式由后端统一生成）；先 puddingteams start，或直接看文件：puddingteams logs");
+		}
+		const target = typeof flags.out === "string" ? flags.out : path.join(process.cwd(), `puddingteams-logs-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
+		let res;
+		try {
+			res = await fetch(`http://127.0.0.1:${port}/api/diagnostics/logs/bundle`, { signal: AbortSignal.timeout(15_000) });
+		} catch (error) {
+			fail(`导出诊断包失败：${error instanceof Error ? error.message : String(error)}`);
+		}
+		if (!res.ok) fail(`导出诊断包失败：HTTP ${res.status}`);
+		writeFileSync(target, await res.text(), "utf-8");
+		console.log(`✓ 已导出诊断包：${target}`);
+		console.log("  包含运行标识、日志级别与日志尾部；不含密钥或会话内容。");
+		return;
+	}
+
+	const limit = flags.tail === undefined ? 120 : Number(flags.tail);
+	if (!Number.isInteger(limit) || limit < 0 || limit > 200_000) fail(`非法 --tail：${flags.tail}`);
+	console.log(`数据目录：${HOME}`);
+	console.log(`日志级别：${logging.enabled ? logging.level : "已关闭"}（在「设置 → 日志」中调整）`);
+	console.log(`日志文件：${describeFile(file)}`);
+	if (existsSync(previous)) console.log(`上一份：  ${describeFile(previous)}`);
+	if (!existsSync(file)) {
+		// 源码开发态没有文件：若后端在跑，就从它的内存缓冲里取最近日志。
+		const recent = await recentLogFromServer();
+		if (recent) {
+			console.log(`\n──── 最近 ${limit} 行（来自运行中的后端内存缓冲）────\n${recent.split(/\r?\n/).slice(-limit).join("\n").trimEnd()}`);
+			return;
+		}
+		console.log("\n尚没有日志文件。源码开发态（pnpm dev）日志只输出到启动它的终端；CLI 管理的实例才写入上面的路径。");
+		return;
+	}
+	if (limit === 0) return;
+	const text = readFileSync(file, "utf-8").split(/\r?\n/);
+	const tail = text.slice(Math.max(0, text.length - limit)).join("\n").trimEnd();
+	console.log(`\n──── 最后 ${limit} 行 ────\n${tail}`);
+	return;
+}
+
 async function cmdStart(args) {
 	const { flags } = parseFlags(args, new Set(["port"]));
 	const port = resolvePort(flags);
@@ -140,10 +252,11 @@ async function cmdStart(args) {
 	if (await portResponds(port)) fail(`端口 ${port} 已有服务在响应（非本 CLI 管理）；请换 --port`);
 	mkdirSync(path.dirname(PID_FILE), { recursive: true });
 	mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+	rotateLogFile(LOG_FILE, 8 * 1024 * 1024);
 	const logFd = openSync(LOG_FILE, "a");
 	const runId = randomUUID();
 	const child = spawn(process.execPath, [SERVER_BUNDLE], {
-		env: { ...process.env, PORT: String(port), PUDDINGTEAMS_HOME: HOME, PUDDINGTEAMS_RUN_ID: runId },
+		env: { ...process.env, PORT: String(port), PUDDINGTEAMS_HOME: HOME, PUDDINGTEAMS_RUN_ID: runId, PUDDINGTEAMS_LOG_FILE: LOG_FILE, PUDDINGTEAMS_VERSION: PKG.version },
 		detached: true,
 		stdio: ["ignore", logFd, logFd],
 	});
@@ -245,6 +358,9 @@ async function main() {
 			return;
 		case "status":
 			await cmdStatus(args);
+			return;
+		case "logs":
+			await cmdLogs(args);
 			return;
 		case "open":
 			await cmdOpen(args);

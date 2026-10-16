@@ -10,10 +10,11 @@ import type { HarnessCodeSearchProvider } from "../pi-bridge/code-search.js";
 
 export interface ProductSettings {
 	developerMode: boolean;
+	logging: LoggingSettings;
 	harness: {
 		codeSearch: { defaultProvider: HarnessCodeSearchProvider };
 		workerResults: WorkerResultContextSettings;
-		goalActivation: { solo: "manager_explicit" | "user_explicit" | "disabled"; group: "manager_explicit" | "user_explicit" | "disabled"; direct: "user_explicit" | "disabled"; confirmWhenAmbiguous: boolean };
+		goalActivation: { solo: "user_explicit" | "disabled"; group: "user_explicit" | "disabled"; direct: "user_explicit" | "disabled" };
 		goalRecovery: { mode: "safe_auto" | "manual"; directMode: "manual"; resumeLeaseMs: number; operationRetentionDays: number; maxOperationsPerSession: number };
 		/** Global defaults for independent verification. These are frozen into a WorkItem at creation time. */
 		verification: VerificationSettings;
@@ -22,8 +23,36 @@ export interface ProductSettings {
 	};
 }
 
-export interface VerificationSettings {
+/** 平台日志级别。`silent` 只由开关产生，不作为用户可选级别。 */
+export type LogLevel = "silent" | "error" | "warn" | "info" | "debug";
+export type SelectableLogLevel = Exclude<LogLevel, "silent">;
+
+export interface LoggingSettings {
+	/** 总开关：关闭等价于 silent，后端不再写任何一行日志。 */
 	enabled: boolean;
+	/** 记录详细程度；`level` 与 `trace` 刻意不提供，避免正常使用下淹没有效信息。 */
+	level: SelectableLogLevel;
+}
+
+export const LOG_LEVELS: readonly SelectableLogLevel[] = ["error", "warn", "info", "debug"];
+
+/**
+ * 默认 `info`：平台自身的启动/生命周期/降级告警都在这一档，默认 `warn` 会让
+ * 「出了问题却什么都没有」成为常态（2026-10-15 停止超时事故的教训）。
+ */
+export const DEFAULT_LOGGING_SETTINGS: LoggingSettings = { enabled: true, level: "info" };
+
+export function effectiveLogLevel(settings: LoggingSettings): LogLevel {
+	return settings.enabled ? settings.level : "silent";
+}
+
+export function normalizeLoggingSettings(input: unknown): LoggingSettings {
+	const value = (input ?? {}) as Partial<LoggingSettings>;
+	const level = LOG_LEVELS.includes(value.level as SelectableLogLevel) ? value.level as SelectableLogLevel : DEFAULT_LOGGING_SETTINGS.level;
+	return { enabled: value.enabled !== false, level };
+}
+
+export interface VerificationSettings {	enabled: boolean;
 	defaultWorkItemMode: "manager_review" | "independent_evidence_review";
 	defaultFinalGoalMode: "manager_review" | "independent_evidence_review" | "environment_verified";
 	trigger: "manager_request" | "auto_on_submission";
@@ -116,16 +145,17 @@ export class ProductSettingsStore {
 			const boundedNumber = (value: unknown, fallback: number, min: number, max: number): number => typeof value === "number" && Number.isFinite(value) ? Math.max(min, Math.min(value, max)) : fallback;
 			return {
 				developerMode: parsed.developerMode === true,
+				logging: normalizeLoggingSettings(parsed.logging),
 				harness: {
 					codeSearch: {
 						defaultProvider: parsed.harness?.codeSearch?.defaultProvider === "fff" ? "fff" : "builtin",
 					},
 					workerResults: validateWorkerResultContext(parsed.harness?.workerResults ?? {}),
 					goalActivation: {
-						solo: parsed.harness?.goalActivation?.solo ?? "manager_explicit",
-						group: parsed.harness?.goalActivation?.group ?? "manager_explicit",
-						direct: parsed.harness?.goalActivation?.direct ?? "user_explicit",
-						confirmWhenAmbiguous: parsed.harness?.goalActivation?.confirmWhenAmbiguous !== false,
+						// 历史 manager_explicit / confirmWhenAmbiguous 值不再存在，解析时直接回退默认（未上线，不做迁移）。
+						solo: enumOr(parsed.harness?.goalActivation?.solo, ["user_explicit", "disabled"], "user_explicit"),
+						group: enumOr(parsed.harness?.goalActivation?.group, ["user_explicit", "disabled"], "user_explicit"),
+						direct: enumOr(parsed.harness?.goalActivation?.direct, ["user_explicit", "disabled"], "user_explicit"),
 					},
 					goalRecovery: {
 						mode: enumOr(parsed.harness?.goalRecovery?.mode, ["safe_auto", "manual"], "safe_auto"),
@@ -175,10 +205,11 @@ export class ProductSettingsStore {
 			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
 			return {
 				developerMode: false,
+				logging: DEFAULT_LOGGING_SETTINGS,
 					harness: {
 					codeSearch: { defaultProvider: "builtin" },
 					workerResults: DEFAULT_WORKER_RESULT_CONTEXT,
-					goalActivation: { solo: "manager_explicit", group: "manager_explicit", direct: "user_explicit", confirmWhenAmbiguous: true },
+					goalActivation: { solo: "user_explicit", group: "user_explicit", direct: "user_explicit" },
 					goalRecovery: { mode: "safe_auto", directMode: "manual", resumeLeaseMs: 30_000, operationRetentionDays: 30, maxOperationsPerSession: 512 },
 					verification: DEFAULT_VERIFICATION_SETTINGS,
 					workspaceExecution: DEFAULT_WORKSPACE_EXECUTION_SETTINGS,
@@ -190,6 +221,31 @@ export class ProductSettingsStore {
 	async setDeveloperMode(enabled: boolean): Promise<ProductSettings> {
 		const run = this.queue.then(async () => {
 			const settings = { ...(await this.get()), developerMode: enabled };
+			await mkdir(this.configDir, { recursive: true });
+			const tmp = `${this.file}.${randomUUID().slice(0, 8)}.tmp`;
+			await writeFile(tmp, JSON.stringify(settings, null, 2) + "\n", "utf-8");
+			await rename(tmp, this.file);
+			return settings;
+		});
+		this.queue = run.then(() => undefined, () => undefined);
+		return run;
+	}
+
+	/** 日志开关与级别：改动立即生效，不参与 Harness 的 revision/冲突协议。 */
+	async setLogging(input: { enabled?: boolean; level?: string }): Promise<ProductSettings> {
+		if (input.enabled !== undefined && typeof input.enabled !== "boolean") throw new Error("logging.enabled 必须是布尔值");
+		if (input.level !== undefined && !LOG_LEVELS.includes(input.level as SelectableLogLevel)) {
+			throw new Error(`logging.level 必须是 ${LOG_LEVELS.join(" | ")}`);
+		}
+		const run = this.queue.then(async () => {
+			const current = await this.get();
+			const settings: ProductSettings = {
+				...current,
+				logging: {
+					enabled: input.enabled ?? current.logging.enabled,
+					level: (input.level as SelectableLogLevel | undefined) ?? current.logging.level,
+				},
+			};
 			await mkdir(this.configDir, { recursive: true });
 			const tmp = `${this.file}.${randomUUID().slice(0, 8)}.tmp`;
 			await writeFile(tmp, JSON.stringify(settings, null, 2) + "\n", "utf-8");
@@ -219,10 +275,9 @@ export class ProductSettingsStore {
 			const codeSearch = { ...current.harness.codeSearch, ...(input.codeSearch ?? {}) };
 			if (!["builtin", "fff"].includes(codeSearch.defaultProvider)) throw new Error("codeSearch.defaultProvider 无效");
 			const activation = { ...current.harness.goalActivation, ...(input.goalActivation ?? {}) };
-			if (!["manager_explicit", "user_explicit", "disabled"].includes(activation.solo)) throw new Error("goalActivation.solo 无效");
-			if (!["manager_explicit", "user_explicit", "disabled"].includes(activation.group)) throw new Error("goalActivation.group 无效");
+			if (!["user_explicit", "disabled"].includes(activation.solo)) throw new Error("goalActivation.solo 无效");
+			if (!["user_explicit", "disabled"].includes(activation.group)) throw new Error("goalActivation.group 无效");
 			if (!["user_explicit", "disabled"].includes(activation.direct)) throw new Error("goalActivation.direct 无效");
-			if (typeof activation.confirmWhenAmbiguous !== "boolean") throw new Error("goalActivation.confirmWhenAmbiguous 必须是布尔值");
 			const recovery = { ...current.harness.goalRecovery, ...(input.goalRecovery ?? {}), directMode: "manual" as const };
 			if (!["safe_auto", "manual"].includes(recovery.mode)) throw new Error("goalRecovery.mode 无效");
 			for (const [key, value] of Object.entries({ resumeLeaseMs: recovery.resumeLeaseMs, operationRetentionDays: recovery.operationRetentionDays, maxOperationsPerSession: recovery.maxOperationsPerSession })) {
@@ -296,5 +351,18 @@ export class ProductSettingsStore {
 		});
 		this.queue = run.then(() => undefined, () => undefined);
 		return run;
+	}
+}
+
+/**
+ * 启动期读取日志设置：只读一个文件、失败即默认值。
+ * 必须在 `Fastify({ logger })` 之前调用，否则首屏启动日志会按引导级别输出。
+ */
+export async function readLoggingSettings(configDir: string): Promise<LoggingSettings> {
+	try {
+		const parsed = JSON.parse(await readFile(path.join(configDir, "product.json"), "utf-8")) as { logging?: unknown };
+		return normalizeLoggingSettings(parsed.logging);
+	} catch {
+		return DEFAULT_LOGGING_SETTINGS;
 	}
 }

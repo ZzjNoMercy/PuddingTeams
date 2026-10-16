@@ -24,6 +24,8 @@ export interface ModelSummary {
 	id: string;
 	name: string;
 	provider: string;
+	/** Endpoint configured for this model; this does not describe network proxy routing. */
+	baseUrl?: string;
 	reasoning?: boolean;
 	/** 该模型支持的 thinking 档位（归一化）；非推理模型为 ["off"]。 */
 	thinkingLevels?: string[];
@@ -125,7 +127,14 @@ export interface PiToolCallBlock {
 	arguments: Record<string, unknown>;
 }
 
-export type PiContentBlock = PiTextBlock | PiThinkingBlock | PiToolCallBlock;
+/** 用户消息里的图片附件（base64，无 data: 前缀）。 */
+export interface PiImageBlock {
+	type: "image";
+	data: string;
+	mimeType: string;
+}
+
+export type PiContentBlock = PiTextBlock | PiThinkingBlock | PiToolCallBlock | PiImageBlock;
 
 export interface PiUserMessage {
 	role: "user";
@@ -226,6 +235,13 @@ export interface ToolCallView {
 
 export type ChatMessageRole = "user" | "assistant" | "toolResult" | "custom";
 
+/** 用户消息附带的图片：缩略图渲染，点击放大；name 来自平台附件冻结清单。 */
+export interface ChatMessageImage {
+	data: string;
+	mimeType: string;
+	name?: string;
+}
+
 export interface ModelErrorPresentation {
 	title: string;
 	explanation: string;
@@ -239,6 +255,8 @@ export interface ChatMessage {
 	role: ChatMessageRole;
 	puddingMessageId?: string;
 	content: string;
+	/** role === "user"：随消息发送的图片附件（已从展示文本中分离）。 */
+	images?: ChatMessageImage[];
 	thinking?: string;
 	toolCalls: ToolCallView[];
 	timestamp: number;
@@ -1027,26 +1045,6 @@ export interface DelegationTimelineEvent {
 
 export type WindowType = "solo" | "direct" | "group";
 
-/** Worker 执行 session 的平行投影（不进 window.sessions，见 RoomSummary.workerSessions）。 */
-export interface WorkerSessionSummary {
-	/** Worker 执行 session 的 handle（pi Session id）。 */
-	id: string;
-	/** session_info 里的用户命名优先；缺省取首个 delegation 任务首句。 */
-	name: string;
-	firstMessage: string;
-	modifiedAt: string;
-	origin: "delegation";
-	/** 发起委派的 manager session（本窗口直派产生的执行面不列入枚举）。 */
-	sourceManagerSessionId: string;
-	/** 发起方所属窗口；源 session 已失去窗口归属时为空串。 */
-	sourceWindowId: string;
-	/** solo → "大管家"；群 → 群名。 */
-	sourceWindowName: string;
-	/** 该 handle 最近一次 delegation。 */
-	lastDelegationId: string;
-	running: boolean;
-}
-
 export interface RoomSummary {
 	/** Window id (not a pi session id). */
 	id: string;
@@ -1068,12 +1066,6 @@ export interface RoomSummary {
 	activeSession: string;
 	/** Solo only: pinned singleton, never deletable. */
 	pinned: boolean;
-	/** Active room Session's per-worker continuation handles. */
-	workerBindings: Record<string, { sessionHandle?: string; targetWindowId: string; workspaceId?: string; cwdSnapshot: string; agentRevision: number; updatedAt: string }>;
-	/** Worker 执行 session 平行投影（委派/直派产生；仅 direct 窗口展示）。 */
-	workerSessions: WorkerSessionSummary[];
-	/** 当前查看的执行 session handle；null = 查看容器 activeSession。 */
-	activeWorkerView: string | null;
 	/** User-edited window system prompt ('' = default relay guidance). */
 	prompt: string;
 	/** Window 创建时冻结的实际运行目录；未选项目时用于保持上下文身份。 */
@@ -1123,4 +1115,39 @@ export interface WorkspaceDirectoryListing {
 	directories: Array<{ name: string; path: string }>;
 }
 
-export interface NativeInputCapability { ownerAgentId: string; connectorId: string; nativePi: boolean; readOnly: boolean; busyInput: { modes: Array<"followUp" | "steer"> }; waiting: string[]; pendingMessageCount: number; unconfirmedInput?: boolean; leafEntryId?: string; sourceSnapshotId?: string; }
+export interface QueuedNativeInput { key: string; text: string; delivery: "followUp" | "steer"; attachmentNames: string[]; hasImages: boolean; }
+
+export interface NativeInputCapability { ownerAgentId: string; connectorId: string; nativePi: boolean; readOnly: boolean; busyInput: { modes: Array<"followUp" | "steer"> }; waiting: string[]; queuedInputs: QueuedNativeInput[]; pendingMessageCount: number; unconfirmedInput?: boolean; leafEntryId?: string; sourceSnapshotId?: string; }
+
+// ---- Agent 工具面预览（GET /api/agents/:name/tool-preview，只读） ----
+
+/** direct=直接声明；deferred=渐进声明（tool_search 按需加载）；model-only=仅模型可见的发现入口。 */
+export type ToolPreviewExposure = "direct" | "deferred" | "model-only";
+
+export interface ToolPreviewItem {
+	name: string;
+	exposure: ToolPreviewExposure;
+	condition?: string;
+}
+
+export type ToolPreviewGroupId = "native" | "orchestration" | "knowledge" | "calendar" | "web" | "mcp" | "capability";
+
+export interface ToolPreviewGroup {
+	id: ToolPreviewGroupId;
+	tools: ToolPreviewItem[];
+	note?: string;
+}
+
+export interface AgentToolPreview {
+	role: "manager" | "worker" | "wiki";
+	groups: ToolPreviewGroup[];
+}
+
+
+export interface ChatNavigationItem {
+ roomId: string; sessionId: string; ownerAgentId: string; agentName: string; agentEnabled: boolean;
+ roomType: WindowType; roomName: string; title: string; firstMessage: string; modifiedAt: string;
+ workspaceId: string | null; workspaceName: string; cwdSnapshot: string; contextActive: boolean;
+ pinned: boolean; archived: boolean;
+}
+export interface ChatNavigationIndex { items: ChatNavigationItem[]; revision: number; }

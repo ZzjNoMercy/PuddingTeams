@@ -47,11 +47,16 @@ const mock = createServer(async (req, res) => {
   const body = JSON.parse(Buffer.concat(chunks).toString());
   const names = (body.tools ?? []).map((tool) => tool.function?.name).filter(Boolean);
   modelTools.push(names);
-  const callTool = names.includes('delegation') && !(body.messages ?? []).some((message) => message.role === 'tool');
+  const browserProof = mode === 'browser-pending';
+  const calls=(body.messages ?? []).flatMap(message=>message.tool_calls ?? []);
+  const callWrite=browserProof && names.includes('write') && !calls.some(call=>call.function?.name==='write');
+  const callTool = names.includes('delegation') && (browserProof ? !calls.some(call=>call.function?.name==='delegation') : !(body.messages ?? []).some((message) => message.role === 'tool'));
   const id = `fixture-${++modelCalls}`;
   const send = (delta, finish_reason = null) => res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: 1780000000, model: 'fixture-model', choices: [{ index: 0, delta, finish_reason }] })}\n\n`);
   res.writeHead(200, { 'content-type': 'text/event-stream' });
-  if (callTool) {
+  if (callWrite) {
+    send({role:'assistant',tool_calls:[{index:0,id:`native-${modelCalls}`,type:'function',function:{name:'write',arguments:JSON.stringify({path:'p4-browser-native-proof.txt',content:'native write before delegation\n'})}}]});send({},'tool_calls');
+  } else if (callTool) {
     send({ role: 'assistant', tool_calls: [{ index: 0, id: `call-${modelCalls}`, type: 'function', function: { name: 'delegation', arguments: JSON.stringify({ workerId: 'puddingclaw', task: '执行安装态委托审批验证' }) } }] });
     send({}, 'tool_calls');
   } else {

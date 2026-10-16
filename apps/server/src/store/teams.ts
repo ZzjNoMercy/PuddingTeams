@@ -281,12 +281,6 @@ export interface WindowConfig {
 	prompt?: string;
 	/** Per-room-Session, per-worker handles for isolated multi-turn continuity (§7.1). */
 	workerBindings?: SessionWorkerBindings;
-	/**
-	 * Direct 窗口正在查看的 worker 执行 session（sessionHandle）的查看指针：
-	 * 平行于容器 activeSession，绝不进 sessions 列表（执行 session 的 JSONL 在
-	 * worker 专属目录，登记进 sessions 会被生命周期修复剪掉）。null/缺省 = 看容器。
-	 */
-	activeWorkerView?: string | null;
 	/** Inactive workspace contexts keyed by workspace identity + canonical cwd. */
 	parkedContexts: Record<string, ParkedWindowContext>;
 	/** 可选的平台项目身份；未选择时沿用平台原有默认 cwd。 */
@@ -658,6 +652,7 @@ export class TeamsStore {
 			throw new Error("windows.json has invalid retired creation operations");
 		}
 		for (const window of Object.values(windows.windows)) {
+			if (Object.hasOwn(window, "activeWorkerView")) throw new Error("windows.json contains a removed execution view pointer");
 			if (
 				(window.workspaceId !== undefined && (typeof window.workspaceId !== "string" || !window.workspaceId)) ||
 				typeof window.cwdSnapshot !== "string" ||
@@ -2069,54 +2064,10 @@ export class TeamsStore {
 		});
 	}
 
-	/**
-	 * Direct 窗口的执行面查看指针。allowedHandles 由路由层用 worker session
-	 * 枚举（delegation 台账 + 文件存在性）算出——TeamsStore 不读台账，只在
-	 * 串行写区内校验该 handle 确实属于本窗口当前可见的执行 session 集合。
-	 */
-	async setActiveWorkerView(windowId: string, sessionHandle: string | null, allowedHandles: ReadonlySet<string>): Promise<void> {
-		await this.serialize(async () => {
-			const data = await this.loadWindowsFile();
-			const w = data.windows[windowId];
-			if (!w) throw new Error(`window not found: ${windowId}`);
-			if (sessionHandle !== null && !allowedHandles.has(sessionHandle)) {
-				throw new Error(`worker session not in window: ${sessionHandle}`);
-			}
-			if (sessionHandle === null) delete w.activeWorkerView;
-			else w.activeWorkerView = sessionHandle;
-			await this.writeWindows(data);
-		});
-	}
-
-	/**
-	 * 删除 worker 执行 session 时清除所有窗口（含停放 context）里指向该 handle
-	 * 的 binding。delegation 台账不动；下次 direct 消息由 sessionHandleFor 的
-	 * 台账自愈逻辑重新开 session。
-	 */
-	async forgetWorkerSessionHandle(sessionHandle: string): Promise<void> {
-		await this.serialize(async () => {
-			const data = await this.loadWindowsFile();
-			let changed = false;
-			for (const w of Object.values(data.windows)) {
-				const contexts: Array<{ workerBindings?: SessionWorkerBindings }> = [w, ...Object.values(w.parkedContexts)];
-				for (const context of contexts) {
-					const bindings = context.workerBindings;
-					if (!bindings) continue;
-					for (const [sessionId, bucket] of Object.entries(bindings)) {
-						for (const [worker, binding] of Object.entries(bucket)) {
-							if (binding.sessionHandle !== sessionHandle) continue;
-							delete bucket[worker];
-							changed = true;
-						}
-						if (Object.keys(bucket).length === 0) delete bindings[sessionId];
-					}
-				}
-			}
-			if (changed) await this.writeWindows(data);
-		});
-	}
-
-	/** Delete one pi session inside a window; the last session is protected. */
+	/** Delete one pi session inside a window; the last session of the active
+	 * context is protected. Sessions parked with an inactive context are
+	 * removed from that context; a parked context emptied this way is
+	 * dropped (validation requires at least one session per context). */
 	async removeWindowSession(
 		windowId: string,
 		sessionId: string,
@@ -2126,16 +2077,30 @@ export class TeamsStore {
 			const data = await this.loadWindowsFile();
 			const w = data.windows[windowId];
 			if (!w) return;
-			if (!w.sessions.includes(sessionId)) return;
-			if (w.sessions.length <= 1) {
-				res = { removed: false, blocked: "窗口至少要保留一个会话" };
+			if (w.sessions.includes(sessionId)) {
+				if (w.sessions.length <= 1) {
+					res = { removed: false, blocked: "窗口至少要保留一个会话" };
+					return;
+				}
+				w.sessions = w.sessions.filter((s) => s !== sessionId);
+				if (w.activeSession === sessionId) w.activeSession = w.sessions[0]!;
+				if (w.workerBindings) delete w.workerBindings[sessionId];
+				await this.writeWindows(data);
+				res = { removed: true };
 				return;
 			}
-			w.sessions = w.sessions.filter((s) => s !== sessionId);
-			if (w.activeSession === sessionId) w.activeSession = w.sessions[0]!;
-			if (w.workerBindings) delete w.workerBindings[sessionId];
-			await this.writeWindows(data);
-			res = { removed: true };
+			for (const [key, context] of Object.entries(w.parkedContexts)) {
+				if (!context.sessions.includes(sessionId)) continue;
+				if (context.sessions.length <= 1) delete w.parkedContexts[key];
+				else {
+					context.sessions = context.sessions.filter((id) => id !== sessionId);
+					if (context.activeSession === sessionId) context.activeSession = context.sessions[0]!;
+					if (context.workerBindings) delete context.workerBindings[sessionId];
+				}
+				await this.writeWindows(data);
+				res = { removed: true };
+				return;
+			}
 		});
 		return res;
 	}

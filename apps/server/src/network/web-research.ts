@@ -217,9 +217,9 @@ export class WebResearchSettings {
       }
       return tools;
   }
-  extension(targetId: string): InlineExtension {
+  extension(targetId: string, opts?: { exposure?: "direct" | "deferred" }): InlineExtension {
     return {name:"pudding-web-research",factory:async(pi:ExtensionAPI)=>{
-      for (const tool of await this.tools(targetId)) pi.registerTool(tool);
+      for (const tool of await this.tools(targetId)) pi.registerTool(opts?.exposure ? {...tool, exposure: opts.exposure} : tool);
     }};
   }
 }

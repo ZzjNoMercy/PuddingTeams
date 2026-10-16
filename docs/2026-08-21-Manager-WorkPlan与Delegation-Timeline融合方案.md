@@ -41,6 +41,8 @@ Worker 内部 Todo 仍由 Worker 自己管理。PuddingTeams 不读取、不合�
 
 创建 Room、进入群聊或 Manager 在场都不自动创建 Goal。Session 初始仍是普通聊天；问候、闲聊、头脑风暴、一次性问答和能在当前回复内完成的轻量请求均不产生 Goal。推荐激活矩阵：
 
+> **2026-10-15 修订：`manager_explicit` 模式已删除。** 下表第 2/3 行及下文 `create_session_goal` core tool 建议、`GoalContractProvenance` 与 `goalActivation` 设置示例（含 `confirmWhenAmbiguous`）仅保留为历史设计记录。当前行为：Goal 仅由用户通过 `/goal`/UI 显式创建（`user_explicit`）或整体 `disabled`；Manager 工具面不再有 `create_session_goal` / `supersede_session_goal`，`goalActivation.solo/group` 只剩 `user_explicit | disabled`。
+
 | 场景 | Goal 如何创建 | 是否需要额外确认 |
 |---|---|---|
 | 用户明确输入 `/goal` 或点击“设为 Goal” | PuddingTeams 直接创建 | 不需要 |
@@ -719,3 +721,8 @@ PuddingTeams 可以保证“本地 Goal 状态只应用一次”，但无法在�
 - 点击 WorkItem/尝试能复用现有 pi Session 回放或 delegation timeline，实时订阅不丢事件；
 - Worker 私有 Todo 不进入 WorkPlan，HITL 审批与交付验收在 UI 上不会混淆；
 - 关闭、刷新、重启后，WorkPlan、Submission、验收结论与选中的 Delegation 均能从对应事实源恢复。
+
+
+## 2026-10-15 原生 Manager 与执行记录收敛
+
+Manager 原生写通过 NativeExecution/ChangeSet 与 scope/lease 证明，Submission 可引用 nativeExecutionIds；不必为写入伪造 Worker delegation。人工准入、批准字节发布和同调用恢复保持各自权威状态。普通会话列表不枚举 delegation handle，执行详情只按 delegationId 读取与取消；不通过聊天镜像推导归属。

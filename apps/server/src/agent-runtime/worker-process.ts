@@ -1,10 +1,9 @@
-import { SessionManager, type AgentSessionEvent } from "@earendil-works/pi-coding-agent";
-import path from "node:path";
+import { type AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { DelegationRecord, DelegationStore } from "./delegation-store.js";
 import type { TeamsStore } from "../store/teams.js";
 import { liveWorkerSession } from "./pi-driver.js";
 import type { DelegationTimelineEvent, DelegationTimelineStore } from "./delegation-timeline-store.js";
-import { liveWorkerMessages, replayWorkerSessionMessages, subscribeWorkerSession, workerRunningToolCallIds } from "./worker-sessions.js";
+import { liveWorkerMessages, replayWorkerSessionMessages, subscribeWorkerSession, workerRunningToolCallIds } from "./worker-process-session.js";
 
 /**
  * pi worker 执行过程可视化（只读）：pi worker 的 child session 是完整 pi
@@ -34,6 +33,8 @@ export interface WorkerProcessInfo {
 }
 
 export interface WorkerProcessListItem extends WorkerProcessInfo {
+	sourceRoomId?: string;
+	workspaceId?: string;
 	updatedAt: string;
 	task?: string;
 	intent?: string;
@@ -73,67 +74,28 @@ export class WorkerProcessService {
 		};
 	}
 
-	/**
-	 * Current-session process index for the shared worker drawer. A solo/group
-	 * delegation is owned by the manager session but executes in (and is mirrored
-	 * to) a worker direct window, so requiring both ids to match hides a live Run.
-	 * Show manager-owned records plus records explicitly mirrored into the
-	 * currently displayed room session.
-	 */
-	async list(windowId: string, managerSessionId?: string): Promise<WorkerProcessListItem[]> {
-		const byWindow = await this.delegations.listDelegations(windowId);
-		let records = byWindow;
-		if (managerSessionId) {
-			const byManager = await this.delegations.listDelegations(undefined, managerSessionId);
-			const mirrored = await this.mirroredTaskIndex(managerSessionId);
-			const visibleWindowRecords = byWindow.filter((record) =>
-				mirrored.has(record.id) || Boolean(record.managerToolCallId && mirrored.has(record.managerToolCallId)),
-			);
-			const union = new Map([...byManager, ...visibleWindowRecords].map((record) => [record.id, record]));
-			records = [...union.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-		}
-		const sessionIds = [...new Set(records.filter((record) => !record.task).map((record) => record.managerSessionId))];
-		const mirroredTasks = new Map<string, Map<string, string>>();
-		await Promise.all(sessionIds.map(async (sessionId) => {
-			mirroredTasks.set(sessionId, await this.mirroredTaskIndex(sessionId));
-		}));
-		return Promise.all(records.map(async (record) => {
-			const info = await this.resolve(record.id);
-			if (!info) throw new Error(`delegation disappeared while listing: ${record.id}`);
-			const taskIndex = mirroredTasks.get(record.managerSessionId);
-			return {
-				...info,
-				updatedAt: record.updatedAt,
-				managerSessionId: record.managerSessionId,
-				task: record.task
-					?? taskIndex?.get(record.id)
-					?? (record.managerToolCallId ? taskIndex?.get(record.managerToolCallId) : undefined),
-				intent: record.intent,
-				expectedOutcome: record.expectedOutcome,
-			};
-		}));
+	/** Source conversation is the identity; execution windows and chat mirrors are not. */
+	async list(windowId: string, sourceSessionId?: string): Promise<WorkerProcessListItem[]> {
+		return this.listRecords(sourceSessionId ? { sourceSessionId } : { windowId });
 	}
 
-	/** Recover task names for records created before DelegationRecord persisted `task`. */
-	private async mirroredTaskIndex(managerSessionId: string): Promise<Map<string, string>> {
-		const index = new Map<string, string>();
-		const managerSessionsDir = path.dirname(this.defaultSessionDir);
-		const info = (await SessionManager.listAll(managerSessionsDir)).find((item) => item.id === managerSessionId);
-		if (info) {
-			const session = SessionManager.open(info.path, managerSessionsDir);
-			for (const entry of session.getBranch()) {
-				const message = entry as {
-					type?: string;
-					customType?: string;
-					content?: unknown;
-					details?: { delegationId?: unknown; taskId?: unknown };
-				};
-				if (message.type !== "custom_message" || message.customType !== "pudding:task_assign" || typeof message.content !== "string") continue;
-				if (typeof message.details?.delegationId === "string") index.set(message.details.delegationId, message.content);
-				if (typeof message.details?.taskId === "string") index.set(message.details.taskId, message.content);
-			}
-		}
-		return index;
+	async listRecords(filters: { windowId?: string; sourceSessionId?: string; workerId?: string; workspaceId?: string; goalId?: string } = {}): Promise<WorkerProcessListItem[]> {
+		const records = (await this.delegations.listDelegations())
+			.filter(record => (!filters.sourceSessionId || record.managerSessionId === filters.sourceSessionId)
+				&& (!filters.workerId || record.agentId === filters.workerId)
+				&& (!filters.workspaceId || record.workspaceId === filters.workspaceId)
+				&& (!filters.goalId || record.goalId === filters.goalId)
+				&& (!filters.windowId || record.windowId === filters.windowId))
+			.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+		return Promise.all(records.map(async record => ({
+			...(await this.resolve(record.id))!,
+			sourceRoomId: (await this.teams.windowForSession(record.managerSessionId))?.id,
+			workspaceId: record.workspaceId,
+			updatedAt: record.updatedAt,
+			task: record.task,
+			intent: record.intent,
+			expectedOutcome: record.expectedOutcome,
+		})));
 	}
 
 	async timeline(delegationId: string, afterSeq = 0): Promise<DelegationTimelineEvent[]> {
@@ -153,18 +115,16 @@ export class WorkerProcessService {
 	 * 会话消息历史：live 命中用内存会话（含未落盘的流式尾部）；否则从 JSONL
 	 * 当前分支读 message 条目。返回 pi AgentMessage[]（与 manager 会话的
 	 * /messages 同形）。会话不存在返回 undefined。读取实现共享自
-	 * worker-sessions.ts（chat 路由的 worker session 分支用同一入口）。
+	 * worker-process-session.ts（只读过程模块）。
 	 */
 	async messages(delegationId: string, handle: string): Promise<unknown[] | undefined> {
 		// live 注册表成员身份本身就是执行中的证明；回放才需要台账归属校验。
-		const liveMessages = liveWorkerMessages(handle);
-		if (liveMessages) return liveMessages;
 		const delegation = await this.delegations.getDelegation(delegationId);
 		if (!delegation || delegation.sessionHandle !== handle || (delegation.driverId && delegation.driverId !== "pi")) return undefined;
-		return replayWorkerSessionMessages(handle, delegation.workerSessionDir ?? this.defaultSessionDir);
+		return liveWorkerMessages(handle) ?? replayWorkerSessionMessages(handle, delegation.workerSessionDir ?? this.defaultSessionDir);
 	}
 
-	/** A Pi Session can contain several Delegations; unknown timestamps are not attributable. */
+	/** Restrict process messages to the recorded execution boundary. */
 	async scopedMessages(info: WorkerProcessInfo, messages: unknown[]): Promise<unknown[] | undefined> {
 		if (!info.sessionHandle) return undefined;
 		// The live AgentSession can append while the delegation index is loading.

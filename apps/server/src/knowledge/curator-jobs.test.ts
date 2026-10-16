@@ -71,7 +71,7 @@ test("聊天Wiki由当前Worker提交候选；准备重放不新增任务，后�
 		await assert.rejects(submit.execute("premature", { bindingId: f.binding.id, pages: [] }, undefined, undefined, {} as never), /先调用/);
 		const first = await prepare.execute("prepare-1", { bindingId: f.binding.id, task: "整理事实" }, undefined, undefined, {} as never);
 		const payload = JSON.parse((first.content[0] as { text: string }).text);
-		assert.equal(payload.status, "running"); assert.match(payload.message, /当前知识管家/);
+		assert.equal(payload.status, "running"); assert.match(payload.message, /当前对话正在整理/);
 		assert.equal(payload.context.sources[0].content, "冻结用户事实");
 		await prepare.execute("prepare-2", { bindingId: f.binding.id, task: "模型重新措辞" }, undefined, undefined, {} as never);
 		assert.equal((await f.jobs.list()).length, 1);

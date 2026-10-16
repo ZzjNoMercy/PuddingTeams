@@ -1,11 +1,26 @@
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { FastifyInstance } from "fastify";
-import { HarnessSettingsConflictError, harnessSettingsRevision } from "../store/product-settings.js";
+import { HarnessSettingsConflictError, harnessSettingsRevision, effectiveLogLevel, type LoggingSettings } from "../store/product-settings.js";
 import type { GoalActivationSettings, GoalRecoverySettings, HarnessCodeSearchSettings, ProductSettings, ProductSettingsStore, VerificationSettingsPatch, WorkspaceExecutionSettingsPatch } from "../store/product-settings.js";
 import type { WorkerResultContextSettings } from "../store/large-worker-result.js";
 import type { WorkStateStore } from "../store/work-state.js";
 
-export async function registerSettingsRoutes(app: FastifyInstance, cwd: string, productSettings?: ProductSettingsStore, workStates?: WorkStateStore, onHarnessChange?: (settings: ProductSettings) => void, isActiveReviewer?: (name: string) => Promise<boolean>): Promise<void> {
+export interface LoggingRouteDeps {
+	/** 启动器重定向出来的日志文件；开发态未设置，日志只到终端。 */
+	logFile?: string;
+	/** 级别变更立即生效（不重启），由 server 更新自己的 logger。 */
+	onLoggingChange?: (settings: LoggingSettings) => void;
+}
+
+export async function registerSettingsRoutes(app: FastifyInstance, cwd: string, productSettings?: ProductSettingsStore, workStates?: WorkStateStore, onHarnessChange?: (settings: ProductSettings) => void, isActiveReviewer?: (name: string) => Promise<boolean>, loggingDeps: LoggingRouteDeps = {}): Promise<void> {
+	/** 开关与级别只影响写入量，真正生效的是 server 的 logger；这里把两者一起回给 UI。 */
+	const loggingSnapshot = (logging: LoggingSettings, logFile?: string) => ({
+		logging,
+		effectiveLevel: effectiveLogLevel(logging),
+		logFile: logFile ?? null,
+		levels: ["error", "warn", "info", "debug"],
+	});
+
 	app.get("/api/settings", async () => {
 		const settings = SettingsManager.create(cwd, getAgentDir());
 		return {
@@ -27,6 +42,23 @@ export async function registerSettingsRoutes(app: FastifyInstance, cwd: string, 
 			return { ok: true, defaultProvider: provider, defaultModel: model };
 		},
 	);
+	app.get("/api/settings/logging", async () => {
+		if (!productSettings) return { logging: null };
+		const { logging } = await productSettings.get();
+		return loggingSnapshot(logging, loggingDeps.logFile);
+	});
+	app.put<{ Body: { enabled?: boolean; level?: string } }>("/api/settings/logging", async (req, reply) => {
+		try {
+			if (!productSettings) throw new Error("Product settings 未启用");
+			const body = req.body ?? {};
+			if (body.enabled === undefined && body.level === undefined) return reply.code(400).send({ error: "至少提供 enabled 或 level" });
+			const settings = await productSettings.setLogging(body);
+			loggingDeps.onLoggingChange?.(settings.logging);
+			return loggingSnapshot(settings.logging, loggingDeps.logFile);
+		} catch (error) {
+			return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+		}
+	});
 	app.get("/api/settings/harness", async () => {
 		if (!productSettings) return { harness: null };
 		const { harness } = await productSettings.get();

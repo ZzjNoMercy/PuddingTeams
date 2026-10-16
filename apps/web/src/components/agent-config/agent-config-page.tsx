@@ -20,6 +20,7 @@ import {
 	SlidersHorizontalIcon,
 	SparklesIcon,
 	UploadIcon,
+	WrenchIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
@@ -49,6 +50,7 @@ import {
 import { OverviewSection } from "@/components/agent-config/overview-section";
 import { ModelSection } from "@/components/agent-config/model-section";
 import { PromptSection } from "@/components/agent-config/prompt-section";
+import { ToolPreviewSection } from "@/components/agent-config/tool-preview-section";
 import { ResourceLibrarySection } from "@/components/agent-config/resource-library-section";
 import {
 	BindingsSection,
@@ -70,7 +72,7 @@ import { configTransferFromDraft, draftWithConfigTransfer, parseConfigTransfer, 
  *   见 connector-sections.tsx）。
  */
 
-type SectionKey = "overview" | "model" | "prompt" | "skills" | "templates" | "connector" | "mcp" | "network" | "extensions" | "status";
+type SectionKey = "overview" | "model" | "prompt" | "skills" | "templates" | "connector" | "mcp" | "network" | "extensions" | "tools" | "status";
 
 type SectionDef = { key: SectionKey; label: string; description: string; icon: typeof InfoIcon };
 
@@ -87,6 +89,7 @@ const PI_SECTIONS: SectionDef[] = [
 	OVERVIEW_SECTION,
 	{ key: "model", label: "模型与运行", description: "选择模型、思考强度与上下文加载方式。", icon: SlidersHorizontalIcon },
 	{ key: "prompt", label: "提示词", description: "运行指令、项目上下文与提示词预览。", icon: MessageSquareTextIcon },
+	{ key: "tools", label: "工具", description: "当前智能体实际装配的工具清单，只读。", icon: WrenchIcon },
 	{ key: "skills", label: "技能", description: "选择当前智能体可用的技能；资源内容在扩展中管理。", icon: SparklesIcon },
 	{ key: "templates", label: "模板", description: "选择当前智能体可用的提示词模板；资源内容在扩展中管理。", icon: BoxIcon },
 	NETWORK_SECTION,
@@ -583,6 +586,7 @@ export function AgentConfigPage({ name }: { name: string }) {
 						{section === "network" ? <WebResearchSection agent={agent} /> : null}
 						{piMode && section === "mcp" ? <McpSelectionSection agent={agent} onMutation={handleMutation} /> : null}
 						{section === "extensions" ? <BindingsSection agent={agent} onMutation={handleMutation} /> : null}
+						{piMode && section === "tools" ? <ToolPreviewSection agent={agent} /> : null}
 					{!piMode && section === "status" ? <StatusSection agent={agent} lastMutation={lastMutation} onToggleEnabled={handleToggleEnabled} toggling={toggling} mutationBusy={saving} /> : null}
 						</div>
 					</main>

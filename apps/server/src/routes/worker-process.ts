@@ -104,6 +104,11 @@ export function registerWorkerProcessRoutes(
 		return withTrustProjection(info);
 	});
 
+	app.get<{ Querystring: { sourceSessionId?: string; workerId?: string; workspaceId?: string; goalId?: string } }>(
+		"/api/delegation-records",
+		async (req) => ({ delegations: await Promise.all((await service.listRecords(req.query)).map(withTrustProjection)) }),
+	);
+
 	app.get<{ Params: { id: string }; Querystring: { managerSessionId?: string } }>(
 		"/api/rooms/:id/delegation-processes",
 		async (req) => ({

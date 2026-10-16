@@ -102,9 +102,20 @@ try {
 	assert.equal(new Set(records.map(record => record.sessionHandle)).size, 2);
 	if (process.argv[3] === 'large') for (const record of records) { assert.equal(record.result.content.length, 100000); assert.equal((await readFile(path.join(home, 'state', 'large-worker-results', record.id + '.txt'), 'utf8')).length, 100000); }
 	assert.equal((await ok('GET', '/api/rooms')).rooms.some(room => room.type === 'direct'), false);
-	assert.deepEqual((await ok('GET', `/api/rooms/${group.id}`)).room.workerSessions, []);
+	assert.equal(Object.hasOwn((await ok('GET', `/api/rooms/${group.id}`)).room, 'workerSessions'), false);
 	for (const record of records) { await ok('GET', `/api/delegations/${record.id}/process`); await ok('GET', `/api/delegations/${record.id}/process/timeline`); }
 	const denied = await request('POST', `/api/sessions/${records[0].sessionHandle}/messages`, { content: '不得续写' }); assert.equal(denied.status, 410);
+ const index=(await ok('GET',`/api/delegation-records?sourceSessionId=${group.activeSession}&workerId=puddingclaw`)).delegations;
+ assert.deepEqual(new Set(index.map(item=>item.delegationId)),new Set(records.map(record=>record.id)));
+ assert.equal((await ok('GET',`/api/delegation-records?sourceSessionId=${sessionId}`)).delegations.length,0);
+ for(const operation of [
+  ['GET',`/api/sessions/${records[0].sessionHandle}/messages`,undefined,410],
+  ['POST',`/api/rooms/${group.id}/sessions/${records[0].sessionHandle}/activate`,{},400],
+  ['PATCH',`/api/rooms/${group.id}/sessions/${records[0].sessionHandle}`,{name:'forbidden'},404],
+  ['DELETE',`/api/rooms/${group.id}/sessions/${records[0].sessionHandle}`,{},404],
+ ]) { const [method,url,payload,status]=operation;assert.equal((await request(method,url,payload)).status,status); }
+ assert.equal((await ok('GET',`/api/rooms/${group.id}`)).room.activeSession,group.activeSession);
+
 	const count = (await readFile(path.join(home, 'worker-invocations.log'), 'utf8')).trim().split('\n').length;
 	assert.equal(count, 2);
 	await run(cli, ['stop'], { env, timeout: 20000 }); started = false;

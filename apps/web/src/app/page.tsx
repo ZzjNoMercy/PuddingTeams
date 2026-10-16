@@ -7,9 +7,10 @@ import { ArrowUpRightIcon, BookOpenIcon, BrainCircuitIcon, CalendarDaysIcon, Che
 import { ChatPane } from "@/components/chat/chat-pane";
 import { NavRail } from "@/components/chat/nav-rail";
 import { QueryRouteObserver } from "@/components/chat/query-route-observer";
+import { KnowledgePickerMenu } from "@/components/chat/knowledge-picker-menu";
 import { DesktopTitlebar } from "@/components/desktop-titlebar";
 import { SectionSidebarToggle } from "@/components/section-topbar";
-import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { ManagerWorkSubmissionError, createManagerWork, getKnowledgeSelection, getManagerSessionLocation, getRoom, getViewerIdentity, listKnowledgeBindings, listRooms, listSessionCommands, setActiveRoomSession, switchRoomWorkspace, updateKnowledgeSelection, type KnowledgeBindingSummary, type KnowledgeSelectionSummary, type SessionSlashCommand } from "@/lib/api";
 import { useModelCatalog } from "@/lib/model-catalog";
 import { LatestSerialQueue } from "@/lib/latest-serial-queue";
@@ -83,8 +84,9 @@ function NewWorkKnowledgePicker({ bindings, selection, loading, saving, error, d
 }) {
 	const selected = new Set(selection?.selectedBindingIds ?? []);
 	const label = loading ? "读取知识库…" : selected.size > 0 ? `${selected.size} 个知识库` : "选择知识库";
-	const { triggerRef, triggerInteractionProps, onCloseAutoFocus } = useDropdownTriggerBlur();
-	return <DropdownMenu><DropdownMenuTrigger asChild><button ref={triggerRef} {...triggerInteractionProps} type="button" className="m1-workbench-knowledge" disabled={disabled || loading || saving} aria-label={`工作知识库：${label}`}><Layers3Icon size={15} /><span>{label}</span><ChevronDownIcon size={13} /></button></DropdownMenuTrigger><DropdownMenuContent align="start" className="m1-workbench-knowledge-menu" onCloseAutoFocus={onCloseAutoFocus}>{error ? <DropdownMenuItem disabled>{error}</DropdownMenuItem> : bindings.length === 0 ? <DropdownMenuItem disabled>还没有已接入的知识库</DropdownMenuItem> : bindings.map((binding) => <DropdownMenuCheckboxItem key={binding.id} checked={selected.has(binding.id)} disabled={binding.availability !== "available" || saving} onSelect={(event) => event.preventDefault()} onCheckedChange={(checked) => onToggle(binding.id, checked === true)}><span className="m1-workbench-knowledge-item"><strong>{binding.name}</strong>{binding.description ? <small>{binding.description}</small> : null}</span></DropdownMenuCheckboxItem>)}</DropdownMenuContent></DropdownMenu>;
+	return <KnowledgePickerMenu bindings={error ? [] : bindings} selected={selected} disabled={disabled} saving={saving} error={error} onToggle={onToggle}>
+		<button type="button" className="m1-workbench-knowledge" disabled={disabled || loading || saving} aria-label={`工作知识库：${label}`}><Layers3Icon size={15} /><span>{label}</span><ChevronDownIcon size={13} /></button>
+	</KnowledgePickerMenu>;
 }
 
 /** M1 workbench: the existing solo Manager is the only live data source here. */
@@ -577,7 +579,15 @@ export default function WorkbenchPage() {
 							</div>
 							<section className="m1-workbench-new-work" aria-label="发起新工作">
 								<label htmlFor="m1-new-work">发起新工作</label>
-								<textarea id="m1-new-work" ref={newWorkInput} value={draftReady ? draft : ""} onChange={(event) => updateDraft(event.target.value)} onKeyDown={(event) => {
+								<textarea id="m1-new-work" ref={newWorkInput} value={draftReady ? draft : ""} onChange={(event) => updateDraft(event.target.value)} onPaste={(event) => {
+									const files = Array.from(event.clipboardData.items)
+										.filter((item) => item.kind === "file")
+										.map((item) => item.getAsFile())
+										.filter((file): file is File => Boolean(file));
+									if (!files.length) return;
+									event.preventDefault();
+									updateAttachments([...workAttachments, ...files]);
+								}} onKeyDown={(event) => {
 									if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229 || event.repeat) return;
 									event.preventDefault();
 									void submitNewWork();

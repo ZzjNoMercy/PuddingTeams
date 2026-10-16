@@ -9,7 +9,7 @@ export interface CurationStatusSnapshot {
 }
 export type CurationStatusReader = (ownerId: string, jobId: string) => Promise<CurationStatusSnapshot | undefined>;
 export const curationStatusParameters = Type.Object({ jobId: Type.String({ minLength: 1, maxLength: 200 }) });
-export const curationStatusDescription = "按 jobId 查询知识整理任务的真实状态与审核入口，只读且不会重新提交。executionMode=worker由来源聊天的当前知识管家执行，background由后台任务执行。queued/running/submitting尚未生成审核候选，应查看原执行过程或状态卡，不能当作失败退回或重复发起整理；不要在 Wiki 正文中搜索 jobId。";
+export const curationStatusDescription = "按 jobId 查询知识整理任务的真实状态与审核入口，只读且不会重新提交。executionMode=worker由来源聊天的当前会话执行，background由后台任务执行。queued/running/submitting尚未生成审核候选，应查看原执行过程或状态卡，不能当作失败退回或重复发起整理；不要在 Wiki 正文中搜索 jobId。";
 
 const short = (value: string | undefined, max = 200) => typeof value === "string" ? value.slice(0, max) : undefined;
 const count = (value: number) => Number.isFinite(value) ? Math.min(100_000, Math.max(0, Math.floor(value))) : 0;
@@ -36,6 +36,6 @@ export function createCurationStatusTool(resolve: () => Promise<{ surface: Knowl
     errorCategory: oneOf(d.errorCategory, ["timeout", "provider_error", "aborted", "output_limit", "no_submission"]),
     validationErrors: d.validationErrors?.filter(code => /^(invalid_directory|unknown_type|(invalid|missing|missing_source):[A-Za-z_][A-Za-z0-9_-]{0,100})$/.test(code)).slice(0, 20) } : undefined;
    return { content: [{ type: "text" as const, text: JSON.stringify({ executionMode: oneOf(record.executionMode, ["worker", "background"]), recoveryRevision: count(record.recoveryRevision ?? 0), jobId: short(jobId), status: short(status, 40), jobUrl: short(jobUrl, 2048), message: short(message, 1000), reviewUrl: short(reviewUrl, 2048), failureCode: short(failureCode, 500), createdAt: short(createdAt, 64), updatedAt: short(updatedAt, 64), reviewStatus: oneOf(record.reviewStatus, ["candidate", "pending_review", "approved", "rejected", "returned", "publishing", "published", "conflict", "failed"]), reviewClosed: record.reviewClosed === true, reviewUpdatedAt: short(record.reviewUpdatedAt, 64), diagnostics,
-    nextAction: ["queued", "running", "submitting"].includes(status) ? record.executionMode === "worker" ? "来源聊天的知识管家继续执行；查看本次执行过程或状态卡，不重复提交，不因尚未完成而退回修订。" : "原任务继续执行；等待状态卡或稍后查询，不重复提交，不因尚未完成而退回修订。" : "按真实结果处理；候选生成完成不代表已经审核或发布。" }) }], details: {} };
+    nextAction: ["queued", "running", "submitting"].includes(status) ? record.executionMode === "worker" ? "来源聊天的当前会话继续执行；查看本次执行过程或状态卡，不重复提交，不因尚未完成而退回修订。" : "原任务继续执行；等待状态卡或稍后查询，不重复提交，不因尚未完成而退回修订。" : "按真实结果处理；候选生成完成不代表已经审核或发布。" }) }], details: {} };
   } });
 }

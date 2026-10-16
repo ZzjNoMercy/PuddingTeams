@@ -137,6 +137,6 @@ export function WebResearchSettingsPanel() {
   </section>}
   </div>
   {error && <div className="network-error" role="alert"><AlertCircleIcon /><p>{error}</p><Button size="sm" variant="ghost" disabled={Boolean(busy)} onClick={() => void load()}>重新读取</Button></div>}
-  <div className="network-save-bar"><span>{dirty ? section === "providers" ? "有未保存的修改，可直接测试并保存" : "有未保存的修改，请点击上方保存设置" : "密钥统一管理 · 联网按 Worker 授权"}</span></div>
+  {dirty && <div className="network-save-bar"><span>{section === "providers" ? "有未保存的修改，可直接测试并保存" : "有未保存的修改，请点击上方保存设置"}</span></div>}
  </div>;
 }

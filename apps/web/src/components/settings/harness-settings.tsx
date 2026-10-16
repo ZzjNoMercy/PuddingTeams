@@ -55,7 +55,7 @@ export function HarnessSettingsPanel({ selectedTab, onTabChange }: { selectedTab
 	const [value, setValue] = useState<HarnessSettings>({
 		codeSearch: { defaultProvider: "builtin" },
 		workerResults: defaults,
-		goalActivation: { solo: "manager_explicit", group: "manager_explicit", direct: "user_explicit", confirmWhenAmbiguous: true },
+		goalActivation: { solo: "user_explicit", group: "user_explicit", direct: "user_explicit" },
 		goalRecovery: { mode: "safe_auto", directMode: "manual", resumeLeaseMs: 30_000, operationRetentionDays: 30, maxOperationsPerSession: 512 },
 		verification: {
 			enabled: true, defaultWorkItemMode: "manager_review", defaultFinalGoalMode: "independent_evidence_review", trigger: "manager_request",
@@ -197,9 +197,8 @@ export function HarnessSettingsPanel({ selectedTab, onTabChange }: { selectedTab
 			{tab === "activation" ? <div className="harness-settings-pane">
 				<h3 className="text-sm font-medium">Goal 激活</h3>
 				<div className="grid gap-3 sm:grid-cols-2">
-					{(["solo", "group"] as const).map((kind) => <label key={kind} className="space-y-1.5 text-xs"><span className="font-medium">{kind}</span><select className="h-9 w-full rounded-md border bg-background px-2" value={value.goalActivation[kind]} onChange={(event) => setValue((current) => ({ ...current, goalActivation: { ...current.goalActivation, [kind]: event.target.value as HarnessSettings["goalActivation"][typeof kind] } }))}><option value="manager_explicit">Manager 显式创建</option><option value="user_explicit">仅用户显式创建</option><option value="disabled">禁用</option></select></label>)}
+					{(["solo", "group"] as const).map((kind) => <label key={kind} className="space-y-1.5 text-xs"><span className="font-medium">{kind}</span><select className="h-9 w-full rounded-md border bg-background px-2" value={value.goalActivation[kind]} onChange={(event) => setValue((current) => ({ ...current, goalActivation: { ...current.goalActivation, [kind]: event.target.value as HarnessSettings["goalActivation"][typeof kind] } }))}><option value="user_explicit">仅用户显式创建</option><option value="disabled">禁用</option></select></label>)}
 					<label className="space-y-1.5 text-xs"><span className="font-medium">direct</span><select className="h-9 w-full rounded-md border bg-background px-2" value={value.goalActivation.direct} onChange={(event) => setValue((current) => ({ ...current, goalActivation: { ...current.goalActivation, direct: event.target.value as "user_explicit" | "disabled" } }))}><option value="user_explicit">仅用户显式创建</option><option value="disabled">禁用</option></select></label>
-					<label className="flex items-center gap-2 self-end pb-2 text-xs"><input type="checkbox" checked={value.goalActivation.confirmWhenAmbiguous} onChange={(event) => setValue((current) => ({ ...current, goalActivation: { ...current.goalActivation, confirmWhenAmbiguous: event.target.checked } }))} />目标含糊时先确认</label>
 				</div>
 			</div> : null}
 			{tab === "recovery" ? <div className="harness-settings-pane">

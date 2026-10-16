@@ -122,7 +122,7 @@ test("房间执行过程索引：按当前 manager session 返回并保留并行
 	await app.close();
 });
 
-test("房间执行过程索引：manager 房间与镜像 worker 单聊都能看到同一委托", async () => {
+test("房间执行过程索引：按来源会话查询，不从旧镜像卡推导执行身份", async () => {
 	const { app, delegations, dir } = await makeStack();
 	const managerSessionId = "manager-current";
 	const directSession = SessionManager.create(dir, dir);
@@ -165,11 +165,11 @@ test("房间执行过程索引：manager 房间与镜像 worker 单聊都能看�
 		method: "GET",
 		url: `/api/rooms/worker-direct/delegation-processes?managerSessionId=${directSession.getSessionId()}`,
 	});
-	assert.deepEqual(directView.json().delegations.map((item: { delegationId: string }) => item.delegationId), [delegation.id]);
+	assert.deepEqual(directView.json().delegations, []);
 	await app.close();
 });
 
-test("房间执行过程索引：旧委托从聊天镜像恢复任务摘要", async () => {
+test("房间执行过程索引：不读取旧聊天镜像修补台账摘要", async () => {
 	const { app, delegations, dir } = await makeStack();
 	const manager = SessionManager.create(dir, dir);
 	manager.appendMessage({ role: "user", content: "安排旧任务", timestamp: Date.now() } as never);
@@ -203,7 +203,7 @@ test("房间执行过程索引：旧委托从聊天镜像恢复任务摘要", as
 		url: `/api/rooms/w1/delegation-processes?managerSessionId=${manager.getSessionId()}`,
 	});
 	assert.equal(response.statusCode, 200, response.body);
-	assert.equal(response.json().delegations[0]?.task, "核对旧任务的时间线摘要");
+	assert.equal(response.json().delegations[0]?.task, undefined);
 	await app.close();
 });
 
@@ -440,4 +440,23 @@ test("Goal v5：历史 Goal 的 Delegation 只能查看，不能再取消", asyn
 	assert.deepEqual(cancellations, []);
 	assert.equal((await delegations.getDelegation(delegation.id))?.executionState, "admitted");
 	await app.close();
+});
+
+test("execution ledger index filters source, worker, workspace and Goal without chat mirrors", async () => {
+ const { app, delegations, dir } = await makeStack();
+ try {
+  const expected = await delegations.createDelegation({cwdSnapshot:dir,windowId:"direct-execution",managerSessionId:"source-a",agentId:"codex",agentRevision:0,operation:"run",workspaceId:"project-a",goalId:"goal-a",task:"review proof"});
+  await delegations.createDelegation({cwdSnapshot:dir,windowId:"direct-execution",managerSessionId:"source-b",agentId:"codex",agentRevision:0,operation:"run",workspaceId:"project-a",goalId:"goal-b"});
+  const query="sourceSessionId=source-a&workerId=codex&workspaceId=project-a&goalId=goal-a";
+  const records=(await app.inject(`/api/delegation-records?${query}`)).json().delegations;
+  assert.deepEqual(records.map((row:{delegationId:string})=>row.delegationId),[expected.id]);
+  assert.equal(records[0].task,"review proof");
+  for(const suffix of ["&workerId=other","&workspaceId=other","&goalId=other","&sourceSessionId=other"]) {
+   // Replace each individual filter rather than sending ambiguous duplicate query keys.
+   const params=new URLSearchParams(query); const [key,value]=suffix.slice(1).split("=");params.set(key!,value!);
+   assert.deepEqual((await app.inject(`/api/delegation-records?${params}`)).json().delegations,[]);
+  }
+  assert.deepEqual((await app.inject("/api/rooms/solo/delegation-processes?managerSessionId=source-a")).json().delegations.map((row:{delegationId:string})=>row.delegationId),[expected.id]);
+  assert.deepEqual((await app.inject("/api/rooms/direct-execution/delegation-processes?managerSessionId=source-b")).json().delegations.map((row:{delegationId:string})=>row.delegationId).length,1);
+ } finally {await app.close();}
 });

@@ -1,6 +1,6 @@
-# Agent 会话收敛：P1–P3 开发与验收进度
+# Agent 会话收敛：P1–P4 开发与验证进度
 
-日期：2026-10-14。实现基线：main `f2e5fc4`（Pi SDK 1.2.0、pi-mcp-adapter 5.3.0）。本文随本次实现提交入库；详细接力报告与截图按仓库约定仅保留在本地 `.pudding/handoff/`。
+更新：2026-10-15。实现基线：main `f2e5fc4`（Pi SDK 1.2.0、pi-mcp-adapter 5.3.0）。本文随本次实现提交入库；详细接力报告与截图按仓库约定仅保留在本地 `.pudding/handoff/`。
 
 ## 当前状态
 
@@ -9,7 +9,7 @@
 | P1 | Manager 原生能力、执行证据、群聊 Worker 范围 | 已完成并验收 |
 | P2 | 单次统一 delegation、审批、结果投递、过程查询 | 已完成并验收 |
 | P3 | Worker 原生单聊、followUp、steer、不可变快照 Fork | 已完成并验收 |
-| P4 | 旧入口与结构清理、统一文档、最终全量验收 | 未开始 |
+| P4 | 旧入口清理、统一 UI/诊断、事实源与公开文档 | 开发及本轮验证完成，证据分层记录 |
 
 ## 已实现的行为
 
@@ -38,10 +38,12 @@ P3 最终 e2e 验收报告记录：
 
 证据来源：本地 `2026-10-14-pre-p3-message-recovery-fixes.md`、`2026-10-14-phase3-development-verification.md`、`2026-10-14-p3-native-conversation-e2e.md` 与 `phase3-verification-summary.json`。此次提交前只做差异格式与提交范围检查，未重新执行完整验收。
 
-## P4 剩余工作
+## P4 落地（2026-10-15）
 
-1. 按实际源码核对并删除旧委派输入队列、双 Session 视图、旧镜像、失效端点与类型；保留 Driver 执行态、HITL、trace、Receipt/ChangeSet 和只读过程查询。
-2. 统一原生会话菜单、按 owner 生效的设置、执行记录诊断入口及内部/公开文档。
-3. 逐项完成 A01–A25 最终验收，记录自动化、真实 SDK 与浏览器证据的边界。
+删除委派输入队列、执行会话管理/聊天路由、双分组/workerView/查看指针与旧内联显示；只读过程独立到 worker-process-session。新增基于来源会话的执行索引、全局执行搜索和旧数据元信息诊断。保留 Driver 的真实执行/审批/连续性和审计事实；非 Pi 单聊适配仍有实际用途，不为清理而破坏它。用户旧数据不自动迁移、读取补投或删除。
 
-P4 清理不包括删除用户旧数据；提交代码不等于发版。本次仅将已验收的 P1–P3 进度提交并推送，不启动 P4、不发布安装包。
+本轮 verify:release exit0（server1122/1122、Electron12/12、Web/docs检查与runtime构建），Web全量175/175。33项安装矩阵首轮32/33，新增DELETE检查请求体修正后单项通过。UI收尾修复搜索详情被卸载和阅读位置被卸载几何覆盖，后续前端检查/构建及真实浏览器复验通过；阅读位置切换、刷新、任务完成均2050→2050。最后受影响路由与server类型检查另行复验。
+
+A01–A25逐项记录T1/T2/T3与沿用P3证据；不把fixture解释为真实外部模型验证，不声称每个故障点都有SIGKILL或T3覆盖。完整矩阵早于末次UI修复，后者按影响面复验，未写成最终包全33项重跑。
+
+P4改动尚未提交、推送或发版；P1–P3的210b152保持不变。详细报告和证据位于本地 `.pudding/handoff/2026-10-15-p4-development-verification.md`、`2026-10-15-p4-acceptance-evidence-index.md` 与 `p4-verification/`。

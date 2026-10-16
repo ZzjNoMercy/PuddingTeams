@@ -5,7 +5,7 @@ import type { PiSessionStore } from "./session-store.js";
 import type { MessageSubmissionOperations, NativeMessageReceipt } from "../store/message-submission-operations.js";
 import type { ChatKnowledgeIntake, ChatSourceRefs } from "../knowledge/chat-intake.js";
 
-type Pending = { key: string; hash: string; contextHash: string; text: string; refs?: ChatSourceRefs; prior: Set<string>; receipt?: NativeMessageReceipt };
+type Pending = { key: string; hash: string; contextHash: string; text: string; refs?: ChatSourceRefs; prior: Set<string>; receipt?: NativeMessageReceipt; attachmentNames?: string[]; hasImages?: boolean };
 const textOf = (content: unknown) => typeof content === "string" ? content.trim() : Array.isArray(content) ? content.filter(part => part.type === "text").map(part => part.text).join("\n").trim() : "";
 
 /** Observes the SDK queue. It never schedules or replays a queued message. */
@@ -16,7 +16,7 @@ export class NativeInput {
  private watched = new Map<string,()=>void>();
  private seen = new Map<string, Set<string>>();
  constructor(private store: PiSessionStore, private operations?: MessageSubmissionOperations, private intakes?: ChatKnowledgeIntake) {
-  store.setNativeInputLifecycle(id => this.hasPending(id), id => this.cancel(id));
+  store.setNativeInputLifecycle(id => this.hasPending(id), id => this.cancel(id), id => this.queued(id));
   store.setBeforeNativeStream(async session => { await store.ensureSessionFile(session.sessionId); await this.observe(session); await intakes?.admitManager(session); });
  }
  async hasPending(id: string) {
@@ -29,6 +29,7 @@ export class NativeInput {
  async cancel(id: string) {
   for (const row of await this.operations?.pending(id) ?? []) await this.operations!.markAccepted(row.key, id, row.requestHash, { ...row.receipt!, terminal: "cancelled_unconfirmed" });
   this.pending.delete(id);this.seen.delete(id);this.watched.get(id)?.();this.watched.delete(id);
+  this.store.notifyQueueChanged(id);
  }
  async replay(key: string) {
   const record = await this.operations?.get(key);
@@ -39,6 +40,29 @@ export class NativeInput {
   return receipt;
  }
  reject(id: string, key: string) { this.pending.get(id)?.delete(key); }
+ /** Queued (not yet delivered) inputs for UI display and queued-input actions. */
+ queued(id: string): { key: string; text: string; delivery: "followUp" | "steer"; attachmentNames: string[]; hasImages: boolean }[] {
+  return [...(this.pending.get(id)?.values() ?? [])]
+   .filter(item => item.receipt?.disposition === "queued")
+   .map(item => ({ key: item.key, text: item.text, delivery: item.receipt!.delivery as "followUp" | "steer", attachmentNames: item.attachmentNames ?? [], hasImages: item.hasImages === true }));
+ }
+ /** Mark a queued input as cancelled (removed from the SDK queue by the caller). */
+ async dropQueued(id: string, key: string) {
+  const item = this.pending.get(id)?.get(key);
+  if (!item?.receipt) return false;
+  this.pending.get(id)?.delete(key);
+  await this.operations?.markAccepted(key, id, item.hash, { ...item.receipt, terminal: "cancelled_unconfirmed" });
+  this.store.notifyQueueChanged(id);
+  return true;
+ }
+ /** Re-label a queued input as steering after the caller rebuilt the SDK queue. */
+ async resteerQueued(id: string, key: string) {
+  const item = this.pending.get(id)?.get(key);
+  if (!item?.receipt) return false;
+  await this.accept(id, key, item.hash, { disposition: "queued", delivery: "steer", persistence: "pending" });
+  this.store.notifyQueueChanged(id);
+  return true;
+ }
  track(session: AgentSession, input: Omit<Pending, "prior"> & {delivery: "followUp" | "steer"}) {
   let entries = this.pending.get(session.sessionId); if (!entries) this.pending.set(session.sessionId, entries = new Map());
   entries.set(input.key, { ...input, receipt:{operationId:input.key,processId:this.processId,disposition:"queued",delivery:input.delivery,persistence:"pending"}, prior: new Set(session.sessionManager.getBranch().map(entry => entry.id)) });
@@ -50,6 +74,7 @@ export class NativeInput {
   if (result.disposition !== "queued") this.pending.get(id)?.delete(key);
   await this.operations?.markAccepted(key, id, hash, result);
   if (result.disposition === "queued") await this.observe(await this.store.open(id));
+  this.store.notifyQueueChanged(id);
   return (await this.operations?.get(key))?.receipt ?? result;
  }
  watch(id: string) {
@@ -80,6 +105,7 @@ export class NativeInput {
    await this.store.appendMessageAdmission(session.sessionId, { operationId: item.key, requestHash: item.hash, contextHash: item.contextHash, userEntryId: entry.id });
    await this.operations?.markAccepted(item.key, session.sessionId, item.hash, { ...item.receipt!, persistence: "durable", userEntryId: entry.id });
    entries.delete(item.key); seen.add(entry.id);
+   this.store.notifyQueueChanged(session.sessionId);
   }
  }
 }

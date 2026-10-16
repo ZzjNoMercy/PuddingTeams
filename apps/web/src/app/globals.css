@@ -1807,15 +1807,21 @@ html[data-reduce-motion="true"] *::after {
 /* 头像编辑行沿用产品能力（原型没有上传入口），但说明文字回到配置页的 10px 灰阶。 */
 .agent-config-avatar p { margin-top: 6px; color: var(--config-muted); font-size: 10px; line-height: 1.7; }
 
-/* 开关行：标签 + 说明在左，右侧原生开关（原型 toggle-row）。 */
+/* 设置条目统一使用 config-surface：浅色为白色，深色为抬升的墨色底。
+   分区标题仍留在画布上，不给整段说明再套一层卡片。 */
 .agent-config-toggle {
 	display: flex;
 	align-items: center;
 	gap: 20px;
-	padding: 16px 0;
+	padding: 16px;
+	border: 1px solid var(--config-line);
+	border-radius: 10px;
+	background: var(--config-surface);
+	transition: background 150ms ease;
 	cursor: pointer;
 }
-.agent-config-toggle + .agent-config-toggle { border-top: 1px solid var(--config-line); }
+.agent-config-toggle + .agent-config-toggle { margin-top: 8px; }
+.agent-config-toggle:not(:has(input:disabled)):hover { background: var(--config-raised); }
 .agent-config-toggle > span { flex: 1; }
 .agent-config-toggle strong { display: block; font-size: 12px; font-weight:500; }
 .agent-config-toggle small { display: block; margin-top: 5px; color: var(--config-muted); font-size: 11px; line-height: 1.6; }
@@ -1851,8 +1857,8 @@ html[data-reduce-motion="true"] *::after {
 .agent-config-toggle:has(input:disabled) { cursor: not-allowed; opacity: .6; }
 .agent-config-toggle-note { margin-top: 5px; color: var(--config-muted); font-size: 11px; line-height: 1.6; }
 
-/* 勾选列表（技能 / 模板 / MCP 选用范围）：原型 choice-line —— 勾选框 + 名称说明 + 右侧状态。 */
-.agent-config-choice-list { display: flex; flex-direction: column; }
+/* 技能 / 模板 / MCP 与工具目录共享有底色的分组列表，条目用分隔线而非叠加卡片。 */
+.agent-config-choice-list { display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--config-line); border-radius: 10px; background: var(--config-surface); }
 .agent-config-resource-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .agent-config-resource-search { position: relative; width: min(320px, 100%); }
 .agent-config-resource-search > svg { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--config-muted); pointer-events: none; }
@@ -1863,12 +1869,15 @@ html[data-reduce-motion="true"] *::after {
 .agent-config-disclosure-trigger:focus-visible:not([data-pointer-focus="true"]) { outline: 2px solid var(--config-accent); outline-offset: 3px; border-radius: 4px; }
 .agent-config-choice {
 	display: flex;
+	min-width: 0;
 	align-items: center;
 	gap: 12px;
-	padding: 19px 0;
+	padding: 16px;
+	transition: background 150ms ease;
 	cursor: pointer;
 }
-.agent-config-choice + .agent-config-choice { border-top: 1px solid color-mix(in oklab, var(--config-line) 60%, transparent); }
+.agent-config-choice + .agent-config-choice { border-top: 1px solid var(--config-line); }
+.agent-config-choice:not(:has(input:disabled)):hover { background: var(--config-raised); }
 .agent-config-choice > input { width: 15px; height: 15px; flex: 0 0 15px; margin: 0; accent-color: var(--config-accent); }
 .agent-config-choice > input:focus-visible:not([data-pointer-focus="true"]) { outline: 2px solid var(--config-accent); outline-offset: 3px; }
 .agent-config-choice:has(input:disabled) { cursor: not-allowed; opacity: .55; }
@@ -3415,6 +3424,7 @@ body {
 .nav-rail {
 	width: 4.25rem;
 	align-items: center;
+	font-family: var(--home-font-sans);
 	overflow: hidden;
 }
 
@@ -3457,6 +3467,7 @@ body {
 }
 
 .nav-brand-name {
+	display: none;
 	color: var(--foreground);
 	font-size: 0.875rem;
 	font-weight:600;
@@ -3543,6 +3554,7 @@ body {
    .home-shell 之外，且 /agents 等页面没有 .home-shell 祖先，全局默认值保证
    菜单皮肤（.home-menu / .home-session-menu）在任何页面都不透明不失色。 */
 :root {
+	--home-font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Noto Sans SC", sans-serif;
 	--home-canvas: #eef3f5;
 	--home-surface-0: #f9fbfc;
 	--home-surface-1: #f3f7f8;
@@ -3610,7 +3622,7 @@ body {
 	overflow: hidden;
 	background: var(--home-canvas);
 	color: var(--home-text);
-	font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Noto Sans SC", sans-serif;
+	font-family: var(--home-font-sans);
 	scrollbar-color: var(--home-scrollbar-thumb) transparent;
 	scrollbar-width: thin;
 }
@@ -4286,94 +4298,6 @@ button.nav-user:focus-visible:not([data-pointer-focus="true"]) {
 .home-session-menu-new:focus,
 .home-session-menu-new:hover { background: var(--home-soft-hover); color: var(--home-text); }
 .home-session-menu-new svg { width: 13px; height: 13px; color: var(--home-text-3) !important; }
-.home-session-menu-group {
-	padding: 7px 9px 4px;
-	color: var(--home-text-3);
-	font-size: 10px;
-	font-weight: 600;
-	letter-spacing: 0.04em;
-	line-height: 1.4;
-}
-.home-session-menu-dot {
-	flex-shrink: 0;
-	align-self: center;
-	width: 6px;
-	height: 6px;
-	margin: 0 2px;
-	border-radius: 999px;
-	background: var(--home-accent, currentColor);
-	animation: home-session-menu-dot-pulse 1.6s ease-in-out infinite;
-}
-@keyframes home-session-menu-dot-pulse {
-	0%, 100% { opacity: 1; }
-	50% { opacity: 0.35; }
-}
-
-/* 委派镜像卡（task_assign/task_result）上的「打开对应会话」入口。 */
-.home-open-worker-session {
-	display: inline-flex;
-	align-items: center;
-	gap: 4px;
-	margin-top: 6px;
-	padding: 3px 8px;
-	border-radius: 7px;
-	color: var(--home-text-3);
-	font-size: 11px;
-	line-height: 1.4;
-	transition: color 120ms ease, background 120ms ease;
-}
-.home-open-worker-session:hover { background: var(--home-soft-hover); color: var(--home-text); }
-.home-open-worker-session svg { width: 12px; height: 12px; }
-
-/* Worker 执行会话视图：排队中的用户输入渲染为灰态待发送气泡（对齐用户气泡侧）。 */
-.home-queued-list {
-	display: flex;
-	flex-direction: column;
-	align-items: flex-end;
-	gap: 8px;
-	margin-top: 8px;
-}
-.home-queued-message {
-	display: flex;
-	align-items: flex-start;
-	gap: 6px;
-	max-width: 560px;
-	padding: 10px 12px;
-	border-radius: 14px;
-	background: var(--home-soft-hover);
-	opacity: 0.72;
-}
-.home-queued-message.is-failed {
-	background: color-mix(in oklab, #db5454 10%, transparent);
-	opacity: 1;
-}
-.home-queued-message-body { min-width: 0; }
-.home-queued-message-status {
-	color: var(--home-text-3);
-	font-size: 10px;
-	line-height: 1.4;
-}
-.home-queued-message.is-failed .home-queued-message-status { color: #db5454; }
-.home-queued-message-text {
-	margin-top: 2px;
-	font-size: 13px;
-	line-height: 1.55;
-	white-space: pre-wrap;
-	word-break: break-word;
-}
-.home-queued-message-cancel {
-	display: grid;
-	flex-shrink: 0;
-	width: 20px;
-	height: 20px;
-	place-items: center;
-	border-radius: 6px;
-	color: var(--home-text-3);
-	transition: color 120ms ease, background 120ms ease;
-}
-.home-queued-message-cancel:hover { background: var(--home-soft-hover); color: var(--home-text); }
-.home-queued-message-cancel svg { width: 12px; height: 12px; }
-
 .home-session-chat { width: 100%; max-width: 100%; min-width: 0; overflow: hidden; }
 .conversation-scroll-viewport {
 	box-sizing: border-box;
@@ -4841,6 +4765,25 @@ button.nav-user:focus-visible:not([data-pointer-focus="true"]) {
 .home-composer-status { min-width: 0; flex: 1; padding-inline: 4px; color: var(--muted-foreground); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .home-composer-status:empty { display: none; }
 .home-composer-send { display: flex; flex-shrink: 0; align-items: center; gap: 4px; }
+/* 排队中的原生输入（followUp/steer），投递前显示在转录底部，可引导插队或删除。 */
+.home-queued-list { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; margin-top: 12px; }
+.home-queued-message { box-sizing: border-box; display: flex; flex-direction: column; gap: 8px; width: min(400px, 100%); min-width: 0; padding: 10px 12px 12px; border: 1px solid var(--home-line); border-radius: 12px; background: var(--home-composer-surface); color: var(--home-text); }
+.home-queued-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; }
+.home-queued-status { display: flex; align-items: center; gap: 6px; flex-shrink: 0; color: var(--home-text-3); font-size: 11px; line-height: 1.5; white-space: nowrap; }
+.home-queued-status svg { flex-shrink: 0; }
+.home-queued-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; margin-left: auto; }
+.home-queued-action { display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-height: 28px; flex-shrink: 0; border: 0; border-radius: 6px; padding: 4px 7px; color: var(--home-text-3); font-size: 11px; line-height: 1.4; cursor: pointer; transition: background 120ms ease, color 120ms ease; }
+.home-queued-steer { background: var(--home-soft); color: var(--home-accent-text); }
+.home-queued-steer:hover:not(:disabled) { background: var(--home-soft-hover); }
+.home-queued-remove { width: 28px; padding: 0; background: transparent; }
+.home-queued-remove:hover:not(:disabled) { background: color-mix(in oklab, var(--home-danger) 9%, transparent); color: var(--home-danger); }
+.home-queued-action:focus-visible:not([data-pointer-focus="true"]) { outline: 2px solid var(--home-accent); outline-offset: 2px; }
+.home-queued-action:disabled { opacity: .45; cursor: default; }
+.home-queued-message .home-queued-text { min-width: 0; max-height: 128px; overflow-y: auto; scrollbar-gutter: stable; padding-inline-end: 12px; margin: 0; color: var(--home-text); font-size: 13px; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
+.home-queued-attachments { display: flex; align-items: flex-start; gap: 6px; min-width: 0; margin: 0; color: var(--home-text-3); font-size: 11px; line-height: 1.6; }
+.home-queued-attachments svg { flex-shrink: 0; margin-top: 3px; }
+.home-queued-attachments span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media(max-width:480px) { .home-queued-message { width: 100%; padding: 10px; } .home-queued-header { gap: 8px; } .home-queued-action { min-height: 32px; } .home-queued-remove { width: 32px; } }
 /* 思考强度：与模型选择器同组的次级入口，视觉权重低于模型。 */
 .thinking-picker-trigger { color: var(--home-text-3) !important; }
 .thinking-picker-trigger:hover,
@@ -5382,9 +5325,9 @@ button.nav-user:focus-visible:not([data-pointer-focus="true"]) {
 .m1-app-shell .nav-item:focus-visible:not([data-pointer-focus="true"]) { outline:2px solid var(--home-accent); outline-offset:-2px; }
 .m1-app-shell .nav-item[aria-current="page"]::before { display:none; }
 .m1-app-shell .nav-label { display:inline; }
-.m1-app-shell .nav-brand-name { display:flex; flex-direction:column; gap:3px; color:var(--home-text); font-size:15px; line-height:1.2; letter-spacing:-.4px; }
+.m1-app-shell .nav-brand-name { display:flex; flex-direction:column; gap:6px; color:var(--home-text); font-size:15px; line-height:1.2; letter-spacing:-.4px; }
 .m1-app-shell .nav-brand-name strong { font-weight:600; }
-.m1-app-shell .nav-brand-caption { display:block; color:var(--home-text-3); font-size:7px; font-weight:400; letter-spacing:1.2px; white-space:nowrap; }
+.m1-app-shell .nav-brand-caption { display:block; color:var(--home-text-3); font-size:7px; font-weight:400; line-height:1.4; letter-spacing:1.2px; white-space:nowrap; }
 .m1-app-shell .nav-workbench-sub { display:inline; margin-left:auto; font-size:9px; opacity:.7; }
 .m1-app-shell .nav-user { width:100%; justify-content:flex-start; gap:10px; }
 .m1-app-shell .nav-user-row { display:flex; width:100%; align-items:center; gap:4px; }
@@ -5487,6 +5430,10 @@ html[data-sidebar="hidden"] .m1-app-shell .desktop-sidebar-stack.desktop-sidebar
 .m1-workbench-thinking-menu { max-height:min(360px,var(--radix-dropdown-menu-content-available-height)); max-width:min(240px,calc(100vw - 30px)); overflow-y:auto; }
 /* 未分级模型的如实说明：不选菜单项，不可点击。 */
 .thinking-picker-note { max-width:210px; padding:7px 9px 5px; color:var(--muted-foreground); font-size:10px; line-height:1.5; white-space:normal; }
+.model-provider-badge { flex-shrink:1; max-width:78px; overflow:hidden; text-overflow:ellipsis; border:1px solid currentColor; border-radius:4px; padding:0 4px; font-size:10px; opacity:.75; }
+.model-connection-details { display:grid; gap:4px; max-width:min(330px,calc(100vw - 40px)); padding:9px; margin-bottom:4px; border-bottom:1px solid var(--border); color:var(--muted-foreground); font-size:11px; line-height:1.5; white-space:normal; }
+.model-connection-details strong { color:var(--foreground); font-weight:600; }
+.model-connection-details code { overflow-wrap:anywhere; font-size:10px; }
 .m1-workbench-knowledge-menu { width:min(310px,calc(100vw - 30px)); max-height:min(360px,var(--radix-dropdown-menu-content-available-height)); overflow-y:auto; }
 .m1-workbench-knowledge-item { display:grid; min-width:0; gap:2px; }
 .m1-workbench-knowledge-item strong,.m1-workbench-knowledge-item small { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -6595,4 +6542,10 @@ textarea.knowledge-json-input:focus-visible:not([data-pointer-focus="true"]) { o
   .m1-app-shell .home-composer .thinking-picker-trigger {
     max-width: min(34vw, 100%);
   }
+}
+
+/* Chat navigation uses a drawer where both grouping and row actions need room. */
+@media (max-width:767px) {
+ .m1-app-shell .chat-navigation-backdrop { display:block; }
+ .m1-app-shell .m1-chat-content .home-open-rooms { display:inline-flex; }
 }

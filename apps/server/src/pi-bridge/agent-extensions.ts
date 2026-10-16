@@ -1,5 +1,5 @@
 import { projectDelegationResult } from "../agent-runtime/delegation-result-projection.js";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { Type, type Static } from "typebox";
 import type { ExtensionAPI, InlineExtension } from "@earendil-works/pi-coding-agent";
 import { eligibleWorkers, agentDisplayName, type TeamsStore, type AgentConfig, type WindowConfig, type WindowType } from "../store/teams.js";
@@ -50,20 +50,17 @@ export const CORE_TOOL_DELEGATION = "delegation";
 export const CORE_TOOL_SEARCH = "search_agent_tools";
 export const CORE_TOOL_UPDATE_WORK_STATE = "update_session_work_state";
 export const CORE_TOOL_REQUEST_DECISION = "request_human_decision";
-export const CORE_TOOL_CREATE_GOAL = "create_session_goal";
 export const CORE_TOOL_UPDATE_WORK_PLAN = "update_work_plan";
 export const CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM = "advance_manager_work_item";
 export const CORE_TOOL_REVIEW_WORK_ITEM = "review_work_item";
 export const CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION = "request_work_item_verification";
 export const CORE_TOOL_READ_DELEGATION_RESULT = "read_delegation_result";
 export const CORE_TOOL_ABANDON_GOAL = "abandon_session_goal";
-export const CORE_TOOL_SUPERSEDE_GOAL = "supersede_session_goal";
 /** solo：manager 自建群聊并下达首条任务（房间即群聊 §manager 建房）。 */
 export const CORE_TOOL_CREATE_GROUP = "create_group_window";
 /** group：拉其他已启用 worker 进本群（成员变化走既有撤权/重建链）。 */
 export const CORE_TOOL_INVITE = "invite_to_group";
-const GOAL_ACTIVE_TOOLS = [CORE_TOOL_UPDATE_WORK_STATE, CORE_TOOL_REQUEST_DECISION, CORE_TOOL_UPDATE_WORK_PLAN, CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM, CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION, CORE_TOOL_REVIEW_WORK_ITEM, CORE_TOOL_ABANDON_GOAL, CORE_TOOL_SUPERSEDE_GOAL] as const;
-const GOAL_CONTROLLED_TOOLS = [CORE_TOOL_CREATE_GOAL, ...GOAL_ACTIVE_TOOLS] as const;
+export const GOAL_ACTIVE_TOOLS = [CORE_TOOL_UPDATE_WORK_STATE, CORE_TOOL_REQUEST_DECISION, CORE_TOOL_UPDATE_WORK_PLAN, CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM, CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION, CORE_TOOL_REVIEW_WORK_ITEM, CORE_TOOL_ABANDON_GOAL] as const;
 
 /** manager Session 的窗口上下文（装配时解析，工具执行期按需重读）。 */
 export interface ManagerWindowContext {
@@ -126,13 +123,11 @@ export async function planManagerTools(
 		CORE_TOOL_DELEGATION,
 		CORE_TOOL_UPDATE_WORK_STATE,
 		CORE_TOOL_REQUEST_DECISION,
-		CORE_TOOL_CREATE_GOAL,
 		CORE_TOOL_UPDATE_WORK_PLAN,
 		CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM,
 		CORE_TOOL_REQUEST_WORK_ITEM_VERIFICATION,
 		CORE_TOOL_REVIEW_WORK_ITEM,
 		CORE_TOOL_ABANDON_GOAL,
-		CORE_TOOL_SUPERSEDE_GOAL,
 		CORE_TOOL_READ_DELEGATION_RESULT,
 		CORE_TOOL_CREATE_GROUP,
 		CORE_TOOL_INVITE,
@@ -140,15 +135,13 @@ export async function planManagerTools(
 	const active = new Set<string>([
 		CORE_TOOL_SEARCH,
 		CORE_TOOL_READ_DELEGATION_RESULT,
-		// Provider tool schemas are frozen before a model request starts. Goal
-		// handlers therefore have to be present before the request that may call
-		// create_session_goal; activating them from a context hook is too late for
-		// that same tool-use chain. Their execute handlers remain the authority for
-		// durable Goal/state gates, so keeping this bounded core surface active does
-		// not grant mutation permission by itself.
+		// Provider tool schemas are frozen before a model request starts, so Goal
+		// state-machine handlers must be active from the start; toggling them from
+		// a context hook is too late for the same tool-use chain. Goal 只能由用户
+		// 通过 /goal 或界面创建，Manager 工具面没有创建入口；这些工具的 execute
+		// handler 仍是 durable Goal/state 门禁的权威，常驻激活不授予任何写权限。
 		...GOAL_ACTIVE_TOOLS,
 	]);
-	if (!ctx || ctx.type !== "direct") active.add(CORE_TOOL_CREATE_GOAL);
 	// 窗口专属 core 工具：建房仅 solo，拉人仅 group（execute 内还有第二道门禁）。
 	if (solo) active.add(CORE_TOOL_CREATE_GROUP);
 	if (ctx?.type === "group") active.add(CORE_TOOL_INVITE);
@@ -266,48 +259,10 @@ const UpdateWorkStateParams = Type.Object({
 	}), { description: "manager 自审完成 Goal 时必填；逐条记录条件、证据与结论。" })),
 });
 
-const CreateGoalParams = Type.Object({
-	goal: Type.String({ description: "用户已经明确表达、需要持续追踪的目标。" }),
-	completionCriteria: Type.Array(Type.String({ minLength: 1 }), {
-		minItems: 1,
-		uniqueItems: true,
-		description: "用户已明确表达的完成条件数组；每个元素是一条独立条件，不得合并、拆分或增加新标准。",
-	}),
-	completionReviewMode: Type.Optional(Type.Union([Type.Literal("manager"), Type.Literal("independent")])),
-	activationReason: Type.String({ description: "为何该请求需要持续执行、追踪或多 Worker 协作。" }),
-	criteriaOrigin: Type.Union([Type.Literal("user_input"), Type.Literal("manager_derived")]),
-	sourceMessageIds: Type.Array(Type.String(), { minItems: 1, description: "目标与条件所依据的用户消息 id。" }),
-	verificationPolicy: Type.Optional(Type.Object({
-		minimumWorkItemMode: Type.Union([Type.Literal("manager_review"), Type.Literal("independent_evidence_review"), Type.Literal("environment_verified")]),
-		finalGoalMode: Type.Union([Type.Literal("manager_review"), Type.Literal("independent_evidence_review"), Type.Literal("environment_verified")]),
-		trigger: Type.Union([Type.Literal("manager_request"), Type.Literal("auto_on_submission")]),
-		source: Type.Union([Type.Literal("user"), Type.Literal("manager_derived")]),
-		reason: Type.String({ minLength: 1, description: "为何本 Goal 需要该验证强度；用户明确要求时 source=user。" }),
-	}, { description: "可显式提高 Harness 默认验证等级；Goal 生效后不能静默降低。" })),
-});
-
 const AbandonGoalParams = Type.Object({
 	goalId: Type.String({ description: "当前 Goal id。" }),
 	expectedRevision: Type.Integer({ minimum: 0 }),
 	reason: Type.String({ minLength: 1, description: "用户不再继续该 Goal 的明确原因。" }),
-});
-
-const SupersedeGoalParams = Type.Object({
-	goalId: Type.String({ description: "要被更换的当前 Goal id。" }),
-	expectedRevision: Type.Integer({ minimum: 0 }),
-	reason: Type.String({ minLength: 1, description: "为何新目标替代旧目标。" }),
-	goal: Type.String({ description: "用户已经明确表达的新目标。" }),
-	completionCriteria: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, uniqueItems: true }),
-	completionReviewMode: Type.Optional(Type.Union([Type.Literal("manager"), Type.Literal("independent")])),
-	criteriaOrigin: Type.Union([Type.Literal("user_input"), Type.Literal("manager_derived")]),
-	sourceMessageIds: Type.Array(Type.String(), { minItems: 1, description: "新目标所依据的用户消息 id。" }),
-	verificationPolicy: Type.Optional(Type.Object({
-		minimumWorkItemMode: Type.Union([Type.Literal("manager_review"), Type.Literal("independent_evidence_review"), Type.Literal("environment_verified")]),
-		finalGoalMode: Type.Union([Type.Literal("manager_review"), Type.Literal("independent_evidence_review"), Type.Literal("environment_verified")]),
-		trigger: Type.Union([Type.Literal("manager_request"), Type.Literal("auto_on_submission")]),
-		source: Type.Union([Type.Literal("user"), Type.Literal("manager_derived")]),
-		reason: Type.String({ minLength: 1 }),
-	})),
 });
 
 const UpdateWorkPlanParams = Type.Object({
@@ -652,12 +607,11 @@ export function rosterPromptSection(plan: ManagedToolPlan, ctx: ManagerWindowCon
 
 function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => void {
 	return (pi) => {
-		let latestUserSourceIds = new Set<string>();
 		let explicitGroupMessages = new Set<string>();
 		let explicitInviteMessages = new Set<string>();
 		let explicitStartMessages = new Set<string>();
 		pi.on("tool_call", async (event) => {
-			if (event.toolName === CORE_TOOL_ABANDON_GOAL || event.toolName === CORE_TOOL_SUPERSEDE_GOAL) return;
+			if (event.toolName === CORE_TOOL_ABANDON_GOAL) return;
 			if (event.toolName === CORE_TOOL_DELEGATION && await deps.invoker.toolCallRecord(deps.getSessionId(), event.toolCallId)) return;
 			const waiting = await managerHumanWait(deps.getSessionId(), deps.invoker, deps.workStates);
 			if (waiting) return { block: true, reason: waiting, terminate: true };
@@ -688,18 +642,10 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 			const harness = contextWindow && deps.productSettings ? (await deps.productSettings.get()).harness : undefined;
 			const goalActivation = harness?.goalActivation;
 			// Goal state-machine tools are part of the request's baseline provider
-			// schema (see planManagerTools). The context hook only controls whether a
-			// new Goal may be created; removing/re-adding the rest here cannot affect
-			// the already-frozen schema reliably and caused real same-turn planning
-			// loops in E2E.
-			const activeWithoutCreateGoal = pi.getActiveTools().filter((name) => name !== CORE_TOOL_CREATE_GOAL);
-			const mayCreateGoal = !workState && contextWindow && contextWindow.type !== "direct"
-				&& (goalActivation?.[contextWindow.type] ?? "manager_explicit") === "manager_explicit";
-			pi.setActiveTools([...new Set([
-				...activeWithoutCreateGoal,
-				...GOAL_ACTIVE_TOOLS,
-				...(mayCreateGoal ? [CORE_TOOL_CREATE_GOAL] : []),
-			])]);
+			// schema (see planManagerTools) and stay active regardless of whether a
+			// Goal exists; their execute handlers are the durable Goal gates. Goal
+			// 只能由用户通过 /goal 或界面创建，本 hook 不再做任何 Goal 工具的
+			// 激活切换（schema 冻结时机也使同轮切换不可靠，见 planManagerTools）。
 			const sourceMessageIds = modelMessages
 				.filter((message) => message.role === "user")
 				.slice(-5)
@@ -707,7 +653,6 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 					const timestamp = "timestamp" in message && typeof message.timestamp === "number" ? message.timestamp : index;
 					return `user:${timestamp}`;
 				});
-			latestUserSourceIds = new Set(sourceMessageIds);
 			explicitGroupMessages = new Set(); explicitInviteMessages = new Set(); explicitStartMessages = new Set();
 			const userMessages = modelMessages.filter((entry) => entry.role === "user").slice(-5);
 			userMessages.forEach((entry, index) => {
@@ -732,7 +677,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 				? [
 						"[PuddingTeams 当前工作上下文]",
 						"当前 Session 是一个需要持续负责的 Goal。manager 是唯一可更新当前工作状态的责任主体。",
-						`先判断本轮用户意图是否属于当前 Goal：相关追问、补充或约束变更才继续当前 Goal；无关的一次性问答正常回答且不得改写 Goal。用户明确不再继续时调用 ${CORE_TOOL_ABANDON_GOAL}；用户明确提出另一个持续目标或新请求明显取代旧目标时调用 ${CORE_TOOL_SUPERSEDE_GOAL}，禁止把新任务绑定到旧 WorkPlan。Goal 终态后可在同一 Session 创建新的 Goal，旧 Goal 保留为历史。`,
+						`先判断本轮用户意图是否属于当前 Goal：相关追问、补充或约束变更才继续当前 Goal；无关的一次性问答正常回答且不得改写 Goal。用户明确不再继续时调用 ${CORE_TOOL_ABANDON_GOAL}；用户明确提出另一个持续目标、新请求明显取代旧目标时，说明新 Goal 需要用户通过 /goal 或界面显式创建，禁止把新任务绑定到旧 WorkPlan。Goal 终态后用户可在同一 Session 创建新的 Goal，旧 Goal 保留为历史。`,
 						`目标：${workState.goal}`,
 						`完成边界：${workState.completionBoundary}`,
 						`完成复核：${workState.reviewMode === "independent" ? `独立 reviewer${workState.reviewerModel ? `（${workState.reviewerModel}）` : "（自动选择模型）"}` : "manager 自审"}`,
@@ -743,14 +688,12 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 						`冻结 Goal 完成条件（update_work_plan 的 sourceGoalCriterionIndexes 只填写 index）：\n${JSON.stringify(goalCriterionRefs(workState).map((item, index) => ({ index: index + 1, criterion: item.text })))}`,
 						...(harness ? [`Harness 新 WorkItem 默认：verification=${harness.verification.defaultWorkItemMode}/${harness.verification.trigger}；Git 写任务 workspace=${harness.workspaceExecution.gitWriteDefault}；非 Git 写任务 workspace=${harness.workspaceExecution.nonGitWriteDefault}。创建/修改 WorkItem 时必须按任务事实显式填写 verificationPolicy 与 workspaceExecutionPolicy：讨论/拆解可 manager_review+read_only_shared；调研证据至少 independent_evidence_review；代码、构建、页面和真实交付提高到 environment_verified；Git 写入按 Harness 默认 isolated_worktree/exclusive_write，非 Git 写入用 exclusive_write。Manager 可以自执行写任务，必须先开始自己的 WorkItem，保留真实 NativeExecution/ChangeSet，并遵守同样的冻结验收策略。`] : []),
 						...(workState.plan ? [`Manager WorkPlan（覆盖 Goal r${workState.plan.coveredGoalRevision}${workState.plan.needsReconcile ? "，必须先对账当前 Goal 契约" : ""}）：\n${planLines.join("\n") || "（全部已验收）"}`] : ["Manager WorkPlan：尚未建立。多步骤、依赖或多 Worker 任务先调用 update_work_plan。"]),
-						`Goal 状态写操作必须串行：一次只调用一个 ${CORE_TOOL_UPDATE_WORK_PLAN}/${CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM}/${CORE_TOOL_REVIEW_WORK_ITEM}/${CORE_TOOL_UPDATE_WORK_STATE}/${CORE_TOOL_ABANDON_GOAL}/${CORE_TOOL_SUPERSEDE_GOAL}，拿到新 revision 后再调用下一个，禁止在同一轮并行提交多个写操作。`,
+						`Goal 状态写操作必须串行：一次只调用一个 ${CORE_TOOL_UPDATE_WORK_PLAN}/${CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM}/${CORE_TOOL_REVIEW_WORK_ITEM}/${CORE_TOOL_UPDATE_WORK_STATE}/${CORE_TOOL_ABANDON_GOAL}，拿到新 revision 后再调用下一个，禁止在同一轮并行提交多个写操作。`,
 						`revision 只能来自本段权威工作上下文或上一个写工具的成功结果，禁止推算、递增猜测或复用委托开始前的 revision。${CORE_TOOL_REVIEW_WORK_ITEM} 必须原样携带当前 WorkItem 的 itemRevision、submissionId 和 Goal epoch；全局 revision 变化但验收目标未变时 Store 会安全对齐，目标或契约变化时必须重新阅读最新 Submission 后再判断。`,
 						`assignedAgentId=manager 的 WorkItem 开始时调用 ${CORE_TOOL_ADVANCE_MANAGER_WORK_ITEM} 标记 in_progress，完成交付后再标记 submitted，然后调用 ${CORE_TOOL_REVIEW_WORK_ITEM} 验收；不得删除 Manager 工作项绕过提交和验收。worker 委托完成只代表 submitted，同样必须明确验收。`,
 						`只有完成边界已满足且证据充分时才提交 status=resolved。manager 自审必须在 completionCriteria 中逐条原样回填全部冻结条件、证据和 satisfied 结论；独立复核 Goal 会启动隔离 reviewer。Worker 原生 input_required/respond 必须作为同一个 WorkItem、同一个 Delegation、同一个 Run 的暂停与恢复处理：不得拆成询问前后两个 WorkItem，用户通过审批卡回答后不得再发 followup、验证委托或替代委托。上游限流由 Runtime 在同一 Delegation/Session 内冷却续跑，不要因 429 立即重新委托。遇到产品/业务取舍时调用 ${CORE_TOOL_REQUEST_DECISION}。`,
 					].join("\n")
-				: contextWindow && goalActivation?.[contextWindow.type] === "manager_explicit"
-					? `[PuddingTeams 当前工作上下文]\n当前 Session 没有正在进行的 Goal。${latestGoal ? `最近结束的 Goal（${latestGoal.status}）：${latestGoal.goal}\n最终摘要：${latestGoal.currentBrief || "（尚未记录）"}\n用户若在追问其结果，基于同一 Session 上下文正常回答；若提出新的持续工作，创建新的 Goal，不得改写历史 Goal。` : ""}仅当用户已明确给出需要持续执行的结果与可判定完成边界时调用 ${CORE_TOOL_CREATE_GOAL}；问候、闲聊、一次性解释不创建，边界含糊${goalActivation.confirmWhenAmbiguous ? "先询问" : "时保持普通会话，除非用户补充明确边界"}。创建时 sourceMessageIds 只能从这些最近用户消息引用中选择：${sourceMessageIds.join("、") || "（当前请求无可引用消息）"}。若任务需要多步骤、写入或 Worker 协作，create_session_goal 成功后同一工具链的下一动作必须是用返回的 goalId/revision 调用 update_work_plan；不要用文字反复规划，也不要在 WorkPlan 建立前委托 Worker。`
-					: `[PuddingTeams 当前工作上下文]\n当前 Session 尚未设置 Goal，且 Harness 的 ${contextWindow?.type ?? "unknown"} 策略不允许 Manager 自动创建。保持普通会话；用户可通过 /goal/UI 显式创建（disabled 时界面请求也会被服务端拒绝）。不要调用 Goal 工具。`;
+				: `[PuddingTeams 当前工作上下文]\n当前 Session 没有进行中的 Goal。${latestGoal ? `最近结束的 Goal（${latestGoal.status}）：${latestGoal.goal}\n最终摘要：${latestGoal.currentBrief || "（尚未记录）"}\n用户若在追问其结果，基于同一 Session 上下文正常回答；若提出新的持续工作，由用户创建新的 Goal，不得改写历史 Goal。` : ""}Goal 只能由用户通过 /goal 或界面显式创建${contextWindow && goalActivation?.[contextWindow.type] === "disabled" ? "；当前 Harness 已禁用本窗口的 Goal，界面创建也会被服务端拒绝" : ""}。认为任务需要持续追踪时，用自然语言建议用户创建 Goal，不要调用任何 Goal 工具，也不要主动提及 Goal 机制。`;
 			return {
 				messages: [
 					...modelMessages,
@@ -859,47 +802,6 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 		});
 
 		pi.registerTool({
-			name: CORE_TOOL_CREATE_GOAL,
-			label: "Create Session Goal",
-			description: "把目标明确、需要持续执行或多 Worker 协作的请求显式设为 Goal。只能规范化用户已表达的完成条件；含糊时先询问。",
-			parameters: CreateGoalParams,
-			async execute(toolCallId, params: Static<typeof CreateGoalParams>, signal) {
-				await assertManagerNotWaiting(deps);
-				if (!deps.workStates) throw new Error("Session Work State 未启用");
-				throwIfAborted(signal);
-				const sessionId = deps.getSessionId();
-				const ctx = await deps.resolveContext();
-				if (!ctx || ctx.type === "direct") throw new Error("direct Session 只能由用户通过 /goal 创建 Goal");
-				const activation = deps.productSettings ? (await deps.productSettings.get()).harness.goalActivation[ctx.type] : "manager_explicit";
-				if (activation !== "manager_explicit") throw new Error(`当前 Harness goalActivation.${ctx.type}=${activation}，Manager 无权自动创建 Goal`);
-				const invalidSources = params.sourceMessageIds.filter((id) => !latestUserSourceIds.has(id));
-				if (invalidSources.length) throw new Error(`sourceMessageIds 不是当前上下文中的真实用户消息引用：${invalidSources.join("、")}`);
-				const completionCriteria = params.completionCriteria.map((criterion) => criterion.trim());
-				if (completionCriteria.some((criterion) => !criterion)) throw new Error("completionCriteria 不能包含空条件");
-				const state = await deps.workStates.create({
-					sessionId,
-					goal: params.goal,
-					completionBoundary: completionCriteria.join("\n"),
-					reviewMode: params.completionReviewMode,
-					participantAgentIds: ctx.members,
-					contractProvenance: {
-						criteriaOrigin: params.criteriaOrigin,
-						sourceMessageIds: params.sourceMessageIds,
-						...(params.criteriaOrigin === "manager_derived" ? { authoredByAgentId: "manager" } : {}),
-					},
-					verificationPolicy: params.verificationPolicy,
-					operationId: toolCallId,
-				});
-				const active = pi.getActiveTools().filter((name) => !(GOAL_CONTROLLED_TOOLS as readonly string[]).includes(name));
-				pi.setActiveTools([...new Set([...active, ...GOAL_ACTIVE_TOOLS])]);
-				return {
-					content: [{ type: "text", text: `已创建 Session Goal（goalId ${state.goalId}，revision ${state.revision}，epoch ${state.execution.epoch}）。后续多步骤工作先建立 WorkPlan。` }],
-					details: { workState: state, activationReason: params.activationReason },
-				};
-			},
-		});
-
-		pi.registerTool({
 			name: CORE_TOOL_ABANDON_GOAL,
 			label: "Abandon Session Goal",
 			description: "用户明确表示不再继续当前 Goal 时，将其关闭为废弃终态。会取消未终态 WorkItem、待处理决策和在飞委托；不要把暂时暂停当成废弃。",
@@ -918,48 +820,6 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 				}, toolCallId, params.goalId);
 				await Promise.all(active.map((item) => deps.invoker.cancel(item.id, signal).catch(() => undefined)));
 				return { content: [{ type: "text", text: `Goal 已废弃并关闭（goalId ${state.goalId}）。后续新任务不再受其 WorkPlan 门禁约束。` }], details: { workState: state } };
-			},
-		});
-
-		pi.registerTool({
-			name: CORE_TOOL_SUPERSEDE_GOAL,
-			label: "Supersede Session Goal",
-			description: "用户明确把持续目标换成另一件事时，原子地把旧 Goal 标为 superseded 并建立新 Goal。旧 Goal 的未验收 Submission 会作为 evidence gap 保留。",
-			parameters: SupersedeGoalParams,
-			async execute(toolCallId, params: Static<typeof SupersedeGoalParams>, signal) {
-				if (!deps.workStates) throw new Error("Session Work State 未启用");
-				throwIfAborted(signal);
-				const sessionId = deps.getSessionId();
-				const ctx = await deps.resolveContext();
-				if (!ctx || ctx.type === "direct") throw new Error("direct Session 只能由用户通过 Goal UI 更换 Goal");
-				const activation = deps.productSettings ? (await deps.productSettings.get()).harness.goalActivation[ctx.type] : "manager_explicit";
-				if (activation !== "manager_explicit") throw new Error(`当前 Harness goalActivation.${ctx.type}=${activation}，Manager 无权更换 Goal`);
-				if (!await deps.workStates.getGoal(sessionId, params.goalId)) throw new Error("Goal 不存在");
-				const invalidSources = params.sourceMessageIds.filter((id) => !latestUserSourceIds.has(id));
-				if (invalidSources.length) throw new Error(`sourceMessageIds 不是当前上下文中的真实用户消息引用：${invalidSources.join("、")}`);
-				const completionCriteria = params.completionCriteria.map((criterion) => criterion.trim());
-				if (completionCriteria.some((criterion) => !criterion)) throw new Error("completionCriteria 不能包含空条件");
-				const active = (await deps.invoker.delegationsForManagerSession(sessionId)).filter((item) => item.goalId === params.goalId && ["waiting_admission", "running", "waiting_input", "cancel_requested", "reconciling"].includes(item.executionState));
-				const result = await deps.workStates.supersedeGoal(sessionId, params.expectedRevision, {
-					by: "manager",
-					reason: params.reason,
-					delegationIds: active.map((item) => item.id),
-					goal: params.goal,
-					completionBoundary: completionCriteria.join("\n"),
-					reviewMode: params.completionReviewMode,
-					participantAgentIds: ctx.members,
-					contractProvenance: {
-						criteriaOrigin: params.criteriaOrigin,
-						sourceMessageIds: params.sourceMessageIds,
-						...(params.criteriaOrigin === "manager_derived" ? { authoredByAgentId: "manager" as const } : {}),
-					},
-					verificationPolicy: params.verificationPolicy,
-				}, toolCallId, params.goalId);
-				await Promise.all(active.map((item) => deps.invoker.cancel(item.id, signal).catch(() => undefined)));
-				return {
-					content: [{ type: "text", text: `旧 Goal 已标为 superseded，新 Goal 已建立（goalId ${result.workState.goalId}，revision ${result.workState.revision}）。多步骤工作下一步建立 WorkPlan。` }],
-					details: result,
-				};
 			},
 		});
 
@@ -1525,7 +1385,7 @@ function agentDelegationFactory(agents: AgentConfig[], deps: ManagerExtensionDep
 				if (!agent || !eligibleWorkers(await deps.store.listAgents(), context).some(candidate => candidate.name === agent.name)) throw new Error("worker_out_of_scope: Worker 不在当前可委派范围内");
 				const goal = deps.workStates ? await deps.workStates.getActive(sessionId) : undefined;
 				if (goal && !params.workItemId) {
-					if (goal.execution.status === "interrupted") throw new Error("当前 Goal 已暂停：若要继续旧目标请先恢复；若新任务取代旧目标，请先调用 supersede_session_goal；若旧目标不再继续，请调用 abandon_session_goal");
+					if (goal.execution.status === "interrupted") throw new Error("当前 Goal 已暂停：若要继续旧目标请先恢复；若新任务取代旧目标，请用户通过 /goal 或界面创建新 Goal；若旧目标不再继续，请调用 abandon_session_goal");
 					throw new Error("当前 Session 有正式 Goal，所有 Worker 委托必须先建立 WorkPlan 并绑定 workItemId");
 				}
 				if (params.workItemId && !goal?.plan?.items[params.workItemId]) throw new Error("workItemId 不属于当前 Goal WorkPlan");

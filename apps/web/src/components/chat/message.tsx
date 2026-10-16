@@ -5,7 +5,7 @@ import { KnowledgeJobCard } from "./knowledge-job-card";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { createContext, type ComponentProps, type ReactNode, useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { CheckIcon, ChevronDownIcon, ChevronRightIcon, CircleAlertIcon, CopyIcon, ExternalLinkIcon, FilePenIcon, FileSearchIcon, FileTextIcon, FolderIcon, ListTreeIcon, RotateCcwIcon, SquareIcon, SquareTerminalIcon, UserPlusIcon, UsersIcon, WrenchIcon } from "lucide-react";
+import { CheckIcon, ChevronDownIcon, ChevronRightIcon, CircleAlertIcon, CopyIcon, ExternalLinkIcon, FilePenIcon, FileSearchIcon, FileTextIcon, FolderIcon, ListTreeIcon, PauseIcon, PlayIcon, RotateCcwIcon, SquareIcon, SquareTerminalIcon, UserPlusIcon, UsersIcon, WrenchIcon } from "lucide-react";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
 	Message as AiMessage,
@@ -20,9 +20,10 @@ import {
 import { Task, TaskContent, TaskTrigger } from "@/components/ai-elements/task";
 import { Badge } from "@/components/ui/badge";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { streamdownPlugins } from "@/core/streamdown/plugins";
 import { writeTextToClipboard } from "@/core/clipboard";
-import { delegateWorker, groupConsecutiveModelErrors, isDelegateCall } from "@/lib/events";
+import { delegateWorker, groupConsecutiveModelErrors, isDelegateCall, recoveredReplyIndex } from "@/lib/events";
 import { useAgentLabel } from "@/lib/avatars";
 import { formatTokens } from "@/lib/session-stats";
 import { toolSummary } from "@/lib/tool-summary";
@@ -60,13 +61,7 @@ type QuickActionDraft = (content: string) => void;
 const CanDelegateContext = createContext(true);
 const QuickActionDraftContext = createContext<QuickActionDraft | undefined>(undefined);
 
-/** 委派镜像卡（task_assign/task_result）上的「打开对应会话」跳转：切到
- *  同窗口的 worker 执行会话（?session=<handle>）。 */
-const WorkerSessionLinkContext = createContext<((sessionHandle: string) => void) | undefined>(undefined);
 
-export function WorkerSessionLinkProvider({ onOpen, children }: { onOpen?: (sessionHandle: string) => void; children: ReactNode }) {
-	return <WorkerSessionLinkContext.Provider value={onOpen}>{children}</WorkerSessionLinkContext.Provider>;
-}
 
 function OpenWorkerSessionButton(props: { sessionHandle?: string }) { void props; return null;
 }
@@ -300,9 +295,42 @@ function ChatInlineCode({ children, node, ...props }: ComponentProps<"code"> & {
 	return <code {...props}>{children}</code>;
 }
 
+/** 聊天里的图片一律收敛为缩略图，点击弹出原图；文件名/mime 收进 hover。 */
+function ChatImageThumbnail({ src, alt }: { src: string; alt?: string }) {
+	const [open, setOpen] = useState(false);
+	return (
+		<>
+			<button
+				type="button"
+				className="block cursor-zoom-in overflow-hidden rounded-md border border-border bg-muted"
+				title={alt ? `${alt} · 点击放大` : "点击放大"}
+				onClick={() => setOpen(true)}
+			>
+				{/* eslint-disable-next-line @next/next/no-img-element -- 动态 data/blob 源，不走 next/image 优化管线 */}
+				<img src={src} alt={alt ?? ""} className="max-h-40 max-w-60 object-cover" />
+			</button>
+			<Dialog open={open} onOpenChange={setOpen}>
+				<DialogContent className="w-auto gap-0 p-2 sm:max-w-[calc(100vw-4rem)]" aria-label={alt ?? "图片预览"}>
+					<DialogTitle className="sr-only">{alt ?? "图片预览"}</DialogTitle>
+					{/* eslint-disable-next-line @next/next/no-img-element -- 同上 */}
+					<img src={src} alt={alt ?? ""} className="max-h-[85vh] max-w-full object-contain" />
+				</DialogContent>
+			</Dialog>
+		</>
+	);
+}
+
+/** Markdown（worker/manager 正文）里的图片同样收敛为缩略图，不再撑开聊天气泡。 */
+function ChatMarkdownImage({ src, alt, node, ...props }: ComponentProps<"img"> & { node?: unknown }) {
+	void node;
+	void props;
+	if (typeof src !== "string" || !src) return null;
+	return <ChatImageThumbnail src={src} alt={typeof alt === "string" && alt ? alt : undefined} />;
+}
+
 const chatStreamdownProps = {
 	...streamdownPlugins,
-	components: { a: ChatMarkdownLink, inlineCode: ChatInlineCode },
+	components: { a: ChatMarkdownLink, inlineCode: ChatInlineCode, img: ChatMarkdownImage },
 };
 
 /**
@@ -968,6 +996,7 @@ function CustomMessageEntry({
 				kind?: "permission" | "question" | "confirmation";
 				source?: "worker" | "platform_policy";
 				workerStarted?: boolean;
+				terminal?: boolean;
 				usage?: TaskUsage;
 				requests?: Array<{ requestId: string; prompt: string; command?: string; path?: string; risk?: string; options?: string[] }>;
 		  }
@@ -1105,6 +1134,25 @@ function CustomMessageEntry({
 		return <p className="text-xs text-muted-foreground">{text}</p>;
 	}
 
+	// Goal 生命周期投影：content 是写给模型的恢复指令，聊天里只展示人性化状态，
+	// 具体进度与恢复操作在工作状态面板（暂停横幅带「继续」按钮）。
+	if (message.customType === "pudding:goal_interrupted" || message.customType === "pudding:goal_recovery" || message.customType === "pudding:decision_answered") {
+		const text = message.customType === "pudding:goal_interrupted"
+			? details?.terminal
+				? "已没有可继续的任务，Goal 已自动关闭。"
+				: "Goal 已暂停；已完成的部分都会保留，可以随时继续。"
+			: message.customType === "pudding:goal_recovery"
+				? "Goal 正在从上次的安全进度继续。"
+				: "已收到你的决定，任务继续推进。";
+		const NoticeIcon = message.customType === "pudding:goal_interrupted" ? PauseIcon : message.customType === "pudding:goal_recovery" ? PlayIcon : CheckIcon;
+		return (
+			<p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+				<NoticeIcon className="size-3.5" />
+				{text}
+			</p>
+		);
+	}
+
 	// Unknown custom types stay visible but unobtrusive.
 	return (
 		<p className="text-xs text-muted-foreground">
@@ -1130,10 +1178,22 @@ function MessageBody({
 }) {
 	const assistantLabel = useAgentLabel(assistantAs ?? "");
 	if (message.role === "user") {
+		const images = message.images ?? [];
 		return (
 			<AiMessage from="user" className="home-user-message" data-query-axis-id={message.id}>
 				<MessageContent>
-					<p className="whitespace-pre-wrap">{message.content}</p>
+					{message.content ? <p className="whitespace-pre-wrap">{message.content}</p> : null}
+					{images.length ? (
+						<div className={`flex flex-wrap gap-2 ${message.content ? "mt-2" : ""}`}>
+							{images.map((image, index) => (
+								<ChatImageThumbnail
+									key={`${image.mimeType}:${index}`}
+									src={`data:${image.mimeType};base64,${image.data}`}
+									alt={image.name ?? image.mimeType}
+								/>
+							))}
+						</div>
+					) : null}
 				</MessageContent>
 			</AiMessage>
 		);
@@ -1279,12 +1339,12 @@ function ModelErrorSummary({ messages, recovered = false }: { messages: ChatMess
 		.filter(Boolean)
 		.join("\n\n");
 	const status = recovered
-		? "已恢复"
+		? "重试成功"
 		: attempts > 1
 			? `${attempts} 次失败`
 			: "请求失败";
 	const summary = recovered
-		? "模型服务连接已经恢复。"
+		? "之后的模型请求已成功返回，本轮正常结束。"
 		: latest.modelError.explanation;
 
 	return (
@@ -1292,7 +1352,7 @@ function ModelErrorSummary({ messages, recovered = false }: { messages: ChatMess
 			<span className="home-model-error-icon">{recovered ? <CheckIcon /> : <CircleAlertIcon />}</span>
 			<div className="home-model-error-body">
 				{latest.modelError.partialContent ? <MessageResponse className="home-message-response mb-2" {...chatStreamdownProps}>{latest.modelError.partialContent}</MessageResponse> : null}
-				<div className="home-model-error-title"><strong>{recovered ? "模型连接已恢复" : latest.modelError.title}</strong><span>{status}</span></div>
+				<div className="home-model-error-title"><strong>{recovered ? "本次重试已成功" : latest.modelError.title}</strong><span>{status}</span></div>
 				<p>{summary}</p>
 				{!recovered ? <p className="home-model-error-action">{latest.modelError.action}</p> : null}
 				<ErrorTechnicalDetails detail={detail} />
@@ -1403,6 +1463,7 @@ function AssistantGroupBody({
 					})
 					.filter((s) => s.showThinking || s.showContent || s.foldCalls.length > 0 || s.cardCalls.length > 0);
 				if (segments.length === 0) return null;
+				const recoveredIndex = recoveredReplyIndex(segments.map((segment) => segment.m));
 				const quickActionContent = [...new Set(segments.filter((segment) => !segment.m.error).map((segment) => segment.m.content).filter(Boolean))].join("\n\n");
 				const lastTime = new Date(segments[segments.length - 1]!.m.timestamp).toLocaleTimeString("zh-CN", {
 					hour: "2-digit",
@@ -1427,7 +1488,7 @@ function AssistantGroupBody({
 										{s.showThinking && <AssistantReasoning streaming={s.m.streaming} thinking={s.m.thinking} startedAt={s.m.timestamp} className="mb-0" />}
 										{s.showContent && (
 											s.m.error && s.m.modelError ? (
-												<ModelErrorSummary messages={s.messages} recovered={segments.slice(segmentIndex + 1).some((segment) => !segment.m.error)} />
+												<ModelErrorSummary messages={s.messages} recovered={segmentIndex < recoveredIndex} />
 											) : (
 												<MessageResponse className="home-message-response" {...chatStreamdownProps}>{s.m.content}</MessageResponse>
 											)

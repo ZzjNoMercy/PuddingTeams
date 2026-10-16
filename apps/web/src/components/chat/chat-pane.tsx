@@ -3,7 +3,7 @@
 import { SnapshotOrigin } from "./snapshot-origin";
 import { ForkSessionDialog } from "./fork-session-dialog";
 
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDownIcon, EllipsisIcon, FolderGit2Icon, FolderOpenIcon, InfoIcon, LayersIcon, ListTreeIcon, PanelLeftOpenIcon } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -30,15 +30,14 @@ import { compactDay } from "@/lib/time";
 import { isIMEComposing } from "@/lib/ime";
 import { preferCurrentRoomSummary } from "@/lib/room-order";
 import {
+	actOnQueuedInput,
 	createRoomSession,
 	createWorkspace,
 	deleteRoomSession,
-	fetchRoomDelegationProcesses,
 	getRoom,
 	listWorkspaces,
 	markRoomRead,
 	renameRoomSession,
-	renameWorkerSession,
 	setActiveRoomSession,
 	switchRoomWorkspace,
 	updateRoom,
@@ -48,12 +47,13 @@ import {
 	type MessageAttachmentInput,
 } from "@/lib/api";
 import { clearGroupCreationOperation, groupWorkspaceSwitchFingerprint, reserveGroupCreationOperation } from "@/lib/group-creation-operation";
-import { agentDisplayName, type ChatMessage, type ChatStatus, type RoomSession, type RoomSummary, type WorkerSessionSummary, type WorkspaceRecord } from "@/lib/types";
+import { agentDisplayName, type ChatMessage, type ChatStatus, type RoomSession, type RoomSummary, type WorkspaceRecord } from "@/lib/types";
 import { Composer } from "./composer";
+import { QueuedInputList } from "./queued-input-list";
 import { computeSessionStats } from "@/lib/session-stats";
 import { delegateWorker, groupForRender, isDelegateCall } from "@/lib/events";
 import { useAgentLabels } from "@/lib/avatars";
-import { AssistantGroup, Message, MessageQuickActionProvider, WorkerSessionLinkProvider } from "./message";
+import { AssistantGroup, Message, MessageQuickActionProvider } from "./message";
 import { ManagerAvatar, MemberStack, WorkerAvatar } from "./worker-avatar";
 import { DirectoryPickerDialog } from "./directory-picker-dialog";
 import { WorkspaceTrustDialog, needsTrustDecision } from "./workspace-trust-dialog";
@@ -64,14 +64,7 @@ import { SessionWorkCard } from "./session-work-card";
 import type { SessionExecutionTurn, SessionRuntimeSummary, SessionRuntimeView } from "./session-activity-drawer";
 import { WorkerProcessDrawer } from "./worker-process-dialog";
 import { WorkerProcessProvider } from "./worker-process-context";
-import { InlinePiHistoryGate, InlinePiProcessProvider } from "./inline-pi-process";
-
-const inlinePreferenceEvent = "pudding:inline-pi-process";
-function subscribeInlinePreference(notify: () => void) {
-	window.addEventListener("storage", notify);
-	window.addEventListener(inlinePreferenceEvent, notify);
-	return () => { window.removeEventListener("storage", notify); window.removeEventListener(inlinePreferenceEvent, notify); };
-}
+import { TranscriptGate } from "./transcript-gate";
 
 /** StickToBottom 的 isAtBottom 桥给悬浮层外的兄弟组件（统计条淡入淡出）。 */
 function AtBottomReporter({ onChange }: { onChange: (atBottom: boolean) => void }) {
@@ -100,23 +93,23 @@ function ConversationScrollMemory({ roomId, sessionId, ready }: { roomId: string
 			catch { /* Storage can be unavailable in a private browser context. */ }
 		};
 		let attached = false;
-		let saveFrame = 0;
-		const onScroll = () => {
-			if (saveFrame) return;
-			saveFrame = requestAnimationFrame(() => { saveFrame = 0; save(); });
-		};
+		// Persist the connected viewport's last observed position. Passive React
+		// cleanup runs after DOM removal; reading its geometry there can overwrite
+		// a real reading pause with a detached element's clamped bottom/zero.
+		const onScroll = () => { if (scroller.isConnected) save(); };
 		const frame = requestAnimationFrame(() => {
 			if (saved && !saved.atBottom) {
 				stopScroll();
 				scroller.scrollTop = Math.min(Math.max(0, saved.top), Math.max(0, scroller.scrollHeight - scroller.clientHeight));
 			}
 			scroller.addEventListener("scroll", onScroll, { passive: true });
+			window.addEventListener("pagehide", onScroll);
 			attached = true;
 		});
 		return () => {
 			cancelAnimationFrame(frame);
-			cancelAnimationFrame(saveFrame);
-			if (attached) { scroller.removeEventListener("scroll", onScroll); save(); }
+			if (attached) scroller.removeEventListener("scroll", onScroll);
+			window.removeEventListener("pagehide", onScroll);
 		};
 	}, [ready, roomId, sessionId, scrollRef, stopScroll]);
 	return null;
@@ -266,8 +259,6 @@ function SessionChat({
 	sessionModifiedAt,
 	emptyHint,
 	windowType,
-	workerView = false,
-	onOpenWorkerSession,
 	onStatus,
 	onOpenWindow,
 	onRoomsMayHaveChanged,
@@ -297,9 +288,7 @@ function SessionChat({
 	emptyHint?: string;
 	windowType: RoomSummary["type"];
 	/** 当前渲染的是 worker 执行 session（running 不阻断输入，服务端排队投递）。 */
-	workerView?: boolean;
 	/** 委派镜像卡「打开对应会话」：切到同窗口的 worker 执行 session。 */
-	onOpenWorkerSession?: (sessionHandle: string) => void;
 	onStatus: (s: ChatStatus) => void;
 	onOpenWindow?: (windowId: string) => void;
 	/** manager 建房工具落定后回调：侧栏房间列表立即刷新，不等轮询。 */
@@ -326,7 +315,7 @@ function SessionChat({
 	activityRevision: number;
 	onHistoryReady?: (sessionId: string, activityRevision: number) => Promise<boolean>;
 }) {
-	const { inputCapability, messages, historyLoading, historyLoaded, status, running, unansweredUserMessage, unfinishedAssistantTurn, sending, stopping, error, unconfirmedOperation, send, stop, refreshHistory, reviewUnconfirmedHistory, startNewMessageIntent } = useChat(sessionId, { allowSendWhileRunning: workerView });
+	const { inputCapability, messages, historyLoading, historyLoaded, status, running, unansweredUserMessage, unfinishedAssistantTurn, sending, stopping, error, unconfirmedOperation, send, stop, refreshHistory, reviewUnconfirmedHistory, startNewMessageIntent } = useChat(sessionId);
 	const [newMessageIntentOpen, setNewMessageIntentOpen] = useState(false);
 	const initialActivityRevision = useRef(activityRevision);
 	const [presentedActivityRevision, setPresentedActivityRevision] = useState<number | null>(null);
@@ -357,6 +346,21 @@ function SessionChat({
 		.filter((message) => message.role === "user" || (message.role === "custom" && message.customType === "pudding:user_message"))
 		.map(({ id, content }) => ({ id, content })), [messages]);
 	const [goalCreateOpen, setGoalCreateOpen] = useState(false);
+	const queuedInputs = inputCapability?.queuedInputs ?? [];
+	const canSteerQueued = running && !inputCapability?.waiting.length && inputCapability?.busyInput.modes.includes("steer") === true;
+	const [queuedActionBusy, setQueuedActionBusy] = useState<string | null>(null);
+	const handleQueuedAction = useCallback(async (key: string, action: "steer" | "cancel") => {
+		setQueuedActionBusy(key);
+		try {
+			await actOnQueuedInput(sessionId, key, action);
+			toast.success(action === "steer" ? "已转为引导，将在当前步骤后插队执行" : "已取消这条排队消息");
+			await refreshHistory();
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		} finally {
+			setQueuedActionBusy(null);
+		}
+	}, [sessionId, refreshHistory]);
 	const [goalDraft, setGoalDraft] = useState("");
 	const [hasGoal, setHasGoal] = useState(false);
 	const [scrollButtonHost, setScrollButtonHost] = useState<HTMLDivElement | null>(null);
@@ -444,12 +448,6 @@ function SessionChat({
 		() => [...messages].reverse().find((message) => message.role === "custom" && message.customType === "pudding:work_plan_update")?.id,
 		[messages],
 	);
-	const inlineHistoryIds = messages.flatMap((message) => {
-		const details = message.details as { delegationId?: string; taskId?: string; status?: string; from?: string } | undefined;
-		const rendered = message.customType === "pudding:task_result" || (message.customType === "pudding:task_assign"
-			&& (details?.from === "direct" || details?.from === "solo") && details.status === "running" && !resolvedTaskIds.has(details.taskId ?? ""));
-		return rendered && details?.delegationId ? [details.delegationId] : [];
-	});
 	// 拆分「等 worker」与「manager 思考」：delegate 工具阻塞在 manager 的 run 里，
 	// run 活跃不等于 manager 在生成。有 running 态委托调用时，composer 提示
 	// 等待哪个 worker，而不是笼统的「处理中」。
@@ -492,7 +490,7 @@ function SessionChat({
 	return (
 		<div className="home-session-chat relative flex min-h-0 flex-1 flex-col" aria-busy={!layoutReady}>
 			<div className={`flex min-h-0 flex-1 flex-col ${layoutReady ? "visible" : "invisible"}`}>
-				{!workerView && inputCapability?.ownerAgentId === "manager" ? (
+				{inputCapability?.ownerAgentId === "manager" ? (
 				<SessionWorkCard
 					roomId={roomId}
 					sessionId={sessionId}
@@ -509,12 +507,11 @@ function SessionChat({
 					onRuntimeViewChange={onRuntimeViewChange}
 				/>
 				) : null}
-				<WorkerSessionLinkProvider onOpen={onOpenWorkerSession}>
 				<MessageQuickActionProvider onDraft={draftFromMessage} canDelegate={inputCapability?.ownerAgentId === "manager"}>
 					<Conversation initial="instant" resize={layoutReady ? "smooth" : "instant"}>
 						<AtBottomReporter onChange={setAtBottom} />
 						<ConversationScrollMemory roomId={roomId} sessionId={sessionId} ready={transcriptReady} />
-						<InlinePiHistoryGate ids={inlineHistoryIds} historyLoading={historyLoading} onReady={handleTranscriptReady} onReadinessChange={handleTranscriptReadinessChange}>
+						<TranscriptGate loading={historyLoading} onReady={handleTranscriptReady} onReadinessChange={handleTranscriptReadinessChange}>
 						<QueryInputAxis items={queryAxisItems} />
 						<ConversationContent className="home-message-column">
        {inputCapability?.sourceSnapshotId ? <SnapshotOrigin sessionId={sessionId} snapshotId={inputCapability.sourceSnapshotId} /> : null}
@@ -542,9 +539,10 @@ function SessionChat({
 									本轮已有工具调用记录，但未找到最终回复。请先核对工具和审批状态，再决定是否发送新指令。
 								</p>
 							) : null}
+							<QueuedInputList items={queuedInputs} canSteer={canSteerQueued} busyKey={queuedActionBusy} onAction={(key, action) => void handleQueuedAction(key, action)} />
 
 						</ConversationContent>
-						</InlinePiHistoryGate>
+						</TranscriptGate>
 						<ConversationScrollButton
 							portalTarget={scrollButtonHost}
 							className="home-scroll-to-bottom"
@@ -553,7 +551,6 @@ function SessionChat({
 						/>
 					</Conversation>
 				</MessageQuickActionProvider>
-				</WorkerSessionLinkProvider>
 				{blocked ? (
 					<div className="border-t border-destructive/20 bg-destructive/5 px-4 py-2 text-center text-xs text-destructive">
 						项目路径已失效，重新绑定或切换项目后才能继续对话与派活。
@@ -565,12 +562,11 @@ function SessionChat({
 					disabled={status !== "connected" || (running && !inputCapability?.busyInput.modes.length) || sending || stopping || Boolean(blocked) || inputCapability?.readOnly === true}
 					sending={sending}
 					stopAvailable={running || stopping || (Boolean(inputCapability?.pendingMessageCount) || inputCapability?.unconfirmedInput === true)}
- canSteer={running && !inputCapability?.waiting.length && inputCapability?.busyInput.modes.includes("steer")}
  hideGoal={inputCapability?.ownerAgentId !== "manager"}
 					stopping={stopping}
-					busyHint={workerView ? undefined : busyHint}
+					busyHint={busyHint}
 					queueHint={inputCapability?.waiting.length ? "等待审批，追加消息只入队" : undefined}
-					hideSessionControls={workerView || inputCapability?.readOnly === true}
+					hideSessionControls={inputCapability?.readOnly === true}
 					hasGoal={hasGoal}
 					workspaceLabel={workspaceLabel}
 					workspacePath={workspacePath}
@@ -670,18 +666,7 @@ export function ChatPane({
 	const [room, setRoom] = useState<RoomSummary | null>(null);
 	const [roomLoadError, setRoomLoadError] = useState<string | null>(null);
 	const [roomLoadNonce, setRoomLoadNonce] = useState(0);
-	const inlinePreferenceKey = `pudding:inline-pi-process:${roomId}`;
-	const inlinePiProcess = useSyncExternalStore(subscribeInlinePreference, () => {
-		try { return localStorage.getItem(inlinePreferenceKey) === "true"; } catch { return false; }
-	}, () => false);
-	const toggleInlinePiProcess = () => {
-		try {
-			localStorage.setItem(inlinePreferenceKey, String(!inlinePiProcess));
-			window.dispatchEvent(new Event(inlinePreferenceEvent));
-		} catch { toast.error("无法保存显示偏好"); }
-	};
 	const [activeId, setActiveId] = useState<string>("");
-	const [historicalPiProcess, setHistoricalPiProcess] = useState<{ roomId: string; sessionId: string; available: boolean } | null>(null);
 	const sessionSwitchQueue = useRef<Promise<void>>(Promise.resolve());
 	const pendingSessionSwitches = useRef(0);
 	const sessionSwitchGeneration = useRef(0);
@@ -698,8 +683,8 @@ export function ChatPane({
 	const [runtimeSummary, setRuntimeSummary] = useState<SessionRuntimeSummary | null>(null);
 	const [requestedDelegationId, setRequestedDelegationId] = useState<string | null>(null);
 	const [requestedFullWorkerSession, setRequestedFullWorkerSession] = useState(false);
-	const [pendingDeleteSession, setPendingDeleteSession] = useState<{ kind: "room"; session: RoomSession } | { kind: "worker"; session: WorkerSessionSummary } | null>(null);
-	const [renamingSession, setRenamingSession] = useState<{ kind: "room"; session: RoomSession } | { kind: "worker"; session: WorkerSessionSummary } | null>(null);
+	const [pendingDeleteSession, setPendingDeleteSession] = useState<{ kind: "room"; session: RoomSession } | null>(null);
+	const [renamingSession, setRenamingSession] = useState<{ kind: "room"; session: RoomSession } | null>(null);
 	const [sessionRenameValue, setSessionRenameValue] = useState("");
 	const [workspaceOpen, setWorkspaceOpen] = useState(false);
 	const [workspaceOptions, setWorkspaceOptions] = useState<WorkspaceRecord[]>([]);
@@ -739,19 +724,17 @@ export function ChatPane({
 				if (cancelled) return;
 				let r = initial;
 				if (requestedSessionId) {
-					const requestedWorker = r.workerSessions.some((item) => item.id === requestedSessionId);
-					if (!requestedWorker && !r.sessions.some((session) => session.id === requestedSessionId)) {
+					if (!r.sessions.some((session) => session.id === requestedSessionId)) {
 						if (requestedSessionActivation === "parent") { onRoomUpdated?.(r); return; }
 						toast.error("目标会话不存在或不属于此对话，已打开当前会话");
 						onInvalidRequestedSession?.(roomId, requestedSessionId);
-					} else if ((requestedWorker ? r.activeWorkerView : r.activeSession) !== requestedSessionId) {
+					} else if (r.activeSession !== requestedSessionId) {
 						if (requestedSessionActivation === "parent") { onRoomUpdated?.(r); return; }
 						try {
 							await setActiveRoomSession(roomId, requestedSessionId);
 							r = await getRoom(roomId);
-							const nowWorker = r.workerSessions.some((item) => item.id === requestedSessionId);
-							if ((nowWorker ? r.activeWorkerView : r.activeSession) !== requestedSessionId ||
-								(!nowWorker && !r.sessions.some((session) => session.id === requestedSessionId))) {
+							if (r.activeSession !== requestedSessionId ||
+								!r.sessions.some((session) => session.id === requestedSessionId)) {
 								throw new Error("目标会话已在其他窗口改变，请重试");
 							}
 						} catch (error) {
@@ -768,7 +751,7 @@ export function ChatPane({
 				setRequestedDelegationId(null);
 				setRoom(r);
 				setRoomLoadError(null);
-				setActiveId(r.activeWorkerView ?? (r.activeSession || ""));
+				setActiveId(r.activeSession || "");
 				onRoomUpdated?.(r);
 			})
 			.catch((err: unknown) => {
@@ -793,9 +776,9 @@ export function ChatPane({
 					if (cancelled || pendingSessionSwitches.current > 0 || switchGeneration !== sessionSwitchGeneration.current || (room && preferCurrentRoomSummary(room, r) !== r)) return;
 					setRoom((prev) => (prev ? preferCurrentRoomSummary(prev, r) : prev));
 					setActiveId((current) =>
-						r.sessions.some((session) => session.id === current) || r.workerSessions.some((item) => item.id === current)
+						r.sessions.some((session) => session.id === current)
 						? current
-						: (r.activeWorkerView ?? (r.activeSession || "")),
+						: (r.activeSession || ""),
 					);
 				})
 				.catch(() => undefined);
@@ -854,12 +837,9 @@ export function ChatPane({
 			setRuntimeView("activity");
 			setRequestedDelegationId(null);
 			void preloadChatHistory(sessionId).catch(() => undefined);
-			// activate 路由同时接受容器 session id 与 worker 执行 session handle
-			// （后者只置 activeWorkerView，容器 activeSession 不动）。
 			await setActiveRoomSession(roomId, sessionId);
 			const updated = await getRoom(roomId);
-			const workerTarget = updated.workerSessions.some((item) => item.id === sessionId);
-			if ((workerTarget ? updated.activeWorkerView : updated.activeSession) !== sessionId) throw new Error("当前会话已在其他窗口改变，请从会话列表重新打开");
+			if (updated.activeSession !== sessionId) throw new Error("当前会话已在其他窗口改变，请从会话列表重新打开");
 			setRoom(updated);
 			setActiveId(sessionId);
 			onSessionActivated?.(updated);
@@ -872,10 +852,6 @@ export function ChatPane({
 		sessionSwitchQueue.current = next;
 		return next;
 	}, [roomId, activeId, onSessionActivated]);
-
-	const openWorkerSession = useCallback((sessionHandle: string) => {
-		void switchSession(sessionHandle);
-	}, [switchSession]);
 
 	const newSession = useCallback(async () => {
 		setWorkerProcessOpen(false);
@@ -904,24 +880,15 @@ export function ChatPane({
 				toast.error(err instanceof Error ? err.message : String(err));
 				return;
 			}
-			setRoom((prev) => {
-				if (!prev) return prev;
-				// Worker 执行 session：删除后服务端清空指向它的 activeWorkerView，
-				// 查看目标回退到容器 activeSession。
-				if (prev.workerSessions.some((item) => item.id === sessionId)) {
-					const workerSessions = prev.workerSessions.filter((item) => item.id !== sessionId);
-					const activeWorkerView = prev.activeWorkerView === sessionId ? null : prev.activeWorkerView;
-					if (prev.activeWorkerView === sessionId) setActiveId(prev.activeSession || "");
-					return { ...prev, workerSessions, activeWorkerView };
-				}
-				const sessions = prev.sessions.filter((s) => s.id !== sessionId);
-				// Mirror the server: a deleted active session falls back to the
-				// first remaining one. setActiveId must follow, otherwise the UI
-				// stays on the deleted session.
-				const active = prev.activeSession === sessionId ? sessions[0]!.id : prev.activeSession;
-				setActiveId(active);
-				return { ...prev, sessions, activeSession: active };
-			});
+			// 重新拉取窗口：删除 pinned 窗口的最后一个会话时，服务端会补一个
+			// 新空会话并激活；本地过滤无法表达这个替换。
+			try {
+				const updated = await getRoom(roomId);
+				setRoom(updated);
+				setActiveId((previous) => updated.sessions.some((s) => s.id === previous) ? previous : updated.activeSession);
+			} catch (err) {
+				toast.error(err instanceof Error ? err.message : String(err));
+			}
 		},
 		[roomId],
 	);
@@ -931,30 +898,15 @@ export function ChatPane({
 		setSessionRenameValue(session.name || session.firstMessage || "新对话");
 	}, []);
 
-	const openWorkerSessionRename = useCallback((session: WorkerSessionSummary) => {
-		setRenamingSession({ kind: "worker", session });
-		setSessionRenameValue(session.name || session.firstMessage || "新对话");
-	}, []);
-
 	const saveSessionRename = useCallback(async () => {
 		if (!renamingSession || !sessionRenameValue.trim()) return;
 		try {
-			if (renamingSession.kind === "worker") {
-				const target = renamingSession.session;
-				const updated = await renameWorkerSession(roomId, target.id, sessionRenameValue.trim());
-				setRoom((prev) =>
-					prev
-						? { ...prev, workerSessions: prev.workerSessions.map((item) => (item.id === target.id ? (updated ?? { ...item, name: sessionRenameValue.trim() }) : item)) }
-						: prev,
-				);
-			} else {
 				const updated = await renameRoomSession(roomId, renamingSession.session.id, sessionRenameValue.trim());
 				setRoom((prev) =>
 					prev
 						? { ...prev, sessions: prev.sessions.map((session) => (session.id === updated.id ? updated : session)) }
 						: prev,
 				);
-			}
 			setRenamingSession(null);
 			toast.success("会话已重命名");
 		} catch (err) {
@@ -1123,29 +1075,10 @@ export function ChatPane({
 	const type = room?.type ?? "solo";
 	const isSingle = type === "direct";
 	const currentPiWorker = isSingle && members[0]?.connector?.connectorId === "pi";
-	const canInlinePiProcess = isSingle && !currentPiWorker && (historicalPiProcess?.roomId === roomId && historicalPiProcess.sessionId === activeId && historicalPiProcess.available);
-	useEffect(() => {
-		if (!isSingle || currentPiWorker || !activeId) return;
-		let current = true;
-		void fetchRoomDelegationProcesses(roomId, activeId)
-			.then((items) => {
-				if (current) setHistoricalPiProcess({ roomId, sessionId: activeId, available: items.some((item) => item.view === "session" && item.workerStarted) });
-			})
-			.catch(() => {
-				if (current) setHistoricalPiProcess({ roomId, sessionId: activeId, available: false });
-			});
-		return () => { current = false; };
-	}, [roomId, activeId, isSingle, currentPiWorker]);
 	const isGroup = type === "group";
 	const headerTitle = room?.name ?? (roomLoadError ? "对话暂不可用" : "正在加载对话…");
-	// 当前查看目标 = activeWorkerView 命中的执行 session 或容器 session（仅 direct 窗口有执行面）。
-	const workerSessions = type === "direct" ? (room?.workerSessions ?? []) : [];
-	const activeWorkerSession = workerSessions.find((item) => item.id === activeId);
-	const viewingWorker = Boolean(activeWorkerSession);
-	const activeSession = room?.sessions.find((s) => s.active);
-	const sessionTitle = activeWorkerSession
-		? (activeWorkerSession.name || activeWorkerSession.firstMessage || "执行会话")
-		: activeSession?.name?.trim() || "";
+	const activeSession = room?.sessions.find((s) => s.id === activeId);
+	const sessionTitle = activeSession?.name?.trim() || "";
 	const subtitle =
 		type === "group"
 			? `${members.length} 位 Worker · Manager 在场`
@@ -1190,18 +1123,10 @@ export function ChatPane({
 					</div>
 				</div>
 				<div className="home-chat-actions">
-					{canInlinePiProcess ? <button type="button" role="switch" aria-checked={inlinePiProcess}
-						aria-label="在主对话中显示执行过程" title="在主对话中显示 Pi Worker 的思考、工具调用和回复"
-						className="flex items-center gap-2 rounded-lg px-2 py-1.5 text-xs text-muted-foreground hover:bg-muted"
-						onClick={toggleInlinePiProcess}>
-						<span>执行过程</span><span className={`flex h-4 w-7 items-center rounded-full p-0.5 transition-colors ${inlinePiProcess ? "bg-primary" : "bg-muted-foreground/30"}`}><span className={`size-3 rounded-full bg-background transition-transform ${inlinePiProcess ? "translate-x-3" : ""}`} /></span>
-					</button> : null}
 					<ForkSessionDialog sourceId={activeId} open={forkOpen} onOpenChange={setForkOpen} />
 					<SessionMenu
  onFork={!isSingle || currentPiWorker ? ()=>setForkOpen(true) : undefined}
 						sessions={room?.sessions ?? []}
-						workerSessions={workerSessions}
-						activeWorkerView={viewingWorker ? activeId : null}
 						trigger={(
 							<Button type="button" size="sm" variant="outline" className="home-context-pill">
 								<LayersIcon className="size-3.5" />
@@ -1213,8 +1138,6 @@ export function ChatPane({
 						onNew={newSession}
 						onRename={openSessionRename}
 						onDelete={(session) => setPendingDeleteSession({ kind: "room", session })}
-						onRenameWorker={openWorkerSessionRename}
-						onDeleteWorker={(session) => setPendingDeleteSession({ kind: "worker", session })}
 					/>
 					{runtimeSummary && (runtimeSummary.hasGoal || runtimeSummary.sessionTotal > 0) ? (
 						<Button
@@ -1248,16 +1171,13 @@ export function ChatPane({
 				</div>
 			</header>
 			{activeId && room ? (
-				<InlinePiProcessProvider key={activeId} enabled={canInlinePiProcess && inlinePiProcess && !viewingWorker} roomId={roomId} sessionId={activeId} openWorkerProcess={openWorkerProcess}>
 				<SessionChat
 					key={activeId}
 					roomId={roomId}
 					sessionId={activeId}
-					sessionModifiedAt={activeWorkerSession?.modifiedAt ?? room.sessions.find((s) => s.id === activeId)?.modifiedAt}
+					sessionModifiedAt={room.sessions.find((s) => s.id === activeId)?.modifiedAt}
 					emptyHint={emptyHint}
 					windowType={type}
-					workerView={viewingWorker}
-					onOpenWorkerSession={openWorkerSession}
 					onStatus={setStatus}
 					onOpenWindow={(windowId) => onOpenWindow?.(windowId, activeId)}
 					onRoomsMayHaveChanged={onRoomsMayHaveChanged}
@@ -1267,9 +1187,9 @@ export function ChatPane({
 					draftContextKey={JSON.stringify([room.workspace?.id ?? null, room.cwdSnapshot])}
 					onOpenWorkspace={openWorkspaceSwitch}
 					blocked={!room.contextAvailable || status === "gone"}
-					sessionModel={viewingWorker ? undefined : activeSession?.model}
-					sessionThinkingLevel={viewingWorker ? undefined : activeSession?.thinkingLevel}
-					directWorkerModel={isSingle && !viewingWorker ? { name: members[0]?.name ?? "", model: typeof members[0]?.connector?.config?.model === "string" ? members[0].connector.config.model : undefined } : undefined}
+					sessionModel={activeSession?.model}
+					sessionThinkingLevel={activeSession?.thinkingLevel}
+					directWorkerModel={isSingle ? { name: members[0]?.name ?? "", model: typeof members[0]?.connector?.config?.model === "string" ? members[0].connector.config.model : undefined } : undefined}
 					onSessionModelChange={handleSessionModelChange}
 					onSessionThinkingChange={handleSessionThinkingChange}
 					runtimeOpen={goalRuntimeOpen}
@@ -1280,7 +1200,6 @@ export function ChatPane({
 						activityRevision={room.activityRevision}
 						onHistoryReady={acknowledgePresentedActivity}
 				/>
-				</InlinePiProcessProvider>
 			) : (
 				<div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center" role={roomLoadError ? "alert" : "status"}>
 					<p className="text-sm text-muted-foreground">{roomLoadError ? `无法加载对话：${roomLoadError}` : "正在加载对话…"}</p>
@@ -1316,10 +1235,6 @@ export function ChatPane({
 					onNewSession={newSession}
 					onRenameSession={openSessionRename}
 					onDeleteSession={(session) => setPendingDeleteSession({ kind: "room", session })}
-					workerSessions={workerSessions}
-					activeWorkerView={viewingWorker ? activeId : null}
-					onRenameWorkerSession={openWorkerSessionRename}
-					onDeleteWorkerSession={(session) => setPendingDeleteSession({ kind: "worker", session })}
 				/>
 			) : null}
 			</> : null}

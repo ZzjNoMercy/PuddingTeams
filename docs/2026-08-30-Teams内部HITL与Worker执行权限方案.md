@@ -846,3 +846,8 @@ Worker 有效能力接口只返回安全摘要和来源，不返回 secret、完
 ### 17.4 与房间 admission 的边界
 
 Wiki 审核域不复用房间 admission Interaction：编译 Worker 在受保护 profile 里没有发起权限请求的运行时通道（无网络、无写外部能力），所有“是否允许”的决定都在编译前（来源集、Agent、任务）与发布前（人工审核批次）两个静态闸口完成。两个域共享的只有原则：HITL 的产品与安全所有权属于平台，Worker 自述一律不作为授权依据。
+
+
+## 2026-10-15 原生 Manager 与执行记录收敛
+
+Manager 原生写通过 NativeExecution/ChangeSet 与 scope/lease 证明，Submission 可引用 nativeExecutionIds；不必为写入伪造 Worker delegation。人工准入、批准字节发布和同调用恢复保持各自权威状态。普通会话列表不枚举 delegation handle，执行详情只按 delegationId 读取与取消；不通过聊天镜像推导归属。

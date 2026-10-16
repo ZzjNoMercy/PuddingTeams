@@ -8,7 +8,7 @@ import {
 	DropdownMenuItem,
 	DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import type { RoomSession, WorkerSessionSummary } from "@/lib/types";
+import type { RoomSession } from "@/lib/types";
 import { homePortalContainer } from "@/lib/home-portal";
 
 /** pi 元数据的 "(no messages)" 是占位不是名字（direct 窗口全是 custom 卡，
@@ -37,43 +37,30 @@ function updateLabel(session: Pick<RoomSession, "modifiedAt">): string {	const m
 
 export function SessionMenu({
 	sessions,
-	activeWorkerView,
 	trigger,
 	onSwitch,
 	onNew,
  onFork,
 	onRename,
 	onDelete,
-	onRenameWorker,
-	onDeleteWorker,
 	align = "end",
 }: {
 	sessions: RoomSession[];
-	/** Manager 委派产生的 worker 执行 session（直派执行面不单列）；传入时按「直接对话 / Manager 委派」分组渲染。 */
-	workerSessions?: WorkerSessionSummary[];
-	/** 当前查看的执行 session handle；命中时对勾标在对应 worker session 上。 */
-	activeWorkerView?: string | null;
 	trigger: ReactElement;
 	onSwitch: (sessionId: string) => void | Promise<void>;
 	onFork?: () => void;
 	onNew?: () => void | Promise<void>;
 	onRename: (session: RoomSession) => void;
 	onDelete: (session: RoomSession) => void;
-	onRenameWorker?: (session: WorkerSessionSummary) => void;
-	onDeleteWorker?: (session: WorkerSessionSummary) => void;
 	align?: "start" | "center" | "end";
 }) {
-	const delegated: WorkerSessionSummary[] = [];
-	const grouped = delegated.length > 0;
-	// 查看执行面时，容器 activeSession 不是当前查看目标，对勾要让位。
 	const containerActive = (session: RoomSession) => session.active;
 	return (
 		<DropdownMenu>
 			<DropdownMenuTrigger asChild>{trigger}</DropdownMenuTrigger>
 			<DropdownMenuContent align={align} sideOffset={8} className="home-session-menu" container={homePortalContainer()}>
 				{onFork ? <DropdownMenuItem onSelect={onFork}>Fork 到 Worker</DropdownMenuItem> : null}
-				<div className="home-session-menu-count">{sessions.length + delegated.length} 个会话</div>
-				{grouped ? <div className="home-session-menu-group">直接对话</div> : null}
+				<div className="home-session-menu-count">{sessions.length} 个会话</div>
 				{sessions.map((session) => (
 					<DropdownMenuItem
 						key={session.id}
@@ -111,50 +98,6 @@ export function SessionMenu({
 						</button>
 					</DropdownMenuItem>
 				))}
-				{grouped ? <div className="home-session-menu-group">Manager 委派</div> : null}
-				{delegated.map((session) => {
-					const name = sessionDisplayName(session);
-					const active = activeWorkerView === session.id;
-					const source = session.sourceWindowName ? `来自${session.sourceWindowName}` : "";
-					return (
-						<DropdownMenuItem
-							key={session.id}
-							onSelect={() => void onSwitch(session.id)}
-							className={`home-session-menu-item ${active ? "is-active" : ""}`}
-						>
-							<span className="home-session-menu-check" aria-hidden="true">
-								{active ? <CheckIcon /> : null}
-							</span>
-							<span className="home-session-menu-copy">
-								<strong>{name}</strong>
-								{session.running ? <span className="home-session-menu-dot" aria-label="运行中" title="运行中" /> : null}
-								<span>{session.running ? [source, "运行中"].filter(Boolean).join(" · ") : [source, updateLabel(session)].filter(Boolean).join(" · ")}</span>
-							</span>
-							<button
-								type="button"
-								aria-label={`重命名会话「${name}」`}
-								onClick={(event) => {
-									event.stopPropagation();
-									onRenameWorker?.(session);
-								}}
-								className="home-session-menu-edit"
-							>
-								<PencilIcon />
-							</button>
-							<button
-								type="button"
-								aria-label={`删除会话「${name}」`}
-								onClick={(event) => {
-									event.stopPropagation();
-									onDeleteWorker?.(session);
-								}}
-								className="home-session-menu-delete"
-							>
-								<Trash2Icon />
-							</button>
-						</DropdownMenuItem>
-					);
-				})}
 				{onNew ? <DropdownMenuItem onSelect={() => void onNew()} className="home-session-menu-new">
 					<PlusIcon />
 					<span>新建会话</span>

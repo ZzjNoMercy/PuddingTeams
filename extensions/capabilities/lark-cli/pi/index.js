@@ -49,14 +49,18 @@ export default function larkCliExtension(pi) {
 		description: "查看飞书官方 CLI 与 Skills 的接入说明",
 		handler: async (_args, ctx) => {
 			ctx.ui.notify(
-				"该扩展直接使用飞书官方 lark-cli。启动 Pi Session 时会自动调用官方更新流程；首次安装后执行 /reload 即可载入官方 lark-* Skills。",
+				"该扩展直接使用飞书官方 lark-cli。启动 Pi Session 时会在后台自动同步官方更新；首次安装后执行 /reload 即可载入官方 lark-* Skills。",
 				"info",
 			);
 		},
 	});
 	pi.on("session_start", async (_event, ctx) => {
-		const result = await syncOfficialLarkCli();
-		if (result.error && ctx.hasUI) ctx.ui.notify(`飞书官方 CLI/Skills 自动同步失败：${result.error}`, "warning");
-		else if (result.changed && ctx.hasUI) ctx.ui.notify("飞书官方 CLI 与 Skills 已同步；首次安装请执行 /reload 载入 Skills。", "info");
+		// 官方更新放在后台静默跑：绝不阻塞 Pi Session 启动，也不占用任何一次
+		// Agent 运行；同步结果只在失败或确有变化时通知。
+		void syncOfficialLarkCli().then((result) => {
+			if (!ctx.hasUI) return;
+			if (result.error) ctx.ui.notify(`飞书官方 CLI/Skills 自动同步失败：${result.error}`, "warning");
+			else if (result.changed) ctx.ui.notify("飞书官方 CLI 与 Skills 已同步；首次安装请执行 /reload 载入 Skills。", "info");
+		}).catch(() => undefined);
 	});
 }

@@ -239,3 +239,13 @@ test("P1 group 创建与更新去重后至少两位 Worker；可用范围不改�
 	assert.equal((await store.getWindow(group.id))!.type, "group");
 	assert.deepEqual((await store.getWindow(group.id))!.members, ["alpha", "beta"]);
 });
+
+test("windows v3 rejects removed execution view pointer without modifying development data", async () => {
+ const {store,dir}=await makeStore();await store.createWindow({type:"group",members:["alpha","beta"],sessionId:"session"});
+ const file=path.join(dir,"windows.json"),data=JSON.parse(readFileSync(file,"utf8"));
+ Object.values(data.windows).forEach(window=>{(window as Record<string,unknown>).activeWorkerView="execution-handle";});
+ const bytes=JSON.stringify(data);writeFileSync(file,bytes);
+ const restarted=new TeamsStore({state:dir,assets:dir,managedWorkspaces:path.join(dir,"managed")},dir);
+ await assert.rejects(restarted.init(),/removed execution view pointer/);
+ assert.equal(readFileSync(file,"utf8"),bytes);
+});

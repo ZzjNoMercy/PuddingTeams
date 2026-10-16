@@ -108,3 +108,8 @@ Verifier 文本中自称“我运行了测试”不是证据。`environment_veri
 - `manager_review` 与 `independent_evidence_review` 仍是有效模式；不是所有任务都值得付出一次真实环境执行的成本。
 
 对 Goal、WorkItem 和 completion review 的整体关系，继续读 [Session Goal](/docs/goals/)；对 Workspace 信任、执行隔离和 Artifact 冻结，继续读 [Workspace 与数据](/docs/workspaces/)。
+
+
+## 原生会话与单次委派
+
+Manager 自执行的写 WorkItem 可以提交 nativeExecutionIds 与 ChangeSet，必须满足原冻结 VerificationPolicy。实际执行证据不等于独立环境复验；要求 environment_verified 时不能仅用 Manager 文字声明通过。

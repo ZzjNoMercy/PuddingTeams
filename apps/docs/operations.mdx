@@ -14,6 +14,8 @@ puddingteams init
 puddingteams doctor [--json]
 puddingteams start [--port 8933]
 puddingteams status
+puddingteams logs [--tail N]
+puddingteams logs --export [--out FILE]
 puddingteams open
 puddingteams restart [--port 8933]
 puddingteams stop
@@ -56,6 +58,30 @@ CLI 后台日志默认位于：
 CLI 管理的 PID/端口记录位于 `~/.puddingteams/run/server.pid`；Server 的单写者 Lease 位于 `~/.puddingteams/runtime/backend.lease`。Electron 自己的桌面日志在 Electron `userData/logs/`，业务状态仍在 `PUDDINGTEAMS_HOME`。
 
 不要把 PID 文件和 Lease 当成同一用途：PID 文件供 CLI 管进程，Lease 防止任意两个 Backend 同时写同一个 Home。
+
+### 日志开关与级别
+
+- **记录日志**：总开关。关闭后后端不写任何一行（平台 logger 与 Agent/扩展的 `console` 输出一起静默），排障前先确认它是打开的。
+- **级别**：`仅错误` / `警告` / `信息`（默认）/ `调试`。默认 `信息` 覆盖启动、生命周期、降级告警与 HTTP 请求（访问日志只在下面说的"有日志文件的运行态"输出）；级别同时约束 `console` 兜底输出，不会出现「关了 info 但扩展还在刷」。
+- 改动**立即生效**，不需要重启后端。前端把当前级别与生效级别一起展示，避免"以为开了其实没生效"。
+
+日志文件位置由启动方式决定：CLI 是 `~/.puddingteams/logs/server.log`，Electron 是 Electron `userData/logs/server.log`，源码开发态直接输出到终端。文件超过上限（CLI 8 MiB / Electron 5 MiB）会轮转为同目录的 `.1`，只保留一份历史；`.1` 就是上一次运行的现场，排障时先看它。
+
+### 取证：看日志与导出诊断包
+
+```bash
+puddingteams logs                 # 报告级别与文件位置，并打印最后 120 行
+puddingteams logs --tail 500      # 指定行数
+puddingteams logs --export        # 导出诊断包（JSON，需后端在运行）
+```
+
+- 没有日志文件时（源码开发态），`puddingteams logs` 会从**运行中后端的内存缓冲**取最近日志——后端始终保留最近 2000 行平台日志（不含 HTTP 访问日志，避免被请求刷掉）。
+- `--export` 生成的诊断包包含：运行标识（版本、数据目录、pid、runId、Node/平台）、当前日志级别、日志文件尾部（每个文件最多 1 MiB）与内存缓冲。它**只读日志文件与设置，不读密钥目录、不触发任何同步或重放**。
+- 设置 → 日志 → 「导出诊断包」是同一个包的浏览器入口（桌面 App 里也是这个界面）。
+
+`puddingteams doctor` 会额外打印一行「日志」：当前级别（或"已关闭"）、日志文件路径与大小，用于一眼确认"这次是不是真的在记"。
+
+`info` 级别在有日志文件的运行态（CLI / Electron）包含 HTTP 访问日志（每个请求两行），这是刻意的：出问题时的第一条线索往往是"哪个请求慢/失败"。它不进内存缓冲与诊断包的分析面，只在文件里。**源码开发态（`pnpm dev`）默认不打访问日志**——那里日志直接刷在终端上，每请求两行 JSON 只会淹没真正有用的行；需要按 URL 排查时用 `PUDDINGTEAMS_ACCESS_LOG=1` 打开。
 
 ## 常见故障
 

@@ -119,7 +119,7 @@ export function NavRail({ view, returnSessionId }: { view: AppView; returnSessio
 		<div id="app-primary-navigation" className="nav-rail flex shrink-0 flex-col" data-app-sidebar="nav">
 			<Link href="/" className="nav-brand" title="PuddingTeams" aria-label="PuddingTeams 首页">
 				<ProductAvatar size={38} shape="square" className="nav-brand-mark" />
-				<span className="nav-brand-name nav-label">
+				<span className="nav-brand-name">
 					<strong>PuddingTeams</strong>
 					<small className="nav-brand-caption" aria-hidden="true">YOUR PERSONAL WORKSPACE</small>
 				</span>
@@ -180,7 +180,7 @@ export function NavRail({ view, returnSessionId }: { view: AppView; returnSessio
 			<div className="flex-1" />
 
 			<div className="nav-user-row">
-			<DropdownMenu>
+			<DropdownMenu modal={false}>
 				<DropdownMenuTrigger asChild>
 					<button
 						type="button"
@@ -230,7 +230,7 @@ export function NavRail({ view, returnSessionId }: { view: AppView; returnSessio
 
 			<AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />
 			{identity && profileOpen ? <ProfileDialog open={profileOpen} onOpenChange={setProfileOpen} identity={identity} onSaved={(next) => setIdentityState({ status: "ready", identity: next })} /> : null}
-			{searchOpen ? <GlobalSearchDialog open onOpenChange={setSearchOpen} returnSessionId={returnSessionId} /> : null}
+			<GlobalSearchDialog open={searchOpen} onOpenChange={setSearchOpen} returnSessionId={returnSessionId} />
 
 			<button
 				type="button"

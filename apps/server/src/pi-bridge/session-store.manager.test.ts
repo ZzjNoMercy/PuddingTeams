@@ -796,16 +796,16 @@ test("§3.3.7: 重启/重建从 JSONL 历史回放已激活的受管工具", asy
 		stopReason: "stop",
 		timestamp: Date.now(),
 	} as never);
-	// 模拟上一轮 search_agent_tools 激活：SDK 会给"激活了新工具"的
-	// toolResult 标注 addedToolNames 并落盘（SDK 只写不读，回放由平台负责）。
+	// 模拟上一轮 search_agent_tools 激活：激活会以下一条 run 的 system
+	// 消息 toolsAdded 增量落盘，回放按 transcript 声明还原（SDK 自带的
+	// 恢复分支在 createAgentSession 下不会执行，由平台负责）。
 	session.sessionManager.appendMessage({
-		role: "toolResult",
-		toolCallId: "call_replay",
-		toolName: "search_agent_tools",
-		content: [{ type: "text", text: "已激活" }],
-		details: { matches: [extTool, "agent_ghost__delegate"], added: [extTool, "agent_ghost__delegate"] },
-		addedToolNames: [extTool, "agent_ghost__delegate"],
-		isError: false,
+		role: "system",
+		content: "",
+		toolsAdded: [
+			{ name: extTool, description: "deep query", parameters: { type: "object", properties: {} } },
+			{ name: "agent_ghost__delegate", description: "ghost", parameters: { type: "object", properties: {} } },
+		],
 		timestamp: Date.now(),
 	} as never);
 
@@ -941,15 +941,65 @@ test("group running 投影直接追加为隐藏 custom entry，不进入展示�
 
 test("平台联网只装入 Manager Solo，Direct/Group relay 不获得联网工具", async () => {
  const { sessions, dir } = await makeStack();
- sessions.setWebResearchExtension(() => ({ name: "web-fixture", factory: (pi) => {
-  pi.registerTool({ name: "web_search", label: "Search", description: "search", parameters: Type.Object({}), async execute() { return { content: [{ type: "text", text: "source" }], details: {} }; } });
+ sessions.setWebResearchExtension((_agentId, opts) => ({ name: "web-fixture", factory: (pi) => {
+  pi.registerTool({ name: "web_search", label: "Search", description: "search", parameters: Type.Object({}), ...(opts?.exposure ? { exposure: opts.exposure } : {}), async execute() { return { content: [{ type: "text", text: "source" }], details: {} }; } });
  } }));
  try {
   for (const type of ["solo", "direct", "group"] as const) {
    const summary = await sessions.create(undefined, { type, members: type === "solo" ? [] : ["puddingclaw"], cwd: dir });
    const session = await sessions.open(summary.id);
-   assert.equal(session.getActiveToolNames().includes("web_search"), type === "solo", type);
+   const registered = session.getAllTools().find((tool) => tool.name === "web_search");
+   if (type === "solo") {
+    // Manager 联网为渐进式：注册但不在默认声明集，经 tool_search 激活。
+    assert.equal(registered?.exposure, "deferred");
+    assert.ok(!session.getActiveToolNames().includes("web_search"), "deferred 工具不应默认激活");
+   } else {
+    assert.equal(registered, undefined, type);
+   }
   }
+ } finally { await sessions.disposeAll(); }
+});
+
+test("Manager 日历工具以 deferred 注册，Worker 委派路径不受影响", async () => {
+ const { sessions, dir } = await makeStack();
+ sessions.setCalendarExtension((_getSessionId, opts) => ({ name: "calendar-fixture", factory: (pi) => {
+  pi.registerTool({ name: "calendar_list_events", label: "Calendar", description: "list", parameters: Type.Object({}), ...(opts?.exposure ? { exposure: opts.exposure } : {}), async execute() { return { content: [{ type: "text", text: "[]" }], details: {} }; } });
+ } }));
+ try {
+  const summary = await sessions.create(undefined, { type: "solo", members: [], cwd: dir });
+  const session = await sessions.open(summary.id);
+  const registered = session.getAllTools().find((tool) => tool.name === "calendar_list_events");
+  assert.equal(registered?.exposure, "deferred");
+  assert.ok(!session.getActiveToolNames().includes("calendar_list_events"), "deferred 工具不应默认激活");
+ } finally { await sessions.disposeAll(); }
+});
+
+test("重建后从 transcript system 增量回放渐进激活的工具（§3.3.7）", async () => {
+ const { teams, sessions } = await makeStack();
+ sessions.setWebResearchExtension((_agentId, opts) => ({ name: "web-fixture", factory: (pi) => {
+  pi.registerTool({ name: "web_search", label: "Search", description: "search", parameters: Type.Object({}), ...(opts?.exposure ? { exposure: opts.exposure } : {}), async execute() { return { content: [{ type: "text", text: "source" }], details: {} }; } });
+ } }));
+ try {
+  const summary = await sessions.create();
+  await teams.ensureSoloWindow(async () => ({ id: summary.id }), async () => true);
+  const session = await sessions.open(summary.id);
+  assert.ok(!session.getActiveToolNames().includes("web_search"), "deferred 工具不应默认激活");
+  // tool_search 激活本身不落盘，SDK 在下一条 run 把 loadout 记为 system
+  // 消息的 toolsAdded 增量；这里直接落等价的 transcript 记录。
+  session.sessionManager.appendMessage({
+   role: "system",
+   content: "",
+   toolsAdded: [
+    { name: "web_search", description: "search", parameters: { type: "object", properties: {} } },
+    { name: "deleted_tool", description: "gone", parameters: { type: "object", properties: {} } },
+   ],
+   timestamp: Date.now(),
+  } as never);
+  await sessions.disposeAll();
+  const rebuilt = await sessions.open(summary.id);
+  assert.notEqual(rebuilt, session, "dispose 后 open 必须重建实例");
+  assert.ok(rebuilt.getActiveToolNames().includes("web_search"), "重建后应回放激活态，模型模仿历史调用不该再 Tool not found");
+  assert.ok(!rebuilt.getActiveToolNames().includes("deleted_tool"), "本次未注册（已删除/撤权）的工具不进回放");
  } finally { await sessions.disposeAll(); }
 });
 

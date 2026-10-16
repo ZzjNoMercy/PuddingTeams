@@ -1,8 +1,10 @@
 import type {
 	ChatMessage,
+	ChatMessageImage,
 	PiAssistantMessage,
 	PiContentBlock,
 	PiCustomMessage,
+	PiImageBlock,
 	PiMessage,
 	PiTextBlock,
 	PiToolCallBlock,
@@ -25,6 +27,43 @@ function textOf(blocks: PiContentBlock[] | undefined): string {
 		.filter((b): b is PiTextBlock => b.type === "text")
 		.map((b) => b.text)
 		.join("\n");
+}
+
+/** server 拼进 prompt 尾部的附件冻结清单（模型按路径读文件）；气泡里不重复展示。 */
+const ATTACHMENT_MANIFEST_MARKER = "\n\n用户附件（平台冻结路径，可按需读取并在委托任务中原样传递）：\n";
+
+/**
+ * 用户消息拆成「展示文本 + 图片」：image 块恢复为缩略图，附件清单裸文本从
+ * 正文剥离，文件名收进对应缩略图的 hover。清单格式解析失败时保留原文，
+ * 图片仍然渲染（最坏只是回到清单可见的现状）。
+ */
+function userDisplayParts(content: string | PiContentBlock[]): { text: string; images?: ChatMessageImage[] } {
+	if (typeof content === "string") return { text: content };
+	const text = textOf(content);
+	const imageBlocks = content.filter((b): b is PiImageBlock => b.type === "image");
+	if (!imageBlocks.length) return { text };
+	let displayText = text;
+	let names: Array<{ name: string; mimeType: string }> = [];
+	const markerAt = text.lastIndexOf(ATTACHMENT_MANIFEST_MARKER);
+	if (markerAt >= 0) {
+		const parsed = text
+			.slice(markerAt + ATTACHMENT_MANIFEST_MARKER.length)
+			.split("\n")
+			.map((line) => /^- (.+) \((.+), [0-9]+ bytes\): .+$/.exec(line))
+			.map((match) => (match ? { name: match[1]!, mimeType: match[2]! } : undefined));
+		if (parsed.every((entry) => entry !== undefined)) {
+			displayText = text.slice(0, markerAt);
+			names = (parsed as Array<{ name: string; mimeType: string }>).filter((entry) => entry.mimeType.startsWith("image/"));
+		}
+	}
+	return {
+		text: displayText,
+		images: imageBlocks.map((block, index) => ({
+			data: block.data,
+			mimeType: block.mimeType,
+			...(names[index] ? { name: names[index]!.name } : {}),
+		})),
+	};
 }
 
 function safeErrorDetail(raw: string): string {
@@ -141,6 +180,20 @@ export function groupConsecutiveModelErrors(messages: ChatMessage[]): ChatMessag
 		else groups.push([message]);
 	}
 	return groups;
+}
+
+/**
+ * 旧错误段只在「之后出现过一条已完成、非流式、有正文的模型答复，且其后没有再失败」
+ * 时才算重试成功。返回该答复段的下标；无符合条件的答复时返回 -1。
+ * 中途的工具段/thinking 段不算恢复，最后再次失败时历史错误保持失败事实。
+ */
+export function recoveredReplyIndex(segments: Array<{ error?: boolean; streaming?: boolean; content?: string }>): number {
+	let last = -1;
+	segments.forEach((segment, index) => {
+		if (!segment.error && !segment.streaming && Boolean(segment.content)) last = index;
+	});
+	if (last < 0) return -1;
+	return segments.slice(last + 1).some((segment) => segment.error) ? -1 : last;
 }
 
 /** Map a pi custom_message (e.g. pudding:task_assign/result) to chat view state. */
@@ -377,10 +430,12 @@ export function renderHistory(msgs: PiMessage[]): ChatMessage[] {
 			continue;
 		}
 		if (m.role === "user") {
+			const parts = userDisplayParts(m.content);
 			out.push({
 				id: uid(),
 				role: "user",
-				content: typeof m.content === "string" ? m.content : textOf(m.content),
+				content: parts.text,
+				...(parts.images?.length ? { images: parts.images } : {}),
 				puddingMessageId: m.puddingMessageId,
 				toolCalls: [],
 				timestamp: m.timestamp ?? Date.now(),
@@ -614,12 +669,14 @@ export function reducePiEvent(messages: ChatMessage[], event: { type: string; [k
 			}
 			if (m.role === "user") {
 				if (m.puddingMessageId && messages.some((item) => item.role === "user" && item.puddingMessageId === m.puddingMessageId)) return messages;
+				const parts = userDisplayParts(m.content);
 				return [
 					...messages,
 					{
 						id: uid(),
 						role: "user",
-						content: typeof m.content === "string" ? m.content : textOf(m.content),
+						content: parts.text,
+						...(parts.images?.length ? { images: parts.images } : {}),
 						puddingMessageId: m.puddingMessageId,
 						toolCalls: [],
 						timestamp: m.timestamp ?? Date.now(),

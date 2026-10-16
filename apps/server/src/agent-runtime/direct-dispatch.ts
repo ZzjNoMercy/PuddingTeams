@@ -5,12 +5,9 @@ import type { TeamsStore, WindowConfig } from "../store/teams.js";
 import type { WorkStateStore } from "../store/work-state.js";
 
 /**
- * Direct 窗口直派（§5.2）：direct 窗口 = 纯 worker 通道，用户消息不再经
- * pi manager relay，直接委托给窗口成员 worker。窗口的 pi session 只作消息
- * 流容器（user 消息与 worker 卡片都是 custom message），永不触发 manager
- * 回合。委托的 managerSessionId 就是 direct 窗口自己的 active session——
- * owner 即本窗口，invoker 的 outcomeTargets 因此自然去重，HITL 审批卡也
- * 直接落回本窗口。
+ * Non-Pi Connector single-chat adapter. Pi owners use PiSessionStore directly.
+ * The external Driver owns its private conversation handle; the local owner
+ * stores display/admission facts. This does not continue a Manager delegation.
  */
 
 export interface DirectDispatchDeps {

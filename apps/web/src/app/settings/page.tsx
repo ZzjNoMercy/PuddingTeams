@@ -10,8 +10,9 @@ import { HarnessSettingsPanel, type HarnessTab } from "@/components/settings/har
 import { ProviderSettings } from "@/components/settings/provider-settings";
 import { WebResearchSettingsPanel } from "@/components/settings/web-research-settings";
 import { FeishuSettings } from "@/components/settings/feishu-settings";
+import { LoggingSettingsPanel } from "@/components/settings/logging-settings";
 
-type SettingsSection = "appearance" | "harness" | "providers" | "network" | "feishu";
+type SettingsSection = "appearance" | "harness" | "providers" | "network" | "feishu" | "logging";
 
 const sections: Array<{ id: SettingsSection; title: string }> = [
 	{ id: "appearance", title: "外观" },
@@ -19,13 +20,14 @@ const sections: Array<{ id: SettingsSection; title: string }> = [
 	{ id: "providers", title: "模型" },
 	{ id: "network", title: "联网" },
 	{ id: "feishu", title: "飞书默认应用" },
+	{ id: "logging", title: "日志" },
 ];
 
 function SettingsPageContent() {
 	const router = useRouter();
 	const query = useSearchParams();
 	const requested = query.get("section");
-	const section: SettingsSection = requested === "harness" || requested === "providers" || requested === "network" || requested === "feishu" ? requested : "appearance";
+	const section: SettingsSection = requested === "harness" || requested === "providers" || requested === "network" || requested === "feishu" || requested === "logging" ? requested : "appearance";
 	const requestedSub = query.get("sub");
 	const harnessTab: HarnessTab = requestedSub === "results" || requestedSub === "activation" || requestedSub === "recovery" || requestedSub === "verification" || requestedSub === "workspace" ? requestedSub : "search";
 	const [harnessVisited, setHarnessVisited] = useState(section === "harness");
@@ -49,10 +51,11 @@ function SettingsPageContent() {
 				</nav>
 				<main ref={contentRef} className="settings-content" aria-label="设置内容">
 					{section === "feishu" ? <FeishuSettings /> : null}
+					{section === "logging" ? <LoggingSettingsPanel /> : null}
 					{section === "network" ? <div className="settings-content-column"><div className="settings-section-heading"><h2>联网</h2><p>统一管理搜索供应商，按 Worker 授权联网。</p></div><WebResearchSettingsPanel /></div> : null}
 					{section === "appearance" ? <div className="settings-content-column"><div className="settings-section-heading"><h2 id="appearance-heading">外观</h2><p>跟随你的工作习惯。</p></div><section className="settings-card settings-appearance-card" aria-labelledby="appearance-heading"><AppearanceSettings /></section></div> : null}
 					{harnessVisited || section === "harness" ? <div className="settings-content-column" hidden={section !== "harness"}><div className="settings-section-heading"><h2 id="harness-heading">Harness</h2><p>控制 Manager 上下文预算、Goal 激活与安全恢复。</p></div><HarnessSettingsPanel selectedTab={harnessTab} onTabChange={selectHarnessTab} /></div> : null}
-					{section === "providers" ? <div className="settings-content-column"><div className="settings-section-heading"><h2 id="providers-heading">模型</h2><p>管理模型凭证、可用模型与默认模型。</p></div><section className="settings-card settings-provider-card" aria-labelledby="providers-heading"><ProviderSettings /></section></div> : null}
+					{section === "providers" ? <div className="settings-content-column"><div className="settings-section-heading"><h2 id="providers-heading">模型</h2><p>管理模型凭证、可用模型与全局后备模型。当前会话的模型在聊天中切换。</p></div><section className="settings-card settings-provider-card" aria-labelledby="providers-heading"><ProviderSettings /></section></div> : null}
 				</main>
 			</div>
 		</div>

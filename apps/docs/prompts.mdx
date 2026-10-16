@@ -88,3 +88,8 @@ Connector Worker 的模型由 Connector config 决定。Codex 可以通过其 ap
 Agent 配置中的“有效提示词预览”应按真实装配顺序分段显示 base、native append、Agent 指令、Window collaboration、global context 和 Workspace context，并列出启用的 skills/templates。它展示已保存配置；未信任的 Workspace 正文不会出现在预览中。
 
 排错时先问三个问题：这条规则属于谁、它来自哪一层、当前请求的信任/开关是否允许。不要只看最终长字符串猜来源。
+
+
+## 原生会话与单次委派
+
+Manager 保留 Pi SDK 原生工具、Goal 和统一 delegation。Pi Worker 单聊仅加载当前负责人的指令、工具、模型和授权；Fork 中的历史对话不能授予来源 Manager 权限。group 限定 Manager 可委派的 Worker 集合，配置至少两位。

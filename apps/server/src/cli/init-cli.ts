@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { access, chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { getAgentDir, ModelRuntime, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { resolvePuddingTeamsPaths, type PuddingTeamsPaths } from "../paths.js";
+import { readLoggingSettings } from "../store/product-settings.js";
 import { upsertCustomProvider, type CustomProviderInput } from "../pi-bridge/custom-providers.js";
 import { CredentialsStore } from "../store/credentials.js";
 import { TeamsStore } from "../store/teams.js";
@@ -293,7 +294,6 @@ async function probeCore(deps: CliDeps): Promise<ProbeItem[]> {
 	let home = "";
 	try {
 		home = resolvePuddingTeamsPaths(deps.env).home;
-		// 探测只读：目录不存在不创建，改验父目录可写（首次启动时会自动创建）。
 		try {
 			await access(home, fsConstants.R_OK | fsConstants.W_OK);
 			items.push({ id: "home", ok: true, detail: home });
@@ -309,6 +309,21 @@ async function probeCore(deps: CliDeps): Promise<ProbeItem[]> {
 			detail: home || "(未解析)",
 			remediation: `数据目录不可写：${err instanceof Error ? err.message : String(err)}；检查权限或设置 PUDDINGTEAMS_HOME 指向可写目录`,
 		});
+	}
+	// 日志：只读报告级别与文件位置，不创建、不轮转、不清理。
+	try {
+		const logging = await readLoggingSettings(resolvePuddingTeamsPaths(deps.env).config);
+		const file = deps.env.PUDDINGTEAMS_LOG_FILE?.trim() || path.join(home || resolvePuddingTeamsPaths(deps.env).home, "logs", "server.log");
+		let size = "尚无文件";
+		try {
+			size = `${((await stat(file)).size / 1024).toFixed(1)} KiB`;
+		} catch {
+			// 源码开发态不给文件路径：日志只在启动它的终端里。
+			size = deps.env.PUDDINGTEAMS_LOG_FILE?.trim() ? "尚无文件" : "尚无文件（源码开发态输出到终端）";
+		}
+		items.push({ id: "logging", ok: true, detail: `级别 ${logging.enabled ? logging.level : "已关闭（设置 → 日志）"}｜${file}｜${size}` });
+	} catch (err) {
+		items.push({ id: "logging", ok: true, detail: `日志设置读取失败：${err instanceof Error ? err.message : String(err)}` });
 	}
 	return items;
 }
@@ -350,6 +365,7 @@ function printSection(title: string, items: ProbeItem[], labels: Map<string, str
 const CORE_LABELS = new Map([
 	["node", "Node.js"],
 	["home", "数据目录"],
+	["logging", "日志"],
 ]);
 
 const WORKER_LABELS = new Map(WORKERS.map((w) => [w.id, w.label]));

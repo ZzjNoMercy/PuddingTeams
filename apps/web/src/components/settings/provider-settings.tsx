@@ -221,10 +221,10 @@ function ProviderRow({
 											<small>{m.id}{m.reasoning ? " · 支持思考" : ""}</small>
 										</span>
 										{!defaultKnown ? <span className="text-xs text-muted-foreground">{defaultPending ? "正在设置默认模型…" : "默认状态未加载"}</span> : isDefault ? (
-											<span className="provider-default-badge">默认</span>
+											<span className="provider-default-badge" title="仅在新会话没有明确模型时使用；已有会话及 Agent 的明确配置优先">全局后备</span>
 										) : (
 											<Button type="button" size="sm" variant="ghost" disabled={defaultPending} onClick={() => void onSetDefault(provider.id, m.id.split("/").slice(1).join("/"))}>
-												设为默认
+												设为全局后备
 											</Button>
 										)}
 									</div>
@@ -307,7 +307,7 @@ export function ProviderSettings() {
 			setDefaultKnown(true);
 			setSettingsError(null);
 			if (settings.defaultProvider !== provider || settings.defaultModel !== model) throw new Error("回读的默认模型与提交值不一致");
-			toast.success("已设为默认模型");
+			toast.success("已设为全局后备模型；已有会话保持原模型");
 		} catch (err) {
 			if (submitted) {
 				setSettingsError(err instanceof Error ? err.message : String(err));
@@ -359,6 +359,7 @@ export function ProviderSettings() {
 
 	return (
 		<div className={cn("provider-settings flex min-h-0 flex-1 flex-col gap-3")}>
+			<p className="text-xs leading-5 text-muted-foreground">全局后备模型仅在新会话没有明确模型时使用。Manager、Worker 的明确配置及已有会话的模型选择优先；切换当前会话模型请使用聊天输入框中的模型菜单。</p>
 			{providersError || customProvidersError || settingsError ? <div role="alert" className="rounded-md border border-destructive/20 bg-destructive/5 p-3 text-xs text-destructive"><p>{providersError ? `Provider 列表加载失败：${providersError}。` : ""}{customProvidersError ? `自定义 Provider 加载失败：${customProvidersError}。` : ""}{settingsError ? `默认模型状态加载失败：${settingsError}。` : ""}</p><Button type="button" size="sm" variant="outline" className="mt-2" disabled={defaultPending} onClick={() => void refresh()}>重试加载</Button></div> : null}
 			<div className="provider-group">
 				<div className="provider-group-label">已配置</div>

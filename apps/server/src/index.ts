@@ -1,3 +1,5 @@
+import { registerLegacyDataDiagnostics } from "./routes/legacy-data-diagnostics.js";
+import { registerLogDiagnostics } from "./routes/diagnostics-log.js";
 import { NativeInput } from "./pi-bridge/native-input.js";
 import { SessionForks } from "./agent-runtime/session-forks.js";
 import { ForkOperations } from "./store/fork-operations.js";
@@ -7,7 +9,7 @@ import { DelegationDeliveryStore } from "./store/delegation-delivery.js";
 import { DelegationDelivery } from "./agent-runtime/delegation-delivery.js";
 import { NativeToolExecution } from "./pi-bridge/native-tool-execution.js";
 import { directConversationHistory } from "./agent-runtime/direct-history.js";
-import Fastify from "fastify";
+import Fastify, { LogController } from "fastify";
 import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
 import path from "node:path";
@@ -30,7 +32,9 @@ import { registerSettingsRoutes } from "./routes/settings.js";
 import { readViewerIdentity, registerIdentityRoutes } from "./routes/identity.js";
 import { registerProvidersRoutes } from "./routes/providers.js";
 import { registerAgentsRoutes } from "./routes/agents.js";
+import { registerToolPreviewRoutes } from "./routes/tool-preview.js";
 import { registerResourcesRoutes } from "./routes/resources.js";
+import { registerChatNavigationRoutes } from "./routes/chat-navigation.js";
 import { registerRoomsRoutes } from "./routes/rooms.js";
 import { registerInteractionsRoutes } from "./routes/interactions.js";
 import { isWorkspaceOwnerClosed } from "./agent-runtime/workspace-owner-lifecycle.js";
@@ -47,7 +51,8 @@ import { piConnectorManifest, piExtensionHooks } from "./agent-runtime/pi-extens
 import { registerExtensionsRoutes } from "./routes/extensions.js";
 import { registerArtifactsRoutes } from "./routes/artifacts.js";
 import { registerWorkspacesRoutes } from "./routes/workspaces.js";
-import { ProductSettingsStore } from "./store/product-settings.js";
+import { ProductSettingsStore, effectiveLogLevel, readLoggingSettings } from "./store/product-settings.js";
+import { LogRing, accessLoggingEnabled, applyLoggingSettings, logStream } from "./logging.js";
 import { LargeWorkerResultStore } from "./store/large-worker-result.js";
 import { WorkStateStore } from "./store/work-state.js";
 import { registerWorkStateRoutes } from "./routes/work-state.js";
@@ -97,7 +102,6 @@ import { CuratorJobStore, WikiCuratorService, curatorJobFeedback } from "./knowl
 import { KnowledgeSourceStore } from "./knowledge/sources.js";
 import { ChatKnowledgeIntake } from "./knowledge/chat-intake.js";
 import { directTaskId } from "./agent-runtime/direct-dispatch.js";
-import { WorkerInputDispatcher, WorkerInputQueueStore } from "./agent-runtime/worker-input-queue.js";
 import { registerWikiCuratorRoutes } from "./routes/wiki-curator.js";
 import { ReadLaterStore } from "./read-later/store.js";
 import { ReadLaterCaptureService } from "./read-later/capture-service.js";
@@ -111,7 +115,24 @@ import { KnowledgeHistoryStore } from "./knowledge/history-store.js";
 // 立即删除，避免 Connector/Worker 子进程继续继承 Electron 专用开关。
 if (process.env.PUDDINGTEAMS_DESKTOP === "1") delete process.env.ELECTRON_RUN_AS_NODE;
 
-const app = Fastify({ logger: { level: "warn" } });
+// 日志级别取持久化设置（设置 → 日志）：必须在构造 Fastify 之前读取，否则首屏
+// 启动日志会先按引导默认输出。文件缺失/损坏一律回退默认（info）。
+const paths = resolvePuddingTeamsPaths();
+const bootLogging = await readLoggingSettings(paths.config);
+// 内存环形缓冲与 pino 输出流：既写 stdout（发行态被启动器重定向进文件），
+// 也留一份最近日志，供开发态/无文件场景导出诊断包。
+const logRing = new LogRing();
+const app = Fastify({
+	// 访问日志只在有日志文件的运行态输出（见 accessLoggingEnabled）：源码开发态
+	// 每个请求两行 JSON 会把终端刷屏，且环形缓冲本就已过滤掉它们。
+	logController: new LogController({ disableRequestLogging: !accessLoggingEnabled() }),
+	logger: { level: effectiveLogLevel(bootLogging), stream: logStream(logRing) },
+});
+// console 兜底策略同时生效：pi SDK / Extension / Capability 的 console 输出也受
+// 同一开关与级别约束，否则「关闭日志」只是关掉了平台自己那一半。
+applyLoggingSettings(app.log, bootLogging);
+/** 超过这个耗时的工具调用即使不是错误也要在默认级别可见。 */
+const SLOW_TOOL_MS = 10_000;
 
 // Browser UI runs on a different origin (Next dev on :8934), so cross-origin
 // requests and WebSocket upgrades to this server must be allowed. DELETE must
@@ -127,7 +148,6 @@ await app.register(websocket);
 
 // 用户数据目录（文档 §4）：一切平台状态落在 PUDDINGTEAMS_HOME（缺省
 // ~/.puddingteams）下；单写者 Lease 保证同一数据目录只有一个后端实例。
-const paths = resolvePuddingTeamsPaths();
 await ensurePaths(paths);
 const releaseLease = await acquireLease(paths).catch((err: unknown) => {
 	app.log.error(err, "failed to acquire backend lease — exiting");
@@ -344,21 +364,30 @@ const store = new PiSessionStore(
 	nativeExecutions,
 );
 store.setKnowledgeRuntime(knowledgeRuntime);
+// 诊断与运行时活动的出口。`setDebugLog` 此前只有埋点、没有调用方（11 处写进空气）；
+// 那些消息都是降级/失败（能力装配失败、模型自愈失败、投递失败），按 warn 落地。
+store.setDebugLog((message) => app.log.warn({ component: "pi-session" }, message));
+// 轮次/工具耗时、自动重试、上下文压缩：平台此前完全没有这类数据（定位停止超时与
+// 慢轮次时只能靠时间戳反推）。工具调用量大，只在出错或明显偏慢时提到 warn。
+store.setActivityLog(({ sessionId, kind, ...fields }) => {
+	const slowTool = kind === "tool" && (fields.isError === true || (fields.durationMs ?? 0) >= SLOW_TOOL_MS);
+	if (kind === "retry") app.log.warn({ sessionId, ...fields }, "模型调用自动重试");
+	else if (kind === "tool") app.log[slowTool ? "warn" : "debug"]({ sessionId, ...fields }, "工具执行完成");
+	else if (kind === "compaction") app.log.info({ sessionId, ...fields }, "上下文压缩");
+	else app.log.info({ sessionId, ...fields }, "会话轮次完成");
+});
+// Manager 即知识整理负责人（无知识管家委派）：完整知识面 + 候选管线直接挂到
+// manager 会话，素材解析与 direct 直派共用 chatKnowledgeIntakes 链路。
+knowledgeRuntime.setManagerCuration((surface, scope) => wikiCurator.workerSurface(surface, {
+	ownerId: scope.ownerId, windowId: scope.windowId, sessionId: scope.sessionId,
+	operationId: `native:${scope.sessionId}:manager`,
+	listSourceMessages: async () => chatKnowledgeIntakes.messages(await store.open(scope.sessionId), scope.ownerId),
+	resolveSources: async (toolCallId, ids) => ids
+		? chatKnowledgeIntakes.resolveMessages(await store.open(scope.sessionId), scope.ownerId, ids)
+		: chatKnowledgeIntakes.resolve(await store.open(scope.sessionId), scope.ownerId, { toolCallId }),
+}, "wiki"));
 const messageOperations = new MessageSubmissionOperations(path.join(paths.state, "message-submission-operations"));
 const nativeInputController = new NativeInput(store,messageOperations,chatKnowledgeIntakes);
-const workerInputQueueStore = new WorkerInputQueueStore(path.join(paths.state, "worker-input-queue.json"));
-await workerInputQueueStore.init();
-const workerInputDispatcher = new WorkerInputDispatcher({
-	queue: workerInputQueueStore,
-	teams,
-	sessions: store,
-	invoker,
-	runtime,
-	delegations,
-	runtimeModelFor: (sessionId) => store.workerRuntimeModel(sessionId),
-	log: (message) => app.log.info(message),
-});
-// P2: delegated contexts are trace-only; no queue consumption is attached.
 const calendarScope = async (sessionId: string) => {
  const scope = await knowledgeRuntime.scopeForSession(sessionId);
  if (!scope) throw new Error("当前聊天上下文不可用");
@@ -368,7 +397,7 @@ const calendarScope = async (sessionId: string) => {
   if (next.revision !== selection.revision || JSON.stringify(next.selectedBindingIds) !== JSON.stringify(selection.selectedBindingIds)) throw new Error("本轮知识库选择已变化，请重试");
  } };
 };
-store.setCalendarExtension(getSessionId => calendarExtension(calendarService, () => calendarScope(getSessionId())));
+store.setCalendarExtension((getSessionId, opts) => calendarExtension(calendarService, () => calendarScope(getSessionId()), opts));
 invoker.setConversationHistory(async (agent, ctx) => {
 	const delegation = ctx.delegationId ? await runtime.getDelegation(ctx.delegationId) : undefined;
 	if (!delegation?.operationId) return [];
@@ -395,7 +424,7 @@ const webResearch = new WebResearchSettings(webResearchCredentials, async (provi
   targets: async () => (await teams.listAgents()).map(webResearchTarget),
   onAccessChanged: () => store.markAllDirty(),
 });
-store.setWebResearchExtension(agentId => webResearch.extension(agentId));
+store.setWebResearchExtension((agentId, opts) => webResearch.extension(agentId, opts));
 invoker.setWebResearchExtension(agentId => webResearch.extension(agentId), agentId => webResearch.accessFingerprint(agentId), agentId => webResearch.tools(agentId));
 invoker.setKnowledgeRuntime(async (agent, ctx, _message) => {
 	const delegation = ctx.delegationId ? await runtime.getDelegation(ctx.delegationId) : undefined;
@@ -715,10 +744,17 @@ await registerChatRoutes(app, store, teams, workStates, uploads, invoker, {
 	...(process.env.PUDDINGTEAMS_RUN_ID ? { runId: process.env.PUDDINGTEAMS_RUN_ID } : {}),
 }, providerDeletion, messageOperations, chatKnowledgeIntakes, {
 	delegations,
-	sessionDir: paths.workerSessions,
-	inputQueue: workerInputDispatcher,
 }, nativeInputController);
 registerIdentityRoutes(app, localViewerIdentity, paths);
+registerLegacyDataDiagnostics(app, paths.state);
+registerLogDiagnostics(app, {
+	logFile: process.env.PUDDINGTEAMS_LOG_FILE,
+	home: paths.home,
+	readLogging: async () => (await productSettings.get()).logging,
+	recentLog: () => logRing.snapshot(),
+	version: process.env.PUDDINGTEAMS_VERSION,
+	runId: process.env.PUDDINGTEAMS_RUN_ID,
+});
 registerWebResearchSettingsRoutes(app, webResearch);
 registerCalendarRoutes(app, calendarService.store, () => localViewerIdentity().user.id, calendarService);
 registerCalendarProviderRoutes(app, new CalendarProviderRegistry([createFeishuCalendarProvider(feishuConnection)]));
@@ -728,6 +764,10 @@ await registerSettingsRoutes(app, defaultCwd, productSettings, workStates, (sett
 }, async (name) => {
 	const agent = await teams.getAgent(name);
 	return !!agent && !agent.pinned && agent.enabled !== false;
+}, {
+	logFile: process.env.PUDDINGTEAMS_LOG_FILE,
+	// 级别改动无需重启：pino 支持运行时改级，`silent`（开关关闭）同样即时生效。
+	onLoggingChange: (logging) => { applyLoggingSettings(app.log, logging); },
 });
 await registerProvidersRoutes(app, store, providerDeletion);
 await registerAgentsRoutes(app, teams, {
@@ -740,6 +780,7 @@ await registerAgentsRoutes(app, teams, {
 	mcpServers,
 	agentCreationStatePath: path.join(paths.state, "agent-creation-operations.json"),
 });
+registerToolPreviewRoutes(app, teams, { memorySetup, webResearch, mcpServers, catalog });
 await registerExtensionsRoutes(app, {
 	registry: extensionRegistry,
 	teams,
@@ -805,6 +846,7 @@ const conversationSnapshots = new ConversationSnapshots(path.join(paths.state, "
 const sessionForks = new SessionForks(teams, store, invoker, conversationSnapshots, new ForkOperations(path.join(paths.state,"fork-operations.json")), [paths.uploads,path.join(paths.state,"large-worker-results"),conversationSnapshots.root]);
 await sessionForks.recover();
 registerSessionForkRoutes(app,sessionForks);
+registerChatNavigationRoutes(app, { teams, sessions: store, statePath: path.join(paths.state, "chat-navigation.json") });
 await registerRoomsRoutes(app, store, teams, invoker, workStates, {
 	attachmentRoot: paths.uploads,
  snapshotAssetRoot:conversationSnapshots.root,
@@ -812,9 +854,6 @@ await registerRoomsRoutes(app, store, teams, invoker, workStates, {
 	productSettings,
 	activityStatePath: path.join(paths.state, "room-activity.json"),
 	sessionCreationStatePath: path.join(paths.state, "session-creation-operations.json"),
-	delegations,
-	workerSessionDir: paths.workerSessions,
-	workerInputQueue: workerInputDispatcher,
 });
 await registerInteractionsRoutes(app, runtime, invoker, teams, workStates);
 registerArtifactsRoutes(app, artifacts);

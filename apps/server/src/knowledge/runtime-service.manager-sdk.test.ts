@@ -81,7 +81,7 @@ test("真实 Manager SDK 配置变化和重建保留同聊天历史，当前权�
 		assert.ok(JSON.stringify(requests.at(-1)).includes("PERSISTED_MANAGER_SECRET_A"));
 		assert.equal(swallowedContextThrows, 2, "SDK 的扩展异常确实被吞掉，不能作为核权边界");
 		const profile = manager.getEntries().find((entry) => entry.type === "custom" && entry.customType === "pudding:knowledge-profile");
-		assert.ok(profile?.type === "custom"); assert.deepEqual(profile.data, { fingerprint: createHash("sha256").update(JSON.stringify(["manager-delegation-v1", active.fingerprint])).digest("hex"), profile: "manager" });
+		assert.ok(profile?.type === "custom"); assert.deepEqual(profile.data, { fingerprint: createHash("sha256").update(JSON.stringify(["manager-curator-v1", active.fingerprint])).digest("hex"), profile: "manager" });
 		const file = manager.getSessionFile(); assert.ok(file); initial.dispose();
 		const same = await open(SessionManager.open(file, sessionDir));
 		await same.prompt("相同挂载重启后续聊");

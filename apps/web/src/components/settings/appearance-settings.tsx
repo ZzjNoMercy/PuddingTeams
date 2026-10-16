@@ -4,6 +4,7 @@ import { useSyncExternalStore } from "react";
 import { CheckCircle2Icon } from "lucide-react";
 import { toast } from "sonner";
 import { useTheme } from "@/components/theme-provider";
+import { PreferenceSwitch } from "./preference-switch";
 
 const MOTION_STORAGE_KEY = "puddingteams:reduce-motion";
 const MOTION_EVENT = "puddingteams:motion-change";
@@ -25,22 +26,6 @@ function subscribeSystemTheme(listener: () => void) {
 
 function getSystemDarkSnapshot() {
 	return window.matchMedia("(prefers-color-scheme: dark)").matches;
-}
-
-function PreferenceSwitch({ checked, label, onToggle }: { checked: boolean; label: string; onToggle: () => void }) {
-	return (
-		<button
-			type="button"
-			role="switch"
-			aria-checked={checked}
-			aria-label={label}
-			className="preference-switch"
-			data-checked={checked ? "true" : "false"}
-			onClick={onToggle}
-		>
-			<span />
-		</button>
-	);
 }
 
 export function AppearanceSettings() {

@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { findCalendarPeople, getCalendarEvent, retryCalendarInteraction, setCalendarEventStatus, KnowledgeApiError, mutateCalendarEvent, type CalendarEventStatus, type CalendarPeopleSource, type CalendarEventInput, type CalendarEventRecord } from "@/lib/api";
 import { plusDay, resolveWallTime, validDay, wallTime } from "./time";
 import styles from "./calendar.module.css";
@@ -16,6 +16,10 @@ export function EventEditor({ event, day, hour, zone, onClose, onSaved }: { even
 	const [startFold, setStartFold] = useState<"reject" | "earlier" | "later">("reject"), [endFold, setEndFold] = useState<"reject" | "earlier" | "later">("reject");
 	const [error, setError] = useState(""), [pending, setPending] = useState(false), [unconfirmed, setUnconfirmed] = useState(false), [confirmCancel, setConfirmCancel] = useState(false);
 	const [latest, setLatest] = useState<CalendarEventRecord | null>(null);
+	const feedbackRef = useRef<HTMLDivElement>(null);
+	useEffect(() => {
+		if (error || confirmCancel || latest) feedbackRef.current?.scrollIntoView({ block: "nearest" });
+	}, [error, confirmCancel, latest]);
 	const [participants, setParticipants] = useState(event?.participants ?? []), [interaction, setInteraction] = useState(event?.interaction);
 	const [peopleQuery, setPeopleQuery] = useState(""), [peopleResult, setPeopleResult] = useState<{ query: string; sources: CalendarPeopleSource[]; error?: string }>();
 	const [names, setNames] = useState<Record<string, string>>(() => Object.fromEntries((event?.participantDetails ?? []).map(p => [JSON.stringify([p.bindingId,p.personId]),p.name])));
@@ -73,9 +77,10 @@ export function EventEditor({ event, day, hour, zone, onClose, onSaved }: { even
 			setError(failure instanceof Error ? failure.message : "日程保存失败，请重试");
 		} finally { inFlight.current = false; setPending(false); }
 	};
-	return <Dialog open onOpenChange={(open) => { if (!open && !locked) onClose(); }}><DialogContent className={styles.dialog} showCloseButton={!locked}>
-		<DialogTitle>{done ? "已完成的日程" : cancelled ? "已取消的日程" : event ? "编辑日程" : "创建日程"}</DialogTitle><DialogDescription>平台本地日程 · 创建后不发送邀请或后台提醒。</DialogDescription>
+	return <Dialog open onOpenChange={(open) => { if (!open && !locked) onClose(); }}><DialogContent className={`${styles.dialog} ${styles.editorDialog}`} showCloseButton={!locked}>
+		<DialogHeader className={styles.editorHeader}><DialogTitle>{done ? "已完成的日程" : cancelled ? "已取消的日程" : event ? "编辑日程" : "创建日程"}</DialogTitle><DialogDescription>平台本地日程 · 创建后不发送邀请或后台提醒。</DialogDescription></DialogHeader>
 		<form onSubmit={(e) => { e.preventDefault(); void save(); }} className={styles.form}>
+			<div className={styles.editorBody}>
 			<fieldset disabled={locked || settled}>
 				<label>标题<input autoFocus aria-label="日程标题" value={title} maxLength={200} onChange={(e) => setTitle(e.target.value)} required /></label>
 				<div className={styles.columns}><label>类型<select disabled={Boolean(event?.interaction)} value={kind} onChange={(e) => { setKind(e.target.value as "event" | "focus"); if (e.target.value === "focus") setInteraction(undefined); }}><option value="event">日程</option><option value="focus">专注时段</option></select></label><label>时区<input aria-label="日程时区" value={timeZone} onChange={(e) => setTimeZone(e.target.value)} placeholder="Asia/Shanghai" required /></label></div>
@@ -94,11 +99,14 @@ export function EventEditor({ event, day, hour, zone, onClose, onSaved }: { even
 				</section>
 			</fieldset>
 			{event?.interactionState && <div className={styles.interactionStatus}><p>{event.interactionState.message}{event.interactionState.status === "needs_attention" && event.interactionState.reviewUrl ? "；请核对日程后重新保存生成新候选。" : ""}</p>{event.interactionState.status === "published" && event.interactionState.noteUrl ? <Link href={event.interactionState.noteUrl}>查看往来记录</Link> : event.interactionState.reviewUrl ? <Link href={event.interactionState.reviewUrl}>查看审核</Link> : null}{event.interactionState.status === "needs_attention" && !event.interactionState.reviewUrl && <button type="button" disabled={locked} onClick={() => { setPending(true); void retryCalendarInteraction(event.id).then(onSaved).catch((e: Error) => setError(e.message)).finally(() => setPending(false)); }}>重试往来同步</button>}</div>}
+			<div ref={feedbackRef} className={styles.editorFeedback}>
 			{error && <p role="alert" className={styles.error}>{error}</p>}
 			{unconfirmed && <p className={styles.hint}>保存结果未确认，已保留本次内容与操作身份。重试会核对同一操作。</p>}
 			{event && error && !locked && <button type="button" onClick={() => { void getCalendarEvent(event.id).then(setLatest).catch((e: Error) => setError(e.message)); }}>核对最新日程</button>}
 			{latest && <p role="status">最新版本 {latest.revision}：{latest.title}（{latest.status === "cancelled" ? "已取消" : latest.status === "done" ? "已完成" : "有效"}）。关闭后重新打开可载入；当前草稿保留。</p>}
 			{confirmCancel && !locked && <p role="alert">确定取消此日程？任务和知识库笔记不会被删除。<button type="button" onClick={() => void save(true)}>确认取消日程</button></p>}
+			</div>
+			</div>
 			<div className={styles.actions}>{event && !settled && !unconfirmed && <><button type="button" className={styles.danger} disabled={locked} onClick={() => setConfirmCancel(true)}>取消日程</button><button type="button" disabled={locked} onClick={() => void applyStatus("done")}>标记完成</button></>}{event && settled && <button type="button" disabled={locked} onClick={() => void applyStatus("confirmed")}>恢复计划</button>}<span /><button type="button" disabled={locked} onClick={onClose}>关闭</button>{!settled && <button className={styles.primary} disabled={pending} type="submit">{pending ? "保存中…" : unconfirmed ? "重试同一操作" : "保存日程"}</button>}</div>
 		</form>
 	</DialogContent></Dialog>;

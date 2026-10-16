@@ -2,12 +2,14 @@ import path from "node:path";
 import type { ConversationSnapshot } from "../store/conversation-snapshots.js";
 import { randomUUID } from "node:crypto";
 import { piSessionOwner, piSessionResourceLoader } from "./pi-session-factory.js";
+import { sessionActivity, type ActivityState, type SessionActivity } from "./session-activity.js";
 import { projectDelegationResult, delegationStatus } from "../agent-runtime/delegation-result-projection.js";
 import type { NativeToolExecution } from "./native-tool-execution.js";
 import {
 	createAgentSession,
 	createBashToolDefinition,
 	createEditToolDefinition,
+	createToolSearchExtension,
 	createWriteToolDefinition,
 	type ToolDefinition,
 	createFindToolDefinition,
@@ -94,6 +96,8 @@ export interface ModelSummary {
 	id: string;
 	name: string;
 	provider: string;
+	/** Endpoint from the resolved model configuration (including per-model overrides). */
+	baseUrl?: string;
 	reasoning: boolean;
 	/** 该模型支持的 thinking 档位（`thinkingLevelMap` 归一化后的可用集）；非推理模型为 ["off"]。 */
 	thinkingLevels: string[];
@@ -273,8 +277,22 @@ function delegationToolResult(delegation: DelegationRecord): RecoveredToolResult
  * active conversation streams without re-opening the file every message.
  * On backend restart, sessions are re-materialized from the JSONL files.
  */
-export class PiSessionStore {
-	private active = new Map<string, AgentSession>();
+/**
+ * pi 原生渐进式工具加载：tool_search 注册后默认不激活，这里在 session_start
+ * 时把它并入 active 集；知识库工具集（deferred）由模型按需搜索加载。
+ */
+function managerToolSearchExtension(): InlineExtension {
+	const inner = createToolSearchExtension();
+	return async (pi) => {
+		await inner(pi);
+		pi.on("session_start", async () => {
+			const active = pi.getActiveTools();
+			if (!active.includes("tool_search")) pi.setActiveTools([...active, "tool_search"]);
+		});
+	};
+}
+
+export class PiSessionStore {	private active = new Map<string, AgentSession>();
 	private readonly catalog: ExtensionCatalog;
 	/** 装配时已注册到会话的受管工具名（撤权时据此识别“该会话自己的”工具）。 */
 	private assembledWorkers = new Map<string, Set<string>>();
@@ -353,17 +371,18 @@ export class PiSessionStore {
 	setBeforeNativeStream(hook: (session: AgentSession) => Promise<void>): void { this.beforeNativeStream = hook; }
 	private pendingInputGate?: (id: string) => Promise<boolean>;
 	private cancelNativeInputs?: (id: string) => Promise<void>;
-	setNativeInputLifecycle(pending: (id: string) => Promise<boolean>, cancel: (id: string) => Promise<void>): void { this.pendingInputGate = pending; this.cancelNativeInputs = cancel; }
+	private queuedNativeInputs?: (id: string) => { key: string; text: string; delivery: "followUp" | "steer"; attachmentNames: string[]; hasImages: boolean }[];
+	setNativeInputLifecycle(pending: (id: string) => Promise<boolean>, cancel: (id: string) => Promise<void>, queued?: (id: string) => { key: string; text: string; delivery: "followUp" | "steer"; attachmentNames: string[]; hasImages: boolean }[]): void { this.pendingInputGate = pending; this.cancelNativeInputs = cancel; this.queuedNativeInputs = queued; }
 	async hasPendingInputs(id: string): Promise<boolean> { return Boolean(this.active.get(id)?.pendingMessageCount || await this.pendingInputGate?.(id)); }
 	async assertNoPendingInputs(id: string): Promise<void> { if (await this.hasPendingInputs(id)) throw new Error("session_rebuild_blocked: 尚有未确认消费的输入，请先停止并核对"); }
 	private knowledgeRuntime: import("../knowledge/runtime-service.js").KnowledgeRuntimeService | undefined;
  private nativeKnowledgeSurface?: (id:string,agent:import("../store/teams.js").AgentConfig,operationId:string)=>Promise<import("../knowledge/runtime-service.js").KnowledgeMountSurface>;
  setNativeKnowledgeSurface(factory:NonNullable<PiSessionStore["nativeKnowledgeSurface"]>) {this.nativeKnowledgeSurface=factory;}
 	setKnowledgeRuntime(service: import("../knowledge/runtime-service.js").KnowledgeRuntimeService): void { this.knowledgeRuntime = service; }
-	private webResearchExtension?: (agentId: string) => InlineExtension;
-	setWebResearchExtension(factory: (agentId: string) => InlineExtension): void { this.webResearchExtension = factory; }
-	private calendarExtension?: (sessionId: () => string) => InlineExtension;
-	setCalendarExtension(factory: (sessionId: () => string) => InlineExtension): void { this.calendarExtension = factory; }
+	private webResearchExtension?: (agentId: string, opts?: { exposure?: "direct" | "deferred" }) => InlineExtension;
+	setWebResearchExtension(factory: (agentId: string, opts?: { exposure?: "direct" | "deferred" }) => InlineExtension): void { this.webResearchExtension = factory; }
+	private calendarExtension?: (sessionId: () => string, opts?: { exposure?: "direct" | "deferred" }) => InlineExtension;
+	setCalendarExtension(factory: (sessionId: () => string, opts?: { exposure?: "direct" | "deferred" }) => InlineExtension): void { this.calendarExtension = factory; }
 
 	/**
 	 * System-prompt shaping for a window's manager sessions（提示词管理方案 §5）：
@@ -426,6 +445,7 @@ export class PiSessionStore {
   return { ownerAgentId: ref?.ownerAgentId ?? owner.agent?.name ?? "manager", connectorId: owner.agent?.connector?.connectorId ?? (owner.role === "manager" ? "pi" : "unavailable"), nativePi: owner.nativePi || !this.teamsStore,
    readOnly: Boolean(this.teamsStore && (!owner.agent || owner.agent.enabled === false)),
    busyInput: { modes: owner.nativePi || !this.teamsStore ? ["followUp", "steer"] : [] }, waiting: waiting ? [waiting] : [],
+   queuedInputs: this.queuedNativeInputs?.(id) ?? [],
    pendingMessageCount: session.pendingMessageCount, unconfirmedInput: Boolean(await this.pendingInputGate?.(id)), leafEntryId: session.sessionManager.getLeafId(), sourceSnapshotId: ref?.sourceSnapshotId };
  }
  async wireMessages(id: string) {
@@ -554,8 +574,8 @@ export class PiSessionStore {
 			});
 		}
 		const guidance = owner.role === "manager" ? PiSessionStore.resolveGuidance(ctx) : owner.restricted ? "你是知识 Worker。使用本会话授权知识工具检索；整理先用 knowledge_prepare_candidate 冻结来源与基线，再用 knowledge_submit_candidate 提交完整候选，无修改时提交 pages=[]。提交后等待用户审核，只有平台 Publisher 回执才表示发布；不直接写工作区或绕过审核。" : owner.agent?.description;
-		if (owner.agent?.enabled !== false && owner.nativePi && this.webResearchExtension && (owner.role === "worker" || !ctx || ctx.type === "solo")) factories.push(this.webResearchExtension(owner.agent?.name ?? "manager"));
-		if (owner.role === "manager" && this.calendarExtension && (!ctx || ctx.type !== "direct")) factories.push(this.calendarExtension(getSessionId));
+		if (owner.agent?.enabled !== false && owner.nativePi && this.webResearchExtension && (owner.role === "worker" || !ctx || ctx.type === "solo")) factories.push(this.webResearchExtension(owner.agent?.name ?? "manager", owner.role === "manager" ? { exposure: "deferred" } : undefined));
+		if (owner.role === "manager" && this.calendarExtension && (!ctx || ctx.type !== "direct")) factories.push(this.calendarExtension(getSessionId, { exposure: "deferred" }));
 		// 信任门（§7.2/§6.3）：服务端按窗口 workspaceId 计算三类放行，
 		// 与 manager 自己的资源开关取与；无 workspaceId = 全关。
 		const workspaceAccess = this.teamsStore
@@ -630,7 +650,7 @@ export class PiSessionStore {
    pi.on("context",async()=>{bound=true;await refresh();});
    pi.on("agent_end",async event=>{const last=[...event.messages].reverse().find(message=>message.role==="assistant");await surface.workerExecution?.finish(last?.role==="assistant"&&last.stopReason==="aborted"?"cancelled":last?.role==="assistant"&&last.stopReason==="error"?"model_error":"worker_no_submission");});
   });
-  const loader = await piSessionResourceLoader({ cwd, settings, resources: sessionResources, workspaceAccess, factories: [...factories, ...(owner.role === "manager" && this.knowledgeRuntime ? [this.knowledgeRuntime.managerExtension(getSessionId)] : [])], guidance, restricted: owner.restricted });
+  const loader = await piSessionResourceLoader({ cwd, settings, resources: sessionResources, workspaceAccess, factories: [...factories, ...(owner.role === "manager" && this.knowledgeRuntime ? [managerToolSearchExtension(), this.knowledgeRuntime.managerExtension(getSessionId)] : [])], guidance, restricted: owner.restricted });
 		return { loader, plan, capabilityRuntime, codeSearch, assertKnowledge, knowledgeExecution };
 	}
 
@@ -718,7 +738,10 @@ export class PiSessionStore {
    await this.beforeNativeStream?.(session);
    return rawStream(...args);
   };
-		if (owner.role === "manager") this.knowledgeRuntime?.guardManagerSession(session);
+		if (owner.role === "manager") {
+			this.knowledgeRuntime?.guardManagerSession(session);
+			this.knowledgeRuntime?.bindManagerSession(session);
+		}
 		// Stop at the completed tool batch, after toolResults/cards are persisted.
 		// Aborting the Session here would also signal in-flight Worker operations;
 		// a human wait must preserve the pending Interaction and its original Run.
@@ -737,21 +760,33 @@ export class PiSessionStore {
 		// 由 search_agent_tools 按需纯加法激活。
 		// 激活态回放（§3.3.7）：active tools 只在内存，重启/空闲重建会清零，
 		// 但 JSONL 历史里留着直接调用成功的记录，模型会模仿历史跳过 search
-		// 导致 "Tool not found"。SDK 会把"激活了新工具"的 toolResult 标注
-		// addedToolNames（只写不读），这里从当前分支历史回放，恢复重建前的
-		// 激活集合；回放仍受 plan 约束——已禁用/移出窗口的 worker 不进
-		// plan.managed，其工具自然被过滤，撤权语义不变。
+		// 导致 "Tool not found"。SDK 自带的 transcript 恢复分支
+		// （_restoreToolsFromTranscript）只在 initialActiveToolNames 未传时执行，
+		// 而 createAgentSession 总会算出初始集，恢复分支实际不会运行，平台必须
+		// 自己回放：tool_search / search_agent_tools 的激活会以下一条 run 的
+		// system 消息 toolsAdded/toolsRemoved 增量落盘，这里按序还原当前分支的
+		// 声明集，与本次注册集取交集后补回 active。回放仍受 plan 约束——已禁用/
+		// 移出窗口的 worker 工具本次不再注册，自然被交集过滤，撤权语义不变。
 		const replayed = new Set<string>();
 		for (const entry of opts.sessionManager.getBranch()) {
 			if (entry.type !== "message") continue;
-			const message = entry.message as { role?: string; addedToolNames?: unknown };
-			if (message.role !== "toolResult" || !Array.isArray(message.addedToolNames)) continue;
-			for (const name of message.addedToolNames) {
+			const message = entry.message as { role?: string; toolsAdded?: unknown; toolsRemoved?: unknown };
+			if (message.role !== "system") continue;
+			for (const tool of Array.isArray(message.toolsRemoved) ? message.toolsRemoved : []) {
+				const name = (tool as { name?: unknown } | undefined)?.name;
+				if (typeof name === "string") replayed.delete(name);
+			}
+			for (const tool of Array.isArray(message.toolsAdded) ? message.toolsAdded : []) {
+				const name = (tool as { name?: unknown } | undefined)?.name;
 				if (typeof name === "string") replayed.add(name);
 			}
 		}
+		const registered = new Set(session.getAllTools().map((tool) => tool.name));
 		const current = session.getActiveToolNames();
 		const next = current.filter((n) => !plan.managed.has(n) || plan.active.has(n) || replayed.has(n));
+		for (const name of replayed) {
+			if (registered.has(name) && !next.includes(name)) next.push(name);
+		}
 		session.setActiveToolsByName([...new Set(next)]);
 		this.assembledManaged.set(session.sessionId, plan.managed);
 		this.assembledWorkers.set(session.sessionId, new Set(owner.role === "worker" && owner.agent ? [owner.agent.name] : plan.agents.map(agent => agent.name)));
@@ -767,8 +802,7 @@ export class PiSessionStore {
 	}
 
 	/** Forward SDK and platform-authored projection events through the same WS bus. */
-	private forwardEvent(id: string, event: AgentSessionEvent): void {
-  if ((event.type === "message_start" || event.type === "message_update" || event.type === "message_end") && ["user", "assistant", "system", "toolResult"].includes(event.message.role)) {
+	private forwardEvent(id: string, event: AgentSessionEvent): void {  if ((event.type === "message_start" || event.type === "message_update" || event.type === "message_end") && ["user", "assistant", "system", "toolResult"].includes(event.message.role)) {
    const message = event.message as typeof event.message & { puddingMessageId?: string; toolCallId?: string };
    const key = `${id}:${message.role}:${message.toolCallId ?? ""}`;
    if (event.type === "message_start") this.wireTurns.set(key, randomUUID());
@@ -776,7 +810,23 @@ export class PiSessionStore {
    if (event.type === "message_end") this.wireTurns.delete(key);
   }
 		this.captureToolExecutionEvent(id, event);
+		this.captureActivity(id, event);
 		this.emitEvent(id, event);
+	}
+
+	/**
+	 * 运行时活动的结构化出口：轮次/工具耗时、自动重试、上下文压缩。
+	 * 只在一处（事件漏斗）采集，宿主决定级别与落地。
+	 */
+	private captureActivity(id: string, event: AgentSessionEvent): void {
+		if (!this.activityLog) return;
+		const result = sessionActivity(event, { sessionId: id, now: Date.now(), state: this.activityState.get(id) ?? {} });
+		if (result.state !== this.activityState.get(id)) this.activityState.set(id, result.state);
+		if (result.activity) this.activityLog(result.activity);
+	}
+
+	setActivityLog(fn: (activity: SessionActivity) => void): void {
+		this.activityLog = fn;
 	}
 
 	/** Notify subscribers without feeding a platform-authored repair back into the live ledger. */
@@ -784,6 +834,11 @@ export class PiSessionStore {
 		const set = this.listeners.get(id);
 		if (!set) return;
 		for (const listener of set) listener(event);
+	}
+
+	/** Queue contents changed (queued/delivered/cancelled/resteered); clients refetch the capability. */
+	notifyQueueChanged(id: string): void {
+		this.emitEvent(id, { type: "queue_update" } as AgentSessionEvent);
 	}
 
 	private captureToolExecutionEvent(id: string, event: AgentSessionEvent): void {
@@ -952,6 +1007,7 @@ export class PiSessionStore {
 			id: `${model.provider}/${model.id}`,
 			name: model.name,
 			provider: model.provider,
+			baseUrl: model.baseUrl,
 			reasoning: model.reasoning,
 			thinkingLevels: PiSessionStore.supportedThinkingLevels(model),
 			thinkingGraded: PiSessionStore.thinkingGraded(model),
@@ -2302,6 +2358,10 @@ export class PiSessionStore {
 	setDebugLog(fn: (msg: string) => void): void {
 		this.debugLog = fn;
 	}
+
+	/** 运行时活动出口（轮次/工具耗时、重试、压缩）；由宿主接到日志。 */
+	private activityLog?: (activity: SessionActivity) => void;
+	private readonly activityState = new Map<string, ActivityState>();
 
 	async disposeAll(): Promise<void> {
 		this.unsubscribeTeams?.();

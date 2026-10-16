@@ -8,6 +8,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { getWorkerRuntimeModel, getWorkerRuntimeModelOptions, setWorkerRuntimeModel, type WorkerRuntimeModelState } from "@/lib/api";
 import type { DriverConfigOption } from "@/lib/types";
 import { useModelCatalog } from "@/lib/model-catalog";
+import { ModelConnectionDetails } from "./model-connection-details";
 
 /** Mounted per Session: late responses cannot overwrite another conversation. */
 export function WorkerModelPicker({ sessionId, workerName, disabled, onSavingChange }: {
@@ -80,13 +81,15 @@ export function WorkerModelPicker({ sessionId, workerName, disabled, onSavingCha
 		<DropdownMenu>
 			<DropdownMenuTrigger asChild>
 				<Button type="button" variant="ghost" className="model-picker-trigger h-8 w-auto gap-1 px-2 text-xs" disabled={locked} aria-busy={pending} aria-label={`Worker 模型：${model ?? "默认"}`} title={note}>
+					{state.modelCatalog === "pi" && model ? <span className="model-provider-badge">{catalog.find(model)?.provider ?? model.split("/")[0]}</span> : null}
 					<span className="max-w-44 truncate">{pending ? "切换中…" : selected?.label ?? model ?? "默认模型"}</span><ChevronDownIcon className="size-3.5 opacity-55" />
 				</Button>
 			</DropdownMenuTrigger>
 			<DropdownMenuContent className="model-picker-menu max-h-80 overflow-y-auto" align="start" sideOffset={8}>
+				{state.modelCatalog === "pi" ? <ModelConnectionDetails model={catalog.find(model)} modelRef={model} /> : null}
 				<DropdownMenuItem className="model-picker-item" onSelect={() => void change({ model: null, effort: null })}>恢复 Worker 默认{!state.settings.model && !state.settings.effort ? <CheckIcon className="ml-auto size-4" /> : null}</DropdownMenuItem>
 				{modelOptions?.map((item) => <DropdownMenuItem key={item.value} className="model-picker-item" onSelect={() => void change({ model: item.value, ...(state.settings.effort && !levelsFor(item.value).includes(state.settings.effort) ? { effort: null } : {}) })}>
-					<span className="min-w-0 flex-1 truncate">{item.label}</span>{item.value === model ? <CheckIcon className="model-picker-check size-4" /> : null}
+					<span className="min-w-0 flex-1 truncate">{state.modelCatalog === "pi" ? `${catalog.find(item.value)?.provider ?? item.value.split("/")[0]} · ` : ""}{item.label}</span>{item.value === model ? <CheckIcon className="model-picker-check size-4" /> : null}
 				</DropdownMenuItem>)}
 				{modelError ? <DropdownMenuItem title={modelError} onSelect={() => { catalog.reload(); setRetry((n) => n + 1); }}>模型列表读取失败 · 重试</DropdownMenuItem> : modelOptions === null ? <DropdownMenuItem disabled>正在读取模型…</DropdownMenuItem> : modelOptions.length === 0 ? <DropdownMenuItem disabled>暂无可选模型</DropdownMenuItem> : null}
 				<div className="thinking-picker-note">下一条消息生效 · 仅当前会话</div>

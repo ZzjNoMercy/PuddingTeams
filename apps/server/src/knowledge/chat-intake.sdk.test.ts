@@ -20,7 +20,7 @@ import { WikiCuratorService, type CuratorJob } from "./curator-jobs.js";
 import { buildManagerExtensionFactories, type ManagerExtensionDeps } from "../pi-bridge/agent-extensions.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 
-test("实际Manager SDK只委派知识管家；Worker整理引用原话与图片，委派不能替换事实，撤权后无第二轮外发", { timeout: 30_000 }, async () => {
+test("Worker整理链路（委派）：引用原话与图片，委派不能替换事实，撤权后无第二轮外发", { timeout: 30_000 }, async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pt-chat-intake-sdk-"));
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = path.join(root, "pi-agent");
 	const requests: Array<{ tools?: Array<{ function: { name: string } }>; messages?: unknown[] }> = [];
@@ -149,6 +149,111 @@ test("实际Manager SDK只委派知识管家；Worker整理引用原话与图片
 			}
 			assert.equal((await sources.get("owner", refs.sourceIds[1]!))?.kind, "image");
 			assert.deepEqual((await sources.readOriginal("owner", refs.sourceIds[1]!)).bytes, Buffer.from(image.base64, "base64"));
+			if (revoke) assert.match(JSON.stringify(session.messages.at(-1)), /授权已撤销/);
+		}
+	} finally {
+		for (const session of sessions) session.dispose(); await new Promise<void>((resolve) => server.close(() => resolve())); resetSharedModelRuntime();
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("Manager 直接整理（无知识管家委派）：原话冻结、候选提交、撤权后无第二轮外发", { timeout: 30_000 }, async () => {
+	const root = await mkdtemp(path.join(tmpdir(), "pt-manager-curator-sdk-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = path.join(root, "pi-agent");
+	const requests: Array<{ tools?: Array<{ function: { name: string } }>; messages?: Array<{ role: string }> }> = [];
+	const server = createServer(async (req, res) => {
+		const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(chunk as Buffer);
+		const body = JSON.parse(Buffer.concat(chunks).toString()) as typeof requests[number]; requests.push(body);
+		const toolResults = (body.messages ?? []).filter((message) => message.role === "tool").length;
+		res.writeHead(200, { "content-type": "text/event-stream" });
+		const send = (delta: unknown, finish_reason: string | null = null) => res.write(`data: ${JSON.stringify({ id: `fixture-${requests.length}`, object: "chat.completion.chunk", created: 1780000000, model: "fixture", choices: [{ index: 0, delta, finish_reason }] })}\n\n`);
+		if (toolResults === 0) { send({ role: "assistant", tool_calls: [{ index: 0, id: `prepare-${requests.length}`, type: "function", function: { name: "knowledge_prepare_candidate", arguments: JSON.stringify({ bindingId: "binding", task: "模型整理指令：虚构日期10月30日" }) } }] }); send({}, "tool_calls"); }
+		else if (toolResults === 1) { send({ role: "assistant", tool_calls: [{ index: 0, id: `submit-${requests.length}`, type: "function", function: { name: "knowledge_submit_candidate", arguments: JSON.stringify({ bindingId: "binding", pages: [] }) } }] }); send({}, "tool_calls"); }
+		else { send({ role: "assistant", content: "已提交候选，等待审核。" }); send({}, "stop"); }
+		res.end("data: [DONE]\n\n");
+	});
+	const sessions: AgentSession[] = [];
+	try {
+		await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+		const address = server.address(); assert(address && typeof address === "object");
+		await upsertCustomProvider("manager-curator-fixture", { name: "fixture", baseUrl: `http://127.0.0.1:${address.port}/v1`, api: "openai-completions", models: [{ id: "fixture", vision: true }] });
+		const authPath = path.join(root, "auth.json"); await writeFile(authPath, JSON.stringify({ "manager-curator-fixture": { type: "api_key", key: "fixture-only" } })); resetSharedModelRuntime(); configureSharedModelRuntime({ authPath });
+		const models = await sharedModelRuntime(), model = models.getModel("manager-curator-fixture", "fixture"); assert.ok(model);
+		const teams = new TeamsStore({ state: path.join(root, "teams"), assets: path.join(root, "assets"), managedWorkspaces: path.join(root, "workspaces") }, root); await teams.init();
+		const bindings = new KnowledgeBindingRegistry(path.join(root, "state")), objects = new KnowledgeObjectStore(path.join(root, "objects"));
+		const sources = new KnowledgeSourceStore({ stateDir: path.join(root, "state"), objects }), intakes = new ChatKnowledgeIntake({ stateDir: path.join(root, "state"), sources });
+		const deps = { teams, bindings, objects, acceptance: new KnowledgeAcceptanceStore(path.join(root, "acceptance")), selections: new KnowledgeSelectionStore(path.join(root, "state"), bindings), stateDir: path.join(root, "state"), cacheDir: path.join(root, "cache") };
+		const original = "用户原话：真实日期10月23日。";
+		const image = { name: "camera", mediaType: "image/png", base64: "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAFWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC", size: 75, path: "/untrusted/never/read" };
+		for (const { revoke } of [{ revoke: false }, { revoke: true }]) {
+			const service = new KnowledgeRuntimeService(deps); let revoked = false;
+			const templates = await service.mount({ ownerId: "owner", windowId: "window", sessionId: "schema", contextKey: "schema" }, []);
+			const contextTool = templates.tools.find((tool) => tool.name === "knowledge_context")!;
+			service.forSession = async () => ({ ...templates, fingerprint: "fixture-authorized", prompt: "固定授权知识库", assertCurrent: async () => { if (revoked) throw new Error("知识库授权已撤销"); }, tools: templates.tools.map((tool) => tool.name === "knowledge_context" ? { ...contextTool, execute: async () => ({ content: [{ type: "text", text: JSON.stringify({ mounts: [{ bindingId: "binding" }] }) }], details: {} }) } : tool) });
+			service.scopeForSession = async (sessionId) => ({ ownerId: "owner", windowId: "window", sessionId, contextKey: "session:manager" });
+			let currentJob: CuratorJob | undefined;
+			const curator = new WikiCuratorService({ jobs: {
+				get: async () => currentJob,
+				transition: async (_id: string, from: string[], patch: Partial<CuratorJob>) => {
+					assert.ok(currentJob && from.includes(currentJob.status));
+					currentJob = { ...currentJob, ...patch }; return currentJob;
+				},
+			}, workerTimeoutMs: 5_000 } as never);
+			let created: Parameters<WikiCuratorService["create"]>[0] | undefined, createCalls = 0, preparationCalls = 0;
+			curator.create = async (input) => {
+				created = input; createCalls++; if (revoke) revoked = true;
+				currentJob = { id: "fixed-job", executionMode: input.executionMode, ownerId: input.ownerId,
+					targetBindingId: input.bindingId, status: "running", sources: (await sources.manifest(input.ownerId, input.sourceIds!)).sources } as CuratorJob;
+				return { job: currentJob, replayed: false };
+			};
+			const fixture = curator as unknown as {
+				prepareSources(job: CuratorJob): Promise<CuratorJob>;
+				candidateContext(job: CuratorJob): Promise<unknown>;
+				assertAuthority(job: CuratorJob): Promise<void>;
+			};
+			fixture.prepareSources = async job => { await fixture.assertAuthority(job); preparationCalls++; return job; };
+			fixture.assertAuthority = async () => { if (revoked) throw new Error("知识库授权已撤销"); };
+			fixture.candidateContext = async job => ({ sources: await Promise.all(job.sources.map(async source => ({ ...source,
+				...(source.kind === "text" ? { content: (await sources.readText(job.ownerId, source.id)).text } : {}) }))) });
+			curator.submit = async job => { currentJob = { ...job, status: "no_changes" }; return currentJob; };
+			let session!: AgentSession;
+			service.setManagerCuration((surface, scope) => curator.workerSurface(surface, {
+				ownerId: scope.ownerId, windowId: scope.windowId, sessionId: scope.sessionId, operationId: "manager-native",
+				resolveSources: (toolCallId, ids) => ids ? intakes.resolveMessages(session, "owner", ids) : intakes.resolve(session, "owner", { toolCallId }),
+			}, "wiki"));
+			service.setChatIntake(async (active) => {
+				const sm = active.sessionManager as unknown as { fileEntries: unknown[]; flushed: boolean };
+				if (!existsSync(active.sessionFile!)) { writeFileSync(active.sessionFile!, sm.fileEntries.map((entry) => JSON.stringify(entry)).join("\n") + "\n", { flag: "wx" }); sm.flushed = true; }
+				await intakes.admitManager(active);
+			}, (sessionId, prompt, images) => intakes.observeExecution(sessionId, prompt, images));
+			const sessionDir = path.join(root, "sessions"); await mkdir(sessionDir, { recursive: true });
+			const manager = SessionManager.create(root, sessionDir);
+			// tool_search 不在本测试装配内；直接激活 deferred 知识工具，验证同一注册/执行路径。
+			const activateKnowledge = (pi: { on(event: string, handler: () => Promise<void>): void; getActiveTools(): string[]; setActiveTools(names: string[]): void }) => {
+				pi.on("session_start", async () => pi.setActiveTools([...pi.getActiveTools(), "knowledge_context", "knowledge_search", "knowledge_glob", "knowledge_read", "knowledge_links", "knowledge_prepare_candidate", "knowledge_submit_candidate", "knowledge_curation_status"]));
+			};
+			const loader = new DefaultResourceLoader({ cwd: root, agentDir: process.env.PI_CODING_AGENT_DIR!, noExtensions: true, noSkills: true, noContextFiles: true, noPromptTemplates: true,
+				settingsManager: SettingsManager.inMemory(), extensionFactories: [activateKnowledge as never, service.managerExtension(() => manager.getSessionId())] }); await loader.reload();
+			({ session } = await createAgentSession({ cwd: root, model, modelRuntime: models, sessionManager: manager, resourceLoader: loader, settingsManager: SettingsManager.inMemory(), noTools: "builtin" }));
+			await session.bindExtensions({ mode: "rpc" }); service.guardManagerSession(session); sessions.push(session);
+			const refs = await intakes.prepare({ ownerId: "owner", windowId: "window", sessionId: session.sessionId, operationId: `op-manager-${revoke}`, text: original, uploads: [image] });
+			const disarm = intakes.armManager(session, refs, original, [image]); const before = requests.length;
+			await session.prompt(original, { images: [{ type: "image", data: image.base64, mimeType: image.mediaType }] }); disarm();
+			assert.equal(requests.length - before, revoke ? 1 : 3, revoke ? "撤权后无第二轮外发" : "prepare → submit → 总结");
+			const declared = requests[before]!.tools!.map((tool) => tool.function.name);
+			assert.ok(declared.includes("knowledge_prepare_candidate") && declared.includes("knowledge_submit_candidate"), "Manager 直接持有候选管线工具");
+			assert.ok(!declared.includes("delegation"), "Manager 整理不经过委派");
+			assert.equal(created?.task, "模型整理指令：虚构日期10月30日");
+			assert.equal(created?.sourceText, undefined); assert.deepEqual(created?.sourceIds, refs.sourceIds);
+			assert.equal(created?.executionMode, "worker"); assert.equal(createCalls, 1);
+			assert.equal(preparationCalls, revoke ? 0 : 1);
+			assert.equal((await sources.readText("owner", refs.sourceIds[0]!)).text, original);
+			assert.equal((await sources.get("owner", refs.sourceIds[1]!))?.kind, "image");
+			if (!revoke) {
+				assert.ok(JSON.stringify(requests[before + 1]!.messages).includes(original), "prepare 回执携带冻结用户原话");
+				assert.equal(currentJob?.status, "no_changes");
+			}
 			if (revoke) assert.match(JSON.stringify(session.messages.at(-1)), /授权已撤销/);
 		}
 	} finally {

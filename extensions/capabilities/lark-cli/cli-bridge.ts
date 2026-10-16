@@ -32,6 +32,7 @@ function execute(env) {
  child.on('exit',(code,signal)=>{process.exitCode=code ?? (signal==='SIGINT'?130:1);});
 }
 async function main() {
+ if (process.env.PUDDING_LARK_BLOCKED) throw new Error(process.env.PUDDING_LARK_BLOCKED);
  if (!process.env.PUDDING_LARK_REAL_CLI) throw new Error('尚未配置飞书 CLI 执行路径');
  const help = args.includes('--help') || args.includes('-h');
  if (!args.length || args[0]==='--version' || args[0]==='skills' || args[0]==='update' || help || (args[0]==='auth' && args[1]==='qrcode')) {execute(process.env);return;}

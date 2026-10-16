@@ -55,7 +55,7 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
 							onClick={() => setSection("providers")}
 						>
 							<ServerCogIcon aria-hidden="true" />
-							<span><strong>模型</strong><small>凭证与默认模型</small></span>
+							<span><strong>模型</strong><small>凭证与全局后备模型</small></span>
 						</button>
 					</nav>
 					<main className="settings-content">
@@ -75,7 +75,7 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
 							<div className="settings-content-column">
 								<div className="settings-section-heading">
 									<h2 id="providers-heading">模型</h2>
-									<p>管理模型凭证、可用模型与默认模型。</p>
+									<p>管理模型凭证、可用模型与全局后备模型。当前会话的模型在聊天中切换。</p>
 								</div>
 								<section className="settings-card settings-provider-card" aria-labelledby="providers-heading">
 									<ProviderSettings />

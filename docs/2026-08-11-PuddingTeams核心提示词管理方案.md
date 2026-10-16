@@ -1,5 +1,18 @@
 # PuddingTeams 核心提示词管理方案
 
+## 2026-10-15 P4：普通会话与只读执行记录
+
+普通聊天只使用 `windows.json` v3 的 `sessions[]`、`activeSession` 与 `sessionRefs`。不再投影执行会话列表，不保留执行面查看指针；同版本文件若仍含已移除的执行面指针，校验明确拒绝，不转换或静默删除。历史 v1/v2 也不自动迁移。
+
+委派只通过 `delegation` 工具发起一次 fresh 调用；`delegationId` 标识执行，`managerToolCallId` 关联真实 Pi toolCall。Driver 的 active registry、Interaction、Receipt、ChangeSet 与追加式 timeline 保留。Pi 执行回放位于 `worker-process-session.ts`，仅供 `/api/delegations/:id/process/*` 使用。普通会话端点不能向执行 handle 发送消息、切换、重命名或删除。
+
+执行索引以台账的来源 `managerSessionId` 为准，拒绝从其他聊天的镜像卡推导归属；全局 `/api/delegation-records` 可按 `sourceSessionId/workerId/workspaceId/goalId` 过滤。全局搜索把原生会话与执行记录分开，执行结果打开只读详情，保留精确单次 cancel。
+
+Manager 和 Pi Worker 使用同一原生会话机制，模型/思考设置作用于当前 Session 的 owner；忙碌输入仅以服务端 capability 开放。Pi 单聊写真实 user/assistant/toolResult JSONL，不写容器直派卡。非 Pi Connector 继续使用 Driver 单聊适配，其 `pudding:user_message/task_assign/task_result` 和内部续接绑定仍有实际用途；它们不把 Manager delegation 变成连续聊天，也不开放原生 followUp/steer/Fork。Pi 原生 provider 连续性已由 `sessionRefs[sessionId].provider` 承载。
+
+平台 Worker 输入队列模块、启动装配、GET/DELETE 队列端点和灰态排队气泡已删除。`GET /api/diagnostics/legacy-data` 只返回旧队列文件的路径、大小与时间，不解析输入、不补投、不删除；用户数据清理是独立明确操作。Fork、SDK followUp/steer 及其未知消费回执沿用 P3 契约。
+
+
 ## 2026-10-14 P3：原生 Worker 对话与快照
 
 Manager 继续使用 Pi 1.2.0 SDK，增加 delegation/Goal；Pi Worker 单聊也使用原生 SDK，但按持久负责人装配自己的指令、模型、工具、MCP 白名单、Capability 和知识授权。单聊只有一份可发送的 Session，不创建委派来承载每条输入，不获得 Manager delegation/Goal/日历控制。内置 Wiki 保持受限知识工具面，使用既有 prepare/submit 候选管线，提交即停并等待审核；任意原生写工具、扩展、MCP 与 Workspace 指令不进入它。普通 Worker 保持知识读取、默认 memory 待审核请求和已授权能力。全新会话在 Window 负责人落盘后注册知识工具；真实用户 JSONL 与素材绑定在 provider 发送前完成，SDK Skill/模板展开只改变执行文本，不改原始素材。其他 Connector 本阶段仍用既有直派通道，不宣称支持原生忙碌输入或快照。
@@ -14,10 +27,10 @@ Fork 冻结当前已提交分支，由 `ConversationSnapshots` 保存不可变 m
 
 一个 `fork-operations.json` v1 账本预约 snapshotId/sessionId，依次 reserved→snapshot_saved→session_saved→attached。快照 hash、导入标记和窗口唯一性负责冷恢复；同键相同意图返回同一目标，改来源/Worker/leaf 冲突。快照完成后源删除可继续；目标删除成为 gone，不重建。冻结前需当前 leaf、不忙碌、不等待、不含待确认输入且执行证据已封存；恢复也校验这些事实。UI 仅在原生对话菜单提供 Fork，显示来源快照；未确认时保留原键，仅服务器确认尚无操作后允许用户重新选择。
 
-本节是 P3 当前行为；下文标注 P3 前的 direct relay/双会话/Window binding/单聊 Goal 描述仅作为历史背景。P4 的旧执行面 helper 和失效字段的物理删除与全矩阵收口尚未实施。
+本节描述已实现的 Pi 原生会话与快照契约；P4 的入口清理见上文。
 
 
-> 2026-10-14 P2 实现更新（开发与本阶段验证完成）：Manager 核心委派统一为 `delegation({workerId, task, contextRefs?, parentDelegationId?, ...Goal字段})`。每次 fresh run，因果引用不自动导入历史；结果/审批只回原 owner Session，不自动建 direct、不写双边镜像。调用去重复用 DelegationStore 的稳定 operationId 和不可变 requestHash，同调用不同内容拒绝。direct 多轮在 P3 前保持原通道；委派 handle 不作为普通聊天枚举或输入，按 delegationId 查只读过程/取消。下文旧双 Session、逐 Worker 工具名与委派续接是 P2 前说明，以本段和审核方案为准。
+> 核心委派使用统一 `delegation({workerId, task, contextRefs?, parentDelegationId?, ...Goal字段})`。每次 fresh，因果不导入历史，审批与结果只回 owner；operationId/requestHash 保证同键同意图去重。
 
 ## 2026-10-14 P1 运行指令修订
 
@@ -216,16 +229,10 @@ Solo 是用户与 pi manager 的自由对话：
 
 ### 5.2 Direct 单聊
 
-Direct 已经绑定唯一 Worker，没有“选择谁”的问题，因此不展示、也不接受用户可编辑的 Window Prompt。
+Direct 的唯一 Worker 是会话持久负责人，不提供 Window 协作提示词。Pi Worker 直接使用原生 SDK 对话，按自己的 piResources、模型、MCP、Capability 和知识授权装配；不加载 Manager roster、Goal/委派工具或 Manager 指令。非 Pi Connector 保留 Driver 单聊适配，绝不生成隐藏 Manager 回合。
 
-**2026-08-12 起 Direct 不再经 manager relay**：direct 窗口是纯 worker 通道，用户消息由服务端直派窗口唯一 Worker（`agent-runtime/direct-dispatch.ts`），窗口的 pi session 只作消息流容器（用户消息与 worker 卡片都是 custom message），不存在 manager 回合，因此也不再注入 roster 路由段与固定 relay 协议。委托以该窗口自己的 active session 作为 `managerSessionId`：HITL 审批卡与结果对账直接落回本窗口，worker session 连续性由窗口 binding 维持（stale handle 由 Runtime 透明回退新会话）。
+需要继承 Manager 对话时使用 Fork 已提交快照；复制历史不复制权限与来源配置。
 
-Direct 中：
-
-- Worker 行为由 Worker 运行指令决定；
-- 智能编排（多 Worker 路由、追问、接力）只发生在 solo 窗口的 pi manager；direct 窗口就是与该 Worker 的直接持续对话。
-
-~~manager 仍恒定在场，平台必须提供不可编辑的 relay 协议~~（2026-08-12 废弃，见上）。
 
 ### 5.3 Group 群聊
 
@@ -241,7 +248,6 @@ Group manager 同时读取成员的完整路由卡，在窗口成员集合内选
 | Manager 运行指令 | 是 | 是 | 是 | 否 |
 | Worker `description` / `responsibility` | 全部启用 Worker | 当前唯一 Worker（可精简） | 当前群聊成员 | 否 |
 | Worker 运行指令 | 否 | 否 | 否 | 仅当前 Worker |
-| Direct 固定 relay | 否 | 已废弃（2026-08-12 起 Direct 无 manager 回合） | 否 | 否 |
 | Group collaboration | 否 | 否 | 是 | 否 |
 | pi global `AGENTS.md` | 是 | 是 | 是 | 是 |
 | 当前 Workspace context | 按开关 | 按开关 | 按开关 | 按同一 Delegation cwd 与开关 |
@@ -271,7 +277,7 @@ Window 配置：
 
 ```text
 Solo   不显示协作提示词
-Direct 不显示协作提示词（2026-08-12 起无 manager 回合，固定 relay 已废弃）
+Direct 使用 Worker 自己的原生会话配置，不显示群聊协作提示词
 Group  显示“群聊协作提示词”
 ```
 
@@ -283,7 +289,7 @@ Group  显示“群聊协作提示词”
 
 1. ~~`piResources.systemPrompt` 和 Window guidance 通过 `systemPromptOverride` 注入~~ **已落地**：改经 `appendSystemPromptOverride` 追加（`pi-resources.ts appendPiPrompts`，manager 与 pi worker 三个装配点统一），pi 内嵌默认提示词与用户 `APPEND_SYSTEM.md` 均保留在前。
 2. ~~`loadWorkspaceContext=false` 映射为 `noContextFiles=true`~~ **已落地**：改用 `agentsFilesOverride` 只剔除显式 Workspace 及目录层级文件，`~/.pi/agent/AGENTS.md` 始终保留（`piResourceLoaderOptions`）。
-3. ~~Direct 数据模型/API 允许 `window.prompt`~~ **已落地**：`TeamsStore.createWindow`/`updateWindow` 对 Direct 非空 prompt 直接抛错（`""` 允许用于清除历史值）；`resolveGuidance` 对 Direct 恒定返回固定 relay；前端仅 Group 显示协作提示词入口。
+3. ~~Direct 数据模型/API 允许 `window.prompt`~~ **已落地**：`TeamsStore.createWindow`/`updateWindow` 对 Direct 非空 prompt 直接抛错（`""` 允许用于清除历史值）；Direct 不注入 Manager 路由材料；前端仅 Group 显示协作提示词入口。
 4. ~~前端“系统提示词（Agent Profile）”命名相撞~~ **已落地**：统一改称「Manager/Worker 运行指令」与「责任边界」，并标注接收者（配置页 `prompt-section.tsx`/`overview-section.tsx`/`agent-manage-dialog.tsx`）。
 5. ~~有效提示词预览为占位文案~~ **已落地**：preview 按最终真实顺序分段——pi-base、pi-native-append（APPEND_SYSTEM.md）、agent-instructions、window-collaboration、global-context、workspace-context（`previewPiResources`）。
 

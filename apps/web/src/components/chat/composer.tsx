@@ -35,6 +35,7 @@ import { BrainCircuitIcon, CheckIcon, ChevronDownIcon, FolderGit2Icon, Paperclip
 import type { PromptInputFilePart } from "@/core/uploads";
 import { SessionKnowledgePicker } from "./session-knowledge-picker";
 import { WorkerModelPicker } from "./worker-model-picker";
+import { ModelConnectionDetails } from "./model-connection-details";
 
 async function encodeAttachment(item: PromptInputFilePart): Promise<MessageAttachmentInput> {
 	let url = item.url;
@@ -108,12 +109,14 @@ function ModelPicker({
 	return (
 		<DropdownMenu>
 			<DropdownMenuTrigger asChild>
-				<Button type="button" variant="ghost" className="model-picker-trigger h-8 w-auto gap-1 px-2 text-xs" disabled={pending} aria-busy={pending}>
+				<Button type="button" variant="ghost" className="model-picker-trigger h-8 w-auto gap-1 px-2 text-xs" disabled={pending} aria-busy={pending} title={`当前会话：${value || "尚未确认"}${selectedModel?.baseUrl ? `\n配置端点：${selectedModel.baseUrl}` : ""}`} aria-label={`当前会话模型：${value || "尚未确认"}`}>
+					{value ? <span className="model-provider-badge">{selectedModel?.provider ?? value.split("/")[0]}</span> : null}
 					<span className="max-w-44 truncate">{pending ? "正在切换模型…" : selectedModel?.name ?? (value ? `当前模型：${value}` : "选择模型")}</span>
 					<ChevronDownIcon className="size-3.5 opacity-55" />
 				</Button>
 			</DropdownMenuTrigger>
 			<DropdownMenuContent className="model-picker-menu" align="start" sideOffset={8}>
+				<ModelConnectionDetails model={selectedModel} modelRef={value} />
 				{[...byProvider.entries()].map(([provider, providerModels]) => (
 					<DropdownMenuSub key={provider}>
 						<DropdownMenuSubTrigger className="model-picker-provider-item">
@@ -220,7 +223,7 @@ function ThinkingLevelPicker({
 }
 
 function ComposerInner({
- canSteer, hideGoal,
+ hideGoal,
 	sessionId,
 	draftScope,
 	disabled,
@@ -245,7 +248,7 @@ function ComposerInner({
 	onOpenWorkspace,
 	draft,
 }: {
- canSteer?: boolean; hideGoal?: boolean;
+ hideGoal?: boolean;
 	sessionId: string;
 	draftScope: string;
 	disabled: boolean;
@@ -254,7 +257,7 @@ function ComposerInner({
 	stopping: boolean;
 	/** run 活跃但 manager 在等 worker（delegate 阻塞中）时的等待文案。 */
 	busyHint?: string;
-	/** worker 执行会话视图：running 不阻断提交，提示消息会排队。 */
+	/** 会话忙时的追加提示（如等待审批期间只入队）。 */
 	queueHint?: string;
 	/** worker 执行会话视图：模型/思考强度等会话级控制不适用，隐藏。 */
 	hideSessionControls?: boolean;
@@ -276,7 +279,6 @@ function ComposerInner({
 	draft?: { id: number; content: string };
 }) {
 	const { textInput, attachments } = usePromptInputController();
- const [steering,setSteering] = useState(false);
 	const [knowledgeSaving, setKnowledgeSaving] = useState(false);
 	const [workerModelSaving, setWorkerModelSaving] = useState(false);
 	const currentTextRef = useRef(textInput.value);
@@ -345,8 +347,7 @@ function ComposerInner({
 		return () => { cancelled = true; };
 	}, [sessionId]);
 	const canSend = textInput.value.trim().length > 0 || attachments.files.length > 0;
-	const canAppend = Boolean(canSteer || queueHint);
- const status: ChatStatus = stopAvailable && !canAppend ? "streaming" : sending ? "submitted" : "idle";
+ const status: ChatStatus = stopAvailable ? "streaming" : sending ? "submitted" : "idle";
 	const commandQuery = !disabled && attachments.files.length === 0 && /^\/[^\s]*$/.test(textInput.value)
 		? textInput.value.slice(1).toLowerCase()
 		: null;
@@ -418,8 +419,7 @@ function ComposerInner({
 					}
 				}
 				const encoded = await Promise.all(message.files.map(encodeAttachment));
-				await onSend(message.text.trim(), encoded, canSteer && steering ? "steer" : undefined);
- setSteering(false);
+				await onSend(message.text.trim(), encoded);
 				if (draftKey && hydratedDraftKey === draftKey) {
 					clearSubmittedChatDraft(draftKey, message.text, currentTextRef.current, () => localStorage);
 					removeSubmittedChatAttachments(draftKey, message.files.flatMap(({ file }) => file ? [file] : []), currentAttachmentsRef.current);
@@ -437,7 +437,6 @@ function ComposerInner({
 			/>
 			<PromptInputFooter>
 				<PromptInputTools>
- {canSteer ? <Button type="button" size="sm" variant={steering?"secondary":"ghost"} aria-pressed={steering} title="调整下一回合方向，不强制终止正在执行的命令" onClick={()=>setSteering(!steering)}>调整执行方向</Button> : null}
 					{hideSessionControls ? null : (
 						<Button type="button" size="icon" variant="ghost" className="size-8" onClick={() => attachments.openFileDialog()} aria-label="添加附件" title="添加附件（最多 5 个，每个 8MB）">
 							<PaperclipIcon className="size-4" />
@@ -467,13 +466,12 @@ function ComposerInner({
 							<ThinkingLevelPicker sessionId={sessionId} sessionModel={sessionModel} sessionThinkingLevel={sessionThinkingLevel} onChanged={onThinkingChanged} />
 						</>
 					)}
-					{stopAvailable && canAppend ? <Button type="button" size="sm" variant="ghost" aria-label="停止" disabled={stopping} onClick={()=>void onStop()}>停止</Button> : null}
      <PromptInputSubmit
 						status={status}
-						disabled={stopping || ((!stopAvailable || canAppend) && (disabled || knowledgeSaving || workerModelSaving || !canSend))}
-						aria-label={stopping ? "正在停止" : stopAvailable && !canAppend ? "停止" : "发送"}
+						disabled={stopping || (!stopAvailable && (disabled || knowledgeSaving || workerModelSaving || !canSend))}
+						aria-label={stopping ? "正在停止" : stopAvailable ? "停止" : "发送"}
 						onClick={(e) => {
-							if (stopAvailable && !canAppend && !stopping) {
+							if (stopAvailable && !stopping) {
 								e.preventDefault();
 								void onStop();
 							}
@@ -487,7 +485,7 @@ function ComposerInner({
 }
 
 export function Composer({
- canSteer, hideGoal,
+ hideGoal,
 	sessionId,
 	draftScope,
 	disabled,
@@ -515,7 +513,7 @@ export function Composer({
 	scrollButtonHostRef,
 	draft,
 }: {
- canSteer?: boolean; hideGoal?: boolean;
+ hideGoal?: boolean;
 	sessionId: string;
 	draftScope: string;
 	disabled: boolean;
@@ -523,7 +521,7 @@ export function Composer({
 	stopAvailable?: boolean;
 	stopping?: boolean;
 	busyHint?: string;
-	/** worker 执行会话视图：running 不阻断提交，提示消息会排队。 */
+	/** 会话忙时的追加提示（如等待审批期间只入队）。 */
 	queueHint?: string;
 	/** worker 执行会话视图：隐藏附件/知识库/模型等会话级控制。 */
 	hideSessionControls?: boolean;
@@ -555,7 +553,7 @@ export function Composer({
 				<div ref={scrollButtonHostRef} className="home-scroll-to-bottom-host" />
 				<PromptInputProvider key={draftScope}>
 					<ComposerInner
- canSteer={canSteer} hideGoal={hideGoal}
+ hideGoal={hideGoal}
 							sessionId={sessionId}
 							draftScope={draftScope}
 						disabled={disabled}

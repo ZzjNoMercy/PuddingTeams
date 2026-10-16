@@ -122,3 +122,8 @@ Workspace 信任回答“哪些项目资源可以进入 Agent 上下文”，执
 迁移到另一台机器时，至少备份完整的 `PUDDINGTEAMS_HOME`。如果要保留 pi Manager/Worker 的全局提示词和资源，还应单独迁移 `~/.pi/agent`；外部 Codex、Claude Code、PuddingClaw 的账号和 Session 由各自产品管理，不能只靠 PuddingTeams 目录恢复。
 
 备份前建议停止 Server，确保没有状态文件正在原子替换。不要只复制 `windows.json`：Window、Session、Goal、Delegation、Artifact 和 Secret 之间以稳定 ID 关联，拆开备份会留下不可恢复的悬空引用。
+
+
+## 原生会话与单次委派
+
+Manager 原生写与 Worker 执行共用 Workspace scope/lease 协调。Manager 自执行使用 native_session owner 和 NativeExecution；写 WorkItem 仍按冻结 accessMode 隔离或独占，不因角色是 Manager 豁免。Fork 复制会话快照，项目目录继续共享；它不是文件系统快照。

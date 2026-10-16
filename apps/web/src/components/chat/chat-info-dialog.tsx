@@ -2,7 +2,7 @@
 
 import { forwardRef, type ButtonHTMLAttributes } from "react";
 import { ChevronDownIcon, XIcon } from "lucide-react";
-import { agentDisplayName, type RoomSession, type RoomSummary, type WorkerSessionSummary } from "@/lib/types";
+import { agentDisplayName, type RoomSession, type RoomSummary } from "@/lib/types";
 import { SessionMenu } from "./session-menu";
 import { ManagerAvatar, WorkerAvatar } from "./worker-avatar";
 
@@ -97,10 +97,6 @@ export function ChatInfoDialog({
 	onNewSession,
 	onRenameSession,
 	onDeleteSession,
-	workerSessions,
-	activeWorkerView,
-	onRenameWorkerSession,
-	onDeleteWorkerSession,
 }: {
 	room: RoomSummary;
 	open: boolean;
@@ -112,19 +108,12 @@ export function ChatInfoDialog({
 	onNewSession?: () => void | Promise<void>;
 	onRenameSession: (session: RoomSession) => void;
 	onDeleteSession: (session: RoomSession) => void;
-	workerSessions?: WorkerSessionSummary[];
-	activeWorkerView?: string | null;
-	onRenameWorkerSession?: (session: WorkerSessionSummary) => void;
-	onDeleteWorkerSession?: (session: WorkerSessionSummary) => void;
 }) {
 	const isGroup = room.type === "group";
 	const isDirect = room.type === "direct";
 	const directMember = isDirect ? room.members[0] : undefined;
 	const activeSession = room.sessions.find((session) => session.active);
-	const activeWorker = activeWorkerView ? workerSessions?.find((item) => item.id === activeWorkerView) : undefined;
-	const activeSessionName = activeWorker
-		? (activeWorker.name || activeWorker.firstMessage || "执行会话")
-		: (activeSession?.name || activeSession?.firstMessage || "新会话");
+	const activeSessionName = activeSession?.name || activeSession?.firstMessage || "新会话";
 	const workspaceName = room.workspace?.name ?? "默认目录";
 	const profileDescription = isGroup
 		? `Manager 负责对话，可委派 ${room.members.length} 位 Worker；也可直接执行工作。`
@@ -205,17 +194,13 @@ export function ChatInfoDialog({
 							/>
 							<SessionMenu
 								sessions={room.sessions}
-								workerSessions={workerSessions}
-								activeWorkerView={activeWorkerView}
 								trigger={<SessionInfoRow value={activeSessionName} />}
 								onSwitch={onSwitchSession}
 								onNew={onNewSession}
 								onRename={(session) => runAction(() => onRenameSession(session))}
 								onDelete={(session) => runAction(() => onDeleteSession(session))}
-								onRenameWorker={(session) => runAction(() => onRenameWorkerSession?.(session))}
-								onDeleteWorker={(session) => runAction(() => onDeleteWorkerSession?.(session))}
 							/>
-							<InfoRow label="会话数量" value={`${room.sessions.length + (workerSessions?.length ?? 0)} 个`} />
+							<InfoRow label="会话数量" value={`${room.sessions.length} 个`} />
 						</div>
 					</section>
 				</div>

@@ -1,16 +1,21 @@
 "use client";
 
+import { createPortal } from "react-dom";
+import { homePortalContainer } from "@/lib/home-portal";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { BotIcon, LoaderIcon, MessageSquareIcon, RefreshCwIcon, SearchIcon, SparklesIcon } from "lucide-react";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { listAgents, listManagerWorks, listRooms } from "@/lib/api";
+import { type WorkerProcessListItem, fetchDelegationRecords, listAgents, listManagerWorks, listRooms } from "@/lib/api";
 import type { AgentConfig, ManagerWorkIndexItem, RoomSummary } from "@/lib/types";
-import { agentResults, filterSearchResults, managerWorkResults, roomResults, withManagerReturn, type SearchResult } from "@/lib/global-search-results";
+import { agentResults, executionResults, filterSearchResults, managerWorkResults, roomResults, withManagerReturn, type SearchResult } from "@/lib/global-search-results";
 import { loadSearchSources } from "@/lib/global-search-load";
 import { isIMEComposing } from "@/lib/ime";
+
+import { WorkerProcessDrawer } from "./worker-process-dialog";
+import { WorkerProcessProvider } from "./worker-process-context";
 
 export function GlobalSearchDialog({ open, onOpenChange, returnSessionId }: { open: boolean; onOpenChange: (open: boolean) => void; returnSessionId?: string | null }) {
 	const router = useRouter();
@@ -18,8 +23,10 @@ export function GlobalSearchDialog({ open, onOpenChange, returnSessionId }: { op
 	const [rooms, setRooms] = useState<RoomSummary[] | null>(null);
 	const [agents, setAgents] = useState<AgentConfig[] | null>(null);
 	const [works, setWorks] = useState<ManagerWorkIndexItem[] | null>(null);
+	const [records, setRecords] = useState<WorkerProcessListItem[] | null>(null);
+	const [selectedExecution, setSelectedExecution] = useState<WorkerProcessListItem | null>(null);
 	const [errors, setErrors] = useState<string[]>([]);
-	const [pending, setPending] = useState(3);
+	const [pending, setPending] = useState(4);
 	const requestId = useRef(0);
 	const invalidate = useCallback(() => {
 		return ++requestId.current;
@@ -30,7 +37,9 @@ export function GlobalSearchDialog({ open, onOpenChange, returnSessionId }: { op
 		setAgents(null);
 		setWorks(null);
 		setErrors([]);
-		setPending(3);
+		setPending(4);
+		setRecords(null);
+		void fetchDelegationRecords().then(value => { if(currentRequest === requestId.current) setRecords(value); }).catch(error => { if(currentRequest === requestId.current) setErrors(previous => [...previous, `执行记录：${String(error)}`]); }).finally(()=>{if(currentRequest === requestId.current) setPending(count => count-1);});
 		void loadSearchSources({ rooms: listRooms, agents: listAgents, works: listManagerWorks }, () => currentRequest === requestId.current, (event) => {
 			if (!event.ok) {
 				const label = event.source === "rooms" ? "工作与对话" : event.source === "agents" ? "智能体" : "Manager 工作";
@@ -49,22 +58,23 @@ export function GlobalSearchDialog({ open, onOpenChange, returnSessionId }: { op
 	const results = useMemo(() => {
 		const chats = (rooms ?? []).filter((room) => room.type !== "solo");
 		const fallbackWork = works === null ? (rooms ?? []).filter((room) => room.type === "solo") : [];
-		return filterSearchResults([...managerWorkResults(works ?? []), ...roomResults([...chats, ...fallbackWork]), ...agentResults(agents ?? [])], query);
-	}, [rooms, agents, works, query]);
+		return filterSearchResults([...managerWorkResults(works ?? []), ...roomResults([...chats, ...fallbackWork]), ...agentResults(agents ?? []), ...executionResults(records ?? [])], query);
+	}, [rooms, agents, works, records, query]);
 	const searching = pending > 0;
-	const allSourcesFailed = !searching && rooms === null && agents === null && works === null;
+	const allSourcesFailed = !searching && rooms === null && agents === null && works === null && records === null;
 	const partialResults = errors.length > 0 && !allSourcesFailed;
 	const openResult = (result: SearchResult) => {
 		invalidate();
 		onOpenChange(false);
+		if(result.execution) { setSelectedExecution(result.execution); return; }
 		const source = returnSessionId ?? (window.location.pathname === "/chats" ? new URLSearchParams(window.location.search).get("returnSession") : null);
 		router.push(withManagerReturn(result.href, source));
 	};
-	return <Dialog open={open} onOpenChange={(next) => { if (!next) invalidate(); onOpenChange(next); }}>
+	return <><Dialog open={open} onOpenChange={(next) => { if (!next) invalidate(); onOpenChange(next); }}>
 		<DialogContent className="max-h-[min(80dvh,680px)] gap-0 overflow-hidden p-0 sm:max-w-[640px]">
 			<DialogHeader className="border-b border-border px-6 pb-4 pt-6">
 				<DialogTitle>搜索工作与对话</DialogTitle>
-				<DialogDescription>当前搜索工作、对话和智能体的标题与摘要；知识库资料搜索将在接入后开放。</DialogDescription>
+				<DialogDescription>搜索原生会话、执行记录与智能体。执行记录可按调用 ID、Worker、来源会话、项目 ID 或 Goal ID 查询。</DialogDescription>
 			</DialogHeader>
 			<div className="relative border-b border-border px-6 py-4">
 				<SearchIcon className="pointer-events-none absolute left-9 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
@@ -88,5 +98,7 @@ export function GlobalSearchDialog({ open, onOpenChange, returnSessionId }: { op
 				})}
 			</div>
 		</DialogContent>
-	</Dialog>;
+	</Dialog>
+ {selectedExecution ? createPortal(<div className="pointer-events-none fixed inset-0 z-50"><WorkerProcessProvider value={{ openWorkerProcess: (id)=>setSelectedExecution(records?.find(record=>record.delegationId===id) ?? selectedExecution) }}><WorkerProcessDrawer key={selectedExecution.delegationId} roomId={selectedExecution.sourceRoomId ?? ""} managerSessionId={selectedExecution.managerSessionId} requestedDelegationId={selectedExecution.delegationId} requestedFullSession={false} showWorkerFilter={false} open onOpenChange={next=>{if(!next)setSelectedExecution(null);}} /></WorkerProcessProvider></div>, homePortalContainer() ?? document.body) : null}
+ </>;
 }

@@ -5,8 +5,8 @@ import { registerChatRoutes as registerRoutes } from "./chat.js";
 export async function registerChatRoutes(...args: Parameters<typeof registerRoutes>) {
  const store=args[1];
  const defaults={
-  isRunning:()=>false,setNativeInputLifecycle(){},setBeforeNativeStream(){},nativeInputAllowed:async()=>{},
-  nativeSessionCapability:async(id:string)=>({ownerAgentId:"manager",connectorId:"pi",nativePi:true,readOnly:false,busyInput:{modes:["followUp","steer"]},waiting:[],pendingMessageCount:0}),
+  isRunning:()=>false,setNativeInputLifecycle(){},setBeforeNativeStream(){},nativeInputAllowed:async()=>{},notifyQueueChanged(){},
+  nativeSessionCapability:async(id:string)=>({ownerAgentId:"manager",connectorId:"pi",nativePi:true,readOnly:false,busyInput:{modes:["followUp","steer"]},waiting:[],queuedInputs:[],pendingMessageCount:0}),
   wireMessages:async(id:string)=>(await store.open(id)).messages,
   messageAdmission:async()=>undefined,
  };

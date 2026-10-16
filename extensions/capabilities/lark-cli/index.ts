@@ -84,6 +84,8 @@ interface PreparedRuntime {
 	skillCount: number;
 	env?: NodeJS.ProcessEnv;
 	issues: RuntimeIssue[];
+	/** 非空表示本次不发放能力，原因已写进 issues 并会让 CLI 入口直接失败。 */
+	blocked?: string;
 }
 
 interface SkillListEntry {
@@ -96,8 +98,48 @@ const WINDOWS_NAMES = ["lark-cli.exe", "lark-cli.cmd", "lark-cli.bat", "lark-cli
 const NPM_NAMES = process.platform === "win32" ? ["npm.cmd", "npm.exe", "npm"] : ["npm"];
 const OFFICIAL_PACKAGE = "@larksuite/cli@latest";
 const SYNC_INTERVAL_MS = 6 * 60 * 60 * 1000;
+/** 后台刷新超过这个时长仍未收尾，视为失败：不再拒绝会话，用当前版本继续。 */
+const REFRESH_STALE_MS = 10 * 60 * 1000;
 const preparations = new Map<string, Promise<PreparedRuntime>>();
+const refreshes = new Map<string, Promise<void>>();
 const connectionActions = new Map<string, Promise<void>>();
+
+/**
+ * CLI/Skills 的同步状态。会话组装只读这个文件，网络与导出永远在后台跑：
+ * `refreshing` 期间不发放 CLI（避免用到写盘中途的二进制或不同版本的 Skills）。
+ */
+interface UpdateState {
+	status: "ready" | "refreshing";
+	startedAt?: string;
+	finishedAt?: string;
+	version?: string;
+	skillCount?: number;
+	error?: string;
+}
+
+function updateStateFile(runtimeDir: string): string {
+	return path.join(runtimeDir, "cli-update.json");
+}
+
+async function readUpdateState(runtimeDir: string): Promise<UpdateState | undefined> {
+	try {
+		return JSON.parse(await readFile(updateStateFile(runtimeDir), "utf-8")) as UpdateState;
+	} catch {
+		return undefined;
+	}
+}
+
+async function writeUpdateState(runtimeDir: string, state: UpdateState): Promise<void> {
+	await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+	await writeFile(updateStateFile(runtimeDir), `${JSON.stringify(state)}\n`, { encoding: "utf-8", mode: 0o600 });
+}
+
+/** 正在刷新且未超过容忍时长；超时说明后台任务卡死或进程被杀，按可用处理。 */
+function refreshInFlight(state: UpdateState | undefined, now = Date.now()): boolean {
+	if (state?.status !== "refreshing") return false;
+	const started = state.startedAt ? Date.parse(state.startedAt) : Number.NaN;
+	return !Number.isFinite(started) || now - started < REFRESH_STALE_MS;
+}
 
 function canonical(file: string): string {
 	try {
@@ -315,6 +357,17 @@ async function mapLimit<T>(items: T[], limit: number, worker: (item: T) => Promi
 	}));
 }
 
+/** 已导出过的官方 Skills（按 CLI 版本缓存）：只读磁盘，不调用 CLI。 */
+async function cachedSkills(runtimeDir: string, version: string): Promise<{ skillPath: string; skillCount: number } | undefined> {
+	const target = path.join(runtimeDir, "skills", version);
+	try {
+		const complete = JSON.parse(await readFile(path.join(target, ".complete.json"), "utf-8")) as { skillCount?: number };
+		return { skillPath: target, skillCount: complete.skillCount ?? 0 };
+	} catch {
+		return undefined;
+	}
+}
+
 async function exportOfficialSkills(
 	cliPath: string,
 	version: string,
@@ -323,11 +376,8 @@ async function exportOfficialSkills(
 ): Promise<{ skillPath: string; skillCount: number }> {
 	const skillsRoot = path.join(runtimeDir, "skills");
 	const target = path.join(skillsRoot, version);
-	const complete = path.join(target, ".complete.json");
-	if (await access(complete).then(() => true, () => false)) {
-		const cached = JSON.parse(await readFile(complete, "utf-8")) as { skillCount?: number };
-		return { skillPath: target, skillCount: cached.skillCount ?? 0 };
-	}
+	const cached = await cachedSkills(runtimeDir, version);
+	if (cached) return cached;
 
 	const listResult = await runCommand(cliPath, ["skills", "list"], env);
 	const list = parseJson<{ skills?: Array<{ name?: unknown }> }>(listResult, "读取飞书官方 Skills");
@@ -375,18 +425,68 @@ async function writeExecutableAtomic(file: string, source: string): Promise<void
 	}
 }
 
+/** 只读组装的公共部分：PATH 与官方 notifier 抑制。 */
+function baseEnv(ctx: RuntimeContext, cliPath?: string): NodeJS.ProcessEnv {
+	return {
+		...(cliPath ? prependPath(ctx.env, path.dirname(cliPath)) : { ...ctx.env }),
+		LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",
+		LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1",
+	};
+}
+
+/**
+ * Worker 的 `lark-cli` 入口。`blocked` 时同一个入口直接以该原因失败：不取 token、
+ * 不碰真实 CLI，让「正在更新，稍后再试」这句出现在调用现场（Manager 能直接看到），
+ * 而不是让调用方挂住等更新结束。
+ */
+async function bridgeEnvironment(ctx: RuntimeContext, cliPath: string | undefined, blocked?: string): Promise<NodeJS.ProcessEnv> {
+	const bridgeDir = path.join(ctx.sharedStateDir, "bin");
+	await mkdir(bridgeDir, { recursive: true, mode: 0o700 });
+	const bridge = path.join(bridgeDir, process.platform === "win32" ? "lark-cli.cjs" : "lark-cli");
+	await writeExecutableAtomic(bridge, (process.platform === "win32" ? "" : `#!${process.execPath}\n`) + CLI_BRIDGE_SOURCE);
+	if (process.platform === "win32") await writeExecutableAtomic(path.join(bridgeDir, "lark-cli.cmd"), `@echo off\r\n"${process.execPath}" "%~dp0lark-cli.cjs" %*\r\n`);
+	const env: NodeJS.ProcessEnv = { ...prependPath(baseEnv(ctx, cliPath), bridgeDir) };
+	if (ctx.connection) Object.assign(env, await ctx.connection.runtimeEnv());
+	if (cliPath && !blocked) env.PUDDING_LARK_REAL_CLI = cliPath;
+	if (blocked) env.PUDDING_LARK_BLOCKED = blocked;
+	// Remove inherited upstream secrets: each invocation obtains a fresh token.
+	for (const key of ["LARKSUITE_CLI_APP_SECRET", "LARKSUITE_CLI_USER_ACCESS_TOKEN", "LARKSUITE_CLI_TENANT_ACCESS_TOKEN", "LARKSUITE_CLI_CONFIG_DIR"]) env[key] = "";
+	return env;
+}
+
+async function blockedRuntime(
+	ctx: RuntimeContext,
+	state: { source: "local" | "platform"; cliPath?: string; version?: string },
+	issue: RuntimeIssue,
+	known: RuntimeIssue[] = [],
+): Promise<PreparedRuntime> {
+	return {
+		...state,
+		skillCount: 0,
+		issues: [...known, issue],
+		blocked: issue.message,
+		env: ctx.connection ? await bridgeEnvironment(ctx, undefined, issue.message) : undefined,
+	};
+}
+
+/**
+ * 会话组装路径：**只做本地、有界的工作**（探测版本 + 读已导出的 Skills 缓存），
+ * 不做任何网络更新，也不等待后台刷新。CLI 正在更新或当前版本的 Skills 尚未
+ * 导出时，不发放能力，而是明确告诉调用方「稍后再试」——绝不静默等待。
+ */
 async function prepareRuntimeUncached(ctx: RuntimeContext): Promise<PreparedRuntime> {
 	const runtimeDir = path.join(ctx.stateDir, "runtime");
 	const issues: RuntimeIssue[] = [];
-	let { cliPath, source } = await findAvailableCli(ctx.env, ctx.sharedStateDir);
-	if (cliPath) {
-		if (source === "local") {
-			const issue = await syncLocalCli(cliPath, ctx.env, path.join(runtimeDir, "local-sync.json"));
-			if (issue) issues.push(issue);
-			cliPath = await findLocalCli(ctx.env) ?? cliPath;
-		}
+	const state = await readUpdateState(runtimeDir);
+	if (refreshInFlight(state)) {
+		return blockedRuntime(ctx, { source: "local", ...(state?.version ? { version: state.version } : {}) }, {
+			code: "cli_update_in_progress",
+			message: "飞书官方 CLI 正在后台更新，请稍后再试",
+			fixAction: `更新开始于 ${state?.startedAt ?? "未知时间"}；完成后重新发起本次任务即可`,
+		});
 	}
 
+	const { cliPath, source } = await findAvailableCli(ctx.env, ctx.sharedStateDir);
 	if (!cliPath || !(await executable(cliPath))) {
 		issues.push({
 			code: "cli_not_installed",
@@ -396,45 +496,95 @@ async function prepareRuntimeUncached(ctx: RuntimeContext): Promise<PreparedRunt
 		return { source, skillCount: 0, issues };
 	}
 
-	let env = prependPath(ctx.env, path.dirname(cliPath));
-	env = {
-		...env,
-		LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",
-		LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1",
-	};
+	const env = baseEnv(ctx, cliPath);
 	const versionResult = await runCommand(cliPath, ["--version"], env);
 	const version = cliVersion(versionResult);
 	if (versionResult.code !== 0 || !version) {
 		issues.push({ code: "version_probe_failed", message: "飞书官方 CLI 版本探测失败", fixAction: commandMessage(versionResult) });
 	}
 
-	let skillPath: string | undefined;
-	let skillCount = 0;
-	if (versionResult.code === 0 && version) {
-		try {
-			const exported = await exportOfficialSkills(cliPath, version, env, runtimeDir);
-			skillPath = exported.skillPath;
-			skillCount = exported.skillCount;
-		} catch (error) {
-			issues.push({
-				code: "official_skills_sync_failed",
-				message: "飞书官方 Skills 自动同步失败",
-				fixAction: error instanceof Error ? error.message : String(error),
-			});
-		}
+	// CLI 与 Skills 必须同版本：当前版本的 Skills 没导出完就不发放，避免 Worker 拿到
+	// 与手上 CLI 不匹配的官方文档。导出与升级都在后台跑。
+	const skills = version ? await cachedSkills(runtimeDir, version) : undefined;
+	if (!skills) {
+		refreshRuntimeInBackground(ctx);
+		return blockedRuntime(ctx, { source, cliPath, ...(version ? { version } : {}) }, {
+			code: "official_skills_syncing",
+			message: "飞书官方 CLI/Skills 正在后台同步，请稍后再试",
+			fixAction: version ? `官方 Skills ${version} 尚未就绪；同步完成后重新发起本次任务` : "CLI 版本探测未通过，请查看连接状态",
+		}, issues);
 	}
-	if (ctx.connection) {
-		const bridgeDir = path.join(ctx.sharedStateDir, "bin");
-		await mkdir(bridgeDir, { recursive: true, mode: 0o700 });
-		const bridge = path.join(bridgeDir, process.platform === "win32" ? "lark-cli.cjs" : "lark-cli");
-		await writeExecutableAtomic(bridge, (process.platform === "win32" ? "" : `#!${process.execPath}\n`) + CLI_BRIDGE_SOURCE);
-		if (process.platform === "win32") await writeExecutableAtomic(path.join(bridgeDir, "lark-cli.cmd"), `@echo off\r\n"${process.execPath}" "%~dp0lark-cli.cjs" %*\r\n`);
-		env = { ...prependPath(env, bridgeDir), ...await ctx.connection.runtimeEnv(), PUDDING_LARK_REAL_CLI: cliPath };
-		// Remove inherited upstream secrets: each invocation obtains a fresh token.
-		for (const key of ["LARKSUITE_CLI_APP_SECRET", "LARKSUITE_CLI_USER_ACCESS_TOKEN", "LARKSUITE_CLI_TENANT_ACCESS_TOKEN", "LARKSUITE_CLI_CONFIG_DIR"]) env[key] = "";
+
+	// 6 小时新鲜度门到了就在后台刷新，不阻塞本次会话（当前 CLI 与 Skills 是一致的）。
+	if (!state || state.version !== version || Date.now() - Date.parse(state.finishedAt ?? state.startedAt ?? "") >= SYNC_INTERVAL_MS) {
+		refreshRuntimeInBackground(ctx);
 	}
-	return { cliPath, source, version, skillPath, skillCount, env, issues };
+
+	const bridged = ctx.connection ? await bridgeEnvironment(ctx, cliPath) : env;
+	return { cliPath, source, version, skillPath: skills.skillPath, skillCount: skills.skillCount, env: bridged, issues };
 }
+
+/**
+ * 后台刷新：官方 update（6 小时门）→ 重新探测版本 → 导出该版本 Skills。
+ * 用状态文件对外表达进度；同一 binding 同时只跑一个。任何失败只写进状态，
+ * 不阻塞会话，也不改变当前可用的 CLI/Skills。
+ */
+function refreshRuntimeInBackground(ctx: RuntimeContext): void {
+	const key = canonical(ctx.stateDir);
+	if (refreshes.has(key)) return;
+	const runtimeDir = path.join(ctx.stateDir, "runtime");
+	const task = (async () => {
+		const available = await findAvailableCli(ctx.env, ctx.sharedStateDir);
+		if (!available.cliPath) {
+			await writeUpdateState(runtimeDir, { status: "ready", finishedAt: new Date().toISOString(), error: "尚未安装飞书 CLI" });
+			return;
+		}
+		try {
+			// 无事可做就不进入 refreshing 态：稳态下不该出现「正在后台更新」的误导窗口。
+			const needsUpdate = available.source === "local" && !(await markerFresh(path.join(runtimeDir, "local-sync.json")));
+			const before = cliVersion(await runCommand(available.cliPath, ["--version"], baseEnv(ctx, available.cliPath)));
+			const beforeSkills = before ? await cachedSkills(runtimeDir, before) : undefined;
+			if (!needsUpdate && beforeSkills) {
+				await writeUpdateState(runtimeDir, { status: "ready", finishedAt: new Date().toISOString(), version: before, skillCount: beforeSkills.skillCount });
+				return;
+			}
+
+			await writeUpdateState(runtimeDir, { status: "refreshing", startedAt: new Date().toISOString(), version: before });
+			let cliPath = available.cliPath;
+			let issue: RuntimeIssue | undefined;
+			if (available.source === "local") {
+				issue = await syncLocalCli(cliPath, ctx.env, path.join(runtimeDir, "local-sync.json"));
+				// 官方 update 可能换掉本机路径，重新解析一次。
+				cliPath = await findLocalCli(ctx.env) ?? cliPath;
+			}
+			const env = baseEnv(ctx, cliPath);
+			const version = cliVersion(await runCommand(cliPath, ["--version"], env));
+			if (!version) throw new Error("飞书官方 CLI 版本探测失败");
+			const exported = await exportOfficialSkills(cliPath, version, env, runtimeDir);
+			await writeUpdateState(runtimeDir, {
+				status: "ready",
+				finishedAt: new Date().toISOString(),
+				version,
+				skillCount: exported.skillCount,
+				...(issue ? { error: issue.message } : {}),
+			});
+		} catch (error) {
+			await writeUpdateState(runtimeDir, {
+				status: "ready",
+				finishedAt: new Date().toISOString(),
+				error: error instanceof Error ? error.message : String(error),
+			}).catch(() => undefined);
+		}
+	})();
+	refreshes.set(key, task);
+	void task.finally(() => { if (refreshes.get(key) === task) refreshes.delete(key); });
+}
+
+/** 测试与关停用：等待所有在飞的后台刷新收尾。 */
+async function settleBackgroundRefresh(): Promise<void> {
+	await Promise.all([...refreshes.values()].map((task) => task.catch(() => undefined)));
+}
+
 
 async function prepareRuntime(ctx: RuntimeContext): Promise<PreparedRuntime> {
 	const key = canonical(ctx.stateDir);
@@ -450,9 +600,10 @@ function sessionRuntime(prepared: PreparedRuntime): SessionRuntime {
 		...(prepared.skillPath ? { skillPaths: [prepared.skillPath] } : {}),
 		...(prepared.env ? { env: prepared.env } : {}),
 		details: {
+			...(prepared.blocked ? { "CLI 同步": prepared.blocked } : {}),
 			"CLI 来源": prepared.source === "local" ? "本机官方版本" : "平台安装的官方版本",
 			...(prepared.version ? { "CLI 版本": prepared.version } : {}),
-			"官方 Skills": prepared.skillCount > 0 ? `${prepared.skillCount} 个（与 CLI 同步）` : "未就绪",
+			"官方 Skills": prepared.skillCount > 0 ? `${prepared.skillCount} 个（与 CLI 同步）` : prepared.blocked ? "本次未发放，稍后再试" : "未就绪",
 			"登录方式": "平台与 CLI 共用加密凭证",
 		},
 		issues: prepared.issues,
@@ -468,12 +619,19 @@ async function probeRuntime(ctx: RuntimeContext): Promise<ProbeRuntime> {
 	const { cliPath, source } = await findAvailableCli(ctx.env, ctx.sharedStateDir);
 	const status = ctx.connection ? await ctx.connection.status() : undefined;
 	const version = cliPath ? cliVersion(await runCommand(cliPath, ["--version"], ctx.env, 5_000)) : undefined;
+	// 只读：报告同步状态，但不触发任何安装/更新（同步由会话组装在后台发起）。
+	const sync = await readUpdateState(path.join(ctx.stateDir, "runtime"));
+	const syncDetail = refreshInFlight(sync) ? `后台同步中（开始于 ${sync?.startedAt ?? "未知时间"}）`
+		: sync?.error ? `上次同步失败：${sync.error}`
+		: sync?.version ? `已就绪（${sync.version}）`
+		: "尚未同步";
 	return {
 		authenticated: status?.userAuthorization === "authorized",
 		details: {
 			"CLI 来源": source === "local" ? "本机官方版本" : "平台安装的官方版本",
+			"CLI 版本": version ?? "未探测到",
+			"CLI 同步": syncDetail,
 			"登录方式": "平台与 CLI 共用加密凭证",
-			...(version ? { "CLI 版本": version } : {}),
 			...(status?.accountName ? { "登录用户": status.accountName } : {}),
 		},
 		issues: [
@@ -490,8 +648,13 @@ async function listConnections(ctx: ConnectionContext): Promise<ConnectionStatus
 	};
 	const { cliPath } = await findAvailableCli(ctx.env, ctx.stateDir);
 	const version = cliPath ? cliVersion(await runCommand(cliPath, ["--version"], ctx.env, 5_000)) : undefined;
+	const sync = await readUpdateState(path.join(ctx.stateDir, "runtime"));
+	const message = refreshInFlight(sync)
+		? [status.message, "官方 CLI/Skills 正在后台同步，稍后再试"].filter(Boolean).join("；")
+		: sync?.error ? [status.message, `上次同步失败：${sync.error}`].filter(Boolean).join("；") : status.message;
 	return [{
 		...status,
+		message,
 		...(version ? { version } : {}),
 		...(!cliPath ? {
 			message: [status.message, "Agent 执行需要安装 CLI"].filter(Boolean).join("；"),
@@ -560,5 +723,5 @@ export const extension = {
 	},
 };
 
-export { authorization, exportOfficialSkills, findLocalCli, listConnections, probeRuntime, resolveRuntime, runConnectionAction };
+export { authorization, exportOfficialSkills, findLocalCli, listConnections, probeRuntime, resolveRuntime, runConnectionAction, settleBackgroundRefresh };
 export default extension;

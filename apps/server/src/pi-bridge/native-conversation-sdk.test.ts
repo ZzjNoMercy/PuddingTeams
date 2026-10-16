@@ -109,6 +109,15 @@ test("P3 real SDK: Worker owns one conversation; followUp/steer, duplicate inten
   assert.equal((await send("native-follow-0001","follow","steer")).statusCode,409);
   await assert.rejects(()=>sessions!.setModel(sid,"native-conversation-fixture/worker-model"),/session_rebuild_blocked/);
   await send("native-same-0001","same","followUp");await send("native-same-0002","same","followUp");
+  await send("native-cancel-0001","cancel-me","followUp");
+  const queuedInputs=async()=>((await app.inject({method:"GET",url:`/api/sessions/${sid}/messages`})).json().queuedInputs??[]) as Array<{key:string;text:string;delivery:string;hasImages:boolean}>;
+  assert.deepEqual((await queuedInputs()).map(item=>item.key).sort(),["native-cancel-0001","native-follow-0001","native-same-0001","native-same-0002","native-steer-0001"].sort());
+  const act=(key:string,action:"steer"|"cancel")=>app.inject({method:"POST",url:`/api/sessions/${sid}/queued-inputs/${key}`,payload:{action}});
+  assert.equal((await act("native-missing","steer")).statusCode,404);
+  const promoted=await act("native-follow-0001","steer");assert.equal(promoted.statusCode,200,promoted.body);
+  assert.equal((await queuedInputs()).find(item=>item.key==="native-follow-0001")?.delivery,"steer");
+  const dropped=await act("native-cancel-0001","cancel");assert.equal(dropped.statusCode,200,dropped.body);
+  assert(!(await queuedInputs()).some(item=>item.key==="native-cancel-0001"));
   await writeFile(path.join(cwd,"release"),"go");await wait(()=>worker.isIdle);
   const longResult=worker.messages.find(message=>message.role==="toolResult"&&message.toolCallId==="long-bash");
   assert(longResult&&longResult.role==="toolResult"&&!longResult.isError,JSON.stringify(longResult));

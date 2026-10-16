@@ -593,7 +593,7 @@ export function AgentsPane() {
 					</div>
 					</button>
 				<ChevronRightIcon className="ops-agent-chevron pointer-events-none absolute right-5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
-				<DropdownMenu>
+				<DropdownMenu modal={false}>
 					<DropdownMenuTrigger asChild>
 						<Button type="button" size="icon" variant="ghost" aria-label={`管理 ${agentDisplayName(agent)}`} className="ops-agent-menu-trigger absolute right-3 top-3 size-8 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100">
 							<MoreHorizontalIcon className="size-4" />
