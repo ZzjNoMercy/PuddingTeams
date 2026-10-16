@@ -3874,6 +3874,37 @@ html[data-desktop-platform="darwin"] :where(
 .nav-item[aria-current="page"]::before { top: 12px; bottom: 12px; left: -10px; width: 3px; }
 .nav-item:focus-visible:not([data-pointer-focus="true"]) { outline: 2px solid var(--home-accent, var(--ring)); outline-offset: 2px; }
 
+.nav-item-count {
+	position:absolute;
+	top:1px;
+	inset-inline-end:1px;
+	display:inline-flex;
+	min-width:18px;
+	height:18px;
+	align-items:center;
+	justify-content:center;
+	color:var(--muted-foreground);
+	font-size:10px;
+	font-weight:400;
+	font-variant-numeric:tabular-nums;
+	line-height:1;
+	pointer-events:none;
+}
+.m1-app-shell .nav-item-count,
+html:not([data-desktop-platform])[data-nav="expanded"] .nav-item-count {
+	top:50%;
+	inset-inline-end:12px;
+	transform:translateY(-50%);
+}
+@media (max-width:960px) {
+	.m1-app-shell .nav-item-count,
+	html:not([data-desktop-platform])[data-nav="expanded"] .nav-item-count {
+		top:1px;
+		inset-inline-end:1px;
+		transform:none;
+	}
+}
+
 .nav-user {
 	display: flex;
 	width: 42px;

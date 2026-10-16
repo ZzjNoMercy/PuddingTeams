@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useId, useState, useSyncExternalStore } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
@@ -40,6 +40,7 @@ import { getViewerIdentity, viewerAvatarUrl } from "@/lib/api";
 import { useTheme } from "@/components/theme-provider";
 import type { ViewerIdentity } from "@/lib/types";
 import { readingRequest, type ReadingList } from "@/lib/read-later";
+import { useWikiReviewQueue } from "@/lib/wiki-review-queue";
 
 const GITHUB_URL = "https://github.com/ZzjNoMercy/PuddingTeams";
 const ISSUE_URL = "https://github.com/ZzjNoMercy/PuddingTeams/issues/new";
@@ -65,6 +66,9 @@ export function NavRail({ view, returnSessionId }: { view: AppView; returnSessio
 	const [identityState, setIdentityState] = useState<{ status: "loading" | "ready" | "error"; identity: ViewerIdentity | null }>({ status: "loading", identity: null });
 	const [identityRetry, setIdentityRetry] = useState(0);
 	const [readLaterUnread, setReadLaterUnread] = useState<number | null>(null);
+	const { pendingCount: pendingReviews } = useWikiReviewQueue();
+	const reviewCountId = useId();
+	const readLaterCountId = useId();
 	useEffect(() => {
 		let active = true;
 		const refresh = () => { void readingRequest<ReadingList>("?limit=1").then(data => { if (active) setReadLaterUnread(data.counts.unread ?? 0); }).catch(() => { if (active) setReadLaterUnread(null); }); };
@@ -146,14 +150,15 @@ export function NavRail({ view, returnSessionId }: { view: AppView; returnSessio
 				<CalendarDaysIcon className="size-4 shrink-0" />
 				<span className="nav-label">日历</span>
 			</Link>
-			<Link href="/knowledge" title="知识库" aria-label="知识库" aria-current={view === "knowledge" || view === "review" ? "page" : undefined} className={cn("mt-1", itemClass())}>
+			<Link href="/knowledge" title={pendingReviews ? `知识库 · ${pendingReviews} 项待审核` : "知识库"} aria-label="知识库" aria-describedby={pendingReviews ? reviewCountId : undefined} aria-current={view === "knowledge" || view === "review" ? "page" : undefined} className={cn("mt-1", itemClass())}>
 				<BookOpenIcon className="size-4 shrink-0" />
 				<span className="nav-label">知识库</span>
+				{pendingReviews !== null && pendingReviews > 0 ? <span id={reviewCountId} className="nav-item-count" aria-label={`${pendingReviews} 项待审核`}>{pendingReviews > 99 ? "99+" : pendingReviews}</span> : null}
 			</Link>
-			<Link href="/read-later" title="稍后读" aria-label="稍后读" aria-current={view === "read-later" ? "page" : undefined} className={cn("mt-1", itemClass())}>
+			<Link href="/read-later" title="稍后读" aria-label="稍后读" aria-describedby={readLaterUnread ? readLaterCountId : undefined} aria-current={view === "read-later" ? "page" : undefined} className={cn("mt-1", itemClass())}>
 				<BookmarkIcon className="size-4 shrink-0" />
 				<span className="nav-label">稍后读</span>
-				{readLaterUnread !== null && readLaterUnread > 0 ? <span className="nav-label ml-auto text-[10px] text-muted-foreground" aria-label={`${readLaterUnread} 篇未读`}>{readLaterUnread}</span> : null}
+				{readLaterUnread !== null && readLaterUnread > 0 ? <span id={readLaterCountId} className="nav-item-count" aria-label={`${readLaterUnread} 篇未读`}>{readLaterUnread > 99 ? "99+" : readLaterUnread}</span> : null}
 			</Link>
 			<Link
 				href="/agents"
