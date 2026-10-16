@@ -2018,13 +2018,14 @@ export class TeamsStore {
 
 	/** Delete a window (solo refused). Returns all active + parked pi session ids so the caller
 	 * can cascade-delete them from the session store. */
-	async removeWindow(id: string): Promise<string[]> {
+	async removeWindow(id: string, onlySessionId?: string): Promise<string[]> {
 		const sessionIds: string[] = [];
 		await this.serialize(async () => {
 			const data = await this.loadWindowsFile();
 			const w = data.windows[id];
 			if (!w) return;
 			if (w.pinned) throw new Error("solo 窗口不可删除");
+			if (onlySessionId !== undefined && (w.sessions.length !== 1 || w.sessions[0] !== onlySessionId || Object.keys(w.parkedContexts).length)) throw new Error("single_session_window_changed");
 			sessionIds.push(...w.sessions, ...Object.values(w.parkedContexts).flatMap((context) => context.sessions));
 			if (w.creationOperationId && w.creationRequestHash) {
 				data.retiredCreationOperations ??= {};

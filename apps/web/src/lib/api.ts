@@ -2442,26 +2442,28 @@ export async function setDeveloperMode(enabled: boolean): Promise<boolean> {
 }
 
 /** 删除窗口（级联删除其全部 pi session）。solo 会被后端拒绝。 */
-export async function deleteRoom(id: string): Promise<void> {
-	const res = await fetch(`${SERVER_URL}/api/rooms/${id}`, { method: "DELETE" });
+export async function deleteRoom(id: string, onlySessionId?: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(id)}${onlySessionId ? `?onlySession=${encodeURIComponent(onlySessionId)}` : ""}`, { method: "DELETE" });
 	if (!res.ok) {
 		const body = (await res.json().catch(() => null)) as { error?: string } | null;
 		throw new Error(body?.error ?? `delete room failed: ${res.status}`);
 	}
 }
 
-/** Create a new pi session inside a window and make it the active one. */
+/** Open a blank ordinary Session (create if needed), or create an explicit Goal Session. */
 export async function createRoomSession(
 	roomId: string,
 	goal?: { goal: string; completionBoundary: string; reviewMode?: "manager" | "independent"; reviewerModel?: string },
-): Promise<SessionSummary> {
+	context?: { workspaceId: string | null; cwdSnapshot: string },
+): Promise<SessionSummary & { reused?: boolean }> {
 	const res = await fetch(`${SERVER_URL}/api/rooms/${roomId}/sessions`, {
 		method: "POST",
 		headers: { "content-type": "application/json", ...(goal ? { "Idempotency-Key": operationKey("room-goal") } : {}) },
-		body: JSON.stringify(goal ?? {}),
+		body: JSON.stringify(goal ?? { reuseEmpty: true, ...(context ? { expectedWorkspaceId: context.workspaceId, expectedCwdSnapshot: context.cwdSnapshot } : {}) }),
 	});
-	if (!res.ok) throw new Error(`create room session failed: ${res.status}`);
-	return ((await res.json()) as { session: SessionSummary }).session;
+	const body = await res.json() as { session: SessionSummary; reused?: boolean; error?: string };
+	if (!res.ok) throw new Error(body.error ?? `create room session failed: ${res.status}`);
+	return { ...body.session, reused: body.reused };
 }
 
 /** Reserve one Manager Session and submit its first message as one retryable operation. */

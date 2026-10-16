@@ -37,3 +37,5 @@ export function useChatNavigation(refreshKey: unknown) {
  }, [refresh]);
  return { items: index.items, ready, error, busyId, refresh, change };
 }
+
+export type ChatNavigationState = ReturnType<typeof useChatNavigation>;

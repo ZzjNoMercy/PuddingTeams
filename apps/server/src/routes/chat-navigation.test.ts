@@ -34,9 +34,11 @@ test("index includes parked projects and real owners; flags never change executi
   const project=await teams.workspaces.createFromPath({path:projectPath});
   await teams.replaceWindowWorkspace("solo",project.id,"manager-new");
   const worker=await teams.createWindow({type:"direct",members:["alpha"],sessionId:"worker"});
+  await teams.addWindowSession(worker.id,"worker",{ownerAgentId:"alpha",sourceSnapshotId:"snapshot-fixture"});
   const before=await readFile(path.join(dir,"state","windows.json"),"utf8");
   registerChatNavigationRoutes(app,{teams,statePath:path.join(dir,"nav.json"),sessions:{list:async()=>["manager-old","manager-new","worker","unowned"].map(id=>({id,sessionFile:"fixture",firstMessage:"hello",modifiedAt:"2026-10-15T01:00:00Z",active:false}))}});
   const index=(await app.inject({url:"/api/chat-navigation"})).json();
+  assert.equal(index.items.find((i:{sessionId:string})=>i.sessionId==="worker").sourceSnapshotId,"snapshot-fixture");
   assert.equal(index.items.length,3); assert.equal(index.items.find((i:{sessionId:string})=>i.sessionId==="manager-old").contextActive,false);
   assert.equal(index.items.find((i:{sessionId:string})=>i.sessionId==="worker").ownerAgentId,"alpha");
   assert.equal(index.items.find((i:{sessionId:string})=>i.sessionId==="manager-new").workspaceId,project.id);

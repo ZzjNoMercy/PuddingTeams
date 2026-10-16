@@ -131,9 +131,11 @@ export function CreateWindowDialog({
 					// A first visit already creates the target context's first Session.
 					needsSession = switched.restored;
 				}
-				if (needsSession) await createRoomSession(room.id);
+				if (needsSession) {
+					const created = await createRoomSession(room.id, undefined, { workspaceId: room.workspace?.id ?? null, cwdSnapshot: room.cwdSnapshot });
+					toast.success(created.reused ? "已打开现有空白会话" : "聊天已创建");
+				}
 				onCreated?.(await getRoom(room.id), true);
-				toast.success("聊天已创建");
 				closeDialog();
 				return;
 			}
@@ -144,12 +146,14 @@ export function CreateWindowDialog({
 			}, operationId);
 			let room = created.room;
 			const existed = created.existed;
+			let reusedEmpty = false;
 			if (newSessionOnExisting && existed && !group) {
-				await createRoomSession(room.id);
+				const session = await createRoomSession(room.id, undefined, { workspaceId: room.workspace?.id ?? null, cwdSnapshot: room.cwdSnapshot });
+				reusedEmpty = session.reused === true;
 				room = await getRoom(room.id);
 			}
 			if (operationId) clearGroupCreationOperation(fingerprint, operationId, storage);
-			toast.success(newSessionOnExisting && !group ? "聊天已创建" : existed ? group ? "已创建的群聊，已打开" : "已有与该 Worker 的单聊，已打开" : group ? "群聊已创建" : "单聊已打开");
+			toast.success(newSessionOnExisting && !group ? reusedEmpty ? "已打开现有空白会话" : "聊天已创建" : existed ? group ? "已创建的群聊，已打开" : "已有与该 Worker 的单聊，已打开" : group ? "群聊已创建" : "单聊已打开");
 			onCreated?.(room, existed);
 			closeDialog();
 		} catch (error) {

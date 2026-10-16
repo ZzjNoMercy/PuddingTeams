@@ -507,6 +507,7 @@ function SessionChat({
 					onRuntimeViewChange={onRuntimeViewChange}
 				/>
 				) : null}
+				{inputCapability?.sourceSnapshotId ? <SnapshotOrigin key={sessionId} sessionId={sessionId} snapshotId={inputCapability.sourceSnapshotId} /> : null}
 				<MessageQuickActionProvider onDraft={draftFromMessage} canDelegate={inputCapability?.ownerAgentId === "manager"}>
 					<Conversation initial="instant" resize={layoutReady ? "smooth" : "instant"}>
 						<AtBottomReporter onChange={setAtBottom} />
@@ -514,7 +515,6 @@ function SessionChat({
 						<TranscriptGate loading={historyLoading} onReady={handleTranscriptReady} onReadinessChange={handleTranscriptReadinessChange}>
 						<QueryInputAxis items={queryAxisItems} />
 						<ConversationContent className="home-message-column">
-       {inputCapability?.sourceSnapshotId ? <SnapshotOrigin sessionId={sessionId} snapshotId={inputCapability.sourceSnapshotId} /> : null}
 							{sessionModifiedAt ? <div className="home-session-marker"><span />{compactDay(sessionModifiedAt)}<span /></div> : null}
 							{messages.length === 0 ? (
 								<div className="flex flex-1 items-center justify-center pt-20 text-sm text-muted-foreground">
@@ -853,24 +853,28 @@ export function ChatPane({
 		return next;
 	}, [roomId, activeId, onSessionActivated]);
 
+	const newSessionPending = useRef(false);
 	const newSession = useCallback(async () => {
+		if (newSessionPending.current || !room) return;
+		newSessionPending.current = true;
 		setWorkerProcessOpen(false);
 		setGoalRuntimeOpen(false);
 		setRuntimeSummary(null);
 		setRuntimeView("activity");
 		setRequestedDelegationId(null);
 		try {
-			const created = await createRoomSession(roomId);
+			const created = await createRoomSession(roomId, undefined, { workspaceId: room.workspace?.id ?? null, cwdSnapshot: room.cwdSnapshot });
 			const updated = await getRoom(roomId);
 			if (updated.activeSession !== created.id) throw new Error("新会话已创建，但当前会话已在其他窗口改变，请从会话列表打开");
 			setRoom(updated);
 			setActiveId(created.id);
 			onSessionActivated?.(updated);
 			onRoomsMayHaveChanged?.();
+			if (created.reused) toast(created.id === activeId ? "已在新会话中" : "已打开现有空白会话");
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
-		}
-	}, [roomId, onSessionActivated, onRoomsMayHaveChanged]);
+		} finally { newSessionPending.current = false; }
+	}, [roomId, room, activeId, onSessionActivated, onRoomsMayHaveChanged]);
 
 	const removeSession = useCallback(
 		async (sessionId: string) => {
@@ -1123,7 +1127,7 @@ export function ChatPane({
 					</div>
 				</div>
 				<div className="home-chat-actions">
-					<ForkSessionDialog sourceId={activeId} open={forkOpen} onOpenChange={setForkOpen} />
+					<ForkSessionDialog sourceId={activeId} roomId={roomId} open={forkOpen} onOpenChange={setForkOpen} />
 					<SessionMenu
  onFork={!isSingle || currentPiWorker ? ()=>setForkOpen(true) : undefined}
 						sessions={room?.sessions ?? []}

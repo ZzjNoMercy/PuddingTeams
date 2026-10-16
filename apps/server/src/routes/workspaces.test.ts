@@ -17,6 +17,7 @@ import { registerRoomsRoutes, type RoomSummary } from "./rooms.js";
 import { registerChatRoutes } from "./chat.js";
 import { registerWorkspacesRoutes } from "./workspaces.js";
 import { UploadStore } from "../store/uploads.js";
+import { ChatNavigationStore } from "../store/chat-navigation.js";
 
 function roomSource(room: RoomSummary) {
 	return { type: room.type, name: room.name, members: room.members.map((member) => member.name), prompt: room.prompt, workspaceId: room.workspace?.id ?? null, cwdSnapshot: room.cwdSnapshot };
@@ -58,9 +59,96 @@ async function makeStack(
 		uploads,
 		activityStatePath: path.join(dir, "state", "room-activity.json"),
 		sessionCreationStatePath: path.join(dir, "state", "session-creation-operations.json"),
+		chatNavigationStatePath: path.join(dir, "state", "chat-navigation.json"),
 	});
 	return { app, teams, sessions, delegations, invoker, dir };
 }
+
+test("新聊天根据真实消息复用空会话，并发请求至多新建一个", async () => {
+	const { app, teams, sessions } = await makeStack();
+	try {
+		const room = (await app.inject({ method: "GET", url: "/api/rooms" })).json().rooms.find((item: RoomSummary) => item.type === "solo") as RoomSummary;
+		const open = () => app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions`, payload: { reuseEmpty: true } });
+		const initial = await open();
+		assert.equal(initial.statusCode, 200, initial.body);
+		assert.equal(initial.json().session.id, room.activeSession);
+		assert.equal(initial.json().reused, true);
+		// This is real user content, even though it matches the SDK's empty label.
+		(await sessions.open(room.activeSession)).sessionManager.appendMessage({ role: "user", content: [{ type: "text", text: "(no messages)" }], timestamp: Date.now() } as never);
+		const parallel = await Promise.all(Array.from({ length: 10 }, open));
+		for (const response of parallel) assert.equal(response.statusCode, 200, response.body);
+		const ids = new Set(parallel.map(response => response.json().session.id));
+		assert.equal(ids.size, 1);
+		assert(!ids.has(room.activeSession));
+		assert.equal(parallel.filter(response => !response.json().reused).length, 1);
+		assert.equal((await teams.getWindow(room.id))!.sessions.length, 2);
+		const emptyId = parallel[0]!.json().session.id as string;
+		// A used active Session should reopen another blank Session in this room.
+		await teams.setActiveWindowSession(room.id, room.activeSession);
+		const reopened = await open();
+		assert.equal(reopened.json().session.id, emptyId);
+		assert.equal(reopened.json().reused, true);
+		assert.equal((await teams.getWindow(room.id))!.activeSession, emptyId);
+	} finally { await sessions.disposeAll(); await app.close(); }
+});
+
+test("新聊天严格按 Agent 和项目复用，Manager 不复用停放项目的空会话", async () => {
+	const { app, teams, sessions } = await makeStack();
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const a = await teams.workspaces.createManaged("新聊天 A"), b = await teams.workspaces.createManaged("新聊天 B");
+		const roomIds = new Set<string>();
+		for (const [member, workspaceId] of [["alpha", a.id], ["alpha", b.id], ["beta", a.id]]) {
+			const result = await app.inject({ method: "POST", url: "/api/rooms", payload: { type: "direct", members: [member], workspaceId } });
+			assert.equal(result.statusCode, 200, result.body);
+			const room = result.json().room as RoomSummary;
+			roomIds.add(room.id);
+			const opened = await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions`, payload: { reuseEmpty: true } });
+			assert.equal(opened.statusCode, 200, opened.body);
+			assert.equal(opened.json().session.id, room.activeSession);
+			assert.equal((await teams.getWindow(room.id))!.sessions.length, 1);
+		}
+		assert.equal(roomIds.size, 3);
+		await app.inject({ method: "GET", url: "/api/rooms" });
+		const switchTo = (workspaceId: string) => app.inject({ method: "POST", url: "/api/rooms/solo/switch-workspace", payload: { workspaceId, mode: "in_place" } });
+		const firstA = (await switchTo(a.id)).json().room as RoomSummary;
+		(await sessions.open(firstA.activeSession)).sessionManager.appendMessage({ role: "user", content: [{ type: "text", text: "已有工作" }], timestamp: Date.now() } as never);
+		const firstB = (await switchTo(b.id)).json().room as RoomSummary;
+		const stale = await app.inject({ method: "POST", url: "/api/rooms/solo/sessions", payload: { reuseEmpty: true, expectedWorkspaceId: a.id, expectedCwdSnapshot: firstA.cwdSnapshot } });
+		assert.equal(stale.statusCode, 409, stale.body);
+		assert.equal(stale.json().code, "workspace_context_changed");
+		await switchTo(a.id);
+		const created = await app.inject({ method: "POST", url: "/api/rooms/solo/sessions", payload: { reuseEmpty: true } });
+		assert.equal(created.statusCode, 200, created.body);
+		assert.equal(created.json().reused, false);
+		assert.notEqual(created.json().session.id, firstB.activeSession);
+		assert.equal((await teams.getWindow("solo"))!.workspaceId, a.id);
+	} finally { await sessions.disposeAll(); await app.close(); }
+});
+
+test("新聊天不复用已归档空会话，也不会因创建失败永久阻塞重试", async () => {
+	const { app, teams, sessions, dir } = await makeStack();
+	try {
+		const room = (await app.inject({ method: "GET", url: "/api/rooms" })).json().rooms.find((item: RoomSummary) => item.type === "solo") as RoomSummary;
+		await new ChatNavigationStore(path.join(dir, "state", "chat-navigation.json")).update(room.activeSession, { archived: true });
+		const create = sessions.create.bind(sessions);
+		let fail = true;
+		sessions.create = async (...args) => { if (fail) { fail = false; throw new Error("fixture create failure"); } return create(...args); };
+		const open = () => app.inject({ method: "POST", url: "/api/rooms/solo/sessions", payload: { reuseEmpty: true } });
+		const failed = await open();
+		assert.equal(failed.statusCode, 409, failed.body);
+		assert.match(failed.body, /fixture create failure/);
+		const created = await open();
+		assert.equal(created.statusCode, 200, created.body);
+		assert.equal(created.json().reused, false);
+		assert.notEqual(created.json().session.id, room.activeSession);
+		const again = await open();
+		assert.equal(again.statusCode, 200, again.body);
+		assert.equal(again.json().reused, true);
+		assert.equal(again.json().session.id, created.json().session.id);
+		assert.equal((await teams.getWindow("solo"))!.sessions.length, 2);
+	} finally { await sessions.disposeAll(); await app.close(); }
+});
 
 test("停用 Worker 不能经旧 direct 复用路径或新群聊绕过发起门禁", async () => {
 	const { app, teams, sessions } = await makeStack();
@@ -2304,4 +2392,20 @@ test("P3 open-file only opens the active session's snapshot assets, not another 
   const next=await sessions.create(undefined,{type:"direct",members:["alpha"]});await teams.addWindowSession(room.id,next.id);
   assert.equal((await open(own)).statusCode,400);assert.deepEqual(opened,[realpathSync(own)]);
  }finally{await sessions.disposeAll();await app.close();}
+});
+
+test("archive last-chat cleanup rejects a changed room and preserves every sibling", async () => {
+ const { app, sessions } = await makeStack();
+ try {
+  const first = await app.inject({method:"POST",url:"/api/rooms",payload:{type:"direct",members:["alpha"]}});
+  assert.equal(first.statusCode,200,first.body);const room=first.json().room as RoomSummary;
+  const second=await app.inject({method:"POST",url:`/api/rooms/${room.id}/sessions`,payload:{}});assert.equal(second.statusCode,200,second.body);
+  const added=second.json().session.id as string;
+  const guarded=await app.inject({method:"DELETE",url:`/api/rooms/${room.id}?onlySession=${room.activeSession}`});assert.equal(guarded.statusCode,409,guarded.body);
+  const retained=await app.inject({url:`/api/rooms/${room.id}`});assert.equal(retained.json().room.sessions.length,2);
+  assert.equal((await app.inject({method:"DELETE",url:`/api/rooms/${room.id}/sessions/${added}`})).statusCode,204);
+  assert.equal((await app.inject({method:"DELETE",url:`/api/rooms/${room.id}?onlySession=wrong`})).statusCode,409);
+  assert.equal((await app.inject({method:"DELETE",url:`/api/rooms/${room.id}?onlySession=${room.activeSession}`})).statusCode,204);
+  assert.equal((await app.inject({url:`/api/rooms/${room.id}`})).statusCode,404);
+ } finally { await sessions.disposeAll(); await app.close(); }
 });

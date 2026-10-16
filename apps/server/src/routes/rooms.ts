@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { openNativeFile } from "../platform/native-file-opener.js";
 import { compareRoomActivity, RoomActivityProjector } from "./room-activity.js";
 import { SessionCreationOperations } from "../store/session-creation-operations.js";
+import { ChatNavigationStore } from "../store/chat-navigation.js";
 import { createHash } from "node:crypto";
 import { localViewerIdentity } from "./identity.js";
 import { identifyUploads, type FirstMessagePathReference, type UploadInput, type UploadStore } from "../store/uploads.js";
@@ -192,6 +193,7 @@ export function registerRoomsRoutes(
 		productSettings?: ProductSettingsStore;
 		activityStatePath?: string;
 		sessionCreationStatePath?: string;
+		chatNavigationStatePath?: string;
 	},
 ): void {
 	const activityProjector = new RoomActivityProjector(localFiles?.activityStatePath);
@@ -200,6 +202,8 @@ export function registerRoomsRoutes(
 	const summarize = (w: WindowConfig) => buildWindowSummary(sessions, teams, w, activityProjector);
 	const pendingSessionCreations = new Map<string, Promise<Awaited<ReturnType<PiSessionStore["create"]>>>>();
 	const pendingNewWork = new Map<string, Promise<{ sessionId: string; accepted: boolean }>>();
+	const newChatQueues = new Map<string, Promise<unknown>>();
+	const chatNavigation = localFiles?.chatNavigationStatePath ? new ChatNavigationStore(localFiles.chatNavigationStatePath) : null;
 	const openLocalFile = localFiles?.open ?? openNativeFile;
 	const additionalFileRoots = localFiles?.additionalRoots ?? [];
 	const attachmentRoot = localFiles?.attachmentRoot;
@@ -693,13 +697,14 @@ export function registerRoomsRoutes(
 	);
 
 	/** 删除窗口（级联删除其全部 pi session）。solo 拒绝（405）。 */
-	app.delete<{ Params: { id: string } }>("/api/rooms/:id", async (req, reply) => {
+	app.delete<{ Params: { id: string }; Querystring: { onlySession?: string } }>("/api/rooms/:id", async (req, reply) => {
+		if (req.query.onlySession !== undefined && (typeof req.query.onlySession !== "string" || !req.query.onlySession)) return reply.code(400).send({ error: "onlySession must be a non-empty session ID" });
 		const w = await teams.getWindow(req.params.id);
 		if (!w) return reply.code(404).send({ error: "window not found" });
 		if (w.pinned) return reply.code(405).send({ error: "solo 窗口不可删除" });
 		try {
 			const remove = async () => {
-				const sessionIds = await teams.removeWindow(req.params.id);
+				const sessionIds = await teams.removeWindow(req.params.id, req.query.onlySession);
 				for (const sid of sessionIds) {
 					await sessions.remove(sid);
 					await workStates?.removeSession(sid);
@@ -712,6 +717,7 @@ export function registerRoomsRoutes(
 						const current = await teams.getWindow(req.params.id);
 						if (!current) throw new Error("window not found");
 						if (current.pinned) throw new Error("solo 窗口不可删除");
+						if (req.query.onlySession !== undefined && (current.sessions.length !== 1 || current.sessions[0] !== req.query.onlySession)) throw new Error("single_session_window_changed");
 					},
 					remove,
 				);
@@ -720,6 +726,7 @@ export function registerRoomsRoutes(
 			}
 			return reply.code(204).send();
 		} catch (err) {
+			if (err instanceof Error && err.message === "single_session_window_changed") return reply.code(409).send({ error: "窗口内聊天已变化，请刷新后重试；其他聊天未删除", code: err.message });
 			return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
 		}
 	});
@@ -741,7 +748,7 @@ export function registerRoomsRoutes(
 	});
 
 	/** 窗口内新建一个 pi session 并激活。 */
-	app.post<{ Params: { id: string }; Body: { goal?: string; completionBoundary?: string; reviewMode?: "manager" | "independent"; reviewerModel?: string; initialContentHash?: string; expectedWorkspaceId?: string | null; expectedCwdSnapshot?: string } }>("/api/rooms/:id/sessions", async (req, reply) => {
+	app.post<{ Params: { id: string }; Body: { reuseEmpty?: boolean; goal?: string; completionBoundary?: string; reviewMode?: "manager" | "independent"; reviewerModel?: string; initialContentHash?: string; expectedWorkspaceId?: string | null; expectedCwdSnapshot?: string } }>("/api/rooms/:id/sessions", async (req, reply) => {
 		const w = await teams.getWindow(req.params.id);
 		if (!w) return reply.code(404).send({ error: "window not found" });
 		const requestedGoal = req.body?.goal?.trim();
@@ -764,6 +771,40 @@ export function registerRoomsRoutes(
 		}
 		if (requestedGoal && localFiles?.productSettings && (await localFiles.productSettings.get()).harness.goalActivation[w.type] === "disabled") {
 			return reply.code(403).send({ error: `Harness 已禁用 ${w.type} Goal` });
+		}
+		// A new-chat action opens an unused Session in this exact context. Read
+		// actual messages, never SDK display strings such as "(no messages)".
+		// Serialize the check and creation across tabs, and share the lifecycle
+		// gate with sends and workspace switches when a runtime is installed.
+		if (req.body?.reuseEmpty === true && !requestedGoal && !goalOperationId) {
+			if ("expectedWorkspaceId" in req.body && (req.body.expectedWorkspaceId !== (w.workspaceId ?? null) || req.body.expectedCwdSnapshot !== w.cwdSnapshot)) {
+				return reply.code(409).send({ error: "项目已变化，请重新打开目标项目后创建聊天", code: "workspace_context_changed" });
+			}
+			const openNewChat = async () => {
+				const current = await teams.getWindow(w.id);
+				if (!current || current.workspaceId !== w.workspaceId || current.cwdSnapshot !== w.cwdSnapshot) throw new Error("项目已变化，请重新打开目标项目后创建聊天");
+				const listed = new Map((await sessions.list()).map(session => [session.id, session]));
+				const flags = await chatNavigation?.read();
+				const candidates = [current.activeSession, ...current.sessions.filter(id => id !== current.activeSession)];
+				for (const id of candidates) {
+					const info = listed.get(id);
+					if (!info || info.sourceSnapshotId || flags?.sessions[id]?.archived || sessions.isRunning(id) || await sessions.hasPendingInputs(id) || (await workStates?.listSessionGoals(id))?.length) continue;
+					const session = await sessions.open(id);
+					if (session.sessionManager.getEntries().some(entry => entry.type === "message" || entry.type === "custom_message" || entry.type === "compaction" || entry.type === "branch_summary")) continue;
+					await teams.setActiveWindowSession(current.id, id);
+					return { session: info, workState: null, reused: true };
+				}
+				const created = await sessions.create(undefined, await contextFor(current));
+				try { await teams.addWindowSession(current.id, created.id); }
+				catch (error) { await sessions.remove(created.id).catch(() => undefined); throw error; }
+				return { session: created, workState: null, reused: false };
+			};
+			const previous = newChatQueues.get(w.id) ?? Promise.resolve();
+			const pending = previous.catch(() => undefined).then(() => invoker ? invoker.withActiveSessionLifecycle(w.activeSession, openNewChat) : openNewChat());
+			newChatQueues.set(w.id, pending);
+			try { return await pending; }
+			catch (error) { return reply.code(409).send({ error: error instanceof Error ? error.message : String(error) }); }
+			finally { if (newChatQueues.get(w.id) === pending) newChatQueues.delete(w.id); }
 		}
 		if (!requestedGoal && goalOperationId) {
 			if (!sessionCreationOperations) return reply.code(503).send({ error: "Session 幂等存储未配置" });

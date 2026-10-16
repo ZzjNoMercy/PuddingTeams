@@ -3,8 +3,10 @@
 import Link from "next/link";
 import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeftIcon } from "lucide-react";
+import { ArchiveIcon, ArrowLeftIcon } from "lucide-react";
 import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import { useChatNavigation } from "@/hooks/useChatNavigation";
 import { ChatPane } from "@/components/chat/chat-pane";
 import { CreateWindowDialog } from "@/components/chat/create-window-dialog";
 import { SessionList } from "@/components/chat/session-list";
@@ -12,7 +14,7 @@ import { NavRail } from "@/components/chat/nav-rail";
 import { QueryRouteObserver } from "@/components/chat/query-route-observer";
 import { DesktopTitlebar, toggleAppSidebar, useAppSidebarHidden } from "@/components/desktop-titlebar";
 import { SectionTopbar } from "@/components/section-topbar";
-import { deleteRoom, getManagerSessionLocation, getRoom, listRooms, setActiveRoomSession, switchRoomWorkspace } from "@/lib/api";
+import { createRoom, createRoomSession, deleteRoom, getManagerSessionLocation, getRoom, listRooms, setActiveRoomSession, switchRoomWorkspace } from "@/lib/api";
 import { invalidChatSessionReplacement, selectChatRoomFromRoute } from "@/lib/chat-route-selection";
 import { preferCurrentRoomSummary, reconcileRoomList, sortRoomsByActivity } from "@/lib/room-order";
 import { LatestSerialQueue } from "@/lib/latest-serial-queue";
@@ -72,16 +74,21 @@ export default function Home() {
 	const router = useRouter();
 	const [rooms, setRooms] = useState<RoomSummary[]>([]);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
+	const navigation = useChatNavigation(rooms);
 	const roomsRef = useRef(rooms);
 	const selectedIdRef = useRef(selectedId);
-	const [requestedSessionId, setRequestedSessionId] = useState<string | null>(() => linkedSessionId());
-	const [returnSessionId, setReturnSessionId] = useState<string | null>(() => linkedReturnSessionId());
-	const routeQuery = useRef(currentQuery());
+	// Static HTML and the first client render must use the same route state.
+	// QueryRouteObserver restores deep links after hydration; null ensures its
+	// first notification is processed, including an empty query string.
+	const [requestedSessionId, setRequestedSessionId] = useState<string | null>(null);
+	const [returnSessionId, setReturnSessionId] = useState<string | null>(null);
+	const routeQuery = useRef<string | null>(null);
 	const [selectionNonce, setSelectionNonce] = useState(0);
 	const [createOpen, setCreateOpen] = useState(false);
 	const [createTarget, setCreateTarget] = useState<NewChatTarget>({});
 	const selectionQueue = useRef(new LatestSerialQueue());
 	const pendingNavigation = useRef<string | null>(null);
+	const chatCreationPending = useRef(false);
 	const [loadError, setLoadError] = useState<string | null>(null);
 	const [hasLoadedRooms, setHasLoadedRooms] = useState(false);
 	const [roomListRetry, setRoomListRetry] = useState(0);
@@ -261,11 +268,49 @@ export default function Home() {
 		selectRoom(room.id);
 	}, [selectRoom]);
 
+	// 侧栏 Agent 组的「新建聊天」：Agent 已确定，与聊天区右上角新会话同逻辑——
+	// 直接创建/复用并打开，不再弹选择对话框。工作空间沿用当前选中房间的项目。
+	const createChatForAgent = useCallback(async (agentId: string) => {
+		if (chatCreationPending.current) return;
+		chatCreationPending.current = true;
+		const workspaceId = roomsRef.current.find(room => room.id === selectedIdRef.current)?.workspace?.id ?? null;
+		try {
+			let room: RoomSummary;
+			if (agentId === "manager") {
+				room = await getRoom("solo");
+				if ((room.workspace?.id ?? null) !== workspaceId) {
+					const switched = await switchRoomWorkspace(room.id, workspaceId, "in_place");
+					room = switched.room;
+					// 首次进入目标上下文时已自动建好第一个空会话，直接打开。
+					if (!switched.restored) {
+						upsertRoom(await getRoom(room.id));
+						toast.success("已打开未开始的聊天");
+						return;
+					}
+				}
+			} else {
+				const created = await createRoom({ type: "direct", members: [agentId], ...(workspaceId ? { workspaceId } : {}) });
+				room = created.room;
+			}
+			const created = await createRoomSession(room.id, undefined, { workspaceId: room.workspace?.id ?? null, cwdSnapshot: room.cwdSnapshot });
+			toast.success(created.reused
+				? room.id === selectedIdRef.current && room.activeSession === created.id ? "已在新会话中" : "已打开现有空白会话"
+				: "聊天已创建");
+			upsertRoom(await getRoom(room.id));
+		} catch (error) {
+			toast.error(error instanceof Error ? error.message : String(error));
+		} finally { chatCreationPending.current = false; }
+	}, [upsertRoom]);
+
 	const handleNew = useCallback((target?: NewChatTarget) => {
+		if (target?.agentId) {
+			void createChatForAgent(target.agentId);
+			return;
+		}
 		const selected = roomsRef.current.find(room => room.id === selectedIdRef.current);
 		setCreateTarget({ agentId: selected?.type === "solo" ? "manager" : selected?.type === "direct" ? selected.members[0]?.name : undefined, workspaceId: selected?.workspace?.id ?? null, ...target });
 		setCreateOpen(true);
-	}, []);
+	}, [createChatForAgent]);
 
 	// Open a window from inside the chat (e.g. solo DelegateCard "已同步到单聊"
 	// link). The window may be brand-new (auto-created by solo routing), so the
@@ -331,6 +376,10 @@ export default function Home() {
 		[selectRoom],
 	);
 
+	const selectedSession = requestedSessionId ?? rooms.find(room => room.id === selectedId)?.activeSession ?? null;
+	const archivedSelection = navigation.items.find(item => item.roomId === selectedId && item.sessionId === selectedSession && item.archived);
+	const archiveHref = `/chats/archived?returnTo=${encodeURIComponent(chatHref(selectedId, selectedSession, returnSessionId))}`;
+
 	return (
 		<div className="home-shell desktop-app-frame m1-app-shell h-dvh">
 			<Suspense fallback={null}><QueryRouteObserver onChange={onRouteChange} /></Suspense>
@@ -345,6 +394,8 @@ export default function Home() {
 					<div className="m1-chat-columns flex min-h-0 min-w-0 flex-1">
 						<SessionList
 							rooms={rooms}
+							navigation={navigation}
+							archiveHref={archiveHref}
 							selectedId={selectedId}
 							selectedSessionId={requestedSessionId ?? rooms.find(room => room.id === selectedId)?.activeSession ?? null}
 							onSelectSession={selectSession}
@@ -359,7 +410,16 @@ export default function Home() {
 						/>
 						<main className="home-main-stage flex min-w-0 flex-1 flex-col">
 							{returnSessionId ? <Link href={`/?session=${encodeURIComponent(returnSessionId)}`} className="flex min-h-10 items-center gap-2 border-b border-border/70 bg-background px-5 text-xs font-medium text-primary hover:bg-muted/50"><ArrowLeftIcon className="size-3.5" />返回 Manager 原工作</Link> : null}
-							{selectedId ? (
+							{archivedSelection ? (
+								<div className="flex flex-1 flex-col items-center justify-center gap-4 px-6 text-center" aria-label="已归档聊天">
+									<ArchiveIcon className="size-8 text-muted-foreground" />
+									<h2 className="text-base font-medium">此聊天已归档</h2>
+									<p className="text-sm text-muted-foreground">恢复后可继续对话。</p>
+									<div className="flex gap-2"><Button disabled={navigation.busyId !== null} onClick={() => void navigation.change(archivedSelection, { archived: false })}>恢复聊天</Button><Button variant="outline" asChild><Link href={archiveHref}>管理已归档聊天</Link></Button></div>
+								</div>
+							) : !navigation.ready || (navigation.error && !navigation.items.length) ? (
+								<div className="flex flex-1 flex-col items-center justify-center gap-3" role="status"><p className="text-sm text-muted-foreground">{navigation.error ?? "正在加载对话…"}</p>{navigation.error ? <Button variant="outline" onClick={() => void navigation.refresh()}>重试</Button> : null}</div>
+							) : selectedId ? (
 								<ChatPane
 									key={`${selectedId}:${requestedSessionId ?? ""}:${selectionNonce}`}
 									roomId={selectedId}

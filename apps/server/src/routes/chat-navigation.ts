@@ -30,7 +30,7 @@ export function registerChatNavigationRoutes(app: FastifyInstance, deps: { teams
      title: session.name ?? "", firstMessage: session.firstMessage, modifiedAt: session.modifiedAt,
      workspaceId: context.workspaceId ?? null, workspaceName: workspace?.name ?? (context.workspaceId ? "已移除项目" : "默认工作目录"),
      cwdSnapshot: context.cwdSnapshot, contextActive: context.contextActive,
-     pinned: flags?.pinned ?? false, archived: flags?.archived ?? false });
+     sourceSnapshotId: ref.sourceSnapshotId, pinned: flags?.pinned ?? false, archived: flags?.archived ?? false });
    }
   }
   return { items, revision: state.revision };
