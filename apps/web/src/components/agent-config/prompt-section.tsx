@@ -34,6 +34,7 @@ const SEGMENT_SOURCE_LABELS: Record<string, string> = {
 	"pi-native-append": "pi 原生追加（APPEND_SYSTEM.md） · 用户文件",
 	"agent-instructions": "Agent 运行指令 · 仅当前 Agent",
 	"window-collaboration": "群聊协作提示词 · 仅 Manager",
+	"current-date": "当前日期 · 平台注入",
 	"global-context": "pi global 上下文（~/.pi/agent）",
 	"workspace-context": "项目上下文（Workspace）",
 };

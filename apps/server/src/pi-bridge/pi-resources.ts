@@ -122,7 +122,18 @@ export function appendPiPrompts(
 	const extra = [resources?.systemPrompt?.trim(), collaboration?.trim()].filter(
 		(part): part is string => Boolean(part),
 	);
-	return [...base, ...extra];
+	return [...base, ...extra, currentDatePromptLine()];
+}
+
+/**
+ * 当前日期注入在系统提示最末尾（业内通行做法：Claude Code 的 "Today's date"、
+ * OpenAI 的 "current date" 均为日期级）：一天才变一次，当天内前缀缓存完全
+ * 稳定。时刻不注入——精确时间由消息时间戳与工具（date）兜底。
+ */
+export function currentDatePromptLine(now: Date = new Date()): string {
+	const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+	const text = new Intl.DateTimeFormat("zh-CN", { dateStyle: "full", timeZone }).format(now);
+	return `当前日期：${text}（${timeZone}）。「今天」「这周」等相对时间以此为基准；需要精确时刻时用工具确认。`;
 }
 
 export async function loadPiResources(input: {
@@ -189,16 +200,17 @@ export async function previewPiResources(input: {
 	// pi global context、Workspace context。占位文案只标注来源，不冒充装配结果。
 	const piBase = loader.getSystemPrompt();
 	// getAppendSystemPrompt() 返回 override 之后的最终列表（含我们追加的运行
-	// 指令/collaboration），切掉尾部自家追加段才是 pi 原生 append。
+	// 指令/collaboration 与最末尾的当前日期行），切掉尾部自家追加段才是 pi 原生 append。
 	const agentInstructions = input.resources?.systemPrompt?.trim();
 	const collaboration = input.collaboration?.trim();
 	const appends = loader.getAppendSystemPrompt();
-	const extraCount = (agentInstructions ? 1 : 0) + (collaboration ? 1 : 0);
+	const extraCount = (agentInstructions ? 1 : 0) + (collaboration ? 1 : 0) + 1;
 	const nativeAppends = appends.slice(0, Math.max(0, appends.length - extraCount));
+	const currentDate = appends[appends.length - 1];
 	const nativeAppendSources = loader.getAppendSystemPromptSources();
 	const globalContext = context.filter((item) => isUnderDir(item.path, input.agentDir));
 	const workspaceContext = context.filter((item) => !isUnderDir(item.path, input.agentDir));
-	const effectivePrompt = [piBase, ...nativeAppends, agentInstructions, collaboration]
+	const effectivePrompt = [piBase, ...nativeAppends, agentInstructions, collaboration, currentDate]
 		.filter((part): part is string => Boolean(part))
 		.join("\n\n");
 	return {
@@ -220,6 +232,7 @@ export async function previewPiResources(input: {
 			})),
 			...(agentInstructions ? [{ source: "agent-instructions", content: agentInstructions, collapsed: false }] : []),
 			...(collaboration ? [{ source: "window-collaboration", content: collaboration, collapsed: false }] : []),
+			...(currentDate ? [{ source: "current-date", content: currentDate, collapsed: false }] : []),
 			...globalContext.map((item) => ({ source: "global-context", path: item.path, content: item.content, collapsed: true })),
 			...workspaceContext.map((item) => ({
 				source: "workspace-context",

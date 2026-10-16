@@ -230,12 +230,16 @@ test("pi-resources: 运行指令/collaboration append-only，不覆盖 pi base �
 	});
 	// 无 SYSTEM.md：base 保持 undefined，由 pi 在请求装配时生成内嵌默认文本（验收 1）。
 	assert.equal(loader.getSystemPrompt(), undefined);
-	// append 顺序（验收 2）：pi 原生 APPEND_SYSTEM.md 在前，运行指令与 collaboration 只追加。
-	assert.deepEqual(loader.getAppendSystemPrompt(), ["用户原生追加", "Agent 运行指令", "群聊协作提示词"]);
+	// append 顺序（验收 2）：pi 原生 APPEND_SYSTEM.md 在前，运行指令与 collaboration 只追加，最末尾是当前日期行。
+	const appends = loader.getAppendSystemPrompt();
+	assert.deepEqual(appends.slice(0, 3), ["用户原生追加", "Agent 运行指令", "群聊协作提示词"]);
+	assert.match(appends[3]!, /^当前日期：.+（.+）。/);
 
-	// 空配置时不产生任何追加段。
+	// 空配置时只有当前日期行，不产生其他追加段。
 	const empty = await loadPiResources({ cwd: fixture.cwd, agentDir: freshDir("pt-wl-empty-") });
-	assert.deepEqual(empty.getAppendSystemPrompt(), []);
+	const emptyAppends = empty.getAppendSystemPrompt();
+	assert.equal(emptyAppends.length, 1);
+	assert.match(emptyAppends[0]!, /^当前日期：/);
 });
 
 /**
@@ -283,17 +287,18 @@ test("pi-resources: preview 按真实装配顺序分段（pi base → 原生 app
 		"pi-native-append",
 		"agent-instructions",
 		"window-collaboration",
+		"current-date",
 		"global-context",
 		"workspace-context",
 	]);
 	const append = preview.segments.find((s) => s.source === "pi-native-append")!;
 	assert.equal(append.content, "用户原生追加");
 	assert.ok(append.path?.endsWith(path.join("APPEND_SYSTEM.md")));
-	// effectivePrompt 按真实顺序拼接，不含占位文案。
-	assert.equal(
-		preview.effectivePrompt,
-		["用户原生追加", "Agent 运行指令", "群聊协作提示词"].join("\n\n"),
+	// effectivePrompt 按真实顺序拼接，不含占位文案；最末尾是当前日期行。
+	assert.ok(
+		preview.effectivePrompt.startsWith(["用户原生追加", "Agent 运行指令", "群聊协作提示词"].join("\n\n")),
 	);
+	assert.match(preview.effectivePrompt, /当前日期：.+（.+）。「今天」「这周」等相对时间以此为基准/);
 
 	// 无 SYSTEM.md 时 pi-base 为占位说明（collapsed），不构成 customPrompt。
 	const bare = await previewPiResources({ cwd: fixture.cwd, agentDir: fixture.agentDir, workspaceAccess: ALL_ALLOWED });

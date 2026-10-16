@@ -89,6 +89,23 @@ test("calendar -> reviewed Wiki -> contacts graph: replay, cold reopen, reschedu
  } finally {await rm(f.base,{recursive:true,force:true});}
 });
 
+test("listWindow 按时间窗过滤、内联参与人姓名并回报窗外数量",async()=>{
+ const f=await fixture(); try {
+  await f.service.mutate(owner,"create",undefined,"create",0,f.input,[f.binding.id]);
+  // 事件 2026-10-05 20:00(+08:00)：覆盖 10/5 的窗口命中，参与人直接带姓名。
+  const week=await f.service.listWindow(owner,[f.binding.id],{start:"2026-10-05",end:"2026-10-12"});
+  assert.equal(week.events.length,1);
+  assert.deepEqual(week.events[0]!.participantNames,["日历人物甲","日历人物乙"]);
+  assert.equal(week.window.start,new Date("2026-10-05T00:00:00").toISOString());
+  assert.equal(week.outsideCount,0);
+  // 窗口不含该事件：空结果，但 outsideCount 说明日历并非全空。
+  const other=await f.service.listWindow(owner,[f.binding.id],{start:"2026-10-12",end:"2026-10-19"});
+  assert.equal(other.events.length,0); assert.equal(other.outsideCount,1);
+  await assert.rejects(f.service.listWindow(owner,[f.binding.id],{start:"2026-10-12",end:"2026-10-12"}),{code:"invalid_input"});
+  await assert.rejects(f.service.listWindow(owner,[f.binding.id],{start:"不是日期",end:"2026-10-12"}),{code:"invalid_input"});
+ } finally {await rm(f.base,{recursive:true,force:true});}
+});
+
 test("calendar preserves external Wiki edits/moves and reports partial success; no duplicate page",async()=>{
  const f=await fixture(); try {
   const first=await f.service.mutate(owner,"create",undefined,"create",0,f.input); await f.publish(first.interactionState!.batchId!);

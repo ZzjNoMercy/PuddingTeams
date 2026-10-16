@@ -28,6 +28,24 @@ export type StatusSyncedCalendarEvent = LinkedCalendarEvent & { wikiSync?: WikiS
 export type WikiInteractionStatusSync = (args: { ownerId: string; bindingId: string; path: string; status: "planned" | "done" | "cancelled"; occurredAt?: string }) => Promise<{ changed: boolean }>;
 type Scope = readonly string[] | undefined;
 
+/** 时间窗边界：日期型（YYYY-MM-DD）按服务器本地时区解释，其余走 Date 解析。 */
+function parseBoundary(raw: string, label: string): Date {
+ const text = raw.trim();
+ const date = /^\d{4}-\d{2}-\d{2}$/.test(text) ? new Date(`${text}T00:00:00`) : new Date(text);
+ if (Number.isNaN(date.getTime())) throw new CalendarError("invalid_input", `无法解析时间窗${label === "start" ? "起点" : "终点"}：${raw}`);
+ return date;
+}
+
+/** 日程的实际时间跨度；全天日程用 startDate/endDateExclusive，无时间信息的返回 null。 */
+function eventSpan(event: CalendarEvent): { start: Date; end: Date } | null {
+ if (event.start && event.end) {
+  const span = { start: new Date(event.start), end: new Date(event.end) };
+  return Number.isNaN(span.start.getTime()) || Number.isNaN(span.end.getTime()) ? null : span;
+ }
+ if (event.startDate && event.endDateExclusive) return { start: new Date(`${event.startDate}T00:00:00`), end: new Date(`${event.endDateExclusive}T00:00:00`) };
+ return null;
+}
+
 /** Note filenames stay human-readable; the event id fallback keeps unusable titles safe. */
 function interactionNoteSlug(title: string): string | undefined {
  const cleaned = [...title.replace(/[/\\:*?"<>|#[\]^]/g, " ").replace(/\s+/g, "-").replace(/^[.-]+|[.-]+$/g, "")].slice(0, 60).join("").replace(/[.-]+$/, "");
@@ -74,6 +92,28 @@ export class CalendarService {
   return people;
  }
  async list(ownerId: string, scope?: Scope) { return Promise.all((await this.store.list(ownerId)).map(e => this.decorate(ownerId, e, scope))); }
+ /**
+  * 按时间窗列出日程（calendar_list_events 工具）：窗内事件按开始时间排序并
+  * 附带参与人姓名（best-effort，人脉库不可访问时退化为空名单），返回窗口
+  * 本身与窗外事件数，调用方能判断结果完整性。日期型边界（YYYY-MM-DD）按
+  * 服务器本地时区解释。
+  */
+ async listWindow(ownerId: string, scope: Scope, range: { start: string; end: string }) {
+  const start = parseBoundary(range.start, "start"), end = parseBoundary(range.end, "end");
+  if (end <= start) throw new CalendarError("invalid_input", "时间窗终点必须晚于起点");
+  const all = await this.store.list(ownerId);
+  const overlaps = (e: CalendarEvent) => {
+   const span = eventSpan(e);
+   return span !== null && span.start < end && span.end > start;
+  };
+  const inside = all.filter(overlaps).sort((a, b) => (eventSpan(a)?.start.getTime() ?? 0) - (eventSpan(b)?.start.getTime() ?? 0));
+  const events = await Promise.all(inside.map(async e => {
+   const decorated = await this.decorate(ownerId, e, scope);
+   const participantNames = await this.participants(ownerId, decorated, scope).then(list => list.map(p => p.name)).catch(() => [] as string[]);
+   return { ...decorated, participantNames };
+  }));
+  return { window: { start: start.toISOString(), end: end.toISOString(), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone }, events, outsideCount: all.length - inside.length };
+ }
  async get(ownerId: string, id: string, scope?: Scope) { const event = await this.store.get(ownerId, id); const visible = await this.decorate(ownerId, event, scope); return { ...visible, participantDetails: await this.participants(ownerId,visible,scope).catch(() => []) }; }
  private batchId(event: CalendarEvent) { return `calendar:${event.id}:${event.revision}`; }
  private async interactionHistory(ownerId: string, event: CalendarEvent) {
