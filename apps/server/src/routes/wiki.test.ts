@@ -508,6 +508,7 @@ test("wiki 审核路由：24 小时审核窗超期 → conflict，决定被拒�
 	assert.equal(expired.statusCode, 200);
 	assert.equal(expired.json().status, "conflict");
 	assert.equal(expired.json().batch.status, "conflict");
+	assert.equal(expired.json().conflictReason, "review_window_expired", "超期成因必须外露，前端才能显示「已过期」而不是「冲突」");
 	const decision = await fixture.app.inject({ method: "POST", url: `/api/wiki/batches/${batch.id}/reviews`, payload: reviewBody(batch) });
 	assert.equal(decision.statusCode, 409);
 	assert.equal(decision.json().code, "expired");

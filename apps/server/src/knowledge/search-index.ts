@@ -202,23 +202,36 @@ function snippetAround(text: string, index: number, length: number): string {
 	return `${from > 0 ? "…" : ""}${text.slice(from, to).replace(/\s+/g, " ").trim()}${to < text.length ? "…" : ""}`;
 }
 
-/** 大小写不敏感子串匹配；排序 title > path > heading > body，同分按路径。 */
+/** 单词命中评分：title > path > heading > body。返回 null 表示未命中。 */
+function locateTerm(note: IndexedNote, term: string): { snippet: string; score: number } | null {
+	if (note.title.toLowerCase().includes(term)) return { snippet: note.title, score: 100 };
+	if (note.path.toLowerCase().includes(term)) return { snippet: note.path, score: 60 };
+	const heading = note.headings.find((entry) => entry.toLowerCase().includes(term));
+	if (heading) return { snippet: heading, score: 40 };
+	const at = note.text.toLowerCase().indexOf(term);
+	if (at >= 0) return { snippet: snippetAround(note.text, at, term.length), score: 20 };
+	return null;
+}
+
+/**
+ * 字面检索：整串优先（连续短语给最高档），否则按空白分词做 OR 匹配——
+ * 命中词越多、命中位置越靠 title 得分越高。snippet 取该笔记最高分的命中词。
+ */
 export function searchBuiltIndex(index: BuiltKnowledgeIndex, query: string, limit: number): { results: SearchHit[]; truncated: boolean } {
-	const needle = query.toLowerCase();
+	const needle = query.toLowerCase().trim();
+	const terms = needle.split(/\s+/).filter(Boolean);
 	const hits: SearchHit[] = [];
 	for (const note of index.notes.values()) {
 		let hit: SearchHit | null = null;
-		if (note.title.toLowerCase().includes(needle)) {
-			hit = { path: note.path, title: note.title, snippet: note.title, score: 100 };
-		} else if (note.path.toLowerCase().includes(needle)) {
-			hit = { path: note.path, title: note.title, snippet: note.path, score: 60 };
+		const phrase = terms.length > 1 ? locateTerm(note, needle) : null;
+		if (phrase) {
+			hit = { path: note.path, title: note.title, snippet: phrase.snippet, score: 1000 + phrase.score };
 		} else {
-			const heading = note.headings.find((entry) => entry.toLowerCase().includes(needle));
-			if (heading) hit = { path: note.path, title: note.title, snippet: heading, score: 40 };
-		}
-		if (!hit) {
-			const at = note.text.toLowerCase().indexOf(needle);
-			if (at >= 0) hit = { path: note.path, title: note.title, snippet: snippetAround(note.text, at, needle.length), score: 20 };
+			const matched = terms.map((term) => locateTerm(note, term)).filter((entry): entry is { snippet: string; score: number } => entry !== null);
+			if (matched.length > 0) {
+				const best = matched.reduce((a, b) => (b.score > a.score ? b : a));
+				hit = { path: note.path, title: note.title, snippet: best.snippet, score: matched.reduce((sum, entry) => sum + entry.score, 0) };
+			}
 		}
 		if (hit) hits.push(hit);
 	}

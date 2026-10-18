@@ -21,7 +21,7 @@ async function stack(transport?:unknown,key?:()=>Promise<string|undefined>) {
  const settings=new WebResearchSettings(credentials,key?async p=>p==="deepseek"?key():undefined:undefined,transport,{targets:async()=>targets,onAccessChanged:()=>{changed++;}});
  const app=Fastify();registerWebResearchSettingsRoutes(app,settings);return {app,settings,dir,credentials,targets,changed:()=>changed};
 }
-const success=async()=>({status:200,headers:{},body:Buffer.from(JSON.stringify({output:[{type:"web_search_call",action:{sources:[{url:"https://example.com/source",title:"Source"}]}},{type:"message",content:[{type:"output_text",text:"Evidence",annotations:[]}]}]}))});
+const success=async()=>({status:200,headers:{},body:Buffer.from(JSON.stringify({results:[{url:"https://example.com/source",title:"Source",summary:"Evidence"}]}))});
 test("all local Pi roles including Wiki can configure networking; external connectors cannot",()=>{
  for(const connectorId of ["pi","codex","claude-code","puddingclaw"]){
   const target=webResearchTarget({name:connectorId,description:"role",...(connectorId==="pi"?{builtinId:"wiki" as const}:{}),connector:{extensionId:connectorId,connectorId,transport:connectorId==="pi"?"sdk":"spawn",config:{}}});
@@ -54,6 +54,20 @@ test("settings API never returns keys, encrypts state, keeps version conflicts a
   const restored=new WebResearchSettings(credentials);assert.equal((await restored.view()).providers.tavily.configured,true);
  } finally {await app.close();}
 });
+test("stored snapshot missing later-added config keys still loads with defaults",async()=>{
+ const {app,settings,credentials}=await stack();
+ try {
+  const initial=(await app.inject({url:"/api/settings/web-research"})).json();
+  const saved=await app.inject({method:"PUT",url:"/api/settings/web-research",payload:{expectedRevision:initial.revision,settings:initial.settings}});
+  assert.equal(saved.statusCode,200,saved.body);
+  const raw=JSON.parse((await credentials.getSecrets("platform"))["STATE"]!);
+  delete raw.config.fetchFallbackEnabled;delete raw.config.providers.deepseek.model;
+  await credentials.setSecrets("platform",{STATE:JSON.stringify(raw)});
+  const view=(await app.inject({url:"/api/settings/web-research"})).json();
+  assert.equal(view.settings.fetchFallbackEnabled,false);assert.equal(view.settings.providers.deepseek.enabled,false);
+  assert.equal((await settings.state()).config.fetchFallbackEnabled,false);
+ } finally {await app.close();}
+});
 test("model credential fallback stays ready on enable and invalidates when credential/model/proxy changes",async()=>{
  let key="model-key-one";const {settings,app}=await stack(success,async()=>key);
  try {
@@ -62,7 +76,7 @@ test("model credential fallback stays ready on enable and invalidates when crede
   view=await settings.save({expectedRevision:view.revision,settings:{...view.settings,enabled:true,providers:{...view.settings.providers,deepseek:{...view.settings.providers.deepseek,enabled:true}}}});assert.equal(view.providers.deepseek.test?.status,"ready");
   key="model-key-two";assert.equal((await settings.view()).providers.deepseek.test,null);
   view=await settings.test("deepseek");view=await settings.save({expectedRevision:view.revision,settings:{...view.settings,proxyUrl:"http://127.0.0.1:7890"}});assert.equal(view.providers.deepseek.test,null);
-  view=await settings.test("deepseek");view=await settings.save({expectedRevision:view.revision,settings:{...view.settings,providers:{...view.settings.providers,deepseek:{...view.settings.providers.deepseek,model:"other-model"}}}});assert.equal(view.providers.deepseek.test,null);
+  view=await settings.test("deepseek");view=await settings.save({expectedRevision:view.revision,settings:{...view.settings,providers:{...view.settings.providers,deepseek:{...view.settings.providers.deepseek,model:"other-model"}}}});assert.equal(view.providers.deepseek.test?.status,"ready");assert.equal(view.settings.providers.deepseek.model,undefined);
  } finally {await app.close();}
 });
 test("independent key overrides model key; clearing it restores fallback and invalidates readiness",async()=>{
@@ -78,13 +92,13 @@ test("in-flight test cannot approve changed configuration",async()=>{
   const testing=settings.test("deepseek");await started;const view=await settings.view();await settings.save({expectedRevision:view.revision,settings:{...view.settings,proxyUrl:"http://127.0.0.1:1234"}});release();await assert.rejects(testing,WebSettingsConflict);assert.equal((await settings.view()).providers.deepseek.test,null);
  } finally {release();await app.close();}
 });
-test("unsupported search is a failed test and cannot become ready",async()=>{
- const {app,settings}=await stack(async()=>({status:200,body:Buffer.from(JSON.stringify({output:[{type:"message",content:[{type:"output_text",text:"https://example.com"}]}]}))}),async()=>"key");try {
-  const tested=await app.inject({method:"POST",url:"/api/settings/web-research/deepseek/test"});assert.equal(tested.statusCode,200);assert.equal(tested.json().providers.deepseek.test.status,"error");assert.match(tested.json().providers.deepseek.test.message,/真实搜索/);assert.equal((await settings.state()).tests.deepseek?.status,"error");
+test("empty search result is a failed test and cannot become ready",async()=>{
+ const {app,settings}=await stack(async()=>({status:200,body:Buffer.from(JSON.stringify({results:[]}))}),async()=>"key");try {
+  const tested=await app.inject({method:"POST",url:"/api/settings/web-research/deepseek/test"});assert.equal(tested.statusCode,200);assert.equal(tested.json().providers.deepseek.test.status,"error");assert.match(tested.json().providers.deepseek.test.message,/可引用来源/);assert.equal((await settings.state()).tests.deepseek?.status,"error");
  }finally{await app.close();}
 });
 test("invalid config and unknown providers are rejected",async()=>{
- const {app,settings}=await stack();try {const view=await settings.view();for(const patch of [{defaultScope:"invalid"},{globalOrder:["tavily","tavily","grok"]},{proxyUrl:"http://user:pw@localhost"},{maxProviderAttempts:10},{apiKey:"secret"}]){const res=await app.inject({method:"PUT",url:"/api/settings/web-research",payload:{expectedRevision:0,settings:{...view.settings,...patch}}});assert.equal(res.statusCode,400);}
+ const {app,settings}=await stack();try {const view=await settings.view();for(const patch of [{defaultScope:"invalid"},{globalOrder:["tavily","tavily","grok"]},{proxyUrl:"http://user:pw@localhost"},{maxProviderAttempts:10},{apiKey:"secret"},{fetchFallbackEnabled:"yes"}]){const res=await app.inject({method:"PUT",url:"/api/settings/web-research",payload:{expectedRevision:0,settings:{...view.settings,...patch}}});assert.equal(res.statusCode,400);}
   const bad=await app.inject({method:"POST",url:"/api/settings/web-research/unknown/test"});assert.equal(bad.statusCode,400);
  }finally{await app.close();}
 });
@@ -188,7 +202,7 @@ test("test-and-save tests the draft key/model before atomically saving encrypted
   const before=await credentials.getSecrets("platform");
   inspect=async(options)=>{
    assert.equal(options.headers.Authorization,"Bearer draft-private-key");
-   assert.equal(JSON.parse(options.body).model,"draft-model");
+   assert.equal(JSON.parse(options.body).query,"DeepSeek 网页搜索 API 文档");
    assert.deepEqual(await credentials.getSecrets("platform"),before);
    assert.equal(changed(),1);
   };

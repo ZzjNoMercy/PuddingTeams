@@ -939,7 +939,7 @@ export function ReadLaterApp() {
                     ? "后台自动保存，采集异常可打开收藏重试。"
                     : dialog === "import"
                       ? "导入浏览器保存的文章页面，保留这条收藏的标签和笔记。"
-                    : "正文将交给 Wiki 管理员整理，候选需要审核后才会发布。"}
+                    : "正文将由平台整理为候选，审核后才会发布。"}
             </DialogDescription>
           </DialogHeader>
           {actionError && (

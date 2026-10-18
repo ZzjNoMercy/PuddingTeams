@@ -5951,6 +5951,7 @@ textarea.knowledge-json-input:focus-visible:not([data-pointer-focus="true"]) { o
 	color: color-mix(in oklab, var(--destructive) 82%, var(--foreground));
 }
 .wiki-batch-badge[data-status="rolled_back"],
+.wiki-batch-badge[data-status="conflict_expired"],
 .wiki-batch-badge[data-status="rejected"] {
 	background: color-mix(in oklab, var(--muted-foreground) 14%, transparent);
 	color: color-mix(in oklab, var(--muted-foreground) 88%, var(--foreground));

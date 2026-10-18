@@ -44,11 +44,11 @@ export function registerWikiCuratorRoutes(app: FastifyInstance, deps: {
 	});
 	app.post<{ Body: { operationId?: string; bindingId?: string; agentId?: string; task?: string; material?: string; uploads?: UploadInput[] } }>("/api/wiki/curator-jobs", { bodyLimit: 30 * 1024 * 1024 }, async (req, reply) => {
 		const body = req.body;
-		if (!body || typeof body.operationId !== "string" || typeof body.bindingId !== "string" || typeof body.agentId !== "string" || typeof body.task !== "string")
-			return reply.code(400).send({ error: "请填写目标知识库、Wiki 管理员、整理指令和 operationId" });
+		if (!body || typeof body.operationId !== "string" || typeof body.bindingId !== "string" || typeof body.task !== "string" || (body.agentId !== undefined && typeof body.agentId !== "string"))
+			return reply.code(400).send({ error: "请填写目标知识库、整理指令和 operationId" });
 		if (body.material !== undefined && (typeof body.material !== "string" || body.material.length > 100_000 || (!body.material.trim() && !body.uploads?.length))) return reply.code(400).send({ error: "请提供资料内容或附件，文字最多十万字" });
 		try {
-			const result = await deps.service.create({ operationId: body.operationId, bindingId: body.bindingId, agentId: body.agentId, task: body.task, ...(body.material !== undefined ? { sourceText: body.material } : {}), uploads: body.uploads, ownerId: owner() });
+			const result = await deps.service.create({ operationId: body.operationId, bindingId: body.bindingId, agentId: body.agentId ?? "wiki", task: body.task, ...(body.material !== undefined ? { sourceText: body.material } : {}), uploads: body.uploads, ownerId: owner() });
 			return reply.code(202).send({ job: presentJob(result.job), replayed: result.replayed });
 		} catch (error) {
 			const message = error instanceof Error ? error.message : "整理请求失败";

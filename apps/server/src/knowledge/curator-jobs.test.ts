@@ -221,7 +221,7 @@ test("稍后读晋升冻结网页与图片；删除收藏后仍可审核发布",
 	const store = new ReadLaterStore(path.join(f.root, "read-later"));
 	const image = Buffer.concat([assetPng, Buffer.alloc(300)]);
 	const capture = new ReadLaterCaptureService(store, async url => ({ url, status: 200, headers: { "content-type": url.includes("img.") ? "image/png" : "text/html" }, body: url.includes("img.") ? image : Buffer.from(`<article>${"正文中的事实必须保留出处，并经人工审核后才能发布。".repeat(20)}<img src="https://img.example.com/a.png"></article>`) }));
-	const promoter = new ReadLaterPromoter({ store, capture, sources: f.sources, curator: f.service, bindings: f.bindings, teams: f.teams });
+	const promoter = new ReadLaterPromoter({ store, capture, sources: f.sources, curator: f.service, bindings: f.bindings });
 	try {
 		const saved = store.create("owner", { operationId: "save", url: "https://example.com/article", note: "私人想法" }); capture.start();
 		for (let i = 0; i < 200 && store.get("owner", saved.item.id).parseStatus !== "ready"; i++) await new Promise(r => setTimeout(r, 5));
@@ -580,6 +580,25 @@ test("候选CAS事务同步guard拒绝超时提交并保留running状态", async
   await f.jobs.transition(created.job.id, ["queued"], { status: "running" });
   await assert.rejects(f.jobs.transition(created.job.id, ["running"], { status: "submitting" }, () => { throw new Error("model_timeout"); }), /model_timeout/);
   assert.equal((await f.jobs.get(created.job.id))!.status, "running"); assert.deepEqual(await f.reviews.list(), []);
+ } finally { await f.service.waitForIdle(); await rm(f.root, { recursive: true, force: true }); }
+});
+
+
+test("整理与 Wiki 管理员解耦：管理员停用时后台与会话内（worker 模式）整理均可用", async () => {
+ const f = await fixture();
+ try {
+  await f.teams.setEnabled("wiki", false);
+  const created = await f.service.create({ ownerId: "owner", bindingId: f.binding.id, agentId: "wiki", operationId: "decoupled", task: "记录偏好", sourceText: "不吃鱼" });
+  const job = await completed(f.jobs, created.job.id);
+  assert.equal(job.status, "pending_review");
+  const scope = { ownerId: "owner", windowId: "window", sessionId: "manager-chat", contextKey: "manager-chat" };
+  const worker = f.service.workerSurface(await f.runtime.mount(scope, [f.binding.id]), { ...scope, operationId: "manager-op", sourceText: "喜欢牛肉" }, "wiki");
+  const prepare = worker.tools.find(tool => tool.name === "knowledge_prepare_candidate")!;
+  const prepared = await prepare.execute("prepare", { bindingId: f.binding.id, task: "记录饮食偏好" }, undefined, undefined, {} as never);
+  assert.equal(JSON.parse((prepared.content[0] as { text: string }).text).status, "running");
+  const submit = worker.tools.find(tool => tool.name === "knowledge_submit_candidate")!;
+  const submitted = await submit.execute("submit", { bindingId: f.binding.id, pages: [] }, undefined, undefined, {} as never);
+  assert.equal(JSON.parse((submitted.content[0] as { text: string }).text).status, "no_changes");
  } finally { await f.service.waitForIdle(); await rm(f.root, { recursive: true, force: true }); }
 });
 

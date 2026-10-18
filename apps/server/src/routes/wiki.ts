@@ -155,6 +155,7 @@ function presentBatch(record: StoredReviewBatch) {
 		...(record.publishRequestedAt ? { publishRequestedAt: record.publishRequestedAt } : {}),
 		createdAt: record.createdAt,
 		updatedAt: record.updatedAt,
+		...(record.conflictReason ? { conflictReason: record.conflictReason } : {}),
 		...(record.conflictClosure ? { conflictClosure: record.conflictClosure } : {}),
 	};
 }

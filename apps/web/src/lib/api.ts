@@ -550,6 +550,8 @@ export interface WikiCompileJob {
 	updatedAt: string;
 }
 
+/** 冲突的具体成因：语义不同，展示也不同（过期作废 ≠ 发布冲突）。 */
+export type WikiBatchConflictReason = "review_window_expired" | "publish_rejected" | "publish_preflight" | "publish_interrupted" | "publish_external" | "publish_uncertain";
 export type WikiBatchStatus = "candidate" | "pending_review" | "approved" | "publishing" | "published" | "partial" | "conflict" | "rejected" | "returned";
 
 export interface WikiCuratorJob {
@@ -586,7 +588,7 @@ export interface WikiCuratorJob {
 }
 
 export async function createWikiCuratorJob(input: {
-	operationId: string; bindingId: string; agentId: string; task: string; material?: string; uploads?: MessageAttachmentInput[];
+	operationId: string; bindingId: string; task: string; material?: string; uploads?: MessageAttachmentInput[];
 }): Promise<{ job: WikiCuratorJob; replayed?: boolean }> {
 	return knowledgeResponse(await fetch(`${SERVER_URL}/api/wiki/curator-jobs`, {
 		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
@@ -649,6 +651,8 @@ export interface WikiPublicationBatch {
 
 export interface WikiBatchSummary {
 	conflictClosure?: { operationId: string; actorId: string; closedAt: string };
+	/** status 为 conflict 时的具体成因；review_window_expired 只是超时作废，不是内容冲突。 */
+	conflictReason?: WikiBatchConflictReason;
 	id: string;
 	bindingId: string;
 	bindingName?: string;
@@ -759,7 +763,7 @@ export interface WikiPublishFileRecord {
 
 export interface WikiPublicationDetail extends Omit<WikiPublicationSummary, "committedGroups"> {
 	stopReason?: string;
-	conflictReason?: "review_window_expired" | "publish_rejected" | "publish_preflight" | "publish_interrupted" | "publish_external" | "publish_uncertain";
+	conflictReason?: WikiBatchConflictReason;
 	/** Current comparison, not a reconstruction of the historic failure. */
 	currentContextChanges?: string[];
 	reviewId: string;
@@ -2773,9 +2777,9 @@ export async function cancelInteraction(id: string, expectedGoalId?: string): Pr
 
 export type WebSearchProvider = "tavily" | "deepseek" | "grok";
 export interface WebResearchConfig {
- enabled:boolean; fetchEnabled:boolean; defaultScope:"domestic"|"global"; fallbackEnabled:boolean; crossCheckEnabled:boolean; maxProviderAttempts:number;
+ enabled:boolean; fetchEnabled:boolean; fetchFallbackEnabled:boolean; defaultScope:"domestic"|"global"; fallbackEnabled:boolean; crossCheckEnabled:boolean; maxProviderAttempts:number;
  domesticOrder:WebSearchProvider[]; globalOrder:WebSearchProvider[]; proxyUrl:string;
- providers:Record<WebSearchProvider,{enabled:boolean;model:string;searchDepth?:"basic"|"advanced";webEnabled?:boolean;xEnabled?:boolean}>;
+ providers:Record<WebSearchProvider,{enabled:boolean;model?:string;searchDepth?:"basic"|"advanced";webEnabled?:boolean;xEnabled?:boolean}>;
 }
 export interface WebResearchGrant { search:boolean; fetch:boolean }
 export interface WebResearchTarget { id:string; name:string; kind:"manager"|"worker"; supported:boolean; enabled:boolean; reason?:string }

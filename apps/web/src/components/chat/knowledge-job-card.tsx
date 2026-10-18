@@ -22,7 +22,7 @@ export function KnowledgeJobCard({ content, details }: { content: string; detail
 		<div role={failed ? "alert" : "status"} aria-label={`知识库整理：${label}`} className={`w-full rounded-xl border px-4 py-3 ${failed ? "border-destructive/40 bg-destructive/5" : "border-border bg-muted/30"}`}>
 			<div className="flex flex-wrap items-center gap-2">
 				{failed ? <CircleAlertIcon size={16} className="text-destructive" /> : <ClipboardCheckIcon size={16} className="text-primary" />}
-				<strong className="text-sm font-medium">Wiki 管理员</strong>
+				<strong className="text-sm font-medium">知识整理</strong>
 				<Badge variant={failed ? "outline" : "secondary"} className={failed ? "border-destructive/40 text-destructive" : undefined}>{label}</Badge>
 			</div>
 			<p className={`mt-2 whitespace-pre-wrap text-sm ${failed ? "text-destructive" : "text-muted-foreground"}`}>{reason}</p>

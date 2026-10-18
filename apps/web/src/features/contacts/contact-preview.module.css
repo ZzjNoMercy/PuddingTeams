@@ -1,0 +1,11 @@
+.dialog.dialog{--dialog-pad:0;display:flex;flex-direction:column;width:min(1100px,calc(100vw - 32px));max-width:none!important;height:min(780px,85dvh);max-height:calc(100dvh - 32px);min-height:0;gap:0;padding:0;overflow:hidden;border:1px solid var(--home-line);border-radius:14px;color:var(--home-text);font-family:var(--home-font-sans)}
+.dialog button,.dialog a{cursor:pointer}
+.dialog button:focus-visible:not([data-pointer-focus="true"]),.dialog a:focus-visible:not([data-pointer-focus="true"]){outline:2px solid var(--home-accent);outline-offset:2px}
+.dialog button:disabled{cursor:default;opacity:.5}
+.dialog>[data-slot=dialog-close]{display:grid;place-items:center;width:32px;height:32px;top:12px;right:12px;border-radius:7px}
+.profile{display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden;background:var(--home-surface-0)}
+.profileHeader{flex-shrink:0;padding:26px 30px 0;padding-inline-end:48px;border-bottom:1px solid var(--home-line)}
+.profileHeader [aria-label="人物资料视图"]{border-bottom:0}
+.profileBody{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding:0 30px 20px}
+@media(min-width:851px){.profileBody>div>section:first-child{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr);column-gap:32px}.profileBody>div>section:first-child>h3{grid-column:1/-1}.profileBody>div>section:first-child>div{margin-top:12px;align-content:start}}
+@media(max-width:600px){.dialog.dialog{width:calc(100vw - 16px);height:calc(100dvh - 24px);max-height:calc(100dvh - 24px);border-radius:12px}.profileHeader{padding:22px 40px 0 18px}.profileBody{padding:0 18px 16px}}

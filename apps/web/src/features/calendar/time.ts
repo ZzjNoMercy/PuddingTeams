@@ -9,13 +9,21 @@ export function wallTime(instant: string | number, timeZone: string): string {
 	return `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}`;
 }
 /** Round-trip candidate offsets through Intl. Gaps have zero matches; folds have two. */
-export function resolveWallTime(local: string, timeZone: string, fold: "reject" | "earlier" | "later" = "reject"): string {
-	if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(local) || !validDay(local.slice(0, 10)) || +local.slice(11, 13) > 23 || +local.slice(14, 16) > 59) throw new Error("请输入有效日期和时间");
+function wallTimeMatches(local: string, timeZone: string): number[] {
+	if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(local) || !validDay(local.slice(0, 10)) || +local.slice(11, 13) > 23 || +local.slice(14, 16) > 59) return [];
 	const nominal = Date.parse(`${local}:00Z`), offsets = new Set<number>();
 	for (let h = -48; h <= 48; h += 6) { const sample = nominal + h * 3600_000; offsets.add(Date.parse(`${wallTime(sample, timeZone)}:00Z`) - sample); }
-	const matches = [...offsets].map((offset) => nominal - offset).filter((value) => wallTime(value, timeZone) === local).sort((a, b) => a - b);
+	return [...offsets].map((offset) => nominal - offset).filter((value) => wallTime(value, timeZone) === local).sort((a, b) => a - b);
+}
+/** 当地时钟把这个时刻走了两遍（夏令时回拨），需要用户指定是哪一次。 */
+export function repeatedWallTime(local: string, timeZone: string): boolean {
+	try { return wallTimeMatches(local, timeZone).length > 1; } catch { return false; }
+}
+export function resolveWallTime(local: string, timeZone: string, fold: "reject" | "earlier" | "later" = "reject"): string {
+	if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(local) || !validDay(local.slice(0, 10)) || +local.slice(11, 13) > 23 || +local.slice(14, 16) > 59) throw new Error("请输入有效日期和时间");
+	const matches = wallTimeMatches(local, timeZone);
 	if (!matches.length) throw new Error("此时区的夏令时跳变使该时间不存在，请选择其他时间");
-	if (matches.length > 1 && fold === "reject") throw new Error("此时间因夏令时回拨出现两次，请选择第一次或第二次");
+	if (matches.length > 1 && fold === "reject") throw new Error("此时间因夏令时回拨出现两次，请选择较早或较晚的一次");
 	return new Date(fold === "later" ? matches.at(-1)! : matches[0]!).toISOString();
 }
 

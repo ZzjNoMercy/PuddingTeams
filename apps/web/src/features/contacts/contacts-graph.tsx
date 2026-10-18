@@ -1,14 +1,15 @@
 "use client";
-import { useEffect, useMemo, useRef, useState, type PointerEvent } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type PointerEvent } from "react";
 import { FocusIcon, MinusIcon, PlusIcon, SearchIcon, NetworkIcon } from "lucide-react";
 import type { ContactGraphEdge, ContactSummary } from "@/lib/contacts";
+import { contactAvatarUrl } from "@/lib/contacts";
 import { getViewerIdentity } from "@/lib/api";
 import { InteractionPanel } from "./interaction-panel";
 import styles from "./contacts-graph.module.css";
 
 type Point = { x: number; y: number };
 type Camera = { x: number; y: number; zoom: number };
-type GraphPerson = Pick<ContactSummary, "id" | "name"> & { company?: string; role?: string; isSelf?: boolean };
+type GraphPerson = Pick<ContactSummary, "id" | "name"> & Partial<Pick<ContactSummary, "avatar" | "source">> & { company?: string; role?: string; isSelf?: boolean };
 // Bounded to 300 nodes by the server; local deterministic force layout, no external service.
 function layout(people: GraphPerson[], edges: ContactGraphEdge[], width: number, height: number): Map<string, Point> {
  const nodes = people.map((person, i) => ({ id: person.id, x: Math.cos(i * 2.39996) * 18 * Math.sqrt(i + 1), y: Math.sin(i * 2.39996) * 18 * Math.sqrt(i + 1), vx: 0, vy: 0 }));
@@ -52,6 +53,9 @@ export function ContactsGraph({ vault, revision, self, people: contacts, edges: 
  const cameraRef = useRef(camera);
  useEffect(() => { cameraRef.current = camera; }, [camera]);
  const [hovered, setHovered] = useState(""), [edgeId, setEdgeId] = useState("");
+ const [failedAvatars, setFailedAvatars] = useState<Record<string, true>>({});
+ const clipPrefix = useId().replace(/[^A-Za-z0-9_-]/g, "");
+ const avatarOf = (person: GraphPerson) => person.avatar && person.source ? contactAvatarUrl(vault, person as ContactSummary) : undefined;
  const byId = new Map(people.map(person => [person.id, person])), degree = new Map<string, number>();
  for (const edge of edges) { degree.set(edge.from, (degree.get(edge.from) ?? 0) + 1); degree.set(edge.to, (degree.get(edge.to) ?? 0) + 1); }
  const focus = hovered || selectedId, adjacent = new Set([focus]);
@@ -94,18 +98,19 @@ export function ContactsGraph({ vault, revision, self, people: contacts, edges: 
  const edge = edges.find(item => item.id === edgeId);
  return <section className={styles.graph} aria-label="人脉图谱">
   <div className={styles.toolbar}><label className={styles.search}><SearchIcon size={15} /><input aria-label="搜索图谱人物" placeholder="搜索姓名、机构、话题" value={q} onChange={event => onSearch(event.target.value)} /></label><select aria-label="图谱人物分组" value={group} onChange={event => onGroup(event.target.value)}><option value="">全部圈层</option>{groups.map(value => <option key={value}>{value}</option>)}</select><label className={styles.selfToggle}><input type="checkbox" checked={showSelf} onChange={event => setShowSelf(event.target.checked)} />显示{selfName}（我）</label><span>{loading ? "正在刷新…" : `${contacts.length} 位联系人 · ${edges.length} 条连线`}</span></div>
-  <div className={styles.canvas} data-edge-open={Boolean(edge)}>
+  <div className={styles.canvas}>
    <svg ref={svg} viewBox={`${-viewport.width / 2} ${-viewport.height / 2} ${viewport.width} ${viewport.height}`} aria-label="人物关系图，可拖拽和缩放" onPointerDown={event => start(event)} onPointerMove={move} onPointerUp={end} onPointerCancel={() => { drag.current = null; }}>
     <g transform={`translate(${camera.x} ${camera.y}) scale(${camera.zoom})`}>
      {edges.map(item => {
       const a = pointOf(item.from), b = pointOf(item.to), dx = b.x - a.x, dy = b.y - a.y, distance = Math.max(1, Math.hypot(dx, dy)), offset = 15;
       const path = `M ${a.x + dx / distance * offset} ${a.y + dy / distance * offset} Q ${(a.x + b.x) / 2 - dy * .08} ${(a.y + b.y) / 2 + dx * .08} ${b.x - dx / distance * offset} ${b.y - dy / distance * offset}`;
       const highlighted = item.from === focus || item.to === focus || item.id === edgeId;
-      return <g key={item.id} className={styles.edge} data-highlight={highlighted} data-planned={!item.doneCount && !item.directCount && Boolean(item.plannedCount)} data-dim={Boolean(focus && !highlighted)} role="button" tabIndex={0} aria-label={`${byId.get(item.from)?.name} ↔ ${byId.get(item.to)?.name}，已发生 ${item.doneCount} 次，计划 ${item.plannedCount} 次，查看共同往来`} onPointerDown={event => event.stopPropagation()} onClick={() => setEdgeId(item.id)} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setEdgeId(item.id); } }}><title>{item.label} · 已发生 {item.doneCount} 次 · 计划 {item.plannedCount} 次</title><path className={styles.edgeHit} d={path} /><path className={styles.edgeLine} d={path} /></g>;
+      return <g key={item.id} className={styles.edge} data-highlight={highlighted} data-planned={!item.doneCount && !item.directCount && Boolean(item.plannedCount)} data-dim={Boolean(focus && !highlighted)} role="button" tabIndex={0} aria-label={`${byId.get(item.from)?.name} ↔ ${byId.get(item.to)?.name}，已发生 ${item.doneCount} 次，计划 ${item.plannedCount} 次，查看共同往来`} onPointerDown={event => event.stopPropagation()} onClick={event => { event.currentTarget.focus(); setEdgeId(item.id); }} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setEdgeId(item.id); } }}><title>{item.label} · 已发生 {item.doneCount} 次 · 计划 {item.plannedCount} 次</title><path className={styles.edgeHit} d={path} /><path className={styles.edgeLine} d={path} /></g>;
      })}
      {people.map(person => {
       const p = pointOf(person.id), radius = Math.min(16, 8 + Math.sqrt(degree.get(person.id) ?? 0) * 2);
-      return <g key={person.id} transform={`translate(${p.x} ${p.y})`} className={styles.node} data-self={person.isSelf} data-selected={selectedId === person.id} data-focus={focus === person.id} data-dim={Boolean(focus && !adjacent.has(person.id))} role="button" tabIndex={0} aria-label={person.isSelf ? `${person.name}，本人，查看连接` : `查看 ${person.name} 的人物资料`} onPointerDown={event => start(event, person.id)} onPointerEnter={() => setHovered(person.id)} onPointerLeave={() => setHovered("")} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); selectPerson(person.id); } }}><title>{[person.name, person.company, person.role].filter(Boolean).join(" · ")}</title><circle className={styles.halo} r={radius + 7} /><circle className={styles.dot} r={radius} /><text y={radius + 22} textAnchor="middle">{person.name}{person.isSelf ? "（我）" : ""}</text></g>;
+      const avatar = avatarOf(person), showAvatar = avatar && !failedAvatars[avatar], clipId = `${clipPrefix}-${person.id}`;
+      return <g key={person.id} transform={`translate(${p.x} ${p.y})`} className={styles.node} data-self={person.isSelf} data-selected={selectedId === person.id} data-focus={focus === person.id} data-dim={Boolean(focus && !adjacent.has(person.id))} role="button" tabIndex={0} aria-label={person.isSelf ? `${person.name}，本人，查看连接` : `查看 ${person.name} 的人物资料`} onPointerDown={event => { event.currentTarget.focus(); start(event, person.id); }} onPointerEnter={() => setHovered(person.id)} onPointerLeave={() => setHovered("")} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); selectPerson(person.id); } }}><title>{[person.name, person.company, person.role].filter(Boolean).join(" · ")}</title><circle className={styles.halo} r={radius + 7} /><circle className={styles.dot} r={radius} />{showAvatar && <><clipPath id={clipId}><circle r={radius - 1} /></clipPath><image href={avatar} x={-(radius - 1)} y={-(radius - 1)} width={(radius - 1) * 2} height={(radius - 1) * 2} preserveAspectRatio="xMidYMid slice" clipPath={`url(#${clipId})`} pointerEvents="none" onError={() => setFailedAvatars(current => ({ ...current, [avatar]: true }))} /><circle className={styles.ring} r={radius} /></>}<text y={radius + 22} textAnchor="middle">{person.name}{person.isSelf ? "（我）" : ""}</text></g>;
      })}
     </g>
    </svg>

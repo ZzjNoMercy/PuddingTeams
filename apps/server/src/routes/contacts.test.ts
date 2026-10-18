@@ -158,6 +158,18 @@ test("通讯录保留同名人物；完成且有日期才算往来，普通反�
   const source = await f.app.inject(`/api/contacts/${person.id}/source?${new URLSearchParams({vault:f.binding.id,path:person.source.path,hash:person.source.contentHash})}`); assert.equal(source.statusCode,200); assert.match(source.json().source.content,/phone: '00123'/);
  } finally { await f.app.close(); await rm(f.base,{recursive:true,force:true}); }
 });
+test("同一笔记既有明确往来又有普通提及时折叠为一行，关系标签不丢失", async () => {
+ const f = await fixture({
+  "People/a.md":note("id: a\ntype: person\ntitle: 周子秦"),
+  "Interactions/gift.md":note("id: gift\ntype: interaction\ntitle: 中秋赠礼\nstatus: done\noccurredAt: 2026-09-25", "- involves: [[People/a]]\n\n备注里又提到 [[People/a]]。"),
+ });
+ try {
+  const list = (await f.app.inject(`/api/contacts?vault=${f.binding.id}`)).json();
+  const detail = (await f.app.inject(`/api/contacts/${list.people[0].id}?vault=${f.binding.id}&revision=${list.revision}`)).json().person;
+  const rows = detail.relations.filter((item:{source:{title:string}})=>item.source.title==="中秋赠礼");
+  assert.equal(rows.length,1); assert.equal(rows[0].label,"实际往来"); assert.deepEqual(rows[0].also,["被提及"]);
+ } finally { await f.app.close(); await rm(f.base,{recursive:true,force:true}); }
+});
 test("同步修改/rename 保持人物身份；旧来源拒绝，删除与撤权清除列表/详情/关系", async () => {
  const f = await fixture({"People/a.md":note("id: a\ntype: person\ntitle: 原姓名"),"related.md":note("type: record\ntitle: 资料","提及 [[People/a]]")});
  try {

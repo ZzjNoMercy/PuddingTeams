@@ -90,8 +90,18 @@ const publishStepLabels: Record<string, string> = {
 	reconcile: "启动对账",
 };
 
-function BatchStatusBadge({ status, closed = false }: { status: WikiBatchStatus; closed?: boolean }) {
-	return <span className="wiki-batch-badge" data-status={closed ? "rejected" : status}>{closed ? "已关闭冲突" : batchStatusLabels[status]}</span>;
+/** 冲突的具体成因不同，读法也不同：超时作废不该显示成「冲突」。 */
+function batchBadge(batch: Pick<WikiBatchSummary, "status" | "conflictReason" | "conflictClosure">): { label: string; tone: string } {
+	const expired = batch.conflictReason === "review_window_expired";
+	if (batch.conflictClosure) return { label: expired ? "已过期" : "已关闭冲突", tone: "rejected" };
+	if (batch.status === "conflict" && expired) return { label: "已过期", tone: "conflict_expired" };
+	if (batch.status === "conflict" && batch.conflictReason === "publish_uncertain") return { label: "待核对", tone: "conflict" };
+	return { label: batchStatusLabels[batch.status], tone: batch.status };
+}
+
+function BatchStatusBadge({ batch }: { batch: Pick<WikiBatchSummary, "status" | "conflictReason" | "conflictClosure"> }) {
+	const badge = batchBadge(batch);
+	return <span className="wiki-batch-badge" data-status={badge.tone}>{badge.label}</span>;
 }
 
 function PublicationStateBadge({ state }: { state: WikiPublicationState }) {
@@ -111,6 +121,14 @@ function OperationBadge({ operation }: { operation: "create" | "update" | "delet
 const shortHash = (value: string) => value.slice(0, 12);
 function batchHref(query: string, id: string) { const search = new URLSearchParams(query); search.delete("publication"); search.set("batch", id); return `/knowledge/review?${search}`; }
 const formatTime = (value: string) => (value ? new Date(value).toLocaleString() : "—");
+/** 审核窗口剩余时间：让「过期」在列表上就可预期，而不是打开才发现。 */
+function deadlineLabel(deadline: string, now = Date.now()): string {
+	const left = Date.parse(deadline) - now;
+	if (!Number.isFinite(left)) return "";
+	if (left <= 0) return "已超时";
+	const hours = Math.ceil(left / 3_600_000);
+	return hours >= 24 ? `剩余 ${Math.ceil(hours / 24)} 天` : `剩余 ${hours} 小时`;
+}
 
 export function KnowledgeReviewApp() {
 	const params = useSearchParams();
@@ -245,7 +263,7 @@ function BatchList({ vault, bindings }: { vault: string | null; bindings: Array<
 			) : <div className="wiki-review-cards">{current.batches.map((batch) => (
 				<button key={batch.id} type="button" onClick={() => open(batch)} className="wiki-review-card">
 					<span className="wiki-review-card-icon"><FileTextIcon size={23} /></span>
-					<span className="wiki-review-card-copy"><span className="wiki-review-card-title"><strong>{batch.title || `候选批次 ${shortHash(batch.id)}`}</strong>{batch.conflictClosure ? <span className="wiki-batch-badge">已关闭冲突</span> : <BatchStatusBadge status={batch.status} />}</span><span className="wiki-review-card-description">{batch.fileCount} 项文件的固定候选 · {shortHash(batch.manifestHash)}</span><span className="wiki-review-card-meta"><span className="wiki-review-vault"><BookOpenIcon size={12} />{batch.bindingName ?? vaultOptions.get(batch.bindingId) ?? batch.bindingId}{batch.bindingAvailability === "offline" ? " · 离线" : ""}</span><span>{formatTime(batch.enteredReviewAt)}</span><span>{batch.fileCount} 项变更</span><span>版本 {batch.revision}</span></span></span>
+					<span className="wiki-review-card-copy"><span className="wiki-review-card-title"><strong>{batch.title || `候选批次 ${shortHash(batch.id)}`}</strong><BatchStatusBadge batch={batch} /></span><span className="wiki-review-card-description">{batch.fileCount} 项文件的固定候选 · {shortHash(batch.manifestHash)}</span><span className="wiki-review-card-meta"><span className="wiki-review-vault"><BookOpenIcon size={12} />{batch.bindingName ?? vaultOptions.get(batch.bindingId) ?? batch.bindingId}{batch.bindingAvailability === "offline" ? " · 离线" : ""}</span><span>{formatTime(batch.enteredReviewAt)}</span><span>{batch.fileCount} 项变更</span><span>版本 {batch.revision}</span>{batch.status === "pending_review" && !batch.conflictClosure ? <span>{deadlineLabel(batch.reviewDeadline)}</span> : null}</span></span>
 					<ChevronRightIcon size={19} className="shrink-0 text-muted-foreground" />
 				</button>
 			))}</div>}
@@ -350,11 +368,18 @@ function TerminalBatchView({ batch, vault, onReload }: { batch: WikiBatchDetail;
 	}, [batch.bindingId, batch.id, batch.status]);
 
 	const calendarHref = calendarEditHref(batch);
-	const conflictHint = calendarHref && (batch.status === "conflict" || batch.status === "rejected") ? "此往来候选不会发布。请回到日程核对并重新保存，生成新候选后再审核。" : batch.status === "conflict"
-		? batch.conflictClosure ? "此冲突已关闭，已移入已处理记录。旧候选和发布记录保留。" : "这批候选无法继续发布。可以用原始资料按当前知识库重新整理，生成新候选后再审核；也可以关闭此冲突。"
-		: batch.status === "rejected"
-			? "批次已拒绝，不会发布。可回到知识库调整来源后生成新的候选。"
-			: null;
+	const expired = batch.status === "conflict" && batch.conflictReason === "review_window_expired";
+	const conflictHint = batch.status === "conflict" && batch.conflictClosure
+		? expired ? "这条候选已过期并关闭，移入已处理记录。旧候选和发布记录保留。" : "此冲突已关闭，已移入已处理记录。旧候选和发布记录保留。"
+		: expired
+			? calendarHref
+				? `这批往来候选超过 24 小时未审核，已于 ${formatTime(batch.reviewDeadline)} 到期作废，不会发布。请回到日程核对并重新保存，生成新候选后再审核。`
+				: `这批候选超过 24 小时未审核，已于 ${formatTime(batch.reviewDeadline)} 到期作废，不会发布。关闭后可以按原始资料重新整理，生成新候选再审核。`
+			: calendarHref && (batch.status === "conflict" || batch.status === "rejected") ? "此往来候选不会发布。请回到日程核对并重新保存，生成新候选后再审核。"
+			: batch.status === "conflict" ? "这批候选无法继续发布。可以用原始资料按当前知识库重新整理，生成新候选后再审核；也可以关闭此冲突。"
+			: batch.status === "rejected"
+				? "批次已拒绝，不会发布。可回到知识库调整来源后生成新的候选。"
+				: null;
 	return (
 		<div className="shrink-0 border-b border-border px-6 py-3">
 			<p className="text-xs text-muted-foreground">固定候选保留，可继续查看文件内容与版本差异。</p>
@@ -364,7 +389,7 @@ function TerminalBatchView({ batch, vault, onReload }: { batch: WikiBatchDetail;
 			<div className="mt-2 flex flex-wrap gap-3 text-sm">
 				{batch.status === "conflict" && !batch.conflictClosure ? <>
 					<>{calendarHref ? <Link href={calendarHref} className="rounded bg-primary px-3 py-2 text-primary-foreground">修改日程</Link> : <button type="button" disabled={Boolean(batch.conflictBlockedReason) || submitting} onClick={() => { setResolutionError(null); setResolving("regenerate"); }} className="rounded bg-primary px-3 py-2 text-primary-foreground disabled:opacity-40">重新整理，生成新候选</button>}</>
-					<button type="button" disabled={Boolean(batch.conflictBlockedReason) || submitting} onClick={() => { setResolutionError(null); setResolving("close"); }} className="rounded border border-border px-3 py-2 disabled:opacity-40">关闭此冲突</button>
+					<button type="button" disabled={Boolean(batch.conflictBlockedReason) || submitting} onClick={() => { setResolutionError(null); setResolving("close"); }} className="rounded border border-border px-3 py-2 disabled:opacity-40">{expired ? "关闭此记录" : "关闭此冲突"}</button>
 				</> : null}
 				{batch.status === "published" ? <Link href={`/knowledge?vault=${encodeURIComponent(batch.bindingId)}`} className="rounded bg-primary px-3 py-2 text-primary-foreground">查看已发布知识库</Link> : null}
 				{batch.status === "rejected" ? (
@@ -389,7 +414,7 @@ function TerminalBatchView({ batch, vault, onReload }: { batch: WikiBatchDetail;
 			</div>
 			<Dialog open={resolving !== null} onOpenChange={open => { if (!open && !submitting) setResolving(null); }}>
 				<DialogContent showCloseButton={!submitting} onEscapeKeyDown={event => { if (submitting) event.preventDefault(); }} onInteractOutside={event => { if (submitting) event.preventDefault(); }}>
-					<DialogHeader><DialogTitle>{resolving === "regenerate" ? "重新整理这批资料" : "关闭此冲突？"}</DialogTitle><DialogDescription>{resolving === "regenerate" ? "知识管家将读取原始资料和当前知识库，生成新的候选。新候选仍需你审核确认后才能发布。" : "关闭后移入已处理，不再计入需处理。旧候选、审核决定及发布记录保留。"}</DialogDescription></DialogHeader>
+					<DialogHeader><DialogTitle>{resolving === "regenerate" ? "重新整理这批资料" : expired ? "关闭这条已过期记录？" : "关闭此冲突？"}</DialogTitle><DialogDescription>{resolving === "regenerate" ? "知识管家将读取原始资料和当前知识库，生成新的候选。新候选仍需你审核确认后才能发布。" : "关闭后移入已处理，不再计入需处理。旧候选、审核决定及发布记录保留。"}</DialogDescription></DialogHeader>
 					{resolving === "regenerate" ? <DialogBody><label htmlFor="conflict-feedback" className="text-sm font-medium">整理要求</label><textarea id="conflict-feedback" value={feedback} onChange={event => setFeedback(event.target.value)} maxLength={20000} disabled={submitting} className="mt-2 min-h-28 w-full rounded border border-border bg-background p-3 text-sm" /></DialogBody> : null}
 					{resolutionError ? <p role="alert" className="text-sm text-destructive">{resolutionError} <button type="button" disabled={submitting} onClick={() => { setResolving(null); onReload(); }} className="underline">刷新状态</button></p> : null}
 					<div className="flex justify-end gap-2"><button type="button" disabled={submitting} onClick={() => setResolving(null)} className="rounded border px-3 py-2 text-sm">取消</button><button type="button" disabled={submitting || (resolving === "regenerate" && !feedback.trim())} onClick={() => void resolve()} className="rounded bg-primary px-3 py-2 text-sm text-primary-foreground disabled:opacity-40">{submitting ? "提交中…" : resolving === "regenerate" ? "开始重新整理" : "确认关闭冲突"}</button></div>
@@ -426,7 +451,7 @@ function RevisionFollowup({ batch }: { batch: WikiBatchDetail }) {
 	const nextParams = new URLSearchParams(params.toString());
 	nextParams.delete("publication");
 	if (nextBatch) nextParams.set("batch", nextBatch);
-	return <div className="shrink-0 space-y-2 border-b border-border bg-muted/30 px-6 py-4"><p className="text-sm font-medium">已退回修订 · 旧候选保留</p><p className="whitespace-pre-wrap text-sm">{batch.returnRequest.feedback}</p><p className="text-xs text-muted-foreground">修订会生成独立版本和 manifest，所有文件需要重新核对。本批次不会发布。</p>{nextBatch ? <Link href={`/knowledge/review?${nextParams.toString()}`} className="inline-block rounded bg-primary px-3 py-2 text-sm text-primary-foreground">查看新候选并重新审核</Link> : currentJob?.status === "failed" || currentJob?.status === "needs_attention" || currentJob?.status === "cancelled" ? <p role="status" className="text-sm">修订{currentJob.status === "cancelled" ? "已取消" : "需要处理"}：{currentJob.failureCode ?? "未生成新候选"}</p> : currentJob?.status === "no_changes" ? <p role="status" className="text-sm">此次修订没有产生文件变更。</p> : <p role="status" className="text-sm text-muted-foreground">{jobId ? "Wiki 管理员正在修订，可稍后回来查看。" : "修订请求已记录，正在恢复整理任务。"}</p>}{error ? <p role="alert" className="text-sm text-destructive">{error} <button type="button" onClick={() => setNonce((value) => value + 1)} className="underline">刷新修订状态</button></p> : null}</div>;
+	return <div className="shrink-0 space-y-2 border-b border-border bg-muted/30 px-6 py-4"><p className="text-sm font-medium">已退回修订 · 旧候选保留</p><p className="whitespace-pre-wrap text-sm">{batch.returnRequest.feedback}</p><p className="text-xs text-muted-foreground">修订会生成独立版本和 manifest，所有文件需要重新核对。本批次不会发布。</p>{nextBatch ? <Link href={`/knowledge/review?${nextParams.toString()}`} className="inline-block rounded bg-primary px-3 py-2 text-sm text-primary-foreground">查看新候选并重新审核</Link> : currentJob?.status === "failed" || currentJob?.status === "needs_attention" || currentJob?.status === "cancelled" ? <p role="status" className="text-sm">修订{currentJob.status === "cancelled" ? "已取消" : "需要处理"}：{currentJob.failureCode ?? "未生成新候选"}</p> : currentJob?.status === "no_changes" ? <p role="status" className="text-sm">此次修订没有产生文件变更。</p> : <p role="status" className="text-sm text-muted-foreground">{jobId ? "正在修订，可稍后回来查看。" : "修订请求已记录，正在恢复整理任务。"}</p>}{error ? <p role="alert" className="text-sm text-destructive">{error} <button type="button" onClick={() => setNonce((value) => value + 1)} className="underline">刷新修订状态</button></p> : null}</div>;
 }
 
 /** 审核工作台：左文件清单（已查看勾选）+ 右预览/diff + 顶部确认/退回操作。 */
@@ -527,10 +552,10 @@ function ReviewWorkspace({ batch, onBatchChange, onReload }: {
 	return (
 		<div className="flex min-h-0 flex-1 flex-col">
 			<div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-border px-6 py-3">
-				<BatchStatusBadge status={batch.status} closed={Boolean(batch.conflictClosure)} />
+				<BatchStatusBadge batch={batch} />
 				{(batch.parentBatchId ?? batch.batch.parentBatchId) ? <Link href={batchHref(scopeParams.toString(), (batch.parentBatchId ?? batch.batch.parentBatchId)!)} className="text-xs underline">查看上次候选与修订意见</Link> : null}
 				<span className="text-xs text-muted-foreground">
-					manifest <code>{shortHash(batch.manifestHash)}</code> · 第 {batch.revision} 代 · 截止 {formatTime(batch.reviewDeadline)}
+					manifest <code>{shortHash(batch.manifestHash)}</code> · 第 {batch.revision} 代 · {batch.status === "conflict" && batch.conflictReason === "review_window_expired" ? "已于" : "截止"} {formatTime(batch.reviewDeadline)}{batch.status === "conflict" && batch.conflictReason === "review_window_expired" ? " 到期" : ""}
 				</span>
 				<span className="text-xs text-muted-foreground">{batch.status === "pending_review" ? `已阅 ${Math.min(viewed.size, files.length)}/${files.length}` : `${files.length} 项固定候选`}</span>
 				<span className="wiki-review-vault"><BookOpenIcon size={12} />{batch.bindingName ?? batch.bindingId}</span>
@@ -635,7 +660,7 @@ function ReviewWorkspace({ batch, onBatchChange, onReload }: {
 			</div>
 			<Dialog open={confirming !== null} onOpenChange={(open) => { if (!open && !submitting) setConfirming(null); }}>
 				<DialogContent className="flex max-h-[85dvh] flex-col overflow-hidden" showCloseButton={!submitting} onEscapeKeyDown={(event) => { if (submitting) event.preventDefault(); }} onInteractOutside={(event) => { if (submitting) event.preventDefault(); }}>
-					<DialogHeader><DialogTitle>{confirming === "approve" ? `发布到 ${batch.bindingName ?? "知识库"}？` : confirming === "return" ? "退回给 Wiki 管理员修订" : "拒绝本次候选？"}</DialogTitle><DialogDescription>{confirming === "approve" ? "将按刚才审阅的固定内容发布全部文件。" : confirming === "return" ? "填写需要修改的地方。旧候选永久保留，新任务生成新候选后需要重新审核。" : "拒绝后保留审核记录，不修改知识库。"}</DialogDescription></DialogHeader>
+					<DialogHeader><DialogTitle>{confirming === "approve" ? `发布到 ${batch.bindingName ?? "知识库"}？` : confirming === "return" ? "退回修订" : "拒绝本次候选？"}</DialogTitle><DialogDescription>{confirming === "approve" ? "将按刚才审阅的固定内容发布全部文件。" : confirming === "return" ? "填写需要修改的地方。旧候选永久保留，新任务生成新候选后需要重新审核。" : "拒绝后保留审核记录，不修改知识库。"}</DialogDescription></DialogHeader>
 					<DialogBody className="space-y-4">{confirming === "return" ? <div className="space-y-2"><label htmlFor="wiki-return-feedback" className="text-sm font-medium">修改意见（必填）</label><textarea id="wiki-return-feedback" value={feedback} onChange={(event) => setFeedback(event.target.value)} maxLength={20000} disabled={submitting} className="min-h-28 w-full rounded border border-border bg-background p-3 text-sm" placeholder="请说明哪项文件需要怎样修改，以及核对依据。" /><p className="text-xs text-muted-foreground">本次声明已阅 {viewed.size}/{files.length} 项；未读文件不会被标记为已阅。</p>{actionError ? <p role="alert" className="text-sm text-destructive">{actionError.message}</p> : null}</div> : null}<p className="break-all text-xs text-muted-foreground">知识库：{batch.bindingName ?? batch.bindingId}<br />版本 {batch.revision} · manifest {batch.manifestHash}</p><div className="space-y-2 rounded border border-border p-3">{files.map((file) => <div key={file.targetPath} className="flex items-start gap-2 text-sm"><OperationBadge operation={file.operation} /><span className="min-w-0 break-all">{file.targetPath}</span></div>)}</div>{confirming === "approve" ? <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} disabled={submitting} className="mt-1" /><span>我已核对这 {files.length} 项变更，同意将本批固定候选发布到对应知识库。</span></label> : null}</DialogBody>
 					<div className="flex justify-end gap-2"><button type="button" disabled={submitting} onClick={() => setConfirming(null)} className="rounded border border-border px-3 py-2 text-sm">继续检查</button><button type="button" disabled={submitting || (confirming === "approve" && (!acknowledged || !allViewed)) || (confirming === "return" && !feedback.trim())} onClick={() => { if (confirming) void submit(confirming); }} className="rounded bg-primary px-3 py-2 text-sm text-primary-foreground disabled:opacity-40">{submitting ? "提交中…" : confirming === "approve" ? "确认发布" : confirming === "return" ? "提交修订意见" : "确认拒绝"}</button></div>
 				</DialogContent>

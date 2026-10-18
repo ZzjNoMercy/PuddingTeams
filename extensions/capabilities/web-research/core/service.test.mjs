@@ -4,7 +4,7 @@ import http from 'node:http';import https from 'node:https';import tls from 'nod
 import {EventEmitter} from 'node:events';import {PassThrough} from 'node:stream';
 import {publicAddress,publicURL,resolvePublic,requestURL} from './network.mjs';
 import {DEFAULT_CONFIG,searchRequest,routeRequest,search,fetchPage,normalizeResponse,testProvider} from './service.mjs';
-const state=()=>({config:{...structuredClone(DEFAULT_CONFIG),enabled:true,providers:{tavily:{enabled:true,model:'',searchDepth:'basic'},deepseek:{enabled:true,model:'deepseek-v4-flash'},grok:{enabled:true,model:'grok-4.7',webEnabled:true,xEnabled:true}}},keys:{TAVILY_API_KEY:'test-tavily',DEEPSEEK_API_KEY:'test-deepseek',XAI_API_KEY:'test-grok'},tests:Object.fromEntries(['tavily','deepseek','grok'].map(p=>[p,{status:'ready'}]))});
+const state=()=>({config:{...structuredClone(DEFAULT_CONFIG),enabled:true,providers:{tavily:{enabled:true,model:'',searchDepth:'basic'},deepseek:{enabled:true},grok:{enabled:true,model:'grok-4.7',webEnabled:true,xEnabled:true}}},keys:{TAVILY_API_KEY:'test-tavily',DEEPSEEK_API_KEY:'test-deepseek',XAI_API_KEY:'test-grok'},tests:Object.fromEntries(['tavily','deepseek','grok'].map(p=>[p,{status:'ready'}]))});
 const response=(json,status=200)=>({status,body:Buffer.from(JSON.stringify(json)),headers:{'content-type':'application/json'}});
 const citations=(url='https://example.com/source')=>({output:[{type:'web_search_call',action:{sources:[{url,title:'Source'}]}},{type:'message',content:[{type:'output_text',text:'Evidence',annotations:[{type:'url_citation',url,title:'Source'}]}]}],usage:{input_tokens:12}});
 
@@ -80,14 +80,17 @@ test('routing selects domestic and global providers and restricts X/media to Gro
 test('search parameters enforce bounds, dates and exclusive filters',()=>{
  for(const raw of [{query:''},{query:'x',max_results:11},{query:'x',from_date:'2026-02-30'},{query:'x',from_date:'2026-10-01',to_date:'2026-09-30'},{query:'x',include_domains:['example.com'],exclude_domains:['test.com']},{query:'x',allowed_x_handles:['a'],excluded_x_handles:['b']},{query:'x',cross_check:'yes'}]) assert.throws(()=>searchRequest(raw));
 });
-test('DeepSeek uses PuddingClaw model, Responses endpoint and forced web_search',async()=>{
+test('DeepSeek uses the standalone in-house Search API without a model',async()=>{
  let captured;
- const result=await testProvider('deepseek',state(),undefined,async(url,opts)=>{captured={url,body:JSON.parse(opts.body)};return response(citations());});
- assert.equal(captured.url,'https://api.deepseek.com/responses');assert.equal(captured.body.model,'deepseek-v4-flash');assert.deepEqual(captured.body.tools,[{type:'web_search'}]);assert.deepEqual(captured.body.tool_choice,{type:'web_search'});assert.deepEqual(captured.body.reasoning,{effort:'none'});assert.equal(result.sources.length,1);
+ const result=await testProvider('deepseek',state(),undefined,async(url,opts)=>{captured={url,body:JSON.parse(opts.body)};return response({results:[{url:'https://example.com/source',title:'Source',snippet:'短摘要',summary:'长摘要'}]});});
+ assert.equal(captured.url,'https://api.deepseek.com/v1/tools/search');assert.deepEqual(captured.body,{query:'DeepSeek 网页搜索 API 文档',count:2,need_content:false});assert.equal(result.sources.length,1);assert.equal(result.sources[0].quote,'长摘要');
+});
+test('DeepSeek rejects queries beyond the 128-character Search API limit',async()=>{
+ await assert.rejects(search({query:'x'.repeat(200),provider:'deepseek'},state(),undefined,async()=>response({results:[{url:'https://example.com/a',title:'A'}]})),/128/);
 });
 test('ordinary model prose and invented links cannot satisfy search readiness',()=>{
- assert.throws(()=>normalizeResponse({output:[{type:'message',content:[{type:'output_text',text:'See https://example.com',annotations:[]}]}]},'deepseek'),/真实搜索/);
- assert.throws(()=>normalizeResponse({output:[{type:'web_search_call'}]},'deepseek'),/来源/);
+ assert.throws(()=>normalizeResponse({output:[{type:'message',content:[{type:'output_text',text:'See https://example.com',annotations:[]}]}]},'grok'),/真实搜索/);
+ assert.throws(()=>normalizeResponse({output:[{type:'web_search_call'}]},'grok'),/来源/);
 });
 test('authentication failures fall back and explicit provider never switches',async()=>{
  const s=state();let count=0;
@@ -115,6 +118,16 @@ test('domain filters are enforced on returned citations',async()=>{
 test('HTML fetch removes scripts, retains links and truthfully marks truncation',async()=>{
  const result=await fetchPage({url:'https://example.com'},state(),undefined,async()=>({status:200,url:'https://example.com/final',headers:{'content-type':'text/html; charset=utf-8'},body:Buffer.from('<title>Title</title><script>evil()</script><main><h1>Heading</h1><a href="/docs">Docs</a><p>'+('a'.repeat(60000))+'</p></main>')}));
  assert.equal(result.uri,'https://example.com/final');assert.equal(result.title,'Title');assert.ok(result.content.includes('[Docs](https://example.com/docs)'));assert.ok(!result.content.includes('evil'));assert.equal(result.truncated,true);assert.equal(result.content.length,50000);
+});
+test('fetch fallback retries through DeepSeek only when enabled',async()=>{
+ const pdf={status:200,headers:{'content-type':'application/pdf'},body:Buffer.from('pdf')};
+ let calls=0;
+ await assert.rejects(fetchPage({url:'https://example.com'},state(),undefined,async()=>{calls++;return pdf;}),/二进制/);assert.equal(calls,1);
+ const s=state();s.config.fetchFallbackEnabled=true;let captured;
+ const result=await fetchPage({url:'https://example.com/page'},s,undefined,async(url,opts)=>{if(url.includes('tools/fetch')){captured={url,opts};return response({title:'DeepSeek 标题',content:'# 正文'});}return pdf;});
+ assert.equal(result.via,'deepseek');assert.equal(result.content,'# 正文');assert.equal(captured.url,'https://api.deepseek.com/v1/tools/fetch');
+ assert.equal(JSON.parse(captured.opts.body).url,'https://example.com/page');assert.equal(captured.opts.headers.Authorization,'Bearer test-deepseek');
+ await assert.rejects(fetchPage({url:'https://example.com'},s,undefined,async(url)=>url.includes('tools/fetch')?response({},404):pdf),/本地抓取失败.*DeepSeek 兜底失败/);
 });
 test('abort prevents fallback to another billable provider',async()=>{
  const controller=new AbortController();let calls=0;await assert.rejects(search({query:'x'},state(),controller.signal,async()=>{calls++;controller.abort();throw new Error('aborted');}));assert.equal(calls,1);

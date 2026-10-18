@@ -19,7 +19,7 @@ export interface ContactSummary {
  id: string; name: string; company: string; role: string; location: string; topics: string[]; groups: string[];
  lastContact: string | null; source: ContactSource; affiliations: ContactAffiliation[]; avatar?: string;
 }
-export interface ContactRelation { kind: string; label: string; source: ContactSource; snippet: string; description: string; occurredAt: string | null }
+export interface ContactRelation { kind: string; label: string; source: ContactSource; snippet: string; description: string; occurredAt: string | null; also?: string[] }
 export interface ContactDetail extends ContactSummary { email: string; phone: string; summary: string; relations: ContactRelation[] }
 export interface ContactGraphEdge { id: string; from: string; to: string; label: string; doneCount: number; plannedCount: number; lastInteractionAt: string | null; directCount: number }
 export interface ContactParticipant { id: string; name: string; isSelf?: boolean }
@@ -135,8 +135,14 @@ export class ContactsProjection {
    const f = fields.get(note.path)!, links = outgoing.get(note.path) ?? [];
    const affiliations = affiliationsByPerson.get(note.path) ?? [];
    const orgRelations = [...new Map(affiliations.map(item => [item.org.path, { kind: "at_org", label: "关联公司", source: item.org, snippet: "", description: "", occurredAt: null }])).values()];
-   const relations = [...(edges.get(note.path) ?? []), ...orgRelations, ...links.map(({ kind, target }) => ({ kind, label: labels[kind] ?? "明确关联", source: sourceOf(target), snippet: "", description: text(fields.get(target.path)?.summary) || introOf(target), occurredAt: null }))];
-   // One occurrence per note identity even when it contains several participant references.
+   // Fold rows from the same source note: first occurrence wins (explicit edge > affiliation > outgoing link), the rest collapse into `also` labels.
+   const bySource = new Map<string, ContactRelation>();
+   for (const item of [...(edges.get(note.path) ?? []), ...orgRelations, ...links.map(({ kind, target }) => ({ kind, label: labels[kind] ?? "明确关联", source: sourceOf(target), snippet: "", description: text(fields.get(target.path)?.summary) || introOf(target), occurredAt: null }))]) {
+    const existing = bySource.get(item.source.path);
+    if (!existing) { bySource.set(item.source.path, { ...item, also: [] }); continue; }
+    if (item.label !== existing.label && !existing.also!.includes(item.label)) existing.also!.push(item.label);
+   }
+   const relations = [...bySource.values()];
    const dated = relations.filter(item => item.occurredAt).sort((a, b) => Date.parse(b.occurredAt!) - Date.parse(a.occurredAt!));
    const body = introOf(note);
    const id = createHash("sha256").update(JSON.stringify([vault, ledger.entries[note.identityKey]?.noteId ?? note.identityKey])).digest("hex");

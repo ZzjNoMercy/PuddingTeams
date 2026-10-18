@@ -1,6 +1,6 @@
 import { requestURL, publicURL } from './network.mjs';
 export const PROVIDERS=['tavily','deepseek','grok'];
-export const DEFAULT_CONFIG={enabled:false,fetchEnabled:true,defaultScope:'global',fallbackEnabled:true,crossCheckEnabled:false,maxProviderAttempts:2,domesticOrder:['deepseek','tavily','grok'],globalOrder:['grok','tavily','deepseek'],proxyUrl:'',providers:{tavily:{enabled:false,model:'',searchDepth:'basic'},deepseek:{enabled:false,model:'deepseek-v4-flash'},grok:{enabled:false,model:'grok-4.7',webEnabled:true,xEnabled:true}}};
+export const DEFAULT_CONFIG={enabled:false,fetchEnabled:true,fetchFallbackEnabled:false,defaultScope:'global',fallbackEnabled:true,crossCheckEnabled:false,maxProviderAttempts:2,domesticOrder:['deepseek','tavily','grok'],globalOrder:['grok','tavily','deepseek'],proxyUrl:'',providers:{tavily:{enabled:false,model:'',searchDepth:'basic'},deepseek:{enabled:false},grok:{enabled:false,model:'grok-4.7',webEnabled:true,xEnabled:true}}};
 const KEYS={tavily:'TAVILY_API_KEY',deepseek:'DEEPSEEK_API_KEY',grok:'XAI_API_KEY'};
 export const PROVIDER_KEYS=KEYS;
 export class SearchError extends Error {constructor(message,category='provider_error'){super(message);this.category=category;}}
@@ -32,11 +32,11 @@ export function routeRequest(req,config) {
 }
 function validSource(raw,provider) {
   const url=raw?.url ?? raw?.uri; if(typeof url!=='string') return undefined;
-  try { const normalized=publicURL(url).href; return {title:String(raw.title??raw.name??new URL(normalized).hostname).slice(0,500),uri:normalized,quote:String(raw.content??raw.snippet??raw.quote??'').slice(0,8000),source_type:/(^|\.)[xt](witter)?\.com$/.test(new URL(normalized).hostname)?'x':'web',provider}; } catch {return undefined;}
+  try { const normalized=publicURL(url).href; return {title:String(raw.title??raw.name??new URL(normalized).hostname).slice(0,500),uri:normalized,quote:String(raw.content??raw.summary??raw.snippet??raw.quote??'').slice(0,8000),source_type:/(^|\.)[xt](witter)?\.com$/.test(new URL(normalized).hostname)?'x':'web',provider}; } catch {return undefined;}
 }
 export function normalizeResponse(payload,provider) {
   let text=''; const rawSources=[]; let searched=false;
-  if(provider==='tavily') {rawSources.push(...(Array.isArray(payload.results)?payload.results:[])); searched=true;}
+  if(provider==='tavily'||provider==='deepseek') {rawSources.push(...(Array.isArray(payload.results)?payload.results:[])); searched=true;}
   else {
     for(const item of payload.output??[]) {
       if(['web_search_call','x_search_call'].includes(item.type)) {searched=true;rawSources.push(...(item.action?.sources??[]));}
@@ -55,6 +55,11 @@ export function normalizeResponse(payload,provider) {
 }
 function requestBody(provider,req,options) {
   if(provider==='tavily') return {query:req.query,max_results:req.max_results,search_depth:options.searchDepth??'basic',include_answer:false,include_raw_content:false,include_images:false,include_usage:true,...(req.include_domains.length?{include_domains:req.include_domains}:{}),...(req.exclude_domains.length?{exclude_domains:req.exclude_domains}:{}),...(req.time_range?{time_range:req.time_range}:{}),...(req.scope==='domestic'?{country:'china'}:{})};
+  if(provider==='deepseek') {
+    // Standalone in-house Search API (2026-10-17): raw JSON, no model in the loop, billed per request.
+    if([...req.query].length>128) throw new SearchError('DeepSeek 搜索词上限 128 字符，请缩短或改用其他供应商','invalid_request');
+    return {query:req.query,count:req.max_results,need_content:false};
+  }
   const tools=[];
   if(req.source!=='x') {
     if(provider==='grok'&&options.webEnabled===false) throw new SearchError('Grok 网页搜索未启用','capability_disabled');
@@ -80,13 +85,13 @@ function requestBody(provider,req,options) {
     tools.push(x);
   }
   const domains=req.include_domains.length?` Only cite these domains: ${req.include_domains.join(', ')}.`:req.exclude_domains.length?` Exclude these domains: ${req.exclude_domains.join(', ')}.`:'';
-  return {model:options.model,input:`Use the enabled server-side search tools. Return concise evidence with source URLs. ${req.scope==='domestic'?'Prefer Chinese mainland public sources.':''}${domains}\n${req.query}`,tools,max_output_tokens:provider==='deepseek'?8192:1400,...(provider==='deepseek'?{tool_choice:{type:'web_search'},reasoning:{effort:'none'}}:{})};
+  return {model:options.model,input:`Use the enabled server-side search tools. Return concise evidence with source URLs. ${req.scope==='domestic'?'Prefer Chinese mainland public sources.':''}${domains}\n${req.query}`,tools,max_output_tokens:1400};
 }
 export async function providerSearch(provider,req,key,config,signal,transport=requestURL) {
-  const endpoint={tavily:'https://api.tavily.com/search',deepseek:'https://api.deepseek.com/responses',grok:'https://api.x.ai/v1/responses'}[provider];
+  const endpoint={tavily:'https://api.tavily.com/search',deepseek:'https://api.deepseek.com/v1/tools/search',grok:'https://api.x.ai/v1/responses'}[provider];
   const body=requestBody(provider,req,config.providers[provider]);
   const res=await transport(endpoint,{method:'POST',body:JSON.stringify(body),headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},proxy:config.proxyUrl,signal,timeoutMs:provider==='grok'?60000:30000,maxBytes:2*1024*1024});
-  if(res.status<200||res.status>=300) throw new SearchError(`${provider} HTTP ${res.status}`,res.status===401||res.status===403?'authentication':res.status===429?'rate_limit':'provider_http');
+  if(res.status<200||res.status>=300) throw new SearchError(res.status===402?`${provider} 账户余额不足`:`${provider} HTTP ${res.status}`,res.status===401||res.status===403?'authentication':res.status===402?'authentication':res.status===429?'rate_limit':'provider_http');
   let payload;try{payload=JSON.parse(res.body.toString('utf8'));}catch{throw new SearchError(`${provider} 响应不是 JSON`,'invalid_response');}
   if(payload.error||payload.status==='failed'||payload.status==='incomplete') throw new SearchError(`${provider} 搜索未完成${payload.incomplete_details?.reason==='max_output_tokens'?'（输出预算不足）':''}`,'provider_error');
   const result=normalizeResponse(payload,provider);
@@ -125,10 +130,8 @@ export function htmlToMarkdown(html,url) {
     .replace(/<li\b[^>]*>/gi,'\n- ').replace(/<br\s*\/?\s*>/gi,'\n').replace(/<\/(?:p|div|section|article|main|ul|ol|tr)>/gi,'\n\n').replace(/<[^>]+>/g,'');
   return {title,content:entities(body).replace(/[^\S\n]+/g,' ').replace(/\n\s*\n(?:\s*\n)+/g,'\n\n').trim()};
 }
-export async function fetchPage(raw,state,signal,transport=requestURL) {
-  if(!state.config.fetchEnabled) throw new Error('网页抓取未启用，请在设置 → 联网启用');
-  if(!raw||typeof raw.url!=='string'||raw.url.length>8192) throw new Error('url 无效');
-  const url=publicURL(raw.url);const res=await transport(url.href,{proxy:state.config.proxyUrl,signal,timeoutMs:30000});
+async function directFetch(url,state,signal,transport) {
+  const res=await transport(url.href,{proxy:state.config.proxyUrl,signal,timeoutMs:30000});
   if(res.status<200||res.status>=300) throw new Error(`网页 HTTP ${res.status}`);
   const type=String(res.headers['content-type']??'').toLowerCase();
   if(!/^(text\/|application\/(json|[^;]+\+json|xml|xhtml\+xml))/.test(type)) throw new Error('网页抓取仅支持 HTML、JSON、XML 与文本，请使用文件工具读取二进制资源');
@@ -136,11 +139,33 @@ export async function fetchPage(raw,state,signal,transport=requestURL) {
   let decoded;try{decoded=new TextDecoder(charset).decode(res.body);}catch{throw new Error('网页字符编码不受支持');}
   const page=/html/.test(type)?htmlToMarkdown(decoded,res.url??url.href):{title:new URL(res.url??url.href).hostname,content:decoded};
   const max=50000;const truncated=page.content.length>max;
-  return {uri:res.url??url.href,title:page.title,content:page.content.slice(0,max),truncated,content_type:type};
+  return {uri:res.url??url.href,title:page.title,content:page.content.slice(0,max),truncated,content_type:type,via:'direct'};
+}
+/** DeepSeek Fetch 兜底（/v1/tools/fetch）：本地直连失败后由 DeepSeek 服务端抓取，按次计费，URL 对 DeepSeek 可见。 */
+async function deepseekFetch(url,key,config,signal,transport) {
+  const res=await transport('https://api.deepseek.com/v1/tools/fetch',{method:'POST',body:JSON.stringify({url:url.href}),headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},proxy:config.proxyUrl,signal,timeoutMs:30000,maxBytes:2*1024*1024});
+  if(res.status<200||res.status>=300) throw new Error(res.status===402?'DeepSeek 账户余额不足':res.status===404?'DeepSeek 未能提取网页正文':`DeepSeek Fetch HTTP ${res.status}`);
+  let payload;try{payload=JSON.parse(res.body.toString('utf8'));}catch{throw new Error('DeepSeek Fetch 响应不是 JSON');}
+  const content=String(payload.content??'');
+  if(!content) throw new Error('DeepSeek 未能提取网页正文');
+  const max=50000;
+  return {uri:url.href,title:String(payload.title??''),content:content.slice(0,max),truncated:content.length>max,content_type:'text/markdown',via:'deepseek'};
+}
+export async function fetchPage(raw,state,signal,transport=requestURL) {
+  if(!state.config.fetchEnabled) throw new Error('网页抓取未启用，请在设置 → 联网启用');
+  if(!raw||typeof raw.url!=='string'||raw.url.length>8192) throw new Error('url 无效');
+  const url=publicURL(raw.url);
+  try { return await directFetch(url,state,signal,transport); }
+  catch(error) {
+    const key=state.keys?.[KEYS.deepseek];
+    if(!state.config.fetchFallbackEnabled||!key||signal?.aborted) throw error;
+    try { return await deepseekFetch(url,key,state.config,signal,transport); }
+    catch(fallbackError) { throw new Error(`本地抓取失败（${error instanceof Error?error.message:error}）；DeepSeek 兜底失败（${fallbackError instanceof Error?fallbackError.message:fallbackError}）`); }
+  }
 }
 export async function testProvider(provider,state,signal,transport=requestURL) {
   if(!PROVIDERS.includes(provider)) throw new Error('未知搜索供应商');
   const key=state.keys[KEYS[provider]];if(!key) throw new Error('请先保存该供应商的 API Key');
-  const req=routeRequest(searchRequest({query:provider==='deepseek'?'Use Web Search to find the official DeepSeek Responses API documentation with a source citation.':'Find the official Tavily and xAI documentation pages and provide source citations.',provider,source:provider==='grok'&&state.config.providers.grok.xEnabled?'both':'web',max_results:2}),state.config);
+  const req=routeRequest(searchRequest({query:provider==='deepseek'?'DeepSeek 网页搜索 API 文档':'Find the official Tavily and xAI documentation pages and provide source citations.',provider,source:provider==='grok'&&state.config.providers.grok.xEnabled?'both':'web',max_results:2}),state.config);
   return providerSearch(provider,req,key,state.config,signal,transport);
 }

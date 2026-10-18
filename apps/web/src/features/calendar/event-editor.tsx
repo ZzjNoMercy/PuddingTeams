@@ -1,9 +1,9 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { findCalendarPeople, getCalendarEvent, retryCalendarInteraction, setCalendarEventStatus, KnowledgeApiError, mutateCalendarEvent, type CalendarEventStatus, type CalendarPeopleSource, type CalendarEventInput, type CalendarEventRecord } from "@/lib/api";
-import { plusDay, resolveWallTime, validDay, wallTime } from "./time";
+import { plusDay, repeatedWallTime, resolveWallTime, validDay, wallTime } from "./time";
 import styles from "./calendar.module.css";
 
 export function EventEditor({ event, day, hour, zone, onClose, onSaved }: { event: CalendarEventRecord | null; day: string; hour: number; zone: string; onClose: () => void; onSaved: (event: CalendarEventRecord) => void }) {
@@ -36,9 +36,18 @@ export function EventEditor({ event, day, hour, zone, onClose, onSaved }: { even
 		if (!event?.interaction && interaction && (!next.length || next.some(p => p.bindingId !== interaction.bindingId))) setInteraction(undefined);
 	};
 	const canRecord = !allDay && kind === "event" && participants.length > 0 && participants.every(p => p.bindingId === participants[0].bindingId);
+	/** 只在当地时钟真的把这个时刻走了两遍时（夏令时回拨）才需要用户指定；国内时区永远为空。 */
+	const folds = useMemo(() => allDay ? [] : ([{ key: "start", label: "开始" }, { key: "end", label: "结束" }] as const)
+		.filter(({ key }) => repeatedWallTime(key === "start" ? start : end, timeZone))
+		.map(({ key, label }) => key === "start" ? { key, label, value: startFold, set: setStartFold } : { key, label, value: endFold, set: setEndFold }),
+	[allDay, start, end, timeZone, startFold, endFold]);
 	const operation = useRef<{ action: "create" | "update" | "cancel"; operationId: string; expectedRevision: number; event?: CalendarEventInput } | null>(null);
 	const statusOperation = useRef<{ status: CalendarEventStatus; operationId: string } | null>(null);
 	const inFlight = useRef(false), locked = pending || unconfirmed;
+	/** 时区换算失败时指明是哪个时间点。 */
+	const wall = (value: string, fold: "reject" | "earlier" | "later", label: string) => {
+		try { return resolveWallTime(value, timeZone, fold); } catch (failure) { throw new Error(`${label}：${failure instanceof Error ? failure.message : "时间无效"}`); }
+	};
 	const cancelled = event?.status === "cancelled", done = event?.status === "done", settled = cancelled || done;
 	const applyStatus = async (status: CalendarEventStatus) => {
 		if (!event || inFlight.current) return;
@@ -62,7 +71,7 @@ export function EventEditor({ event, day, hour, zone, onClose, onSaved }: { even
 				if (!cancel) {
 					const common = { title: title.trim(), description, location, kind, busy, timeZone, participants, ...(interaction ? { interaction } : {}) };
 					if (!common.title) throw new Error("请填写日程标题");
-					input = allDay ? { ...common, allDay: true, startDate: start.slice(0, 10), endDateExclusive: end.slice(0, 10) } : { ...common, allDay: false, start: event && !event.allDay && start === wallTime(event.start, timeZone) ? event.start : resolveWallTime(start, timeZone, startFold), end: event && !event.allDay && end === wallTime(event.end, timeZone) ? event.end : resolveWallTime(end, timeZone, endFold) };
+					input = allDay ? { ...common, allDay: true, startDate: start.slice(0, 10), endDateExclusive: end.slice(0, 10) } : { ...common, allDay: false, start: event && !event.allDay && start === wallTime(event.start, timeZone) ? event.start : wall(start, startFold, "开始时间"), end: event && !event.allDay && end === wallTime(event.end, timeZone) ? event.end : wall(end, endFold, "结束时间") };
 					if (input.allDay ? !validDay(input.startDate) || !validDay(input.endDateExclusive) || input.endDateExclusive <= input.startDate : input.end <= input.start) throw new Error("结束时间须晚于开始时间；全天结束日期不包含在内");
 				}
 				operation.current = { action: cancel ? "cancel" : event ? "update" : "create", operationId: crypto.randomUUID(), expectedRevision: event?.revision ?? 0, ...(input ? { event: input } : {}) };
@@ -86,8 +95,19 @@ export function EventEditor({ event, day, hour, zone, onClose, onSaved }: { even
 				<div className={styles.columns}><label>类型<select disabled={Boolean(event?.interaction)} value={kind} onChange={(e) => { setKind(e.target.value as "event" | "focus"); if (e.target.value === "focus") setInteraction(undefined); }}><option value="event">日程</option><option value="focus">专注时段</option></select></label><label>时区<input aria-label="日程时区" value={timeZone} onChange={(e) => setTimeZone(e.target.value)} placeholder="Asia/Shanghai" required /></label></div>
 				<label className={styles.check}><input type="checkbox" disabled={Boolean(event?.interaction)} checked={allDay} onChange={(e) => { setAllDay(e.target.checked); if (e.target.checked) setInteraction(undefined); setStart(e.target.checked ? start.slice(0, 10) : `${start.slice(0, 10)}T09:00`); setEnd(e.target.checked ? plusDay(start.slice(0, 10), 1) : `${start.slice(0, 10)}T10:00`); }} />全天</label>
 				<div className={styles.columns}><label>开始<input aria-label="开始时间" type={allDay ? "date" : "datetime-local"} value={start} onChange={(e) => setStart(e.target.value)} required /></label><label>{allDay ? "结束日期（不含）" : "结束"}<input aria-label="结束时间" type={allDay ? "date" : "datetime-local"} value={end} onChange={(e) => setEnd(e.target.value)} required /></label></div>
-				{!allDay && <details><summary>夏令时重复时间</summary><div className={styles.columns}>{([{ label: "开始时间", value: startFold, set: setStartFold }, { label: "结束时间", value: endFold, set: setEndFold }]).map(({ label, value, set }) => <label key={label}>{label}<select aria-label={`${label}夏令时选择`} value={value} onChange={(e) => set(e.target.value as "reject" | "earlier" | "later")}><option value="reject">重复时先提示确认</option><option value="earlier">第一次</option><option value="later">第二次</option></select></label>)}</div></details>}
-				<label className={styles.check}><input type="checkbox" checked={busy} onChange={(e) => setBusy(e.target.checked)} />占用忙闲时间</label>
+				{folds.length > 0 && <section className={styles.foldField} aria-label="夏令时重复时间">
+					<p className={styles.foldTitle}>当地这个时间会出现两次</p>
+					<p className={styles.hint}>夏令时回拨时时钟会重复走过同一段，两次对应的实际时刻不同，请选择按哪一次保存。</p>
+					<div className={styles.foldChoices}>{folds.map(({ key, label, value, set }) => <label key={key}>{label}<select aria-label={`${label}时间重复时取哪一次`} value={value} onChange={(e) => set(e.target.value as "reject" | "earlier" | "later")}><option value="reject">请选择</option><option value="earlier">较早的一次</option><option value="later">较晚的一次</option></select></label>)}</div>
+				</section>}
+				<div className={styles.busyField}>
+					<span id="event-busy-label">显示为</span>
+					<div className={styles.busyChoice} role="radiogroup" aria-labelledby="event-busy-label" aria-describedby="event-busy-hint">
+						<button type="button" role="radio" aria-checked={busy} onClick={() => setBusy(true)}>忙碌</button>
+						<button type="button" role="radio" aria-checked={!busy} onClick={() => setBusy(false)}>空闲</button>
+					</div>
+					<p id="event-busy-hint" className={styles.hint}>空闲以虚线显示，表示这段时间可以另作安排。</p>
+				</div>
 				<label>地点<input value={location} maxLength={500} onChange={(e) => setLocation(e.target.value)} /></label><label>描述<textarea value={description} maxLength={10000} rows={3} onChange={(e) => setDescription(e.target.value)} /></label>
 				<section className={styles.participants} aria-label="日程参与人"><strong>参与人</strong>
 					{participants.length > 0 && <div className={styles.peopleChips}>{participants.map(p => <button type="button" key={selectedKey(p)} onClick={() => togglePerson(p.bindingId,p.personId)} aria-label={`移除参与人${names[selectedKey(p)] ?? "联系人"}`}>{names[selectedKey(p)] ?? "联系人暂不可访问"}<span aria-hidden> ×</span></button>)}</div>}

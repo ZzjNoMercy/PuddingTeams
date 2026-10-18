@@ -206,7 +206,7 @@ export const TEAMS_SCHEMA_PRESETS: Readonly<Record<string, TeamsSchemaPreset>> =
 	},
 	memory: {
 		formatVersion: 1, schemaId: "memory", revision: 1, name: "长期记忆",
-		description: "保存有来源的事实、偏好、上下文、决策、经历与方法，由 Wiki 管理员整理并经审核更新。",
+		description: "保存有来源的事实、偏好、上下文、决策、经历与方法，由平台整理为候选并经审核更新。",
 		entities: [
 			entity("fact", "facts", [field("key", "text", true)], memoryCommon),
 			entity("preference", "preferences", [field("key", "text", true)], memoryCommon),

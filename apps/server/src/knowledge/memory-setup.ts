@@ -73,7 +73,7 @@ export class MemorySetupService {
 		const probe = await this.deps.probes.create(ownerId, root, { intent: "create" });
 		await this.requireEmpty(probe.canonicalBindingRoot);
 		const plan = await buildKnowledgePlan(ownerId, probe, {
-			name: "长期记忆", description: "记录可复用的事实、偏好、长期上下文、决策、关键经历与方法；修改交给 Wiki 管理员并经审核发布。",
+			name: "长期记忆", description: "记录可复用的事实、偏好、长期上下文、决策、关键经历与方法；修改由平台整理为候选，经审核发布。",
 			mode: "create", schemaPresetId: "memory",
 		}, await this.deps.registry.findOverlap(probe.canonicalBindingRoot));
 		return this.deps.plans.save(plan);

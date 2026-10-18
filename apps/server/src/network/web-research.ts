@@ -34,7 +34,7 @@ function validateConfig(raw: unknown): WebConfig {
   const config = structuredClone(DEFAULT_CONFIG);
   const allowed = new Set(Object.keys(config));
   if (Object.keys(value).some(key => !allowed.has(key))) throw new Error("未知联网配置字段");
-  for (const key of ["enabled", "fetchEnabled", "fallbackEnabled", "crossCheckEnabled"] as const) {
+  for (const key of ["enabled", "fetchEnabled", "fetchFallbackEnabled", "fallbackEnabled", "crossCheckEnabled"] as const) {
     if(typeof value[key] !== "boolean") throw new Error(`${key} 必须为布尔值`);
     config[key] = value[key];
   }
@@ -55,13 +55,15 @@ function validateConfig(raw: unknown): WebConfig {
   if(!value.providers||Object.keys(value.providers).some(p=>!PROVIDERS.includes(p as ProviderId))) throw new Error("供应商配置无效");
   for(const p of PROVIDERS) {
     const entry=value.providers[p];
-    if(!entry||typeof entry.enabled!=="boolean"||typeof entry.model!=="string"||entry.model.length>120||/[\r\n]/.test(entry.model)) throw new Error(`${p} 配置无效`);
     const fields=p==="tavily"?["enabled","model","searchDepth"]:p==="grok"?["enabled","model","webEnabled","xEnabled"]:["enabled","model"];
+    if(!entry||typeof entry.enabled!=="boolean") throw new Error(`${p} 配置无效`);
     if(Object.keys(entry).some(k=>!fields.includes(k))) throw new Error(`${p} 未知配置字段`);
-    if(p!=="tavily"&&!entry.model.trim()) throw new Error(`${p} 模型不能为空`);
+    // DeepSeek 走自研 Search 裸 API，无需模型；保留接受 model 字段（忽略）以免旧配置不可读。
+    if(entry.model!==undefined&&(typeof entry.model!=="string"||entry.model.length>120||/[\r\n]/.test(entry.model))) throw new Error(`${p} 配置无效`);
+    if(p!=="tavily"&&p!=="deepseek"&&(typeof entry.model!=="string"||!entry.model.trim())) throw new Error(`${p} 模型不能为空`);
     if(p==="tavily"&&!["basic","advanced"].includes(entry.searchDepth??"")) throw new Error("Tavily 搜索深度无效");
     if(p==="grok"&&(typeof entry.webEnabled!=="boolean"||typeof entry.xEnabled!=="boolean")) throw new Error("Grok 工具开关无效");
-    config.providers[p]={...entry,model:entry.model.trim()};
+    config.providers[p]=p==="deepseek"?{enabled:entry.enabled}:{...entry,model:(entry.model??"").trim()};
   }
   return config;
 }
@@ -74,7 +76,10 @@ export class WebResearchSettings {
     const raw=(await this.credentials.getSecrets("platform"))["STATE"];
     if(!raw) return {revision:0,config:structuredClone(DEFAULT_CONFIG),keys:{},tests:{},grants:{}};
     const value=JSON.parse(raw) as StoredState;
-    return {...value,grants:value.grants ?? {},config:validateConfig(value.config)};
+    // 旧快照可能缺少后增的配置键：读取时以默认值补齐，PUT 仍走严格校验。
+    const defaults=structuredClone(DEFAULT_CONFIG);
+    const merged={...defaults,...value.config,providers:{...defaults.providers,...value.config?.providers}};
+    return {...value,grants:value.grants ?? {},config:validateConfig(merged)};
   }
   async state():Promise<StoredState> {
     await this.queue;

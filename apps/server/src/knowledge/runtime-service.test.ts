@@ -206,3 +206,33 @@ test("全库默认挂载只注入简短路由，已挂载库的无效noteRef须�
 		assert.equal((await call(surface, "knowledge_read", { bindingId: second.id, noteRef: note.noteRef })).content, `# 第二库\n${secret}`);
 	} finally { await rm(f.root, { recursive: true, force: true }); }
 });
+
+test("search/glob 省略 bindingId 扇出全部挂载库，memory 库结果加权置顶", async () => {
+	const f = await fixture();
+	try {
+		// 第二库：memory schema，内容为个人饮食偏好。
+		const memoryRoot = path.join(f.root, "memory-vault"); await mkdir(memoryRoot);
+		await writeFile(path.join(memoryRoot, "wiki.schema.json"), JSON.stringify(copySchemaPreset("memory")));
+		await writeFile(path.join(memoryRoot, "prefs.md"), "# 偏好记录\n不吃鱼；喜欢牛肉和豆制品\n");
+		const memory = await f.bindings.create({ ownerId: "owner", rootPath: memoryRoot, name: "Memory", description: "个人记忆" });
+		await f.selections.set("owner", f.scope.contextKey, 1, [f.binding.id, memory.id]);
+		const surface = await f.runtime.mount(f.scope);
+
+		const search = await call(surface, "knowledge_search", { query: "喜欢 吃" });
+		const libraries = search.libraries as Array<{ bindingId: string; memory: boolean }>;
+		assert.deepEqual(libraries.map(item => item.bindingId), [memory.id, f.binding.id], "memory 库排第一");
+		const merged = search.results as Array<{ bindingId: string; memory: boolean; path: string }>;
+		assert.equal(merged[0]?.bindingId, memory.id, "memory 命中置顶");
+		assert.equal(merged[0]?.memory, true);
+		assert.ok(merged.every(hit => hit.bindingId === memory.id || hit.memory === false));
+
+		const glob = await call(surface, "knowledge_glob", {});
+		const globLibraries = glob.libraries as Array<{ bindingId: string; memory: boolean; notes: Array<{ path: string }> }>;
+		assert.deepEqual(globLibraries.map(item => item.bindingId), [memory.id, f.binding.id]);
+		assert.ok(globLibraries[0]!.notes.some(note => note.path === "prefs.md"));
+
+		// 显式 bindingId 保持原单库返回结构。
+		const single = await call(surface, "knowledge_search", { bindingId: f.binding.id, query: "事实" });
+		assert.ok(Array.isArray(single.results) && single.libraries === undefined);
+	} finally { await rm(f.root, { recursive: true, force: true }); }
+});

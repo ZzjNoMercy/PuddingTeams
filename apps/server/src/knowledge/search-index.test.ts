@@ -54,6 +54,27 @@ test("索引仅从账本+快照构建；title/heading/body 排序；pending_new 
 	void ledger;
 });
 
+test("多关键词按空白分词 OR 匹配：命中词越多排名越高，连续短语优先", async () => {
+	const { acceptance, objects, index } = await fixture("multiterm");
+	await acceptNotes(acceptance, objects, "b1", {
+		"prefs.md": "---\ntitle: 饮食偏好\n---\n不吃鱼；喜欢牛肉和豆制品\n",
+		"other.md": "只提到喜欢，没有别的词\n",
+		"exact.md": "这里出现连续短语 喜欢 吃 口味 食物 偏好 的整串\n",
+	}, 0);
+	const built = await index.load("b1", await acceptance.getSnapshot("b1"));
+
+	// 复现 2026-10-18 饮食偏好漏检：空格拼接的多词查询不能再整串匹配失败。
+	const { results } = searchBuiltIndex(built, "喜欢 吃 口味 食物 偏好", 20);
+	assert.ok(results.some((hit) => hit.path === "prefs.md"), "分词后必须命中饮食偏好笔记");
+	// exact.md 含整串短语，应排最前；prefs.md 命中 3 词，高于只命中 1 词的 other.md。
+	assert.equal(results[0]?.path, "exact.md");
+	assert.ok(results.findIndex((hit) => hit.path === "prefs.md") < results.findIndex((hit) => hit.path === "other.md"));
+
+	// 单词查询行为不变。
+	const single = searchBuiltIndex(built, "偏好", 20);
+	assert.ok(single.results.some((hit) => hit.path === "prefs.md"));
+});
+
 test("缓存复用与失效：acceptanceRevision 变化后重建", async () => {
 	const { acceptance, objects, index } = await fixture("cache");
 	let ledger = await acceptNotes(acceptance, objects, "b1", { "a.md": "# A\n" }, 0);

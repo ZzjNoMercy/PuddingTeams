@@ -307,4 +307,4 @@ Group  显示“群聊协作提示词”
 
 ## 长期记忆运行时补充（2026-09-30）
 
-memory 初始化后默认挂载到当前用户会话，可显式取消。普通 Pi Worker 执行业务任务时与 Pi Manager 一样获得按需查询与主动更新规则；发现有长期价值、明确纠正或忘记要求时，普通 Worker 用宿主提供的 `memory_request_update` 提交仅针对默认 memory 的请求；通用知识整理入口只保留给内置 Wiki worker 与 Manager。普通 Worker 对其他知识库只读。宿主启动 Wiki worker 生成待审核候选，Manager 不作为强制中转。该规则由本轮实际 memory 挂载与请求工具共同决定，不复制全库或将 AGENTS.md 强行加入普通 Worker 的全局配置。后台编译器仅消费其目标库操作契约，不递归注入请求规则；审批、来源和发布门保持原控制面。仅覆盖 Pi 接入。
+memory 初始化后默认挂载到当前用户会话，可显式取消。普通 Pi Worker 执行业务任务时与 Pi Manager 一样获得按需查询与主动更新规则；发现有长期价值、明确纠正或忘记要求时，普通 Worker 用宿主提供的 `memory_request_update` 提交仅针对默认 memory 的请求；通用知识整理入口只保留给内置 Wiki worker 与 Manager。普通 Worker 对其他知识库只读。宿主启动后台整理任务生成待审核候选（2026-10-18 起后台执行者与 Wiki 管理员解耦，该 Agent 停用不影响），Manager 不作为强制中转。该规则由本轮实际 memory 挂载与请求工具共同决定，不复制全库或将 AGENTS.md 强行加入普通 Worker 的全局配置。后台编译器仅消费其目标库操作契约，不递归注入请求规则；审批、来源和发布门保持原控制面。仅覆盖 Pi 接入。

@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import Image from "next/image";
-import { AlertCircleIcon, BotIcon, CheckCircle2Icon, ChevronDownIcon, FileTextIcon, GlobeIcon, KeyRoundIcon, LoaderIcon, SearchIcon, Settings2Icon, ShieldCheckIcon, SparklesIcon } from "lucide-react";
+import { AlertCircleIcon, BotIcon, CheckCircle2Icon, ChevronDownIcon, FileTextIcon, GlobeIcon, KeyRoundIcon, LoaderIcon, RefreshCwIcon, SearchIcon, Settings2Icon, ShieldCheckIcon, SparklesIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -11,7 +11,7 @@ import { getWebResearchSettings, saveWebResearchSettings, testAndSaveWebResearch
 
 const providers: WebSearchProvider[] = ["tavily", "deepseek", "grok"];
 const names = { tavily: "Tavily", deepseek: "DeepSeek", grok: "Grok" };
-const descriptions = { tavily: "为搜索而生，返回网页来源与摘要。", deepseek: "通过模型的服务端搜索工具检索网页。", grok: "检索全球网页与 X，支持图片和视频理解。" };
+const descriptions = { tavily: "为搜索而生，返回网页来源与摘要。", deepseek: "自研搜索引擎直连检索，按次计费，无需模型。", grok: "检索全球网页与 X，支持图片和视频理解。" };
 const orders: WebSearchProvider[][] = [["deepseek", "tavily", "grok"], ["grok", "tavily", "deepseek"], ["tavily", "deepseek", "grok"], ["tavily", "grok", "deepseek"], ["deepseek", "grok", "tavily"], ["grok", "deepseek", "tavily"]];
 
 function ProviderMark({ provider, large = false }: { provider: WebSearchProvider; large?: boolean }) {
@@ -100,6 +100,7 @@ export function WebResearchSettingsPanel() {
   <div className="network-capabilities">
    <div className="network-capability"><span className="network-icon"><SearchIcon /></span><div><h3>联网搜索</h3><p>查找实时信息 · {readyCount} 家供应商就绪</p></div><Toggle label="启用联网搜索" checked={config.enabled} disabled={Boolean(busy)} onChange={enabled => patch({ enabled })} /></div>
    <div className="network-capability"><span className="network-icon"><FileTextIcon /></span><div><h3>网页阅读</h3><p>读取指定 URL 正文，无需搜索密钥</p></div><Toggle label="启用网页阅读 fetch_url" checked={config.fetchEnabled} disabled={Boolean(busy)} onChange={fetchEnabled => patch({ fetchEnabled })} /></div>
+   <div className="network-capability"><span className="network-icon"><RefreshCwIcon /></span><div><h3>抓取兜底</h3><p>本地直连失败时改用 DeepSeek 抓取，按次计费，URL 将发送给 DeepSeek</p></div><Toggle label="本地抓取失败时使用 DeepSeek 兜底" checked={config.fetchFallbackEnabled} disabled={Boolean(busy) || !config.fetchEnabled} onChange={fetchFallbackEnabled => patch({ fetchFallbackEnabled })} /></div>
   </div>
   <div className="network-section-heading">
    <Tabs label="联网设置" selected={section} onChange={setSection} items={[{ id: "providers", content: <><GlobeIcon />搜索供应商</> }, { id: "workers", content: <><ShieldCheckIcon />Worker 授权<span className="network-count">{authorized}</span></> }]} />
@@ -113,7 +114,7 @@ export function WebResearchSettingsPanel() {
      <div className="network-provider-heading"><ProviderMark provider={provider} large /><div><h3>{names[provider]}<span className="network-status" data-status={info.test?.status ?? "unset"}>{info.test?.status === "ready" ? "已通过测试" : info.test?.status === "error" ? "测试未通过" : "待测试"}</span></h3><p>{descriptions[provider]}</p></div><Toggle label={`启用 ${names[provider]}`} checked={item.enabled} disabled={Boolean(busy)} onChange={enabled => patchProvider({ enabled })} /></div>
      <fieldset disabled={Boolean(busy)} className="network-provider-fields">
       <label className="network-field"><span><KeyRoundIcon />API Key</span><Input type="password" autoComplete="new-password" aria-label={`${names[provider]} API Key`} value={keys[provider] ?? ""} placeholder={info.configured ? info.credentialSource === "model" ? "沿用模型页密钥，输入可单独覆盖" : "已配置，留空保留" : "输入 API Key"} onChange={e => setKeys(old => { const next = { ...old }; if (e.target.value) next[provider] = e.target.value; else delete next[provider]; return next; })} /><div className="network-field-note"><span>{keys[provider] === "" ? "保存后清除独立密钥" : keys[provider]?.trim() ? "当前输入待验证，通过后加密保存" : info.credentialSource === "model" ? "已沿用模型页凭据" : info.configured ? "密钥已加密保存" : "尚未配置密钥"}</span>{info.credentialSource === "network" && <button type="button" onClick={() => setKeys(old => ({ ...old, [provider]: "" }))}>清除独立密钥</button>}</div></label>
-      <label className="network-field"><span><Settings2Icon />{provider === "tavily" ? "搜索深度" : "搜索模型"}</span>{provider === "tavily" ? <Picker label="Tavily 搜索深度" value={item.searchDepth ?? "basic"} onChange={searchDepth => patchProvider({ searchDepth: searchDepth as "basic" | "advanced" })}><SelectItem value="basic">基础 · 快速检索</SelectItem><SelectItem value="advanced">深入 · 更完整的内容</SelectItem></Picker> : <Input aria-label={`${names[provider]} 搜索模型`} value={item.model} onChange={e => patchProvider({ model: e.target.value })} />}<span className="network-field-note">{provider === "tavily" ? "深入搜索可能消耗更多额度" : "需要模型支持真实的服务端搜索"}</span></label>
+      {provider !== "deepseek" && <label className="network-field"><span><Settings2Icon />{provider === "tavily" ? "搜索深度" : "搜索模型"}</span>{provider === "tavily" ? <Picker label="Tavily 搜索深度" value={item.searchDepth ?? "basic"} onChange={searchDepth => patchProvider({ searchDepth: searchDepth as "basic" | "advanced" })}><SelectItem value="basic">基础 · 快速检索</SelectItem><SelectItem value="advanced">深入 · 更完整的内容</SelectItem></Picker> : <Input aria-label={`${names[provider]} 搜索模型`} value={item.model ?? ""} onChange={e => patchProvider({ model: e.target.value })} />}<span className="network-field-note">{provider === "tavily" ? "深入搜索可能消耗更多额度" : "需要模型支持真实的服务端搜索"}</span></label>}
      </fieldset>
      {provider === "grok" && <div className="network-grok-sources"><label>网页搜索<Toggle label="Grok 网页搜索" checked={Boolean(item.webEnabled)} disabled={Boolean(busy)} onChange={webEnabled => patchProvider({ webEnabled })} /></label><label>X 搜索<Toggle label="Grok X 搜索" checked={Boolean(item.xEnabled)} disabled={Boolean(busy)} onChange={xEnabled => patchProvider({ xEnabled })} /></label></div>}
      <div className="network-test"><div><p role="status">{dirty ? <ShieldCheckIcon /> : info.test?.status === "ready" ? <CheckCircle2Icon className="text-emerald-600" /> : info.test?.status === "error" ? <AlertCircleIcon className="text-destructive" /> : <ShieldCheckIcon />}<span>{dirty ? "当前修改尚未验证" : info.test?.status === "ready" ? "真实搜索已验证，可参与自动路由" : info.test?.status === "error" ? "未验证到可用的联网搜索" : "配置后测试，通过才加入自动路由"}</span></p><small>先测试当前配置，通过后保存本页修改；可能产生供应商费用。</small></div><Button size="sm" variant="outline" disabled={Boolean(busy) || !(keys[provider]?.trim() || info.configured)} onClick={() => void test()}>{busy === provider ? <LoaderIcon className="size-3 animate-spin" /> : <SearchIcon className="size-3" />}{busy === provider ? "测试并保存中…" : "测试并保存"}</Button></div>

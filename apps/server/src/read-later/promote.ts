@@ -10,7 +10,6 @@ import type { ReadLaterCaptureService } from "./capture-service.js";
 import type { KnowledgeSourceStore } from "../knowledge/sources.js";
 import type { WikiCuratorService } from "../knowledge/curator-jobs.js";
 import type { KnowledgeBindingRegistry } from "../knowledge/bindings.js";
-import type { TeamsStore } from "../store/teams.js";
 import { imageAssetPath } from "../knowledge/image-publication.js";
 export interface PromoteInput {
   operationId: string;
@@ -31,7 +30,6 @@ export class ReadLaterPromoter {
       sources: KnowledgeSourceStore;
       curator: WikiCuratorService;
       bindings: KnowledgeBindingRegistry;
-      teams: TeamsStore;
     },
   ) {}
   async promote(ownerId: string, input: PromoteInput) {
@@ -80,14 +78,6 @@ export class ReadLaterPromoter {
     if (old && old.requestHash !== hash)
       throw new ReadLaterError("conflict", "operationId 已用于不同整理请求");
     await this.deps.bindings.requireUsable(ownerId, bindingId);
-    const agent = (await this.deps.teams.listAgents()).find(
-      (a) =>
-        a.builtinId === "wiki" &&
-        a.enabled !== false &&
-        a.connector?.connectorId === "pi" &&
-        a.connector.transport === "sdk",
-    );
-    if (!agent) throw new ReadLaterError("unavailable", "请先启用 Wiki 管理员");
     let promotion: Promotion | undefined = old;
     if (!promotion) {
       // Validate the entire selection before freezing any source.
@@ -167,7 +157,7 @@ export class ReadLaterPromoter {
       ownerId,
       operationId: `read-later:${input.operationId}`,
       bindingId,
-      agentId: agent.name,
+      agentId: "wiki",
       task: promotion.task,
       sourceIds: promotion.sourceIds,
     });

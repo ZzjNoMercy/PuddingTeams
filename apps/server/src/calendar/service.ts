@@ -139,10 +139,16 @@ export class CalendarService {
   if (!usable) return { ...event, interactionState: { bindingId, status: "needs_attention", message: "关联人脉库暂不可访问；日程已保存" } };
   const file = record?.batch.files[0], path = file?.targetPath;
   const status = record?.status === "published" ? "published" : record?.status === "pending_review" || record?.status === "approved" || record?.status === "publishing" ? "pending_review" : "needs_attention";
+  // 过期作废（review_window_expired）与内容冲突的处置路径不同，别用同一句话糊过去。
+  const message = status === "published" ? "往来记录已发布"
+   : status === "pending_review" ? "往来记录等待审核；日程已保存"
+   : record?.status === "conflict" && record.conflictReason === "review_window_expired" ? "往来候选已过期作废，日程已保存"
+   : record?.status === "conflict" ? "往来候选需重新确认，日程已保存"
+   : "日程已保存，往来记录尚未同步。请重试或在知识库处理";
   return { ...event, noteRefs: path ? [{ bindingId, normalizedRelativePath: path }] : event.noteRefs,
    interactionState: { bindingId, status, ...(path ? { path, noteUrl: `/knowledge?${new URLSearchParams({ vault: bindingId, note: path })}` } : {}),
     ...(record ? { batchId: record.batch.id, reviewUrl: `/knowledge/review?batch=${encodeURIComponent(record.batch.id)}` } : {}),
-    message: status === "published" ? "往来记录已发布" : status === "pending_review" ? "往来记录等待审核；日程已保存" : "日程已保存，往来记录尚未同步。请重试或在知识库处理" } };
+    message } };
  }
  async mutate(ownerId: string, action: "create" | "update" | "cancel", id: string | undefined, operationId: unknown, expectedRevision: unknown, input?: unknown, scope?: Scope, guard?: () => Promise<void>): Promise<StatusSyncedCalendarEvent> {
   // Cancellation is a status transition: it syncs the linked wiki note directly

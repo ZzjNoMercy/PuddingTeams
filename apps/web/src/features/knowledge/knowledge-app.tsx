@@ -435,7 +435,7 @@ export function KnowledgeApp() {
 									className="flex items-center gap-1.5 rounded border border-border px-3 py-2 text-sm"
 								>
 									<SparklesIcon size={15} />
-									Wiki 管理员
+									添加资料
 								</button>
 							</>
 						) : null}

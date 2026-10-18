@@ -416,7 +416,7 @@ invoker.setConversationHistory(async (agent, ctx) => {
 
 const readLaterStore = new ReadLaterStore(path.join(paths.state, "read-later"));
 const readLaterCapture = new ReadLaterCaptureService(readLaterStore);
-const readLaterPromoter = new ReadLaterPromoter({ store: readLaterStore, capture: readLaterCapture, sources: knowledgeSources, curator: wikiCurator, bindings: knowledgeRegistry, teams });
+const readLaterPromoter = new ReadLaterPromoter({ store: readLaterStore, capture: readLaterCapture, sources: knowledgeSources, curator: wikiCurator, bindings: knowledgeRegistry });
 knowledgeRuntime.setChatIntake(async (session) => { await store.ensureSessionFile(session.sessionId); await chatKnowledgeIntakes.admitManager(session); },
 	(sessionId, prompt, images) => chatKnowledgeIntakes.observeExecution(sessionId, prompt, images));
 const webResearchCredentials = new CredentialsStore(path.join(paths.secrets, "web-research"));

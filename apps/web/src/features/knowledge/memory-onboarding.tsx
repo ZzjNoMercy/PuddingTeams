@@ -71,7 +71,7 @@ export function MemoryOnboarding() {
 			<DialogHeader>
 				<div className="mb-2 flex size-11 items-center justify-center rounded-xl bg-primary/10 text-primary"><BrainIcon size={24} /></div>
 				<DialogTitle>{configured ? "长期记忆已就绪" : plan ? "确认长期记忆的保存位置" : "给长期记忆一个家"}</DialogTitle>
-				<DialogDescription>把偏好、决策和有用的经验保存在自己的文件夹里，随时查看和编辑。Agent 的修改会交给 Wiki 管理员，审核后才会发布。</DialogDescription>
+				<DialogDescription>把偏好、决策和有用的经验保存在自己的文件夹里，随时查看和编辑。Agent 的修改由平台整理为候选，审核后才会发布。</DialogDescription>
 			</DialogHeader>
 			<DialogBody>
 				{configured ? <div className="space-y-4">
