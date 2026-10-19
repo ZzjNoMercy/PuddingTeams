@@ -9,11 +9,10 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
-import { BrainIcon, ChevronDownIcon } from "lucide-react";
+import { BrainIcon, ChevronDownIcon, ChevronRightIcon } from "lucide-react";
 import type { ComponentProps, ReactNode } from "react";
 import { createContext, memo, useContext, useEffect, useState } from "react";
 import { reasoningPlugins } from "@/core/streamdown/plugins";
-import { thinkingElapsedSeconds } from "@/lib/thinking-timing";
 import { Shimmer } from "./shimmer";
 import { ClipboardSafeStreamdown } from "./streamdown";
 
@@ -122,48 +121,14 @@ export type ReasoningTriggerProps = ComponentProps<
   hasContent?: boolean;
 };
 
-const LiveTimer = ({ startTime }: { startTime: number }) => {
-  const [elapsed, setElapsed] = useState(() =>
-    thinkingElapsedSeconds(startTime),
+// 整轮时长由 RunProcessSection 统一显示；推理行只表达「正在想 / 想完了」，
+// 避免同一个 bubble 里出现两个跳动时钟。
+const defaultGetThinkingMessage = (isStreaming: boolean) =>
+  isStreaming ? (
+    <Shimmer duration={1}>深度思考中</Shimmer>
+  ) : (
+    <span>已深度思考</span>
   );
-
-  useEffect(() => {
-    const calculateElapsed = () => thinkingElapsedSeconds(startTime);
-    setElapsed(calculateElapsed());
-
-    const interval = setInterval(() => {
-      setElapsed(calculateElapsed());
-    }, 1000);
-
-    return () => clearInterval(interval);
-  }, [startTime]);
-
-  return (
-    <span className="flex items-center gap-2">
-      <Shimmer duration={1}>Thinking...</Shimmer>
-      <span className="text-muted-foreground/80">({elapsed}s)</span>
-    </span>
-  );
-};
-
-const defaultGetThinkingMessage = (
-  isStreaming: boolean,
-  duration?: number,
-  startTime?: number | null,
-) => {
-  if (isStreaming && startTime != null && startTime !== undefined) {
-    return <LiveTimer startTime={startTime} />;
-  }
-  if (isStreaming) {
-    return <Shimmer duration={1}>Thinking...</Shimmer>;
-  }
-  // duration 0 = sub-second turn (floor of ms/1000); without this branch
-  // merging 0 into "a few seconds", the trigger shimmers forever post-stream.
-  if (duration === undefined || duration === 0) {
-    return <span>Thought for a few seconds</span>;
-  }
-  return <span>Thought for {duration} seconds</span>;
-};
 
 export const ReasoningTrigger = memo(
   ({
@@ -189,12 +154,11 @@ export const ReasoningTrigger = memo(
             <BrainIcon className="size-4" />
             {getThinkingMessage(isStreaming, duration, startTime)}
             {hasContent && (
-              <ChevronDownIcon
-                className={cn(
-                  "size-4 transition-transform",
-                  isOpen ? "rotate-180" : "rotate-0",
-                )}
-              />
+              isOpen ? (
+                <ChevronDownIcon className="size-4" />
+              ) : (
+                <ChevronRightIcon className="size-4" />
+              )
             )}
           </>
         )}

@@ -167,6 +167,8 @@ export interface PiAssistantMessage {
 	errorMessage?: string;
 	usage?: PiUsage;
 	timestamp?: number;
+	/** Milliseconds from timestamp until this response ended (pi SDK, monotonic). */
+	durationMs?: number;
 }
 
 export interface PiToolResultMessage {
@@ -263,6 +265,8 @@ export interface ChatMessage {
 	thinking?: string;
 	toolCalls: ToolCallView[];
 	timestamp: number;
+	/** assistant：provider 从 timestamp 起算到本次回复结束的毫秒数（pi SDK 的 durationMs）。 */
+	durationMs?: number;
 	streaming: boolean;
 	/** Pi terminal marker; absent on a live history overlay that can still receive updates. */
 	piStopReason?: string;

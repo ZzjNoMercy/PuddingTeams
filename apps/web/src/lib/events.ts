@@ -124,6 +124,7 @@ export function renderPiMessage(m: PiAssistantMessage): {
 	thinking?: string;
 	toolCalls: ToolCallView[];
 	usage?: PiUsage;
+	durationMs?: number;
 	puddingMessageId?: string;
 	puddingHistorical?: boolean;
 	piStopReason?: string;
@@ -150,6 +151,7 @@ export function renderPiMessage(m: PiAssistantMessage): {
 	return {
 		content: visibleContent,
 		thinking: thinking.length ? thinking : undefined,
+		durationMs: typeof m.durationMs === "number" ? m.durationMs : undefined,
 		toolCalls,
 		usage: m.usage,
 		puddingMessageId: m.puddingMessageId,

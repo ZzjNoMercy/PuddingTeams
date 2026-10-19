@@ -17,6 +17,7 @@ import {
 	ReasoningContent,
 	ReasoningTrigger,
 } from "@/components/ai-elements/reasoning";
+import { Shimmer } from "@/components/ai-elements/shimmer";
 import { Task, TaskContent, TaskTrigger } from "@/components/ai-elements/task";
 import { Badge } from "@/components/ui/badge";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -27,6 +28,7 @@ import { delegateWorker, groupConsecutiveModelErrors, isDelegateCall, recoveredR
 import { useAgentLabel } from "@/lib/avatars";
 import { formatTokens } from "@/lib/session-stats";
 import { toolSummary } from "@/lib/tool-summary";
+import { formatThinkingDuration } from "@/lib/thinking-timing";
 import { cancelDelegation, getKnowledgeSelection, listKnowledgeBindings, openRoomFile, readKnowledgeNote, type KnowledgeBindingSummary } from "@/lib/api";
 import type { ChatMessage, ToolCallView, WindowType } from "@/lib/types";
 import { toast } from "sonner";
@@ -523,13 +525,19 @@ function WorkerTaskEntry({
 	actions?: React.ReactNode;
 	children?: React.ReactNode;
 }) {
-	// worker 工作过程：运行中/完成都默认展开； chevron 折叠整卡（两种状态一致），
-	// 完成态的长结果另有 clamp，运行中的长任务默认折叠成三行可展开。
+	// worker 工作过程：运行中展开看进度，完成后默认收成一行摘要（任务首行 + 状态），
+	// chevron 可再展开整卡；完成态的长结果另有 clamp。
 	// worker prop 是内部 id（头像/详情用），展示渲染显示名。
 	const workerLabel = useAgentLabel(worker);
 	const { renderInlineProcess } = useWorkerProcessDrawer();
 	const finished = !running && result !== undefined && result !== "";
-	const [open, setOpen] = useState(true);
+	const [open, setOpen] = useState(!finished);
+	const [wasFinished, setWasFinished] = useState(finished);
+	// 运行中 → 完成时自动折叠一次；历史消息挂载即按完成态收起。
+	if (finished !== wasFinished) {
+		setWasFinished(finished);
+		if (finished) setOpen(false);
+	}
 	const [resultOpen, setResultOpen] = useState(true);
 	const [taskOpen, setTaskOpen] = useState(false);
 	const { rootRef, toggle: toggleKeepingAnchor } = useAnchorPreservingToggle<HTMLDivElement>();
@@ -943,7 +951,8 @@ function ToolCallItem({
 		}
 	}
 	return (
-		<Task defaultOpen={call.status === "running" || call.status === "error"}>
+		// 工具调用过程默认收起：只保留一行「状态 · 工具名」，args/结果点开再看。
+		<Task defaultOpen={false}>
 			<TaskTrigger title={`${TOOL_STATUS_LABEL[call.status]} · ${call.name}`} icon={toolCallIcon(call.name)} />
 			<TaskContent>
 				{call.args !== undefined && (
@@ -1402,6 +1411,133 @@ function ToolSummaryRow({
 
 type AssistantNode = { merged: ChatMessage[] } | { single: ChatMessage };
 
+type AssistantSegment = {
+	m: ChatMessage;
+	messages: ChatMessage[];
+	showThinking: boolean;
+	showContent: boolean;
+	foldCalls: ToolCallView[];
+	cardCalls: ToolCallView[];
+	recovered: boolean;
+};
+
+/**
+ * 连续「只有思考/工具、没有正文」的 assistant 段合成一个过程段：
+ * 一次 run 跑几轮 tool loop 时，折叠行只留一条「已深度思考」和一条工具摘要，
+ * 而不是每轮各出一条。正文段不参与合并，保持与回答的先后关系；
+ * 合并后计时从段内第一条 assistant turn 起算（含中间工具等待）。
+ */
+function mergeProcessSegments(segments: AssistantSegment[]): AssistantSegment[] {
+	const merged: AssistantSegment[] = [];
+	for (const segment of segments) {
+		const prev = merged[merged.length - 1];
+		const processOnly = !segment.showContent && segment.cardCalls.length === 0;
+		const prevProcessOnly = prev ? !prev.showContent && prev.cardCalls.length === 0 : false;
+		if (prev && processOnly && prevProcessOnly) {
+			prev.showThinking = prev.showThinking || segment.showThinking;
+			prev.foldCalls = prev.foldCalls.concat(segment.foldCalls);
+			const thinking = [prev.m.thinking, segment.m.thinking].filter(Boolean).join("\n\n");
+			prev.m = {
+				...segment.m,
+				id: prev.m.id,
+				timestamp: prev.m.timestamp,
+				thinking: thinking || undefined,
+				streaming: prev.m.streaming || segment.m.streaming,
+			};
+			continue;
+		}
+		merged.push({ ...segment });
+	}
+	return merged;
+}
+
+/**
+ * 整轮过程折叠（对齐 deepseek-harness 的 turn process）：
+ * - 运行中：过程保持展开，抬头显示「深度求索中 · 用时 N」；
+ * - 结束后：过程默认收起，抬头显示「已完成 · 用时 N」，点开才看思考、工具与阶段回复；
+ * - 失败：过程保持展开且不能收起，抬头显示「本轮失败」。
+ * 最终答案正文不参与折叠，始终显示。
+ */
+function RunProcessSection({
+	running,
+	failed,
+	hasProcess,
+	startedAt,
+	recordedMs,
+	children,
+}: {
+	running: boolean;
+	failed: boolean;
+	hasProcess: boolean;
+	startedAt: number;
+	/** pi 落盘的整轮时长；历史加载也能拿到，优先于客户端观察值。 */
+	recordedMs?: number;
+	children: ReactNode;
+}) {
+	const [open, setOpen] = useState(false);
+	const [endedMs, setEndedMs] = useState<number | null>(null);
+	const observedRunning = useRef(running);
+	const { rootRef, toggle } = useAnchorPreservingToggle<HTMLDivElement>();
+	useEffect(() => {
+		if (running) {
+			observedRunning.current = true;
+			return;
+		}
+		// 运行 → 结束的第一次提交记下整轮用时；历史加载（从未运行过）不显示用时。
+		if (observedRunning.current && endedMs === null) setEndedMs(Math.max(1000, Date.now() - startedAt));
+	}, [running, startedAt, endedMs]);
+	const expanded = running || failed || open;
+	const settledMs = recordedMs ?? endedMs ?? undefined;
+	const seconds = settledMs === undefined ? undefined : Math.max(1, Math.round(settledMs / 1000));
+	const collapsible = hasProcess;
+	const interactive = collapsible && !running && !failed;
+	// 没有过程、也没有可显示的用时（历史里的普通问答）不占一行。
+	if (!running && !failed && !hasProcess && seconds === undefined) return null;
+	return (
+		<div ref={rootRef} className="flex w-full flex-col gap-2">
+			<button
+				type="button"
+				disabled={running || failed || !hasProcess}
+				aria-expanded={interactive ? open : undefined}
+				onClick={() => toggle(setOpen)}
+				className="flex items-center gap-1.5 text-xs text-muted-foreground transition-colors enabled:hover:text-foreground disabled:cursor-default"
+			>
+				{interactive ? (open ? (
+					<ChevronDownIcon className="size-3.5 shrink-0" />
+				) : (
+					<ChevronRightIcon className="size-3.5 shrink-0" />
+				)) : null}
+				{running ? (
+					<Shimmer as="span" duration={1}>深度求索中</Shimmer>
+				) : (
+					<span>{failed ? "本轮失败" : "已完成"}</span>
+				)}
+				{running ? (
+					<LiveRunDuration startedAt={startedAt} />
+				) : !failed && seconds !== undefined ? (
+					<span className="tabular-nums">· 用时 {formatThinkingDuration(seconds)}</span>
+				) : null}
+			</button>
+			{collapsible ? (
+				<Collapsible open={expanded}>
+					<CollapsibleContent>{children}</CollapsibleContent>
+				</Collapsible>
+			) : null}
+		</div>
+	);
+}
+
+/** 运行中的整轮用时；每秒只重渲染这一行，不带着整棵消息树跳动。 */
+function LiveRunDuration({ startedAt }: { startedAt: number }) {
+	const [now, setNow] = useState(() => Date.now());
+	useEffect(() => {
+		const timer = setInterval(() => setNow(Date.now()), 1000);
+		return () => clearInterval(timer);
+	}, []);
+	const seconds = Math.max(1, Math.floor((now - startedAt) / 1000));
+	return <span className="tabular-nums">· 用时 {formatThinkingDuration(seconds)}</span>;
+}
+
 /**
  * 合并气泡正文：连续 assistant 段（一个 run 的多个 turn，常只有 thinking+工具、
  * 无正文）渲染为一条气泡，段内按 thinking → 正文 → 工具摘要行 顺序排布。
@@ -1448,7 +1584,7 @@ function AssistantGroupBody({
 				}
 				const visibleMessages = node.merged
 					.filter((m) => Boolean(m.thinking) || (m.streaming && !m.content && m.toolCalls.length === 0) || Boolean(m.content) || m.error || m.toolCalls.length > 0);
-				const segments = groupConsecutiveModelErrors(visibleMessages)
+				const rawSegments = groupConsecutiveModelErrors(visibleMessages)
 					.map((messages) => {
 						const m = messages[messages.length - 1]!;
 						return {
@@ -1456,14 +1592,49 @@ function AssistantGroupBody({
 							messages,
 							showThinking:
 								Boolean(m.thinking) || (m.streaming && !m.content && m.toolCalls.length === 0),
-							showContent: Boolean(m.content) || m.error,
+							showContent: Boolean(m.content) || Boolean(m.error),
 							foldCalls: m.toolCalls.filter((c) => !isDelegateCall(c)),
 							cardCalls: memberFlow ? [] : m.toolCalls.filter((c) => isDelegateCall(c)),
 						};
 					})
 					.filter((s) => s.showThinking || s.showContent || s.foldCalls.length > 0 || s.cardCalls.length > 0);
-				if (segments.length === 0) return null;
-				const recoveredIndex = recoveredReplyIndex(segments.map((segment) => segment.m));
+				if (rawSegments.length === 0) return null;
+				const recoveredIndex = recoveredReplyIndex(rawSegments.map((segment) => segment.m));
+				// 整轮用时优先用落盘事实：最后一条 assistant 的 timestamp + durationMs 就是
+				// 本段回复的真正结束时刻，减去本 run 第一条 assistant 的 timestamp 即整轮用时。
+				const runStartedAt = rawSegments[0]!.m.timestamp;
+				const lastTurn = rawSegments[rawSegments.length - 1]!.m;
+				const recordedMs = typeof lastTurn.durationMs === "number"
+					? Math.max(1000, lastTurn.timestamp + lastTurn.durationMs - runStartedAt)
+					: undefined;
+				const segments = mergeProcessSegments(
+					rawSegments.map((segment, index) => ({ ...segment, recovered: index < recoveredIndex })),
+				);
+				// 一个 run 还活着 = 任一 assistant 段在流式，或还有未结算的（含 delegate）工具调用。
+				const callActive = (call: ToolCallView) => call.status === "running" || call.status === "pending";
+				const running = segments.some((segment) =>
+					segment.m.streaming
+					|| segment.foldCalls.some(callActive)
+					|| segment.cardCalls.some(callActive),
+				);
+				// 失败只认最后一个段：中途模型重试成功后仍是正常完成（重试卡由 recovered 表达）。
+				const lastSegment = segments[segments.length - 1]!;
+				const failed = Boolean(lastSegment.m.error) || Boolean(lastSegment.m.modelError);
+				// 最终答案 = 最后一个有正文、且没有工具调用块的段（对齐 harness 的 turn 规则）；
+				// 其余段（阶段回复、思考、工具、委派卡）都属整轮过程。
+				let answerIndex = -1;
+				for (let index = segments.length - 1; index >= 0; index -= 1) {
+					const segment = segments[index]!;
+					if (segment.showContent && segment.foldCalls.length === 0 && segment.cardCalls.length === 0 && !segment.m.error) {
+						answerIndex = index;
+						break;
+					}
+				}
+				const answer = answerIndex >= 0 ? segments[answerIndex]! : undefined;
+				const hasProcess = segments.some((segment, index) =>
+					Boolean(segment.m.thinking) || segment.foldCalls.length > 0
+					|| (segment.showContent && index !== answerIndex),
+				);
 				const quickActionContent = [...new Set(segments.filter((segment) => !segment.m.error).map((segment) => segment.m.content).filter(Boolean))].join("\n\n");
 				const lastTime = new Date(segments[segments.length - 1]!.m.timestamp).toLocaleTimeString("zh-CN", {
 					hour: "2-digit",
@@ -1483,37 +1654,51 @@ function AssistantGroupBody({
 								<span>{lastTime}</span>
 							</div>
 							<div className="flex w-full flex-col gap-3">
-								{segments.map((s, segmentIndex) => (
-									<div key={s.m.id} className="home-assistant-segment flex w-full flex-col gap-2">
-										{s.showThinking && <AssistantReasoning streaming={s.m.streaming} thinking={s.m.thinking} startedAt={s.m.timestamp} className="mb-0" />}
-										{s.showContent && (
-											s.m.error && s.m.modelError ? (
-												<ModelErrorSummary messages={s.messages} recovered={segmentIndex < recoveredIndex} />
-											) : (
-												<MessageResponse className="home-message-response" {...chatStreamdownProps}>{s.m.content}</MessageResponse>
-											)
-										)}
-										{!s.m.modelError ? <ErrorTechnicalDetails detail={s.m.errorDetail} /> : null}
-										{s.foldCalls.length > 0 && (
-											<ToolSummaryRow
-												calls={s.foldCalls}
-												windowType={windowType}
-												onOpenWindow={onOpenWindow}
-												timestamp={s.m.timestamp}
-											/>
-										)}
-										{s.cardCalls.map((call) => (
-											<ToolCallItem
-												key={call.id}
-												call={call}
-												windowType={windowType}
-												onOpenWindow={onOpenWindow}
-												timestamp={s.m.timestamp}
-											/>
-										))}
+								<RunProcessSection running={running} failed={failed} hasProcess={hasProcess} startedAt={runStartedAt} recordedMs={recordedMs}>
+									<div className="flex w-full flex-col gap-2">
+										{segments.map((s, index) => {
+											const processContent = s.showContent && index !== answerIndex;
+											if (!s.m.thinking && !processContent && s.foldCalls.length === 0) return null;
+											return (
+												<div key={s.m.id} className="home-assistant-segment flex w-full flex-col gap-2">
+													{s.m.thinking && <AssistantReasoning streaming={s.m.streaming} thinking={s.m.thinking} startedAt={s.m.timestamp} className="mb-0" />}
+													{processContent && (
+														s.m.error && s.m.modelError ? (
+															<ModelErrorSummary messages={s.messages} recovered={s.recovered} />
+														) : (
+															<MessageResponse className="home-message-response" {...chatStreamdownProps}>{s.m.content}</MessageResponse>
+														)
+													)}
+													{!s.m.modelError ? <ErrorTechnicalDetails detail={s.m.errorDetail} /> : null}
+													{s.foldCalls.length > 0 && (
+														<ToolSummaryRow
+															calls={s.foldCalls}
+															windowType={windowType}
+															onOpenWindow={onOpenWindow}
+															timestamp={s.m.timestamp}
+														/>
+													)}
+												</div>
+											);
+										})}
 									</div>
-								))}
-								{!segments.some((segment) => segment.m.streaming) && quickActionContent ? (
+								</RunProcessSection>
+								{segments.map((s) => s.cardCalls.map((call) => (
+									<ToolCallItem
+										key={call.id}
+										call={call}
+										windowType={windowType}
+										onOpenWindow={onOpenWindow}
+										timestamp={s.m.timestamp}
+									/>
+								)))}
+								{answer && (
+									<div className="home-assistant-segment flex w-full flex-col gap-2">
+										<MessageResponse className="home-message-response" {...chatStreamdownProps}>{answer.m.content}</MessageResponse>
+										{!answer.m.modelError ? <ErrorTechnicalDetails detail={answer.m.errorDetail} /> : null}
+									</div>
+								)}
+								{!running && quickActionContent ? (
 									<MessageQuickActions kind={assistantAs ? "worker" : "manager"} content={quickActionContent} workerLabel={assistantAs ? assistantLabel : undefined} />
 								) : null}
 							</div>
