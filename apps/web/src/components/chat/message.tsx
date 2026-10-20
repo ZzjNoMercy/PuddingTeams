@@ -1453,9 +1453,10 @@ function mergeProcessSegments(segments: AssistantSegment[]): AssistantSegment[] 
 
 /**
  * 整轮过程折叠（对齐 deepseek-harness 的 turn process）：
- * - 运行中：过程保持展开，抬头显示「深度求索中 · 用时 N」；
- * - 结束后：过程默认收起，抬头显示「已完成 · 用时 N」，点开才看思考、工具与阶段回复；
+ * - 运行中：抬头显示「深度求索中 · 用时 N」，过程默认也收起，点开才看思考、工具与阶段回复；
+ * - 结束后：抬头显示「已完成 · 用时 N」，过程保持收起（用户手动展开过就保持展开）；
  * - 失败：过程保持展开且不能收起，抬头显示「本轮失败」。
+ * 运行中不再自动展开、结束再自动收起，避免过程内容「冒出来又缩回去」。
  * 最终答案正文不参与折叠，始终显示。
  */
 function RunProcessSection({
@@ -1486,18 +1487,18 @@ function RunProcessSection({
 		// 运行 → 结束的第一次提交记下整轮用时；历史加载（从未运行过）不显示用时。
 		if (observedRunning.current && endedMs === null) setEndedMs(Math.max(1000, Date.now() - startedAt));
 	}, [running, startedAt, endedMs]);
-	const expanded = running || failed || open;
+	const expanded = failed || open;
 	const settledMs = recordedMs ?? endedMs ?? undefined;
 	const seconds = settledMs === undefined ? undefined : Math.max(1, Math.round(settledMs / 1000));
 	const collapsible = hasProcess;
-	const interactive = collapsible && !running && !failed;
+	const interactive = collapsible && !failed;
 	// 没有过程、也没有可显示的用时（历史里的普通问答）不占一行。
 	if (!running && !failed && !hasProcess && seconds === undefined) return null;
 	return (
 		<div ref={rootRef} className="flex w-full flex-col gap-2">
 			<button
 				type="button"
-				disabled={running || failed || !hasProcess}
+				disabled={failed || !hasProcess}
 				aria-expanded={interactive ? open : undefined}
 				onClick={() => toggle(setOpen)}
 				className="flex items-center gap-1.5 text-xs text-muted-foreground transition-colors enabled:hover:text-foreground disabled:cursor-default"
