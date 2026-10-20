@@ -1463,6 +1463,7 @@ function RunProcessSection({
 	running,
 	failed,
 	hasProcess,
+	hasFollowing,
 	startedAt,
 	recordedMs,
 	children,
@@ -1470,6 +1471,8 @@ function RunProcessSection({
 	running: boolean;
 	failed: boolean;
 	hasProcess: boolean;
+	/** 控件下方是否还有答案或委派卡；没有就不画分割线，避免空尾巴。 */
+	hasFollowing: boolean;
 	startedAt: number;
 	/** pi 落盘的整轮时长；历史加载也能拿到，优先于客户端观察值。 */
 	recordedMs?: number;
@@ -1501,7 +1504,7 @@ function RunProcessSection({
 				disabled={failed || !hasProcess}
 				aria-expanded={interactive ? open : undefined}
 				onClick={() => toggle(setOpen)}
-				className="flex items-center gap-2 text-sm text-muted-foreground transition-colors enabled:hover:text-foreground disabled:cursor-default"
+				className={`flex items-center gap-2 text-sm text-muted-foreground transition-colors enabled:hover:text-foreground disabled:cursor-default ${!running && (hasFollowing || failed) ? "border-b border-border/60 pb-2" : ""}`}
 			>
 				{interactive ? (open ? (
 					<ChevronDownIcon className="size-4 shrink-0" />
@@ -1632,6 +1635,7 @@ function AssistantGroupBody({
 					}
 				}
 				const answer = answerIndex >= 0 ? segments[answerIndex]! : undefined;
+				const hasFollowing = Boolean(answer) || segments.some((segment) => segment.cardCalls.length > 0);
 				const hasProcess = segments.some((segment, index) =>
 					Boolean(segment.m.thinking) || segment.foldCalls.length > 0
 					|| (segment.showContent && index !== answerIndex),
@@ -1655,7 +1659,7 @@ function AssistantGroupBody({
 								<span>{lastTime}</span>
 							</div>
 							<div className="flex w-full flex-col gap-3">
-								<RunProcessSection running={running} failed={failed} hasProcess={hasProcess} startedAt={runStartedAt} recordedMs={recordedMs}>
+								<RunProcessSection running={running} failed={failed} hasProcess={hasProcess} hasFollowing={hasFollowing} startedAt={runStartedAt} recordedMs={recordedMs}>
 									<div className="flex w-full flex-col gap-2">
 										{segments.map((s, index) => {
 											const processContent = s.showContent && index !== answerIndex;
