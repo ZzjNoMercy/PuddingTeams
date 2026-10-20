@@ -1,13 +1,14 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { BrainIcon, CheckCircle2Icon, CircleDotIcon, FilePenIcon, FilesIcon, ListChecksIcon, MessageSquareIcon, PackageCheckIcon, SearchIcon, ShieldAlertIcon, SlidersHorizontalIcon, TerminalIcon, WrenchIcon, XCircleIcon, XIcon } from "lucide-react";
+import { CheckCircle2Icon, CircleDotIcon, FilePenIcon, FilesIcon, ListChecksIcon, MessageSquareIcon, PackageCheckIcon, SearchIcon, ShieldAlertIcon, SlidersHorizontalIcon, TerminalIcon, WrenchIcon, XCircleIcon, XIcon } from "lucide-react";
 import {
 	Conversation,
 	ConversationContent,
 	ConversationScrollButton,
 } from "@/components/ai-elements/conversation";
 import { Loader } from "@/components/ai-elements/loader";
+import { ThinkIcon } from "@/components/icons/think-icon";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useWorkerProcess } from "@/hooks/useWorkerProcess";
@@ -128,10 +129,10 @@ function WorkerProcessBodyAttempt({ delegationId, full, until, liveUpdates, onRe
 	);
 }
 
-const activityIcons: Record<DelegationTimelineEvent["kind"], typeof CircleDotIcon> = {
+const activityIcons: Record<DelegationTimelineEvent["kind"], typeof CircleDotIcon | typeof ThinkIcon> = {
 	lifecycle: CircleDotIcon,
 	assistant: MessageSquareIcon,
-	reasoning: BrainIcon,
+	reasoning: ThinkIcon,
 	tool: WrenchIcon,
 	file: FilePenIcon,
 	search: SearchIcon,

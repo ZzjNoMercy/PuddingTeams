@@ -559,9 +559,9 @@ function WorkerTaskEntry({
 				aria-expanded={open}
 			>
 				{open ? (
-					<ChevronDownIcon className="size-3.5 shrink-0" />
+					<ChevronDownIcon className="size-4 shrink-0" />
 				) : (
-					<ChevronRightIcon className="size-3.5 shrink-0" />
+					<ChevronRightIcon className="size-4 shrink-0" />
 				)}
 			</button>
 			<div className="flex min-w-0 flex-1 items-center gap-2">
@@ -1501,12 +1501,12 @@ function RunProcessSection({
 				disabled={failed || !hasProcess}
 				aria-expanded={interactive ? open : undefined}
 				onClick={() => toggle(setOpen)}
-				className="flex items-center gap-1.5 text-xs text-muted-foreground transition-colors enabled:hover:text-foreground disabled:cursor-default"
+				className="flex items-center gap-2 text-sm text-muted-foreground transition-colors enabled:hover:text-foreground disabled:cursor-default"
 			>
 				{interactive ? (open ? (
-					<ChevronDownIcon className="size-3.5 shrink-0" />
+					<ChevronDownIcon className="size-4 shrink-0" />
 				) : (
-					<ChevronRightIcon className="size-3.5 shrink-0" />
+					<ChevronRightIcon className="size-4 shrink-0" />
 				)) : null}
 				{running ? (
 					<Shimmer as="span" duration={1}>深度求索中</Shimmer>

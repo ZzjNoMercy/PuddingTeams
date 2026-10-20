@@ -9,9 +9,10 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
-import { BrainIcon, ChevronDownIcon, ChevronRightIcon } from "lucide-react";
+import { ChevronDownIcon, ChevronRightIcon } from "lucide-react";
 import type { ComponentProps, ReactNode } from "react";
 import { createContext, memo, useContext, useEffect, useState } from "react";
+import { ThinkIcon } from "@/components/icons/think-icon";
 import { reasoningPlugins } from "@/core/streamdown/plugins";
 import { Shimmer } from "./shimmer";
 import { ClipboardSafeStreamdown } from "./streamdown";
@@ -151,7 +152,7 @@ export const ReasoningTrigger = memo(
       >
         {children ?? (
           <>
-            <BrainIcon className="size-4" />
+            <ThinkIcon className="size-4 shrink-0" />
             {getThinkingMessage(isStreaming, duration, startTime)}
             {hasContent && (
               isOpen ? (
@@ -177,7 +178,7 @@ export const ReasoningContent = memo(
   ({ className, children, ...props }: ReasoningContentProps) => (
     <CollapsibleContent
       className={cn(
-        "mt-4 max-h-72 overflow-y-auto pr-2 text-sm",
+        "mt-2 max-h-72 overflow-y-auto rounded-lg border border-border/70 bg-muted/30 px-3 py-2.5 text-sm",
         "data-[state=closed]:fade-out-0 data-[state=closed]:slide-out-to-top-2 data-[state=open]:slide-in-from-top-2 text-muted-foreground data-[state=closed]:animate-out data-[state=open]:animate-in outline-none",
         className,
       )}
