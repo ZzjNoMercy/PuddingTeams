@@ -291,6 +291,28 @@ test("GET /api/sessions/:id/messages 包含运行中隐藏投影", async () => {
 	await app.close();
 });
 
+test("GET /api/sessions/:id/messages 返回 native Pi 当前上下文用量和压缩后未知状态", async () => {
+	const { app, sessions } = await makeStack();
+	try {
+		const summary = await sessions.create();
+		const session = await sessions.open(summary.id);
+		const usage = { tokens: 32_000, contextWindow: 200_000, percent: 16 };
+		session.getContextUsage = () => usage;
+		const route = `/api/sessions/${summary.id}/messages`;
+		const response = await app.inject({ method: "GET", url: route });
+		assert.equal(response.statusCode, 200, response.body);
+		assert.deepEqual(response.json().contextUsage, usage);
+
+		session.getContextUsage = () => ({ tokens: null, contextWindow: 200_000, percent: null });
+		const compacted = await app.inject({ method: "GET", url: route });
+		assert.equal(compacted.statusCode, 200, compacted.body);
+		assert.deepEqual(compacted.json().contextUsage, { tokens: null, contextWindow: 200_000, percent: null });
+	} finally {
+		await sessions.disposeAll();
+		await app.close();
+	}
+});
+
 test("GET 历史标出已保存但没有完成回复的最后一条用户消息", async () => {
 	const { app, sessions } = await makeStack();
 	const summary = await sessions.create();

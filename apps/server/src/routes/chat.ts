@@ -815,7 +815,8 @@ export async function registerChatRoutes(
 					&& lastConversationEntry.message.stopReason === "toolUse"
 					&& branch.some((entry) => entry.type === "message" && entry.message.role === "user")
 					&& messageEntryPersisted(session.sessionFile, lastConversationEntry.id, "assistant");
-				return { ...await store.nativeSessionCapability(req.params.id), messages: (await store.wireMessages(req.params.id)).map(withWireMessageId), running, unansweredUserMessage, unfinishedAssistantTurn, ...toolCallState };
+				const capability = await store.nativeSessionCapability(req.params.id);
+				return { ...capability, contextUsage: capability.nativePi ? session.getContextUsage() : undefined, messages: (await store.wireMessages(req.params.id)).map(withWireMessageId), running, unansweredUserMessage, unfinishedAssistantTurn, ...toolCallState };
 			});
 		} catch (err) {
 			if (inactiveContextError(err)) return reply.code(409).send({ error: "session_context_inactive" });

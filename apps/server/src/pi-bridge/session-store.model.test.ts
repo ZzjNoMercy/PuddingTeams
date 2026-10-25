@@ -10,6 +10,9 @@ import { InteractionSecretStore } from "../agent-runtime/interaction-secret-stor
 import { DriverRegistry } from "../agent-runtime/driver-registry.js";
 import { AgentInvoker } from "../agent-runtime/invoker.js";
 import { PiSessionStore } from "./session-store.js";
+import { shouldCompact } from "@earendil-works/pi-coding-agent";
+import { upsertCustomProvider } from "./custom-providers.js";
+import { configureSharedModelRuntime, resetSharedModelRuntime } from "./model-runtime.js";
 
 /**
  * 会话模型持久化：composer 的模型选择经 setModel 落 model_change，重开
@@ -98,4 +101,69 @@ test("模型选择随会话持久化：重开后恢复 model_change，不被 man
 	assert.equal(list.find((s) => s.id === sessionId)?.model, "anthropic/claude-haiku-4-5", "磁盘会话的 model 取自最后一条 model_change");
 
 	await sessions.disposeAll();
+});
+
+test("上下文用量与 compact 共用当前模型窗口和压缩参数", async () => {
+	const { teams, sessions, dir } = await makeStack();
+	const authPath = path.join(dir, "fixture-auth.json");
+	writeFileSync(authPath, JSON.stringify({ "context-fixture": { type: "api_key", key: "fixture" } }));
+	writeFileSync(path.join(process.env.PI_CODING_AGENT_DIR!, "settings.json"), JSON.stringify({
+		compaction: {
+			enabled: true,
+			reserveTokens: 10_000,
+			keepRecentTokens: 12_000,
+			modelOverrides: { "context-fixture/small": { reserveTokens: 7_000, keepRecentTokens: 8_000 } },
+		},
+	}));
+	const provider = (smallWindow: number, largeWindow: number) => ({
+		name: "Context Fixture",
+		baseUrl: "http://127.0.0.1:18931/v1",
+		api: "openai-completions",
+		models: [
+			{ id: "small", contextWindow: smallWindow, maxTokens: 4_096 },
+			{ id: "large", contextWindow: largeWindow, maxTokens: 4_096 },
+		],
+	});
+	try {
+		await upsertCustomProvider("context-fixture", provider(100_000, 200_000));
+		resetSharedModelRuntime();
+		configureSharedModelRuntime({ authPath });
+		const summary = await sessions.create("context-fixture/small");
+		await teams.ensureSoloWindow(async () => summary, async () => false);
+		let session = await sessions.open(summary.id);
+		let usage = session.getContextUsage();
+		assert.ok(usage);
+		assert.equal(usage.contextWindow, 100_000);
+		let compaction = session.settingsManager.getCompactionSettings(session.model);
+		assert.deepEqual(compaction, { enabled: true, reserveTokens: 7_000, keepRecentTokens: 8_000 });
+		assert.equal(shouldCompact(93_000, usage.contextWindow, compaction), false);
+		assert.equal(shouldCompact(93_001, usage.contextWindow, compaction), true);
+
+		await sessions.setModel(summary.id, "context-fixture/large");
+		session = await sessions.open(summary.id);
+		usage = session.getContextUsage();
+		assert.ok(usage);
+		assert.equal(usage.contextWindow, 200_000);
+		compaction = session.settingsManager.getCompactionSettings(session.model);
+		assert.deepEqual(compaction, { enabled: true, reserveTokens: 10_000, keepRecentTokens: 12_000 });
+		assert.equal(shouldCompact(190_000, usage.contextWindow, compaction), false);
+		assert.equal(shouldCompact(190_001, usage.contextWindow, compaction), true);
+
+		await upsertCustomProvider("context-fixture", provider(120_000, 240_000));
+		resetSharedModelRuntime();
+		sessions.markAllDirty();
+		const beforeReload = session;
+		session = await sessions.open(summary.id);
+		assert.notStrictEqual(session, beforeReload, "目录更新后空闲会话必须按新模型配置重建");
+		usage = session.getContextUsage();
+		assert.ok(usage);
+		assert.equal(session.model?.id, "large");
+		assert.equal(usage.contextWindow, 240_000);
+		compaction = session.settingsManager.getCompactionSettings(session.model);
+		assert.deepEqual(compaction, { enabled: true, reserveTokens: 10_000, keepRecentTokens: 12_000 });
+		assert.equal(shouldCompact(230_001, usage.contextWindow, compaction), true);
+	} finally {
+		await sessions.disposeAll();
+		resetSharedModelRuntime();
+	}
 });

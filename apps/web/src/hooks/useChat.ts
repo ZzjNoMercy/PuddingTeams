@@ -4,13 +4,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { abortSession, fetchMessages, sendMessage, sessionWsUrl, MessageDeliveryUnconfirmedError, MessageOperationRejectedError, SessionMessagesError, type MessageAttachmentInput } from "@/lib/api";
 import { ChatSendIntentChangedError, clearChatSendOperation, reserveChatSendOperation } from "@/lib/chat-send-operation";
 import { applyRecoveredToolResults, markRunningToolCalls, reducePiEvent, renderHistory, replayPiEvents } from "@/lib/events";
-import type { NativeInputCapability, ChatMessage, ChatStatus, PiMessage } from "@/lib/types";
+import type { NativeInputCapability, ChatMessage, ChatStatus, ContextUsage, PiMessage } from "@/lib/types";
 
 const HISTORY_CACHE_LIMIT = 8;
 const historyCache = new Map<string, ChatMessage[]>();
 
 interface HistorySnapshot {
  inputCapability?: NativeInputCapability;
+	contextUsage?: ContextUsage;
 	messages: ChatMessage[];
 	hasRunning: boolean;
 	unansweredUserMessage: boolean;
@@ -34,7 +35,7 @@ async function loadHistorySnapshot(sessionId: string): Promise<HistorySnapshot> 
 	const rendered = renderHistory(messages as PiMessage[]);
 	const reconciled = markRunningToolCalls(applyRecoveredToolResults(rendered, recoveredToolResults), runningToolCallIds);
 	return {
-		inputCapability, messages: reconciled,
+		inputCapability, contextUsage: inputCapability.contextUsage, messages: reconciled,
 		hasRunning: running || reconciled.some((message) => message.toolCalls.some((call) => call.status === "running")),
 		unansweredUserMessage,
 		unfinishedAssistantTurn,
@@ -49,6 +50,7 @@ export async function preloadChatHistory(sessionId: string): Promise<void> {
 
 export function useChat(sessionId: string) {
 	const [inputCapability, setInputCapability] = useState<NativeInputCapability>();
+	const [contextUsage, setContextUsage] = useState<ContextUsage>();
  const allowSendWhileRunning = Boolean(inputCapability?.busyInput.modes.length);
 	// Session 切换会 remount；命中预热/最近访问快照时直接首帧展示，随后仍从
 	// 服务端重对齐，缓存只消除视觉空档，不替代事实源。
@@ -93,6 +95,7 @@ export function useChat(sessionId: string) {
 		rememberHistory(sessionId, messages);
 		setMessages(messages);
 		if (snapshot.inputCapability) setInputCapability(snapshot.inputCapability);
+		setContextUsage(snapshot.contextUsage);
 		setUnansweredUserMessage(snapshot.unansweredUserMessage);
 		setUnfinishedAssistantTurn(snapshot.unfinishedAssistantTurn);
 		return {
@@ -110,6 +113,7 @@ export function useChat(sessionId: string) {
 		wsEventsRef.current = [];
 		historyCache.delete(sessionId);
 		setStatus("gone");
+		setContextUsage(undefined);
 		setError("会话不存在或已被删除");
 		if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.close();
 	}, [sessionId]);
@@ -213,9 +217,14 @@ export function useChat(sessionId: string) {
 					activityVersionRef.current += 1;
 					setRunning(true);
 				}
-				if (event.type === "queue_update" || event.type === "agent_settled") {
-     void fetchMessages(sessionId).then(snapshot => { if (!disposed) setInputCapability(snapshot); }).catch(() => {});
-    }
+				if (event.type === "queue_update" || event.type === "agent_settled" || event.type === "compaction_end") {
+					void fetchMessages(sessionId).then(snapshot => {
+						if (!disposed) {
+							setInputCapability(snapshot);
+							setContextUsage(snapshot.contextUsage);
+						}
+					}).catch(() => {});
+				}
     if (event.type === "agent_settled" || event.type === "error") {
 					activityVersionRef.current += 1;
 					setRunning(false);
@@ -285,7 +294,10 @@ export function useChat(sessionId: string) {
 				const result = await sendMessage(sessionId, content, attachments, operationId, delivery);
 				clearChatSendOperation(sessionId, operationId);
 				setUnconfirmedOperation(null);
-    void fetchMessages(sessionId).then(snapshot => setInputCapability(snapshot)).catch(() => {});
+				void fetchMessages(sessionId).then(snapshot => {
+					setInputCapability(snapshot);
+					setContextUsage(snapshot.contextUsage);
+				}).catch(() => {});
 				return result;
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
@@ -379,5 +391,5 @@ export function useChat(sessionId: string) {
 		}
 	}, [applyHistorySnapshot, beginHistorySnapshot, sessionId]);
 
-	return { inputCapability, messages, historyLoading, historyLoaded, status, running, unansweredUserMessage, unfinishedAssistantTurn, sending, stopping, error, unconfirmedOperation, send, stop, refreshHistory, reviewUnconfirmedHistory, startNewMessageIntent };
+	return { inputCapability, contextUsage, messages, historyLoading, historyLoaded, status, running, unansweredUserMessage, unfinishedAssistantTurn, sending, stopping, error, unconfirmedOperation, send, stop, refreshHistory, reviewUnconfirmedHistory, startNewMessageIntent };
 }

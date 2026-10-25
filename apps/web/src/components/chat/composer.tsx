@@ -18,9 +18,10 @@ import { getViewerIdentity, listSessionCommands, setSessionModel, setSessionThin
 import { useModelCatalog } from "@/lib/model-catalog";
 import { setPreferredModel } from "@/lib/model-pref";
 import { clearSubmittedChatDraft, loadChatAttachmentDraft, loadChatDraft, removeSubmittedChatAttachments, saveChatAttachmentDraft, saveChatDraft } from "@/lib/chat-draft";
-import type { ModelSummary } from "@/lib/types";
+import type { ContextUsage, ModelSummary } from "@/lib/types";
 import type { SessionStats } from "@/lib/session-stats";
 import { ChatStatsBar } from "./chat-stats-bar";
+import { ContextUsageBadge } from "./context-usage-badge";
 import { Button } from "@/components/ui/button";
 import {
 	DropdownMenu,
@@ -240,6 +241,7 @@ function ComposerInner({
 	sessionModel,
 	sessionThinkingLevel,
 	directWorkerModel,
+	contextUsage,
 	onModelChanged,
 	onThinkingChanged,
 	onSend,
@@ -270,6 +272,7 @@ function ComposerInner({
 	/** 会话真实 thinking level（服务端 rooms 数据，§10.6）。 */
 	sessionThinkingLevel?: string;
 	directWorkerModel?: { name: string; model?: string };
+	contextUsage?: ContextUsage;
 	onModelChanged?: (sessionId: string, model: string) => void;
 	onThinkingChanged?: (sessionId: string, level: string) => void;
 	onSend: (text: string, attachments?: MessageAttachmentInput[], delivery?: "normal" | "followUp" | "steer") => void | Promise<void>;
@@ -458,6 +461,7 @@ function ComposerInner({
 				</PromptInputTools>
 				<span className="home-composer-status">{stopping ? "正在停止并保存结果…" : stopAvailable ? (busyHint ?? "处理中…") : sending ? "正在提交消息…" : (queueHint ?? "")}</span>
 				<div className="home-composer-send">
+					{contextUsage ? <ContextUsageBadge usage={contextUsage} /> : null}
 					{hideSessionControls ? null : directWorkerModel ? (
 						<WorkerModelPicker key={`${sessionId}:${directWorkerModel.name}`} sessionId={sessionId} workerName={directWorkerModel.name} disabled={disabled || sending || stopping} onSavingChange={setWorkerModelSaving} />
 					) : (
@@ -503,6 +507,7 @@ export function Composer({
 	sessionThinkingLevel,
 	directWorkerModel,
 	stats,
+	contextUsage,
 	statsVisible = true,
 	onModelChanged,
 	onThinkingChanged,
@@ -534,6 +539,7 @@ export function Composer({
 	directWorkerModel?: { name: string; model?: string };
 	/** 会话用量统计（composer 悬浮层内、输入框上方）。 */
 	stats?: SessionStats | null;
+	contextUsage?: ContextUsage;
 	/** 吸底时才显示统计条，上滑浏览历史时淡出。 */
 	statsVisible?: boolean;
 	onModelChanged?: (sessionId: string, model: string) => void;
@@ -570,6 +576,7 @@ export function Composer({
 						sessionModel={sessionModel}
 						sessionThinkingLevel={sessionThinkingLevel}
 						directWorkerModel={directWorkerModel}
+						contextUsage={contextUsage}
 						onModelChanged={onModelChanged}
 						onThinkingChanged={onThinkingChanged}
 						onSend={onSend}

@@ -4716,6 +4716,11 @@ button.nav-user:focus-visible:not([data-pointer-focus="true"]) {
 
 .home-chat-stats {
 	box-sizing: border-box;
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: flex-end;
+	gap: 4px;
 	width: min(780px, calc(100% - 48px));
 	margin: 0 auto;
 	padding: 0 4px 5px;
@@ -4732,6 +4737,36 @@ button.nav-user:focus-visible:not([data-pointer-focus="true"]) {
 	backdrop-filter: blur(8px);
 	transition: opacity 180ms ease, transform 180ms ease;
 }
+.home-chat-context-pill {
+	display: inline-flex;
+	flex: none;
+	align-items: center;
+	gap: 3px;
+	height: 32px;
+	padding-inline: 2px;
+	color: var(--home-text-3);
+	font-size: 10px;
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+.home-chat-context-ring-trigger {
+	display: inline-grid;
+	place-items: center;
+	width: 18px;
+	height: 24px;
+	border-radius: 6px;
+	cursor: default;
+	transition: color 150ms ease;
+}
+.home-chat-context-ring-trigger:hover { color: var(--home-text); }
+.home-chat-context-ring-trigger:focus-visible:not([data-pointer-focus="true"]) {
+	outline: 2px solid color-mix(in oklab, var(--home-accent) 65%, transparent);
+	outline-offset: 2px;
+}
+.home-chat-context-ring { width: 14px; height: 14px; flex: none; }
+.home-chat-context-ring-track { stroke: currentColor; opacity: 0.18; }
+.home-chat-context-ring-value { stroke: currentColor; opacity: 0.85; transition: stroke-dashoffset 180ms ease; }
+.home-chat-context-percent { min-width: 3ch; text-align: right; line-height: 1; }
 /* 只在吸底时显示：上滑浏览历史时淡出，避免悬浮层与消息流互相干涉。 */
 .home-chat-stats.is-hidden .home-chat-stats-pill {
 	opacity: 0;

@@ -1,4 +1,4 @@
-import type { NativeInputCapability } from "./types";
+import type { ContextUsage, NativeInputCapability } from "./types";
 import type {
 	ExtensionAuthorizationSession,
 	AgentCapabilityBinding,
@@ -1114,12 +1114,13 @@ export class SessionMessagesError extends Error {
 	}
 }
 
-export async function fetchMessages(sessionId: string): Promise<NativeInputCapability & { messages: unknown[]; running: boolean; unansweredUserMessage: boolean; unfinishedAssistantTurn: boolean; runningToolCallIds: string[]; recoveredToolResults: RecoveredToolResult[] }> {
+export async function fetchMessages(sessionId: string): Promise<NativeInputCapability & { contextUsage?: ContextUsage; messages: unknown[]; running: boolean; unansweredUserMessage: boolean; unfinishedAssistantTurn: boolean; runningToolCallIds: string[]; recoveredToolResults: RecoveredToolResult[] }> {
 	const res = await fetch(`${SERVER_URL}/api/sessions/${sessionId}/messages`);
-	const body = (await res.json()) as Partial<NativeInputCapability> & { messages?: unknown[]; running?: boolean; unansweredUserMessage?: boolean; unfinishedAssistantTurn?: boolean; runningToolCallIds?: string[]; recoveredToolResults?: RecoveredToolResult[]; error?: string };
+	const body = (await res.json()) as Partial<NativeInputCapability> & { contextUsage?: ContextUsage; messages?: unknown[]; running?: boolean; unansweredUserMessage?: boolean; unfinishedAssistantTurn?: boolean; runningToolCallIds?: string[]; recoveredToolResults?: RecoveredToolResult[]; error?: string };
 	if (!res.ok) throw new SessionMessagesError(sessionApiError(body.error, `fetch messages failed: ${res.status}`), res.status, body.error);
 	return {
 		ownerAgentId: body.ownerAgentId ?? "manager", connectorId: body.connectorId ?? "pi", nativePi: body.nativePi === true, readOnly: body.readOnly === true, busyInput: body.busyInput ?? {modes:[]}, waiting: body.waiting ?? [], queuedInputs: body.queuedInputs ?? [], pendingMessageCount: body.pendingMessageCount ?? 0, unconfirmedInput: body.unconfirmedInput === true, leafEntryId: body.leafEntryId, sourceSnapshotId: body.sourceSnapshotId,
+		contextUsage: body.contextUsage,
 		messages: body.messages ?? [],
 		running: body.running === true,
 		unansweredUserMessage: body.unansweredUserMessage === true,

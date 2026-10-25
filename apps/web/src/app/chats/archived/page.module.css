@@ -37,7 +37,7 @@
 .actions .icon:hover { color:var(--destructive); }
 .icon svg { width:16px; height:16px; }
 .icon:disabled { opacity:.4; }
-.icon:focus-visible,.back:focus-visible { outline:2px solid var(--home-accent); outline-offset:2px; }
+.icon:focus-visible:not([data-pointer-focus="true"]),.back:focus-visible:not([data-pointer-focus="true"]) { outline:2px solid var(--home-accent); outline-offset:2px; }
 .restore { min-height:34px; border-radius:8px; padding:0 11px; background:var(--home-surface-2); color:var(--home-text-2); box-shadow:none; font-size:12px; }
 .restore:hover { background:var(--home-soft-hover); color:var(--home-text); }
 .empty { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:13px; padding:75px 20px; text-align:center; color:var(--home-text-3); }

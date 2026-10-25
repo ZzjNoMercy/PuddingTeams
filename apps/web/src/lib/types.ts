@@ -144,6 +144,13 @@ export interface PiUserMessage {
 	puddingHistorical?: boolean;
 }
 
+/** pi 当前有效上下文；compaction 后、下一次模型响应前 tokens/percent 可能暂时未知。 */
+export interface ContextUsage {
+	tokens: number | null;
+	contextWindow: number;
+	percent: number | null;
+}
+
 /** pi assistant 消息上的逐轮用量（provider 返回、pi-ai 归一化）；cost 由 pi 按模型价目表换算。 */
 export interface PiUsage {
 	input: number;

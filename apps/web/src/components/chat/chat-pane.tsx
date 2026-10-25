@@ -315,7 +315,7 @@ function SessionChat({
 	activityRevision: number;
 	onHistoryReady?: (sessionId: string, activityRevision: number) => Promise<boolean>;
 }) {
-	const { inputCapability, messages, historyLoading, historyLoaded, status, running, unansweredUserMessage, unfinishedAssistantTurn, sending, stopping, error, unconfirmedOperation, send, stop, refreshHistory, reviewUnconfirmedHistory, startNewMessageIntent } = useChat(sessionId);
+	const { inputCapability, contextUsage, messages, historyLoading, historyLoaded, status, running, unansweredUserMessage, unfinishedAssistantTurn, sending, stopping, error, unconfirmedOperation, send, stop, refreshHistory, reviewUnconfirmedHistory, startNewMessageIntent } = useChat(sessionId);
 	const [newMessageIntentOpen, setNewMessageIntentOpen] = useState(false);
 	const initialActivityRevision = useRef(activityRevision);
 	const [presentedActivityRevision, setPresentedActivityRevision] = useState<number | null>(null);
@@ -334,6 +334,10 @@ function SessionChat({
 		const result = await send(text, attachments, delivery);
  if(result.queued) toast.info("已受理，尚未写入对话历史");
 	}, [send]);
+	const handleComposerModelChange = useCallback((changedSessionId: string, model: string) => {
+		onSessionModelChange?.(changedSessionId, model);
+		void refreshHistory();
+	}, [onSessionModelChange, refreshHistory]);
 	const executionTurns = useMemo<SessionExecutionTurn[]>(() => messages
 		.filter((message) => message.role === "user")
 		.map((message, index) => ({
@@ -575,8 +579,9 @@ function SessionChat({
 					sessionThinkingLevel={sessionThinkingLevel}
 					directWorkerModel={inputCapability && !inputCapability.nativePi && !inputCapability.readOnly ? directWorkerModel : undefined}
 					stats={sessionStats}
+					contextUsage={inputCapability?.nativePi ? contextUsage : undefined}
 					statsVisible={atBottom}
-					onModelChanged={onSessionModelChange}
+					onModelChanged={handleComposerModelChange}
 					onThinkingChanged={onSessionThinkingChange}
 					onSend={handleSend}
 					onStop={handleStop}

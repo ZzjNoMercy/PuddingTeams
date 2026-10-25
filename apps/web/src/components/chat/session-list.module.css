@@ -23,7 +23,7 @@
 .icon:hover,.icon[data-state=open] { background:var(--home-soft-hover); color:var(--home-text); }
 .icon:disabled { opacity:.4; cursor:wait; }
 .icon svg { width:14px; height:14px; }
-.icon:focus-visible,.groupToggle:focus-visible,.view:focus-visible,.archiveToggle:focus-visible,.select:focus-visible { outline:2px solid var(--home-accent); outline-offset:-2px; }
+.icon:focus-visible:not([data-pointer-focus="true"]),.groupToggle:focus-visible:not([data-pointer-focus="true"]),.view:focus-visible:not([data-pointer-focus="true"]),.archiveToggle:focus-visible:not([data-pointer-focus="true"]),.select:focus-visible:not([data-pointer-focus="true"]) { outline:2px solid var(--home-accent); outline-offset:-2px; }
 .list { padding:3px 0 0 21px; }
 .row { position:relative; display:flex; align-items:center; min-height:52px; border-radius:9px; margin:1px 0; }
 .row:hover { background:var(--home-soft); }
