@@ -1218,6 +1218,7 @@ export interface RoomTimelineSnapshot {
 	participants: Array<{ agentId: string; agentSessionId: string; role: "manager" | "worker"; state: string; nativePi: boolean }>;
 	managerParticipantSessionId: string | null;
 	lastEventSeq: number;
+	queuedInputs: Array<{ operationId: string; sourceRoomEventId: string; delivery: "normal" | "followUp"; persistence: "pending" | "durable" }>;
 	capabilities: {
 		canSend: boolean;
 		canStop: boolean;

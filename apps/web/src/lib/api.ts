@@ -2796,6 +2796,16 @@ export async function searchRoomEvents(roomId: string, roomSessionId: string, qu
 	return body?.hits ?? [];
 }
 
+export async function cancelQueuedRoomInput(roomId: string, roomSessionId: string, operationId: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(roomSessionId)}/queued-inputs/${encodeURIComponent(operationId)}`, {
+		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "cancel" }),
+	});
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `cancel queued input failed: ${res.status}`);
+	}
+}
+
 export async function markRoomSessionRead(roomId: string, roomSessionId: string): Promise<void> {
 	await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(roomSessionId)}/read`, { method: "POST" }).catch(() => undefined);
 }

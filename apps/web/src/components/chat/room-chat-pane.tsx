@@ -10,6 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import {
 	abandonGoal,
 	abortRoomTurn,
+	cancelQueuedRoomInput,
 	createRoomGoal,
 	resumeGoal,
 	supersedeGoal,
@@ -321,6 +322,21 @@ export function RoomChatPane({
 							{event.attachments?.length ? <div className="mt-1 flex flex-wrap gap-1">{event.attachments.map((item) => <span key={item.path} className="rounded border border-border px-1.5 py-0.5 text-xs">{item.name}</span>)}</div> : null}
 						</div>
 					))}
+					{timeline?.queuedInputs?.length ? (
+						<div className="rounded border border-border/70 p-2 text-xs">
+							<p className="mb-1 text-muted-foreground">排队中的输入</p>
+							{timeline.queuedInputs.map((item) => (
+								<div key={item.operationId} className="flex items-center justify-between gap-2">
+									<span className="truncate">{item.delivery} · {item.operationId.slice(0, 8)}</span>
+									<Button size="sm" variant="ghost" className="h-6 px-2" onClick={() => {
+										void cancelQueuedRoomInput(room.id, roomSessionId, item.operationId)
+											.then(() => void load())
+											.catch((caught: unknown) => toast.error(caught instanceof Error ? caught.message : String(caught)));
+									}}>取消</Button>
+								</div>
+							))}
+						</div>
+					) : null}
 					{activeTurn ? <p className="text-xs text-muted-foreground">{labels.get(timeline?.participants.find((item) => item.agentSessionId === activeTurn.agentSessionId)?.agentId ?? "") ?? ""}{activeTurn.status === "running" ? "正在回复…" : activeTurn.status === "waiting_input" ? "等待输入/审批…" : activeTurn.status === "unknown" ? "执行结果未知，可确认无运行后解除" : "处理中…"}</p> : null}
 					<div ref={bottomRef} />
 				</div>
