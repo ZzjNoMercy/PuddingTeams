@@ -35,6 +35,8 @@ export class RoomFanoutStore {
 		const handle = await open(temp, "r");
 		try { await handle.sync(); } finally { await handle.close(); }
 		await rename(temp, this.file);
+		const directory = await open(path.dirname(this.file), "r");
+		try { await directory.sync(); } finally { await directory.close(); }
 	}
 
 	private serialize<T>(operation: () => Promise<T>): Promise<T> {
@@ -47,29 +49,34 @@ export class RoomFanoutStore {
 		return Object.values(await this.read());
 	}
 
+	private key(roomSessionId: string, operationId: string): string {
+		return `${roomSessionId}\u0000${operationId}`;
+	}
+
 	async put(plan: RoomFanoutPlan): Promise<void> {
 		await this.serialize(async () => {
 			const plans = await this.read();
-			plans[plan.operationId] = plan;
+			plans[this.key(plan.roomSessionId, plan.operationId)] = plan;
 			await this.write(plans);
 		});
 	}
 
-	async advance(operationId: string, nextIndex: number): Promise<void> {
+	async advance(roomSessionId: string, operationId: string, nextIndex: number): Promise<void> {
 		await this.serialize(async () => {
 			const plans = await this.read();
-			const plan = plans[operationId];
+			const plan = plans[this.key(roomSessionId, operationId)];
 			if (!plan) return;
 			plan.nextIndex = Math.max(plan.nextIndex, nextIndex);
 			await this.write(plans);
 		});
 	}
 
-	async remove(operationId: string): Promise<void> {
+	async remove(roomSessionId: string, operationId: string): Promise<void> {
 		await this.serialize(async () => {
 			const plans = await this.read();
-			if (!plans[operationId]) return;
-			delete plans[operationId];
+			const key = this.key(roomSessionId, operationId);
+			if (!plans[key]) return;
+			delete plans[key];
 			await this.write(plans);
 		});
 	}

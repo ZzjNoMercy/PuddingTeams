@@ -528,16 +528,19 @@ for (const operation of await roomForkStore.list()) {
 }
 for (const plan of await roomFanoutStore.list()) {
 	const room = await teams.roomSession(plan.roomSessionId);
+	let complete = true;
 	if (room) {
 		for (const agentId of plan.targetAgentIds.slice(plan.nextIndex)) {
-			await roomEventStore.append(plan.roomSessionId, {
-				id: crypto.randomUUID(), kind: "terminal", actor: { kind: "system" },
-				content: `已跳过 @${agentId}：进程重启，fanout 未完成`, mentions: [agentId], createdAt: new Date().toISOString(),
-			}).catch(() => undefined);
+			try {
+				await roomEventStore.appendIdempotent(plan.roomSessionId, {
+					id: `fanout-skip:${plan.operationId}:${agentId}`, kind: "terminal", actor: { kind: "system" },
+					content: `已跳过 @${agentId}：进程重启，fanout 未完成`, mentions: [agentId], createdAt: new Date().toISOString(),
+				});
+			} catch { complete = false; break; }
 		}
 		app.log.warn({ operationId: plan.operationId }, "closed interrupted room fanout");
 	}
-	await roomFanoutStore.remove(plan.operationId);
+	if (complete) await roomFanoutStore.remove(plan.roomSessionId, plan.operationId);
 }
 invoker.setManagerSender((managerSessionId, message, options) =>
 	store.sendCustomMessage(managerSessionId, message, options),

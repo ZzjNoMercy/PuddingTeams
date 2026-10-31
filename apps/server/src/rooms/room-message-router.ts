@@ -626,10 +626,26 @@ export class RoomMessageRouter {
 			if (error instanceof RoomContextTooLargeError) throw new RoomMessageError("context_too_large", error.message);
 			throw error;
 		}
-		const reserved = await this.deps.operations.reserveMessage(input.roomSessionId, { key: input.operationId, requestHash: requestHash({ ...input, content }, content) });
-		if (!reserved.created) throw new RoomMessageError("message_delivery_unconfirmed", "消息操作已存在但未确认 accepted");
-		const sourceIds = await this.knowledgeSourceIds(eventId, binding, content, input.attachments);
-		const userEvent = await this.deps.events.append(input.roomSessionId, sourceIds ? { ...draft, knowledgeSourceIds: sourceIds } : draft);
+		if (this.deps.fanouts) {
+			try {
+				await this.deps.fanouts.put({
+					operationId: input.operationId, roomSessionId: input.roomSessionId, sourceEventId: eventId,
+					targetAgentIds: targets.map((item) => item.agentId), nextIndex: 1, createdAt: this.now(),
+				});
+			} catch (error) {
+				throw new RoomMessageError("message_delivery_unconfirmed", `fanout 计划无法持久化: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+		let userEvent;
+		try {
+			const reserved = await this.deps.operations.reserveMessage(input.roomSessionId, { key: input.operationId, requestHash: requestHash({ ...input, content }, content) });
+			if (!reserved.created) throw new RoomMessageError("message_delivery_unconfirmed", "消息操作已存在但未确认 accepted");
+			const sourceIds = await this.knowledgeSourceIds(eventId, binding, content, input.attachments);
+			userEvent = await this.deps.events.append(input.roomSessionId, sourceIds ? { ...draft, knowledgeSourceIds: sourceIds } : draft);
+		} catch (error) {
+			await this.deps.fanouts?.remove(input.roomSessionId, input.operationId).catch(() => undefined);
+			throw error;
+		}
 		await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "user_event_appended", { roomEventId: userEvent.id });
 		this.deps.bus?.publish(input.roomSessionId, { type: "room_event", event: userEvent });
 		await this.recordActivity(input.roomSessionId, userEvent, false);
@@ -645,10 +661,6 @@ export class RoomMessageRouter {
 		});
 		this.fanouts.set(input.operationId, { roomSessionId: input.roomSessionId, sourceEventId: userEvent.id, operationId: input.operationId, targets, nextIndex: 1 });
 		this.turnFanout.set(turn.id, input.operationId);
-		await this.deps.fanouts?.put({
-			operationId: input.operationId, roomSessionId: input.roomSessionId, sourceEventId: userEvent.id,
-			targetAgentIds: targets.map((item) => item.agentId), nextIndex: 1, createdAt: this.now(),
-		}).catch(() => undefined);
 		let durableMarked = false;
 		let resolveDurable!: () => void;
 		const durableReached = new Promise<void>((resolve) => { resolveDurable = resolve; });
@@ -668,25 +680,38 @@ export class RoomMessageRouter {
 		return { roomEventId: userEvent.id, turnId: turn.id, status: turn.status, replayed: false };
 	}
 
+	private async fanoutRemaining(plan: { roomSessionId: string; operationId: string; sourceEventId: string; targets: RoomParticipantTarget[]; nextIndex: number }, reason: string): Promise<boolean> {
+		let complete = true;
+		for (const target of plan.targets.slice(plan.nextIndex)) {
+			try {
+				const event = await this.deps.events.appendIdempotent(plan.roomSessionId, {
+					id: `fanout-skip:${plan.operationId}:${target.agentId}`, kind: "terminal", actor: { kind: "system" },
+					content: `已跳过 @${target.agentId}：${reason}`, mentions: [target.agentId], createdAt: this.now(),
+				});
+				this.deps.bus?.publish(plan.roomSessionId, { type: "room_event", event: event.event });
+				await this.recordActivity(plan.roomSessionId, event.event);
+			} catch {
+				complete = false;
+				break;
+			}
+		}
+		if (!complete) return false;
+		this.fanouts.delete(plan.operationId);
+		await this.deps.fanouts?.remove(plan.roomSessionId, plan.operationId).catch(() => undefined);
+		return true;
+	}
+
 	private async skipFanout(turnId: string, reason: string): Promise<void> {
 		const operationId = this.turnFanout.get(turnId);
 		if (!operationId) return;
-		this.turnFanout.delete(turnId);
 		const plan = this.fanouts.get(operationId);
-		this.fanouts.delete(operationId);
-		await this.deps.fanouts?.remove(operationId).catch(() => undefined);
-		if (!plan) return;
-		for (const target of plan.targets.slice(plan.nextIndex)) {
-			try {
-				const event = await this.deps.events.append(plan.roomSessionId, {
-					id: randomUUID(), kind: "terminal", actor: { kind: "system" },
-					content: `已跳过 @${target.agentId}：${reason}`,
-					mentions: [target.agentId], createdAt: this.now(),
-				});
-				this.deps.bus?.publish(plan.roomSessionId, { type: "room_event", event });
-				await this.recordActivity(plan.roomSessionId, event);
-			} catch { /* skip best effort */ }
-		}
+		if (!plan) { this.turnFanout.delete(turnId); return; }
+		if (await this.fanoutRemaining(plan, reason)) this.turnFanout.delete(turnId);
+	}
+
+	/** abort/close-unknown 等 execute 之外收敛 Turn 时关闭 fanout。 */
+	async closeFanout(turnId: string, reason: string): Promise<void> {
+		await this.skipFanout(turnId, reason);
 	}
 
 	private async continueFanout(turnId: string): Promise<void> {
@@ -696,47 +721,60 @@ export class RoomMessageRouter {
 		const plan = this.fanouts.get(operationId);
 		if (!plan) return;
 		const target = plan.targets[plan.nextIndex];
-		if (!target) { this.fanouts.delete(operationId); await this.deps.fanouts?.remove(operationId).catch(() => undefined); return; }
-		const index = plan.nextIndex;
-		plan.nextIndex += 1;
-		await this.deps.fanouts?.advance(operationId, plan.nextIndex).catch(() => undefined);
+		if (!target) {
+			this.fanouts.delete(operationId);
+			await this.deps.fanouts?.remove(plan.roomSessionId, operationId).catch(() => undefined);
+			return;
+		}
 		await withRoomAdmissionLock(plan.roomSessionId, async () => {
-		const active = await this.activeTurn(plan.roomSessionId);
-		if (active) { this.fanouts.delete(operationId); await this.deps.fanouts?.remove(operationId).catch(() => undefined); return; }
-		const binding = await this.deps.bindings.get(plan.roomSessionId, target.agentId);
-		if (!binding) { this.fanouts.delete(operationId); return; }
-		const events = await this.deps.events.read(plan.roomSessionId);
-		const source = events.find((event) => event.id === plan.sourceEventId);
-		if (!source) { this.fanouts.delete(operationId); return; }
-		let context: BuiltRoomContext;
-		try {
-			context = buildRoomContext({
-				roomSessionId: plan.roomSessionId, events,
-				...(binding.lastRoomEntryId ? { after: binding.lastRoomEntryId } : {}),
-				current: {
-					eventId: source.id, content: source.content, mentions: source.mentions,
-					...(source.attachments?.length ? { attachments: source.attachments } : {}),
-					targetAgentName: this.deps.agentNames?.[target.agentId] ?? target.agentId,
+			const active = await this.activeTurn(plan.roomSessionId);
+			if (active) { await this.fanoutRemaining(plan, "房间已有其他活动回合"); return; }
+			const binding = await this.deps.bindings.get(plan.roomSessionId, target.agentId);
+			if (!binding) { await this.fanoutRemaining(plan, "目标 Participant 无可用 binding"); return; }
+			const events = await this.deps.events.read(plan.roomSessionId);
+			const source = events.find((event) => event.id === plan.sourceEventId);
+			if (!source) { await this.fanoutRemaining(plan, "来源事件不存在"); return; }
+			let context: BuiltRoomContext;
+			try {
+				context = buildRoomContext({
+					roomSessionId: plan.roomSessionId, events,
+					...(binding.lastRoomEntryId ? { after: binding.lastRoomEntryId } : {}),
+					current: {
+						eventId: source.id, content: source.content, mentions: source.mentions,
+						...(source.attachments?.length ? { attachments: source.attachments } : {}),
+						targetAgentName: this.deps.agentNames?.[target.agentId] ?? target.agentId,
+					},
+					maxChars: effectiveBudget(this.deps.budget),
+					...(this.deps.agentNames ? { agentNames: this.deps.agentNames } : {}),
+				});
+			} catch {
+				await this.fanoutRemaining(plan, "剩余上下文超预算");
+				return;
+			}
+			const internalOperationId = `${operationId}::${plan.nextIndex + 1}`;
+			let turn: ParticipantTurn;
+			try {
+				const begun = await this.deps.turnService.begin({
+					roomSessionId: plan.roomSessionId, agentId: target.agentId, agentSessionId: target.agentSessionId,
+					sourceRoomEventId: source.id, operationId: internalOperationId, inputHash: hashText(context.text),
+					...(binding.lastRoomEntryId ? { contextFromAfterRoomEventId: binding.lastRoomEntryId } : {}),
+				});
+				turn = await this.deps.turnService.start(plan.roomSessionId, begun.turn.id);
+			} catch {
+				await this.fanoutRemaining(plan, "无法启动下一个 Participant");
+				return;
+			}
+			this.deps.bus?.publish(plan.roomSessionId, { type: "participant_turn", turn: publicTurn(turn) });
+			this.turnFanout.set(turn.id, operationId);
+			const nextIndex = plan.nextIndex + 1;
+			plan.nextIndex = nextIndex;
+			await this.deps.fanouts?.advance(plan.roomSessionId, operationId, nextIndex).catch(() => undefined);
+			void this.execute(plan.roomSessionId, turn.id, {
+				roomSessionId: plan.roomSessionId, turn, binding, prompt: context.text, context,
+				markInputDurable: async (agentUserEntryId?: string) => {
+					await this.deps.turnService.markInputDurable(plan.roomSessionId, turn.id, internalOperationId, agentUserEntryId);
 				},
-				maxChars: effectiveBudget(this.deps.budget),
-				...(this.deps.agentNames ? { agentNames: this.deps.agentNames } : {}),
-			});
-		} catch { this.fanouts.delete(operationId); return; }
-		const internalOperationId = `${operationId}::${index}`;
-		const begun = await this.deps.turnService.begin({
-			roomSessionId: plan.roomSessionId, agentId: target.agentId, agentSessionId: target.agentSessionId,
-			sourceRoomEventId: source.id, operationId: internalOperationId, inputHash: hashText(context.text),
-			...(binding.lastRoomEntryId ? { contextFromAfterRoomEventId: binding.lastRoomEntryId } : {}),
-		});
-		const turn = await this.deps.turnService.start(plan.roomSessionId, begun.turn.id);
-		this.deps.bus?.publish(plan.roomSessionId, { type: "participant_turn", turn: publicTurn(turn) });
-		this.turnFanout.set(turn.id, operationId);
-		void this.execute(plan.roomSessionId, turn.id, {
-			roomSessionId: plan.roomSessionId, turn, binding, prompt: context.text, context,
-			markInputDurable: async (agentUserEntryId?: string) => {
-				await this.deps.turnService.markInputDurable(plan.roomSessionId, turn.id, internalOperationId, agentUserEntryId);
-			},
-		}).catch(() => undefined);
+			}).catch(() => undefined);
 		});
 	}
 
@@ -748,7 +786,9 @@ export class RoomMessageRouter {
 				result = await this.deps.runner.run(runnerInput);
 			} catch (error) {
 				// 输入已 durable 时无法证明远端没有执行；按 unknown 交人工对账。
-				await this.deps.turnService.markUnknown(roomSessionId, turnId, error instanceof Error ? error.message : String(error));
+				const unknown = await this.deps.turnService.markUnknown(roomSessionId, turnId, error instanceof Error ? error.message : String(error));
+				this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(unknown) });
+				await this.skipFanout(turnId, "目标执行异常");
 				return;
 			}
 			if (result.execution || result.delegationIds?.length) {
@@ -760,6 +800,7 @@ export class RoomMessageRouter {
 			if (result.status === "waiting_input") {
 				const updated = await this.deps.turns.update(roomSessionId, turnId, { status: "waiting_input" });
 				this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(updated) });
+				await this.skipFanout(turnId, "目标等待输入/审批");
 				return;
 			}
 			if (result.status === "unknown") {
@@ -785,7 +826,10 @@ export class RoomMessageRouter {
 					await this.skipFanout(turnId, "排队输入执行失败");
 					return;
 				}
-				if (drained.terminal) return;
+				if (drained.terminal) {
+					await this.skipFanout(turnId, "排队输入执行失败");
+					return;
+				}
 				const finalContent = drained.finalContent ?? result.finalContent;
 				// 等待排队输入不能持有房间准入锁：否则长 delegation 期间所有发送都被挂起。
 				while (true) {
@@ -854,6 +898,7 @@ export class RoomMessageRouter {
 	async closeUnknown(roomSessionId: string, turnId: string, reason: string): Promise<ProjectionResult> {
 		const closed = await this.deps.turnService.closeUnknown(roomSessionId, turnId, reason);
 		if (closed.projection.event) await this.recordActivity(roomSessionId, closed.projection.event);
+		await this.skipFanout(turnId, "目标被用户解除");
 		return closed.projection;
 	}
 

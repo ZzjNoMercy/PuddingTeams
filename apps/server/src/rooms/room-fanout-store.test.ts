@@ -15,10 +15,10 @@ test("RoomFanoutStore: 计划持久化、前进与删除", async () => {
 	await store.put(plan);
 	const restarted = new RoomFanoutStore(file);
 	assert.deepEqual(await restarted.list(), [plan]);
-	await restarted.advance("op-fanout-1", 2);
+	await restarted.advance(plan.roomSessionId, "op-fanout-1", 2);
 	assert.equal((await restarted.list())[0]!.nextIndex, 2);
-	await restarted.advance("op-fanout-1", 1);
+	await restarted.advance(plan.roomSessionId, "op-fanout-1", 1);
 	assert.equal((await restarted.list())[0]!.nextIndex, 2, "nextIndex 只前进");
-	await restarted.remove("op-fanout-1");
+	await restarted.remove(plan.roomSessionId, "op-fanout-1");
 	assert.deepEqual(await restarted.list(), []);
 });

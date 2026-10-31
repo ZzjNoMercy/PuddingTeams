@@ -185,6 +185,7 @@ export function createRoomRuntime(input: {
 				await input.sessions.abort(active.agentSessionId).catch(() => undefined);
 			}
 			const cancelled = await turnService.cancel(roomSessionId, active.id, "用户停止");
+			await runtime.router.closeFanout(active.id, "用户停止").catch(() => undefined);
 			const projection = await turnService.project(roomSessionId, cancelled.id);
 			if (projection.event) {
 				bus.publish(roomSessionId, { type: "room_event", event: projection.event });
