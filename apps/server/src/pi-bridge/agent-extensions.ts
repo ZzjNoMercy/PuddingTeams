@@ -2,7 +2,7 @@ import { projectDelegationResult } from "../agent-runtime/delegation-result-proj
 import { createHash } from "node:crypto";
 import { Type, type Static } from "typebox";
 import type { ExtensionAPI, InlineExtension } from "@earendil-works/pi-coding-agent";
-import { eligibleWorkers, agentDisplayName, type TeamsStore, type AgentConfig, type WindowConfig, type WindowType } from "../store/teams.js";
+import { eligibleWorkers, agentDisplayName, MANAGER_AGENT_NAME, type TeamsStore, type AgentConfig, type WindowConfig, type WindowType } from "../store/teams.js";
 import { WorkStateConflictError, WorkStateOperationConflictError, goalCriterionRefs, workItemContractHash, type WorkStateStore } from "../store/work-state.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import {
@@ -1237,7 +1237,7 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 						prompt: params.prompt,
 						workspaceId: ctx.workspaceId,
 						cwd,
-					}, reservedId),
+					}, reservedId, { ownerAgentId: MANAGER_AGENT_NAME }),
 					rollbackSession: (id) => deps.sessions.remove(id),
 				});
 				// fire-and-forget 开跑（chat.ts 首发消息同款）：房间 manager 在自己
@@ -1353,7 +1353,7 @@ async function resolveDirectWindowForDelegation(
 	return deps.store.ensureDirectWindow(
 		agentName,
 		workspaceId,
-		(reservedId) => deps.sessions.create(undefined, { type: "direct", members: [agentName], workspaceId, cwd }, reservedId),
+		(reservedId) => deps.sessions.create(undefined, { type: "direct", members: [agentName], workspaceId, cwd }, reservedId, { ownerAgentId: agentName }),
 		{ cwdSnapshot: cwd, requireEnabledMember: true, rollbackSession: (id) => deps.sessions.remove(id), journalSession: true },
 	);
 }

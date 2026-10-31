@@ -29,7 +29,7 @@ import {
  */
 
 export class RoomTurnServiceError extends Error {
-	constructor(readonly code: "participant_binding_required" | "turn_not_terminal" | "turn_not_found" | "invalid_cutoff", message: string) {
+	constructor(readonly code: "participant_binding_required" | "turn_not_terminal" | "turn_not_found" | "invalid_cutoff" | "input_not_durable" | "watermark_conflict", message: string) {
 		super(message);
 		this.name = "RoomTurnServiceError";
 	}
@@ -114,6 +114,7 @@ export class RoomTurnService {
 			contextThroughRoomEventId: input.sourceRoomEventId,
 			inputHash: input.inputHash,
 			operationId: input.operationId,
+			bindingRevision: binding.revision,
 			inputs: [initialInput],
 			...(input.execution ? { execution: input.execution } : {}),
 		});
@@ -134,8 +135,38 @@ export class RoomTurnService {
 		if (!finalContent.trim()) throw new RoomTurnConflictError(roomSessionId, "completed Turn 的 finalContent 不能为空");
 		const current = await this.deps.turns.get(roomSessionId, turnId);
 		if (!current) throw new RoomTurnNotFoundError(roomSessionId, turnId);
+		if (current.inputs.some((input) => input.persistence !== "durable")) {
+			throw new RoomTurnServiceError("input_not_durable", `turn ${turnId} 仍有未确认的输入，不能 completed`);
+		}
 		await this.ensureRunning(roomSessionId, current);
 		return this.deps.turns.update(roomSessionId, turnId, { status: "completed", finalContent });
+	}
+
+	/** 输入确认落盘/接单；只有 durable 的输入才把 binding 水位推进到该事件。 */
+	async markInputDurable(roomSessionId: string, turnId: string, operationId: string, agentUserEntryId?: string): Promise<{ turn: ParticipantTurn; watermarkAdvanced: boolean }> {
+		const turn = await this.deps.turns.get(roomSessionId, turnId);
+		if (!turn) throw new RoomTurnNotFoundError(roomSessionId, turnId);
+		const input = turn.inputs.find((item) => item.operationId === operationId);
+		if (!input) throw new RoomTurnConflictError(roomSessionId, `输入 ${operationId} 不属于 turn ${turnId}`);
+		const updated = await this.deps.turns.markInputDurable(roomSessionId, turnId, operationId, agentUserEntryId);
+		const binding = await this.deps.bindings.findActiveBySession(roomSessionId, updated.agentSessionId);
+		if (!binding) return { turn: updated, watermarkAdvanced: false };
+		const events = await this.deps.events.read(roomSessionId);
+		const target = events.find((event) => event.id === input.contextThroughRoomEventId);
+		if (!target) throw new RoomTurnServiceError("invalid_cutoff", `输入 cutoff 事件不存在: ${input.contextThroughRoomEventId}`);
+		const current = binding.lastRoomEntryId ? events.find((event) => event.id === binding.lastRoomEntryId) : undefined;
+		if (current && current.seq >= target.seq) return { turn: updated, watermarkAdvanced: false };
+		await this.deps.bindings.advanceWatermark(roomSessionId, binding.agentId, binding.revision, target.id);
+		return { turn: updated, watermarkAdvanced: true };
+	}
+
+	async markUnknown(roomSessionId: string, turnId: string, reason: string): Promise<ParticipantTurn> {
+		return this.deps.turns.markUnknown(roomSessionId, turnId, reason);
+	}
+
+	async closeUnknown(roomSessionId: string, turnId: string, reason: string): Promise<{ turn: ParticipantTurn; projection: ProjectionResult }> {
+		const turn = await this.deps.turns.closeUnknown(roomSessionId, turnId, reason);
+		return { turn, projection: await this.project(roomSessionId, turnId) };
 	}
 
 	async fail(roomSessionId: string, turnId: string, reason: string, finalContent?: string): Promise<ParticipantTurn> {
@@ -176,18 +207,26 @@ export class RoomTurnService {
 			createdAt: this.now(),
 		});
 		let watermarkAdvanced = false;
-		if (turn.publicProjectionState !== "projected") {
-			await this.deps.turns.update(roomSessionId, turnId, { publicProjectionState: "projected" });
-		}
-		if (kind === "message" && binding.lastRoomEntryId !== projected.event.id) {
-			try {
-				// 公开回合串行，投影时取当前 revision 即可；P0-B 若引入并发，
-				// 必须把准入时的 binding revision 冻结进 ParticipantInput。
-				await this.deps.bindings.advanceWatermark(roomSessionId, binding.agentId, binding.revision, projected.event.id);
-				watermarkAdvanced = true;
-			} catch (error) {
-				if (!(error instanceof ParticipantBindingRevisionConflictError)) throw error;
+		const allDurable = turn.inputs.length > 0 && turn.inputs.every((input) => input.persistence === "durable");
+		if (kind === "message" && allDurable) {
+			const events = await this.deps.events.read(roomSessionId);
+			const current = binding.lastRoomEntryId ? events.find((event) => event.id === binding.lastRoomEntryId) : undefined;
+			if (!current || current.seq < projected.event.seq) {
+				try {
+					await this.deps.bindings.advanceWatermark(roomSessionId, binding.agentId, binding.revision, projected.event.id);
+					watermarkAdvanced = true;
+				} catch (error) {
+					if (error instanceof ParticipantBindingRevisionConflictError) {
+						throw new RoomTurnServiceError("watermark_conflict", `turn ${turnId} 水位推进 CAS 冲突；投影保持 pending`);
+					}
+					throw error;
+				}
 			}
+		}
+		if (turn.publicProjectionState !== "projected") {
+			// 水位先推进、再标记 projected：崩溃在两者之间时 recoverPending 可重试，
+			// 不会出现“已 projected 但水位永久落后”。
+			await this.deps.turns.update(roomSessionId, turnId, { publicProjectionState: "projected" });
 		}
 		const refreshed = await this.deps.turns.get(roomSessionId, turnId);
 		return { turn: refreshed ?? turn, event: projected.event, created: projected.created, watermarkAdvanced };

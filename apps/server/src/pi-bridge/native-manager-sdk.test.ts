@@ -88,7 +88,7 @@ test("真实 Pi 1.2 SDK：solo/group 原生 read/edit/bash→Goal 提交，与�
 		sessions = new PiSessionStore(cwd, path.join(root, "sessions"), teams, invoker, undefined, states, undefined, undefined, undefined, undefined, undefined, mcp, native);
 		for (const type of ["solo", "group"] as const) {
 			stage = 0;
-			const summary = await sessions.create("native-manager-fixture/fixture-model", { type, members: type === "group" ? ["allowed", "allowed-b"] : [], cwd }); sessionId = summary.id;
+			const summary = await sessions.create("native-manager-fixture/fixture-model", { type, members: type === "group" ? ["allowed", "allowed-b"] : [], cwd }, undefined, type === "group" ? { ownerAgentId: "manager" } : undefined); sessionId = summary.id;
 			if (type === "solo") await teams.ensureSoloWindow(async () => ({ id: sessionId }), async () => true);
 			else await teams.createWindow({ type, members: ["allowed", "allowed-b"], sessionId });
 			const goal = await states.create({ sessionId, goal: "produce checked result", completionBoundary: "result checked and submitted", verificationPolicy: { minimumWorkItemMode: "manager_review", finalGoalMode: "manager_review", source: "user", reason: "SDK fixture", trigger: "manager_request" } });

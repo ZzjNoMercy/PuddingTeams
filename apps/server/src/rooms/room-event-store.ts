@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
+import { withRoomFileLock } from "./room-file-lock.js";
 
 /**
  * RoomSession 公共事件存储（方案 §18.2/§18.3）。
@@ -65,6 +66,13 @@ export class RoomSessionRecoveryRequiredError extends Error {
 	}
 }
 
+export class RoomEventInvalidRequestError extends Error {
+	constructor(readonly roomSessionId: string, message: string) {
+		super(message);
+		this.name = "RoomEventInvalidRequestError";
+	}
+}
+
 export class RoomEventConflictError extends Error {
 	constructor(readonly roomSessionId: string, message: string) {
 		super(message);
@@ -81,10 +89,26 @@ export class RoomPersistenceUncertainError extends Error {
 
 const EVENT_KINDS: ReadonlySet<string> = new Set(["message", "terminal", "artifact"]);
 const ACTOR_KINDS: ReadonlySet<string> = new Set(["user", "agent", "system"]);
+const EVENT_KEYS: ReadonlySet<string> = new Set([
+	"id", "roomSessionId", "seq", "kind", "actor", "content", "mentions",
+	"attachments", "artifactRefs", "sourceParticipantTurnId", "replyToEventId", "createdAt",
+]);
+const DRAFT_KEYS: ReadonlySet<string> = new Set([
+	"id", "kind", "actor", "content", "mentions", "attachments",
+	"artifactRefs", "sourceParticipantTurnId", "replyToEventId", "createdAt",
+]);
+const ACTOR_KEYS: ReadonlySet<string> = new Set(["kind", "agentId"]);
+const ATTACHMENT_KEYS: ReadonlySet<string> = new Set(["name", "path", "mediaType", "size", "sha256", "kind"]);
+const ARTIFACT_KEYS: ReadonlySet<string> = new Set(["name", "path", "kind"]);
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 const SAFE_ROOM_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/;
 
+function hasOnlyKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
+	return Object.keys(value).every((key) => allowed.has(key));
+}
+
 function assertRoomSessionId(roomSessionId: string): void {
-	if (!SAFE_ROOM_SESSION_ID.test(roomSessionId)) throw new RoomSessionNotFoundError(roomSessionId);
+	if (!SAFE_ROOM_SESSION_ID.test(roomSessionId)) throw new RoomEventInvalidRequestError(roomSessionId, "roomSessionId 无效");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -97,10 +121,10 @@ function validMentions(value: unknown): value is string[] {
 
 function validAttachments(value: unknown): value is RoomAttachmentRef[] {
 	return Array.isArray(value) && value.every((item) => {
-		if (!isRecord(item)) return false;
-		return typeof item.name === "string" && item.name.length > 0
-			&& typeof item.path === "string" && item.path.length > 0
-			&& typeof item.mediaType === "string" && item.mediaType.length > 0
+		if (!isRecord(item) || !hasOnlyKeys(item, ATTACHMENT_KEYS)) return false;
+		return typeof item.name === "string" && item.name.length > 0 && !CONTROL_CHARS.test(item.name)
+			&& typeof item.path === "string" && item.path.length > 0 && !CONTROL_CHARS.test(item.path)
+			&& typeof item.mediaType === "string" && item.mediaType.length > 0 && !CONTROL_CHARS.test(item.mediaType)
 			&& Number.isSafeInteger(item.size) && (item.size as number) >= 0
 			&& typeof item.sha256 === "string" && /^[a-f0-9]{64}$/.test(item.sha256)
 			&& (item.kind === "file" || item.kind === "image");
@@ -109,7 +133,7 @@ function validAttachments(value: unknown): value is RoomAttachmentRef[] {
 
 function validArtifactRefs(value: unknown): value is RoomArtifactRef[] {
 	return Array.isArray(value) && value.every((item) => {
-		if (!isRecord(item)) return false;
+		if (!isRecord(item) || !hasOnlyKeys(item, ARTIFACT_KEYS)) return false;
 		return typeof item.name === "string" && item.name.length > 0
 			&& typeof item.path === "string" && item.path.length > 0
 			&& (item.kind === undefined || typeof item.kind === "string");
@@ -117,7 +141,7 @@ function validArtifactRefs(value: unknown): value is RoomArtifactRef[] {
 }
 
 function validActor(value: unknown): value is RoomActor {
-	if (!isRecord(value) || typeof value.kind !== "string" || !ACTOR_KINDS.has(value.kind)) return false;
+	if (!isRecord(value) || !hasOnlyKeys(value, ACTOR_KEYS) || typeof value.kind !== "string" || !ACTOR_KINDS.has(value.kind)) return false;
 	if (value.kind === "agent") return typeof value.agentId === "string" && value.agentId.length > 0;
 	return value.agentId === undefined;
 }
@@ -125,6 +149,7 @@ function validActor(value: unknown): value is RoomActor {
 /** 校验一条已持久事件；不合法即 recovery_required。 */
 function parseEvent(roomSessionId: string, raw: unknown, expectedSeq: number): RoomEvent {
 	if (!isRecord(raw)) throw new RoomSessionRecoveryRequiredError(roomSessionId, `seq ${expectedSeq} is not an object`);
+	if (!hasOnlyKeys(raw, EVENT_KEYS)) throw new RoomSessionRecoveryRequiredError(roomSessionId, `seq ${expectedSeq} has unknown fields`);
 	if (typeof raw.id !== "string" || !raw.id) throw new RoomSessionRecoveryRequiredError(roomSessionId, `seq ${expectedSeq} has no id`);
 	if (raw.roomSessionId !== roomSessionId) throw new RoomSessionRecoveryRequiredError(roomSessionId, `seq ${expectedSeq} belongs to another room`);
 	if (raw.seq !== expectedSeq) throw new RoomSessionRecoveryRequiredError(roomSessionId, `seq ${expectedSeq} expected, got ${String(raw.seq)}`);
@@ -154,14 +179,15 @@ function parseEvent(roomSessionId: string, raw: unknown, expectedSeq: number): R
 }
 
 function validateDraft(roomSessionId: string, draft: RoomEventDraft): void {
-	if (!draft.id) throw new RoomEventConflictError(roomSessionId, "RoomEvent 缺少 id");
-	if (!EVENT_KINDS.has(draft.kind)) throw new RoomEventConflictError(roomSessionId, "RoomEvent kind 无效");
-	if (!validActor(draft.actor)) throw new RoomEventConflictError(roomSessionId, "RoomEvent actor 无效");
-	if (typeof draft.content !== "string") throw new RoomEventConflictError(roomSessionId, "RoomEvent content 无效");
-	if (!validMentions(draft.mentions)) throw new RoomEventConflictError(roomSessionId, "RoomEvent mentions 无效");
-	if (draft.attachments !== undefined && !validAttachments(draft.attachments)) throw new RoomEventConflictError(roomSessionId, "RoomEvent attachments 无效");
-	if (draft.artifactRefs !== undefined && !validArtifactRefs(draft.artifactRefs)) throw new RoomEventConflictError(roomSessionId, "RoomEvent artifactRefs 无效");
-	if (!Number.isFinite(Date.parse(draft.createdAt))) throw new RoomEventConflictError(roomSessionId, "RoomEvent createdAt 无效");
+	if (!hasOnlyKeys(draft as unknown as Record<string, unknown>, DRAFT_KEYS)) throw new RoomEventInvalidRequestError(roomSessionId, "RoomEvent 含未知字段");
+	if (!draft.id) throw new RoomEventInvalidRequestError(roomSessionId, "RoomEvent 缺少 id");
+	if (!EVENT_KINDS.has(draft.kind)) throw new RoomEventInvalidRequestError(roomSessionId, "RoomEvent kind 无效");
+	if (!validActor(draft.actor)) throw new RoomEventInvalidRequestError(roomSessionId, "RoomEvent actor 无效");
+	if (typeof draft.content !== "string") throw new RoomEventInvalidRequestError(roomSessionId, "RoomEvent content 无效");
+	if (!validMentions(draft.mentions)) throw new RoomEventInvalidRequestError(roomSessionId, "RoomEvent mentions 无效");
+	if (draft.attachments !== undefined && !validAttachments(draft.attachments)) throw new RoomEventInvalidRequestError(roomSessionId, "RoomEvent attachments 无效");
+	if (draft.artifactRefs !== undefined && !validArtifactRefs(draft.artifactRefs)) throw new RoomEventInvalidRequestError(roomSessionId, "RoomEvent artifactRefs 无效");
+	if (!Number.isFinite(Date.parse(draft.createdAt))) throw new RoomEventInvalidRequestError(roomSessionId, "RoomEvent createdAt 无效");
 }
 
 function sameProjection(left: RoomEvent, right: RoomEventDraft, opts: { ignoreId?: boolean } = {}): boolean {
@@ -177,9 +203,18 @@ function sameProjection(left: RoomEvent, right: RoomEventDraft, opts: { ignoreId
 }
 
 export class RoomEventStore {
-	private readonly queues = new Map<string, Promise<unknown>>();
+	private readonly attachmentRoot?: string;
+	private readonly uncertain = new Set<string>();
 
-	constructor(private readonly root: string) {}
+	constructor(private readonly root: string, options: { attachmentRoot?: string } = {}) {
+		this.attachmentRoot = options.attachmentRoot;
+	}
+
+	private assertWritable(roomSessionId: string): void {
+		if (this.uncertain.has(roomSessionId)) {
+			throw new RoomPersistenceUncertainError(roomSessionId, "RoomEvent 写盘结果不确定；需重启回读后再继续");
+		}
+	}
 
 	eventsPath(roomSessionId: string): string {
 		assertRoomSessionId(roomSessionId);
@@ -191,15 +226,7 @@ export class RoomEventStore {
 	}
 
 	private async runExclusive<T>(roomSessionId: string, action: () => Promise<T>): Promise<T> {
-		const previous = this.queues.get(roomSessionId) ?? Promise.resolve();
-		const run = previous.then(action, action);
-		const tail = run.then(() => undefined, () => undefined);
-		this.queues.set(roomSessionId, tail);
-		try {
-			return await run;
-		} finally {
-			if (this.queues.get(roomSessionId) === tail) this.queues.delete(roomSessionId);
-		}
+		return withRoomFileLock(this.root, roomSessionId, action);
 	}
 
 	private async syncDirectory(directory: string): Promise<void> {
@@ -213,11 +240,20 @@ export class RoomEventStore {
 		assertRoomSessionId(roomSessionId);
 		const file = this.eventsPath(roomSessionId);
 		return this.runExclusive(roomSessionId, async () => {
+			this.assertWritable(roomSessionId);
 			try {
 				await stat(file);
+				// 已存在也必须完整校验；损坏文件不能当健康房间返回 created=false。
+				await this.readUnlocked(roomSessionId);
 				return { created: false, path: file };
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			let rootExisted = true;
+			try { await stat(this.root); }
+			catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				rootExisted = false;
 			}
 			const directory = this.sessionDir(roomSessionId);
 			await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -226,6 +262,8 @@ export class RoomEventStore {
 			finally { await handle.close(); }
 			try {
 				await this.syncDirectory(directory);
+				await this.syncDirectory(this.root);
+				if (!rootExisted) await this.syncDirectory(path.dirname(this.root));
 			} catch (error) {
 				throw new RoomPersistenceUncertainError(roomSessionId, "RoomEvent 文件创建后目录同步失败；需启动对账", error);
 			}
@@ -234,13 +272,15 @@ export class RoomEventStore {
 	}
 
 	async exists(roomSessionId: string): Promise<boolean> {
-		try {
-			await readFile(this.eventsPath(roomSessionId), "utf8");
-			return true;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-			throw error;
-		}
+		return this.runExclusive(roomSessionId, async () => {
+			try {
+				await this.readUnlocked(roomSessionId);
+				return true;
+			} catch (error) {
+				if (error instanceof RoomSessionNotFoundError) return false;
+				throw error;
+			}
+		});
 	}
 
 	/**
@@ -270,6 +310,7 @@ export class RoomEventStore {
 		}
 		const events: RoomEvent[] = [];
 		const seen = new Set<string>();
+		const seenTurns = new Set<string>();
 		for (const [index, line] of lines.entries()) {
 			if (!line) throw new RoomSessionRecoveryRequiredError(roomSessionId, `seq ${index + 1} is empty`);
 			let parsed: unknown;
@@ -278,6 +319,10 @@ export class RoomEventStore {
 			const event = parseEvent(roomSessionId, parsed, index + 1);
 			if (seen.has(event.id)) throw new RoomSessionRecoveryRequiredError(roomSessionId, `duplicate event id: ${event.id}`);
 			seen.add(event.id);
+			if (event.sourceParticipantTurnId) {
+				if (seenTurns.has(event.sourceParticipantTurnId)) throw new RoomSessionRecoveryRequiredError(roomSessionId, `duplicate sourceParticipantTurnId: ${event.sourceParticipantTurnId}`);
+				seenTurns.add(event.sourceParticipantTurnId);
+			}
 			events.push(event);
 		}
 		return events;
@@ -287,8 +332,11 @@ export class RoomEventStore {
 	async snapshot(roomSessionId: string, opts: { afterSeq?: number; limit?: number } = {}): Promise<{ events: RoomEvent[]; throughSeq: number; nextSeq?: number }> {
 		const all = await this.read(roomSessionId);
 		const after = opts.afterSeq ?? 0;
-		if (!Number.isSafeInteger(after) || after < 0 || after > all.length) throw new RoomEventConflictError(roomSessionId, `afterSeq 越界: ${after}`);
-		const limit = opts.limit === undefined ? all.length : Math.max(1, Math.min(opts.limit, 500));
+		if (!Number.isSafeInteger(after) || after < 0 || after > all.length) throw new RoomEventInvalidRequestError(roomSessionId, `afterSeq 越界: ${after}`);
+		if (opts.limit !== undefined && (!Number.isSafeInteger(opts.limit) || opts.limit < 1 || opts.limit > 500)) {
+			throw new RoomEventInvalidRequestError(roomSessionId, `limit 必须是 1..500 的整数: ${String(opts.limit)}`);
+		}
+		const limit = opts.limit ?? all.length;
 		const remaining = all.slice(after);
 		const events = remaining.slice(0, limit);
 		const throughSeq = events.at(-1)?.seq ?? after;
@@ -298,9 +346,14 @@ export class RoomEventStore {
 	async append(roomSessionId: string, draft: RoomEventDraft): Promise<RoomEvent> {
 		assertRoomSessionId(roomSessionId);
 		validateDraft(roomSessionId, draft);
+		this.assertAttachmentPaths(roomSessionId, draft.attachments);
 		return this.runExclusive(roomSessionId, async () => {
+			this.assertWritable(roomSessionId);
 			const events = await this.readUnlocked(roomSessionId);
 			if (events.some((event) => event.id === draft.id)) throw new RoomEventConflictError(roomSessionId, `event ${draft.id} 已存在`);
+			if (draft.sourceParticipantTurnId && events.some((event) => event.sourceParticipantTurnId === draft.sourceParticipantTurnId)) {
+				throw new RoomEventConflictError(roomSessionId, `turn ${draft.sourceParticipantTurnId} 已有公共投影`);
+			}
 			return this.appendUnlocked(roomSessionId, events, draft);
 		});
 	}
@@ -312,7 +365,9 @@ export class RoomEventStore {
 	async appendIdempotent(roomSessionId: string, draft: RoomEventDraft): Promise<{ event: RoomEvent; created: boolean }> {
 		assertRoomSessionId(roomSessionId);
 		validateDraft(roomSessionId, draft);
+		this.assertAttachmentPaths(roomSessionId, draft.attachments);
 		return this.runExclusive(roomSessionId, async () => {
+			this.assertWritable(roomSessionId);
 			const events = await this.readUnlocked(roomSessionId);
 			const byId = events.find((event) => event.id === draft.id);
 			if (byId) {
@@ -328,6 +383,18 @@ export class RoomEventStore {
 			}
 			return { event: await this.appendUnlocked(roomSessionId, events, draft), created: true };
 		});
+	}
+
+	private assertAttachmentPaths(roomSessionId: string, attachments: RoomAttachmentRef[] | undefined): void {
+		if (!attachments?.length || !this.attachmentRoot) return;
+		const root = path.resolve(this.attachmentRoot);
+		for (const item of attachments) {
+			const target = path.resolve(item.path);
+			const relative = path.relative(root, target);
+			if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
+				throw new RoomEventInvalidRequestError(roomSessionId, `附件路径不在冻结命名空间内: ${item.path}`);
+			}
+		}
 	}
 
 	private async appendUnlocked(roomSessionId: string, events: RoomEvent[], draft: RoomEventDraft): Promise<RoomEvent> {
@@ -354,6 +421,7 @@ export class RoomEventStore {
 			await handle.sync();
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new RoomSessionNotFoundError(roomSessionId);
+			this.uncertain.add(roomSessionId);
 			throw new RoomPersistenceUncertainError(roomSessionId, "RoomEvent 追加写盘失败；需启动对账", error);
 		} finally {
 			await handle?.close().catch(() => undefined);
@@ -365,6 +433,7 @@ export class RoomEventStore {
 	async remove(roomSessionId: string): Promise<void> {
 		assertRoomSessionId(roomSessionId);
 		await this.runExclusive(roomSessionId, async () => {
+			this.assertWritable(roomSessionId);
 			await rm(this.sessionDir(roomSessionId), { recursive: true, force: true });
 			await this.syncDirectory(this.root).catch((error) => {
 				throw new RoomPersistenceUncertainError(roomSessionId, "RoomSession 删除后目录同步失败", error);
@@ -373,31 +442,66 @@ export class RoomEventStore {
 	}
 
 	/** 为 Fork 复制到新 roomSessionId；调用方负责生成新 id。 */
+	/**
+	 * 公共历史复制到新 RoomSession：先写临时目录，再原子 rename。
+	 * - 同一 target 中途失败可重试，不会留下半成品；
+	 * - 事件 id 全部重发，replyToEventId 重映射到新 id（目标不在 cutoff 内则丢弃）；
+	 * - sourceParticipantTurnId 作为来源 provenance 保留（目标的 Turn 不复制）。
+	 */
 	async fork(sourceRoomSessionId: string, targetRoomSessionId: string, opts: { throughSeq?: number } = {}): Promise<RoomEvent[]> {
 		assertRoomSessionId(targetRoomSessionId);
 		const events = await this.read(sourceRoomSessionId);
 		const through = opts.throughSeq ?? events.length;
-		if (!Number.isSafeInteger(through) || through < 0 || through > events.length) throw new RoomEventConflictError(sourceRoomSessionId, `throughSeq 越界: ${through}`);
-		const creation = await this.create(targetRoomSessionId);
-		if (!creation.created) {
-			const existing = await this.read(targetRoomSessionId);
-			if (existing.length > 0) throw new RoomEventConflictError(sourceRoomSessionId, `fork target 已有公共事件: ${targetRoomSessionId}`);
-		}
-		const copied: RoomEvent[] = [];
-		for (const event of events.slice(0, through)) {
-			copied.push(await this.append(targetRoomSessionId, {
-				id: randomUUID(),
-				kind: event.kind,
-				actor: event.actor,
-				content: event.content,
-				mentions: event.mentions,
-				...(event.attachments ? { attachments: event.attachments } : {}),
-				...(event.artifactRefs ? { artifactRefs: event.artifactRefs } : {}),
-				...(event.sourceParticipantTurnId ? { sourceParticipantTurnId: event.sourceParticipantTurnId } : {}),
-				...(event.replyToEventId ? { replyToEventId: event.replyToEventId } : {}),
-				createdAt: event.createdAt,
-			}));
-		}
-		return copied;
+		if (!Number.isSafeInteger(through) || through < 0 || through > events.length) throw new RoomEventInvalidRequestError(sourceRoomSessionId, `throughSeq 越界: ${through}`);
+		const selected = events.slice(0, through);
+		const idMap = new Map(selected.map((event) => [event.id, randomUUID()]));
+		const copies: RoomEvent[] = selected.map((event, index) => ({
+			id: idMap.get(event.id)!,
+			roomSessionId: targetRoomSessionId,
+			seq: index + 1,
+			kind: event.kind,
+			actor: event.actor,
+			content: event.content,
+			mentions: event.mentions,
+			...(event.attachments ? { attachments: event.attachments } : {}),
+			...(event.artifactRefs ? { artifactRefs: event.artifactRefs } : {}),
+			...(event.sourceParticipantTurnId ? { sourceParticipantTurnId: event.sourceParticipantTurnId } : {}),
+			...(event.replyToEventId ? (idMap.has(event.replyToEventId) ? { replyToEventId: idMap.get(event.replyToEventId)! } : {}) : {}),
+			createdAt: event.createdAt,
+		}));
+		const directory = this.sessionDir(targetRoomSessionId);
+		const file = this.eventsPath(targetRoomSessionId);
+		return this.runExclusive(targetRoomSessionId, async () => {
+			this.assertWritable(targetRoomSessionId);
+			let targetExists = false;
+			try { await stat(directory); targetExists = true; }
+			catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+			if (targetExists) {
+				const existing = await this.readUnlocked(targetRoomSessionId);
+				if (existing.length > 0) throw new RoomEventConflictError(sourceRoomSessionId, `fork target 已有公共事件: ${targetRoomSessionId}`);
+			}
+			const temp = path.join(this.root, `.fork-${randomUUID()}`);
+			await mkdir(temp, { recursive: true, mode: 0o700 });
+			const handle = await open(path.join(temp, "events.jsonl"), "wx", 0o600);
+			try {
+				for (const event of copies) await handle.writeFile(`${JSON.stringify(event)}\n`);
+				await handle.sync();
+			} finally {
+				await handle.close();
+			}
+			await this.syncDirectory(temp);
+			let renamed = false;
+			try {
+				if (targetExists) await rm(directory, { recursive: true, force: true });
+				await rename(temp, directory);
+				renamed = true;
+				await this.syncDirectory(this.root);
+			} catch (error) {
+				if (!renamed) await rm(temp, { recursive: true, force: true }).catch(() => undefined);
+				else this.uncertain.add(targetRoomSessionId);
+				throw new RoomPersistenceUncertainError(targetRoomSessionId, "fork 目标目录提交结果不确定", error);
+			}
+			return copies;
+		});
 	}
 }

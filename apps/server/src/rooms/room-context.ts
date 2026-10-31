@@ -32,6 +32,7 @@ export interface RoomCurrentInput {
 }
 
 export interface BuildRoomContextInput {
+	roomSessionId: string;
 	events: readonly RoomEvent[];
 	/** binding.lastRoomEntryId：已经在之前输入中装配过的公共事件（不含）。 */
 	after?: string;
@@ -58,6 +59,12 @@ export interface BuiltRoomContext {
 	throughSeq: number;
 }
 
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/g;
+
+function inline(value: string): string {
+	return value.replace(CONTROL_CHARS, " ");
+}
+
 function codePointLength(text: string): number {
 	let count = 0;
 	for (const _ of text) count += 1;
@@ -77,7 +84,7 @@ function mentionLabel(mentions: readonly string[], agentNames: Record<string, st
 
 function attachmentLines(attachments: readonly RoomAttachmentRef[] | undefined): string[] {
 	if (!attachments?.length) return [];
-	return attachments.map((item) => `附件：${item.name}（${item.mediaType}，sha256=${item.sha256}）：${item.path}`);
+	return attachments.map((item) => `附件：${inline(item.name)}（${inline(item.mediaType)}，sha256=${item.sha256}）：${inline(item.path)}`);
 }
 
 function renderEvent(event: RoomEvent, agentNames: Record<string, string>): string {
@@ -87,7 +94,7 @@ function renderEvent(event: RoomEvent, agentNames: Record<string, string>): stri
 	const lines = [header];
 	if (event.content) lines.push(event.content);
 	if (event.artifactRefs?.length) {
-		for (const ref of event.artifactRefs) lines.push(`产物：${ref.name}${ref.kind ? `（${ref.kind}）` : ""}：${ref.path}`);
+		for (const ref of event.artifactRefs) lines.push(`产物：${inline(ref.name)}${ref.kind ? `（${inline(ref.kind)}）` : ""}：${inline(ref.path)}`);
 	}
 	lines.push(...attachmentLines(event.attachments));
 	return lines.join("\n");
@@ -98,27 +105,55 @@ function renderEvent(event: RoomEvent, agentNames: Record<string, string>): stri
  * 同时出现在历史和当前段落里。调用方必须传入完整、已校验的 RoomEvent 快照。
  */
 export function buildRoomContext(input: BuildRoomContextInput): BuiltRoomContext {
+	if (input.maxChars !== undefined && (!Number.isSafeInteger(input.maxChars) || input.maxChars < 0)) {
+		throw new RoomContextRangeError(`maxChars 必须是非负整数: ${String(input.maxChars)}`);
+	}
+	const seenSeq = new Set<number>();
+	let previousSeq = 0;
+	for (const event of input.events) {
+		if (!Number.isSafeInteger(event.seq) || event.seq <= previousSeq || seenSeq.has(event.seq)) throw new RoomContextRangeError("公共事件必须按严格递增的 seq 排列");
+		previousSeq = event.seq;
+		seenSeq.add(event.seq);
+	}
+	if (!input.current.eventId) throw new RoomContextRangeError("当前用户事件缺少 eventId");
+	if (!Array.isArray(input.current.mentions) || input.current.mentions.some((item) => typeof item !== "string" || !item) || new Set(input.current.mentions).size !== input.current.mentions.length) {
+		throw new RoomContextRangeError("当前用户事件的 mentions 无效");
+	}
 	const byId = new Map(input.events.map((event) => [event.id, event]));
+	const persistedCurrent = byId.get(input.current.eventId);
+	if (persistedCurrent) {
+		if (persistedCurrent.kind !== "message" || persistedCurrent.actor.kind !== "user"
+			|| persistedCurrent.content !== input.current.content
+			|| JSON.stringify(persistedCurrent.mentions) !== JSON.stringify(input.current.mentions)
+			|| JSON.stringify(persistedCurrent.attachments ?? null) !== JSON.stringify(input.current.attachments ?? null)) {
+			throw new RoomContextRangeError("当前用户事件与已落盘投影不一致");
+		}
+	}
 	const through = input.through === undefined ? undefined : byId.get(input.through);
 	if (input.through !== undefined && !through) throw new RoomContextRangeError(`cutoff 事件不存在：${input.through}`);
 	const after = input.after === undefined ? undefined : byId.get(input.after);
 	if (input.after !== undefined && !after) throw new RoomContextRangeError(`水位事件不存在：${input.after}`);
+	const last = input.events.at(-1);
+	if (last && last.roomSessionId !== input.roomSessionId) throw new RoomContextRangeError("事件属于其他 RoomSession");
+	if (through && through.roomSessionId !== input.roomSessionId) throw new RoomContextRangeError("cutoff 属于其他 RoomSession");
+	if (through && last && through.id !== last.id) throw new RoomContextRangeError("cutoff 必须位于当前已提交尾部");
 	const afterSeq = after?.seq ?? 0;
-	const throughSeq = through?.seq ?? input.events.at(-1)?.seq ?? 0;
+	const throughSeq = through?.seq ?? last?.seq ?? 0;
 	if (afterSeq > throughSeq) throw new RoomContextRangeError("水位晚于本次 cutoff");
 	if (!Number.isInteger(afterSeq) || !Number.isInteger(throughSeq)) throw new RoomContextRangeError("事件 seq 无效");
 
 	const agentNames = input.agentNames ?? {};
 	const history = input.events.filter((event) =>
 		event.seq > afterSeq && event.seq <= throughSeq && event.id !== input.current.eventId);
-	const roomSessionId = through?.roomSessionId ?? input.events.at(-1)?.roomSessionId;
 	const cutoffLabel = through ? `${through.id}/${through.seq}` : "initial/0";
 	const sections: string[] = [];
 	if (history.length > 0 || input.includeEmptyHeader !== false) {
-		sections.push(`[房间公共历史｜roomSessionId=${roomSessionId ?? ""}｜through=${cutoffLabel}]\n仅包含面向房间的最终发言、必要终态和公开产物；不是任何成员的私有执行记录。`);
+		sections.push(`[房间公共历史｜roomSessionId=${input.roomSessionId}｜through=${cutoffLabel}]\n仅包含面向房间的最终发言、必要终态和公开产物；不是任何成员的私有执行记录。`);
 	}
 	for (const event of history) sections.push(renderEvent(event, agentNames));
-	const target = input.current.targetAgentName ? `@${input.current.targetAgentName}` : "@你";
+	const target = input.current.targetAgentName
+		? `@${input.current.targetAgentName}`
+		: input.current.mentions.length === 1 ? `@${agentNames[input.current.mentions[0]!] ?? input.current.mentions[0]}` : "@你";
 	const currentLines = [`[当前用户消息｜用户 → ${target}｜event=${input.current.eventId}]`];
 	if (input.current.content) currentLines.push(input.current.content);
 	currentLines.push(...attachmentLines(input.current.attachments));
@@ -132,7 +167,7 @@ export function buildRoomContext(input: BuildRoomContextInput): BuiltRoomContext
 		chars,
 		historyCount: history.length,
 		...(after ? { afterEventId: after.id, afterSeq: after.seq } : {}),
-		...(through ? { throughEventId: through.id } : {}),
+		...(through ?? last ? { throughEventId: (through ?? last)!.id } : {}),
 		throughSeq,
 	};
 }

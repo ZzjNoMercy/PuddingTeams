@@ -27,6 +27,7 @@ function newTurn(overrides: Partial<NewParticipantTurn> = {}): NewParticipantTur
 		contextThroughRoomEventId: "event-1",
 		inputHash: "a".repeat(64),
 		operationId: "op-1",
+		bindingRevision: 1,
 		...overrides,
 	};
 }

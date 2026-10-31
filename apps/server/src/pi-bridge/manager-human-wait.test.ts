@@ -48,7 +48,7 @@ test("真实 pi 循环：HITL 工具结果落盘后结束本轮，聊天继续�
 		const runtime = new AgentRuntime(delegations, secrets, (id) => registry.get(id), { ttlMs: 60_000 });
 		const invoker = new AgentInvoker(teams, runtime, registry, undefined, dir);
 		sessions = new PiSessionStore(dir, path.join(dir, "sessions"), teams, invoker);
-		const summary = await sessions.create(undefined, { type: "group", members: ["alpha", "beta"] });
+		const summary = await sessions.create(undefined, { type: "group", members: ["alpha", "beta"] }, undefined, { ownerAgentId: "manager" });
 		await teams.createWindow({ type: "group", members: ["alpha", "beta"], sessionId: summary.id });
 		const session = await sessions.open(summary.id);
 		let modelCalls = 0;

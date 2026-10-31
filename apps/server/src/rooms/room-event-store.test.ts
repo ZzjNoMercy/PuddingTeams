@@ -1,10 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
 	RoomEventConflictError,
+	RoomEventInvalidRequestError,
 	RoomEventStore,
 	RoomSessionNotFoundError,
 	RoomSessionRecoveryRequiredError,
@@ -150,7 +151,9 @@ test("RoomEventStore: snapshot 按 afterSeq/limit 增量读取", async () => {
 	const tail = await store.snapshot(ROOM, { afterSeq: 4 });
 	assert.deepEqual(tail.events.map((event) => event.seq), [5]);
 	assert.equal(tail.nextSeq, undefined);
-	await assert.rejects(() => store.snapshot(ROOM, { afterSeq: 6 }), RoomEventConflictError);
+	await assert.rejects(() => store.snapshot(ROOM, { afterSeq: 6 }), RoomEventInvalidRequestError);
+	await assert.rejects(() => store.snapshot(ROOM, { limit: Number.NaN }), RoomEventInvalidRequestError);
+	await assert.rejects(() => store.snapshot(ROOM, { limit: 0 }), RoomEventInvalidRequestError);
 });
 
 test("RoomEventStore: 未创建的 RoomSession 明确 not found", async () => {
@@ -159,17 +162,93 @@ test("RoomEventStore: 未创建的 RoomSession 明确 not found", async () => {
 	await assert.rejects(() => store.append("room-1111-2222", draft()), RoomSessionNotFoundError);
 });
 
-test("RoomEventStore: fork 复制公共事件但不复用 id", async () => {
+test("RoomEventStore: fork 复制公共事件但不复用 id，并重映射 replyToEventId", async () => {
 	const { store } = freshStore();
 	await store.create(ROOM);
 	await store.append(ROOM, draft());
-	await store.append(ROOM, draft({ id: "event-2", actor: { kind: "agent", agentId: "worker-a" }, content: "结论", mentions: [] }));
+	await store.append(ROOM, draft({
+		id: "event-2", actor: { kind: "agent", agentId: "worker-a" }, content: "结论", mentions: [],
+		sourceParticipantTurnId: "turn-1", replyToEventId: "event-1",
+	}));
 	const copied = await store.fork(ROOM, "room-3333-4444");
 	assert.equal(copied.length, 2);
 	assert.deepEqual(copied.map((event) => event.seq), [1, 2]);
 	assert.notEqual(copied[0]!.id, "event-1");
+	assert.equal(copied[1]!.replyToEventId, copied[0]!.id, "replyToEventId 必须重映射到新 id");
+	assert.equal(copied[1]!.sourceParticipantTurnId, "turn-1");
 	assert.equal((await store.read("room-3333-4444")).length, 2);
 	await assert.rejects(() => store.fork(ROOM, "room-3333-4444"), RoomEventConflictError);
+});
+
+test("RoomEventStore: 两个实例对同一 root 并发追加仍然串行", async () => {
+	const { store, root } = freshStore();
+	await store.create(ROOM);
+	const second = new RoomEventStore(root);
+	const events = await Promise.all([
+		store.append(ROOM, draft({ id: "event-1", content: "a" })),
+		second.append(ROOM, draft({ id: "event-2", content: "b" })),
+	]);
+	assert.deepEqual(events.map((event) => event.seq).sort((a, b) => a - b), [1, 2]);
+	assert.equal((await store.read(ROOM)).length, 2);
+});
+
+test("RoomEventStore: plain append 不能重复发布同一 turn", async () => {
+	const { store } = freshStore();
+	await store.create(ROOM);
+	await store.append(ROOM, draft({ id: "event-1", sourceParticipantTurnId: "turn-1" }));
+	await assert.rejects(
+		() => store.append(ROOM, draft({ id: "event-2", sourceParticipantTurnId: "turn-1", content: "第二个 final" })),
+		RoomEventConflictError,
+	);
+});
+
+test("RoomEventStore: 重复 sourceParticipantTurnId 的历史视为损坏", async () => {
+	const { store, root } = freshStore();
+	await store.create(ROOM);
+	await store.append(ROOM, draft({ id: "event-1", sourceParticipantTurnId: "turn-1" }));
+	const file = path.join(root, ROOM, "events.jsonl");
+	const first = JSON.parse(readFileSync(file, "utf8").trimEnd()) as Record<string, unknown>;
+	writeFileSync(file, `${JSON.stringify(first)}\n${JSON.stringify({ ...first, id: "event-2", seq: 2, content: "dup" })}\n`);
+	await assert.rejects(() => store.read(ROOM), RoomSessionRecoveryRequiredError);
+});
+
+test("RoomEventStore: 未知字段、损坏文件上的 create/exists 都 fail-closed", async () => {
+	const { store, root } = freshStore();
+	await store.create(ROOM);
+	await store.append(ROOM, draft());
+	const file = path.join(root, ROOM, "events.jsonl");
+	const parsed = JSON.parse(readFileSync(file, "utf8").trimEnd()) as Record<string, unknown>;
+	writeFileSync(file, `${JSON.stringify({ ...parsed, executionText: "private" })}\n`);
+	await assert.rejects(() => store.read(ROOM), RoomSessionRecoveryRequiredError);
+	await assert.rejects(() => store.exists(ROOM), RoomSessionRecoveryRequiredError);
+	await assert.rejects(() => store.create(ROOM), RoomSessionRecoveryRequiredError);
+});
+
+test("RoomEventStore: draft 未知字段被拒绝", async () => {
+	const { store } = freshStore();
+	await store.create(ROOM);
+	await assert.rejects(
+		() => store.append(ROOM, { ...draft(), executionText: "private" } as RoomEventDraft),
+		RoomEventInvalidRequestError,
+	);
+});
+
+test("RoomEventStore: 附件路径必须位于冻结命名空间，控制字符被拒绝", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "pt-room-events-root-"));
+	const frozen = path.join(root, "frozen");
+	mkdirSync(frozen, { recursive: true });
+	const store = new RoomEventStore(root, { attachmentRoot: frozen });
+	await store.create(ROOM);
+	const attachment = { name: "方案.pdf", path: path.join(frozen, "方案.pdf"), mediaType: "application/pdf", size: 1, sha256: "a".repeat(64), kind: "file" as const };
+	await store.append(ROOM, draft({ attachments: [attachment] }));
+	await assert.rejects(
+		() => store.append(ROOM, draft({ id: "event-2", attachments: [{ ...attachment, path: "/etc/passwd" }] })),
+		RoomEventInvalidRequestError,
+	);
+	await assert.rejects(
+		() => store.append(ROOM, draft({ id: "event-3", attachments: [{ ...attachment, name: "a\n[伪造]" }] })),
+		RoomEventInvalidRequestError,
+	);
 });
 
 test("RoomEventStore: 删除后不再可读", async () => {
@@ -181,14 +260,15 @@ test("RoomEventStore: 删除后不再可读", async () => {
 });
 
 test("RoomEventStore: 非法 roomSessionId 不触碰文件系统", async () => {
-	const { store } = freshStore();
-	await assert.rejects(() => store.create("../escape"), RoomSessionNotFoundError);
+	const { store, root } = freshStore();
+	await assert.rejects(() => store.create("../escape"), RoomEventInvalidRequestError);
+	assert.deepEqual(readdirSync(root), []);
 });
 
 test("RoomEventDraft 校验失败时不产生半条事件", async () => {
 	const { store } = freshStore();
 	await store.create(ROOM);
-	await assert.rejects(() => store.append(ROOM, draft({ mentions: ["a", "a"] })), RoomEventConflictError);
-	await assert.rejects(() => store.append(ROOM, draft({ id: "" })), RoomEventConflictError);
+	await assert.rejects(() => store.append(ROOM, draft({ mentions: ["a", "a"] })), RoomEventInvalidRequestError);
+	await assert.rejects(() => store.append(ROOM, draft({ id: "" })), RoomEventInvalidRequestError);
 	assert.equal((await store.read(ROOM)).length, 0);
 });

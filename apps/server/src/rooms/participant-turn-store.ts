@@ -45,6 +45,7 @@ export interface NewParticipantTurn {
 	contextThroughRoomEventId: string;
 	inputHash: string;
 	operationId: string;
+	bindingRevision: number;
 	inputs?: ParticipantInput[];
 	execution?: ParticipantTurnExecution;
 	delegationIds?: string[];
@@ -59,6 +60,8 @@ export interface ParticipantTurn {
 	contextThroughRoomEventId: string;
 	inputHash: string;
 	operationId: string;
+	/** 准入时冻结的 binding revision，用于审计与并发核对。 */
+	bindingRevision: number;
 	inputs: ParticipantInput[];
 	execution?: ParticipantTurnExecution;
 	delegationIds: string[];
@@ -147,6 +150,7 @@ function validateTurn(roomSessionId: string, turnId: string, raw: unknown): Part
 	if (typeof raw.contextThroughRoomEventId !== "string" || !raw.contextThroughRoomEventId) fail("contextThroughRoomEventId");
 	if (typeof raw.inputHash !== "string" || !raw.inputHash) fail("inputHash");
 	if (typeof raw.operationId !== "string" || !raw.operationId) fail("operationId");
+	if (!Number.isSafeInteger(raw.bindingRevision) || (raw.bindingRevision as number) < 1) fail("bindingRevision");
 	if (!Array.isArray(raw.inputs) || !raw.inputs.every(validInput)) fail("inputs");
 	if (new Set((raw.inputs as ParticipantInput[]).map((input) => input.operationId)).size !== (raw.inputs as ParticipantInput[]).length) fail("duplicate input operationId");
 	if (raw.execution !== undefined && !validExecution(raw.execution)) fail("execution");
@@ -170,6 +174,7 @@ function validateTurn(roomSessionId: string, turnId: string, raw: unknown): Part
 		contextThroughRoomEventId: raw.contextThroughRoomEventId as string,
 		inputHash: raw.inputHash as string,
 		operationId: raw.operationId as string,
+		bindingRevision: raw.bindingRevision as number,
 		inputs: (raw.inputs as ParticipantInput[]).map((input) => ({ ...input })),
 		...(raw.execution ? { execution: raw.execution as ParticipantTurnExecution } : {}),
 		delegationIds: [...(raw.delegationIds as string[])],
@@ -345,6 +350,65 @@ export class ParticipantTurnStore {
 			turn.updatedAt = new Date().toISOString();
 			await this.save(roomSessionId, turns);
 			return { input: { ...input }, created: true, turn };
+		});
+	}
+
+	/** 输入确认落盘/接单后，把对应 ParticipantInput 标为 durable。 */
+	async markInputDurable(roomSessionId: string, turnId: string, operationId: string, agentUserEntryId?: string): Promise<ParticipantTurn> {
+		return this.runExclusive(roomSessionId, async () => {
+			this.assertWritable(roomSessionId);
+			const turns = await this.readUnlocked(roomSessionId);
+			const turn = turns[turnId];
+			if (!turn) throw new RoomTurnNotFoundError(roomSessionId, turnId);
+			const input = turn.inputs.find((item) => item.operationId === operationId);
+			if (!input) throw new RoomTurnConflictError(roomSessionId, `输入 ${operationId} 不属于 turn ${turnId}`);
+			if (input.persistence !== "durable") {
+				input.persistence = "durable";
+				if (agentUserEntryId) {
+					if (input.agentUserEntryId && input.agentUserEntryId !== agentUserEntryId) throw new RoomTurnConflictError(roomSessionId, "输入已绑定其他 agentUserEntryId");
+					input.agentUserEntryId = agentUserEntryId;
+				}
+				turn.updatedAt = new Date().toISOString();
+				turns[turnId] = validateTurn(roomSessionId, turnId, turn);
+				await this.save(roomSessionId, turns);
+			}
+			return turns[turnId]!;
+		});
+	}
+
+	/** 执行结果不确定：不伪造 failed/cancelled，进入人工对账。 */
+	async markUnknown(roomSessionId: string, turnId: string, reason: string): Promise<ParticipantTurn> {
+		return this.runExclusive(roomSessionId, async () => {
+			this.assertWritable(roomSessionId);
+			const turns = await this.readUnlocked(roomSessionId);
+			const turn = turns[turnId];
+			if (!turn) throw new RoomTurnNotFoundError(roomSessionId, turnId);
+			if (turn.status !== "unknown") {
+				if (!ALLOWED_TRANSITIONS[turn.status].has("unknown")) throw new RoomTurnConflictError(roomSessionId, `非法状态迁移：${turn.status} → unknown`);
+				turn.status = "unknown";
+				turn.terminalReason = reason;
+				turn.updatedAt = new Date().toISOString();
+				turns[turnId] = validateTurn(roomSessionId, turnId, turn);
+				await this.save(roomSessionId, turns);
+			}
+			return turns[turnId]!;
+		});
+	}
+
+	/** 用户显式确认无 live Run 后解除公开回合锁。 */
+	async closeUnknown(roomSessionId: string, turnId: string, reason: string): Promise<ParticipantTurn> {
+		return this.runExclusive(roomSessionId, async () => {
+			this.assertWritable(roomSessionId);
+			const turns = await this.readUnlocked(roomSessionId);
+			const turn = turns[turnId];
+			if (!turn) throw new RoomTurnNotFoundError(roomSessionId, turnId);
+			if (turn.status !== "unknown" && turn.status !== "reconciling") throw new RoomTurnConflictError(roomSessionId, `只有 unknown/reconciling 可 close-unknown: ${turn.status}`);
+			turn.status = "interrupted_unknown";
+			turn.terminalReason = reason;
+			turn.updatedAt = new Date().toISOString();
+			turns[turnId] = validateTurn(roomSessionId, turnId, turn);
+			await this.save(roomSessionId, turns);
+			return turns[turnId]!;
 		});
 	}
 

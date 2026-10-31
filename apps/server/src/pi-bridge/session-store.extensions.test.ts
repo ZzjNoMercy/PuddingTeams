@@ -83,7 +83,7 @@ test("Phase4 集成: 真实 manager Session 只暴露成员工具，禁用后立
 
 	try {
 		// direct 窗口（成员 alpha）：真实会话的工具集不含非成员 beta 的工具。
-		const summary = await sessions.create(undefined, { type: "group", members: ["alpha", "gamma"] });
+		const summary = await sessions.create(undefined, { type: "group", members: ["alpha", "gamma"] }, undefined, { ownerAgentId: "manager" });
 		await teams.createWindow({ type: "group", members: ["alpha", "gamma"], sessionId: summary.id });
 		const session = await sessions.open(summary.id);
 		const allNames = session.getAllTools().map((t) => t.name);

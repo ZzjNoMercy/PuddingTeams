@@ -53,6 +53,7 @@ test("RoomTurnService: final 先落 Turn，再幂等投影 RoomEvent 并推进�
 	const { events, turns, bindings, service } = await makeService();
 	const { turn } = await service.begin(beginInput);
 	await service.start(ROOM, turn.id);
+	await service.markInputDurable(ROOM, turn.id, "op-1");
 	await service.complete(ROOM, turn.id, "最终结论");
 	const before = await turns.get(ROOM, turn.id);
 	assert.equal(before?.status, "completed");
@@ -116,6 +117,7 @@ test("RoomTurnService: 重启后 recoverPending 补齐未投影终态", async ()
 	const { root, service, bindings } = await makeService();
 	const { turn } = await service.begin(beginInput);
 	await service.start(ROOM, turn.id);
+	await service.markInputDurable(ROOM, turn.id, "op-1");
 	await service.complete(ROOM, turn.id, "崩溃前已持久");
 	// 模拟进程重启：新的 store/service 实例读同一目录。
 	const restartedEvents = new RoomEventStore(root);

@@ -122,6 +122,12 @@ async function makeStack(catalog?: ExtensionCatalog) {
 	return { teams, sessions, invoker, drivers, runtime, dir };
 }
 
+/** 测试里直接 create 的 Session 没有窗口归属；open 需要 Window context。 */
+async function attachSolo(teams: TeamsStore, id: string): Promise<void> {
+	const window = await teams.ensureSoloWindow(async () => ({ id }), async () => true);
+	if (!window.sessions.includes(id)) await teams.addWindowSession(window.id, id);
+}
+
 test("P3-R: Agent 运行指令与 Window collaboration 分层；Direct 固定 relay 不可覆盖", async () => {
 	// solo 不注入 collaboration guidance；Agent 运行指令由 ResourceLoader 独立追加。
 	assert.equal(PiSessionStore.resolveGuidance(undefined, undefined), undefined);
@@ -162,12 +168,15 @@ test("Manager solo/group 默认启用 grep/find，显式 off 关闭搜索", asyn
 	const { teams, sessions, dir } = await makeStack();
 	const context = { type: "solo" as const, members: [], cwd: dir };
 	const disabled = await sessions.create(undefined, context);
+	await attachSolo(teams, disabled.id);
 	assert.ok((await sessions.open(disabled.id)).getActiveToolNames().includes("grep"));
 	await teams.updateManager({ manager: { codeSearch: "off" } });
 	const off = await sessions.create(undefined, context);
+	await attachSolo(teams, off.id);
 	assert.ok(!(await sessions.open(off.id)).getActiveToolNames().includes("grep"));
 	await teams.updateManager({ manager: { codeSearch: "builtin" } });
 	const enabled = await sessions.create(undefined, context);
+	await attachSolo(teams, enabled.id);
 	const active = (await sessions.open(enabled.id)).getActiveToolNames();
 	assert.ok(active.includes("grep"));
 	assert.ok(active.includes("find"));
@@ -177,16 +186,19 @@ test("Manager solo/group 默认启用 grep/find，显式 off 关闭搜索", asyn
 test("Manager solo/group 恢复原生工具，显式 builtinTools=false 保留禁用边界", async () => {
 	const { teams, sessions, dir } = await makeStack();
 	const summary = await sessions.create(undefined, { type: "solo", members: [], cwd: dir });
+	await attachSolo(teams, summary.id);
 	const tools = (await sessions.open(summary.id)).getAllTools().map((tool) => tool.name);
 	assert.ok(tools.includes("read") && tools.includes("ls"));
 	assert.ok(tools.includes("bash"));
 	assert.ok(tools.includes("write"));
 	assert.ok(tools.includes("edit"));
-	const group = await sessions.create(undefined, { type: "group", members: ["puddingclaw"], cwd: dir });
+	const group = await sessions.create(undefined, { type: "group", members: ["puddingclaw"], cwd: dir }, undefined, { ownerAgentId: "manager" });
+	await attachSolo(teams, group.id);
 	const groupTools = (await sessions.open(group.id)).getAllTools().map((tool) => tool.name);
 	for (const name of ["read", "ls", "grep", "find", "bash", "edit", "write"]) assert.ok(groupTools.includes(name));
 	await teams.updateManager({ manager: { builtinTools: false } });
-	const restricted = await sessions.create(undefined, { type: "group", members: [], cwd: dir });
+	const restricted = await sessions.create(undefined, { type: "group", members: [], cwd: dir }, undefined, { ownerAgentId: "manager" });
+	await attachSolo(teams, restricted.id);
 	const restrictedTools = (await sessions.open(restricted.id)).getAllTools().map((tool) => tool.name);
 	for (const name of ["read", "ls", "grep", "find", "bash", "edit", "write"]) assert.ok(!restrictedTools.includes(name));
 	await sessions.disposeAll();
@@ -946,7 +958,7 @@ test("平台联网只装入 Manager Solo，Direct/Group relay 不获得联网工
  } }));
  try {
   for (const type of ["solo", "direct", "group"] as const) {
-   const summary = await sessions.create(undefined, { type, members: type === "solo" ? [] : ["puddingclaw"], cwd: dir });
+   const summary = await sessions.create(undefined, { type, members: type === "solo" ? [] : ["puddingclaw"], cwd: dir }, undefined, type === "group" ? { ownerAgentId: "manager" } : type === "direct" ? { ownerAgentId: "puddingclaw" } : undefined);
    const session = await sessions.open(summary.id);
    const registered = session.getAllTools().find((tool) => tool.name === "web_search");
    if (type === "solo") {

@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { TeamsStore, WindowSessionCleanupError, RoomCreationOperationConflictError, RoomCreationOperationGoneError, RoomWorkerUnavailableError, RoomWorkspaceUnavailableError, RoomSourceUnavailableError, RoomSourceChangedError, agentDisplayName, type AgentConfig, type RoomSourceSnapshot, type WindowConfig, type WindowType } from "../store/teams.js";
+import { TeamsStore, WindowSessionCleanupError, RoomCreationOperationConflictError, RoomCreationOperationGoneError, RoomWorkerUnavailableError, RoomWorkspaceUnavailableError, RoomSourceUnavailableError, RoomSourceChangedError, agentDisplayName, MANAGER_AGENT_NAME, type AgentConfig, type RoomSourceSnapshot, type WindowConfig, type WindowType } from "../store/teams.js";
 import { PiSessionStore } from "../pi-bridge/session-store.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import { isWorkspaceDirectoryAvailable, type WorkspaceSummary } from "../store/workspaces.js";
@@ -214,6 +214,11 @@ export function registerRoomsRoutes(
 		workspaceId: w.workspaceId,
 		cwd: await teams.workspaceFor(w.id),
 	});
+	/** group 显式 Manager、direct 显式 Worker；solo 维持既有推断。 */
+	const ownerOptionsFor = (type: WindowType, members: string[]) =>
+		type === "group" ? { ownerAgentId: MANAGER_AGENT_NAME }
+		: type === "direct" ? { ownerAgentId: members[0]! }
+		: undefined;
 	const ensureSolo = () =>
 		teams.ensureSoloWindow(
 			async (workspaceId, cwdSnapshot) => {
@@ -247,7 +252,7 @@ export function registerRoomsRoutes(
 		if (dead.length === 0) return;
 		const live = w.sessions.filter((id) => isLive(id));
 		if (live.length === 0) {
-			const created = await sessions.create(undefined, await contextFor(w));
+			const created = await sessions.create(undefined, await contextFor(w), undefined, ownerOptionsFor(w.type, w.members));
 			await teams.addWindowSession(w.id, created.id);
 		} else if (!isLive(w.activeSession)) {
 			await teams.setActiveWindowSession(w.id, live[0]!);
@@ -449,7 +454,7 @@ export function registerRoomsRoutes(
 							prompt: req.body?.prompt,
 							workspaceId,
 							cwd: context.cwdSnapshot,
-						}, reservedId);
+						}, reservedId, ownerOptionsFor(type, members));
 					}, { name: req.body?.name, prompt: req.body?.prompt, cwdSnapshot: context.cwdSnapshot, requireEnabledMember: true, rollbackSession: (id) => sessions.remove(id), journalSession: true });
 					return { room: await summarize(w), existed: !createdHere };
 				}
@@ -470,7 +475,7 @@ export function registerRoomsRoutes(
 						prompt: req.body?.prompt,
 						workspaceId,
 						cwd: context.cwdSnapshot,
-					}, reservedId); },
+					}, reservedId, ownerOptionsFor(type, members)); },
 					rollbackSession: (id) => sessions.remove(id),
 				});
 				return { room: await summarize(w), existed: !createdHere };
@@ -613,7 +618,7 @@ export function registerRoomsRoutes(
 							workspaceId,
 							(reservedId) => {
 								createdHere = true;
-								return sessions.create(undefined, ctx, reservedId);
+								return sessions.create(undefined, ctx, reservedId, { ownerAgentId: source.members[0]! });
 							},
 							{ name: source.name, prompt: source.prompt, cwdSnapshot: target.cwdSnapshot, requireEnabledMember: true, rollbackSession: (id) => sessions.remove(id), journalSession: true, sourceSnapshot },
 						);
@@ -634,7 +639,7 @@ export function registerRoomsRoutes(
 						journalSession: true,
 						creationOperation,
 						sourceSnapshot,
-						createSession: (reservedId) => { createdHere = true; return sessions.create(undefined, ctx, reservedId); },
+						createSession: (reservedId) => { createdHere = true; return sessions.create(undefined, ctx, reservedId, ownerOptionsFor(source.type, source.members)); },
 						rollbackSession: (id) => sessions.remove(id),
 					});
 					return { room: await summarize(next), existed: !createdHere, restored: !createdHere };
@@ -650,7 +655,7 @@ export function registerRoomsRoutes(
 							prompt: fresh.prompt,
 							workspaceId,
 							cwd,
-						}),
+						}, undefined, ownerOptionsFor(fresh.type, fresh.members)),
 					(id) => sessions.prepareForParking(id),
 					(id) => sessions.validateStoredContext(id),
 					(id) => sessions.suspend(id),
@@ -794,7 +799,7 @@ export function registerRoomsRoutes(
 					await teams.setActiveWindowSession(current.id, id);
 					return { session: info, workState: null, reused: true };
 				}
-				const created = await sessions.create(undefined, await contextFor(current));
+				const created = await sessions.create(undefined, await contextFor(current), undefined, ownerOptionsFor(current.type, current.members));
 				try { await teams.addWindowSession(current.id, created.id); }
 				catch (error) { await sessions.remove(created.id).catch(() => undefined); throw error; }
 				return { session: created, workState: null, reused: false };
@@ -829,7 +834,7 @@ export function registerRoomsRoutes(
 							throw new Error("幂等 Session 已提交但不存在或归属改变");
 						}
 						if (owner && owner.id !== w.id) throw new Error("幂等 Session 属于其他房间");
-						if (!listed && operation.phase === "reserved") await sessions.create(undefined, await contextFor(w), operation.sessionId);
+						if (!listed && operation.phase === "reserved") await sessions.create(undefined, await contextFor(w), operation.sessionId, ownerOptionsFor(w.type, w.members));
 						if (operation.phase === "reserved") await teams.addWindowSession(w.id, operation.sessionId);
 						await sessionCreationOperations.markAttached(goalOperationId, operation.sessionId);
 						const session = (await sessions.list()).find((item) => item.id === operation.sessionId);
@@ -852,7 +857,7 @@ export function registerRoomsRoutes(
 		}
 		let createdId: string | undefined;
 		try {
-			const created = await sessions.create(undefined, await contextFor(w));
+			const created = await sessions.create(undefined, await contextFor(w), undefined, ownerOptionsFor(w.type, w.members));
 			createdId = created.id;
 			await teams.addWindowSession(req.params.id, created.id);
 			const goal = requestedGoal;
@@ -1001,7 +1006,7 @@ export function registerRoomsRoutes(
 						// 是「重置」：先补一个新空会话并激活，再删旧的，窗口始终
 						// 保留至少一个会话。
 						if (!current.pinned) throw new Error("窗口至少要保留一个会话");
-						const created = await sessions.create(undefined, await contextFor(current));
+						const created = await sessions.create(undefined, await contextFor(current), undefined, ownerOptionsFor(current.type, current.members));
 						await teams.addWindowSession(current.id, created.id);
 					}
 					const { removed, blocked } = await teams.removeWindowSession(req.params.id, req.params.sid);

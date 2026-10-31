@@ -437,14 +437,16 @@ export class PiSessionStore {	private active = new Map<string, AgentSession>();
 	}
 
  private async sessionOwner(id: string, birth?: ManagerWindowContext, explicitOwnerAgentId?: string) {
+  const ref = await this.teamsStore?.sessionRef?.(id);
   if (explicitOwnerAgentId) {
+   if (ref && ref.ownerAgentId !== explicitOwnerAgentId) throw new Error("session_owner_mismatch");
    const agent = await this.teamsStore?.getAgent(explicitOwnerAgentId);
    if (!agent) throw new Error(`session owner not found: ${explicitOwnerAgentId}`);
    if (agent.enabled === false) throw new Error("session_owner_unavailable");
    return piSessionOwner(agent);
   }
-  const ref = await this.teamsStore?.sessionRef?.(id);
   if (ref) return piSessionOwner(await this.teamsStore?.getAgent(ref.ownerAgentId));
+  if (birth?.type === "group") throw new Error("session_owner_required");
   if (birth) return piSessionOwner(birth.type === "direct" ? await this.teamsStore?.getAgent(birth.members[0]!) : await this.teamsStore?.getManager());
   if (this.teamsStore && await this.teamsStore.contextForSession(id)) throw new Error("native session owner is missing");
   return piSessionOwner(this.teamsStore ? await this.teamsStore.getManager() : { name: "manager", description: "", pinned: true, invoke: { type: "pi" } });
@@ -566,6 +568,7 @@ export class PiSessionStore {	private active = new Map<string, AgentSession>();
 		cwd: string,
 		settings?: PiManagerSettings,
 		resources?: PiResourceConfig,
+		ownerSnapshot?: ReturnType<typeof piSessionOwner>,
 	): Promise<{
 		loader: DefaultResourceLoader;
 		plan: ManagedToolPlan;
@@ -574,7 +577,7 @@ export class PiSessionStore {	private active = new Map<string, AgentSession>();
   assertKnowledge?:()=>Promise<void>;
   knowledgeExecution?:()=>import("../knowledge/runtime-service.js").KnowledgeWorkerExecution|undefined;
 	}> {
-		const owner = await this.sessionOwner(getSessionId(), ctx);
+		const owner = ownerSnapshot ?? await this.sessionOwner(getSessionId(), ctx);
 		let plan: ManagedToolPlan = { managed: new Set(), active: new Set(), agents: [] };
 		let factories: InlineExtension[] = [];
   let assertKnowledge: (()=>Promise<void>) | undefined;
@@ -707,6 +710,7 @@ export class PiSessionStore {	private active = new Map<string, AgentSession>();
 			opts.cwd,
 			settings,
 			resources,
+			owner,
 		);
 		// Direct keeps its existing relay until P3. Solo/group are native Manager
 		// sessions; explicit builtinTools:false still removes the whole surface.
