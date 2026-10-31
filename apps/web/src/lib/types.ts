@@ -1169,6 +1169,8 @@ export interface ChatNavigationItem {
  roomType: WindowType; roomName: string; title: string; firstMessage: string; modifiedAt: string;
  workspaceId: string | null; workspaceName: string; cwdSnapshot: string; contextActive: boolean;
  pinned: boolean; archived: boolean;
+ /** group：RoomSession 行级活动。 */
+ hasUnreadActivity?: boolean; lastMessagePreview?: string; managerParticipantSessionId?: string;
 }
 export interface ChatNavigationIndex { items: ChatNavigationItem[]; revision: number; }
 

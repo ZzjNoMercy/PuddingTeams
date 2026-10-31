@@ -58,7 +58,7 @@ export function SessionList({ rooms, selectedId, selectedSessionId, onSelectSess
  const renderItem = (item: ChatNavigationItem) => {
   const title = navigationTitle(item), selected = selectedId === item.roomId && selectedSessionId === item.sessionId;
   const room = rooms.find(current => current.id === item.roomId);
-  const unread = room?.hasUnreadActivity && room.activitySessionId === item.sessionId;
+  const unread = item.hasUnreadActivity || Boolean(room?.hasUnreadActivity && room.activitySessionId === item.sessionId);
   return <div key={item.sessionId} className={styles.row} data-selected={selected} data-session-id={item.sessionId}>
    <button type="button" className={styles.select} aria-current={selected ? "page" : undefined} aria-label={`打开聊天：${title}，${item.agentName}，${item.workspaceName}`} onClick={() => { onSelectSession(item); onClose?.(); }}>
     {view === "project" ? avatar(item.ownerAgentId, 22) : null}

@@ -1058,6 +1058,34 @@ export function registerRoomsRoutes(
 		},
 	);
 
+	/** 房间公开事件搜索（当前为线性扫描；后续可换索引）。 */
+	app.get<{ Params: { id: string; sid: string }; Querystring: { q?: string; limit?: string } }>(
+		"/api/rooms/:id/sessions/:sid/search",
+		async (req, reply) => {
+			if (!roomEvents) return reply.code(503).send({ error: "room session stores are not configured" });
+			const context = await teams.contextForRoomSession(req.params.sid);
+			if (!context || context.window.id !== req.params.id) return reply.code(404).send({ error: "room session not found", code: "room_session_not_found" });
+			const query = req.query.q?.trim();
+			if (!query) return reply.code(400).send({ error: "q 不能为空", code: "invalid_query" });
+			const limit = Math.min(Math.max(Number(req.query.limit ?? 20) || 20, 1), 100);
+			let events;
+			try { events = await roomEvents.read(req.params.sid); }
+			catch (error) { return reply.code(503).send({ error: error instanceof Error ? error.message : String(error), code: "room_recovery_required" }); }
+			const needle = query.toLowerCase();
+			const hits = events
+				.filter((event) => event.content.toLowerCase().includes(needle)
+					|| event.attachments?.some((item) => item.name.toLowerCase().includes(needle))
+					|| (event.actor.kind === "agent" ? event.actor.agentId : "").toLowerCase().includes(needle))
+				.slice(0, limit)
+				.map((event) => ({
+					eventId: event.id, seq: event.seq, kind: event.kind, actor: event.actor,
+					content: event.content, createdAt: event.createdAt,
+					...(event.attachments?.length ? { attachments: event.attachments.map((item) => ({ name: item.name, mediaType: item.mediaType })) } : {}),
+				}));
+			return { roomSessionId: req.params.sid, query, hits, total: hits.length };
+		},
+	);
+
 	/** 最小 RoomSession 时间线：公共事件 + Turn 状态，不含私有执行记录。 */
 	app.get<{ Params: { id: string; sid: string } }>("/api/rooms/:id/sessions/:sid/timeline", async (req, reply) => {
 		if (!roomEvents || !roomTurns) return reply.code(503).send({ error: "room session stores are not configured" });

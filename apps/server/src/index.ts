@@ -39,6 +39,7 @@ import { registerChatNavigationRoutes } from "./routes/chat-navigation.js";
 import { registerRoomsRoutes } from "./routes/rooms.js";
 import { RoomEventStore } from "./rooms/room-event-store.js";
 import { RoomCreationReconciler } from "./rooms/room-creation-reconciler.js";
+import { RoomActivityStore } from "./rooms/room-activity-store.js";
 import { RoomOperationStore } from "./rooms/room-operation-store.js";
 import { registerInteractionsRoutes } from "./routes/interactions.js";
 import { isWorkspaceOwnerClosed } from "./agent-runtime/workspace-owner-lifecycle.js";
@@ -887,7 +888,7 @@ const conversationSnapshots = new ConversationSnapshots(path.join(paths.state, "
 const sessionForks = new SessionForks(teams, store, invoker, conversationSnapshots, new ForkOperations(path.join(paths.state,"fork-operations.json")), [paths.uploads,path.join(paths.state,"large-worker-results"),conversationSnapshots.root]);
 await sessionForks.recover();
 registerSessionForkRoutes(app,sessionForks);
-registerChatNavigationRoutes(app, { teams, sessions: store, statePath: path.join(paths.state, "chat-navigation.json") });
+registerChatNavigationRoutes(app, { teams, sessions: store, statePath: path.join(paths.state, "chat-navigation.json"), roomActivity: new RoomActivityStore(path.join(paths.state, "room-session-activity.json")) });
 await registerRoomsRoutes(app, store, teams, invoker, workStates, {
 	attachmentRoot: paths.uploads,
  snapshotAssetRoot:conversationSnapshots.root,

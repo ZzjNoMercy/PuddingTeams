@@ -7,6 +7,7 @@ import Fastify from "fastify";
 import { TeamsStore } from "../store/teams.js";
 import { ChatNavigationStore } from "../store/chat-navigation.js";
 import { registerChatNavigationRoutes } from "./chat-navigation.js";
+import { RoomActivityStore } from "../rooms/room-activity-store.js";
 
 test("navigation metadata survives restart, serializes updates and preserves corrupt state", async () => {
  const dir = await mkdtemp(path.join(os.tmpdir(), "pt-nav-state-"));
@@ -70,5 +71,26 @@ test("group navigation 用 roomSessionId 作为行身份，flags 按房间键持
   assert.equal((await app.inject({method:"PATCH",url:`/api/chat-navigation/${group.id}/${roomSessionId}`,payload:{pinned:true}})).statusCode,200);
   assert.equal((await new ChatNavigationStore(path.join(dir,"nav.json")).read()).sessions[roomSessionId]?.pinned,true);
   assert.equal((await app.inject({method:"PATCH",url:`/api/chat-navigation/other/${roomSessionId}`,payload:{pinned:true}})).statusCode,404);
+ } finally { await app.close(); await rm(dir,{recursive:true,force:true}); }
+});
+
+test("group navigation 行级未读来自 RoomActivityStore，已读后清除", async () => {
+ const dir = await mkdtemp(path.join(os.tmpdir(),"pt-nav-unread-")); const app = Fastify();
+ try {
+  const teams = new TeamsStore({state:path.join(dir,"state"),assets:dir,managedWorkspaces:path.join(dir,"managed")},dir);
+  await teams.init();
+  await teams.upsertAgent({name:"alpha",description:"Worker",invoke:{type:"command",command:"echo",runArgs:[]}});
+  await teams.upsertAgent({name:"beta",description:"Worker",invoke:{type:"command",command:"echo",runArgs:[]}});
+  const group = await teams.createWindow({type:"group",members:["alpha","beta"],sessionId:"manager-u"});
+  const roomSessionId = group.activeRoomSessionId!;
+  const activity = new RoomActivityStore(path.join(dir,"room-activity.json"));
+  await activity.record(roomSessionId, {eventId:"event-1", at:"2026-10-31T01:00:00.000Z", preview:"未读消息"});
+  registerChatNavigationRoutes(app,{teams,statePath:path.join(dir,"nav.json"),roomActivity:activity,sessions:{list:async()=>[{id:"manager-u",sessionFile:"fixture",firstMessage:"hello",modifiedAt:"2026-10-31T00:00:00Z",active:false}]}});
+  const before=(await app.inject({url:"/api/chat-navigation"})).json().items.find((item:{sessionId:string})=>item.sessionId===roomSessionId);
+  assert.equal(before.hasUnreadActivity,true);
+  assert.equal(before.lastMessagePreview,"未读消息");
+  await activity.markRead(roomSessionId);
+  const after=(await app.inject({url:"/api/chat-navigation"})).json().items.find((item:{sessionId:string})=>item.sessionId===roomSessionId);
+  assert.equal(after.hasUnreadActivity,false);
  } finally { await app.close(); await rm(dir,{recursive:true,force:true}); }
 });

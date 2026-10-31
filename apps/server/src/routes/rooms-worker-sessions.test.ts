@@ -530,3 +530,30 @@ test("v4 HTTP: 房间活动/未读投影与已读", async () => {
 		assert.equal(((await app.inject({ method: "GET", url: `/api/rooms/${room.id}` })).json().room as RoomSummary).hasUnreadActivity, false);
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("v4 HTTP: 房间公开事件搜索", async () => {
+	const { app, teams, sessions, dir } = await makeStack();
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		const room = created.json().room as RoomSummary;
+		const roomSessionId = room.roomSessionIds![0]!;
+		await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/messages`,
+			headers: { "idempotency-key": randomUUID() }, payload: { content: "请检查登录逻辑", mentions: ["alpha"] },
+		});
+		for (let attempt = 0; attempt < 50; attempt += 1) {
+			const timeline = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` });
+			if (timeline.json().events.length >= 2) break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		const search = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/search?q=${encodeURIComponent("登录")}` });
+		assert.equal(search.statusCode, 200, search.body);
+		assert.equal(search.json().hits.length, 1);
+		assert.match(search.json().hits[0].content, /登录/);
+		const miss = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/search?q=none` });
+		assert.equal(miss.json().hits.length, 0);
+		const invalid = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/search` });
+		assert.equal(invalid.statusCode, 400);
+	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});
