@@ -108,6 +108,10 @@ export interface RoomMessageRouterDeps {
 	budget: RoomContextBudget;
 	bus?: RoomEventBus;
 	activity?: RoomActivityStore;
+	knowledge?: {
+		ownerId: string;
+		sources: { createText(ownerId: string, text: string, origin?: Record<string, unknown>): Promise<{ id: string }> };
+	};
 	now?: () => string;
 }
 
@@ -164,6 +168,17 @@ export class RoomMessageRouter {
 	constructor(private readonly deps: RoomMessageRouterDeps) {}
 
 	/** 活动读模型不得阻断准入/投影；失败只丢投影，重启可重建。 */
+	private async knowledgeSourceIds(eventId: string, binding: ParticipantBinding, text: string): Promise<string[] | undefined> {
+		if (!this.deps.knowledge) return undefined;
+		try {
+			const source = await this.deps.knowledge.sources.createText(this.deps.knowledge.ownerId, text, {
+				sessionId: binding.agentSessionId, messageId: eventId, windowId: binding.roomId,
+				roomSessionId: binding.roomSessionId, sourceRoomEventId: eventId, channel: "user_input",
+			});
+			return [source.id];
+		} catch { return undefined; }
+	}
+
 	private async recordActivity(roomSessionId: string, event: RoomEvent, unread = true): Promise<void> {
 		try { await this.deps.activity?.record(roomSessionId, { eventId: event.id, at: event.createdAt, preview: event.content, unread }); }
 		catch { /* read model only */ }
@@ -248,9 +263,11 @@ export class RoomMessageRouter {
 				}
 				const eventId = randomUUID();
 				const mentions = [binding.agentId];
+				const sourceIds = await this.knowledgeSourceIds(eventId, binding, content);
 				const draft = {
 					id: eventId, kind: "message" as const, actor: { kind: "user" as const },
 					content, mentions,
+					...(sourceIds ? { knowledgeSourceIds: sourceIds } : {}),
 					...(input.attachments?.length ? { attachments: input.attachments } : {}),
 					createdAt: this.now(),
 				};
@@ -342,9 +359,11 @@ export class RoomMessageRouter {
 				}
 				const eventId = randomUUID();
 				const mentions = [activeBinding.agentId];
+				const sourceIds = await this.knowledgeSourceIds(eventId, activeBinding, content);
 				const draft = {
 					id: eventId, kind: "message" as const, actor: { kind: "user" as const },
 					content, mentions,
+					...(sourceIds ? { knowledgeSourceIds: sourceIds } : {}),
 					...(input.attachments?.length ? { attachments: input.attachments } : {}),
 					createdAt: this.now(),
 				};
@@ -374,12 +393,14 @@ export class RoomMessageRouter {
 
 			const eventId = randomUUID();
 			const mentions = [...new Set(input.mentions)];
+			const sourceIds = await this.knowledgeSourceIds(eventId, binding, content);
 			const draft = {
 				id: eventId,
 				kind: "message" as const,
 				actor: { kind: "user" as const },
 				content,
 				mentions,
+				...(sourceIds ? { knowledgeSourceIds: sourceIds } : {}),
 				...(input.attachments?.length ? { attachments: input.attachments } : {}),
 				createdAt: this.now(),
 			};

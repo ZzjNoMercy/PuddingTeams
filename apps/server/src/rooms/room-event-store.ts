@@ -44,6 +44,8 @@ export interface RoomEvent {
 	mentions: string[];
 	attachments?: RoomAttachmentRef[];
 	artifactRefs?: RoomArtifactRef[];
+	/** 知识来源 id（roomSessionId/sourceRoomEventId 存在 source.origin）。 */
+	knowledgeSourceIds?: string[];
 	sourceParticipantTurnId?: string;
 	replyToEventId?: string;
 	createdAt: string;
@@ -91,11 +93,11 @@ const EVENT_KINDS: ReadonlySet<string> = new Set(["message", "terminal", "artifa
 const ACTOR_KINDS: ReadonlySet<string> = new Set(["user", "agent", "system"]);
 const EVENT_KEYS: ReadonlySet<string> = new Set([
 	"id", "roomSessionId", "seq", "kind", "actor", "content", "mentions",
-	"attachments", "artifactRefs", "sourceParticipantTurnId", "replyToEventId", "createdAt",
+	"attachments", "artifactRefs", "knowledgeSourceIds", "sourceParticipantTurnId", "replyToEventId", "createdAt",
 ]);
 const DRAFT_KEYS: ReadonlySet<string> = new Set([
 	"id", "kind", "actor", "content", "mentions", "attachments",
-	"artifactRefs", "sourceParticipantTurnId", "replyToEventId", "createdAt",
+	"artifactRefs", "knowledgeSourceIds", "sourceParticipantTurnId", "replyToEventId", "createdAt",
 ]);
 const ACTOR_KEYS: ReadonlySet<string> = new Set(["kind", "agentId"]);
 const ATTACHMENT_KEYS: ReadonlySet<string> = new Set(["name", "path", "mediaType", "size", "sha256", "kind"]);
@@ -159,6 +161,7 @@ function parseEvent(roomSessionId: string, raw: unknown, expectedSeq: number): R
 	if (!validMentions(raw.mentions)) throw new RoomSessionRecoveryRequiredError(roomSessionId, `seq ${expectedSeq} has invalid mentions`);
 	if (raw.attachments !== undefined && !validAttachments(raw.attachments)) throw new RoomSessionRecoveryRequiredError(roomSessionId, `seq ${expectedSeq} has invalid attachments`);
 	if (raw.artifactRefs !== undefined && !validArtifactRefs(raw.artifactRefs)) throw new RoomSessionRecoveryRequiredError(roomSessionId, `seq ${expectedSeq} has invalid artifactRefs`);
+	if (raw.knowledgeSourceIds !== undefined && !validMentions(raw.knowledgeSourceIds)) throw new RoomSessionRecoveryRequiredError(roomSessionId, `seq ${expectedSeq} has invalid knowledgeSourceIds`);
 	if (raw.sourceParticipantTurnId !== undefined && (typeof raw.sourceParticipantTurnId !== "string" || !raw.sourceParticipantTurnId)) throw new RoomSessionRecoveryRequiredError(roomSessionId, `seq ${expectedSeq} has invalid sourceParticipantTurnId`);
 	if (raw.replyToEventId !== undefined && (typeof raw.replyToEventId !== "string" || !raw.replyToEventId)) throw new RoomSessionRecoveryRequiredError(roomSessionId, `seq ${expectedSeq} has invalid replyToEventId`);
 	if (typeof raw.createdAt !== "string" || !Number.isFinite(Date.parse(raw.createdAt))) throw new RoomSessionRecoveryRequiredError(roomSessionId, `seq ${expectedSeq} has invalid createdAt`);
@@ -172,6 +175,7 @@ function parseEvent(roomSessionId: string, raw: unknown, expectedSeq: number): R
 		mentions: [...raw.mentions],
 		...(raw.attachments ? { attachments: raw.attachments } : {}),
 		...(raw.artifactRefs ? { artifactRefs: raw.artifactRefs } : {}),
+		...(raw.knowledgeSourceIds ? { knowledgeSourceIds: [...raw.knowledgeSourceIds] } : {}),
 		...(raw.sourceParticipantTurnId ? { sourceParticipantTurnId: raw.sourceParticipantTurnId } : {}),
 		...(raw.replyToEventId ? { replyToEventId: raw.replyToEventId } : {}),
 		createdAt: raw.createdAt,
@@ -187,6 +191,7 @@ function validateDraft(roomSessionId: string, draft: RoomEventDraft): void {
 	if (!validMentions(draft.mentions)) throw new RoomEventInvalidRequestError(roomSessionId, "RoomEvent mentions 无效");
 	if (draft.attachments !== undefined && !validAttachments(draft.attachments)) throw new RoomEventInvalidRequestError(roomSessionId, "RoomEvent attachments 无效");
 	if (draft.artifactRefs !== undefined && !validArtifactRefs(draft.artifactRefs)) throw new RoomEventInvalidRequestError(roomSessionId, "RoomEvent artifactRefs 无效");
+	if (draft.knowledgeSourceIds !== undefined && !validMentions(draft.knowledgeSourceIds)) throw new RoomEventInvalidRequestError(roomSessionId, "RoomEvent knowledgeSourceIds 无效");
 	if (!Number.isFinite(Date.parse(draft.createdAt))) throw new RoomEventInvalidRequestError(roomSessionId, "RoomEvent createdAt 无效");
 }
 
@@ -198,6 +203,7 @@ function sameProjection(left: RoomEvent, right: RoomEventDraft, opts: { ignoreId
 		&& JSON.stringify(left.mentions) === JSON.stringify(right.mentions)
 		&& JSON.stringify(left.attachments ?? null) === JSON.stringify(right.attachments ?? null)
 		&& JSON.stringify(left.artifactRefs ?? null) === JSON.stringify(right.artifactRefs ?? null)
+		&& JSON.stringify(left.knowledgeSourceIds ?? null) === JSON.stringify(right.knowledgeSourceIds ?? null)
 		&& (left.sourceParticipantTurnId ?? null) === (right.sourceParticipantTurnId ?? null)
 		&& (left.replyToEventId ?? null) === (right.replyToEventId ?? null);
 }
@@ -409,6 +415,7 @@ export class RoomEventStore {
 			mentions: [...draft.mentions],
 			...(draft.attachments ? { attachments: draft.attachments } : {}),
 			...(draft.artifactRefs ? { artifactRefs: draft.artifactRefs } : {}),
+			...(draft.knowledgeSourceIds ? { knowledgeSourceIds: [...draft.knowledgeSourceIds] } : {}),
 			...(draft.sourceParticipantTurnId ? { sourceParticipantTurnId: draft.sourceParticipantTurnId } : {}),
 			...(draft.replyToEventId ? { replyToEventId: draft.replyToEventId } : {}),
 			createdAt: draft.createdAt,
@@ -504,6 +511,7 @@ export class RoomEventStore {
 			mentions: event.mentions,
 			...(attachments ? { attachments } : {}),
 			...(event.artifactRefs ? { artifactRefs: event.artifactRefs } : {}),
+			...(event.knowledgeSourceIds ? { knowledgeSourceIds: [...event.knowledgeSourceIds] } : {}),
 			...(event.sourceParticipantTurnId ? { sourceParticipantTurnId: event.sourceParticipantTurnId } : {}),
 			...(event.replyToEventId ? (idMap.has(event.replyToEventId) ? { replyToEventId: idMap.get(event.replyToEventId)! } : {}) : {}),
 			createdAt: event.createdAt,

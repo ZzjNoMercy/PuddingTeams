@@ -17,6 +17,8 @@ export interface KnowledgeSourceOrigin {
 	sessionId?: string;
 	messageId?: string;
 	windowId?: string;
+	roomSessionId?: string;
+	sourceRoomEventId?: string;
 	channel?: "user_input" | "agent_task";
 	/** 速记来源身份：参与 manifest hash，tags 顺序不影响身份。 */
 	memo?: MemoSourceOrigin;
@@ -109,7 +111,7 @@ export class KnowledgeSourceStore {
 			if (origin.channel !== "user_input" && origin.channel !== "agent_task") throw new KnowledgeSourceError("invalid_input", "素材来源通道无效");
 			clean.channel = origin.channel;
 		}
-		for (const key of ["sessionId", "messageId", "windowId"] as const) {
+		for (const key of ["sessionId", "messageId", "windowId", "roomSessionId", "sourceRoomEventId"] as const) {
 			const value = origin[key];
 			if (value !== undefined) {
 				if (typeof value !== "string" || !value.trim() || value.length > 200 || /[\u0000-\u001f\u007f]/.test(value)) {

@@ -263,6 +263,10 @@ export function registerRoomsRoutes(
 		roomActivityStatePath?: string;
 		roomActivityStore?: RoomActivityStore;
 		roomForkStatePath?: string;
+		roomKnowledge?: {
+			ownerId: string;
+			sources: { createText(ownerId: string, text: string, origin?: Record<string, unknown>): Promise<{ id: string }> };
+		};
 		/** 测试/宿主替换房间 runner。 */
 		roomRunner?: RoomParticipantRunner;
 	},
@@ -276,6 +280,7 @@ export function registerRoomsRoutes(
 		? createRoomRuntime({
 			root: localFiles.roomSessionsStatePath, teams, sessions, invoker,
 			runner: localFiles.roomRunner, attachmentRoot: localFiles.attachmentRoot, activity: roomActivity,
+			knowledge: localFiles.roomKnowledge,
 		})
 		: undefined;
 	// 路由与 runtime 共用同一组 store 实例，避免 turns/operations 的实例内队列互相覆盖。

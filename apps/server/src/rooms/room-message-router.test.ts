@@ -401,3 +401,24 @@ test("RoomMessageRouter: 非 Pi 活动回合的 normal 输入排队，首个 run
 	assert.equal(stored.at(-1)?.content, "排队后的最终结论");
 	assert.equal(runs, 2);
 });
+
+test("RoomMessageRouter: 用户事件写入知识来源 id 与 room origin", async () => {
+	const { events, router } = await makeRouter({ bindings: "all" });
+	let origin: Record<string, unknown> | undefined;
+	(router as unknown as { deps: { knowledge?: unknown } }).deps.knowledge = {
+		ownerId: "owner-1",
+		sources: {
+			createText: async (_owner: string, _text: string, value?: Record<string, unknown>) => {
+				origin = value;
+				return { id: "knowledge-source-1" };
+			},
+		},
+	};
+	await router.send({ roomSessionId: ROOM, content: "来源测试", mentions: ["worker-a"], operationId: "op-knowledge-1" });
+	const [event] = await events.read(ROOM);
+	assert.deepEqual(event?.knowledgeSourceIds, ["knowledge-source-1"]);
+	assert.equal(origin?.roomSessionId, ROOM);
+	assert.equal(origin?.sourceRoomEventId, event?.id);
+	assert.equal(origin?.sessionId, "agent-worker-a");
+	assert.equal(origin?.windowId, ROOM_ID);
+});

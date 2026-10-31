@@ -913,6 +913,7 @@ await registerRoomsRoutes(app, store, teams, invoker, workStates, {
 	roomActivityStatePath: path.join(paths.state, "room-session-activity.json"),
 	roomActivityStore,
 	roomForkStatePath: path.join(paths.state, "room-fork-operations.json"),
+	roomKnowledge: { ownerId: localViewerIdentity().user.id, sources: knowledgeSources },
 	chatNavigationStatePath: path.join(paths.state, "chat-navigation.json"),
 });
 await registerInteractionsRoutes(app, runtime, invoker, teams, workStates);

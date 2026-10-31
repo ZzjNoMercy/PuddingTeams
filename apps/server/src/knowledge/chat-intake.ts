@@ -7,7 +7,7 @@ import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { StoredUpload } from "../store/uploads.js";
 import type { KnowledgeSourceStore } from "./sources.js";
 
-export interface ChatSourceRefs { operationId: string; sourceIds: string[]; }
+export interface ChatSourceRefs { operationId: string; sourceIds: string[]; roomSessionId?: string; sourceRoomEventId?: string; agentSessionId?: string; windowId?: string; }
 interface Intake extends ChatSourceRefs { ownerId: string; sessionId: string; requestHash: string; userEntryId?: string; unsupportedNames: string[]; }
 const hash = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
 const textOf = (content: unknown): string => Array.isArray(content) ? content.filter((block) => block?.type === "text").map((block) => block.text).join("\n") : typeof content === "string" ? content : "";
@@ -25,13 +25,13 @@ export class ChatKnowledgeIntake {
 	private async get(operationId: string): Promise<Intake | undefined> {
 		return this.database((db) => { const row = db.prepare("SELECT record_json FROM intakes WHERE operation_id=?").get(operationId) as { record_json: string } | undefined; return row && JSON.parse(row.record_json) as Intake; });
 	}
-	async prepare(input: { ownerId: string; sessionId: string; windowId: string; operationId: string; text: string; uploads: StoredUpload[] }): Promise<ChatSourceRefs> {
+	async prepare(input: { ownerId: string; sessionId: string; windowId: string; operationId: string; text: string; uploads: StoredUpload[]; room?: { roomSessionId: string; sourceRoomEventId: string } }): Promise<ChatSourceRefs> {
 		const supported = input.uploads.filter((upload) => /^(text\/(plain|markdown)|image\/(png|jpeg|gif|webp)|application\/pdf)(;|$)/i.test(upload.mediaType) || /\.(md|txt|png|jpe?g|gif|webp|pdf)$/i.test(upload.name));
 		const unsupportedNames = input.uploads.filter((upload) => !supported.includes(upload)).map((upload) => upload.name);
 		const requestHash = hash(JSON.stringify([input.ownerId, input.sessionId, input.windowId, input.text, input.uploads.map((upload) => [upload.name, upload.mediaType, hash(Buffer.from(upload.base64, "base64"))])]));
 		const previous = await this.get(input.operationId);
 		if (previous) { if (previous.requestHash !== requestHash) throw new Error("消息素材 operationId 冲突"); return { operationId: previous.operationId, sourceIds: previous.sourceIds }; }
-		const origin = { sessionId: input.sessionId, windowId: input.windowId, channel: "user_input" as const };
+		const origin = { sessionId: input.sessionId, windowId: input.windowId, channel: "user_input" as const, ...(input.room ? { roomSessionId: input.room.roomSessionId, sourceRoomEventId: input.room.sourceRoomEventId } : {}) };
 		const sources = input.text.trim() ? [await this.deps.sources.createText(input.ownerId, input.text, origin)] : [];
 		// Use validated UploadStore bytes, never its filesystem path.
 		sources.push(...await this.deps.sources.createUploads(input.ownerId, supported.map((upload) => ({ filename: upload.name, mediaType: upload.mediaType, data: upload.base64 })), origin));

@@ -72,6 +72,10 @@ export function createRoomRuntime(input: {
 	maxContextChars?: number;
 	attachmentRoot?: string;
 	activity?: RoomActivityStore;
+	knowledge?: {
+		ownerId: string;
+		sources: { createText(ownerId: string, text: string, origin?: Record<string, unknown>): Promise<{ id: string }> };
+	};
 }): RoomRuntime {
 	const events = new RoomEventStore(input.root, { attachmentRoot: input.attachmentRoot });
 	const turns = new ParticipantTurnStore(input.root);
@@ -100,6 +104,7 @@ export function createRoomRuntime(input: {
 		turns,
 		bus,
 		...(input.activity ? { activity: input.activity } : {}),
+		...(input.knowledge ? { knowledge: input.knowledge } : {}),
 		bindings,
 		turnService,
 		operations,
