@@ -511,7 +511,6 @@ export class RoomEventStore {
 			mentions: event.mentions,
 			...(attachments ? { attachments } : {}),
 			...(event.artifactRefs ? { artifactRefs: event.artifactRefs } : {}),
-			...(event.knowledgeSourceIds ? { knowledgeSourceIds: [...event.knowledgeSourceIds] } : {}),
 			...(event.sourceParticipantTurnId ? { sourceParticipantTurnId: event.sourceParticipantTurnId } : {}),
 			...(event.replyToEventId ? (idMap.has(event.replyToEventId) ? { replyToEventId: idMap.get(event.replyToEventId)! } : {}) : {}),
 			createdAt: event.createdAt,

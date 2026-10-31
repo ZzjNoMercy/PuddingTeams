@@ -492,3 +492,25 @@ test("RoomMessageRouter: fanout 首个 Turn 取消后不再继续后续目标", 
 	assert.equal(runs, 1);
 	assert.equal((await turns.list(ROOM)).length, 1, "首个取消后不应创建第二个 Turn");
 });
+
+test("RoomMessageRouter: fanout 首个失败后剩余目标落显式 skipped 终态", async () => {
+	const { events, turns, bindings, router } = await makeRouter({ bindings: "all" });
+	for (const [agentId, sessionId] of [["worker-b", "agent-worker-b"], ["worker-c", "agent-worker-c"]] as const) {
+		await bindings.ensure({ roomId: ROOM_ID, roomSessionId: ROOM, agentId, role: "worker", agentSessionId: sessionId, cwdSnapshot: "/workspace" });
+	}
+	const runner: RoomParticipantRunner = {
+		run: async (input) => { await input.markInputDurable(); return { status: "failed", terminalReason: "provider down" }; },
+	};
+	(router as unknown as { deps: { runner: RoomParticipantRunner } }).deps.runner = runner;
+	await router.send({ roomSessionId: ROOM, content: "三目标", mentions: ["worker-a", "worker-b", "worker-c"], operationId: "op-fanout-fail" });
+	for (let attempt = 0; attempt < 100; attempt += 1) {
+		const terminal = (await events.read(ROOM)).filter((event) => event.kind === "terminal");
+		if (terminal.length >= 3) break;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	const terminal = (await events.read(ROOM)).filter((event) => event.kind === "terminal");
+	assert.equal(terminal.length, 3, "失败 Turn 的 terminal + 两个 skipped");
+	assert.match(terminal.map((event) => event.content).join("\n"), /worker-b/);
+	assert.match(terminal.map((event) => event.content).join("\n"), /worker-c/);
+	assert.equal((await turns.list(ROOM)).length, 1, "失败后不应再创建后续 Turn");
+});
