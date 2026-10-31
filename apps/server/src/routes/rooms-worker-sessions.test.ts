@@ -885,6 +885,12 @@ test("v4 HTTP: 公共摘要只含 RoomEvent 事实", async () => {
 		assert.match(summary.json().text, /问题：请检查登录/);
 		assert.match(summary.json().text, /结论：房间结论/);
 		assert.equal(summary.json().lastEventSeq, 2);
+		const ranged = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/summary?fromEventSeq=2&toEventSeq=2` });
+		assert.equal(ranged.json().eventCount, 1);
+		assert.equal(ranged.json().range.fromEventSeq, 2);
+		assert.equal(ranged.json().lastEventSeq, 2);
+		const invalidRange = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/summary?fromEventSeq=3&toEventSeq=1` });
+		assert.equal(invalidRange.statusCode, 400);
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });
 
