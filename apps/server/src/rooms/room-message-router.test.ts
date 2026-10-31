@@ -16,6 +16,7 @@ import {
 	type RoomParticipantRunnerInput,
 	type RoomParticipantRunnerResult,
 } from "./room-message-router.js";
+import { PiParticipantRunner } from "./participant-runners.js";
 
 const ROOM = "room-1111-2222";
 const ROOM_ID = "room-id-1";
@@ -232,4 +233,44 @@ test("RoomMessageRouter: ensureParticipant 懒创建 binding 后再路由", asyn
 	await routerWithEnsure.waitForTurn(ROOM, accepted.turnId);
 	assert.deepEqual(ensured, ["worker-b"]);
 	assert.equal((await turns.get(ROOM, accepted.turnId))?.status, "completed");
+});
+
+test("RoomMessageRouter: 真实 Pi runner 走 SDK preflight 后 durable 并投影 final", async () => {
+	const { events, router } = await makeRouter({ bindings: "all" });
+	const messages: Array<{ role: string; content: string; stopReason?: string; timestamp: number }> = [];
+	const piRunner = new PiParticipantRunner({
+		sessions: {
+			open: async () => ({
+				messages,
+				prompt: async (text: string, options?: { preflightResult?: (disposition: unknown) => void }) => {
+					messages.push({ role: "user", content: text, timestamp: Date.now() });
+					options?.preflightResult?.("started");
+					messages.push({ role: "assistant", content: "Pi 结论", stopReason: "stop", timestamp: Date.now() });
+				},
+			}),
+		} as never,
+	});
+	(router as unknown as { deps: { runner: RoomParticipantRunner } }).deps.runner = piRunner;
+	const accepted = await router.send({ roomSessionId: ROOM, content: "执行", mentions: ["worker-a"], operationId: "op-pi-real-1" });
+	await wait(router, accepted.turnId);
+	const stored = await events.read(ROOM);
+	assert.equal(stored.at(-1)?.content, "Pi 结论");
+	assert.equal(stored.at(-1)?.kind, "message");
+});
+
+test("RoomMessageRouter: 真实 Pi runner 的 prompt 被拒绝时不返回 accepted", async () => {
+	const { router } = await makeRouter({ bindings: "all" });
+	const piRunner = new PiParticipantRunner({
+		sessions: {
+			open: async () => ({
+				messages: [],
+				prompt: async () => { throw new Error("no api key"); },
+			}),
+		} as never,
+	});
+	(router as unknown as { deps: { runner: RoomParticipantRunner } }).deps.runner = piRunner;
+	await assert.rejects(
+		() => router.send({ roomSessionId: ROOM, content: "执行", mentions: ["worker-a"], operationId: "op-pi-real-2" }),
+		(error: unknown) => error instanceof RoomMessageError && error.code === "message_delivery_unconfirmed",
+	);
 });
