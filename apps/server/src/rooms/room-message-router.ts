@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import {
 	RoomContextTooLargeError,
 	buildRoomContext,
@@ -110,7 +111,10 @@ export interface RoomMessageRouterDeps {
 	activity?: RoomActivityStore;
 	knowledge?: {
 		ownerId: string;
-		sources: { createText(ownerId: string, text: string, origin?: Record<string, unknown>): Promise<{ id: string }> };
+		sources: {
+			createText(ownerId: string, text: string, origin?: Record<string, unknown>): Promise<{ id: string }>;
+			createUploads?(ownerId: string, uploads: Array<{ filename: string; mediaType: string; data: string }>, origin?: Record<string, unknown>): Promise<Array<{ id: string }>>;
+		};
 	};
 	now?: () => string;
 }
@@ -168,15 +172,28 @@ export class RoomMessageRouter {
 	constructor(private readonly deps: RoomMessageRouterDeps) {}
 
 	/** 活动读模型不得阻断准入/投影；失败只丢投影，重启可重建。 */
-	private async knowledgeSourceIds(eventId: string, binding: ParticipantBinding, text: string): Promise<string[] | undefined> {
+	private async knowledgeSourceIds(eventId: string, binding: ParticipantBinding, text: string, attachments?: RoomAttachmentRef[]): Promise<string[] | undefined> {
 		if (!this.deps.knowledge) return undefined;
-		try {
-			const source = await this.deps.knowledge.sources.createText(this.deps.knowledge.ownerId, text, {
-				sessionId: binding.agentSessionId, messageId: eventId, windowId: binding.roomId,
-				roomSessionId: binding.roomSessionId, sourceRoomEventId: eventId, channel: "user_input",
-			});
-			return [source.id];
-		} catch { return undefined; }
+		const origin = {
+			sessionId: binding.agentSessionId, messageId: eventId, windowId: binding.roomId,
+			roomSessionId: binding.roomSessionId, sourceRoomEventId: eventId, channel: "user_input",
+		};
+		const ids: string[] = [];
+		if (text.trim()) {
+			try { ids.push((await this.deps.knowledge.sources.createText(this.deps.knowledge.ownerId, text, origin)).id); }
+			catch { /* read model may be unavailable */ }
+		}
+		if (attachments?.length && this.deps.knowledge.sources.createUploads) {
+			try {
+				const uploads = await Promise.all(attachments.map(async (item) => ({
+					filename: item.name, mediaType: item.mediaType,
+					data: (await readFile(item.path)).toString("base64"),
+				})));
+				const sources = await this.deps.knowledge.sources.createUploads(this.deps.knowledge.ownerId, uploads, origin);
+				ids.push(...sources.map((source) => source.id));
+			} catch { /* attachment source best effort */ }
+		}
+		return ids.length ? ids : undefined;
 	}
 
 	private async recordActivity(roomSessionId: string, event: RoomEvent, unread = true): Promise<void> {
@@ -263,7 +280,7 @@ export class RoomMessageRouter {
 				}
 				const eventId = randomUUID();
 				const mentions = [binding.agentId];
-				const sourceIds = await this.knowledgeSourceIds(eventId, binding, content);
+				const sourceIds = await this.knowledgeSourceIds(eventId, binding, content, input.attachments);
 				const draft = {
 					id: eventId, kind: "message" as const, actor: { kind: "user" as const },
 					content, mentions,
@@ -359,7 +376,7 @@ export class RoomMessageRouter {
 				}
 				const eventId = randomUUID();
 				const mentions = [activeBinding.agentId];
-				const sourceIds = await this.knowledgeSourceIds(eventId, activeBinding, content);
+				const sourceIds = await this.knowledgeSourceIds(eventId, activeBinding, content, input.attachments);
 				const draft = {
 					id: eventId, kind: "message" as const, actor: { kind: "user" as const },
 					content, mentions,
@@ -393,7 +410,7 @@ export class RoomMessageRouter {
 
 			const eventId = randomUUID();
 			const mentions = [...new Set(input.mentions)];
-			const sourceIds = await this.knowledgeSourceIds(eventId, binding, content);
+			const sourceIds = await this.knowledgeSourceIds(eventId, binding, content, input.attachments);
 			const draft = {
 				id: eventId,
 				kind: "message" as const,

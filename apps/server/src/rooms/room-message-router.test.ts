@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { RoomEventStore } from "./room-event-store.js";
@@ -421,4 +421,30 @@ test("RoomMessageRouter: 用户事件写入知识来源 id 与 room origin", asy
 	assert.equal(origin?.sourceRoomEventId, event?.id);
 	assert.equal(origin?.sessionId, "agent-worker-a");
 	assert.equal(origin?.windowId, ROOM_ID);
+});
+
+test("RoomMessageRouter: 附件也写入知识来源并共享 room origin", async () => {
+	const { root, events, router } = await makeRouter({ bindings: "all" });
+	const file = path.join(root, "note.txt");
+	writeFileSync(file, "attachment body");
+	const origins: Array<Record<string, unknown> | undefined> = [];
+	(router as unknown as { deps: { knowledge?: unknown } }).deps.knowledge = {
+		ownerId: "owner-1",
+		sources: {
+			createText: async () => ({ id: "text-source" }),
+			createUploads: async (_owner: string, uploads: Array<{ filename: string }>, origin?: Record<string, unknown>) => {
+				origins.push(origin);
+				assert.equal(uploads[0]?.filename, "note.txt");
+				return [{ id: "upload-source" }];
+			},
+		},
+	};
+	await router.send({
+		roomSessionId: ROOM, content: "看附件", mentions: ["worker-a"], operationId: "op-knowledge-2",
+		attachments: [{ name: "note.txt", path: file, mediaType: "text/plain", size: 15, sha256: "a".repeat(64), kind: "file" }],
+	});
+	const [event] = await events.read(ROOM);
+	assert.deepEqual(event?.knowledgeSourceIds, ["text-source", "upload-source"]);
+	assert.equal(origins[0]?.roomSessionId, ROOM);
+	assert.equal(origins[0]?.sourceRoomEventId, event?.id);
 });
