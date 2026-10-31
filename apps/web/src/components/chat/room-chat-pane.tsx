@@ -188,6 +188,11 @@ export function RoomChatPane({
 	const handleSend = useCallback(async () => {
 		const content = draft.trim();
 		if (!content || !roomSessionId || !canSend) return;
+		const activeAgentId = activeTurn ? timeline?.participants.find((item) => item.agentSessionId === activeTurn.agentSessionId)?.agentId : undefined;
+		if (activeTurn && targetAgentId && activeAgentId && targetAgentId !== activeAgentId) {
+			toast.error(`当前回合属于 @${agentDisplayName(room.members.find((member) => member.name === activeAgentId) ?? { name: activeAgentId })}，followUp 只能发给同一 Participant`);
+			return;
+		}
 		setSending(true);
 		try {
 			await sendRoomMessage(room.id, roomSessionId, {
@@ -199,7 +204,7 @@ export function RoomChatPane({
 		} catch (caught) {
 			toast.error(caught instanceof Error ? caught.message : String(caught));
 		} finally { setSending(false); }
-	}, [activeTurn, canSend, draft, room.id, roomSessionId, targetAgentId]);
+	}, [activeTurn, canSend, draft, room.id, roomSessionId, targetAgentId, timeline?.participants, room.members]);
 
 	const handleStop = useCallback(async () => {
 		if (!roomSessionId) return;

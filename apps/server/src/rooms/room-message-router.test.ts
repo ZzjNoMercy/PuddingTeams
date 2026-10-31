@@ -287,7 +287,7 @@ test("RoomMessageRouter: 原生 followUp 追加输入、不另起 runner，完�
 			await pending;
 			return { status: "completed", finalContent: "最终结论" };
 		},
-		followUp: async (input) => { await input.markInputDurable("followup-entry"); },
+		followUp: async (input) => { await input.markInputDurable("followup-entry"); return "durable" as const; },
 	};
 	(router as unknown as { deps: { runner: RoomParticipantRunner } }).deps.runner = runner;
 	const first = await router.send({ roomSessionId: ROOM, content: "开始", mentions: ["worker-a"], operationId: "op-follow-1" });
@@ -305,4 +305,34 @@ test("RoomMessageRouter: 原生 followUp 追加输入、不另起 runner，完�
 	const stored = await events.read(ROOM);
 	assert.equal(stored.filter((event) => event.kind === "message").length, 3, "两个用户输入 + 一次 final");
 	assert.equal(stored.filter((event) => event.kind === "terminal").length, 0);
+});
+
+test("RoomMessageRouter: queued followUp 先返回 pending，watcher durable 后再完成 final", async () => {
+	const { events, turns, router } = await makeRouter({ bindings: "all" });
+	let release!: () => void;
+	const pending = new Promise<void>((resolve) => { release = resolve; });
+	const runner: RoomParticipantRunner = {
+		run: async (input) => {
+			await input.markInputDurable("initial");
+			await pending;
+			return { status: "completed", finalContent: "最终" };
+		},
+		followUp: async (input) => {
+			setTimeout(() => { void input.markInputDurable("later"); }, 50);
+			return "queued";
+		},
+	};
+	(router as unknown as { deps: { runner: RoomParticipantRunner } }).deps.runner = runner;
+	const first = await router.send({ roomSessionId: ROOM, content: "开始", mentions: ["worker-a"], operationId: "op-queued-1" });
+	const follow = await router.send({
+		roomSessionId: ROOM, content: "排队", mentions: ["worker-a"], operationId: "op-queued-2",
+		delivery: "followUp", expectedParticipantTurnId: first.turnId,
+	});
+	assert.equal(follow.persistence, "pending");
+	assert.equal((await turns.get(ROOM, first.turnId))?.inputs[1]?.persistence, "pending");
+	release();
+	await wait(router, first.turnId);
+	const stored = await events.read(ROOM);
+	assert.equal(stored.filter((event) => event.kind === "message").length, 3, "watcher durable 后 final 才能投影");
+	assert.equal((await turns.get(ROOM, first.turnId))?.status, "completed");
 });

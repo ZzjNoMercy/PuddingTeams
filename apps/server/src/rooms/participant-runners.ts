@@ -71,8 +71,8 @@ function persistedUserEntry(session: RunnerSession, entryId: string, text: strin
 }
 
 /** 轮询到新 user entry 出现（且 JSONL 已落盘）；超时返回 undefined。 */
-async function waitForDurableUserEntry(session: RunnerSession, promptText: string, priorIds: Set<string>, priorCount: number): Promise<string | undefined> {
-	const deadline = Date.now() + 5_000;
+async function waitForDurableUserEntry(session: RunnerSession, promptText: string, priorIds: Set<string>, priorCount: number, timeoutMs = 5_000): Promise<string | undefined> {
+	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		const branch = session.sessionManager?.getBranch();
 		if (branch) {
@@ -129,27 +129,36 @@ export class PiParticipantRunner implements RoomParticipantRunner {
 		return { status: "completed", finalContent: final.text, execution: { kind: "native_pi" } };
 	}
 
-	async followUp(input: RoomParticipantFollowUpInput): Promise<void> {
+	async followUp(input: RoomParticipantFollowUpInput): Promise<"durable" | "queued"> {
 		const session = await this.deps.sessions.open(input.binding.agentSessionId) as unknown as RunnerSession;
 		const priorUserIds = new Set((session.sessionManager?.getBranch() ?? [])
 			.filter((entry) => entry.type === "message" && entry.message?.role === "user")
 			.map((entry) => entry.id).filter((id): id is string => Boolean(id)));
 		const priorCount = session.messages.filter((message) => message.role === "user").length;
-		let accepted!: () => void;
-		const acceptedInput = new Promise<void>((resolve) => { accepted = resolve; });
+		let resolvePreflight!: (value: string) => void;
+		const preflight = new Promise<string>((resolve) => { resolvePreflight = resolve; });
 		const prompt = session.prompt(input.text, {
 			streamingBehavior: "followUp",
-			preflightResult: () => accepted(),
+			preflightResult: (value) => resolvePreflight(String(value)),
 		} as { preflightResult?: (disposition: unknown) => void });
 		const outcome = await Promise.race([
-			acceptedInput.then(() => "accepted" as const),
-			prompt.then(() => "finished" as const, () => "failed" as const),
+			preflight,
+			prompt.then(() => "finished", () => "failed"),
 		]);
 		if (outcome === "failed") throw new Error("Agent 拒绝了 followUp 输入");
+		if (outcome === "queued") {
+			// SDK 在当前 run 结束前只排队；watcher 在 user entry 真正落盘后补 durable。
+			void waitForDurableUserEntry(session, input.text, priorUserIds, priorCount, 30 * 60_000)
+				.then(async (entryId) => { if (entryId) await input.markInputDurable(entryId); })
+				.catch(() => undefined);
+			void prompt.catch(() => undefined);
+			return "queued";
+		}
 		const userEntryId = await waitForDurableUserEntry(session, input.text, priorUserIds, priorCount);
 		if (!userEntryId) throw new Error("followUp 输入尚未写入 Agent 会话记录");
 		await input.markInputDurable(userEntryId);
 		void prompt.catch(() => undefined);
+		return "durable";
 	}
 }
 

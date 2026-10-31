@@ -226,10 +226,12 @@ test("PiParticipantRunner: followUp 走 streamingBehavior 并在 user entry 落�
 		},
 	};
 	const runner = new PiParticipantRunner({ sessions: { open: async () => session as never } });
-	await runner.followUp({
+	const result = await runner.followUp({
 		roomSessionId: runnerInput.roomSessionId, turn: runnerInput.turn, binding: runnerInput.binding,
 		text: "补充", markInputDurable: async (id) => { durableEntry = id; },
 	});
 	assert.equal(streaming, "followUp");
-	assert.equal(durableEntry, "user-entry");
+	assert.equal(result, "queued");
+	for (let attempt = 0; attempt < 50 && durableEntry !== "user-entry"; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(durableEntry, "user-entry", "queued 后 watcher 必须在 entry 落盘时补 durable");
 });

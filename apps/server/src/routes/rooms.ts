@@ -977,7 +977,7 @@ export function registerRoomsRoutes(
 					accepted: true,
 					roomEventId: result.roomEventId,
 					participantTurnId: result.turnId,
-					persistence: "durable",
+					persistence: result.persistence ?? "durable",
 				});
 			} catch (error) {
 				if (error instanceof RoomMessageError) {
@@ -1317,6 +1317,9 @@ export function registerRoomsRoutes(
 		}
 		const window = context.window;
 		const agentConfigs = new Map((await teams.listAgents()).map((agent) => [agent.name, agent]));
+		const activeParticipant = activeTurn ? participants.find((item) => item.agentSessionId === activeTurn.agentSessionId) : undefined;
+		const activeAgent = activeParticipant ? agentConfigs.get(activeParticipant.agentId) : undefined;
+		const activeNativePi = Boolean(activeAgent?.pinned || activeAgent?.invoke?.type === "pi" || activeAgent?.connector?.connectorId === "pi");
 		return {
 			roomId: req.params.id,
 			roomSessionId: req.params.sid,
@@ -1339,9 +1342,9 @@ export function registerRoomsRoutes(
 			queuedInputs: [],
 			activityRevision: roomActivity ? (await roomActivity.status(req.params.sid)).entry?.revision ?? 0 : 0,
 			capabilities: {
-				canSend: !publicActiveTurn && !recoveryReason,
+				canSend: (!publicActiveTurn || activeNativePi) && !recoveryReason,
 				canStop: Boolean(publicActiveTurn),
-				busyInputModes: [],
+				busyInputModes: publicActiveTurn && activeNativePi ? ["followUp"] : [],
 				allowedMentions: window.members,
 				...(publicActiveTurn ? { activeParticipantTurnId: publicActiveTurn.id } : {}),
 				recoveryRequired: Boolean(recoveryReason),

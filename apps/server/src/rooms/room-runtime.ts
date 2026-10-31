@@ -6,7 +6,7 @@ import { RoomEventStore } from "./room-event-store.js";
 import { ParticipantTurnStore } from "./participant-turn-store.js";
 import { RoomOperationStore } from "./room-operation-store.js";
 import { RoomTurnService } from "./room-turn-service.js";
-import { RoomMessageError, RoomMessageRouter, type RoomParticipantRunner, type RoomParticipantRunnerInput, type RoomParticipantRunnerResult } from "./room-message-router.js";
+import { RoomMessageError, RoomMessageRouter, type RoomParticipantFollowUpInput, type RoomParticipantRunner, type RoomParticipantRunnerInput, type RoomParticipantRunnerResult } from "./room-message-router.js";
 import { PiParticipantRunner, DirectChatParticipantRunner } from "./participant-runners.js";
 import { TeamsParticipantBindingPort } from "./teams-binding-port.js";
 import { RoomEventBus } from "./room-event-bus.js";
@@ -29,7 +29,7 @@ export interface RoomRuntime {
 	recoverPending(roomSessionId: string): Promise<number>;
 }
 
-class ConnectorParticipantRunner implements RoomParticipantRunner {
+export class ConnectorParticipantRunner implements RoomParticipantRunner {
 	constructor(
 		private readonly deps: {
 			teams: Pick<TeamsStore, "getAgent">;
@@ -45,6 +45,13 @@ class ConnectorParticipantRunner implements RoomParticipantRunner {
 		if (pi) return this.deps.pi.run(input);
 		if (!this.deps.direct) return { status: "failed", terminalReason: "非 Pi Worker 需要 AgentInvoker 才能执行" };
 		return this.deps.direct.run(input);
+	}
+
+	async followUp(input: RoomParticipantFollowUpInput): Promise<"durable" | "queued"> {
+		const agent = await this.deps.teams.getAgent(input.binding.agentId);
+		const pi = Boolean(agent && (agent.invoke?.type === "pi" || agent.connector?.connectorId === "pi" || agent.pinned === true));
+		if (!pi) throw new RoomMessageError("participant_delivery_unsupported", "非 Pi Participant 不支持 followUp");
+		return await this.deps.pi.followUp!(input);
 	}
 }
 

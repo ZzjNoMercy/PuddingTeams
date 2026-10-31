@@ -80,7 +80,7 @@ export interface RoomParticipantFollowUpInput {
 export interface RoomParticipantRunner {
 	run(input: RoomParticipantRunnerInput): Promise<RoomParticipantRunnerResult>;
 	/** 原生 followUp：应把输入交给同一 Agent 会话队列，不另起 runner。 */
-	followUp?(input: RoomParticipantFollowUpInput): Promise<void>;
+	followUp?(input: RoomParticipantFollowUpInput): Promise<"durable" | "queued">;
 }
 
 export interface RoomContextBudget {
@@ -121,6 +121,8 @@ export interface SendRoomMessageInput {
 }
 
 export interface SendRoomMessageResult {
+	/** followUp 排队时 accepted 只代表 SDK 已接单，原生输入仍未落盘。 */
+	persistence?: "durable" | "pending";
 	roomEventId: string;
 	turnId: string;
 	status: ParticipantTurnStatus;
@@ -212,6 +214,11 @@ export class RoomMessageRouter {
 					if (replay.phase !== "accepted") await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "accepted");
 					return { roomEventId: replay.roomEventId, turnId: replay.participantTurnId, status: turn.status, replayed: true };
 				}
+				if (replay.phase === "participant_bound" && replay.participantTurnId) {
+					const turn = await this.deps.turns.get(input.roomSessionId, replay.participantTurnId);
+					const pending = turn?.inputs.find((item) => item.operationId === input.operationId && item.delivery === "followUp");
+					if (pending) return { roomEventId: replay.roomEventId ?? "", turnId: replay.participantTurnId, status: turn!.status, replayed: true, persistence: "pending" };
+				}
 				throw new RoomMessageError("message_delivery_unconfirmed", "消息已受理但尚未确认输入落盘；请刷新时间线核对");
 			}
 
@@ -230,6 +237,9 @@ export class RoomMessageRouter {
 				}
 				const binding = await this.deps.bindings.findActiveBySession(input.roomSessionId, active.agentSessionId);
 				if (!binding) throw new RoomMessageError("participant_binding_required", "followUp 的 ParticipantSession 没有 active binding");
+				if (input.mentions.length > 0 && !input.mentions.includes(binding.agentId)) {
+					throw new RoomMessageError("invalid_delivery", `followUp 的 mentions 必须指向当前 Participant: ${binding.agentId}`);
+				}
 				if (!this.deps.runner.followUp) {
 					throw new RoomMessageError("participant_delivery_unsupported", "当前 Participant 不支持原生 followUp");
 				}
@@ -259,20 +269,40 @@ export class RoomMessageRouter {
 					agentSessionId: binding.agentSessionId, participantTurnId: active.id,
 				});
 				let durableMarked = false;
+				let acceptedMarked = false;
 				let resolveDurable!: () => void;
 				const durableReached = new Promise<void>((resolve) => { resolveDurable = resolve; });
+				const finalizeAccepted = async () => {
+					if (acceptedMarked) return;
+					await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "accepted");
+					acceptedMarked = true;
+				};
 				const markInputDurable = async (agentUserEntryId?: string) => {
 					if (durableMarked) return;
 					await this.deps.turnService.markInputDurable(input.roomSessionId, active.id, input.operationId, agentUserEntryId);
 					await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "participant_input_durable");
 					durableMarked = true;
 					resolveDurable();
+					await finalizeAccepted();
 				};
-				const following = this.deps.runner.followUp({ roomSessionId: input.roomSessionId, turn: appended.turn, binding, text: content, markInputDurable });
-				await Promise.race([durableReached, following.then(() => undefined, () => undefined)]);
+				const pendingDurable = this.deps.runner.followUp({ roomSessionId: input.roomSessionId, turn: appended.turn, binding, text: content, markInputDurable });
+				let disposition: "durable" | "queued";
+				try {
+					disposition = await pendingDurable;
+				} catch (error) {
+					// 排队后输入落盘由 watcher 负责；runner 抛错表示 SDK 拒绝受理。
+					throw error instanceof RoomMessageError ? error
+						: new RoomMessageError("participant_delivery_unsupported", error instanceof Error ? error.message : String(error));
+				}
+				if (disposition === "queued") {
+					// 用户事件已公开、Turn 保持 active；输入由 watcher 在 native user entry
+					// 落盘后推进 durable/accepted。这里只确认 SDK 接单。
+					return { roomEventId: userEvent.id, turnId: active.id, status: appended.turn.status, replayed: false, persistence: "pending" };
+				}
+				await Promise.race([durableReached, Promise.resolve()]);
 				if (!durableMarked) throw new RoomMessageError("message_delivery_unconfirmed", "followUp 输入未确认落盘；请刷新时间线核对");
-				await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "accepted");
-				return { roomEventId: userEvent.id, turnId: active.id, status: appended.turn.status, replayed: false };
+				await finalizeAccepted();
+				return { roomEventId: userEvent.id, turnId: active.id, status: appended.turn.status, replayed: false, persistence: "durable" };
 			}
 			const active = await this.activeTurn(input.roomSessionId);
 			if (active) throw new RoomMessageError("room_turn_active", `房间已有未终态公开回合：${active.id}`);
@@ -329,6 +359,7 @@ export class RoomMessageRouter {
 				...(binding.lastRoomEntryId ? { contextFromAfterRoomEventId: binding.lastRoomEntryId } : {}),
 			});
 			const turn = await this.deps.turnService.start(input.roomSessionId, begun.turn.id);
+			this.deps.bus?.publish(input.roomSessionId, { type: "participant_turn", turn: publicTurn(turn) });
 			await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "participant_bound", {
 				agentSessionId: target.agentSessionId, participantTurnId: turn.id,
 			});
@@ -357,6 +388,19 @@ export class RoomMessageRouter {
 			await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "accepted");
 			return { roomEventId: userEvent.id, turnId: turn.id, status: turn.status, replayed: false };
 		});
+	}
+
+	/** followUp 可能仍在 native 队列；完成终态前必须等所有输入 durable。 */
+	private async waitForDurableInputs(roomSessionId: string, turnId: string, timeoutMs = 30 * 60_000): Promise<boolean> {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			const turn = await this.deps.turns.get(roomSessionId, turnId);
+			if (!turn) return false;
+			if (!["admitted", "running", "waiting_input", "reconciling"].includes(turn.status)) return true;
+			if (turn.inputs.every((input) => input.persistence === "durable")) return true;
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+		return false;
 	}
 
 	private execute(roomSessionId: string, turnId: string, runnerInput: RoomParticipantRunnerInput): Promise<void> {
@@ -392,13 +436,21 @@ export class RoomMessageRouter {
 				return;
 			}
 			if (result.status === "completed" && result.finalContent?.trim()) {
-				const completed = await this.deps.turnService.complete(roomSessionId, turnId, result.finalContent);
-				const projection = await this.deps.turnService.project(roomSessionId, completed.id);
-				if (projection.event) {
-					this.deps.bus?.publish(roomSessionId, { type: "room_event", event: projection.event });
-					await this.recordActivity(roomSessionId, projection.event);
-				}
-				this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(projection.turn) });
+				await withRoomAdmissionLock(roomSessionId, async () => {
+					const ready = await this.waitForDurableInputs(roomSessionId, turnId);
+					if (!ready) {
+						const unknown = await this.deps.turnService.markUnknown(roomSessionId, turnId, "followUp 输入未在超时内落盘");
+						this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(unknown) });
+						return;
+					}
+					const completed = await this.deps.turnService.complete(roomSessionId, turnId, result.finalContent!);
+					const projection = await this.deps.turnService.project(roomSessionId, completed.id);
+					if (projection.event) {
+						this.deps.bus?.publish(roomSessionId, { type: "room_event", event: projection.event });
+						await this.recordActivity(roomSessionId, projection.event);
+					}
+					this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(projection.turn) });
+				});
 				return;
 			}
 			if (result.status === "cancelled") {
