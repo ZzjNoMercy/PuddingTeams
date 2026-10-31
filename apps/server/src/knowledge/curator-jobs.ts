@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { createCurationStatusTool, type CurationStatusSnapshot } from "./curation-status.js";
 import { workerCurationSurface } from "./worker-curation.js";
 import { memoryRuntimePolicy } from "./memory-runtime-policy.js";
-import { lstat, mkdir } from "node:fs/promises";
+import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import { Type } from "typebox";
@@ -28,6 +28,9 @@ import { extractImageWithPi, type ImageExtractionArtifact } from "./image-extrac
 import { readKnowledgeAsset } from "./assets.js";
 import { checkedKnowledgeRoot } from "./observation.js";
 import { assertImageAssetBytes, assertImageBatchIntegrity, attachSourceImages, sourceImageAssets } from "./image-publication.js";
+import type { KnowledgeAuditStore } from "./audit-store.js";
+import type { DecideAndPublishResult } from "./wiki/decide.js";
+import { TaskWorkspace, type TaskPage } from "./task-files.js";
 
 export type CuratorJobStatus = "queued" | "running" | "submitting" | "pending_review" | "no_changes" | "needs_attention" | "failed" | "cancelled";
 /** Execution metadata only: never persist model prose, tool arguments or source contents here. */
@@ -45,6 +48,9 @@ export interface CuratorRevision {
 }
 export interface CuratorJob {
 	id: string; operationId: string; ownerId: string; requestHash: string;
+	/** 一次多库任务共享的组身份；单库任务为空。 */
+	groupId?: string;
+	groupBindingIds?: string[];
 	executionMode: "worker" | "background";
 	targetBindingId: string; agentId: string; agentRevision: number;
 	task: string; sources: CuratorSource[]; baseline: StoredAcceptedNoteVersion[];
@@ -140,6 +146,8 @@ interface CuratorDeps {
 	objects: KnowledgeObjectStore; reviews: ReviewStore; runtime: KnowledgeRuntimeService;
 	teams: TeamsStore; cacheDir: string;
 	sources: KnowledgeSourceStore;
+	/** 统一审计账本；候选提交事实在审核登记成功后追加，失败可重试。 */
+	audit?: Pick<KnowledgeAuditStore, "append">;
 	/** Test seam replaces only the model, never candidate validation or review. */
 	generate?: (job: CuratorJob, surface: KnowledgeMountSurface, submit: ToolDefinition) => Promise<void>;
 	extractImage?: typeof extractImageWithPi;
@@ -163,8 +171,35 @@ export function curatorJobFeedback(job: CuratorJob) {
 		cancelled: "知识整理已取消；正式知识库尚未修改。",
 	};
 	return { jobId: job.id, status: job.status, executionMode: job.executionMode, recoveryRevision: job.recoveryRevision ?? 0, jobUrl: `/knowledge?vault=${encodeURIComponent(job.targetBindingId)}&job=${encodeURIComponent(job.id)}`,
+		...(job.candidateBatchId ? { batchId: job.candidateBatchId } : {}),
 		...(job.status === "pending_review" && job.candidateBatchId ? { reviewUrl: `/knowledge/review?batch=${encodeURIComponent(job.candidateBatchId)}` } : {}),
 		...(job.failureCode ? { failureCode: job.failureCode } : {}), message: job.status === "failed" && job.diagnostics?.validationErrors?.length ? `${messages[job.status]}候选曾因目录或字段格式校验不通过而被拒绝。` : messages[job.status] };
+}
+
+export interface TaskDescriptor {
+	root: string; sources: string; pages: number; allowedSourceIds: string[];
+	targets: Array<{ bindingId: string; library: string }>;
+	sourcesManifest: Array<{ id: string; kind: string; mediaType: string; title: string; file: string; originalHash: string; textHash?: string; extracted?: string }>;
+}
+
+function mediaExtension(mediaType: string): string {
+	const normalized = mediaType.split(";")[0]!.trim().toLowerCase();
+	return ({ "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp", "application/pdf": ".pdf" } as Record<string, string>)[normalized] ?? ".bin";
+}
+
+async function describeTask(job: CuratorJob, workspace: TaskWorkspace, root: string): Promise<TaskDescriptor> {
+	const manifest = await readFile(path.join(workspace.sources, "manifest.json"), "utf8").catch(() => "");
+	let sourcesManifest: TaskDescriptor["sourcesManifest"] = [];
+	try { const parsed = JSON.parse(manifest) as { sources?: TaskDescriptor["sourcesManifest"] }; if (Array.isArray(parsed.sources)) sourcesManifest = parsed.sources; } catch { /* Missing manifest keeps an empty list. */ }
+	const targets = (job.groupBindingIds ?? [job.targetBindingId]).map((bindingId) => ({ bindingId, library: path.join(root, "targets", bindingId, "library") }));
+	return { root, sources: workspace.sources, targets,
+		pages: job.baseline.filter(entry => entry.availability === "current").length,
+		allowedSourceIds: job.sources.map(source => source.id), sourcesManifest };
+}
+
+function taskDocument(job: CuratorJob, bindingName: string, sources: TaskDescriptor["sourcesManifest"], contentPrefix: string): string {
+	const targets = (job.groupBindingIds ?? [job.targetBindingId]).map((bindingId) => `targets/${bindingId}/library`).join("、");
+	return `# 本次整理任务\n\n- 知识库：${bindingName}（${job.targetBindingId}）\n- 目标库（每库独立候选与审核）：${targets}\n- 任务：${job.task}\n- 当前库候选区：library/（镜像该库 contentRoot，路径保持正式库坐标${contentPrefix ? `，例如 ${contentPrefix}concepts/example.md` : ""}）\n- 规则：AGENTS.md、wiki.schema.json（只读）\n- 素材：sources/（只读，组内共享）；sources/manifest.json 列出 sourceId、文件与哈希\n- 允许引用的来源 ID：${sources.map(source => source.id).join("、") || "无"}\n\n## 操作\n\n1. 先读 AGENTS.md、wiki.schema.json、sources/manifest.json 和相关 sources 文件。\n2. 用 knowledge_task_read / ls / grep / find 查看 library/ 现有页面并查重。\n3. 用 knowledge_task_write / edit 在 library/ 写 Markdown 候选；路径是相对当前库任务根的 library/...。\n4. 其他目标库用同一组工具并传 bindingId，各自写各自的 library/。\n5. 调用 knowledge_submit_candidate（不需要传正文）；平台逐库扫描并冻结候选，校验失败按诊断修正后重新提交。\n6. 用 knowledge_publish_task 逐库批准并发布；允许部分库成功，逐库回执必须如实报告。\n\n## 边界\n\n- 只能修改各目标库的 library/**；sources/、AGENTS.md、wiki.schema.json、task.md 只读。\n- 禁止 bash、符号链接、library/ 之外的写入。\n- 首版只支持新增/更新页面，不支持删除或重命名。\n`;
 }
 
 export class WikiCuratorService {
@@ -174,7 +209,10 @@ export class WikiCuratorService {
 	private readonly workerAborters = new Map<string, () => Promise<void>>();
 	private readonly expired = new Set<string>();
 	private readonly workerStops = new Map<string, string>();
+	private candidatePublisher?: (job: CuratorJob, reason?: string) => Promise<DecideAndPublishResult>;
 	constructor(private readonly deps: CuratorDeps) {}
+	/** 模型代批的发布入口由宿主注入（需 reviews/publisher/audit 齐备），服务本身不持有发布器。 */
+	setPublisher(publisher: (job: CuratorJob, reason?: string) => Promise<DecideAndPublishResult>): void { this.candidatePublisher = publisher; }
  async readStatus(ownerId: string, jobId: string): Promise<CurationStatusSnapshot | undefined> {
   const job = await this.deps.jobs.get(jobId);
   if (!job || job.ownerId !== ownerId) return undefined;
@@ -203,8 +241,15 @@ export class WikiCuratorService {
 				return resumed;
 			},
 			create: args => this.create({ ...args, executionMode: "worker" }), jobs: this.deps.jobs,
+			createGroup: args => this.createGroup({ ...args, executionMode: "worker" }),
 			prepare: (job, modelRef) => this.prepareSources(job, modelRef), context: job => this.candidateContext(job),
 			submit: (job, pages, ids, evidence) => this.submit(job, pages, ids, evidence),
+			approve: async (job, reason) => {
+				if (!this.candidatePublisher) throw new Error("发布能力尚未装配");
+				return this.candidatePublisher(job, reason);
+			},
+			canApprove: () => Boolean(this.candidatePublisher),
+			task: job => this.materializeTask(job),
 			notify: job => this.deps.notify?.(job) ?? Promise.resolve(),
 			registerAbort: (id, abort) => { if (abort) this.workerAborters.set(id, abort); else this.workerAborters.delete(id); },
 			readStatus: (ownerId, jobId) => this.readStatus(ownerId, jobId), assertAuthority: job => this.assertAuthority(job),
@@ -260,7 +305,8 @@ export class WikiCuratorService {
 	async create(input: { ownerId: string; operationId: string; bindingId: string; agentId: string; task: string;
 		sourceText?: string; uploads?: UploadInput[]; origin?: CuratorJob["origin"]; revision?: CuratorRevision;
 		/** Internal retry/revision inputs; never forwarded from HTTP JSON. */
-		sourceIds?: string[]; retryOf?: string; executionMode?: CuratorJob["executionMode"] }): Promise<{ job: CuratorJob; replayed: boolean }> {
+		sourceIds?: string[]; retryOf?: string; executionMode?: CuratorJob["executionMode"];
+		groupId?: string; groupBindingIds?: string[] }): Promise<{ job: CuratorJob; replayed: boolean }> {
 		if (!input.ownerId || !input.operationId.trim() || input.operationId.length > 200 || !input.task.trim() || input.task.length > 20_000 ||
 			(input.sourceText?.length ?? 0) > 100_000) throw new Error("整理指令或 operationId 无效");
 		const binding = await this.deps.bindings.requireUsable(input.ownerId, input.bindingId);
@@ -272,7 +318,7 @@ export class WikiCuratorService {
 		// Request semantics exclude regenerated IDs and mutable runtime state. A replay
 		// reuses the first frozen baseline; a new edit needs a fresh operation identity.
 		const uploadIdentities = identifyUploads(input.uploads ?? []);
-		const requestHash = sha(JSON.stringify([input.ownerId, input.bindingId, input.agentId, input.task.trim(), originalHash, uploadIdentities, input.origin ?? null, input.revision ?? null, input.sourceIds ?? null, input.retryOf ?? null, input.executionMode ?? "background"]));
+		const requestHash = sha(JSON.stringify([input.ownerId, input.bindingId, input.agentId, input.task.trim(), originalHash, uploadIdentities, input.origin ?? null, input.revision ?? null, input.sourceIds ?? null, input.retryOf ?? null, input.executionMode ?? "background", input.groupBindingIds ?? null]));
 		const existing = (await this.deps.jobs.list(input.ownerId)).find((job) => job.operationId === input.operationId);
 		if (existing) {
 			if (existing.requestHash !== requestHash) throw new Error("同一 operationId 已用于不同整理请求");
@@ -341,6 +387,7 @@ export class WikiCuratorService {
 		const now = new Date().toISOString();
 		const result = await this.deps.jobs.create({ id: randomUUID(), operationId: input.operationId, ownerId: input.ownerId,
 			requestHash, executionMode: input.executionMode ?? "background", targetBindingId: binding.id, agentId: agent?.name ?? input.agentId, agentRevision: agent ? agentRunConfigRevision(agent) : 0,
+			...(input.groupId ? { groupId: input.groupId } : {}), ...(input.groupBindingIds ? { groupBindingIds: [...input.groupBindingIds] } : {}),
 			task: input.task.trim(), sources, baseline, historicalSources, historicalAcceptedSources,
 			bindingRevision: binding.bindingRevision, trustRevision: binding.trustRevision, rootIdentity: binding.rootIdentity,
 			contentPrefix: await schemaContentPrefix(binding, effectiveSchema.schema), schemaHash: await effectiveSchemaHash(binding), status: canRun ? (input.executionMode === "worker" ? "running" : "queued") : "needs_attention",
@@ -350,6 +397,38 @@ export class WikiCuratorService {
 			origin: input.origin, createdAt: now, updatedAt: now });
 		await this.deps.notify?.(result.job).catch(() => undefined);
 		if (result.job.executionMode === "background") this.kick(result.job.id); return result;
+	}
+
+	/**
+	 * 多库任务：一个组内每个目标库一个独立 Job/批次/审核/发布。
+	 * 素材只冻结一次，后续目标复用同一组 sourceIds；任一库不可用则整组不创建。
+	 */
+	async createGroup(input: { ownerId: string; operationId: string; bindingIds: string[]; agentId: string; task: string;
+		sourceText?: string; sourceIds?: string[]; uploads?: UploadInput[]; origin?: CuratorJob["origin"]; executionMode?: CuratorJob["executionMode"] }): Promise<{ jobs: CuratorJob[]; replayed: boolean[] }> {
+		if (!input.bindingIds.length || input.bindingIds.length > 8 || new Set(input.bindingIds).size !== input.bindingIds.length)
+			throw new Error("多库整理目标必须为 1–8 个且不重复");
+		for (const bindingId of input.bindingIds) await this.deps.bindings.requireUsable(input.ownerId, bindingId);
+		const created: Array<{ job: CuratorJob; replayed: boolean }> = [];
+		try {
+			let sourceIds: string[] | undefined;
+			for (const [index, bindingId] of input.bindingIds.entries()) {
+				const result = await this.create({ ownerId: input.ownerId, operationId: `group:${sha(input.operationId).slice(0, 24)}:${bindingId}`,
+					bindingId, agentId: input.agentId, task: input.task,
+					...(index === 0 ? (input.sourceIds ? { sourceIds: input.sourceIds } : { sourceText: input.sourceText, uploads: input.uploads }) : { sourceIds }),
+					...(input.origin ? { origin: input.origin } : {}), ...(input.executionMode ? { executionMode: input.executionMode } : {}),
+					groupId: input.operationId, groupBindingIds: input.bindingIds });
+				if (index === 0) sourceIds = result.job.sources.map((source) => source.id);
+				created.push(result);
+			}
+			return { jobs: created.map((entry) => entry.job), replayed: created.map((entry) => entry.replayed) };
+		} catch (error) {
+			// 没有跨库事务：组创建失败时只收敛已创建的 Job，不留下运行中的孤儿。
+			for (const entry of created) {
+				const failed = await this.deps.jobs.transition(entry.job.id, ["queued", "running"], { status: "failed", failureCode: "group_creation_failed" }).catch(() => undefined);
+				if (failed) await this.deps.notify?.(failed).catch(() => undefined);
+			}
+			throw error;
+		}
 	}
 
 	kick(id: string): void {
@@ -529,6 +608,21 @@ export class WikiCuratorService {
 			if (existing && existing.batch.manifestHash !== frozen.manifestHash)
 				return this.deps.jobs.transition(job.id, ["submitting"], { status: "failed", failureCode: "candidate_manifest_conflict" });
 			if (!existing) await this.deps.reviews.registerCandidate(frozen, job.ownerId);
+			// 登记成功后才记账；审计写入失败不产生待审核候选，可沿既有
+			// candidate_registration_failed 重试路径恢复，不重新生成模型输出。
+			await this.deps.audit?.append({
+				dedupeKey: `knowledge:candidate:${job.id}:${frozen.manifestHash}`,
+				kind: "candidate.submitted", ownerId: job.ownerId, actorId: job.agentId, actorKind: "agent",
+				channel: job.executionMode === "worker" && job.origin?.sessionId ? "chat" : "host",
+				bindingId: frozen.bindingId, jobId: job.id, batchId: frozen.id, manifestHash: frozen.manifestHash,
+				...(job.origin?.sessionId ? { sessionId: job.origin.sessionId } : {}),
+				...(job.origin?.windowId ? { windowId: job.origin.windowId } : {}),
+				sourceIds: job.sources.map((source) => source.id),
+				files: frozen.files.map((file) => ({ path: file.targetPath, operation: file.operation,
+					candidateHash: file.candidateHash ?? null, baselineHash: file.expectedHashOrAbsent ?? null })),
+				summary: `提交候选：${frozen.files.length} 项文件待审核`,
+				details: { executionMode: job.executionMode, schemaHash: job.schemaHash ?? null, contractHash: job.contractHash },
+			});
 			return await this.deps.jobs.transition(job.id, ["submitting"], { status: "pending_review", candidateBatchId: frozen.id, failureCode: undefined });
 		} catch (error) {
 			// The bytes already won the submission CAS. Preserve them for registration
@@ -539,6 +633,71 @@ export class WikiCuratorService {
 			}
 			throw error;
 		}
+	}
+
+	/** file as API：任务组共享 sources/，每个目标库独立 targets/<bindingId>/（规则、候选、证据）。 */
+	private async materializeTask(job: CuratorJob): Promise<TaskDescriptor> {
+		const root = path.join(this.deps.cacheDir, "tasks", job.groupId ?? job.id);
+		const sourcesRoot = path.join(root, "sources");
+		const targetRoot = path.join(root, "targets", job.targetBindingId);
+		const workspace = new TaskWorkspace(targetRoot, { sourcesRoot });
+		if (await workspace.ready()) return await describeTask(job, workspace, root);
+		await mkdir(path.join(targetRoot, "library"), { recursive: true, mode: 0o700 });
+		const binding = await this.deps.bindings.requireUsable(job.ownerId, job.targetBindingId);
+		const contract = job.contractSnapshotRef
+			? (await this.deps.objects.get(job.contractSnapshotRef)).toString("utf8")
+			: (await readKnowledgeOperationContract(binding))?.content;
+		if (contract) await workspace.hostWrite("AGENTS.md", contract, 0o444);
+		const schema = await readFile(path.join(binding.canonicalBindingRoot, "wiki.schema.json")).catch(() => null);
+		if (schema) await workspace.hostWrite("wiki.schema.json", schema, 0o444);
+		const sources = await this.materializeSources(job, sourcesRoot);
+		await workspace.hostWrite("task.md", taskDocument(job, binding.name, sources, job.contentPrefix), 0o444);
+		let files = 0, bytes = 0;
+		for (const entry of job.baseline) {
+			if (!entry.contentHash || entry.availability !== "current") continue;
+			const content = await this.deps.objects.get(entry.contentHash);
+			bytes += content.length;
+			if (++files > 300 || bytes > 64 * 1024 * 1024) throw new Error("知识库超过首版任务副本上限（300 页 / 64 MiB），请缩小范围");
+			await workspace.hostWrite(`library/${entry.relativePath}`, content, 0o644);
+		}
+		await workspace.markReady();
+		return await describeTask(job, workspace, root);
+	}
+
+	/** 组内共享素材只写一次；manifest 最后写，避免看到半成品目录。 */
+	private async materializeSources(job: CuratorJob, sourcesRoot: string): Promise<TaskDescriptor["sourcesManifest"]> {
+		const manifestPath = path.join(sourcesRoot, "manifest.json");
+		const existing = await readFile(manifestPath, "utf8").catch(() => null);
+		if (existing) {
+			try { const parsed = JSON.parse(existing) as { sources?: TaskDescriptor["sourcesManifest"] }; if (Array.isArray(parsed.sources)) return parsed.sources; } catch { /* Rewrite a corrupt manifest. */ }
+		}
+		await mkdir(path.join(sourcesRoot, "files"), { recursive: true, mode: 0o700 });
+		await mkdir(path.join(sourcesRoot, "extract"), { recursive: true, mode: 0o700 });
+		const sources: TaskDescriptor["sourcesManifest"] = [];
+		for (const source of job.sources) {
+			const extension = mediaExtension(source.mediaType);
+			if (source.kind === "text" || source.kind === "markdown") {
+				const { text } = await this.deps.sources.readText(job.ownerId, source.id);
+				const file = `sources/${source.id}.md`;
+				await writeFile(path.join(sourcesRoot, `${source.id}.md`), text, { mode: 0o444 });
+				sources.push({ id: source.id, kind: source.kind, mediaType: source.mediaType, title: source.title, file, originalHash: source.originalHash,
+					...(source.textHash ? { textHash: source.textHash } : {}) });
+				continue;
+			}
+			const { bytes } = await this.deps.sources.readOriginal(job.ownerId, source.id);
+			const file = `sources/files/${source.originalHash}${extension}`;
+			await writeFile(path.join(sourcesRoot, "files", `${source.originalHash}${extension}`), bytes, { mode: 0o444 });
+			let extracted: string | undefined;
+			if (source.extraction) {
+				const text = (await this.deps.objects.get(source.extraction.artifactHash)).toString("utf8");
+				extracted = `sources/extract/${source.id}.md`;
+				await writeFile(path.join(sourcesRoot, "extract", `${source.id}.md`), text, { mode: 0o444 });
+			}
+			sources.push({ id: source.id, kind: source.kind, mediaType: source.mediaType, title: source.title, file,
+				originalHash: source.originalHash, ...(extracted ? { extracted } : {}) });
+		}
+		await writeFile(manifestPath, JSON.stringify({ sources }, null, 2), { mode: 0o444 });
+		return sources;
 	}
 
 	private async prepareSources(job: CuratorJob, modelRef?: string): Promise<CuratorJob> {

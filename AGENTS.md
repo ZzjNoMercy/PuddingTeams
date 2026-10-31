@@ -11,6 +11,7 @@ Connector/Capability Extension 的本质是**给 pi 扩充连接其他 Agent 的
 - 会话记录格式与 harness 消费：`docs/2026-08-14-会话记录格式与Harness消费.md`——session JSONL 条目全集、`pudding:*` 自定义卡清单；新增 customType 或改落盘结构必须同步。
 - 提示词体系全景（pi 原生文件约定、append-only 注入、责任边界路由材料、各 worker 编辑入口）：`docs/2026-08-17-提示词体系完整介绍.md`——设计决策仍以 `docs/2026-08-11-PuddingTeams核心提示词管理方案.md` 为准。
 - 工具装配与暴露方式清单（Manager/Worker 各会话工具面、exposure 枚举、分级配置评估）：`docs/2026-10-15-工具装配与暴露清单及分级配置评估.md`——改工具装配或 exposure 必须同步。
+- 速记收件箱与整理：`docs/2026-10-27-速记收件箱与定期整理方案.md`——独立 sqlite 收件箱、memo lifecycle 与审核/发布显示投影分离、整理复用 curator/review/publisher；改 memo 状态机、接口或来源身份必须同步。
 
 ## 目录
 

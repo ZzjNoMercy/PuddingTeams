@@ -77,11 +77,21 @@ test("Worker整理链路（委派）：引用原话与图片，委派不能替�
 					targetBindingId: input.bindingId, status: "running", sources: (await sources.manifest(input.ownerId, input.sourceIds!)).sources } as CuratorJob;
 				return { job: currentJob, replayed: false };
 			};
+			curator.createGroup = async (groupInput) => {
+				const result = await curator.create({ ownerId: groupInput.ownerId, operationId: groupInput.operationId, bindingId: groupInput.bindingIds[0]!,
+					agentId: groupInput.agentId, task: groupInput.task, ...(groupInput.sourceText ? { sourceText: groupInput.sourceText } : {}),
+					...(groupInput.sourceIds ? { sourceIds: groupInput.sourceIds } : {}), ...(groupInput.origin ? { origin: groupInput.origin } : {}),
+					executionMode: groupInput.executionMode, groupId: groupInput.operationId, groupBindingIds: groupInput.bindingIds });
+				return { jobs: [result.job], replayed: [result.replayed] };
+			};
 			const fixture = curator as unknown as {
 				prepareSources(job: CuratorJob): Promise<CuratorJob>;
 				candidateContext(job: CuratorJob): Promise<unknown>;
 				assertAuthority(job: CuratorJob): Promise<void>;
+				materializeTask(job: CuratorJob): Promise<unknown>;
 			};
+			fixture.materializeTask = async job => ({ root: path.join(root, `task-${job.id}`), library: path.join(root, `task-${job.id}`, "library"),
+				sources: path.join(root, `task-${job.id}`, "sources"), pages: 0, allowedSourceIds: [], sourcesManifest: [] });
 			fixture.prepareSources = async job => { await fixture.assertAuthority(job); preparationCalls++; return job; };
 			fixture.assertAuthority = async () => { if (revoked) throw new Error("知识库授权已撤销"); };
 			fixture.candidateContext = async job => ({ sources: await Promise.all(job.sources.map(async source => ({ ...source,
@@ -207,11 +217,21 @@ test("Manager 直接整理（无知识管家委派）：原话冻结、候选提
 					targetBindingId: input.bindingId, status: "running", sources: (await sources.manifest(input.ownerId, input.sourceIds!)).sources } as CuratorJob;
 				return { job: currentJob, replayed: false };
 			};
+			curator.createGroup = async (groupInput) => {
+				const result = await curator.create({ ownerId: groupInput.ownerId, operationId: groupInput.operationId, bindingId: groupInput.bindingIds[0]!,
+					agentId: groupInput.agentId, task: groupInput.task, ...(groupInput.sourceText ? { sourceText: groupInput.sourceText } : {}),
+					...(groupInput.sourceIds ? { sourceIds: groupInput.sourceIds } : {}), ...(groupInput.origin ? { origin: groupInput.origin } : {}),
+					executionMode: groupInput.executionMode, groupId: groupInput.operationId, groupBindingIds: groupInput.bindingIds });
+				return { jobs: [result.job], replayed: [result.replayed] };
+			};
 			const fixture = curator as unknown as {
 				prepareSources(job: CuratorJob): Promise<CuratorJob>;
 				candidateContext(job: CuratorJob): Promise<unknown>;
 				assertAuthority(job: CuratorJob): Promise<void>;
+				materializeTask(job: CuratorJob): Promise<unknown>;
 			};
+			fixture.materializeTask = async job => ({ root: path.join(root, `task-${job.id}`), library: path.join(root, `task-${job.id}`, "library"),
+				sources: path.join(root, `task-${job.id}`, "sources"), pages: 0, allowedSourceIds: [], sourcesManifest: [] });
 			fixture.prepareSources = async job => { await fixture.assertAuthority(job); preparationCalls++; return job; };
 			fixture.assertAuthority = async () => { if (revoked) throw new Error("知识库授权已撤销"); };
 			fixture.candidateContext = async job => ({ sources: await Promise.all(job.sources.map(async source => ({ ...source,

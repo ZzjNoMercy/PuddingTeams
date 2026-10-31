@@ -884,6 +884,35 @@ export async function submitWikiReview(batchId: string, input: {
 	}));
 }
 
+export type KnowledgeAuditKind = "candidate.submitted" | "review.approved" | "review.rejected" | "review.returned" | "publication.settled";
+
+export interface KnowledgeAuditEventView {
+	seq: number;
+	id: string;
+	at: string;
+	kind: KnowledgeAuditKind;
+	actorKind: "user" | "agent" | "host";
+	actorId: string;
+	channel: "chat" | "review_page" | "host";
+	bindingId?: string;
+	batchId?: string;
+	jobId?: string;
+	sessionId?: string;
+	publicationId?: string;
+	decision?: "approve" | "reject" | "return";
+	manifestHash?: string;
+	reviewedFiles?: string[];
+	files?: Array<{ path: string; operation: string; candidateHash?: string | null; baselineHash?: string | null }>;
+	publication?: { state: string; fileCount: number; committedGroups: number };
+	summary: string;
+}
+
+export async function listKnowledgeAudit(input: { bindingId?: string; batchId?: string; jobId?: string; kind?: string; limit?: number; offset?: number } = {}): Promise<{ events: KnowledgeAuditEventView[]; total: number; limit: number; offset: number }> {
+	const query = new URLSearchParams();
+	for (const [key, value] of Object.entries(input)) if (value !== undefined) query.set(key, String(value));
+	return knowledgeResponse(await fetch(`${SERVER_URL}/api/knowledge/audit?${query.toString()}`));
+}
+
 export async function listWikiPublications(bindingId?: string): Promise<WikiPublicationSummary[]> {
 	const query = bindingId ? `?bindingId=${encodeURIComponent(bindingId)}` : "";
 	return (await knowledgeResponse<{ publications: WikiPublicationSummary[] }>(await fetch(`${SERVER_URL}/api/wiki/publications${query}`))).publications;

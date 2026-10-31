@@ -7,11 +7,19 @@ import type { KnowledgeObjectStore } from "./objects.js";
 import { imageDimensions, parseImageExtraction, type ImageExtractionArtifact } from "./image-extraction.js";
 
 export type KnowledgeSourceKind = "text" | "markdown" | "image" | "pdf";
+export interface MemoSourceOrigin {
+	id: string;
+	createdAt: string;
+	tags: string[];
+	revision: number;
+}
 export interface KnowledgeSourceOrigin {
 	sessionId?: string;
 	messageId?: string;
 	windowId?: string;
 	channel?: "user_input" | "agent_task";
+	/** 速记来源身份：参与 manifest hash，tags 顺序不影响身份。 */
+	memo?: MemoSourceOrigin;
 }
 
 export interface WebCaptureOrigin { itemId: string; versionId: string; originalUrl: string; canonicalUrl: string; fetchedUrl?: string; author: string; siteName: string; capturedAt: string; extractorVersion: string; contentHash: string; captureMethod?: "http" | "saved_html"; sourceFilename?: string }
@@ -49,6 +57,7 @@ export function knowledgeSourceManifestHash(sources: readonly KnowledgeSource[])
 		source.originalHash, source.textHash ?? null, source.status, source.locations, source.warnings,
 		source.origin?.sessionId ?? null, source.origin?.messageId ?? null, source.origin?.windowId ?? null,
 		source.origin?.channel ?? "user_input",
+		source.origin?.memo ? [source.origin.memo.id, source.origin.memo.createdAt, [...new Set(source.origin.memo.tags)].sort(), source.origin.memo.revision] : null,
 		source.derivedFrom ?? null, source.extraction ?? null, source.webCapture ?? null, source.assets ?? null,
 	]))).digest("hex");
 }
@@ -109,7 +118,23 @@ export class KnowledgeSourceStore {
 				clean[key] = value;
 			}
 		}
+		if (origin.memo !== undefined) clean.memo = this.cleanMemoOrigin(origin.memo);
 		return clean;
+	}
+
+	/** 速记来源不允许模型构造：只由宿主在 promote 时签发，字段全部有界。 */
+	private cleanMemoOrigin(memo: MemoSourceOrigin): MemoSourceOrigin {
+		if (!memo || typeof memo !== "object") throw new KnowledgeSourceError("invalid_input", "速记来源无效");
+		if (typeof memo.id !== "string" || !memo.id.trim() || memo.id.length > 200 || /[\u0000-\u001f\u007f]/.test(memo.id)) throw new KnowledgeSourceError("invalid_input", "速记来源无效");
+		if (typeof memo.createdAt !== "string" || !memo.createdAt.trim() || memo.createdAt.length > 60 || Number.isNaN(Date.parse(memo.createdAt))) throw new KnowledgeSourceError("invalid_input", "速记来源时间无效");
+		if (typeof memo.revision !== "number" || !Number.isSafeInteger(memo.revision) || memo.revision < 1) throw new KnowledgeSourceError("invalid_input", "速记来源版本无效");
+		if (!Array.isArray(memo.tags) || memo.tags.length > 16) throw new KnowledgeSourceError("invalid_input", "速记标签无效");
+		const tags: string[] = [];
+		for (const tag of memo.tags) {
+			if (typeof tag !== "string" || !tag.trim() || Array.from(tag).length > 32 || /[\u0000-\u001f\u007f]/.test(tag)) throw new KnowledgeSourceError("invalid_input", "速记标签无效");
+			if (!tags.includes(tag)) tags.push(tag);
+		}
+		return { id: memo.id, createdAt: memo.createdAt, tags: tags.sort((a, b) => a.localeCompare(b, "zh-CN")), revision: memo.revision };
 	}
 
 	private async freeze(ownerId: string, kind: KnowledgeSourceKind, title: string, mediaType: string, bytes: Buffer,
@@ -160,6 +185,39 @@ export class KnowledgeSourceStore {
 		const source = await this.freeze(ownerId, "text", `${origin?.channel === "agent_task" ? "Agent 任务请求：" : ""}${text.trim().split(/\r\n|\r|\n/)[0]!.slice(0, 120)}`,
 			"text/plain", Buffer.from(text, "utf8"), this.cleanOrigin(origin));
 		await this.save([source]);
+		return source;
+	}
+
+	/**
+	 * Trusted memo freeze with a deterministic id. A replayed operation must reuse the
+	 * exact same bytes and memo origin; refusing mismatches keeps source identity honest.
+	 */
+	async createMemoText(ownerId: string, input: { id: string; text: string; title: string; origin: KnowledgeSourceOrigin }): Promise<KnowledgeSource> {
+		this.checkOwner(ownerId);
+		if (typeof input.id !== "string" || !input.id.trim() || input.id.length > 200 || /[\u0000-\u001f\u007f]/.test(input.id)) throw new KnowledgeSourceError("invalid_input", "速记来源 ID 无效");
+		if (typeof input.text !== "string" || !input.text.trim() || Buffer.byteLength(input.text, "utf8") > TEXT_LIMIT || Buffer.from(input.text, "utf8").toString("utf8") !== input.text) {
+			throw new KnowledgeSourceError("invalid_input", "请输入非空文字，最大 8MB");
+		}
+		const origin = this.cleanOrigin(input.origin);
+		if (!origin?.memo) throw new KnowledgeSourceError("invalid_input", "速记来源必须携带 memo 身份");
+		const bytes = Buffer.from(input.text, "utf8");
+		const textHash = await this.objects.put(bytes);
+		const existing = await this.get(ownerId, input.id);
+		if (existing) {
+			if (existing.ownerId !== ownerId || existing.kind !== "text" || existing.textHash !== textHash.hash ||
+				existing.title !== input.title.slice(0, 200) ||
+				JSON.stringify(existing.origin ?? null) !== JSON.stringify(origin)) {
+				throw new KnowledgeSourceError("integrity_error", "同一来源 ID 已存在但内容不一致");
+			}
+			return existing;
+		}
+		const source = await this.freeze(ownerId, "text", input.title.slice(0, 200), "text/plain", bytes, origin);
+		source.id = input.id;
+		try { await this.save([source]); } catch (error) {
+			const winner = await this.get(ownerId, input.id);
+			if (winner && winner.textHash === textHash.hash && JSON.stringify(winner.origin ?? null) === JSON.stringify(origin)) return winner;
+			throw error;
+		}
 		return source;
 	}
 

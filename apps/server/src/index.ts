@@ -109,8 +109,14 @@ import { ReadLaterCaptureService } from "./read-later/capture-service.js";
 import { ReadLaterPromoter } from "./read-later/promote.js";
 import { withReadLater } from "./read-later/tool.js";
 import { registerReadLaterRoutes } from "./routes/read-later.js";
+import { MemoStore } from "./memo/store.js";
+import { MemoPromoter } from "./memo/promote.js";
+import { MemoProjection } from "./memo/projection.js";
+import { registerMemoRoutes } from "./routes/memos.js";
 import { WikiRevisionService } from "./knowledge/wiki/revision-service.js";
 import { KnowledgeHistoryStore } from "./knowledge/history-store.js";
+import { KnowledgeAuditStore } from "./knowledge/audit-store.js";
+import { createAgentPublisher } from "./knowledge/wiki/decide.js";
 
 // Electron 只需要该变量让自身二进制以 Node 模式启动 server。进入 server 后
 // 立即删除，避免 Connector/Worker 子进程继续继承 Electron 专用开关。
@@ -297,8 +303,10 @@ const interactionStatusHandler = (input: Parameters<typeof setInteractionStatus>
 calendarService.setInteractionStatusSync((args) => setInteractionStatus(interactionStatusDeps, args, { source: "calendar" }));
 knowledgeRuntime.setInteractionStatusHandler(interactionStatusHandler);
 const chatKnowledgeIntakes = new ChatKnowledgeIntake({ stateDir: paths.knowledgeState, sources: knowledgeSources });
+const knowledgeAudit = new KnowledgeAuditStore(path.join(paths.knowledgeState, "audit"));
 const wikiCurator = new WikiCuratorService({ jobs: curatorJobs, bindings: knowledgeRegistry, acceptance: knowledgeAcceptance,
 	objects: knowledgeObjects, reviews: reviewStore, runtime: knowledgeRuntime, teams, cacheDir: paths.knowledgeCache, sources: knowledgeSources,
+	audit: knowledgeAudit,
 	notify: async (job) => {
 		if (!job.origin || !await teams.contextForSession(job.origin.sessionId)) return;
 		await store.appendCustomMessageIfAbsent(job.origin.sessionId, `wiki-curator:${job.id}:${job.status}:${job.recoveryRevision ?? 0}`, {
@@ -309,6 +317,10 @@ const wikiCurator = new WikiCuratorService({ jobs: curatorJobs, bindings: knowle
 	} });
 knowledgeRuntime.setCurationStatusReader((ownerId, jobId) => wikiCurator.readStatus(ownerId, jobId));
 const wikiRevisions = new WikiRevisionService({ curator: wikiCurator, jobs: curatorJobs, reviews: reviewStore, bindings: knowledgeRegistry, objects: knowledgeObjects, publications: publishJournal });
+// 速记是独立收件箱：不写知识库文件，整理时才冻结来源并复用 curator/review/publisher。
+const memoStore = new MemoStore(path.join(paths.state, "memo"));
+const memoPromoter = new MemoPromoter({ store: memoStore, bindings: knowledgeRegistry, sources: knowledgeSources, curator: wikiCurator, jobs: curatorJobs });
+const memoProjection = new MemoProjection({ store: memoStore, jobs: curatorJobs, reviews: reviewStore, publications: publishJournal, revisions: wikiRevisions });
 // T40/T42/T44：发布操作日志 + Markdown 发布器（检索索引为派生缓存，提前构造供发布回写后重建）。
 const wikiPublisher = new MarkdownWikiPublisher({
 	bindings: knowledgeRegistry,
@@ -321,6 +333,9 @@ const wikiPublisher = new MarkdownWikiPublisher({
 	operationsDir: paths.knowledgeOperations,
 	assertSourceCurrent: batch => calendarService.assertPublicationCurrent(batch),
 });
+// 模型代批：同一 ReviewStore 门禁 + Publisher 重验，审计 actorKind=agent；
+// 用户仍可在审核页以 user 通道复核/退回。
+wikiCurator.setPublisher(createAgentPublisher({ reviews: reviewStore, publisher: wikiPublisher, publications: publishJournal, audit: knowledgeAudit }));
 const runtime: AgentRuntime = new AgentRuntime(
 	delegations,
 	interactionSecrets,
@@ -813,6 +828,7 @@ registerKnowledgeRoutes(app, knowledgeRegistry, {
 	selections: knowledgeSelections,
 	history: knowledgeHistory,
 	setInteractionStatus: interactionStatusHandler,
+	audit: knowledgeAudit,
 });
 // T30/T31 W1：知识库编译生产入口。取消复用 Runtime 的 Delegation 取消机制。
 registerWikiRoutes(app, {
@@ -838,14 +854,18 @@ registerWikiRoutes(app, {
 	publisher: wikiPublisher,
 	publications: publishJournal,
 	revisions: wikiRevisions,
+	audit: knowledgeAudit,
+	curatorJobs,
 });
 await knowledgeObservation.startAll(knowledgeRegistry, localViewerIdentity().user.id);
-registerWikiCuratorRoutes(app, { service: wikiCurator, jobs: curatorJobs, reviews: reviewStore, objects: knowledgeObjects, bindings: knowledgeRegistry, teams, revisions: wikiRevisions, publications: publishJournal });
+registerWikiCuratorRoutes(app, { service: wikiCurator, jobs: curatorJobs, reviews: reviewStore, objects: knowledgeObjects, bindings: knowledgeRegistry, teams, revisions: wikiRevisions, publications: publishJournal, audit: knowledgeAudit });
 registerReadLaterRoutes(app, { store: readLaterStore, capture: readLaterCapture, promoter: readLaterPromoter });
+registerMemoRoutes(app, { store: memoStore, promoter: memoPromoter, projection: memoProjection });
 app.addHook("onClose", async () => { await readLaterCapture.close(); });
 readLaterCapture.start();
 await wikiCurator.recover();
 await wikiRevisions.recover();
+await memoPromoter.recover();
 const conversationSnapshots = new ConversationSnapshots(path.join(paths.state, "conversation-snapshots"));
 const sessionForks = new SessionForks(teams, store, invoker, conversationSnapshots, new ForkOperations(path.join(paths.state,"fork-operations.json")), [paths.uploads,path.join(paths.state,"large-worker-results"),conversationSnapshots.root]);
 await sessionForks.recover();

@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { createHash } from "node:crypto";
 import { localViewerIdentity } from "./identity.js";
 import type { CuratorJob, CuratorJobStore, WikiCuratorService } from "../knowledge/curator-jobs.js";
 import { curatorJobFeedback } from "../knowledge/curator-jobs.js";
@@ -10,6 +11,7 @@ import type { TeamsStore } from "../store/teams.js";
 import type { UploadInput } from "../store/uploads.js";
 import type { PublishJournal, StoredPublishOperation } from "../knowledge/wiki/publish-journal.js";
 import type { WikiRevisionService } from "../knowledge/wiki/revision-service.js";
+import type { KnowledgeAuditStore } from "../knowledge/audit-store.js";
 
 function presentJob(job: CuratorJob, review?: StoredReviewBatch, bindingName?: string, publication?: StoredPublishOperation) {
 	return { ...curatorTaskView(job, review, bindingName, publication), id: job.id, operationId: job.operationId, targetBindingId: job.targetBindingId, agentId: job.agentId,
@@ -23,6 +25,7 @@ export function registerWikiCuratorRoutes(app: FastifyInstance, deps: {
 	objects: KnowledgeObjectStore; bindings: KnowledgeBindingRegistry;
 	teams: TeamsStore;
 	revisions?: WikiRevisionService; publications?: Pick<PublishJournal, "list">;
+	audit?: Pick<KnowledgeAuditStore, "append">;
 }) {
 	const owner = () => localViewerIdentity().user.id;
 	const visible = async (bindingId: string) => (await deps.bindings.list(owner())).some((binding) => binding.id === bindingId);
@@ -31,15 +34,48 @@ export function registerWikiCuratorRoutes(app: FastifyInstance, deps: {
 		if (!record || record.ownerId !== job.ownerId || record.batch.bindingId !== job.targetBindingId) return undefined;
 		return record.status === "returned" && deps.revisions ? { ...record, returnRequest: await deps.revisions.followup(record) } : record;
 	};
-	app.post<{ Params: { id: string }; Body: { operationId?: string; manifestHash?: string; feedback?: string; reviewedFiles?: string[] } }>("/api/wiki/batches/:id/revisions", async (req, reply) => {
+	app.post<{ Params: { id: string }; Body: { operationId?: string; manifestHash?: string; feedback?: string; reviewedFiles?: string[]; origin?: { sessionId?: string; windowId?: string } } }>("/api/wiki/batches/:id/revisions", async (req, reply) => {
 		const record = await deps.reviews.get(req.params.id), body = req.body;
 		if (!record || record.ownerId !== owner() || !await visible(record.batch.bindingId)) return reply.code(404).send({ error: "审核批次不存在" });
 		if (!deps.revisions) return reply.code(422).send({ error: "退回修改能力尚未装配" });
 		if (!body || typeof body.operationId !== "string" || typeof body.manifestHash !== "string" || typeof body.feedback !== "string" || !Array.isArray(body.reviewedFiles)) return reply.code(400).send({ error: "退回修改参数无效" });
+		let originRef: { sessionId: string; windowId?: string; jobId: string } | undefined;
+		if (body.origin !== undefined) {
+			const origin = body.origin;
+			if (!origin || typeof origin !== "object" ||
+				(origin.sessionId !== undefined && (typeof origin.sessionId !== "string" || !origin.sessionId.trim() || origin.sessionId.length > 200)) ||
+				(origin.windowId !== undefined && (typeof origin.windowId !== "string" || !origin.windowId.trim() || origin.windowId.length > 200)))
+				return reply.code(400).send({ error: "origin 参数无效" });
+			if (origin.sessionId) {
+				let receipt: { jobId?: string } = {};
+				try { receipt = JSON.parse(record.batch.validationReceipt) as { jobId?: string }; } catch { /* Non-curator receipt. */ }
+				const job = receipt.jobId ? await deps.jobs.get(receipt.jobId) : undefined;
+				if (!job || job.ownerId !== owner() || job.candidateBatchId !== record.batch.id || job.origin?.sessionId !== origin.sessionId)
+					return reply.code(400).send({ error: "会话来源与该候选批次不一致" });
+				originRef = { sessionId: origin.sessionId, ...(job.origin.windowId ? { windowId: job.origin.windowId } : {}), jobId: job.id };
+			}
+		}
 		try {
 			const result = await deps.revisions.request({ batchId: record.batch.id, actorId: owner(), operationId: body.operationId,
 				manifestHash: body.manifestHash, feedback: body.feedback, reviewedFiles: body.reviewedFiles });
-			return reply.code(202).send({ job: presentJob(result.job), replayed: result.replayed });
+			let auditWarning: string | undefined;
+			if (deps.audit) {
+				try {
+					await deps.audit.append({
+						dedupeKey: `knowledge:return:${record.batch.id}:${body.operationId}`,
+						kind: "review.returned", ownerId: owner(), actorId: owner(), actorKind: "user",
+						channel: originRef ? "chat" : "review_page",
+						bindingId: record.batch.bindingId, batchId: record.batch.id, jobId: originRef?.jobId,
+						manifestHash: record.batch.manifestHash, decision: "return", reviewedFiles: body.reviewedFiles,
+						...(originRef ? { sessionId: originRef.sessionId, ...(originRef.windowId ? { windowId: originRef.windowId } : {}) } : {}),
+						files: record.batch.files.map((file) => ({ path: file.targetPath, operation: file.operation,
+							candidateHash: file.candidateHash ?? null, baselineHash: file.expectedHashOrAbsent ?? null })),
+						summary: `退回修订：${record.batch.files.length} 项候选`,
+						details: { newJobId: result.job.id, feedbackLength: body.feedback.length, feedbackHash: createHash("sha256").update(body.feedback).digest("hex") },
+					});
+				} catch { auditWarning = "退回已受理，但审计写入失败"; }
+			}
+			return reply.code(202).send({ job: presentJob(result.job), replayed: result.replayed, ...(auditWarning ? { auditWarning } : {}) });
 		} catch (error) { return reply.code((error as { code?: string }).code === "invalid_input" ? 400 : 409).send({ error: error instanceof Error ? error.message : "退回修改失败" }); }
 	});
 	app.post<{ Body: { operationId?: string; bindingId?: string; agentId?: string; task?: string; material?: string; uploads?: UploadInput[] } }>("/api/wiki/curator-jobs", { bodyLimit: 30 * 1024 * 1024 }, async (req, reply) => {

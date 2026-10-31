@@ -7,7 +7,7 @@ import { hashBufferSha256 } from "../hashing.js";
 import type { KnowledgeObjectStore } from "../objects.js";
 import { checkedKnowledgeRoot, readNoteBytes, withinKnowledgeRoot, type KnowledgeObservationService } from "../observation.js";
 import type { KnowledgeSearchIndex } from "../search-index.js";
-import type { WikiPublisher } from "../../routes/wiki.js";
+import type { WikiPublisher } from "../contracts.js";
 import type { ReviewStore } from "./review-store.js";
 import { PublishJournal, type PublishFileRecord, type StoredPublishOperation } from "./publish-journal.js";
 import { publicationContextChanges } from "./publication-context.js";

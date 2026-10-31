@@ -58,11 +58,12 @@ async function completed(jobs: CuratorJobStore, id: string): Promise<CuratorJob>
 	throw new Error("job did not settle");
 }
 
-test("聊天Wiki由当前Worker提交候选；准备重放不新增任务，后台生成器零调用，仍须人审发布", async () => {
+test("聊天Wiki由当前Worker提交候选；准备重放不新增任务，后台生成器零调用，代批前留一轮机会", async () => {
 	let generated = 0;
 	const notices: string[] = [];
 	const f = await fixture(async () => { generated++; }, undefined, "owner", async job => { notices.push(job.status); });
 	const scope = { ownerId: "owner", windowId: "window", sessionId: "worker-chat", contextKey: "worker-chat" };
+	f.service.setPublisher(async () => { throw new Error("此测试只验证代批轮次，不实际发布"); });
 	const worker = f.service.workerSurface(await f.runtime.mount(scope, [f.binding.id]), { ...scope, operationId: "chat-op", sourceText: "冻结用户事实" }, "wiki");
 	try {
 		assert(!worker.tools.some(tool => tool.name === "knowledge_request_curation"));
@@ -86,6 +87,8 @@ test("聊天Wiki由当前Worker提交候选；准备重放不新增任务，后�
 		const outcome = await submit.execute("submit-current", { bindingId: f.binding.id, pages: [{ path: "fact.md", content, reason: "采纳用户事实" }] }, undefined, undefined, {} as never);
 		const receipt = JSON.parse((outcome.content[0] as { text: string }).text);
 		assert.equal(receipt.status, "pending_review"); assert.ok(receipt.reviewUrl);
+		// 提交后留一轮给同一 Agent 调 knowledge_publish_candidate；不发布则下一轮停。
+		assert.equal(await worker.workerExecution!.shouldStop(), false);
 		assert.equal(await worker.workerExecution!.shouldStop(), true);
 		assert.equal((await worker.workerExecution!.finish("worker_no_submission"))?.status, "completed");
 		assert.deepEqual(notices, ["running", "pending_review"]);
@@ -94,6 +97,117 @@ test("聊天Wiki由当前Worker提交候选；准备重放不新增任务，后�
 		const approved = await f.reviews.decide({ batchId: batch.id, operationId: "human", actorId: "owner", decision: "approve", manifestHash: batch.manifestHash, reviewedFiles: batch.files.map(file => file.targetPath) });
 		await f.publisher.onApproved(batch, approved.decision);
 		assert.equal(await readFile(path.join(f.vault, "fact.md"), "utf8"), content);
+	} finally { await worker.workerExecution!.finish("cancelled"); await rm(f.root, { recursive: true, force: true }); }
+});
+
+test("模型代批工具：只批准本会话候选，返回 Publisher 回执并记录 agent 通道", async () => {
+	const f = await fixture();
+	const scope = { ownerId: "owner", windowId: "window", sessionId: "agent-publish", contextKey: "agent-publish" };
+	const worker = f.service.workerSurface(await f.runtime.mount(scope, [f.binding.id]), { ...scope, operationId: "agent-publish", sourceText: "冻结事实" }, "wiki");
+	const approved: Array<{ id: string; reason?: string }> = [];
+	f.service.setPublisher(async (job, reason) => {
+		approved.push({ id: job.id, ...(reason ? { reason } : {}) });
+		const record = (await f.reviews.get(job.candidateBatchId!))!;
+		return { record: { ...record, status: "published" } as never, decision: { id: "decision-stub", batchId: record.batch.id } as never,
+			replayed: false, publish: { accepted: true } };
+	});
+	try {
+		const publish = worker.tools.find(tool => tool.name === "knowledge_publish_candidate")!;
+		await assert.rejects(publish.execute("publish-early", { batchId: "missing" }, undefined, undefined, {} as never), /不属于当前会话/);
+		const prepared = await worker.tools.find(tool => tool.name === "knowledge_prepare_candidate")!
+			.execute("prepare", { bindingId: f.binding.id, task: "整理事实" }, undefined, undefined, {} as never);
+		const context = JSON.parse((prepared.content[0] as { text: string }).text);
+		const content = `---\nsources: [${context.context.sources[0].id}]\n---\n# 事实\n冻结事实\n`;
+		const submitted = await worker.tools.find(tool => tool.name === "knowledge_submit_candidate")!
+			.execute("submit", { bindingId: f.binding.id, pages: [{ path: "fact.md", content, reason: "采纳事实" }] }, undefined, undefined, {} as never);
+		const batchId = (submitted.details as { batchId?: string }).batchId!;
+		assert.ok(batchId);
+		const result = await publish.execute("publish", { batchId, reason: "来源已核对" }, undefined, undefined, {} as never);
+		const payload = JSON.parse((result.content[0] as { text: string }).text);
+		assert.equal(payload.publish.accepted, true);
+		assert.equal(payload.status, "published");
+		assert.match(payload.message, /已按固定候选发布/);
+		assert.deepEqual(approved, [{ id: payload.jobId, reason: "来源已核对" }]);
+	} finally { await worker.workerExecution!.finish("cancelled"); await rm(f.root, { recursive: true, force: true }); }
+});
+
+test("file as API：任务目录写候选、薄提交扫描并冻结，提交后封存且不能越界", async () => {
+	const f = await fixture();
+	const scope = { ownerId: "owner", windowId: "window", sessionId: "file-task", contextKey: "file-task" };
+	const worker = f.service.workerSurface(await f.runtime.mount(scope, [f.binding.id]), { ...scope, operationId: "file-task", sourceText: "冻结事实" }, "wiki");
+	try {
+		const prepared = await worker.tools.find(tool => tool.name === "knowledge_prepare_candidate")!
+			.execute("prepare", { bindingId: f.binding.id, task: "整理事实" }, undefined, undefined, {} as never);
+		const payload = JSON.parse((prepared.content[0] as { text: string }).text);
+		const target = payload.task.targets.find((entry: { bindingId: string }) => entry.bindingId === f.binding.id);
+		assert.ok(target.library.startsWith(payload.task.root));
+		assert.equal(path.dirname(target.library), path.join(payload.task.root, "targets", f.binding.id));
+		assert.deepEqual(payload.task.allowedSourceIds, [payload.context.sources[0].id]);
+		assert.equal(payload.task.sourcesManifest[0].file, `sources/${payload.context.sources[0].id}.md`);
+		assert.equal(await readFile(path.join(payload.task.sources, `${payload.context.sources[0].id}.md`), "utf8"), "冻结事实");
+		const write = worker.tools.find(tool => tool.name === "knowledge_task_write")!;
+		const read = worker.tools.find(tool => tool.name === "knowledge_task_read")!;
+		const submit = worker.tools.find(tool => tool.name === "knowledge_submit_candidate")!;
+		const sourceId = payload.context.sources[0].id as string;
+		const content = `---\nsources: [${sourceId}]\n---\n# 文件候选\n冻结事实\n`;
+		// 越界与只读区拒绝
+		await assert.rejects(write.execute("escape", { path: "../outside.md", content }, undefined, undefined, {} as never), /越出|无效/);
+		await assert.rejects(write.execute("ro", { path: "AGENTS.md", content }, undefined, undefined, {} as never), /只能写|只读/);
+		await assert.rejects(read.execute("host", { path: ".host/reads.jsonl" }, undefined, undefined, {} as never), /无效|宿主/);
+		const written = await write.execute("write", { path: "library/fact.md", content }, undefined, undefined, {} as never);
+		assert.equal(JSON.parse((written.content[0] as { text: string }).text).path, "library/fact.md");
+		assert.equal((await read.execute("read", { path: "library/fact.md" }, undefined, undefined, {} as never)).content[0]!.type, "text");
+		const submitted = await submit.execute("submit", { summary: "按 AGENTS.md 整理" }, undefined, undefined, {} as never);
+		const receipt = JSON.parse((submitted.content[0] as { text: string }).text);
+		assert.equal(receipt.results[0].status, "pending_review");
+		const job = (await f.jobs.get(payload.jobId))!;
+		const batch = (await f.reviews.get(job.candidateBatchId!))!;
+		const file = batch.batch.files.find(entry => entry.targetPath === "fact.md")!;
+		assert.equal((await f.objects.get(file.candidateHash!)).toString("utf8"), content);
+		// 提交后封存：继续改必须开新任务
+		await assert.rejects(write.execute("late", { path: "library/fact.md", content: `${content}晚到` }, undefined, undefined, {} as never), /已提交/);
+	} finally { await worker.workerExecution!.finish("cancelled"); await rm(f.root, { recursive: true, force: true }); }
+});
+
+test("多库任务组：默认处理全部挂载库，逐库提交批次并逐库批准发布", async () => {
+	const f = await fixture();
+	const secondRoot = path.join(f.root, "vault2"); await mkdir(secondRoot);
+	const second = await f.bindings.create({ ownerId: "owner", rootPath: secondRoot, name: "Second", description: "Second vault" });
+	const published: string[] = [];
+	f.service.setPublisher(async job => {
+		const record = (await f.reviews.get(job.candidateBatchId!))!;
+		published.push(job.targetBindingId);
+		return { record: { ...record, status: "published" } as never, decision: { id: `decision-${job.id}`, batchId: record.batch.id } as never,
+			replayed: false, publish: { accepted: true } };
+	});
+	const scope = { ownerId: "owner", windowId: "window", sessionId: "multi", contextKey: "multi" };
+	const worker = f.service.workerSurface(await f.runtime.mount(scope, [f.binding.id, second.id]), { ...scope, operationId: "multi", sourceText: "多库共享事实" }, "wiki");
+	try {
+		const prepared = await worker.tools.find(tool => tool.name === "knowledge_prepare_candidate")!
+			.execute("prepare", { bindingId: f.binding.id, task: "同时整理两个库" }, undefined, undefined, {} as never);
+		const payload = JSON.parse((prepared.content[0] as { text: string }).text);
+		assert.equal(payload.targets.length, 2);
+		assert.deepEqual(payload.targets.map((entry: { bindingId: string }) => entry.bindingId).sort(), [f.binding.id, second.id].sort());
+		assert.equal(payload.task.targets.length, 2);
+		const sourceId = payload.task.sourcesManifest[0].id as string;
+		const write = worker.tools.find(tool => tool.name === "knowledge_task_write")!;
+		for (const bindingId of [f.binding.id, second.id]) {
+			const content = `---\nsources: [${sourceId}]\n---\n# 多库事实\n共享事实\n`;
+			await write.execute("write", { bindingId, path: "library/fact.md", content }, undefined, undefined, {} as never);
+		}
+		const submitted = await worker.tools.find(tool => tool.name === "knowledge_submit_candidate")!
+			.execute("submit", {}, undefined, undefined, {} as never);
+		const receipt = JSON.parse((submitted.content[0] as { text: string }).text);
+		assert.equal(receipt.results.length, 2);
+		assert.deepEqual(receipt.results.map((entry: { status: string }) => entry.status), ["pending_review", "pending_review"]);
+		const batches = await Promise.all(receipt.results.map((entry: { batchId: string }) => f.reviews.get(entry.batchId)));
+		assert.deepEqual(batches.map(batch => batch!.batch.bindingId).sort(), [f.binding.id, second.id].sort());
+		const pubs = await worker.tools.find(tool => tool.name === "knowledge_publish_task")!
+			.execute("publish", { reason: "两个库都已核对" }, undefined, undefined, {} as never);
+		const outcome = JSON.parse((pubs.content[0] as { text: string }).text);
+		assert.equal(outcome.results.length, 2);
+		assert.deepEqual(outcome.results.map((entry: { status: string }) => entry.status), ["published", "published"]);
+		assert.deepEqual(published.sort(), [f.binding.id, second.id].sort());
 	} finally { await worker.workerExecution!.finish("cancelled"); await rm(f.root, { recursive: true, force: true }); }
 });
 

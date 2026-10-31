@@ -102,8 +102,16 @@ async function knowledgeGroup(deps: ToolPreviewDeps, role: AgentToolPreview["rol
 				direct("knowledge_curation_status"),
 				direct("knowledge_update_interaction_status"),
 				...KNOWLEDGE_READ_TOOLS.map((name) => ({ name, exposure: "deferred" as const })),
+				{ name: "knowledge_task_ls", exposure: "deferred" },
+				{ name: "knowledge_task_read", exposure: "deferred" },
+				{ name: "knowledge_task_write", exposure: "deferred" },
+				{ name: "knowledge_task_edit", exposure: "deferred" },
+				{ name: "knowledge_task_grep", exposure: "deferred" },
+				{ name: "knowledge_task_find", exposure: "deferred" },
 				{ name: "knowledge_prepare_candidate", exposure: "deferred" },
 				{ name: "knowledge_submit_candidate", exposure: "deferred" },
+				{ name: "knowledge_publish_candidate", exposure: "deferred" },
+				{ name: "knowledge_publish_task", exposure: "deferred" },
 			],
 		};
 	}
@@ -114,8 +122,16 @@ async function knowledgeGroup(deps: ToolPreviewDeps, role: AgentToolPreview["rol
 			tools: [
 				...KNOWLEDGE_READ_TOOLS.map((name) => direct(name)),
 				direct("knowledge_update_interaction_status"),
+				direct("knowledge_task_ls"),
+				direct("knowledge_task_read"),
+				direct("knowledge_task_write"),
+				direct("knowledge_task_edit"),
+				direct("knowledge_task_grep"),
+				direct("knowledge_task_find"),
 				direct("knowledge_prepare_candidate"),
 				direct("knowledge_submit_candidate"),
+				direct("knowledge_publish_candidate"),
+				direct("knowledge_publish_task"),
 				direct("knowledge_curation_status"),
 			],
 		};

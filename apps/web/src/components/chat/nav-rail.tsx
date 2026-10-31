@@ -12,6 +12,7 @@ import {
 	InfoIcon,
 	MessageSquareIcon,
 	LayoutDashboardIcon,
+	NotebookPenIcon,
 	BookOpenIcon,
 	BookmarkIcon,
 	CalendarDaysIcon,
@@ -41,13 +42,14 @@ import { useTheme } from "@/components/theme-provider";
 import type { ViewerIdentity } from "@/lib/types";
 import { readingRequest, type ReadingList } from "@/lib/read-later";
 import { useWikiReviewQueue } from "@/lib/wiki-review-queue";
+import { useMemoInboxCount } from "@/lib/memo-inbox-count";
 
 const GITHUB_URL = "https://github.com/ZzjNoMercy/PuddingTeams";
 const ISSUE_URL = "https://github.com/ZzjNoMercy/PuddingTeams/issues/new";
 const navListeners = new Set<() => void>();
 const subscribeNav = (listener: () => void) => { navListeners.add(listener); return () => { navListeners.delete(listener); }; };
 const navExpanded = () => document.documentElement.dataset.nav === "expanded";
-export type AppView = "workbench" | "chat" | "agents" | "extensions" | "settings" | "knowledge" | "review" | "calendar" | "contacts" | "read-later";
+export type AppView = "workbench" | "chat" | "agents" | "extensions" | "settings" | "knowledge" | "review" | "calendar" | "contacts" | "read-later" | "memos";
 
 function initialsOf(name: string): string {
 	const parts = name.trim().split(/\s+/).filter(Boolean);
@@ -67,8 +69,10 @@ export function NavRail({ view, returnSessionId }: { view: AppView; returnSessio
 	const [identityRetry, setIdentityRetry] = useState(0);
 	const [readLaterUnread, setReadLaterUnread] = useState<number | null>(null);
 	const { pendingCount: pendingReviews } = useWikiReviewQueue();
+	const memoCount = useMemoInboxCount();
 	const reviewCountId = useId();
 	const readLaterCountId = useId();
+	const memoCountId = useId();
 	useEffect(() => {
 		let active = true;
 		const refresh = () => { void readingRequest<ReadingList>("?limit=1").then(data => { if (active) setReadLaterUnread(data.counts.unread ?? 0); }).catch(() => { if (active) setReadLaterUnread(null); }); };
@@ -154,6 +158,11 @@ export function NavRail({ view, returnSessionId }: { view: AppView; returnSessio
 				<BookOpenIcon className="size-4 shrink-0" />
 				<span className="nav-label">知识库</span>
 				{pendingReviews !== null && pendingReviews > 0 ? <span id={reviewCountId} className="nav-item-count" aria-label={`${pendingReviews} 项待审核`}>{pendingReviews > 99 ? "99+" : pendingReviews}</span> : null}
+			</Link>
+			<Link href="/memos" title={memoCount ? `速记 · ${memoCount} 条未整理` : "速记"} aria-label="速记" aria-describedby={memoCount ? memoCountId : undefined} aria-current={view === "memos" ? "page" : undefined} className={cn("mt-1", itemClass())}>
+				<NotebookPenIcon className="size-4 shrink-0" />
+				<span className="nav-label">速记</span>
+				{memoCount !== null && memoCount > 0 ? <span id={memoCountId} className="nav-item-count" aria-label={`${memoCount} 条未整理`}>{memoCount > 99 ? "99+" : memoCount}</span> : null}
 			</Link>
 			<Link href="/read-later" title="稍后读" aria-label="稍后读" aria-describedby={readLaterUnread ? readLaterCountId : undefined} aria-current={view === "read-later" ? "page" : undefined} className={cn("mt-1", itemClass())}>
 				<BookmarkIcon className="size-4 shrink-0" />

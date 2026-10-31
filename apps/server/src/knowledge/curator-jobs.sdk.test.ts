@@ -25,6 +25,7 @@ import type { AgentEvent } from "../agent-runtime/types.js";
 const schema = { formatVersion: 1, schemaId: "sdk-fixture", revision: 1, name: "SDK schema", description: "固定结构",
 	entities: [{ type: "fact", directory: "facts", fields: [{ name: "type", type: "text", required: true },
 		{ name: "title", type: "text", required: true }, { name: "sources", type: "text_list", required: true }] }], relations: [] };
+// 后台执行默认不代批：保持人审入口，publish 只出现在会话内 Worker 工具面。
 const expectedTools = ["knowledge_context", "knowledge_search", "knowledge_glob", "knowledge_read", "knowledge_links", "knowledge_submit_candidate"].sort();
 interface RequestBody {
 	tools?: Array<{ function?: { name?: string } }>;

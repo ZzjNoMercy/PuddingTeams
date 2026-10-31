@@ -24,6 +24,10 @@ import { assertConflictResolution, conflictResolutionBlock } from "../knowledge/
 import { withKnowledgeMutation } from "../knowledge/mutation-lock.js";
 import { localViewerIdentity } from "./identity.js";
 import { assertImageAssetBytes, assertImageBatchIntegrity } from "../knowledge/image-publication.js";
+import { KnowledgeAuditError, type KnowledgeAuditStore } from "../knowledge/audit-store.js";
+import type { CuratorJobStore } from "../knowledge/curator-jobs.js";
+import { decideAndPublish } from "../knowledge/wiki/decide.js";
+import type { WikiPublisher } from "../knowledge/contracts.js";
 
 export const COMPILER_REF = "@puddingteams/connector-codex";
 
@@ -47,18 +51,17 @@ export interface WikiRouteDeps {
 	publisher?: WikiPublisher;
 	/** 发布操作日志（T42）：publications 查询路由的事实源。 */
 	publications: PublishJournal;
+	/** 统一审计账本；缺省时审核仍可进行，只是没有对话/审核通道证据链。 */
+	audit?: Pick<KnowledgeAuditStore, "append">;
+	/** 会话内确认的归属校验：审计通道必须能对上产生该批次的整理任务。 */
+	curatorJobs?: Pick<CuratorJobStore, "get">;
 }
 
 /**
- * 发布挂载点接口形状（W3 对接用）：批次与审核决定均已持久化，状态机已进入
- * approved；实现方负责 approved → publishing → published/partial/conflict 的
- * 后续推进。返回 accepted=false 时批次保持 approved 且 publishRequestedAt 不登记，
- * 供后续对账重试。
+ * 发布挂载点：批次与审核决定均已持久化（审核页或模型代批），状态机已进入
+ * approved；实现方负责 approved → publishing → published/partial/conflict。
+ * 返回 accepted=false 时批次保持 approved 且 publishRequestedAt 不登记，供对账重试。
  */
-export interface WikiPublisher {
-	onApproved(batch: PublicationBatch, review: ReviewDecision): Promise<{ accepted: boolean; note?: string }>;
-}
-
 const defaultWikiPublisher: WikiPublisher = {
 	onApproved: async () => ({ accepted: true, note: "发布链路（W3）未接入，批次保持 approved 待发布" }),
 };
@@ -138,6 +141,8 @@ interface ReviewRequestBody {
 	decision?: string;
 	manifestHash?: string;
 	reviewedFiles?: string[];
+	/** 会话内确认时由客户端声明来源；必须与该批次的整理任务来源一致，只影响审计通道。 */
+	origin?: { sessionId?: string; windowId?: string; jobId?: string };
 }
 
 function presentBatch(record: StoredReviewBatch) {
@@ -462,16 +467,28 @@ export function registerWikiRoutes(app: FastifyInstance, deps: WikiRouteDeps): v
 			await syncCandidateBatches(deps, ownerId());
 			const existing = await deps.reviews.get(req.params.id);
 			if (!existing || existing.ownerId !== ownerId() || !(await deps.bindings.list(ownerId())).some((binding) => binding.id === existing.batch.bindingId)) throw new WikiRouteError("not_found", "批次不存在");
+			const origin = body.origin;
+			if (origin !== undefined && (!origin || typeof origin !== "object" ||
+				(origin.sessionId !== undefined && (typeof origin.sessionId !== "string" || !origin.sessionId.trim() || origin.sessionId.length > 200)) ||
+				(origin.windowId !== undefined && (typeof origin.windowId !== "string" || !origin.windowId.trim() || origin.windowId.length > 200)) ||
+				(origin.jobId !== undefined && (typeof origin.jobId !== "string" || !origin.jobId.trim() || origin.jobId.length > 200)))) {
+				throw new WikiRouteError("invalid_input", "origin 参数无效");
+			}
+			let originRef: { sessionId: string; windowId?: string; jobId: string } | undefined;
+			if (origin?.sessionId) {
+				const job = origin.jobId ? await deps.curatorJobs?.get(origin.jobId) : undefined;
+				if (!job || job.ownerId !== ownerId() || job.candidateBatchId !== existing.batch.id || job.origin?.sessionId !== origin.sessionId)
+					throw new WikiRouteError("invalid_input", "会话来源与该候选批次不一致");
+				originRef = { sessionId: origin.sessionId, ...(job.origin.windowId ? { windowId: job.origin.windowId } : {}), jobId: job.id };
+			}
 			let outcome;
 			try {
-				outcome = await deps.reviews.decide({
-					batchId: req.params.id,
-					operationId: body.operationId?.trim() || randomUUID(),
-					actorId: ownerId(),
-					decision,
-					manifestHash: body.manifestHash!,
-					reviewedFiles,
-				});
+				outcome = await decideAndPublish(
+					{ reviews: deps.reviews, publisher: deps.publisher ?? defaultWikiPublisher, publications: deps.publications, audit: deps.audit },
+					{ batchId: existing.batch.id, manifestHash: body.manifestHash!, decision, reviewedFiles,
+						operationId: body.operationId?.trim() || randomUUID(),
+						actor: { id: ownerId(), kind: "user" }, channel: originRef ? "chat" : "review_page",
+						...(originRef ? { sessionId: originRef.sessionId, ...(originRef.windowId ? { windowId: originRef.windowId } : {}), jobId: originRef.jobId } : {}) });
 			} catch (error) {
 				if (error instanceof ReviewStoreError && error.code === "expired") {
 					throw new WikiRouteError("expired", "审核窗口已超期（24 小时），批次已转入 conflict，请重新编译后再审");
@@ -480,22 +497,12 @@ export function registerWikiRoutes(app: FastifyInstance, deps: WikiRouteDeps): v
 				if (error instanceof ReviewStoreError && (error.code === "conflict" || error.code === "invalid_input")) {
 					throw new WikiRouteError("state_conflict", "审核与当前批次不一致（批次已变化、已有审核决定或文件覆盖不完整），请刷新后重试");
 				}
+				// 审计写入失败：审核已落账，提示用同一操作重试。
+				if (error instanceof KnowledgeAuditError) throw new WikiRouteError("state_conflict", "审核已记录，但审计写入失败；请用同一操作重试");
 				throw error;
 			}
-			let publish: { accepted: boolean; note?: string } | undefined;
-			let record = outcome.record;
-			if (outcome.decision.decision === "approve" && record.status === "approved" && record.decisionId === outcome.decision.id) {
-				publish = await (deps.publisher ?? defaultWikiPublisher).onApproved(record.batch, outcome.decision)
-					.catch(() => ({ accepted: false, note: "发布挂载点调用失败，批次保持 approved 待发布" }));
-				if (publish.accepted) {
-					// 真 publisher 可能已同步推进到 publishing/published 等终态；
-					// 只有仍在 approved 时才由路由补登记 publishRequestedAt。
-					const current = await deps.reviews.get(record.batch.id);
-					if (current && current.status === "approved") record = await deps.reviews.markPublishRequested(record.batch.id);
-					else if (current) record = current;
-				}
-			}
-			return { ...presentBatch(record), batch: record.batch, decision: outcome.decision, replayed: outcome.replayed, ...(publish ? { publish } : {}) };
+			return { ...presentBatch(outcome.record), batch: outcome.record.batch, decision: outcome.decision, replayed: outcome.replayed,
+				...(outcome.publish ? { publish: outcome.publish } : {}), ...(outcome.auditWarning ? { auditWarning: outcome.auditWarning } : {}) };
 		} catch (error) {
 			return sendWikiError(reply, error);
 		}

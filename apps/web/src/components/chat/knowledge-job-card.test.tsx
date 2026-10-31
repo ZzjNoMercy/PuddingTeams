@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { KnowledgeJobCard } from "./knowledge-job-card";
+import { KnowledgeDeliverySummary, KnowledgeJobCard } from "./knowledge-job-card";
 
 test("聊天中的历史通用失败卡按结构化错误码直接显示超时和重试入口", () => {
 	const html = renderToStaticMarkup(createElement(KnowledgeJobCard, {
@@ -40,4 +40,23 @@ test("聊天 Worker 失败仅引导查看任务，不误导启动后台重试", 
 	}));
 	assert.match(timeout, /返回来源聊天继续/);
 	assert.doesNotMatch(timeout, /重试/);
+});
+
+test("已发布候选在会话卡中展示真实批次状态、文件清单与审计入口", () => {
+	const html = renderToStaticMarkup(createElement(KnowledgeDeliverySummary, {
+		batch: {
+			id: "batch-1", bindingId: "vault-1", status: "published", revision: 1,
+			manifestHash: "a".repeat(64), fileCount: 2, enteredReviewAt: "2026-10-20T00:00:00.000Z",
+			reviewDeadline: "2026-10-21T00:00:00.000Z", createdAt: "2026-10-20T00:00:00.000Z", updatedAt: "2026-10-20T00:00:00.000Z",
+			batch: { files: [
+				{ targetPath: "notes/a.md", operation: "create" },
+				{ targetPath: "notes/b.md", operation: "update" },
+			] },
+		} as never,
+	}));
+	assert.match(html, /已入库/);
+	assert.match(html, /2 项文件/);
+	assert.match(html, /notes\/a\.md/);
+	assert.match(html, /href="\/knowledge\/review\?batch=batch-1"/);
+	assert.match(html, /href="\/knowledge\?vault=vault-1"/);
 });

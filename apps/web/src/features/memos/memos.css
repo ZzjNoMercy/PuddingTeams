@@ -1,0 +1,538 @@
+/* 速记页与全局捕获共用；颜色全部来自现有主题 token，不新增品牌色。 */
+.memos-app {
+  --mf-paper: var(--card);
+  --mf-canvas: var(--background);
+  --mf-line: var(--border);
+  --mf-soft: color-mix(in oklab, var(--foreground) 4%, transparent);
+  --mf-soft-strong: color-mix(in oklab, var(--foreground) 8%, transparent);
+  --mf-muted: var(--muted-foreground);
+  --mf-accent: var(--primary);
+  --mf-accent-soft: color-mix(in oklab, var(--primary) 10%, transparent);
+  --mf-danger: var(--destructive);
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  color: var(--foreground);
+  background: var(--mf-canvas);
+}
+
+.memos-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.memos-column {
+  width: min(760px, 100%);
+  margin: 0 auto;
+  padding: 22px 26px 120px;
+}
+
+.memos-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 26px;
+  min-height: 70px;
+  border-bottom: 1px solid var(--mf-line);
+  background: var(--mf-canvas);
+}
+
+.memos-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.memos-heading h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 620;
+  letter-spacing: -0.01em;
+}
+
+.memos-heading span {
+  font-size: 11px;
+  color: var(--mf-muted);
+  white-space: nowrap;
+}
+
+.memos-tools {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.memos-search {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 34px;
+  width: 210px;
+  padding: 0 9px 0 10px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: var(--mf-soft);
+  color: var(--mf-muted);
+}
+
+.memos-search:focus-within {
+  border-color: color-mix(in oklab, var(--mf-accent) 42%, transparent);
+  background: var(--mf-paper);
+}
+
+.memos-search input {
+  min-width: 0;
+  width: 100%;
+  border: 0;
+  background: none;
+  color: var(--foreground);
+  outline: 0;
+  font-size: 12.5px;
+}
+
+.memos-filters {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 12px 26px 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.memos-filters button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 11px;
+  border-radius: 8px;
+  color: var(--mf-muted);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.memos-filters button:hover { background: var(--mf-soft); }
+
+.memos-filters button[aria-pressed="true"] {
+  background: var(--mf-soft-strong);
+  color: var(--foreground);
+  font-weight: 550;
+}
+
+.memos-filters em {
+  font-style: normal;
+  font-size: 10.5px;
+  color: var(--mf-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.memos-tagbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 26px 0;
+}
+
+.memos-tagbar button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  color: var(--mf-muted);
+  font-size: 11.5px;
+}
+
+.memos-tagbar button:hover { background: var(--mf-soft); }
+
+.memos-tagbar button[aria-pressed="true"] {
+  border-color: color-mix(in oklab, var(--mf-accent) 34%, transparent);
+  background: var(--mf-accent-soft);
+  color: var(--mf-accent);
+}
+
+.memos-tagbar em { font-style: normal; opacity: 0.75; font-variant-numeric: tabular-nums; }
+
+.memos-alert {
+  margin: 12px 26px 0;
+  padding: 9px 12px;
+  border-radius: 9px;
+  border: 1px solid color-mix(in oklab, var(--mf-danger) 34%, transparent);
+  background: color-mix(in oklab, var(--mf-danger) 8%, transparent);
+  color: var(--foreground);
+  font-size: 12px;
+}
+
+.memos-alert button {
+  margin-left: 8px;
+  color: var(--mf-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  font-size: 12px;
+}
+
+/* ---------- 输入 ---------- */
+
+.memo-composer {
+  border: 1px solid var(--mf-line);
+  border-radius: 14px;
+  background: var(--mf-paper);
+  padding: 13px 14px 10px;
+  transition: border-color 120ms, box-shadow 120ms;
+}
+
+.memo-composer:focus-within {
+  border-color: color-mix(in oklab, var(--mf-accent) 45%, var(--mf-line));
+  box-shadow: 0 2px 14px color-mix(in oklab, var(--mf-accent) 8%, transparent);
+}
+
+.memo-composer textarea {
+  display: block;
+  width: 100%;
+  border: 0;
+  resize: none;
+  background: none;
+  color: var(--foreground);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.8;
+  outline: 0;
+}
+
+.memo-composer textarea::placeholder { color: var(--mf-muted); }
+
+.memo-composer-foot {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 6px;
+}
+
+.memo-composer-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--mf-muted);
+}
+
+.memo-composer-hint { line-height: 1.7; }
+
+.memo-counter {
+  font-size: 10.5px;
+  color: var(--mf-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.memo-tag {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  height: 21px;
+  padding: 0 7px;
+  border-radius: 6px;
+  background: var(--mf-accent-soft);
+  color: var(--mf-accent);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------- 时间线 ---------- */
+
+.memo-timeline { margin-top: 18px; }
+
+.memo-day + .memo-day { margin-top: 22px; }
+
+.memo-day-head {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  margin: 0 2px 8px;
+}
+
+.memo-day-head h2 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--foreground);
+  letter-spacing: 0.02em;
+}
+
+.memo-day-head span { font-size: 10.5px; color: var(--mf-muted); }
+
+.memo-cards { display: flex; flex-direction: column; gap: 8px; }
+
+.memo-card {
+  display: flex;
+  gap: 2px;
+  border: 1px solid var(--mf-line);
+  border-radius: 13px;
+  background: var(--mf-paper);
+  padding: 11px 13px 11px 7px;
+  transition: border-color 120ms, box-shadow 120ms;
+}
+
+.memo-card:hover { border-color: color-mix(in oklab, var(--foreground) 22%, transparent); }
+
+.memo-card[data-selected="true"] {
+  border-color: color-mix(in oklab, var(--mf-accent) 55%, var(--mf-line));
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--mf-accent) 9%, transparent);
+}
+
+.memo-check {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  margin: 3px 4px 0;
+  border: 1.5px solid color-mix(in oklab, var(--foreground) 28%, transparent);
+  border-radius: 50%;
+  color: var(--mf-paper);
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 110ms, background 110ms, border-color 110ms;
+}
+
+.memo-card:hover .memo-check,
+.memo-check:focus-visible:not([data-pointer-focus="true"]),
+.memo-check[aria-checked="true"] { opacity: 1; }
+
+.memo-check[aria-checked="true"] {
+  background: var(--mf-accent);
+  border-color: var(--mf-accent);
+}
+
+.memo-check:disabled { visibility: hidden; }
+
+.memo-main { flex: 1; min-width: 0; }
+
+.memo-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 22px;
+}
+
+.memo-time {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10.5px;
+  color: var(--mf-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.memo-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 19px;
+  padding: 0 7px;
+  border-radius: 5px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.memo-badge[data-tone="neutral"] { background: var(--mf-soft); color: var(--mf-muted); }
+.memo-badge[data-tone="busy"] { background: var(--mf-soft-strong); color: var(--mf-muted); }
+.memo-badge[data-tone="review"] { background: color-mix(in oklab, #a5762f 12%, transparent); color: #8a6224; }
+.memo-badge[data-tone="done"] { background: color-mix(in oklab, #2f7d5c 12%, transparent); color: #276a4e; }
+.memo-badge[data-tone="danger"] { background: color-mix(in oklab, var(--mf-danger) 12%, transparent); color: var(--mf-danger); }
+
+.dark .memo-badge[data-tone="review"] { background: color-mix(in oklab, #e2b15c 16%, transparent); color: #e2bd79; }
+.dark .memo-badge[data-tone="done"] { background: color-mix(in oklab, #63d4a4 15%, transparent); color: #86e0ba; }
+
+.memo-actions {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  opacity: 0;
+  transition: opacity 110ms;
+}
+
+.memo-card:hover .memo-actions,
+.memo-card:focus-within .memo-actions { opacity: 1; }
+
+.memo-text {
+  margin: 5px 0 9px;
+  font-size: 14px;
+  line-height: 1.85;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  text-wrap: pretty;
+}
+
+.memo-card[data-organized="true"] .memo-text { color: var(--muted-foreground); }
+
+.memo-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  min-width: 0;
+  gap: 7px;
+  margin-top: 8px;
+  font-size: 10.5px;
+  color: var(--mf-muted);
+}
+
+.memo-links a {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  color: var(--mf-accent);
+}
+
+.memo-links a:hover { text-decoration: underline; }
+
+.memo-editor textarea {
+  width: 100%;
+  margin: 4px 0 8px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in oklab, var(--mf-accent) 45%, var(--mf-line));
+  border-radius: 9px;
+  background: var(--mf-canvas);
+  color: var(--foreground);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.8;
+  resize: vertical;
+  outline: 0;
+}
+
+.memo-editor-error {
+  margin: 0 0 6px;
+  font-size: 11.5px;
+  color: var(--mf-danger);
+}
+
+.memo-editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.memo-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 54px 20px;
+  text-align: center;
+  color: var(--mf-muted);
+}
+
+.memo-empty strong { font-size: 13.5px; font-weight: 600; color: var(--foreground); }
+.memo-empty p { margin: 0; font-size: 12px; }
+
+.memo-load {
+  display: flex;
+  justify-content: center;
+  margin-top: 18px;
+}
+
+/* ---------- 多选条 ---------- */
+
+.memo-selectbar {
+  position: sticky;
+  bottom: 16px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 14px;
+  margin: 18px auto 0;
+  width: fit-content;
+  max-width: calc(100% - 24px);
+  padding: 8px 9px 8px 15px;
+  border: 1px solid var(--mf-line);
+  border-radius: 13px;
+  background: var(--mf-paper);
+  box-shadow: 0 10px 32px color-mix(in oklab, #000 14%, transparent);
+}
+
+.memo-selectbar strong { font-size: 12.5px; white-space: nowrap; }
+.memo-selectbar span { font-size: 11px; color: var(--mf-muted); white-space: nowrap; }
+.memo-selectbar-actions { display: flex; align-items: center; gap: 4px; }
+
+/* ---------- 捕获浮层 ---------- */
+
+.memo-capture {
+  width: min(620px, calc(100vw - 32px));
+  border: 1px solid var(--mf-line);
+  border-radius: 16px;
+  background: var(--mf-paper);
+  padding: 16px 18px 12px;
+  box-shadow: 0 24px 70px color-mix(in oklab, #000 26%, transparent);
+}
+
+.memo-capture-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  font-size: 11.5px;
+  color: var(--mf-accent);
+  font-weight: 550;
+}
+
+.memo-capture textarea {
+  width: 100%;
+  border: 0;
+  background: none;
+  color: var(--foreground);
+  font: inherit;
+  font-size: 15.5px;
+  line-height: 1.85;
+  resize: none;
+  outline: 0;
+}
+
+.memo-capture-foot {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid var(--mf-line);
+  padding-top: 10px;
+}
+
+.memo-capture-actions { display: flex; align-items: center; gap: 9px; flex-shrink: 0; }
+
+@media (max-width: 860px) {
+  .memos-header { flex-wrap: wrap; padding: 12px 16px; min-height: 0; }
+  .memos-tools { width: 100%; margin-left: 0; }
+  .memos-search { flex: 1; width: auto; }
+  .memos-filters { padding: 10px 16px 0; }
+  .memos-tagbar { padding: 8px 16px 0; }
+  .memos-column { padding: 16px 14px 110px; }
+  .memo-check, .memo-actions { opacity: 1; }
+  .memo-selectbar { bottom: 10px; gap: 8px 10px; }
+  .memo-selectbar span { display: none; }
+  .memo-selectbar-actions { margin-left: auto; }
+}
+
+@media (hover: none) {
+  .memo-check, .memo-actions { opacity: 1; }
+}
+
+@media (max-width: 520px) {
+  /* 极窄屏优先保证输入与按钮，不被快捷键说明挤成三行。 */
+  .memo-composer-hint { display: none; }
+  .memos-heading h1 { font-size: 17px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .memos-app *, .memo-capture * { transition: none !important; animation: none !important; }
+}

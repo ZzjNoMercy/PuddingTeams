@@ -73,8 +73,16 @@ test("manager：分组齐全，knowledge direct/deferred 拆分正确，tool_sea
 		"knowledge_glob",
 		"knowledge_read",
 		"knowledge_links",
+		"knowledge_task_ls",
+		"knowledge_task_read",
+		"knowledge_task_write",
+		"knowledge_task_edit",
+		"knowledge_task_grep",
+		"knowledge_task_find",
 		"knowledge_prepare_candidate",
 		"knowledge_submit_candidate",
+		"knowledge_publish_candidate",
+		"knowledge_publish_task",
 	]);
 
 	const calendar = groupOf(preview, "calendar");
@@ -164,8 +172,16 @@ test("wiki：无 native/orchestration/calendar/mcp 组，knowledge 9 个全 dire
 			"knowledge_read",
 			"knowledge_links",
 			"knowledge_update_interaction_status",
+			"knowledge_task_ls",
+			"knowledge_task_read",
+			"knowledge_task_write",
+			"knowledge_task_edit",
+			"knowledge_task_grep",
+			"knowledge_task_find",
 			"knowledge_prepare_candidate",
 			"knowledge_submit_candidate",
+			"knowledge_publish_candidate",
+			"knowledge_publish_task",
 			"knowledge_curation_status",
 		],
 	);

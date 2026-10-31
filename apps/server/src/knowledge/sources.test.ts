@@ -107,3 +107,62 @@ test("sources：manifest固定原件/文本/定位/来源，顺序稳定且跨�
 	objects.get = async (hash) => { if (hash === first.originalHash) throw new Error("missing object"); return originalGet(hash); };
 	await assert.rejects(() => store.manifest("owner", [first.id]), /missing object/);
 });
+
+test("sources：memo origin 参与 manifest hash，tags 顺序不影响身份", () => {
+	const base = {
+		id: "s1", ownerId: "owner", kind: "text" as const, title: "速记", mediaType: "text/plain",
+		byteSize: 12, originalHash: "a".repeat(64), textHash: "b".repeat(64), status: "ready" as const,
+		locations: [], warnings: [], createdAt: "2026-10-27T00:00:00.000Z",
+		origin: { channel: "user_input" as const, memo: { id: "memo-1", createdAt: "2026-10-27T00:00:00.000Z", tags: ["产品", "知识库"], revision: 1 } },
+	};
+	const hash = (patch: Record<string, unknown> = {}, memoPatch: Record<string, unknown> = {}) => knowledgeSourceManifestHash([{
+		...base, ...patch, origin: { ...base.origin, memo: { ...base.origin.memo, ...memoPatch } },
+	}]);
+	assert.equal(hash(), hash({}, { tags: ["知识库", "产品"] }));
+	for (const patch of [{ revision: 2 }, { createdAt: "2026-10-28T00:00:00.000Z" }, { id: "memo-2" }, { tags: ["产品"] }]) {
+		assert.notEqual(hash(), hash({}, patch), `改变 ${Object.keys(patch)[0]} 必须改变 manifest hash`);
+	}
+	assert.equal(hash(), hash({}, { tags: ["产品", "产品", "知识库"] }));
+});
+
+test("sources：createMemoText 确定性 id、重放复用与同 id 完整性冲突", async () => {
+	const { store, objects } = await fixture();
+	const origin = { channel: "user_input" as const, memo: { id: "memo-1", createdAt: "2026-10-27T00:00:00.000Z", tags: ["产品"], revision: 1 } };
+	const first = await store.createMemoText("owner", { id: "memo:abc", text: "速记正文", title: "速记：正文", origin });
+	assert.equal(first.id, "memo:abc");
+	assert.equal(first.status, "ready");
+	assert.equal((await objects.get(first.originalHash)).toString(), "速记正文");
+	const replay = await store.createMemoText("owner", { id: "memo:abc", text: "速记正文", title: "速记：正文", origin });
+	assert.equal(replay.originalHash, first.originalHash);
+	await assert.rejects(
+		() => store.createMemoText("owner", { id: "memo:abc", text: "不同正文", title: "速记：正文", origin }),
+		(error: unknown) => error instanceof KnowledgeSourceError && error.code === "integrity_error",
+	);
+	await assert.rejects(
+		() => store.createMemoText("owner", { id: "memo:abc", text: "速记正文", title: "速记：正文", origin: { ...origin, memo: { ...origin.memo, revision: 2 } } }),
+		(error: unknown) => error instanceof KnowledgeSourceError && error.code === "integrity_error",
+	);
+	await assert.rejects(
+		() => store.createMemoText("owner", { id: "memo:bad", text: "速记正文", title: "速记", origin: { channel: "user_input" } }),
+		(error: unknown) => error instanceof KnowledgeSourceError && error.code === "invalid_input",
+	);
+	await assert.rejects(
+		() => store.createMemoText("owner", { id: "memo:bad", text: "速记正文", title: "速记", origin: { channel: "user_input", memo: { ...origin.memo, revision: 0 } } }),
+		(error: unknown) => error instanceof KnowledgeSourceError && error.code === "invalid_input",
+	);
+	assert.equal(await store.get("other", "memo:abc"), undefined);
+});
+
+test("sources：createMemoText 拒绝超长 id 与同 id 不同标题", async () => {
+	const { store } = await fixture();
+	const origin = { channel: "user_input" as const, memo: { id: "memo-1", createdAt: "2026-10-27T00:00:00.000Z", tags: [], revision: 1 } };
+	await assert.rejects(
+		() => store.createMemoText("owner", { id: "x".repeat(201), text: "正文", title: "速记", origin }),
+		(error: unknown) => error instanceof KnowledgeSourceError && error.code === "invalid_input",
+	);
+	await store.createMemoText("owner", { id: "memo:title", text: "正文", title: "标题一", origin });
+	await assert.rejects(
+		() => store.createMemoText("owner", { id: "memo:title", text: "正文", title: "标题二", origin }),
+		(error: unknown) => error instanceof KnowledgeSourceError && error.code === "integrity_error",
+	);
+});

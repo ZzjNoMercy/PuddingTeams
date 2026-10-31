@@ -153,6 +153,11 @@ export interface ReviewDecision {
 	policyRevision: number;
 }
 
+/** 发布挂载点：审核决定落账后接收冻结批次；实现方推进 approved → published/partial/conflict。 */
+export interface WikiPublisher {
+	onApproved(batch: PublicationBatch, review: ReviewDecision): Promise<{ accepted: boolean; note?: string }>;
+}
+
 export interface PublishOperation {
 	id: string;
 	batchId: string;

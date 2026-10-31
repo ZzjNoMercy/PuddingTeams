@@ -17,6 +17,7 @@ export const TEAMS_SCHEMA_PRESET_AGENTS: Readonly<Record<string, string>> = Obje
 
 - \`wiki/\` 是唯一可写的内容区。库根的 \`AGENTS.md\` 与 \`wiki.schema.json\` 是契约本身，不得改写。
 - 写入先在候选区生成 Markdown 补丁；用户审阅固定候选和正式 Wiki diff 后，才由发布流程更新 \`wiki/\`。不得绕过审阅直接写入。
+- 候选区补丁在发布并校验通过后应被删除，仅保留候选区说明文件；不得在未发布时清理。
 - 查询与检查均为只读操作。
 - \`wiki/index.md\` 与 \`wiki/log.md\` 只允许追加，禁止改写已有记录。
 
@@ -57,6 +58,7 @@ people: `# 人脉知识库 Agent 操作契约
 
 - \`wiki/\` 是唯一可写的内容区。库根的 \`AGENTS.md\` 与 \`wiki.schema.json\` 是契约本身，不得改写。
 - 写入一律先在候选区生成 Markdown 补丁并给出 diff，经用户确认后才发布；不得直接覆盖既有页面。
+- 候选区补丁在发布并校验通过后应被删除，仅保留候选区说明文件；不得在未发布时清理。
 - 删除或合并人物页必须由用户明确指示，且同一次操作内一并更新指向它的关系。
 - \`wiki/index.md\` 与 \`wiki/log.md\` 只追加，禁止改写已有条目。
 

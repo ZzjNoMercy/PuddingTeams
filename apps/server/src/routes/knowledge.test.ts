@@ -13,6 +13,7 @@ import { registerKnowledgeRoutes, type KnowledgeRouteDeps } from "./knowledge.js
 import { KnowledgeSelectionStore } from "../knowledge/selections.js";
 import { localViewerIdentity, readViewerIdentity, registerIdentityRoutes } from "./identity.js";
 import { KnowledgeHistoryStore } from "../knowledge/history-store.js";
+import { KnowledgeAuditStore } from "../knowledge/audit-store.js";
 
 test("knowledge route creates a binding, reads a note, and revokes without writing the vault", async () => {
 	const base = await mkdtemp(path.join(tmpdir(), "pt-knowledge-route-"));
@@ -298,4 +299,26 @@ test("M2 端点在未装配 deps 时返回 422 capability_unavailable", async ()
 	assert.equal(scan.statusCode, 422);
 	assert.equal(scan.json().code, "capability_unavailable");
 	await app.close();
+});
+
+test("入库审计查询按批次/类型过滤、分页有界，未装配时明确不可用", async () => {
+	const f = await m2Fixture("audit", { "a.md": "# A\n" });
+	try {
+		assert.equal((await f.app.inject({ method: "GET", url: "/api/knowledge/audit" })).statusCode, 422);
+		const audits = new KnowledgeAuditStore(path.join(f.base, "audit"));
+		f.deps.audit = audits;
+		const owner = localViewerIdentity().user.id;
+		await audits.append({ kind: "review.approved", ownerId: owner, actorId: "manager", actorKind: "agent", channel: "chat",
+			bindingId: f.binding.id, batchId: "batch-1", summary: "批准 1 项文件", dedupeKey: "audit-test:approved" });
+		await audits.append({ kind: "candidate.submitted", ownerId: owner, actorId: "wiki", actorKind: "agent", channel: "chat",
+			bindingId: f.binding.id, batchId: "batch-1", summary: "提交候选", dedupeKey: "audit-test:submitted" });
+		const listed = await f.app.inject({ method: "GET", url: "/api/knowledge/audit?batchId=batch-1" });
+		assert.equal(listed.statusCode, 200);
+		assert.equal(listed.json().events.length, 2);
+		assert.equal(listed.json().events[0].kind, "candidate.submitted");
+		assert.equal((await f.app.inject({ method: "GET", url: "/api/knowledge/audit?kind=review.approved" })).json().events.length, 1);
+		assert.equal((await f.app.inject({ method: "GET", url: "/api/knowledge/audit?limit=201" })).statusCode, 400);
+		assert.equal((await f.app.inject({ method: "GET", url: "/api/knowledge/audit?kind=bogus" })).statusCode, 400);
+		assert.equal((await f.app.inject({ method: "GET", url: `/api/knowledge/audit/${listed.json().events[0].id}` })).statusCode, 200);
+	} finally { await f.app.close(); }
 });

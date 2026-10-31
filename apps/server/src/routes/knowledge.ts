@@ -27,6 +27,7 @@ import type { MemorySetupService } from "../knowledge/memory-setup.js";
 import type { ReviewStore } from "../knowledge/wiki/review-store.js";
 import { assertImageAssetBytes, assertImageBatchIntegrity, markdownImageTargets, resolveImagePath } from "../knowledge/image-publication.js";
 import type { InteractionStatusHandler } from "../knowledge/runtime-service.js";
+import type { KnowledgeAuditKind, KnowledgeAuditStore } from "../knowledge/audit-store.js";
 
 export interface KnowledgeRouteDeps {
 	viewerIdentity?: () => Promise<ViewerIdentity>;
@@ -41,6 +42,8 @@ export interface KnowledgeRouteDeps {
 	plans?: KnowledgePlanStore;
 	selections?: KnowledgeSelectionStore;
 	setInteractionStatus?: InteractionStatusHandler;
+	/** 统一审计账本：素材→候选→审核→发布的通道证据链，只读查询。 */
+	audit?: Pick<KnowledgeAuditStore, "list" | "get">;
 }
 
 class KnowledgeRouteError extends Error {
@@ -555,6 +558,34 @@ export function registerKnowledgeRoutes(app: FastifyInstance, registry: Knowledg
 				.header("Content-Security-Policy", "default-src 'none'")
 				.header("Cache-Control", "private, max-age=60")
 				.send(asset.content);
+		} catch (error) { return sendKnowledgeError(reply, error); }
+	});
+
+	/** 入库审计查询：owner 私有、只读；事件本身保留撤权/删除库的历史证据。 */
+	app.get<{ Querystring: { bindingId?: string; batchId?: string; jobId?: string; kind?: string; limit?: string; offset?: string } }>("/api/knowledge/audit", async (req, reply) => {
+		try {
+			const services = requireDeps();
+			if (!services.audit) throw new KnowledgeRouteError("capability_unavailable", "审计账本未装配");
+			const limit = req.query.limit === undefined ? 50 : Number(req.query.limit);
+			const offset = req.query.offset === undefined ? 0 : Number(req.query.offset);
+			if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200 || !Number.isSafeInteger(offset) || offset < 0)
+				throw new KnowledgeRouteError("invalid_input", "审计分页参数无效");
+			const result = await services.audit.list({ ownerId: ownerId(),
+				...(req.query.bindingId ? { bindingId: req.query.bindingId } : {}),
+				...(req.query.batchId ? { batchId: req.query.batchId } : {}),
+				...(req.query.jobId ? { jobId: req.query.jobId } : {}),
+				...(req.query.kind ? { kind: req.query.kind as KnowledgeAuditKind } : {}), limit, offset });
+			return { events: result.events, total: result.total, limit, offset };
+		} catch (error) { return sendKnowledgeError(reply, error); }
+	});
+
+	app.get<{ Params: { id: string }; Querystring: { path?: string } }>("/api/knowledge/audit/:id", async (req, reply) => {
+		try {
+			const services = requireDeps();
+			if (!services.audit) throw new KnowledgeRouteError("capability_unavailable", "审计账本未装配");
+			const event = await services.audit.get(ownerId(), req.params.id);
+			if (!event) throw new KnowledgeRouteError("not_found", "审计事件不存在");
+			return { event };
 		} catch (error) { return sendKnowledgeError(reply, error); }
 	});
 }

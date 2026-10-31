@@ -46,6 +46,7 @@ import { KnowledgePageShell } from "./page-shell";
 import { Dialog, DialogBody, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { WIKI_REVIEW_CHANGED } from "@/lib/wiki-review-queue";
 import { ReviewSources } from "./review-sources";
+import { ReviewAudit } from "./review-audit";
 import { SnapshotMarkdown } from "./snapshot-markdown";
 import { hasFrozenBatchImage } from "./snapshot-images";
 import { publicationFeedback } from "./publication-feedback";
@@ -560,6 +561,7 @@ function ReviewWorkspace({ batch, onBatchChange, onReload }: {
 				<span className="text-xs text-muted-foreground">{batch.status === "pending_review" ? `已阅 ${Math.min(viewed.size, files.length)}/${files.length}` : `${files.length} 项固定候选`}</span>
 				<span className="wiki-review-vault"><BookOpenIcon size={12} />{batch.bindingName ?? batch.bindingId}</span>
 				<div className="ml-auto flex flex-wrap items-center gap-2">
+					<ReviewAudit batchId={batch.id} />
 					<ReviewSources batchId={batch.id} />
 					{batch.status === "pending_review" ? (
 						(

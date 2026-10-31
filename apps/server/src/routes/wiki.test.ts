@@ -26,6 +26,9 @@ import { syncCandidateBatches } from "../knowledge/wiki/candidate-sync.js";
 import { imageAssetPath } from "../knowledge/image-publication.js";
 import { localViewerIdentity } from "./identity.js";
 import { registerWikiRoutes, type WikiRouteDeps } from "./wiki.js";
+import { KnowledgeAuditStore } from "../knowledge/audit-store.js";
+import { createAgentPublisher } from "../knowledge/wiki/decide.js";
+import type { CuratorJob } from "../knowledge/curator-jobs.js";
 
 interface WikiFixture {
 	root: string;
@@ -41,6 +44,9 @@ interface WikiFixture {
 	searchIndex: KnowledgeSearchIndex;
 	publisherCalls: string[];
 	delegations: DelegationStore;
+	audit: KnowledgeAuditStore;
+	/** 会话内确认测试用：origin 校验读取的整理任务。 */
+	chatOriginJob: { job?: CuratorJob };
 	deps: WikiRouteDeps;
 	behavior: { candidates: Record<string, string> | null; hang: boolean; started: number };
 	knobs: { packageDigest: string | undefined; commandOk: boolean };
@@ -110,6 +116,8 @@ async function wikiFixture(opts?: { now?: () => number; realPublisher?: boolean;
 	const reviews = new ReviewStore(path.join(root, "reviews"), opts?.now);
 	const journal = new PublishJournal(path.join(root, "operations"), opts?.now);
 	const searchIndex = new KnowledgeSearchIndex(path.join(root, "index-cache"), objects);
+	const audit = new KnowledgeAuditStore(path.join(root, "audit"));
+	const chatOriginJob: { job?: CuratorJob } = {};
 	const publisherCalls: string[] = [];
 	const publisher = opts?.realPublisher
 		? new MarkdownWikiPublisher({
@@ -137,10 +145,12 @@ async function wikiFixture(opts?: { now?: () => number; realPublisher?: boolean;
 		reviews,
 		publisher,
 		publications: journal,
+		audit,
+		curatorJobs: { get: async (id: string) => chatOriginJob.job?.id === id ? chatOriginJob.job : undefined },
 	};
 	const app = Fastify();
 	registerWikiRoutes(app, deps);
-	return { root, vault, app, binding, acceptanceId, acceptance, objects, jobs, reviews, journal, searchIndex, publisherCalls, delegations, deps, behavior, knobs };
+	return { root, vault, app, binding, acceptanceId, acceptance, objects, jobs, reviews, journal, searchIndex, publisherCalls, delegations, audit, chatOriginJob, deps, behavior, knobs };
 }
 
 async function waitFor<T>(read: () => Promise<T>, done: (value: T) => boolean, timeoutMs = 15_000): Promise<T> {
@@ -431,17 +441,79 @@ test("wiki 审核路由：编译候选转正 → 列表/详情/文件 diff → a
 	assert.equal(approve.json().decision.revision, batch.revision);
 	assert.ok(approve.json().publishRequestedAt);
 	assert.deepEqual(fixture.publisherCalls, [batch.id]);
+	// 审核页确认：审计以 review_page 通道落账，重放不重复记账
+	const decided = await fixture.audit.list({ ownerId: localViewerIdentity().user.id, batchId: batch.id, limit: 20, offset: 0 });
+	assert.equal(decided.events.filter((event) => event.kind === "review.approved").length, 1);
+	assert.equal(decided.events.find((event) => event.kind === "review.approved")?.channel, "review_page");
+	assert.deepEqual(decided.events.find((event) => event.kind === "review.approved")?.reviewedFiles, batch.files.map((file) => file.targetPath));
 	// 同 body 重放：仍为 approved 的批次会重驱幂等 publisher
 	const replay = await fixture.app.inject({ method: "POST", url: `/api/wiki/batches/${batch.id}/reviews`, payload: reviewBody(batch) });
 	assert.equal(replay.statusCode, 200);
 	assert.equal(replay.json().replayed, true);
 	assert.equal(fixture.publisherCalls.length, 2);
+	assert.equal((await fixture.audit.list({ ownerId: localViewerIdentity().user.id, batchId: batch.id, limit: 20, offset: 0 })).events.filter((event) => event.kind === "review.approved").length, 1);
 	// 已决批次再审（新 operationId）→ 409
 	const again = await fixture.app.inject({ method: "POST", url: `/api/wiki/batches/${batch.id}/reviews`, payload: reviewBody(batch, { operationId: "review-again" }) });
 	assert.equal(again.statusCode, 409);
 	// 正式库与账本零变化
 	assert.equal(await readFile(path.join(fixture.vault, "a.md"), "utf8"), "# Accepted\n");
 	assert.equal((await fixture.acceptance.getSnapshot(fixture.binding.id)).acceptanceRevision, 1);
+	await fixture.app.close();
+});
+
+test("会话内确认：origin 必须对上产生该批次的整理任务，审计记录 chat 通道", async () => {
+	const fixture = await wikiFixture();
+	const batch = await registerBatchDirect(fixture, [{ targetPath: "notes/chat.md", content: "# Chat\n" }]);
+	fixture.chatOriginJob.job = { id: "chat-job", ownerId: localViewerIdentity().user.id, targetBindingId: fixture.binding.id,
+		candidateBatchId: batch.id, origin: { sessionId: "session-chat", windowId: "window-chat" } } as unknown as CuratorJob;
+	// 错误会话 / 不存在的任务 → 400，且未落审核决定
+	const foreign = await fixture.app.inject({ method: "POST", url: `/api/wiki/batches/${batch.id}/reviews`,
+		payload: reviewBody(batch, { origin: { sessionId: "session-other", jobId: "chat-job" } }) });
+	assert.equal(foreign.statusCode, 400);
+	const unknownJob = await fixture.app.inject({ method: "POST", url: `/api/wiki/batches/${batch.id}/reviews`,
+		payload: reviewBody(batch, { origin: { sessionId: "session-chat", jobId: "missing-job" } }) });
+	assert.equal(unknownJob.statusCode, 400);
+	assert.equal((await fixture.reviews.get(batch.id))?.status, "pending_review");
+	assert.equal((await fixture.audit.list({ ownerId: localViewerIdentity().user.id, batchId: batch.id, limit: 20, offset: 0 })).total, 0);
+	// 正确来源 → 审核走同一账本，审计通道为 chat
+	const approved = await fixture.app.inject({ method: "POST", url: `/api/wiki/batches/${batch.id}/reviews`,
+		payload: reviewBody(batch, { origin: { sessionId: "session-chat", jobId: "chat-job" } }) });
+	assert.equal(approved.statusCode, 200);
+	const events = (await fixture.audit.list({ ownerId: localViewerIdentity().user.id, batchId: batch.id, limit: 20, offset: 0 })).events;
+	const decision = events.find((event) => event.kind === "review.approved");
+	assert.equal(decision?.channel, "chat");
+	assert.equal(decision?.sessionId, "session-chat");
+	assert.equal(decision?.windowId, "window-chat");
+	assert.equal(decision?.jobId, "chat-job");
+	assert.equal(decision?.actorKind, "user");
+	assert.equal(decision?.manifestHash, batch.manifestHash);
+	await fixture.app.close();
+});
+
+test("模型代批：以 agent 身份批准并发布，审计不伪装成人工审核", async () => {
+	const fixture = await wikiFixture();
+	const batch = await registerBatchDirect(fixture, [{ targetPath: "notes/agent.md", content: "# Agent\n" }]);
+	const calls: string[] = [];
+	const publish = createAgentPublisher({ reviews: fixture.reviews, publications: fixture.journal, audit: fixture.audit,
+		publisher: { onApproved: async (frozen) => { calls.push(frozen.id); return { accepted: true }; } } });
+	const job = { id: "job-agent", ownerId: localViewerIdentity().user.id, targetBindingId: fixture.binding.id,
+		candidateBatchId: batch.id, agentId: "manager", origin: { sessionId: "session-agent", windowId: "window-agent" } } as unknown as CuratorJob;
+	const result = await publish(job, "整理完成，来源已核对");
+	assert.deepEqual(calls, [batch.id]);
+	assert.equal(result.publish?.accepted, true);
+	const events = (await fixture.audit.list({ ownerId: localViewerIdentity().user.id, batchId: batch.id, limit: 20, offset: 0 })).events;
+	const approved = events.find((event) => event.kind === "review.approved");
+	assert.equal(approved?.actorKind, "agent");
+	assert.equal(approved?.actorId, "manager");
+	assert.equal(approved?.channel, "chat");
+	assert.equal(approved?.sessionId, "session-agent");
+	assert.equal(approved?.windowId, "window-agent");
+	assert.equal(approved?.jobId, "job-agent");
+	assert.deepEqual(approved?.reviewedFiles, batch.files.map((file) => file.targetPath));
+	// 同任务重试：同一操作重放，不重复记账，也不重复发布
+	await publish(job);
+	assert.equal(calls.length, 2);
+	assert.equal((await fixture.audit.list({ ownerId: localViewerIdentity().user.id, batchId: batch.id, limit: 20, offset: 0 })).events.filter((event) => event.kind === "review.approved").length, 1);
 	await fixture.app.close();
 });
 
