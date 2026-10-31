@@ -8,6 +8,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { useChatNavigation } from "@/hooks/useChatNavigation";
 import { ChatPane } from "@/components/chat/chat-pane";
+import { RoomChatPane } from "@/components/chat/room-chat-pane";
 import { CreateWindowDialog } from "@/components/chat/create-window-dialog";
 import { SessionList } from "@/components/chat/session-list";
 import { NavRail } from "@/components/chat/nav-rail";
@@ -74,6 +75,7 @@ export default function Home() {
 	const router = useRouter();
 	const [rooms, setRooms] = useState<RoomSummary[]>([]);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
+	const selectedRoom = rooms.find((room) => room.id === selectedId) ?? null;
 	const navigation = useChatNavigation(rooms);
 	const roomsRef = useRef(rooms);
 	const selectedIdRef = useRef(selectedId);
@@ -419,6 +421,21 @@ export default function Home() {
 								</div>
 							) : !navigation.ready || (navigation.error && !navigation.items.length) ? (
 								<div className="flex flex-1 flex-col items-center justify-center gap-3" role="status"><p className="text-sm text-muted-foreground">{navigation.error ?? "正在加载对话…"}</p>{navigation.error ? <Button variant="outline" onClick={() => void navigation.refresh()}>重试</Button> : null}</div>
+							) : selectedId && selectedRoom?.type === "group" ? (
+								<RoomChatPane
+									key={`room:${selectedId}:${requestedSessionId ?? ""}:${selectionNonce}`}
+									room={selectedRoom}
+									requestedSessionId={requestedSessionId}
+									onRoomUpdated={handleRoomUpdated}
+									onSessionActivated={(updated) => {
+										handleRoomUpdated(updated);
+										const viewed = updated.activeRoomSessionId ?? updated.activeSession;
+										setRequestedSessionId(viewed);
+										const href = chatHref(updated.id, viewed, returnSessionId);
+										routeQuery.current = href.split("?")[1] ?? "";
+										router.push(href);
+									}}
+								/>
 							) : selectedId ? (
 								<ChatPane
 									key={`${selectedId}:${requestedSessionId ?? ""}:${selectionNonce}`}

@@ -1077,8 +1077,12 @@ export interface RoomSummary {
 	members: AgentConfig[];
 	/** pi sessions belonging to this window (newest first). */
 	sessions: RoomSession[];
-	/** The pi session currently shown in the chat. */
+	/** The pi session currently shown in the chat（group 的兼容 Manager Session）。 */
 	activeSession: string;
+	/** group：当前 RoomSession 与索引。 */
+	activeRoomSessionId?: string;
+	roomSessionIds?: string[];
+	roomSessions?: Array<{ roomSessionId: string; name: string; active: boolean; managerParticipantSessionId?: string }>;
 	/** Solo only: pinned singleton, never deletable. */
 	pinned: boolean;
 	/** User-edited window system prompt ('' = default relay guidance). */
@@ -1167,3 +1171,58 @@ export interface ChatNavigationItem {
  pinned: boolean; archived: boolean;
 }
 export interface ChatNavigationIndex { items: ChatNavigationItem[]; revision: number; }
+
+export interface RoomAttachmentView {
+	name: string;
+	path: string;
+	mediaType: string;
+	size: number;
+	sha256: string;
+	kind: "file" | "image";
+}
+
+export interface RoomEventView {
+	id: string;
+	roomSessionId: string;
+	seq: number;
+	kind: "message" | "terminal" | "artifact";
+	actor: { kind: "user" | "agent" | "system"; agentId?: string };
+	content: string;
+	mentions: string[];
+	attachments?: RoomAttachmentView[];
+	artifactRefs?: Array<{ name: string; path: string; kind?: string }>;
+	sourceParticipantTurnId?: string;
+	replyToEventId?: string;
+	createdAt: string;
+}
+
+export interface RoomPublicTurn {
+	id: string;
+	agentSessionId: string;
+	sourceRoomEventId: string;
+	status: "admitted" | "running" | "waiting_input" | "reconciling" | "unknown" | "interrupted_unknown" | "completed" | "failed" | "cancelled";
+	publicProjectionState: "pending" | "projected" | "not_applicable";
+	finalContent?: string;
+	createdAt: string;
+	updatedAt: string;
+}
+
+export interface RoomTimelineSnapshot {
+	roomId: string;
+	roomSessionId: string;
+	events: RoomEventView[];
+	turns: RoomPublicTurn[];
+	activeTurn?: RoomPublicTurn;
+	participants: Array<{ agentId: string; agentSessionId: string; role: "manager" | "worker"; state: string; nativePi: boolean }>;
+	managerParticipantSessionId: string | null;
+	lastEventSeq: number;
+	capabilities: {
+		canSend: boolean;
+		canStop: boolean;
+		busyInputModes: string[];
+		allowedMentions: string[];
+		activeParticipantTurnId?: string;
+		recoveryRequired: boolean;
+		recoveryReason?: string;
+	};
+}

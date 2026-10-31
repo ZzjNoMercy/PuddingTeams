@@ -24,6 +24,7 @@ import type {
 	PuddingTeamsExtensionManifest,
 	ResourceDiagnostic,
 	RoomSession,
+	RoomTimelineSnapshot,
 	RoomSummary,
 	SessionWorkState,
 	DecisionRequest,
@@ -2704,6 +2705,55 @@ export async function renameRoomSession(roomId: string, sessionId: string, name:
 		throw new Error(body?.error ?? `rename room session failed: ${res.status}`);
 	}
 	return ((await res.json()) as { session: RoomSession }).session;
+}
+
+// ---- RoomSession 公共时间线 ----
+
+export function roomTimelineWsUrl(roomId: string, roomSessionId: string): string {
+	return `${SERVER_URL.replace(/^http/, "ws")}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(roomSessionId)}/ws`;
+}
+
+export async function fetchRoomTimeline(roomId: string, roomSessionId: string): Promise<RoomTimelineSnapshot> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(roomSessionId)}/timeline`);
+	const body = (await res.json().catch(() => null)) as (RoomTimelineSnapshot & { error?: string; code?: string }) | null;
+	if (!res.ok) throw new Error(body?.error ?? `load room timeline failed: ${res.status}`);
+	return body!;
+}
+
+export async function sendRoomMessage(
+	roomId: string,
+	roomSessionId: string,
+	input: { content: string; mentions: string[]; delivery?: "normal"; expectedParticipantTurnId?: string; attachments?: MessageAttachmentInput[] },
+	operationKey: string,
+): Promise<{ accepted: boolean; roomEventId: string; participantTurnId: string }> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(roomSessionId)}/messages`, {
+		method: "POST",
+		headers: { "content-type": "application/json", "idempotency-key": operationKey },
+		body: JSON.stringify(input),
+	});
+	const body = (await res.json().catch(() => null)) as { error?: string; code?: string; roomEventId?: string; participantTurnId?: string } | null;
+	if (!res.ok) throw new Error(body?.error ?? `send room message failed: ${res.status}`);
+	return { accepted: true, roomEventId: body!.roomEventId!, participantTurnId: body!.participantTurnId! };
+}
+
+export async function abortRoomTurn(roomId: string, roomSessionId: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(roomSessionId)}/abort`, { method: "POST" });
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `abort room turn failed: ${res.status}`);
+	}
+}
+
+export async function closeUnknownRoomTurn(roomId: string, roomSessionId: string, turnId: string, reason?: string): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(roomSessionId)}/turns/${encodeURIComponent(turnId)}/close-unknown`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ reason }),
+	});
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `close unknown turn failed: ${res.status}`);
+	}
 }
 
 // ---- interactions（HITL 审批，§6.4）----
