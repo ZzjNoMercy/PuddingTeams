@@ -41,6 +41,7 @@ const runnerInput = {
 	binding,
 	prompt: "请检查",
 	context: { text: "请检查", chars: 3, historyCount: 0, throughSeq: 0 },
+	markInputDurable: async () => undefined,
 };
 
 test("PiParticipantRunner: 取最后一条非空 assistant 文本，忽略工具间旁白", async () => {

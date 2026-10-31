@@ -45,7 +45,7 @@ async function makeStack() {
 		activityStatePath: path.join(dir, "state", "room-activity.json"),
 		sessionCreationStatePath: path.join(dir, "state", "session-creation-operations.json"),
 		roomSessionsStatePath: path.join(dir, "state", "room-sessions"),
-		roomRunner: { run: async () => ({ status: "completed" as const, finalContent: "房间结论" }) },
+		roomRunner: { run: async (input) => { await input.markInputDurable(); return { status: "completed" as const, finalContent: "房间结论" }; } },
 	});
 	return { app, teams, sessions, delegations, invoker, dir, workerSessionDir };
 }
@@ -345,5 +345,32 @@ test("v4 HTTP: 房间公开消息准入、幂等与 final 投影", async () => {
 		assert.equal(replay.json().participantTurnId, accepted.participantTurnId);
 		const timeline = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` });
 		assert.equal(timeline.json().events.length, 2);
+	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("v4 HTTP: reuseEmpty / 幂等新建 RoomSession 都建 events，首条消息不 500", async () => {
+	const { app, teams, sessions, dir } = await makeStack();
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		const room = created.json().room as RoomSummary;
+
+		const reuse = await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions`, payload: { reuseEmpty: true } });
+		assert.equal(reuse.statusCode, 200, reuse.body);
+		const reuseRoomId = reuse.json().roomSessionId as string;
+		assert.ok(reuseRoomId);
+		assert.equal(existsSync(path.join(dir, "state", "room-sessions", reuseRoomId, "events.jsonl")), true);
+
+		const idempotent = await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions`, headers: { "idempotency-key": randomUUID() }, payload: {} });
+		assert.equal(idempotent.statusCode, 200, idempotent.body);
+		const idemRoomId = idempotent.json().roomSessionId as string;
+		assert.ok(idemRoomId);
+		assert.equal(existsSync(path.join(dir, "state", "room-sessions", idemRoomId, "events.jsonl")), true);
+
+		const send = await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${reuseRoomId}/messages`,
+			headers: { "idempotency-key": randomUUID() }, payload: { content: "首条", mentions: ["alpha"] },
+		});
+		assert.equal(send.statusCode, 202, send.body);
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });

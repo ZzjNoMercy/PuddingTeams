@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { MANAGER_AGENT_NAME, type TeamsStore } from "../store/teams.js";
 import type { PiSessionStore } from "../pi-bridge/session-store.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
@@ -5,7 +6,7 @@ import { RoomEventStore } from "./room-event-store.js";
 import { ParticipantTurnStore } from "./participant-turn-store.js";
 import { RoomOperationStore } from "./room-operation-store.js";
 import { RoomTurnService } from "./room-turn-service.js";
-import { RoomMessageRouter, type RoomParticipantRunner, type RoomParticipantRunnerInput, type RoomParticipantRunnerResult } from "./room-message-router.js";
+import { RoomMessageError, RoomMessageRouter, type RoomParticipantRunner, type RoomParticipantRunnerInput, type RoomParticipantRunnerResult } from "./room-message-router.js";
 import { PiParticipantRunner, DirectChatParticipantRunner } from "./participant-runners.js";
 import { TeamsParticipantBindingPort } from "./teams-binding-port.js";
 
@@ -77,23 +78,28 @@ export function createRoomRuntime(input: {
 			const existing = await bindings.get(roomSessionId, agentId);
 			if (existing) return existing;
 			const context = await input.teams.contextForRoomSession(roomSessionId);
-			if (!context) throw new Error(`RoomSession 不存在: ${roomSessionId}`);
+			if (!context) throw new RoomMessageError("participant_unavailable", `RoomSession 不存在: ${roomSessionId}`);
 			const agent = await input.teams.getAgent(agentId);
-			if (!agent) throw new Error(`agent not found: ${agentId}`);
-			if (agent.enabled === false) throw new Error(`agent disabled: ${agentId}`);
+			if (!agent || agent.enabled === false) throw new RoomMessageError("participant_unavailable", `agent 不可用: ${agentId}`);
+			if (agentId === MANAGER_AGENT_NAME) {
+				// Manager PS 必须在建房事务中创建；缺失属于 recovery，不能懒建第二个。
+				throw new RoomMessageError("participant_binding_required", `RoomSession 缺少 Manager binding: ${roomSessionId}`);
+			}
+			if (!context.window.members.includes(agentId)) throw new RoomMessageError("participant_unavailable", `agent 不是当前房间成员: ${agentId}`);
+			const agentSessionId = randomUUID();
 			const created = await input.sessions.create(undefined, {
 				type: "group",
 				members: context.window.members,
 				prompt: context.window.prompt,
 				workspaceId: context.window.workspaceId,
 				cwd: context.window.cwdSnapshot,
-			}, undefined, { ownerAgentId: agentId });
+			}, agentSessionId, { ownerAgentId: agentId });
 			try {
 				const ensured = await bindings.ensure({
 					roomId: context.window.id,
 					roomSessionId,
 					agentId,
-					role: agentId === MANAGER_AGENT_NAME ? "manager" : "worker",
+					role: "worker",
 					agentSessionId: created.id,
 					...(context.window.workspaceId ? { workspaceId: context.window.workspaceId } : {}),
 					cwdSnapshot: context.window.cwdSnapshot,
@@ -101,7 +107,8 @@ export function createRoomRuntime(input: {
 				return ensured.binding;
 			} catch (error) {
 				await input.sessions.remove(created.id).catch(() => undefined);
-				throw error;
+				throw error instanceof RoomMessageError ? error
+					: new RoomMessageError("participant_unavailable", error instanceof Error ? error.message : String(error));
 			}
 		},
 	});

@@ -34,7 +34,9 @@ export class RoomMessageError extends Error {
 		| "participant_binding_required"
 		| "context_too_large"
 		| "message_operation_conflict"
-		| "message_delivery_unconfirmed", message: string) {
+		| "message_delivery_unconfirmed"
+		| "participant_unavailable"
+		| "participant_delivery_unsupported", message: string) {
 		super(message);
 		this.name = "RoomMessageError";
 	}
@@ -53,6 +55,8 @@ export interface RoomParticipantRunnerInput {
 	prompt: string;
 	context: BuiltRoomContext;
 	signal?: AbortSignal;
+	/** runner 在组合输入真正落盘/接单后调用；调用前 accepted 不会返回。 */
+	markInputDurable(agentUserEntryId?: string): Promise<void>;
 }
 
 export interface RoomParticipantRunnerResult {
@@ -173,38 +177,36 @@ export class RoomMessageRouter {
 		const delivery = input.delivery ?? "normal";
 		if (delivery === "normal" && input.expectedParticipantTurnId) throw new RoomMessageError("invalid_delivery", "normal 消息不能携带 expectedParticipantTurnId");
 		if (delivery === "followUp" && !input.expectedParticipantTurnId) throw new RoomMessageError("invalid_delivery", "followUp 必须携带 expectedParticipantTurnId");
+		if (delivery === "followUp") throw new RoomMessageError("participant_delivery_unsupported", "同 Turn followUp 尚未接通；首期只支持 normal");
 		const hash = requestHash({ ...input, content }, content);
 
 		return withRoomAdmissionLock(input.roomSessionId, async () => {
 			const replay = await this.deps.operations.getMessage(input.roomSessionId, input.operationId);
 			if (replay) {
 				if (replay.requestHash !== hash) throw new RoomMessageError("message_operation_conflict", "同一消息键已用于不同请求");
-				if (replay.phase === "accepted" && replay.roomEventId && replay.participantTurnId) {
+				if ((replay.phase === "accepted" || replay.phase === "participant_input_durable")
+					&& replay.roomEventId && replay.participantTurnId) {
 					const turn = await this.deps.turns.get(input.roomSessionId, replay.participantTurnId);
-					return { roomEventId: replay.roomEventId, turnId: replay.participantTurnId, status: turn?.status ?? "admitted", replayed: true };
+					if (!turn) throw new RoomMessageError("message_delivery_unconfirmed", "消息账本指向的 Turn 不存在；请刷新时间线核对");
+					const durable = turn.inputs.some((item) => item.operationId === input.operationId && item.persistence === "durable");
+					if (!durable) throw new RoomMessageError("message_delivery_unconfirmed", "输入尚未落盘；请刷新时间线核对");
+					if (replay.phase !== "accepted") await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "accepted");
+					return { roomEventId: replay.roomEventId, turnId: replay.participantTurnId, status: turn.status, replayed: true };
 				}
 				throw new RoomMessageError("message_delivery_unconfirmed", "消息已受理但尚未确认输入落盘；请刷新时间线核对");
 			}
 
-			const events = await this.deps.events.read(input.roomSessionId);
-			const active = await this.activeTurn(input.roomSessionId);
-			let target: RoomParticipantTarget;
-			let activeTurn: ParticipantTurn | undefined;
-			if (delivery === "followUp") {
-				activeTurn = active;
-				if (!activeTurn || activeTurn.id !== input.expectedParticipantTurnId) {
-					throw new RoomMessageError("invalid_delivery", "followUp 的目标回合已不活动");
-				}
-				const binding = await this.deps.bindings.findActiveBySession(input.roomSessionId, activeTurn.agentSessionId);
-				if (!binding) throw new RoomMessageError("participant_binding_required", "followUp 的 ParticipantSession 没有 active binding");
-				target = { agentId: binding.agentId, agentSessionId: binding.agentSessionId, role: binding.role };
-				if (input.mentions.some((agentId) => agentId !== binding.agentId)) {
-					throw new RoomMessageError("invalid_delivery", "followUp 必须发往当前回合的参与者");
-				}
-			} else {
-				if (active) throw new RoomMessageError("room_turn_active", `房间已有未终态公开回合：${active.id}`);
-				target = await this.resolveTarget(input.roomSessionId, input.mentions);
+			let events: RoomEvent[];
+			try { events = await this.deps.events.read(input.roomSessionId); }
+			catch (error) {
+				if (error instanceof Error && error.name === "RoomSessionNotFoundError") {
+					await this.deps.events.create(input.roomSessionId);
+					events = [];
+				} else throw error;
 			}
+			const active = await this.activeTurn(input.roomSessionId);
+			if (active) throw new RoomMessageError("room_turn_active", `房间已有未终态公开回合：${active.id}`);
+			const target = await this.resolveTarget(input.roomSessionId, input.mentions);
 			const binding = await this.deps.bindings.get(input.roomSessionId, target.agentId);
 			if (!binding) throw new RoomMessageError("participant_binding_required", `agent ${target.agentId} 没有 active binding`);
 
@@ -245,53 +247,47 @@ export class RoomMessageRouter {
 			const userEvent = await this.deps.events.append(input.roomSessionId, draft);
 			await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "user_event_appended", { roomEventId: userEvent.id });
 
-			let turn: ParticipantTurn;
-			if (delivery === "followUp") {
-				const inputRecord: ParticipantInput = {
-					operationId: input.operationId,
-					sourceRoomEventId: userEvent.id,
-					...(binding.lastRoomEntryId ? { contextFromAfterRoomEventId: binding.lastRoomEntryId } : {}),
-					contextThroughRoomEventId: userEvent.id,
-					inputHash: hashText(context.text),
-					delivery: "followUp",
-					persistence: "pending",
-				};
-				const appended = await this.deps.turns.appendInput(input.roomSessionId, activeTurn!.id, inputRecord);
-				turn = appended.turn;
-				await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "participant_bound", {
-					agentSessionId: target.agentSessionId, participantTurnId: turn.id,
-				});
-			} else {
-				const begun = await this.deps.turnService.begin({
-					roomSessionId: input.roomSessionId,
-					agentId: target.agentId,
-					agentSessionId: target.agentSessionId,
-					sourceRoomEventId: userEvent.id,
-					operationId: input.operationId,
-					inputHash: hashText(context.text),
-					...(binding.lastRoomEntryId ? { contextFromAfterRoomEventId: binding.lastRoomEntryId } : {}),
-				});
-				turn = await this.deps.turnService.start(input.roomSessionId, begun.turn.id);
-				await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "participant_bound", {
-					agentSessionId: target.agentSessionId, participantTurnId: turn.id,
-				});
-			}
-			await this.deps.turnService.markInputDurable(input.roomSessionId, turn.id, input.operationId);
-			await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "participant_input_durable");
-			await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "accepted");
-
-			this.execute(input.roomSessionId, turn.id, {
+			const begun = await this.deps.turnService.begin({
+				roomSessionId: input.roomSessionId,
+				agentId: target.agentId,
+				agentSessionId: target.agentSessionId,
+				sourceRoomEventId: userEvent.id,
+				operationId: input.operationId,
+				inputHash: hashText(context.text),
+				...(binding.lastRoomEntryId ? { contextFromAfterRoomEventId: binding.lastRoomEntryId } : {}),
+			});
+			const turn = await this.deps.turnService.start(input.roomSessionId, begun.turn.id);
+			await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "participant_bound", {
+				agentSessionId: target.agentSessionId, participantTurnId: turn.id,
+			});
+			let durableMarked = false;
+			let resolveDurable!: () => void;
+			const durableReached = new Promise<void>((resolve) => { resolveDurable = resolve; });
+			const markInputDurable = async (agentUserEntryId?: string) => {
+				if (durableMarked) return;
+				await this.deps.turnService.markInputDurable(input.roomSessionId, turn.id, input.operationId, agentUserEntryId);
+				await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "participant_input_durable");
+				durableMarked = true;
+				resolveDurable();
+			};
+			const execution = this.execute(input.roomSessionId, turn.id, {
 				roomSessionId: input.roomSessionId,
 				turn,
 				binding,
 				prompt: context.text,
 				context,
+				markInputDurable,
 			});
+			await Promise.race([durableReached, execution.then(() => undefined, () => undefined)]);
+			if (!durableMarked) {
+				throw new RoomMessageError("message_delivery_unconfirmed", "组合输入未确认落盘；消息已公开，请刷新时间线核对");
+			}
+			await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "accepted");
 			return { roomEventId: userEvent.id, turnId: turn.id, status: turn.status, replayed: false };
 		});
 	}
 
-	private execute(roomSessionId: string, turnId: string, runnerInput: RoomParticipantRunnerInput): void {
+	private execute(roomSessionId: string, turnId: string, runnerInput: RoomParticipantRunnerInput): Promise<void> {
 		const key = this.executionKey(roomSessionId, turnId);
 		const run: Promise<void> = (async () => {
 			let result: RoomParticipantRunnerResult;
@@ -342,6 +338,7 @@ export class RoomMessageRouter {
 		});
 		this.executions.set(key, run);
 		void run.catch(() => undefined);
+		return run;
 	}
 
 	/** 等待某个 Turn 的后台执行结束（测试/内部对账用）。 */

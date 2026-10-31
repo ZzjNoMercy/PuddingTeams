@@ -498,12 +498,13 @@ if (recoveredRoomCreations.kept || recoveredRoomCreations.removed) {
 	app.log.info(recoveredRoomCreations, "reconciled pending room Session creations before opening routes");
 }
 const roomSessionsStateRoot = path.join(paths.state, "room-sessions");
+const existingAgentSessions = new Set((await store.list()).map((item) => item.id));
 const roomCreationReconcile = await new RoomCreationReconciler({
 	root: roomSessionsStateRoot,
 	events: new RoomEventStore(roomSessionsStateRoot),
 	operations: new RoomOperationStore(roomSessionsStateRoot),
 	teams,
-	sessionExists: async (agentSessionId) => (await store.list()).some((item) => item.id === agentSessionId),
+	sessionExists: async (agentSessionId) => existingAgentSessions.has(agentSessionId),
 	removeSession: (agentSessionId) => store.remove(agentSessionId),
 	log: (message) => app.log.warn(message),
 }).reconcile();

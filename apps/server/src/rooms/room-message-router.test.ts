@@ -25,6 +25,7 @@ class RecordingRunner implements RoomParticipantRunner {
 	constructor(private result: RoomParticipantRunnerResult = { status: "completed", finalContent: "最终结论" }) {}
 	async run(input: RoomParticipantRunnerInput): Promise<RoomParticipantRunnerResult> {
 		this.calls.push(input);
+		await input.markInputDurable();
 		return this.result;
 	}
 }
@@ -102,6 +103,7 @@ test("RoomMessageRouter: 同一房间串行，活动回合时拒绝新 normal �
 	const pending = new Promise<RoomParticipantRunnerResult>((resolve) => { release = resolve; });
 	runner.run = async (input) => {
 		runner.calls.push(input);
+		await input.markInputDurable();
 		return pending;
 	};
 	const first = await router.send({ roomSessionId: ROOM, content: "第一条", mentions: ["worker-a"], operationId: "op-message-1" });
@@ -143,7 +145,7 @@ test("RoomMessageRouter: 同键并发只有一个准入，两个请求得到同�
 test("RoomMessageRouter: 不同键并发只有一个接单", async () => {
 	const { runner, router } = await makeRouter({ bindings: "all" });
 	let release!: (result: RoomParticipantRunnerResult) => void;
-	runner.run = async () => new Promise<RoomParticipantRunnerResult>((resolve) => { release = resolve; });
+	runner.run = async (input) => { await input.markInputDurable(); return new Promise<RoomParticipantRunnerResult>((resolve) => { release = resolve; }); };
 	const results = await Promise.allSettled([
 		router.send({ roomSessionId: ROOM, content: "A", mentions: ["worker-a"], operationId: "op-message-1" }),
 		router.send({ roomSessionId: ROOM, content: "B", mentions: ["worker-a"], operationId: "op-message-2" }),
@@ -167,21 +169,25 @@ test("RoomMessageRouter: 上下文超预算时不写用户事件", async () => {
 	assert.equal((await events.read(ROOM)).length, 0);
 });
 
-test("RoomMessageRouter: runner 抛异常→unknown，close-unknown 后才写 terminal", async () => {
-	const { events, runner, router } = await makeRouter({ bindings: "all" });
-	runner.run = async () => { throw new Error("provider down"); };
-	const accepted = await router.send({ roomSessionId: ROOM, content: "执行", mentions: ["worker-a"], operationId: "op-message-1" });
-	const turn = await wait(router, accepted.turnId);
-	assert.equal(turn?.status, "unknown");
+test("RoomMessageRouter: runner 未确认输入就失败→不返回 accepted，Turn 进入 unknown", async () => {
+	const { events, turns, router } = await makeRouter({ bindings: "all" });
+	const realRunner = router as unknown as { deps: { runner: RoomParticipantRunner } };
+	realRunner.deps.runner = { run: async () => { throw new Error("provider down"); } };
+	await assert.rejects(
+		() => router.send({ roomSessionId: ROOM, content: "执行", mentions: ["worker-a"], operationId: "op-message-1" }),
+		(error: unknown) => error instanceof RoomMessageError && error.code === "message_delivery_unconfirmed",
+	);
+	const stored = await events.read(ROOM);
+	assert.equal(stored.length, 1, "用户事件已经公开，不能假装未发送");
+	const turn = (await turns.list(ROOM))[0]!;
+	assert.equal(turn.status, "unknown");
 	assert.equal((await events.read(ROOM)).length, 1, "不确定结果不能投影成终态");
 	await assert.rejects(
 		() => router.send({ roomSessionId: ROOM, content: "新消息", mentions: [], operationId: "op-message-2" }),
 		(error: unknown) => error instanceof RoomMessageError && error.code === "room_turn_active",
 	);
-	await router.closeUnknown(ROOM, accepted.turnId, "用户确认远端无活动 Run");
-	const stored = await events.read(ROOM);
-	assert.equal(stored.length, 2);
-	assert.equal(stored[1]!.kind, "terminal");
+	await router.closeUnknown(ROOM, turn.id, "用户确认远端无活动 Run");
+	assert.equal((await events.read(ROOM))[1]!.kind, "terminal");
 });
 
 test("RoomMessageRouter: mentions 非法/多目标不路由，也不写事件", async () => {

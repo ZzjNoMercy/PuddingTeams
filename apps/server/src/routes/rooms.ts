@@ -241,6 +241,39 @@ export function registerRoomsRoutes(
 		type === "group" ? { ownerAgentId: MANAGER_AGENT_NAME }
 		: type === "direct" ? { ownerAgentId: members[0]! }
 		: undefined;
+
+	/**
+	 * 任何新建 RoomSession 的最后一步：确保空 events.jsonl 与创建账本已到
+	 * attached，且对同一 Manager Session 幂等。缺账本的历史房间在这里补齐。
+	 */
+	const ensureRoomSessionRecord = async (
+		w: WindowConfig,
+		managerAgentSessionId: string,
+		opts: { roomSessionId?: string } = {},
+	): Promise<string> => {
+		const existing = await teams.participantSession(managerAgentSessionId);
+		const roomSessionId = existing?.roomSessionId ?? opts.roomSessionId ?? randomUUID();
+		if (!existing) await teams.addRoomSession(w.id, managerAgentSessionId, { roomSessionId });
+		if (roomEvents && roomOperations) {
+			await roomEvents.create(roomSessionId);
+			const ops = await roomOperations.listCreation(roomSessionId);
+			const phases = ["event_file_created", "manager_created", "manager_bound", "attached"] as const;
+			if (!ops.length) {
+				const key = `ensure-${roomSessionId}`;
+				await roomOperations.reserveCreation(roomSessionId, {
+					key, requestHash: `ensure-${roomSessionId}`, managerAgentSessionId,
+				});
+				for (const phase of phases) await roomOperations.advanceCreation(roomSessionId, key, phase);
+			} else {
+				const key = ops[0]!.key;
+				const index = phases.indexOf(ops[0]!.phase as (typeof phases)[number]);
+				for (let next = index + 1; next < phases.length; next += 1) {
+					await roomOperations.advanceCreation(roomSessionId, key, phases[next]!);
+				}
+			}
+		}
+		return roomSessionId;
+	};
 	const ensureSolo = () =>
 		teams.ensureSoloWindow(
 			async (workspaceId, cwdSnapshot) => {
@@ -804,12 +837,14 @@ export function registerRoomsRoutes(
 	});
 
 	/** 房间公开消息：服务端原子准入，执行在后台继续。 */
-	app.post<{ Params: { id: string; sid: string }; Body: { content?: unknown; mentions?: unknown; delivery?: unknown; expectedParticipantTurnId?: unknown } }>(
+	app.post<{ Params: { id: string; sid: string }; Body: { content?: unknown; mentions?: unknown; delivery?: unknown; expectedParticipantTurnId?: unknown; attachments?: unknown } }>(
 		"/api/rooms/:id/sessions/:sid/messages",
 		async (req, reply) => {
 			if (!roomRuntime) return reply.code(503).send({ error: "room session stores are not configured" });
 			const key = req.headers["idempotency-key"];
 			if (typeof key !== "string" || !key) return reply.code(428).send({ error: "发送房间消息需要 Idempotency-Key", code: "message_operation_required" });
+			if (!/^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(key)) return reply.code(400).send({ error: "Idempotency-Key 格式无效", code: "invalid_operation_key" });
+			if (req.body?.attachments !== undefined) return reply.code(400).send({ error: "房间消息附件尚未接通", code: "attachments_unsupported" });
 			if (!req.body || typeof req.body.content !== "string" || !req.body.content.trim()) return reply.code(400).send({ error: "消息正文不能为空", code: "invalid_message" });
 			const mentions = req.body.mentions ?? [];
 			if (!Array.isArray(mentions) || mentions.some((item) => typeof item !== "string")) return reply.code(400).send({ error: "mentions 必须是字符串数组", code: "invalid_mentions" });
@@ -836,10 +871,14 @@ export function registerRoomsRoutes(
 				});
 			} catch (error) {
 				if (error instanceof RoomMessageError) {
-					const status = error.code === "context_too_large" ? 422
-						: error.code === "invalid_message" || error.code === "invalid_mentions" || error.code === "invalid_delivery" ? 400
-						: 409;
-					return reply.code(status).send({ error: error.message, code: error.code });
+					const mapped = error.code === "context_too_large" ? { status: 422, code: "room_context_too_large" }
+						: error.code === "invalid_delivery" ? { status: 400, code: "room_delivery_unsupported" }
+						: error.code === "invalid_message" || error.code === "invalid_mentions" ? { status: 400, code: error.code }
+						: { status: 409, code: error.code };
+					return reply.code(mapped.status).send({ error: error.message, code: mapped.code });
+				}
+				if (error instanceof Error && (error.name === "RoomSessionRecoveryRequiredError" || error.name === "RoomOperationRecoveryRequiredError")) {
+					return reply.code(503).send({ error: error.message, code: "room_recovery_required" });
 				}
 				throw error;
 			}
@@ -857,23 +896,63 @@ export function registerRoomsRoutes(
 			if (error instanceof Error && error.name === "RoomSessionNotFoundError") events = [];
 			else return reply.code(503).send({ error: error instanceof Error ? error.message : String(error), code: "room_recovery_required" });
 		}
-		const turns = await roomTurns.list(req.params.sid);
+		let turns;
+		try { turns = await roomTurns.list(req.params.sid); }
+		catch (error) {
+			return reply.code(503).send({ error: error instanceof Error ? error.message : String(error), code: "room_recovery_required" });
+		}
 		const activeTurn = turns.find((turn) => ["admitted", "running", "waiting_input", "reconciling", "unknown"].includes(turn.status));
-		const participants = await teams.participantSessionsForRoom(req.params.sid);
+		const participants = (await teams.participantSessionsForRoom(req.params.sid)).filter((participant) => participant.state === "active");
+		const publicTurns = turns.map((turn) => ({
+			id: turn.id,
+			agentSessionId: turn.agentSessionId,
+			sourceRoomEventId: turn.sourceRoomEventId,
+			status: turn.status,
+			publicProjectionState: turn.publicProjectionState,
+			...(turn.finalContent ? { finalContent: turn.finalContent } : {}),
+			createdAt: turn.createdAt,
+			updatedAt: turn.updatedAt,
+		}));
+		const publicActiveTurn = activeTurn ? publicTurns.find((turn) => turn.id === activeTurn.id) : undefined;
+		let recoveryReason: string | undefined;
+		if (localFiles?.roomSessionsStatePath) {
+			try {
+				const marker = JSON.parse(await readFile(path.join(localFiles.roomSessionsStatePath, req.params.sid, "recovery.json"), "utf8")) as { reason?: unknown };
+				if (typeof marker.reason === "string") recoveryReason = marker.reason;
+			} catch { /* no marker */ }
+		}
+		const window = context.window;
+		const agentConfigs = new Map((await teams.listAgents()).map((agent) => [agent.name, agent]));
 		return {
 			roomId: req.params.id,
 			roomSessionId: req.params.sid,
 			events,
-			turns,
-			...(activeTurn ? { activeTurn } : {}),
-			participants: participants.map((participant) => ({
-				agentId: participant.agentId,
-				agentSessionId: participant.agentSessionId,
-				role: participant.role,
-				state: participant.state,
-			})),
+			turns: publicTurns,
+			...(publicActiveTurn ? { activeTurn: publicActiveTurn } : {}),
+			participants: participants.map((participant) => {
+				const agent = agentConfigs.get(participant.agentId);
+				return {
+					agentId: participant.agentId,
+					agentSessionId: participant.agentSessionId,
+					role: participant.role,
+					state: participant.state,
+					nativePi: Boolean(agent?.pinned || agent?.invoke?.type === "pi" || agent?.connector?.connectorId === "pi"),
+				};
+			}),
 			managerParticipantSessionId: (await teams.managerSessionForRoom(req.params.sid)) ?? null,
 			lastEventSeq: events.at(-1)?.seq ?? 0,
+			executionProjections: [],
+			queuedInputs: [],
+			activityRevision: 0,
+			capabilities: {
+				canSend: !publicActiveTurn && !recoveryReason,
+				canStop: Boolean(publicActiveTurn),
+				busyInputModes: [],
+				allowedMentions: window.members,
+				...(publicActiveTurn ? { activeParticipantTurnId: publicActiveTurn.id } : {}),
+				recoveryRequired: Boolean(recoveryReason),
+				...(recoveryReason ? { recoveryReason } : {}),
+			},
 		};
 	});
 
@@ -936,7 +1015,7 @@ export function registerRoomsRoutes(
 				const created = await sessions.create(undefined, await contextFor(current), undefined, ownerOptionsFor(current.type, current.members));
 				try {
 					if (current.type === "group") {
-						const roomSessionId = await teams.addRoomSession(current.id, created.id);
+						const roomSessionId = await ensureRoomSessionRecord(current, created.id);
 						return { session: created, workState: null, reused: false, roomSessionId };
 					}
 					await teams.addWindowSession(current.id, created.id);
@@ -976,7 +1055,7 @@ export function registerRoomsRoutes(
 						if (owner && owner.id !== w.id) throw new Error("幂等 Session 属于其他房间");
 						if (!listed && operation.phase === "reserved") await sessions.create(undefined, await contextFor(w), operation.sessionId, ownerOptionsFor(w.type, w.members));
 						if (operation.phase === "reserved") {
-							if (w.type === "group") await teams.addRoomSession(w.id, operation.sessionId);
+							if (w.type === "group") await ensureRoomSessionRecord(w, operation.sessionId);
 							else await teams.addWindowSession(w.id, operation.sessionId);
 						}
 						await sessionCreationOperations.markAttached(goalOperationId, operation.sessionId);
@@ -989,7 +1068,9 @@ export function registerRoomsRoutes(
 						if (pendingSessionCreations.get(goalOperationId) === pending) pendingSessionCreations.delete(goalOperationId);
 					}).catch(() => undefined);
 				}
-				return { session: await pending, workState: null };
+				const session = await pending;
+				const roomSessionId = w.type === "group" ? (await teams.participantSession(session.id))?.roomSessionId : undefined;
+				return { session, workState: null, ...(roomSessionId ? { roomSessionId } : {}) };
 			} catch (err) {
 				return reply.code(409).send({
 					error: err instanceof Error ? err.message : String(err),
@@ -1047,12 +1128,16 @@ export function registerRoomsRoutes(
 				: null;
 			return { session: created, workState, ...(createdRoomSessionId ? { roomSessionId: createdRoomSessionId } : {}) };
 		} catch (err) {
-			if (createdRoomSessionId) await teams.removeRoomSession(req.params.id, createdRoomSessionId).catch(() => undefined);
-			if (createdId) {
-				if (w.type !== "group") await teams.removeWindowSession(req.params.id, createdId).catch(() => undefined);
-				await sessions.remove(createdId).catch(() => undefined);
+			if (w.type === "group") {
+				// §21.1 step 7：Goal 失败保留 attached 的空 RoomSession + Manager，供原键重试；
+				// 只有 Manager Session 尚未创建时才清理事件目录。
+				if (!createdId && pendingRoomSessionId && roomEvents) await roomEvents.remove(pendingRoomSessionId).catch(() => undefined);
+			} else {
+				if (createdId) {
+					await teams.removeWindowSession(req.params.id, createdId).catch(() => undefined);
+					await sessions.remove(createdId).catch(() => undefined);
+				}
 			}
-			if (!createdId && pendingRoomSessionId && roomEvents) await roomEvents.remove(pendingRoomSessionId).catch(() => undefined);
 			if (err instanceof WorkStateOperationConflictError) return reply.code(409).send({ error: err.message, code: err.code });
 			return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
 		}
@@ -1187,6 +1272,11 @@ export function registerRoomsRoutes(
 					for (const agentSessionId of agentSessionIds) {
 						await sessions.remove(agentSessionId);
 						await workStates?.removeSession(agentSessionId);
+					}
+					if (roomEvents) await roomEvents.remove(room.roomSessionId);
+					else {
+						await roomTurns?.removeRoom(room.roomSessionId).catch(() => undefined);
+						await roomOperations?.removeRoom(room.roomSessionId).catch(() => undefined);
 					}
 					return reply.code(204).send();
 				}

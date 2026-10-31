@@ -1,4 +1,4 @@
-import { readdir, stat } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { TeamsStore } from "../store/teams.js";
 import { RoomEventStore, RoomSessionNotFoundError } from "./room-event-store.js";
@@ -64,8 +64,39 @@ export class RoomCreationReconciler {
 		const result: RoomCreationReconcileResult = { kept: 0, removed: 0, recoveryRequired: [] };
 		const ids = await this.knownRoomSessionIds();
 		for (const roomSessionId of await this.roomDirectories()) ids.add(roomSessionId);
-		for (const roomSessionId of ids) await this.reconcileOne(roomSessionId, result);
+		for (const roomSessionId of ids) {
+			try {
+				await this.reconcileOne(roomSessionId, result);
+				if (!result.recoveryRequired.some((item) => item.roomSessionId === roomSessionId)) {
+					await this.clearRecoveryMarker(roomSessionId);
+				}
+			} catch (error) {
+				// 单个房间损坏只隔离该房间，不能阻断启动。
+				result.recoveryRequired.push({ roomSessionId, reason: error instanceof Error ? error.message : String(error) });
+			}
+		}
+		for (const item of result.recoveryRequired) await this.writeRecoveryMarker(item.roomSessionId, item.reason).catch(() => undefined);
 		return result;
+	}
+
+	private recoveryPath(roomSessionId: string): string {
+		return path.join(this.deps.root, roomSessionId, "recovery.json");
+	}
+
+	async recoveryReason(roomSessionId: string): Promise<string | undefined> {
+		try {
+			const parsed = JSON.parse(await readFile(this.recoveryPath(roomSessionId), "utf8")) as { reason?: unknown };
+			return typeof parsed.reason === "string" ? parsed.reason : undefined;
+		} catch { return undefined; }
+	}
+
+	private async writeRecoveryMarker(roomSessionId: string, reason: string): Promise<void> {
+		await mkdir(path.join(this.deps.root, roomSessionId), { recursive: true, mode: 0o700 });
+		await writeFile(this.recoveryPath(roomSessionId), JSON.stringify({ roomSessionId, reason, at: new Date().toISOString() }) + "\n", { mode: 0o600 });
+	}
+
+	private async clearRecoveryMarker(roomSessionId: string): Promise<void> {
+		await rm(this.recoveryPath(roomSessionId), { force: true });
 	}
 
 	private async reconcileOne(roomSessionId: string, result: RoomCreationReconcileResult): Promise<void> {
@@ -114,8 +145,18 @@ export class RoomCreationReconciler {
 			result.recoveryRequired.push({ roomSessionId, reason: "无房间归属但预留 Manager Session 已存在" });
 			return;
 		}
-		await this.deps.events.remove(roomSessionId).catch(() => undefined);
-		if (manager) await this.deps.removeSession(manager).catch(() => undefined);
+		if (manager) {
+			try { await this.deps.removeSession(manager); }
+			catch (error) {
+				result.recoveryRequired.push({ roomSessionId, reason: `清理预留 Manager Session 失败：${error instanceof Error ? error.message : String(error)}` });
+				return;
+			}
+		}
+		try { await this.deps.events.remove(roomSessionId); }
+		catch (error) {
+			result.recoveryRequired.push({ roomSessionId, reason: `清理 RoomSession 目录失败：${error instanceof Error ? error.message : String(error)}` });
+			return;
+		}
 		this.deps.log?.(`room creation reconcile: removed orphan ${roomSessionId}`);
 		result.removed += 1;
 	}
