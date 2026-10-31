@@ -11,6 +11,27 @@ export function registerChatNavigationRoutes(app: FastifyInstance, deps: { teams
   const projects = new Map(workspaces.map(workspace => [workspace.id, workspace]));
   const items = [];
   for (const room of windows) {
+   if (room.type === "group") {
+    for (const roomSessionId of room.roomSessionIds ?? []) {
+     const roomSession = await deps.teams.roomSession(roomSessionId);
+     if (!roomSession) continue;
+     const managerSessionId = await deps.teams.managerSessionForRoom(roomSessionId);
+     const managerInfo = managerSessionId ? byId.get(managerSessionId) : undefined;
+     const flags = Object.hasOwn(state.sessions, roomSessionId) ? state.sessions[roomSessionId] : undefined;
+     const workspace = room.workspaceId ? projects.get(room.workspaceId) : undefined;
+     items.push({
+      roomId: room.id, sessionId: roomSessionId, ownerAgentId: "manager", agentName: "Manager", agentEnabled: true,
+      roomType: "group", roomName: room.name ?? "",
+      title: roomSession.customName ?? roomSession.generatedName ?? "新对话",
+      firstMessage: managerInfo?.firstMessage ?? "", modifiedAt: managerInfo?.modifiedAt ?? roomSession.createdAt,
+      workspaceId: room.workspaceId ?? null, workspaceName: workspace?.name ?? (room.workspaceId ? "已移除项目" : "默认工作目录"),
+      cwdSnapshot: room.cwdSnapshot, contextActive: true,
+      sourceSnapshotId: roomSession.sourceSnapshotId, pinned: flags?.pinned ?? false, archived: flags?.archived ?? false,
+      managerParticipantSessionId: managerSessionId,
+     });
+    }
+    continue;
+   }
    const contexts = [{ workspaceId: room.workspaceId, cwdSnapshot: room.cwdSnapshot, sessions: room.sessions, contextActive: true },
     ...Object.values(room.parkedContexts).map(context => ({ ...context, contextActive: false }))];
    const seen = new Set<string>();
@@ -39,6 +60,11 @@ export function registerChatNavigationRoutes(app: FastifyInstance, deps: { teams
   const patch = request.body;
   if (!patch || typeof patch !== "object" || Array.isArray(patch) || Object.keys(patch).length === 0
    || Object.entries(patch).some(([key, value]) => !["pinned", "archived"].includes(key) || typeof value !== "boolean")) return reply.code(400).send({ error: "只接受 pinned / archived 布尔值" });
+  const groupRoom = await deps.teams.roomSession(request.params.sessionId);
+  if (groupRoom) {
+   if (groupRoom.roomId !== request.params.roomId) return reply.code(404).send({ error: "会话不存在或不属于当前对话" });
+   return metadata.update(request.params.sessionId, patch);
+  }
   const context = await deps.teams.contextForSession(request.params.sessionId);
   if (!context || context.window.id !== request.params.roomId) return reply.code(404).send({ error: "会话不存在或不属于当前对话" });
   return metadata.update(request.params.sessionId, patch);

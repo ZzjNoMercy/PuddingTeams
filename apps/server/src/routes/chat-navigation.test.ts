@@ -52,3 +52,23 @@ test("index includes parked projects and real owners; flags never change executi
   assert.equal((await new ChatNavigationStore(path.join(dir,"nav.json")).read()).sessions["manager-old"]?.pinned,true);
  } finally { await app.close(); await rm(dir,{recursive:true,force:true}); }
 });
+
+test("group navigation 用 roomSessionId 作为行身份，flags 按房间键持久", async () => {
+ const dir = await mkdtemp(path.join(os.tmpdir(),"pt-nav-group-")); const app = Fastify();
+ try {
+  const teams = new TeamsStore({state:path.join(dir,"state"),assets:dir,managedWorkspaces:path.join(dir,"managed")},dir);
+  await teams.init();
+  await teams.upsertAgent({name:"alpha",description:"Worker",invoke:{type:"command",command:"echo",runArgs:[]}});
+  await teams.upsertAgent({name:"beta",description:"Worker",invoke:{type:"command",command:"echo",runArgs:[]}});
+  const group = await teams.createWindow({type:"group",members:["alpha","beta"],sessionId:"manager-g"});
+  const roomSessionId = group.activeRoomSessionId!;
+  registerChatNavigationRoutes(app,{teams,statePath:path.join(dir,"nav.json"),sessions:{list:async()=>[{id:"manager-g",sessionFile:"fixture",firstMessage:"hello",modifiedAt:"2026-10-15T01:00:00Z",name:"Manager"}]}});
+  const index=(await app.inject({url:"/api/chat-navigation"})).json();
+  const item=index.items.find((i:{sessionId:string})=>i.sessionId===roomSessionId);
+  assert.ok(item); assert.equal(item.roomType,"group"); assert.equal(item.managerParticipantSessionId,"manager-g");
+  assert.equal(item.workspaceName,"默认工作目录");
+  assert.equal((await app.inject({method:"PATCH",url:`/api/chat-navigation/${group.id}/${roomSessionId}`,payload:{pinned:true}})).statusCode,200);
+  assert.equal((await new ChatNavigationStore(path.join(dir,"nav.json")).read()).sessions[roomSessionId]?.pinned,true);
+  assert.equal((await app.inject({method:"PATCH",url:`/api/chat-navigation/other/${roomSessionId}`,payload:{pinned:true}})).statusCode,404);
+ } finally { await app.close(); await rm(dir,{recursive:true,force:true}); }
+});

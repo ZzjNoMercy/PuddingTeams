@@ -163,7 +163,7 @@ test("P1 HTTP: group 创建与编辑至少两位 Worker，Manager 保留原生�
 			assert.equal(updated.statusCode, 400, updated.body);
 			assert.deepEqual((await teams.getWindow(room.id))!.members, ["alpha", "beta"]);
 		}
-		const manager = await sessions.open(room.activeSession);
+		const manager = await sessions.open((await teams.managerSession(room.id))!);
 		for (const name of ["read", "grep", "find", "ls", "edit", "write", "bash"]) assert.ok(manager.getActiveToolNames().includes(name));
 		assert.equal(manager.messages.filter((entry) => entry.role === "user").length, 0, "creating a group does not execute a first task");
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }

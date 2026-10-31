@@ -154,6 +154,23 @@ async function buildWindowSummary(
 		: await isWorkspaceDirectoryAvailable(w.cwdSnapshot, w.cwdSnapshot);
 	// 窗口名：自定义名优先，否则按类型派生（"与 X 单聊"等）。active session 的
 	// LLM 标题不混入窗口名——侧栏/头部把它作为第二行的会话上下文展示。
+	const roomSummaries = w.type === "group"
+		? await Promise.all((w.roomSessionIds ?? []).map(async (roomSessionId) => {
+			const room = await teams.roomSession(roomSessionId);
+			const manager = await teams.managerSessionForRoom(roomSessionId);
+			const info = manager ? byId.get(manager) : undefined;
+			return {
+				id: roomSessionId,
+				name: room?.customName ?? room?.generatedName ?? "",
+				firstMessage: info?.firstMessage ?? "新对话",
+				modifiedAt: info?.modifiedAt ?? room?.createdAt ?? "",
+				active: w.activeRoomSessionId === roomSessionId,
+				managerParticipantSessionId: manager,
+				model: info?.model,
+				thinkingLevel: info?.thinkingLevel,
+			};
+		}))
+		: undefined;
 	return {
 		id: w.id,
 		type: w.type,
@@ -166,7 +183,7 @@ async function buildWindowSummary(
 		readRevision: read.readRevision,
 		hasUnreadActivity: read.hasUnreadActivity,
 		members,
-		sessions: ids.map((id) => {
+		sessions: roomSummaries ?? ids.map((id) => {
 			const info = byId.get(id);
 			return {
 				id,
@@ -179,7 +196,7 @@ async function buildWindowSummary(
 				thinkingLevel: info?.thinkingLevel,
 			};
 		}),
-		activeSession: active,
+		activeSession: w.type === "group" ? (w.activeRoomSessionId ?? "") : active,
 		...(w.type === "group" ? {
 			activeRoomSessionId: w.activeRoomSessionId,
 			roomSessionIds: [...(w.roomSessionIds ?? [])],
