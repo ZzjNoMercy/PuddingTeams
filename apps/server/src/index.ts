@@ -900,7 +900,8 @@ const conversationSnapshots = new ConversationSnapshots(path.join(paths.state, "
 const sessionForks = new SessionForks(teams, store, invoker, conversationSnapshots, new ForkOperations(path.join(paths.state,"fork-operations.json")), [paths.uploads,path.join(paths.state,"large-worker-results"),conversationSnapshots.root]);
 await sessionForks.recover();
 registerSessionForkRoutes(app,sessionForks);
-registerChatNavigationRoutes(app, { teams, sessions: store, statePath: path.join(paths.state, "chat-navigation.json"), roomActivity: new RoomActivityStore(path.join(paths.state, "room-session-activity.json")), roomEvents: roomEventStore });
+const roomActivityStore = new RoomActivityStore(path.join(paths.state, "room-session-activity.json"));
+registerChatNavigationRoutes(app, { teams, sessions: store, statePath: path.join(paths.state, "chat-navigation.json"), roomActivity: roomActivityStore, roomEvents: roomEventStore });
 await registerRoomsRoutes(app, store, teams, invoker, workStates, {
 	attachmentRoot: paths.uploads,
  snapshotAssetRoot:conversationSnapshots.root,
@@ -910,6 +911,7 @@ await registerRoomsRoutes(app, store, teams, invoker, workStates, {
 	sessionCreationStatePath: path.join(paths.state, "session-creation-operations.json"),
 	roomSessionsStatePath: path.join(paths.state, "room-sessions"),
 	roomActivityStatePath: path.join(paths.state, "room-session-activity.json"),
+	roomActivityStore,
 	roomForkStatePath: path.join(paths.state, "room-fork-operations.json"),
 	chatNavigationStatePath: path.join(paths.state, "chat-navigation.json"),
 });

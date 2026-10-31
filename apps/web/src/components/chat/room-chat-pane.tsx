@@ -173,7 +173,9 @@ export function RoomChatPane({
 
 	const activeTurn = timeline?.activeTurn;
 	const recoveryRequired = Boolean(timeline?.capabilities.recoveryRequired);
-	const canSend = Boolean(roomSessionId) && !recoveryRequired && !sending;
+	const activeBusyInputs = timeline?.capabilities.busyInputModes ?? [];
+	const canFollowUp = !activeTurn || activeBusyInputs.includes("followUp");
+	const canSend = Boolean(roomSessionId) && !recoveryRequired && !sending && canFollowUp;
 	const labels = useMemo(() => {
 		const map = new Map<string, string>();
 		for (const member of room.members) map.set(member.name, agentDisplayName(member));
@@ -228,6 +230,7 @@ export function RoomChatPane({
 		try {
 			const forked = await forkRoomSession(room.id, roomSessionId, { operationKey });
 			forkKeyRef.current = null;
+			await setActiveRoomSession(room.id, forked.roomSessionId);
 			const updated = await getRoom(room.id);
 			onRoomUpdated?.(updated);
 			onSessionActivated?.(updated);
@@ -358,7 +361,7 @@ export function RoomChatPane({
 							void handleSend();
 						}
 					}}
-					placeholder={activeTurn ? "当前回合进行中；发送会作为 followUp 追加" : "输入消息，Enter 发送，Shift+Enter 换行"}
+					placeholder={activeTurn ? (canFollowUp ? "当前回合进行中；发送会作为 followUp 追加" : "当前 Participant 忙碌且不支持追问") : "输入消息，Enter 发送，Shift+Enter 换行"}
 					disabled={!canSend}
 					className="min-h-[72px]"
 				/>

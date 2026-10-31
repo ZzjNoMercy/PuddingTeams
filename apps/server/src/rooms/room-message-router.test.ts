@@ -339,3 +339,27 @@ test("RoomMessageRouter: queued followUp 先返回 pending，watcher durable 后
 	assert.equal(stored.filter((event) => event.kind === "message").length, 3, "watcher durable 后 final 才能投影");
 	assert.equal((await turns.get(ROOM, first.turnId))?.status, "completed");
 });
+
+test("RoomMessageRouter: 不支持 followUp 时在写 RoomEvent 之前拒绝", async () => {
+	const { events, turns, router } = await makeRouter({ bindings: "all" });
+	let release!: () => void;
+	const pending = new Promise<void>((resolve) => { release = resolve; });
+	const runner: RoomParticipantRunner = {
+		run: async (input) => { await input.markInputDurable("initial"); await pending; return { status: "completed", finalContent: "完成" }; },
+		supportsFollowUp: async () => false,
+	};
+	(router as unknown as { deps: { runner: RoomParticipantRunner } }).deps.runner = runner;
+	const first = await router.send({ roomSessionId: ROOM, content: "开始", mentions: ["worker-a"], operationId: "op-unsupported-1" });
+	await assert.rejects(
+		() => router.send({
+			roomSessionId: ROOM, content: "追问", mentions: ["worker-a"], operationId: "op-unsupported-2",
+			delivery: "followUp", expectedParticipantTurnId: first.turnId,
+		}),
+		(error: unknown) => error instanceof RoomMessageError && error.code === "participant_delivery_unsupported",
+	);
+	const stored = await events.read(ROOM);
+	assert.equal(stored.length, 1, "被拒绝的 followUp 不得写公共事件");
+	assert.equal((await turns.get(ROOM, first.turnId))?.inputs.length, 1, "不得残留 pending 输入");
+	release();
+	await wait(router, first.turnId);
+});

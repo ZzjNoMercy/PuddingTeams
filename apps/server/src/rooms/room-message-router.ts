@@ -81,6 +81,8 @@ export interface RoomParticipantRunner {
 	run(input: RoomParticipantRunnerInput): Promise<RoomParticipantRunnerResult>;
 	/** 原生 followUp：应把输入交给同一 Agent 会话队列，不另起 runner。 */
 	followUp?(input: RoomParticipantFollowUpInput): Promise<"durable" | "queued">;
+	/** 写 RoomEvent 之前先判定该 Participant 是否支持 followUp。 */
+	supportsFollowUp?(binding: ParticipantBinding): Promise<boolean>;
 }
 
 export interface RoomContextBudget {
@@ -240,7 +242,8 @@ export class RoomMessageRouter {
 				if (input.mentions.length > 0 && !input.mentions.includes(binding.agentId)) {
 					throw new RoomMessageError("invalid_delivery", `followUp 的 mentions 必须指向当前 Participant: ${binding.agentId}`);
 				}
-				if (!this.deps.runner.followUp) {
+				if (!this.deps.runner.followUp
+					|| (this.deps.runner.supportsFollowUp && !(await this.deps.runner.supportsFollowUp(binding)))) {
 					throw new RoomMessageError("participant_delivery_unsupported", "当前 Participant 不支持原生 followUp");
 				}
 				const eventId = randomUUID();
@@ -455,22 +458,29 @@ export class RoomMessageRouter {
 				return;
 			}
 			if (result.status === "completed" && result.finalContent?.trim()) {
-				await withRoomAdmissionLock(roomSessionId, async () => {
+				// 等待排队输入不能持有房间准入锁：否则长 delegation 期间所有发送都被挂起。
+				while (true) {
 					const ready = await this.waitForDurableInputs(roomSessionId, turnId);
 					if (!ready) {
 						const unknown = await this.deps.turnService.markUnknown(roomSessionId, turnId, "followUp 输入未在超时内落盘");
 						this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(unknown) });
 						return;
 					}
-					const completed = await this.deps.turnService.complete(roomSessionId, turnId, result.finalContent!);
-					const projection = await this.deps.turnService.project(roomSessionId, completed.id);
-					if (projection.event) {
-						this.deps.bus?.publish(roomSessionId, { type: "room_event", event: projection.event });
-						await this.recordActivity(roomSessionId, projection.event);
-					}
-					this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(projection.turn) });
-				});
-				return;
+					const finished = await withRoomAdmissionLock(roomSessionId, async () => {
+						const latest = await this.deps.turns.get(roomSessionId, turnId);
+						if (!latest || !["admitted", "running", "waiting_input", "reconciling"].includes(latest.status)) return true;
+						if (latest.inputs.some((input) => input.persistence !== "durable")) return false;
+						const completed = await this.deps.turnService.complete(roomSessionId, turnId, result.finalContent!);
+						const projection = await this.deps.turnService.project(roomSessionId, completed.id);
+						if (projection.event) {
+							this.deps.bus?.publish(roomSessionId, { type: "room_event", event: projection.event });
+							await this.recordActivity(roomSessionId, projection.event);
+						}
+						this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(projection.turn) });
+						return true;
+					});
+					if (finished) return;
+				}
 			}
 			if (result.status === "cancelled") {
 				const cancelled = await this.deps.turnService.cancel(roomSessionId, turnId, result.terminalReason ?? "用户取消", result.finalContent);

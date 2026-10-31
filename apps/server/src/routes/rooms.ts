@@ -261,6 +261,7 @@ export function registerRoomsRoutes(
 		/** state/room-sessions 根目录；用于 RoomEvent / 创建账本。 */
 		roomSessionsStatePath?: string;
 		roomActivityStatePath?: string;
+		roomActivityStore?: RoomActivityStore;
 		roomForkStatePath?: string;
 		/** 测试/宿主替换房间 runner。 */
 		roomRunner?: RoomParticipantRunner;
@@ -269,10 +270,7 @@ export function registerRoomsRoutes(
 	const activityProjector = new RoomActivityProjector(localFiles?.activityStatePath);
 	const sessionCreationOperations = localFiles?.sessionCreationStatePath
 		? new SessionCreationOperations(localFiles.sessionCreationStatePath) : null;
-	const roomEvents = localFiles?.roomSessionsStatePath ? new RoomEventStore(localFiles.roomSessionsStatePath, { attachmentRoot: localFiles.attachmentRoot }) : undefined;
-	const roomOperations = localFiles?.roomSessionsStatePath ? new RoomOperationStore(localFiles.roomSessionsStatePath) : undefined;
-	const roomTurns = localFiles?.roomSessionsStatePath ? new ParticipantTurnStore(localFiles.roomSessionsStatePath) : undefined;
-	const roomActivity = localFiles?.roomActivityStatePath ? new RoomActivityStore(localFiles.roomActivityStatePath) : undefined;
+	const roomActivity = localFiles?.roomActivityStore ?? (localFiles?.roomActivityStatePath ? new RoomActivityStore(localFiles.roomActivityStatePath) : undefined);
 	const roomForks = localFiles?.roomForkStatePath ? new RoomForkStore(localFiles.roomForkStatePath) : undefined;
 	const roomRuntime = localFiles?.roomSessionsStatePath
 		? createRoomRuntime({
@@ -280,6 +278,10 @@ export function registerRoomsRoutes(
 			runner: localFiles.roomRunner, attachmentRoot: localFiles.attachmentRoot, activity: roomActivity,
 		})
 		: undefined;
+	// 路由与 runtime 共用同一组 store 实例，避免 turns/operations 的实例内队列互相覆盖。
+	const roomEvents = roomRuntime?.events ?? (localFiles?.roomSessionsStatePath ? new RoomEventStore(localFiles.roomSessionsStatePath, { attachmentRoot: localFiles.attachmentRoot }) : undefined);
+	const roomOperations = roomRuntime?.operations ?? (localFiles?.roomSessionsStatePath ? new RoomOperationStore(localFiles.roomSessionsStatePath) : undefined);
+	const roomTurns = roomRuntime?.turns ?? (localFiles?.roomSessionsStatePath ? new ParticipantTurnStore(localFiles.roomSessionsStatePath) : undefined);
 	const summarize = (w: WindowConfig) => buildWindowSummary(sessions, teams, w, activityProjector, roomActivity);
 	const pendingSessionCreations = new Map<string, Promise<Awaited<ReturnType<PiSessionStore["create"]>>>>();
 	const pendingNewWork = new Map<string, Promise<{ sessionId: string; accepted: boolean }>>();
@@ -943,7 +945,6 @@ export function registerRoomsRoutes(
 			const context = await teams.contextForRoomSession(req.params.sid);
 			if (!context || context.window.id !== req.params.id) return reply.code(404).send({ error: "room session not found", code: "room_session_not_found" });
 			let attachments: Array<{ name: string; path: string; mediaType: string; size: number; sha256: string; kind: "file" | "image" }> | undefined;
-			let discardAttachments: (() => Promise<void>) | undefined;
 			if (Array.isArray(req.body.attachments) && req.body.attachments.length > 0) {
 				if (!localFiles?.uploads) return reply.code(503).send({ error: "附件存储未配置", code: "attachments_unavailable" });
 				try {
@@ -958,7 +959,6 @@ export function registerRoomsRoutes(
 							kind: identity.mediaType.startsWith("image/") ? "image" as const : "file" as const,
 						};
 					});
-					discardAttachments = async () => { await localFiles.uploads!.discard(req.params.sid, stored); };
 				} catch (error) {
 					return reply.code(400).send({ error: error instanceof Error ? error.message : String(error), code: "invalid_attachments" });
 				}
@@ -981,8 +981,6 @@ export function registerRoomsRoutes(
 				});
 			} catch (error) {
 				if (error instanceof RoomMessageError) {
-					const keepAttachments = error.code === "message_delivery_unconfirmed";
-					if (!keepAttachments) await discardAttachments?.().catch(() => undefined);
 					const mapped = error.code === "context_too_large" ? { status: 422, code: "room_context_too_large" }
 						: error.code === "invalid_delivery" ? { status: 400, code: "room_delivery_unsupported" }
 						: error.code === "invalid_message" || error.code === "invalid_mentions" ? { status: 400, code: error.code }
@@ -1739,9 +1737,14 @@ export function registerRoomsRoutes(
 					const room = await teams.roomSession(req.params.sid);
 					if (!room) {
 						const participant = await teams.participantSession(req.params.sid);
+						if (participant && participant.roomId !== req.params.id) return reply.code(404).send({ error: "session not found in window" });
 						if (participant) return reply.code(409).send({ error: "Participant Session 由房间管理；请删除 RoomSession", code: "participant_session_managed" });
 						return reply.code(404).send({ error: "session not found in window" });
 					}
+					if (room.roomId !== req.params.id) return reply.code(404).send({ error: "room session not found" });
+					const activeTurn = (await roomTurns?.list(room.roomSessionId) ?? []).find((turn) =>
+						["admitted", "running", "waiting_input", "reconciling", "unknown"].includes(turn.status));
+					if (activeTurn) return reply.code(409).send({ error: `房间回合进行中，不能删除：${activeTurn.id}`, code: "room_turn_active" });
 					const participants = await teams.participantSessionsForRoom(room.roomSessionId);
 					// 先收敛各 Participant 的 Run/Delegation/审批；失败则不删任何文件。
 					if (invoker) {
