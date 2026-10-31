@@ -41,15 +41,22 @@ export class PiParticipantRunner implements RoomParticipantRunner {
 	async run(input: RoomParticipantRunnerInput): Promise<RoomParticipantRunnerResult> {
 		const session = await this.deps.sessions.open(input.binding.agentSessionId) as unknown as {
 			messages: MessageLike[];
-			prompt(text: string): Promise<void>;
+			prompt(text: string, options?: { preflightResult?: (disposition: unknown) => void }): Promise<void>;
 		};
 		const start = session.messages.length;
 		try {
-			// prompt() 先同步把 user input 交给 SDK，再进入模型执行；在调用边界
-			// 确认 durable，避免等整轮结束才放行 HTTP accepted。
-			const prompt = session.prompt(input.prompt);
+			// preflightResult 在 SDK 接受输入（started/queued）时同步触发；只有
+			// 接受后才推进 watermark，避免把被拒绝的 prompt 当成 durable。
+			let accepted!: () => void;
+			const acceptedInput = new Promise<void>((resolve) => { accepted = resolve; });
+			const prompt = session.prompt(input.prompt, { preflightResult: () => accepted() });
+			const outcome = await Promise.race([
+				acceptedInput.then(() => "accepted" as const),
+				prompt.then(() => "finished" as const, () => "failed" as const),
+			]);
+			if (outcome === "failed") throw new Error("Agent 拒绝了房间输入");
 			await input.markInputDurable();
-			await prompt;
+			if (outcome === "accepted") await prompt;
 		} catch (error) {
 			return { status: "failed", terminalReason: error instanceof Error ? error.message : String(error) };
 		}

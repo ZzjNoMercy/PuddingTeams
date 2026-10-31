@@ -761,7 +761,7 @@ test("v4 HTTP: RoomSession Goal 归属 Manager PS，幂等且公开房间身份"
 		const read = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/goal` });
 		assert.equal(read.json().goal.goalId, goalId);
 		const revision = createdGoal.json().goal.revision as number;
-		await workStates.abandonGoal(manager, revision, { kind: "user", by: "web-user", reason: "房间放弃" }, randomUUID(), goalId);
+		await workStates.abandonGoal(manager, revision, { kind: "user_abandoned", by: "web-user", reason: "房间放弃" }, randomUUID(), goalId);
 		assert.equal((await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/goal` })).json().goal, null);
 		const nextGoal = await app.inject({
 			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/goal`,

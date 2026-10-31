@@ -171,3 +171,18 @@ test("Pi/Direct runner 在真实发送边界调用 markInputDurable", async () =
 	await direct.run(directInput);
 	assert.equal(directDurable, 1);
 });
+
+test("PiParticipantRunner: SDK 拒绝 prompt 时不推进 durability", async () => {
+	let durable = 0;
+	const runner = new PiParticipantRunner({
+		sessions: {
+			open: async () => ({
+				messages: [],
+				prompt: async () => { throw new Error("no api key"); },
+			}),
+		} as never,
+	});
+	const result = await runner.run({ ...runnerInput, markInputDurable: async () => { durable += 1; } });
+	assert.equal(result.status, "failed");
+	assert.equal(durable, 0);
+});
