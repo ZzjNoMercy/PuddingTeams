@@ -51,6 +51,7 @@ async function makeStack(roomRunner?: { run: (input: { markInputDurable(): Promi
 		sessionCreationStatePath: path.join(dir, "state", "session-creation-operations.json"),
 		roomSessionsStatePath: path.join(dir, "state", "room-sessions"),
 		roomActivityStatePath: path.join(dir, "state", "room-session-activity.json"),
+		roomForkStatePath: path.join(dir, "state", "room-fork-operations.json"),
 		roomRunner: roomRunner ?? { run: async (input) => { await input.markInputDurable(); return { status: "completed" as const, finalContent: "房间结论" }; } },
 	});
 	return { app, teams, sessions, delegations, invoker, dir, workerSessionDir };
@@ -680,4 +681,41 @@ test("v4 HTTP: Fork 在活动回合时 409，附件复制到目标命名空间",
 		rmSync(path.join(dir, "uploads", roomSessionId), { recursive: true, force: true });
 		assert.equal(readFileSync(copiedPath, "utf8"), "x");
 	} finally { release(); await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("v4 HTTP: Fork 幂等键重放同一目标，fork-targets 列截断点", async () => {
+	const { app, teams, sessions, dir } = await makeStack();
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		const room = created.json().room as RoomSummary;
+		const sourceId = room.roomSessionIds![0]!;
+		await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${sourceId}/messages`,
+			headers: { "idempotency-key": randomUUID() }, payload: { content: "原始问题", mentions: ["alpha"] },
+		});
+		for (let attempt = 0; attempt < 50; attempt += 1) {
+			const timeline = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${sourceId}/timeline` });
+			if (timeline.json().events.length >= 2) break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		const targets = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${sourceId}/fork-targets` });
+		assert.equal(targets.statusCode, 200, targets.body);
+		assert.equal(targets.json().lastEventSeq, 2);
+		assert.equal(targets.json().targets.length, 2);
+
+		const key = randomUUID();
+		const first = await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions/${sourceId}/fork`, headers: { "idempotency-key": key }, payload: {} });
+		assert.equal(first.statusCode, 201, first.body);
+		const targetId = first.json().roomSessionId as string;
+		const replay = await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions/${sourceId}/fork`, headers: { "idempotency-key": key }, payload: {} });
+		assert.equal(replay.statusCode, 200, replay.body);
+		assert.equal(replay.json().roomSessionId, targetId);
+		assert.equal(replay.json().replayed, true);
+		assert.equal((await teams.getWindow(room.id))!.roomSessionIds!.length, 2);
+		assert.equal((await app.inject({ method: "DELETE", url: `/api/rooms/${room.id}/sessions/${targetId}` })).statusCode, 204);
+		const gone = await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions/${sourceId}/fork`, headers: { "idempotency-key": key }, payload: {} });
+		assert.equal(gone.statusCode, 409, gone.body);
+		assert.equal(gone.json().code, "fork_target_gone");
+	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });

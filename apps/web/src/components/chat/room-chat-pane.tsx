@@ -60,6 +60,7 @@ export function RoomChatPane({
 	const loading = timeline === null && error === null;
 	const [draft, setDraft] = useState("");
 	const [sending, setSending] = useState(false);
+	const [forking, setForking] = useState(false);
 	const [targetAgentId, setTargetAgentId] = useState<string | null>(null);
 	const bottomRef = useRef<HTMLDivElement | null>(null);
 
@@ -171,15 +172,16 @@ export function RoomChatPane({
 
 	const handleFork = useCallback(async () => {
 		if (!roomSessionId) return;
+		setForking(true);
 		try {
-			const forked = await forkRoomSession(room.id, roomSessionId);
+			const forked = await forkRoomSession(room.id, roomSessionId, { operationKey: crypto.randomUUID() });
 			const updated = await getRoom(room.id);
 			onRoomUpdated?.(updated);
 			onSessionActivated?.(updated);
 			setRoomSessionId(forked.roomSessionId);
 		} catch (caught) {
 			toast.error(caught instanceof Error ? caught.message : String(caught));
-		}
+		} finally { setForking(false); }
 	}, [onRoomUpdated, onSessionActivated, room.id, roomSessionId]);
 
 	const handleSessionChange = useCallback(async (nextRoomSessionId: string) => {
@@ -210,7 +212,7 @@ export function RoomChatPane({
 					</SelectContent>
 				</Select>
 				<div className="ml-auto flex items-center gap-2">
-					<Button size="sm" variant="outline" disabled={Boolean(activeTurn)} onClick={() => void handleFork()}>Fork</Button>
+					<Button size="sm" variant="outline" disabled={Boolean(activeTurn) || forking} onClick={() => void handleFork()}>{forking ? "Fork 中…" : "Fork"}</Button>
 					{activeTurn ? <Button size="sm" variant="outline" onClick={() => void handleStop()}>停止</Button> : null}
 					{activeTurn && ["unknown", "reconciling"].includes(activeTurn.status)
 						? <Button size="sm" variant="outline" onClick={() => void handleCloseUnknown()}>确认无运行</Button> : null}

@@ -2736,13 +2736,21 @@ export async function sendRoomMessage(
 	return { accepted: true, roomEventId: body!.roomEventId!, participantTurnId: body!.participantTurnId! };
 }
 
-export async function forkRoomSession(roomId: string, roomSessionId: string, options: { throughEventSeq?: number; name?: string } = {}): Promise<{ roomSessionId: string; managerAgentSessionId: string }> {
+export async function forkRoomSession(roomId: string, roomSessionId: string, options: { throughEventSeq?: number; name?: string; operationKey?: string } = {}): Promise<{ roomSessionId: string; managerAgentSessionId: string }> {
+	const { operationKey, ...payload } = options;
 	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(roomSessionId)}/fork`, {
-		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(options),
+		method: "POST", headers: { "content-type": "application/json", ...(operationKey ? { "idempotency-key": operationKey } : {}) }, body: JSON.stringify(payload),
 	});
 	const body = (await res.json().catch(() => null)) as { roomSessionId?: string; managerAgentSessionId?: string; error?: string } | null;
 	if (!res.ok) throw new Error(body?.error ?? `fork room session failed: ${res.status}`);
 	return { roomSessionId: body!.roomSessionId!, managerAgentSessionId: body!.managerAgentSessionId! };
+}
+
+export async function fetchForkTargets(roomId: string, roomSessionId: string): Promise<Array<{ eventId: string; seq: number; kind: string; contentPreview: string; createdAt: string; hasAttachments: boolean }>> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(roomSessionId)}/fork-targets`);
+	const body = (await res.json().catch(() => null)) as { targets?: Array<{ eventId: string; seq: number; kind: string; contentPreview: string; createdAt: string; hasAttachments: boolean }>; error?: string } | null;
+	if (!res.ok) throw new Error(body?.error ?? `load fork targets failed: ${res.status}`);
+	return body?.targets ?? [];
 }
 
 export async function searchRoomEvents(roomId: string, roomSessionId: string, query: string, limit = 20): Promise<Array<{ eventId: string; seq: number; kind: string; content: string; createdAt: string }>> {

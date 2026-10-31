@@ -20,6 +20,7 @@ import { identifyUploads, type FirstMessagePathReference, type UploadInput, type
 import { internalFirstWorkFreezeToken, isWithin, localPathReferences } from "./chat.js";
 import { RoomEventStore, type RoomEvent } from "../rooms/room-event-store.js";
 import { RoomActivityStore } from "../rooms/room-activity-store.js";
+import { RoomForkStore } from "../rooms/room-fork-store.js";
 import { RoomOperationStore } from "../rooms/room-operation-store.js";
 import { ParticipantTurnStore } from "../rooms/participant-turn-store.js";
 import { createRoomRuntime } from "../rooms/room-runtime.js";
@@ -260,6 +261,7 @@ export function registerRoomsRoutes(
 		/** state/room-sessions 根目录；用于 RoomEvent / 创建账本。 */
 		roomSessionsStatePath?: string;
 		roomActivityStatePath?: string;
+		roomForkStatePath?: string;
 		/** 测试/宿主替换房间 runner。 */
 		roomRunner?: RoomParticipantRunner;
 	},
@@ -271,6 +273,7 @@ export function registerRoomsRoutes(
 	const roomOperations = localFiles?.roomSessionsStatePath ? new RoomOperationStore(localFiles.roomSessionsStatePath) : undefined;
 	const roomTurns = localFiles?.roomSessionsStatePath ? new ParticipantTurnStore(localFiles.roomSessionsStatePath) : undefined;
 	const roomActivity = localFiles?.roomActivityStatePath ? new RoomActivityStore(localFiles.roomActivityStatePath) : undefined;
+	const roomForks = localFiles?.roomForkStatePath ? new RoomForkStore(localFiles.roomForkStatePath) : undefined;
 	const roomRuntime = localFiles?.roomSessionsStatePath
 		? createRoomRuntime({
 			root: localFiles.roomSessionsStatePath, teams, sessions, invoker,
@@ -1092,6 +1095,22 @@ export function registerRoomsRoutes(
 		},
 	);
 
+	/** Fork 可选截断点：列出公开事件，UI 用于选择 throughEventSeq。 */
+	app.get<{ Params: { id: string; sid: string } }>("/api/rooms/:id/sessions/:sid/fork-targets", async (req, reply) => {
+		if (!roomEvents) return reply.code(503).send({ error: "room session stores are not configured" });
+		const context = await teams.contextForRoomSession(req.params.sid);
+		if (!context || context.window.id !== req.params.id) return reply.code(404).send({ error: "room session not found", code: "room_session_not_found" });
+		let events;
+		try { events = await roomEvents.read(req.params.sid); }
+		catch (error) { return reply.code(503).send({ error: error instanceof Error ? error.message : String(error), code: "room_recovery_required" }); }
+		const targets = events.map((event) => ({
+			eventId: event.id, seq: event.seq, kind: event.kind, actor: event.actor,
+			contentPreview: event.content.slice(0, 160), createdAt: event.createdAt,
+			hasAttachments: Boolean(event.attachments?.length),
+		}));
+		return { roomSessionId: req.params.sid, lastEventSeq: events.at(-1)?.seq ?? 0, targets };
+	});
+
 	/** 从 RoomSession 的公开事件 fork 出新房间会话（新 Manager、不复制私有执行历史）。 */
 	app.post<{ Params: { id: string; sid: string }; Body: { throughEventSeq?: unknown; name?: unknown } }>(
 		"/api/rooms/:id/sessions/:sid/fork",
@@ -1112,16 +1131,44 @@ export function registerRoomsRoutes(
 			catch (error) { return reply.code(503).send({ error: error instanceof Error ? error.message : String(error), code: "room_recovery_required" }); }
 			const cutoffSeq = throughSeq === undefined ? (sourceEvents.at(-1)?.seq ?? 0) : throughSeq as number;
 			if (cutoffSeq > (sourceEvents.at(-1)?.seq ?? 0)) return reply.code(400).send({ error: "throughEventSeq 超出房间末条事件", code: "invalid_cutoff" });
+			const operationKeyHeader = req.headers["idempotency-key"];
+			if (operationKeyHeader !== undefined && (typeof operationKeyHeader !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(operationKeyHeader))) {
+				return reply.code(400).send({ error: "Idempotency-Key 格式无效", code: "invalid_operation_key" });
+			}
+			const operationKey = typeof operationKeyHeader === "string" ? operationKeyHeader : undefined;
+			if (operationKey && roomForks) {
+				const existing = await roomForks.get(operationKey);
+				if (existing) {
+					if (existing.sourceRoomSessionId !== req.params.sid || existing.throughEventSeq !== cutoffSeq) {
+						return reply.code(409).send({ error: "同一 Fork 键已用于不同源/截断", code: "fork_operation_conflict" });
+					}
+					if (existing.phase !== "attached") return reply.code(409).send({ error: "Fork 尚未完成；请稍后重试", code: "fork_in_progress" });
+					const existingRoom = await teams.roomSession(existing.targetRoomSessionId);
+					if (!existingRoom) return reply.code(409).send({ error: "Fork 目标已删除", code: "fork_target_gone" });
+					return { roomSessionId: existing.targetRoomSessionId, managerAgentSessionId: existing.managerAgentSessionId, replayed: true };
+				}
+			}
 			const managerSessionId = randomUUID();
 			const roomSessionId = randomUUID();
+			let reservedFork = false;
 			let createdSession: Awaited<ReturnType<PiSessionStore["create"]>> | undefined;
 			try {
+				if (operationKey && roomForks) {
+					const reserved = await roomForks.reserve({
+						key: operationKey, sourceRoomSessionId: req.params.sid, throughEventSeq: cutoffSeq,
+						targetRoomSessionId: roomSessionId, managerAgentSessionId: managerSessionId,
+					});
+					reservedFork = reserved.created;
+					if (!reserved.created) return reply.code(409).send({ error: "Fork 键已被占用", code: "fork_operation_conflict" });
+				}
 				createdSession = await sessions.create(undefined, await contextFor(source.window), managerSessionId, { ownerAgentId: MANAGER_AGENT_NAME });
 				await roomEvents.fork(req.params.sid, roomSessionId, { throughSeq: cutoffSeq });
 				await ensureRoomSessionRecord(source.window, createdSession.id, { roomSessionId });
 				if (name) await teams.renameRoomSession(roomSessionId, name);
+				if (operationKey && roomForks) await roomForks.markAttached(operationKey);
 				return reply.code(201).send({ roomSessionId, managerAgentSessionId: createdSession.id });
 			} catch (error) {
+				if (reservedFork && operationKey && roomForks) await roomForks.remove(operationKey).catch(() => undefined);
 				// addRoomSession 可能已提交但后续 ledger 失败；无条件尝试按房间回滚。
 				await teams.removeRoomSession(req.params.id, roomSessionId).catch(() => undefined);
 				await roomEvents.remove(roomSessionId).catch(() => undefined);
