@@ -35,11 +35,13 @@ export function RoomChatPane({
 	requestedSessionId,
 	onRoomUpdated,
 	onSessionActivated,
+	onInvalidRequestedSession,
 }: {
 	room: RoomSummary;
 	requestedSessionId?: string | null;
 	onRoomUpdated?: (room: RoomSummary) => void;
 	onSessionActivated?: (room: RoomSummary) => void;
+	onInvalidRequestedSession?: (roomId: string, sessionId: string) => void;
 }) {
 	const roomSessions = useMemo(() => room.roomSessions ?? [], [room.roomSessions]);
 	const resolveSessionId = useCallback(() => {
@@ -83,7 +85,12 @@ export function RoomChatPane({
 
 	useEffect(() => {
 		if (!roomSessionId) return;
-		const socket = new WebSocket(roomTimelineWsUrl(room.id, roomSessionId));
+		let disposed = false;
+		let socket: WebSocket | undefined;
+		let retry = 0;
+		let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+		const connect = () => {
+		socket = new WebSocket(roomTimelineWsUrl(room.id, roomSessionId));
 		socket.onmessage = (message) => {
 			try {
 				const payload = JSON.parse(message.data as string) as {
@@ -121,8 +128,20 @@ export function RoomChatPane({
 				if (payload.type === "error" && payload.message) setError(payload.message);
 			} catch { /* ignore malformed frame */ }
 		};
+		socket.onopen = () => { retry = 0; void load(); };
 		socket.onerror = () => setError("房间实时连接失败");
-		return () => socket.close();
+		socket.onclose = () => {
+			if (disposed) return;
+			reconnectTimer = setTimeout(connect, Math.min(1000 * 2 ** retry, 10_000));
+			retry += 1;
+		};
+		};
+		connect();
+		return () => {
+			disposed = true;
+			if (reconnectTimer) clearTimeout(reconnectTimer);
+			socket?.close();
+		};
 	}, [load, room.id, roomSessionId]);
 
 	useEffect(() => { bottomRef.current?.scrollIntoView({ block: "end" }); }, [timeline?.events.length, timeline?.activeTurn?.status]);
@@ -196,6 +215,15 @@ export function RoomChatPane({
 			toast.error(caught instanceof Error ? caught.message : String(caught));
 		}
 	}, [onRoomUpdated, onSessionActivated, room.id]);
+
+	const requestedResolved = !requestedSessionId
+		|| roomSessions.some((item) => item.roomSessionId === requestedSessionId || item.managerParticipantSessionId === requestedSessionId);
+	if (requestedSessionId && !requestedResolved) {
+		return <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center text-sm text-muted-foreground">
+			<p>指定的房间会话已不存在。</p>
+			<Button size="sm" variant="outline" onClick={() => onInvalidRequestedSession?.(room.id, requestedSessionId)}>回到当前会话</Button>
+		</div>;
+	}
 
 	if (!roomSessions.length) {
 		return <div className="flex flex-1 items-center justify-center px-6 text-sm text-muted-foreground">此群聊还没有 RoomSession。</div>;

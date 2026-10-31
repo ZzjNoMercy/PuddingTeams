@@ -427,6 +427,7 @@ export default function Home() {
 									room={selectedRoom}
 									requestedSessionId={requestedSessionId}
 									onRoomUpdated={handleRoomUpdated}
+									onInvalidRequestedSession={onInvalidRequestedSession}
 									onSessionActivated={(updated) => {
 										handleRoomUpdated(updated);
 										const viewed = updated.activeRoomSessionId ?? updated.activeSession;
