@@ -114,7 +114,8 @@ async function makeStack(variant: "completed" | "failed" | "blocked" | "needs_in
 	const projectA = twoWorkspaces ? await teams.workspaces.createManaged("project-a") : undefined;
 	const projectB = twoWorkspaces ? await teams.workspaces.createManaged("project-b") : undefined;
 	const window = await teams.createWindow({ type: ownerType, members: ownerType === "group" ? ["puddingclaw", "beta"] : ["puddingclaw"], sessionId: "direct-sess-1", ...(projectA ? { workspaceId: projectA.id } : {}) });
-	if (managerSessionId !== window.activeSession) {
+	const windowManagerSession = (await teams.managerSession(window.id)) ?? window.activeSession;
+	if (managerSessionId !== windowManagerSession) {
 		await teams.ensureSoloWindow(async () => ({ id: projectA ? "manager-default-sess" : managerSessionId }), async () => true);
 		if (projectA) await teams.replaceWindowWorkspace("solo", projectA.id, managerSessionId);
 	}
@@ -502,7 +503,8 @@ test("P1 group 范围收缩阻止新调用，已接单的审批按冻结生命�
 	assert.equal((await teams.getWindow(window.id))!.type, "group");
 	assert.deepEqual((await teams.eligibleWorkersFor((await teams.getWindow(window.id))!)).map((worker) => worker.name), ["beta", "gamma"]);
 	for (const purpose of ["execution", "verification"] as const) {
-		await assert.rejects(() => invoker.delegate({ windowId: window.id, managerSessionId: window.activeSession, agent, message: "new", mode: "run", purpose }), /不是当前窗口的成员/);
+		const managerSession = (await teams.managerSession(window.id))!;
+		await assert.rejects(async () => invoker.delegate({ windowId: window.id, managerSessionId: managerSession, agent, message: "new", mode: "run", purpose }), /不是当前窗口的成员/);
 	}
 	const result = await invoker.respond(interactionId, approve);
 	assert.equal(result.status, "approved");

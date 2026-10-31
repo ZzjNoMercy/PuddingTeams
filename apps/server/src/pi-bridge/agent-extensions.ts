@@ -1244,13 +1244,16 @@ function coreRosterFactory(deps: ManagerExtensionDeps): (pi: ExtensionAPI) => vo
 				// 窗口里干活，本工具不等执行结果；标题异步生成。
 				if (params.task?.trim()) {
 				const task = params.task.trim();
-				void deps.sessions
-					.open(window.activeSession)
-					.then((session) => session.prompt(task))
-					.catch((err: unknown) =>
-						deps.log?.(`create_group_window 首发任务失败: ${err instanceof Error ? err.message : String(err)}`),
-					);
-				void deps.sessions.generateSessionTitle(window.activeSession, task).catch(() => undefined);
+				const managerSessionId = await deps.store.managerSession(window.id);
+				if (managerSessionId) {
+					void deps.sessions
+						.open(managerSessionId)
+						.then((session) => session.prompt(task))
+						.catch((err: unknown) =>
+							deps.log?.(`create_group_window 首发任务失败: ${err instanceof Error ? err.message : String(err)}`),
+						);
+					void deps.sessions.generateSessionTitle(managerSessionId, task).catch(() => undefined);
+				}
 				}
 				const displayName = window.name ?? memberLabels.join("、");
 				return {
@@ -1535,8 +1538,7 @@ async function announceToWindow(
 	from: "solo" | "group" = "solo",
 ): Promise<void> {
 	try {
-		const fresh = await deps.store.getWindow(window.id);
-		const activeSession = fresh?.activeSession ?? window.activeSession;
+		const activeSession = (await deps.store.managerSession(window.id)) ?? window.activeSession;
 		const message = {
 			customType: "pudding:task_assign",
 			content: task,
@@ -1600,8 +1602,7 @@ async function syncToWindow(
 	try {
 		// Re-read the window: the active session may have moved since the
 		// delegation started.
-		const fresh = await deps.store.getWindow(window.id);
-		const activeSession = fresh?.activeSession ?? window.activeSession;
+		const activeSession = (await deps.store.managerSession(window.id)) ?? window.activeSession;
 		const target = await deps.sessions.open(activeSession);
 		if (!target.isIdle) {
 			await Promise.race([

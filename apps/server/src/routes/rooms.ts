@@ -100,6 +100,9 @@ export interface RoomSummary {
 	members: AgentConfig[];
 	sessions: RoomSessionSummary[];
 	activeSession: string;
+	/** group：当前 RoomSession 与索引；solo/direct 为空。 */
+	activeRoomSessionId?: string;
+	roomSessionIds?: string[];
 	pinned: boolean;
 	/** 群聊协作提示词（仅 Group 可编辑；Direct 固定 relay，写入会被拒绝）。 */
 	prompt: string;
@@ -169,6 +172,10 @@ async function buildWindowSummary(
 			};
 		}),
 		activeSession: active,
+		...(w.type === "group" ? {
+			activeRoomSessionId: w.activeRoomSessionId,
+			roomSessionIds: [...(w.roomSessionIds ?? [])],
+		} : {}),
 		pinned: Boolean(w.pinned),
 		prompt: w.prompt ?? "",
 		cwdSnapshot: w.cwdSnapshot,
@@ -246,6 +253,7 @@ export function registerRoomsRoutes(
 	 * dropdown stays clean. Dead sessions carry no messages, so pruning loses
 	 * nothing. */
 	const ensureWindowAlive = async (w: WindowConfig): Promise<void> => {
+		if (w.type === "group") return;
 		const diskIds = new Set((await sessions.list()).map((s) => s.id));
 		const isLive = (id: string) => diskIds.has(id) || sessions.isOpen(id);
 		const dead = w.sessions.filter((id) => !isLive(id));
@@ -800,7 +808,13 @@ export function registerRoomsRoutes(
 					return { session: info, workState: null, reused: true };
 				}
 				const created = await sessions.create(undefined, await contextFor(current), undefined, ownerOptionsFor(current.type, current.members));
-				try { await teams.addWindowSession(current.id, created.id); }
+				try {
+					if (current.type === "group") {
+						const roomSessionId = await teams.addRoomSession(current.id, created.id);
+						return { session: created, workState: null, reused: false, roomSessionId };
+					}
+					await teams.addWindowSession(current.id, created.id);
+				}
 				catch (error) { await sessions.remove(created.id).catch(() => undefined); throw error; }
 				return { session: created, workState: null, reused: false };
 			};
@@ -835,7 +849,10 @@ export function registerRoomsRoutes(
 						}
 						if (owner && owner.id !== w.id) throw new Error("幂等 Session 属于其他房间");
 						if (!listed && operation.phase === "reserved") await sessions.create(undefined, await contextFor(w), operation.sessionId, ownerOptionsFor(w.type, w.members));
-						if (operation.phase === "reserved") await teams.addWindowSession(w.id, operation.sessionId);
+						if (operation.phase === "reserved") {
+							if (w.type === "group") await teams.addRoomSession(w.id, operation.sessionId);
+							else await teams.addWindowSession(w.id, operation.sessionId);
+						}
 						await sessionCreationOperations.markAttached(goalOperationId, operation.sessionId);
 						const session = (await sessions.list()).find((item) => item.id === operation.sessionId);
 						if (!session) throw new Error("幂等 Session 创建后不可读取");
@@ -859,7 +876,8 @@ export function registerRoomsRoutes(
 		try {
 			const created = await sessions.create(undefined, await contextFor(w), undefined, ownerOptionsFor(w.type, w.members));
 			createdId = created.id;
-			await teams.addWindowSession(req.params.id, created.id);
+			const roomSessionId = w.type === "group" ? await teams.addRoomSession(req.params.id, created.id) : undefined;
+			if (w.type !== "group") await teams.addWindowSession(req.params.id, created.id);
 			const goal = requestedGoal;
 			const completionBoundary = requestedBoundary;
 			const workState = goal && completionBoundary && workStates
@@ -874,7 +892,7 @@ export function registerRoomsRoutes(
 						operationId: goalOperationId,
 					})
 				: null;
-			return { session: created, workState };
+			return { session: created, workState, ...(roomSessionId ? { roomSessionId } : {}) };
 		} catch (err) {
 			if (createdId) {
 				await teams.removeWindowSession(req.params.id, createdId).catch(() => undefined);
@@ -994,6 +1012,20 @@ export function registerRoomsRoutes(
 			try {
 				const owner = await teams.getWindow(req.params.id);
 				if (!owner) return reply.code(404).send({ error: "window not found" });
+				if (owner.type === "group") {
+					const room = await teams.roomSession(req.params.sid);
+					const participant = room ? undefined : await teams.participantSession(req.params.sid);
+					const roomSessionId = room?.roomSessionId ?? participant?.roomSessionId;
+					if (!roomSessionId) return reply.code(404).send({ error: "session not found in window" });
+					const { removed, blocked, agentSessionIds } = await teams.removeRoomSession(req.params.id, roomSessionId);
+					if (blocked) throw new Error(blocked);
+					if (!removed) throw new Error("session not found in window");
+					for (const agentSessionId of agentSessionIds) {
+						await sessions.remove(agentSessionId).catch(() => undefined);
+						await workStates?.removeSession(agentSessionId).catch(() => undefined);
+					}
+					return reply.code(204).send();
+				}
 				const located = await teams.contextForSession(req.params.sid);
 				if (!located || located.window.id !== owner.id) return reply.code(404).send({ error: "session not found in window" });
 				const remove = async () => {
@@ -1063,6 +1095,17 @@ export function registerRoomsRoutes(
 		"/api/rooms/:id/sessions/:sid/activate",
 		async (req, reply) => {
 			try {
+				const window = await teams.getWindow(req.params.id);
+				if (window?.type === "group") {
+					const room = await teams.roomSession(req.params.sid);
+					if (room) await teams.setActiveRoomSession(req.params.id, req.params.sid);
+					else {
+						const participant = await teams.participantSession(req.params.sid);
+						if (!participant) throw new Error("session not in window");
+						await teams.setActiveRoomSession(req.params.id, participant.roomSessionId);
+					}
+					return { ok: true };
+				}
 				await teams.setActiveWindowSession(req.params.id, req.params.sid);
 				return { ok: true };
 			} catch (err) {

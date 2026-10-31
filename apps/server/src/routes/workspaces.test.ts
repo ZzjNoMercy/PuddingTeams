@@ -845,7 +845,8 @@ test("P3-1 API: 项目创建/最近列表与 direct Window 按 (worker, workspac
 	});
 	assert.equal(groupCreated.statusCode, 200, groupCreated.body);
 	const group = groupCreated.json().room as { id: string; activeSession: string };
-	await sessions.ensureSessionFile(group.activeSession);
+	const groupManagerSession = (await teams.managerSession(group.id))!;
+	await sessions.ensureSessionFile(groupManagerSession);
 	const groupInPlace = await app.inject({
 		method: "POST",
 		url: `/api/rooms/${group.id}/switch-workspace`,
@@ -853,7 +854,7 @@ test("P3-1 API: 项目创建/最近列表与 direct Window 按 (worker, workspac
 	});
 	assert.equal(groupInPlace.statusCode, 400, groupInPlace.body);
 	assert.equal((await teams.getWindow(group.id))?.workspaceId, a.id);
-	const groupInfo = (await sessions.list()).find((session) => session.id === group.activeSession);
+	const groupInfo = (await sessions.list()).find((session) => session.id === groupManagerSession);
 	assert.ok(groupInfo && existsSync(groupInfo.sessionFile), "拒绝 group 原地切换不得删除原 JSONL");
 
 	const list = await app.inject({ method: "GET", url: "/api/workspaces" });

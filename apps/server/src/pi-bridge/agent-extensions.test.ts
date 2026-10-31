@@ -1085,12 +1085,14 @@ test("manager 建房: solo create_group_window 建成群聊并 fire-and-forget �
 	assert.deepEqual(window.members, ["alpha", "beta"]);
 	assert.equal(window.name, "报告组");
 	assert.equal(window.prompt, "先分工再汇总", "群聊协作提示词落库（只给该房间 manager）");
-	assert.match(window.sessions[0]!, /^[0-9a-f-]{36}$/);
+	assert.match(window.roomSessionIds![0]!, /^[0-9a-f-]{36}$/);
+	assert.equal(window.activeRoomSessionId, window.roomSessionIds![0]);
+	assert.equal(window.sessions.length, 0, "group 不再使用 window.sessions");
 
 	// fire-and-forget 首发任务：等 promise 链跑完后新 session 收到首条消息。
 	await new Promise((resolve) => setImmediate(resolve));
 	await new Promise((resolve) => setImmediate(resolve));
-	assert.deepEqual(prompted, [`${window.activeSession}::做一份对比报告`]);
+	assert.deepEqual(prompted, [`${await store.managerSession(window.id)}::做一份对比报告`]);
 
 	// 校验：<2 成员 / 未知 worker / 禁用 worker / pinned manager 分别拒绝。
 	await assert.rejects(

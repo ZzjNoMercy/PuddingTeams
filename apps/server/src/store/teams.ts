@@ -7,6 +7,11 @@ import { spawnWorker } from "../agent-runtime/transport/spawn.js";
 import { ensureHandoffGuidance } from "../agent-runtime/handoff.js";
 import type { AgentCapabilityBinding, AgentConnectorBinding } from "../agent-runtime/extensions.js";
 import { WorkspaceStore, type WorkspaceTrust } from "./workspaces.js";
+import {
+	parseWindowsFileV4,
+	type ParticipantSessionRefV4,
+	type RoomSessionRefV4,
+} from "./windows-v4.js";
 import type { ManagerCodeSearchProvider, WorkerCodeSearchOverride } from "../pi-bridge/code-search.js";
 
 export class AgentRemovalRequiresDisabledError extends Error {
@@ -271,8 +276,12 @@ export interface WindowConfig {
 	members: string[];
 	/** pi session ids in this window (newest first). Always ≥ 1. */
 	sessions: string[];
-	/** Currently active pi session. */
+	/** Currently active pi session (solo/direct). */
 	activeSession: string;
+	/** RoomSession ids for group; solo/direct 为空。 */
+	roomSessionIds?: string[];
+	/** group 当前活跃 RoomSession；solo/direct 为空。 */
+	activeRoomSessionId?: string;
 	/**
 	 * 群聊协作提示词（提示词管理方案 §5.3）：仅 Group 可编辑，只注入该群聊
 	 * manager，不传给 Worker。Direct 无 manager 回合、无协作段（§5.2，纯
@@ -369,11 +378,13 @@ interface WindowsFile {
  sessionRefs: Record<string, WindowSessionRef>;
 	version: number;
 	windows: Record<string, WindowConfig>;
+	roomSessions: Record<string, RoomSessionRefV4>;
+	participantSessions: Record<string, ParticipantSessionRefV4>;
 	/** A deleted Room must not release its old creation key for replay. */
 	retiredCreationOperations?: Record<string, string>;
 }
 
-const WINDOWS_FILE_VERSION = 3;
+const WINDOWS_FILE_VERSION = 4;
 
 function recordValue(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -644,6 +655,23 @@ export class TeamsStore {
 	}
 
 	private async validateWindowsFile(windows: WindowsFile): Promise<void> {
+		const normalized = {
+			version: 4 as const,
+			windows: Object.fromEntries(Object.entries(windows.windows).map(([id, window]) => [id, {
+				...window,
+				roomSessionIds: window.roomSessionIds ?? [],
+				activeRoomSessionId: window.activeRoomSessionId ?? "",
+			}])),
+			roomSessions: windows.roomSessions,
+			participantSessions: windows.participantSessions,
+			sessionRefs: windows.sessionRefs,
+			...(windows.retiredCreationOperations ? { retiredCreationOperations: windows.retiredCreationOperations } : {}),
+		};
+		try {
+			parseWindowsFileV4(normalized);
+		} catch (error) {
+			throw new Error(`windows.json invalid: ${error instanceof Error ? error.message : String(error)}`);
+		}
 		const sessionOwners = new Map<string, string>();
 		const directIdentities = new Map<string, string>();
 		const creationOperations = new Set<string>();
@@ -653,18 +681,44 @@ export class TeamsStore {
 		}
 		for (const window of Object.values(windows.windows)) {
 			if (Object.hasOwn(window, "activeWorkerView")) throw new Error("windows.json contains a removed execution view pointer");
+			const group = window.type === "group";
 			if (
 				(window.workspaceId !== undefined && (typeof window.workspaceId !== "string" || !window.workspaceId)) ||
 				typeof window.cwdSnapshot !== "string" ||
 				!window.cwdSnapshot ||
 				!Array.isArray(window.sessions) ||
-				window.sessions.length === 0 ||
-				!window.sessions.includes(window.activeSession) ||
+				(group ? (window.sessions.length !== 0 || window.activeSession !== "") : (window.sessions.length === 0 || !window.sessions.includes(window.activeSession))) ||
 				!window.parkedContexts ||
 				typeof window.parkedContexts !== "object" ||
 				Array.isArray(window.parkedContexts)
 			) {
 				throw new Error(`window "${window.id ?? "unknown"}" has invalid workspace-history data`);
+			}
+			if (group) {
+				if (!Array.isArray(window.roomSessionIds) || window.roomSessionIds.length === 0 || !window.roomSessionIds.includes(window.activeRoomSessionId ?? "")) {
+					throw new Error(`group window "${window.id}" has invalid room session index`);
+				}
+				if (Object.keys(window.parkedContexts).length > 0) throw new Error(`group window "${window.id}" cannot park contexts`);
+				for (const roomSessionId of window.roomSessionIds) {
+					const room = windows.roomSessions[roomSessionId];
+					if (!room || room.roomId !== window.id) throw new Error(`group window "${window.id}" references missing room session: ${roomSessionId}`);
+					if (room.cwdSnapshot !== window.cwdSnapshot || room.workspaceId !== window.workspaceId) throw new Error(`room session "${roomSessionId}" context mismatch`);
+					if (room.workspaceId) {
+						const workspace = await this.workspaces.get(room.workspaceId);
+						if (!workspace || workspace.canonicalPath !== room.cwdSnapshot) throw new Error(`room session "${roomSessionId}" workspace mismatch`);
+					}
+					let managers = 0;
+					for (const participant of Object.values(windows.participantSessions)) {
+						if (participant.roomSessionId !== roomSessionId) continue;
+						if (participant.state === "active" && participant.role === "manager") managers += 1;
+						if (participant.role === "manager" && participant.state !== "active") throw new Error(`room session "${roomSessionId}" manager binding must be active`);
+						const owner = sessionOwners.get(participant.agentSessionId);
+						if (owner) throw new Error(`participant session "${participant.agentSessionId}" belongs to multiple rooms: ${owner}, ${roomSessionId}`);
+						sessionOwners.set(participant.agentSessionId, roomSessionId);
+					}
+					if (managers !== 1) throw new Error(`room session "${roomSessionId}" requires exactly one active manager binding`);
+				}
+				continue;
 			}
 			if (window.creationOperationId !== undefined || window.creationRequestHash !== undefined) {
 				if (window.type !== "group" || typeof window.creationOperationId !== "string" || !window.creationOperationId ||
@@ -1474,12 +1528,21 @@ export class TeamsStore {
 		try {
 			const raw = await readFile(this.windowsFile, "utf-8");
 			const parsed = JSON.parse(raw) as Partial<WindowsFile>;
-			if (parsed.version !== WINDOWS_FILE_VERSION || !recordValue(parsed.sessionRefs)) throw new Error("windows.json requires v3 native session identities; old development data is not migrated");
-			return { version: parsed.version, windows: parsed.windows ?? {}, sessionRefs: parsed.sessionRefs, retiredCreationOperations: parsed.retiredCreationOperations };
+			if (parsed.version !== WINDOWS_FILE_VERSION || !recordValue(parsed.sessionRefs) || !recordValue(parsed.roomSessions) || !recordValue(parsed.participantSessions)) {
+				throw new Error("windows.json requires v4 room-session identities; old development data is not migrated");
+			}
+			return {
+				version: parsed.version,
+				windows: parsed.windows ?? {},
+				sessionRefs: parsed.sessionRefs,
+				roomSessions: parsed.roomSessions as Record<string, RoomSessionRefV4>,
+				participantSessions: parsed.participantSessions as Record<string, ParticipantSessionRefV4>,
+				retiredCreationOperations: parsed.retiredCreationOperations,
+			};
 		} catch (err: unknown) {
 			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
 			// 决策 20：无兼容、无历史数据迁移。旧 rooms.json 直接忽略。
-			return { version: WINDOWS_FILE_VERSION, windows: {}, sessionRefs: {} };
+			return { version: WINDOWS_FILE_VERSION, windows: {}, sessionRefs: {}, roomSessions: {}, participantSessions: {} };
 		}
 	}
 
@@ -1492,7 +1555,15 @@ export class TeamsStore {
 	}
 
 	private async writeWindows(data: WindowsFile): Promise<void> {
- const owned = new Set(Object.values(data.windows).flatMap(window => [...window.sessions,...Object.values(window.parkedContexts).flatMap(context => context.sessions)]));
+ const referencedRooms = new Set(Object.values(data.windows).flatMap(window => window.roomSessionIds ?? []));
+ for (const roomSessionId of Object.keys(data.roomSessions)) if (!referencedRooms.has(roomSessionId)) delete data.roomSessions[roomSessionId];
+ for (const [agentSessionId, participant] of Object.entries(data.participantSessions)) {
+  if (!referencedRooms.has(participant.roomSessionId) || participant.state === "tombstoned") delete data.participantSessions[agentSessionId];
+ }
+ const owned = new Set([
+  ...Object.values(data.windows).flatMap(window => [...window.sessions, ...Object.values(window.parkedContexts).flatMap(context => context.sessions)]),
+  ...Object.keys(data.participantSessions),
+ ]);
  for(const id of Object.keys(data.sessionRefs)) if(!owned.has(id)) delete data.sessionRefs[id];
  for(const ref of Object.values(data.sessionRefs)) if(!ref.provider) {
   const owner=await this.getAgent(ref.ownerAgentId);
@@ -1612,7 +1683,8 @@ export class TeamsStore {
 		active: boolean;
 		workerBindings: SessionWorkerBindings;
 	} | undefined> {
-		for (const window of await this.listWindows()) {
+		const data = await this.windowsFileData();
+		for (const window of Object.values(data.windows)) {
 			const found = contextContainingSession(window, sessionId);
 			if (!found) continue;
 			return {
@@ -1623,7 +1695,65 @@ export class TeamsStore {
 				workerBindings: found.context.workerBindings ?? {},
 			};
 		}
-		return undefined;
+		const participant = data.participantSessions[sessionId];
+		if (!participant) return undefined;
+		const room = data.roomSessions[participant.roomSessionId];
+		const window = room ? data.windows[room.roomId] : undefined;
+		if (!room || !window || window.type !== "group") return undefined;
+		return {
+			window,
+			...(participant.workspaceId ? { workspaceId: participant.workspaceId } : {}),
+			cwdSnapshot: participant.cwdSnapshot,
+			active: true,
+			workerBindings: {},
+		};
+	}
+
+	async contextForRoomSession(roomSessionId: string): Promise<{
+		window: WindowConfig;
+		roomSession: RoomSessionRefV4;
+		active: boolean;
+	} | undefined> {
+		const data = await this.windowsFileData();
+		const room = data.roomSessions[roomSessionId];
+		const window = room ? data.windows[room.roomId] : undefined;
+		if (!room || !window || window.type !== "group") return undefined;
+		return { window, roomSession: room, active: window.activeRoomSessionId === roomSessionId };
+	}
+
+	/** group 的 Manager Agent Session；solo/direct 返回 activeSession。 */
+	async managerSession(windowId: string): Promise<string | undefined> {
+		const data = await this.windowsFileData();
+		const window = data.windows[windowId];
+		if (!window) return undefined;
+		if (window.type !== "group") return window.activeSession || window.sessions[0];
+		const roomSessionId = window.activeRoomSessionId ?? window.roomSessionIds?.[0];
+		if (!roomSessionId) return undefined;
+		const manager = Object.values(data.participantSessions).find((participant) =>
+			participant.roomSessionId === roomSessionId && participant.role === "manager" && participant.state === "active");
+		return manager?.agentSessionId;
+	}
+
+	/** group 的当前 RoomSession；solo/direct 返回 undefined。 */
+	async activeRoomSessionId(windowId: string): Promise<string | undefined> {
+		const window = await this.getWindow(windowId);
+		if (!window || window.type !== "group") return undefined;
+		return window.activeRoomSessionId ?? window.roomSessionIds?.[0];
+	}
+
+	async roomSession(roomSessionId: string): Promise<RoomSessionRefV4 | undefined> {
+		return (await this.windowsFileData()).roomSessions[roomSessionId];
+	}
+
+	async participantSession(agentSessionId: string): Promise<ParticipantSessionRefV4 | undefined> {
+		return (await this.windowsFileData()).participantSessions[agentSessionId];
+	}
+
+	async listRoomSessions(windowId: string): Promise<RoomSessionRefV4[]> {
+		const data = await this.windowsFileData();
+		const window = data.windows[windowId];
+		if (!window || window.type !== "group") return [];
+		return (window.roomSessionIds ?? []).flatMap((id) => data.roomSessions[id] ? [data.roomSessions[id]!] : []);
 	}
 
 	async workspaceForSession(sessionId: string): Promise<string> {
@@ -1869,21 +1999,53 @@ export class TeamsStore {
 				? await this.createRoomSession(opts.createSession, opts.journalSession === true, opts.rollbackSession)
 				: { id: opts.sessionId! };
 			const sessionId = created.id;
-			const window: WindowConfig = {
+			const now = new Date().toISOString();
+			const base: WindowConfig = {
 				id: randomUUID(),
 				type,
 				members: [...new Set(members)],
 				name: name?.trim() || undefined,
 				prompt: prompt?.trim() || undefined,
-				sessions: [sessionId],
-				activeSession: sessionId,
+				sessions: [],
+				activeSession: "",
 				parkedContexts: {},
 				workspaceId,
 				cwdSnapshot: context.cwdSnapshot,
-				createdAt: new Date().toISOString(),
+				createdAt: now,
 				...(opts.creationOperation ? { creationOperationId: opts.creationOperation.key, creationRequestHash: opts.creationOperation.requestHash } : {}),
 			};
-			data.sessionRefs[window.activeSession] = { sessionId: window.activeSession, ownerAgentId: window.type === "direct" ? window.members[0]! : MANAGER_AGENT_NAME, createdAt: new Date().toISOString() };
+			let window: WindowConfig;
+			if (type === "group") {
+				const roomSessionId = randomUUID();
+				window = { ...base, roomSessionIds: [roomSessionId], activeRoomSessionId: roomSessionId };
+				data.roomSessions[roomSessionId] = {
+					roomSessionId,
+					roomId: window.id,
+					...(workspaceId ? { workspaceId } : {}),
+					cwdSnapshot: context.cwdSnapshot,
+					createdAt: now,
+				};
+				data.participantSessions[sessionId] = {
+					agentSessionId: sessionId,
+					roomId: window.id,
+					roomSessionId,
+					agentId: MANAGER_AGENT_NAME,
+					role: "manager",
+					state: "active",
+					...(workspaceId ? { workspaceId } : {}),
+					cwdSnapshot: context.cwdSnapshot,
+					revision: 1,
+					createdAt: now,
+					updatedAt: now,
+				};
+			} else {
+				window = { ...base, sessions: [sessionId], activeSession: sessionId };
+			}
+			data.sessionRefs[sessionId] = {
+				sessionId,
+				ownerAgentId: window.type === "direct" ? window.members[0]! : MANAGER_AGENT_NAME,
+				createdAt: now,
+			};
 			data.windows[window.id] = window;
 			try {
 				await this.writeWindows(data);
@@ -2025,8 +2187,20 @@ export class TeamsStore {
 			const w = data.windows[id];
 			if (!w) return;
 			if (w.pinned) throw new Error("solo 窗口不可删除");
-			if (onlySessionId !== undefined && (w.sessions.length !== 1 || w.sessions[0] !== onlySessionId || Object.keys(w.parkedContexts).length)) throw new Error("single_session_window_changed");
-			sessionIds.push(...w.sessions, ...Object.values(w.parkedContexts).flatMap((context) => context.sessions));
+			if (w.type === "group") {
+				const rooms = w.roomSessionIds ?? [];
+				if (onlySessionId !== undefined && (rooms.length !== 1 || rooms[0] !== onlySessionId)) throw new Error("single_session_window_changed");
+				const participants = Object.values(data.participantSessions).filter((participant) => rooms.includes(participant.roomSessionId));
+				sessionIds.push(...participants.map((participant) => participant.agentSessionId));
+				for (const participant of participants) {
+					delete data.participantSessions[participant.agentSessionId];
+					delete data.sessionRefs[participant.agentSessionId];
+				}
+				for (const roomSessionId of rooms) delete data.roomSessions[roomSessionId];
+			} else {
+				if (onlySessionId !== undefined && (w.sessions.length !== 1 || w.sessions[0] !== onlySessionId || Object.keys(w.parkedContexts).length)) throw new Error("single_session_window_changed");
+				sessionIds.push(...w.sessions, ...Object.values(w.parkedContexts).flatMap((context) => context.sessions));
+			}
 			if (w.creationOperationId && w.creationRequestHash) {
 				data.retiredCreationOperations ??= {};
 				data.retiredCreationOperations[w.creationOperationId] = w.creationRequestHash;
@@ -2043,6 +2217,7 @@ export class TeamsStore {
 			const data = await this.loadWindowsFile();
 			const w = data.windows[windowId];
 			if (!w) throw new Error(`window not found: ${windowId}`);
+			if (w.type === "group") throw new Error("group 窗口使用 addRoomSession 管理 RoomSession");
 			const ownerAgentId = w.type === "direct" ? w.members[0]! : MANAGER_AGENT_NAME;
 			if (snapshot && snapshot.ownerAgentId !== ownerAgentId) throw new Error("session owner mismatch");
 			data.sessionRefs[sessionId] ??= { sessionId, ownerAgentId, createdAt: new Date().toISOString(), ...(snapshot ? { sourceSnapshotId: snapshot.sourceSnapshotId } : {}) };
@@ -2059,6 +2234,7 @@ export class TeamsStore {
 			const data = await this.loadWindowsFile();
 			const w = data.windows[windowId];
 			if (!w) throw new Error(`window not found: ${windowId}`);
+			if (w.type === "group") throw new Error("group 窗口使用 setActiveRoomSession 切换");
 			if (!w.sessions.includes(sessionId)) throw new Error(`session not in window: ${sessionId}`);
 			w.activeSession = sessionId;
 			await this.writeWindows(data);
@@ -2078,6 +2254,7 @@ export class TeamsStore {
 			const data = await this.loadWindowsFile();
 			const w = data.windows[windowId];
 			if (!w) return;
+			if (w.type === "group") { res = { removed: false, blocked: "group 窗口使用 removeRoomSession" }; return; }
 			if (w.sessions.includes(sessionId)) {
 				if (w.sessions.length <= 1) {
 					res = { removed: false, blocked: "窗口至少要保留一个会话" };
@@ -2106,14 +2283,174 @@ export class TeamsStore {
 		return res;
 	}
 
+	/** 为 group 追加一个 RoomSession，并登记其唯一 Manager ParticipantSession。 */
+	async addRoomSession(windowId: string, managerAgentSessionId: string, opts: { sourceSnapshotId?: string } = {}): Promise<string> {
+		return this.serialize(async () => {
+			const data = await this.loadWindowsFile();
+			const window = data.windows[windowId];
+			if (!window) throw new Error(`window not found: ${windowId}`);
+			if (window.type !== "group") throw new Error("addRoomSession 只用于 group 窗口");
+			if (data.participantSessions[managerAgentSessionId]) throw new Error(`manager session 已绑定 RoomSession: ${managerAgentSessionId}`);
+			const existingRef = data.sessionRefs[managerAgentSessionId];
+			if (existingRef && existingRef.ownerAgentId !== MANAGER_AGENT_NAME) throw new Error("manager session owner mismatch");
+			const now = new Date().toISOString();
+			const roomSessionId = randomUUID();
+			window.roomSessionIds = [roomSessionId, ...(window.roomSessionIds ?? [])];
+			window.activeRoomSessionId = roomSessionId;
+			data.roomSessions[roomSessionId] = {
+				roomSessionId,
+				roomId: window.id,
+				...(window.workspaceId ? { workspaceId: window.workspaceId } : {}),
+				cwdSnapshot: window.cwdSnapshot,
+				createdAt: now,
+				...(opts.sourceSnapshotId ? { sourceSnapshotId: opts.sourceSnapshotId } : {}),
+			};
+			data.participantSessions[managerAgentSessionId] = {
+				agentSessionId: managerAgentSessionId,
+				roomId: window.id,
+				roomSessionId,
+				agentId: MANAGER_AGENT_NAME,
+				role: "manager",
+				state: "active",
+				...(window.workspaceId ? { workspaceId: window.workspaceId } : {}),
+				cwdSnapshot: window.cwdSnapshot,
+				revision: 1,
+				createdAt: now,
+				updatedAt: now,
+			};
+			data.sessionRefs[managerAgentSessionId] = {
+				sessionId: managerAgentSessionId,
+				ownerAgentId: MANAGER_AGENT_NAME,
+				createdAt: now,
+			};
+			await this.writeWindows(data);
+			return roomSessionId;
+		});
+	}
+
+	async setActiveRoomSession(windowId: string, roomSessionId: string): Promise<void> {
+		await this.serialize(async () => {
+			const data = await this.loadWindowsFile();
+			const window = data.windows[windowId];
+			if (!window || window.type !== "group") throw new Error(`group window not found: ${windowId}`);
+			if (!(window.roomSessionIds ?? []).includes(roomSessionId)) throw new Error(`room session not in window: ${roomSessionId}`);
+			window.activeRoomSessionId = roomSessionId;
+			await this.writeWindows(data);
+		});
+	}
+
+	/** 删除一个 RoomSession；返回需要级联删除的 Agent Session ids。 */
+	async removeRoomSession(windowId: string, roomSessionId: string): Promise<{ removed: boolean; blocked?: string; agentSessionIds: string[] }> {
+		let result: { removed: boolean; blocked?: string; agentSessionIds: string[] } = { removed: false, agentSessionIds: [] };
+		await this.serialize(async () => {
+			const data = await this.loadWindowsFile();
+			const window = data.windows[windowId];
+			if (!window || window.type !== "group") return;
+			const rooms = window.roomSessionIds ?? [];
+			if (!rooms.includes(roomSessionId)) return;
+			if (rooms.length <= 1) {
+				result = { removed: false, blocked: "群聊至少要保留一个 RoomSession", agentSessionIds: [] };
+				return;
+			}
+			window.roomSessionIds = rooms.filter((id) => id !== roomSessionId);
+			if (window.activeRoomSessionId === roomSessionId) window.activeRoomSessionId = window.roomSessionIds[0]!;
+			const agentSessionIds = Object.values(data.participantSessions)
+				.filter((participant) => participant.roomSessionId === roomSessionId)
+				.map((participant) => participant.agentSessionId);
+			for (const agentSessionId of agentSessionIds) {
+				delete data.participantSessions[agentSessionId];
+				delete data.sessionRefs[agentSessionId];
+			}
+			delete data.roomSessions[roomSessionId];
+			await this.writeWindows(data);
+			result = { removed: true, agentSessionIds };
+		});
+		return result;
+	}
+
+	async addParticipantSession(input: {
+		windowId: string;
+		roomSessionId: string;
+		agentSessionId: string;
+		agentId: string;
+		role: "manager" | "worker";
+		workspaceId?: string;
+		cwdSnapshot: string;
+	}): Promise<ParticipantSessionRefV4> {
+		return this.serialize(async () => {
+			const data = await this.loadWindowsFile();
+			const window = data.windows[input.windowId];
+			if (!window || window.type !== "group") throw new Error(`group window not found: ${input.windowId}`);
+			const room = data.roomSessions[input.roomSessionId];
+			if (!room || room.roomId !== window.id) throw new Error(`room session not found: ${input.roomSessionId}`);
+			if (data.participantSessions[input.agentSessionId]) throw new Error(`agent session 已绑定: ${input.agentSessionId}`);
+			if (Object.values(data.participantSessions).some((participant) => participant.state === "active"
+				&& participant.roomSessionId === input.roomSessionId && participant.agentId === input.agentId)) {
+				throw new Error(`agent ${input.agentId} 已有 active ParticipantSession`);
+			}
+			if (input.workspaceId !== room.workspaceId || input.cwdSnapshot !== room.cwdSnapshot) throw new Error("participant context 与 RoomSession 不一致");
+			const ref = data.sessionRefs[input.agentSessionId];
+			if (ref && ref.ownerAgentId !== input.agentId) throw new Error("participant session owner mismatch");
+			const now = new Date().toISOString();
+			data.sessionRefs[input.agentSessionId] = {
+				sessionId: input.agentSessionId,
+				ownerAgentId: input.agentId,
+				createdAt: now,
+			};
+			const participant: ParticipantSessionRefV4 = {
+				agentSessionId: input.agentSessionId,
+				roomId: window.id,
+				roomSessionId: input.roomSessionId,
+				agentId: input.agentId,
+				role: input.role,
+				state: "active",
+				...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
+				cwdSnapshot: input.cwdSnapshot,
+				revision: 1,
+				createdAt: now,
+				updatedAt: now,
+			};
+			data.participantSessions[input.agentSessionId] = participant;
+			await this.writeWindows(data);
+			return participant;
+		});
+	}
+
 	/** The pi sessions belonging to a window, plus the active one. */
 	async windowSessionList(windowId: string): Promise<{ sessions: string[]; active: string }> {
 		const w = await this.getWindow(windowId);
 		if (!w) throw new Error("window_not_found");
+		if (w.type === "group") {
+			const data = await this.windowsFileData();
+			const rooms = w.roomSessionIds ?? [];
+			if (!rooms.length) throw new Error("window_has_no_session");
+			const managers = rooms.map((roomSessionId) => Object.values(data.participantSessions).find((participant) =>
+				participant.roomSessionId === roomSessionId && participant.role === "manager" && participant.state === "active")?.agentSessionId)
+				.filter((id): id is string => Boolean(id));
+			if (!managers.length) throw new Error("window_has_no_session");
+			const activeRoom = w.activeRoomSessionId ?? rooms[0]!;
+			const activeIndex = rooms.indexOf(activeRoom);
+			return { sessions: managers, active: managers[Math.max(0, activeIndex)] ?? managers[0]! };
+		}
 		if (!w.sessions.length) throw new Error("window_has_no_session");
 		const sessions = w.sessions.length ? w.sessions : [windowId];
 		const active = w.activeSession && sessions.includes(w.activeSession) ? w.activeSession : sessions[0]!;
 		return { sessions, active };
+	}
+
+	/** group 的 RoomSession 索引（与 windowSessionList 的 Manager Agent Session 列表区分）。 */
+	async windowRoomSessionList(windowId: string): Promise<{ roomSessions: string[]; active: string }> {
+		const w = await this.getWindow(windowId);
+		if (!w || w.type !== "group") throw new Error("window_has_no_room_session");
+		const roomSessions = w.roomSessionIds ?? [];
+		if (!roomSessions.length) throw new Error("window_has_no_room_session");
+		return { roomSessions, active: w.activeRoomSessionId ?? roomSessions[0]! };
+	}
+
+	async managerSessionForRoom(roomSessionId: string): Promise<string | undefined> {
+		const data = await this.windowsFileData();
+		return Object.values(data.participantSessions).find((participant) =>
+			participant.roomSessionId === roomSessionId && participant.role === "manager" && participant.state === "active")?.agentSessionId;
 	}
 
 	async sessionRef(sessionId: string): Promise<WindowSessionRef | undefined> { return (await this.windowsFileData()).sessionRefs[sessionId]; }

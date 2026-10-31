@@ -64,18 +64,18 @@ test("windows v1/v2 被拒绝，原文件和既有备份不变", async () => {
   const file=path.join(dir,"windows.json"),data=JSON.parse(readFileSync(file,"utf8"));data.version=version;
   const bytes=JSON.stringify(data);writeFileSync(file,bytes);writeFileSync(`${file}.v1.bak`,"existing backup");
   const restarted=new TeamsStore({state:dir,assets:dir,managedWorkspaces:path.join(dir,"managed")},dir);
-  await assert.rejects(()=>restarted.init(),/requires v3/);
+  await assert.rejects(()=>restarted.init(),/requires v4/);
   assert.equal(readFileSync(file,"utf8"),bytes);assert.equal(readFileSync(`${file}.v1.bak`,"utf8"),"existing backup");
  }
 });
 
-test("v3 会话负责人是单一持久身份，缺失/错配拒绝，不从成员猜测",async()=>{
+test("v4 会话负责人是单一持久身份，缺失/错配拒绝，不从成员猜测",async()=>{
  const {store,dir}=await makeStore();const room=await store.createWindow({type:"direct",members:["alpha"],sessionId:"session"});
  await store.addWindowSession(room.id,"second");assert.equal((await store.sessionRef("session"))?.ownerAgentId,"alpha");
  assert.equal((await store.sessionRef("second"))?.ownerAgentId,"alpha");
  const file=path.join(dir,"windows.json"),data=JSON.parse(readFileSync(file,"utf8"));delete data.sessionRefs.session;
  writeFileSync(file,JSON.stringify(data));const restarted=new TeamsStore({state:dir,assets:dir,managedWorkspaces:path.join(dir,"managed")},dir);
- await assert.rejects(()=>restarted.init(),/invalid native session owner/);
+ await assert.rejects(()=>restarted.init(),/sessionRef|invalid native session owner/);
 });
 
 test("无项目 Window 的 cwdSnapshot 跨重启保持，新的默认 cwd 使用独立 direct 身份", async () => {
