@@ -62,7 +62,7 @@ test("group navigation 用 roomSessionId 作为行身份，flags 按房间键持
   await teams.upsertAgent({name:"beta",description:"Worker",invoke:{type:"command",command:"echo",runArgs:[]}});
   const group = await teams.createWindow({type:"group",members:["alpha","beta"],sessionId:"manager-g"});
   const roomSessionId = group.activeRoomSessionId!;
-  registerChatNavigationRoutes(app,{teams,statePath:path.join(dir,"nav.json"),sessions:{list:async()=>[{id:"manager-g",sessionFile:"fixture",firstMessage:"hello",modifiedAt:"2026-10-15T01:00:00Z",name:"Manager"}]}});
+  registerChatNavigationRoutes(app,{teams,statePath:path.join(dir,"nav.json"),sessions:{list:async()=>[{id:"manager-g",sessionFile:"fixture",firstMessage:"hello",modifiedAt:"2026-10-15T01:00:00Z",name:"Manager",active:false}]}});
   const index=(await app.inject({url:"/api/chat-navigation"})).json();
   const item=index.items.find((i:{sessionId:string})=>i.sessionId===roomSessionId);
   assert.ok(item); assert.equal(item.roomType,"group"); assert.equal(item.managerParticipantSessionId,"manager-g");

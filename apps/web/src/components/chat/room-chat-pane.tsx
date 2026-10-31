@@ -10,6 +10,7 @@ import {
 	closeUnknownRoomTurn,
 	fetchRoomTimeline,
 	getRoom,
+	markRoomSessionRead,
 	roomTimelineWsUrl,
 	sendRoomMessage,
 	setActiveRoomSession,
@@ -60,6 +61,7 @@ export function RoomChatPane({
 			const next = await fetchRoomTimeline(room.id, roomSessionId);
 			setTimeline(next);
 			setError(null);
+			void markRoomSessionRead(room.id, roomSessionId);
 		} catch (caught) {
 			setError(caught instanceof Error ? caught.message : String(caught));
 		}

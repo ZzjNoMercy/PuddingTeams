@@ -10,6 +10,7 @@ import { RoomMessageError, RoomMessageRouter, type RoomParticipantRunner, type R
 import { PiParticipantRunner, DirectChatParticipantRunner } from "./participant-runners.js";
 import { TeamsParticipantBindingPort } from "./teams-binding-port.js";
 import { RoomEventBus } from "./room-event-bus.js";
+import type { RoomActivityStore } from "./room-activity-store.js";
 import { publicTurn } from "./room-event-bus.js";
 
 /**
@@ -55,6 +56,7 @@ export function createRoomRuntime(input: {
 	runner?: RoomParticipantRunner;
 	maxContextChars?: number;
 	attachmentRoot?: string;
+	activity?: RoomActivityStore;
 }): RoomRuntime {
 	const events = new RoomEventStore(input.root, { attachmentRoot: input.attachmentRoot });
 	const turns = new ParticipantTurnStore(input.root);
@@ -81,6 +83,7 @@ export function createRoomRuntime(input: {
 		events,
 		turns,
 		bus,
+		...(input.activity ? { activity: input.activity } : {}),
 		bindings,
 		turnService,
 		operations,

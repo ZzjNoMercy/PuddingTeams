@@ -50,6 +50,7 @@ async function makeStack(roomRunner?: { run: (input: { markInputDurable(): Promi
 		activityStatePath: path.join(dir, "state", "room-activity.json"),
 		sessionCreationStatePath: path.join(dir, "state", "session-creation-operations.json"),
 		roomSessionsStatePath: path.join(dir, "state", "room-sessions"),
+		roomActivityStatePath: path.join(dir, "state", "room-session-activity.json"),
 		roomRunner: roomRunner ?? { run: async (input) => { await input.markInputDurable(); return { status: "completed" as const, finalContent: "房间结论" }; } },
 	});
 	return { app, teams, sessions, delegations, invoker, dir, workerSessionDir };
@@ -493,5 +494,39 @@ test("v4 HTTP: RoomSession 摘要与改名，不写 Manager PS 的 sessionName",
 		assert.equal(listed.json().roomSessions[0].name, "方案讨论");
 		assert.equal(listed.json().activeRoomSessionId, roomSessionId);
 		assert.equal((await teams.roomSession(roomSessionId))?.customName, "方案讨论");
+	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("v4 HTTP: 房间活动/未读投影与已读", async () => {
+	const { app, teams, sessions, dir } = await makeStack();
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		const room = created.json().room as RoomSummary;
+		const roomSessionId = room.roomSessionIds![0]!;
+		await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/messages`,
+			headers: { "idempotency-key": randomUUID() }, payload: { content: "请检查", mentions: ["alpha"] },
+		});
+		for (let attempt = 0; attempt < 50; attempt += 1) {
+			const timeline = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` });
+			if (timeline.json().events.length >= 2) break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		let activity = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/activity` });
+		for (let attempt = 0; attempt < 50 && activity.json().entry?.revision !== 2; attempt += 1) {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			activity = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/activity` });
+		}
+		assert.equal(activity.statusCode, 200, activity.body);
+		assert.equal(activity.json().hasUnreadActivity, true);
+		assert.equal(activity.json().entry.revision, 2);
+		const summary = (await app.inject({ method: "GET", url: `/api/rooms/${room.id}` })).json().room as RoomSummary;
+		assert.equal(summary.hasUnreadActivity, true);
+		assert.equal(summary.activitySessionId, roomSessionId);
+		assert.equal(summary.roomSessions![0]!.hasUnreadActivity, true);
+		assert.equal((await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/read` })).statusCode, 200);
+		assert.equal((await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/activity` })).json().hasUnreadActivity, false);
+		assert.equal(((await app.inject({ method: "GET", url: `/api/rooms/${room.id}` })).json().room as RoomSummary).hasUnreadActivity, false);
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });

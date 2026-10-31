@@ -19,6 +19,7 @@ import { localViewerIdentity } from "./identity.js";
 import { identifyUploads, type FirstMessagePathReference, type UploadInput, type UploadStore } from "../store/uploads.js";
 import { internalFirstWorkFreezeToken, isWithin, localPathReferences } from "./chat.js";
 import { RoomEventStore, type RoomEvent } from "../rooms/room-event-store.js";
+import { RoomActivityStore } from "../rooms/room-activity-store.js";
 import { RoomOperationStore } from "../rooms/room-operation-store.js";
 import { ParticipantTurnStore } from "../rooms/participant-turn-store.js";
 import { createRoomRuntime } from "../rooms/room-runtime.js";
@@ -110,7 +111,7 @@ export interface RoomSummary {
 	/** group：当前 RoomSession 与索引；solo/direct 为空。 */
 	activeRoomSessionId?: string;
 	roomSessionIds?: string[];
-	roomSessions?: Array<{ roomSessionId: string; name: string; active: boolean; managerParticipantSessionId?: string }>;
+	roomSessions?: Array<{ roomSessionId: string; name: string; active: boolean; managerParticipantSessionId?: string; hasUnreadActivity?: boolean; lastMessagePreview?: string }>;
 	pinned: boolean;
 	/** 群聊协作提示词（仅 Group 可编辑；Direct 固定 relay，写入会被拒绝）。 */
 	prompt: string;
@@ -133,6 +134,7 @@ async function buildWindowSummary(
 	teams: TeamsStore,
 	w: WindowConfig,
 	projector = new RoomActivityProjector(),
+	roomActivity?: RoomActivityStore,
 ): Promise<RoomSummary> {
 	const list = await sessions.list();
 	const byId = new Map(list.map((s) => [s.id, s]));
@@ -154,34 +156,44 @@ async function buildWindowSummary(
 		: await isWorkspaceDirectoryAvailable(w.cwdSnapshot, w.cwdSnapshot);
 	// 窗口名：自定义名优先，否则按类型派生（"与 X 单聊"等）。active session 的
 	// LLM 标题不混入窗口名——侧栏/头部把它作为第二行的会话上下文展示。
+	const roomActivityStatuses = w.type === "group" && roomActivity
+		? await roomActivity.statuses(w.roomSessionIds ?? [])
+		: new Map();
 	const roomSummaries = w.type === "group"
 		? await Promise.all((w.roomSessionIds ?? []).map(async (roomSessionId) => {
 			const room = await teams.roomSession(roomSessionId);
 			const manager = await teams.managerSessionForRoom(roomSessionId);
 			const info = manager ? byId.get(manager) : undefined;
+			const status = roomActivityStatuses.get(roomSessionId);
 			return {
 				id: roomSessionId,
 				name: room?.customName ?? room?.generatedName ?? "",
 				firstMessage: info?.firstMessage ?? "新对话",
-				modifiedAt: info?.modifiedAt ?? room?.createdAt ?? "",
+				modifiedAt: status?.entry?.lastActivityAt ?? info?.modifiedAt ?? room?.createdAt ?? "",
 				active: w.activeRoomSessionId === roomSessionId,
 				managerParticipantSessionId: manager,
+				hasUnreadActivity: status?.hasUnreadActivity ?? false,
+				lastMessagePreview: status?.entry?.lastMessagePreview ?? "",
 				model: info?.model,
 				thinkingLevel: info?.thinkingLevel,
 			};
 		}))
+		: undefined;
+	const activeRoomStatus = w.type === "group" && w.activeRoomSessionId ? roomActivityStatuses.get(w.activeRoomSessionId) : undefined;
+	const latestRoomStatus = w.type === "group"
+		? [...roomActivityStatuses.values()].sort((a, b) => (b.entry?.lastActivityAt ?? "").localeCompare(a.entry?.lastActivityAt ?? ""))[0]
 		: undefined;
 	return {
 		id: w.id,
 		type: w.type,
 		name: w.name || autoTitle(w, members),
 		firstMessage: byId.get(ids[0]!)?.firstMessage ?? "",
-		modifiedAt: activity.lastActivityAt ?? w.createdAt,
+		modifiedAt: (w.type === "group" ? latestRoomStatus?.entry?.lastActivityAt : undefined) ?? activity.lastActivityAt ?? w.createdAt,
 		...activity,
-		activitySessionId: read.unreadSessionId ?? activity.activitySessionId,
-		lastMessagePreview: read.unreadPreview ?? activity.lastMessagePreview,
-		readRevision: read.readRevision,
-		hasUnreadActivity: read.hasUnreadActivity,
+		activitySessionId: w.type === "group" ? (w.activeRoomSessionId ?? null) : (read.unreadSessionId ?? activity.activitySessionId),
+		lastMessagePreview: (w.type === "group" ? activeRoomStatus?.entry?.lastMessagePreview : undefined) ?? read.unreadPreview ?? activity.lastMessagePreview,
+		readRevision: w.type === "group" ? (activeRoomStatus?.readRevision ?? 0) : read.readRevision,
+		hasUnreadActivity: w.type === "group" ? (activeRoomStatus?.hasUnreadActivity ?? false) : read.hasUnreadActivity,
 		members,
 		sessions: roomSummaries ?? ids.map((id) => {
 			const info = byId.get(id);
@@ -203,11 +215,14 @@ async function buildWindowSummary(
 			roomSessions: await Promise.all((w.roomSessionIds ?? []).map(async (roomSessionId) => {
 				const room = await teams.roomSession(roomSessionId);
 				const manager = await teams.managerSessionForRoom(roomSessionId);
+				const status = roomActivityStatuses.get(roomSessionId);
 				return {
 					roomSessionId,
 					name: room?.customName ?? room?.generatedName ?? "新对话",
 					active: w.activeRoomSessionId === roomSessionId,
 					...(manager ? { managerParticipantSessionId: manager } : {}),
+					hasUnreadActivity: status?.hasUnreadActivity ?? false,
+					lastMessagePreview: status?.entry?.lastMessagePreview ?? "",
 				};
 			})),
 		} : {}),
@@ -238,6 +253,7 @@ export function registerRoomsRoutes(
 		chatNavigationStatePath?: string;
 		/** state/room-sessions 根目录；用于 RoomEvent / 创建账本。 */
 		roomSessionsStatePath?: string;
+		roomActivityStatePath?: string;
 		/** 测试/宿主替换房间 runner。 */
 		roomRunner?: RoomParticipantRunner;
 	},
@@ -248,13 +264,14 @@ export function registerRoomsRoutes(
 	const roomEvents = localFiles?.roomSessionsStatePath ? new RoomEventStore(localFiles.roomSessionsStatePath) : undefined;
 	const roomOperations = localFiles?.roomSessionsStatePath ? new RoomOperationStore(localFiles.roomSessionsStatePath) : undefined;
 	const roomTurns = localFiles?.roomSessionsStatePath ? new ParticipantTurnStore(localFiles.roomSessionsStatePath) : undefined;
+	const roomActivity = localFiles?.roomActivityStatePath ? new RoomActivityStore(localFiles.roomActivityStatePath) : undefined;
 	const roomRuntime = localFiles?.roomSessionsStatePath
 		? createRoomRuntime({
 			root: localFiles.roomSessionsStatePath, teams, sessions, invoker,
-			runner: localFiles.roomRunner, attachmentRoot: localFiles.attachmentRoot,
+			runner: localFiles.roomRunner, attachmentRoot: localFiles.attachmentRoot, activity: roomActivity,
 		})
 		: undefined;
-	const summarize = (w: WindowConfig) => buildWindowSummary(sessions, teams, w, activityProjector);
+	const summarize = (w: WindowConfig) => buildWindowSummary(sessions, teams, w, activityProjector, roomActivity);
 	const pendingSessionCreations = new Map<string, Promise<Awaited<ReturnType<PiSessionStore["create"]>>>>();
 	const pendingNewWork = new Map<string, Promise<{ sessionId: string; accepted: boolean }>>();
 	const newChatQueues = new Map<string, Promise<unknown>>();
@@ -942,6 +959,21 @@ export function registerRoomsRoutes(
 			}
 		},
 	);
+
+	/** 房间活动/未读读模型（由 RoomEvent 投影，可重建）。 */
+	app.get<{ Params: { id: string; sid: string } }>("/api/rooms/:id/sessions/:sid/activity", async (req, reply) => {
+		if (!roomActivity) return reply.code(503).send({ error: "room activity store is not configured" });
+		const context = await teams.contextForRoomSession(req.params.sid);
+		if (!context || context.window.id !== req.params.id) return reply.code(404).send({ error: "room session not found", code: "room_session_not_found" });
+		return await roomActivity.status(req.params.sid);
+	});
+
+	app.post<{ Params: { id: string; sid: string } }>("/api/rooms/:id/sessions/:sid/read", async (req, reply) => {
+		if (!roomActivity) return reply.code(503).send({ error: "room activity store is not configured" });
+		const context = await teams.contextForRoomSession(req.params.sid);
+		if (!context || context.window.id !== req.params.id) return reply.code(404).send({ error: "room session not found", code: "room_session_not_found" });
+		return { ok: true, ...(await roomActivity.markRead(req.params.sid)) };
+	});
 
 	/** 停止当前公开回合；先取消/abort 执行，再收敛 Turn。 */
 	app.post<{ Params: { id: string; sid: string } }>("/api/rooms/:id/sessions/:sid/abort", async (req, reply) => {

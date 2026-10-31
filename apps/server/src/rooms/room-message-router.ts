@@ -17,6 +17,7 @@ import { RoomTurnService, type ProjectionResult } from "./room-turn-service.js";
 import { RoomOperationStore } from "./room-operation-store.js";
 import { withRoomAdmissionLock } from "./room-admission-lock.js";
 import { publicTurn, type RoomEventBus } from "./room-event-bus.js";
+import type { RoomActivityStore } from "./room-activity-store.js";
 
 /**
  * 房间消息路由（方案 §6、§8.1、§8.2、§19.2、§21.2）。
@@ -94,6 +95,7 @@ export interface RoomMessageRouterDeps {
 	agentNames?: Record<string, string>;
 	budget: RoomContextBudget;
 	bus?: RoomEventBus;
+	activity?: RoomActivityStore;
 	now?: () => string;
 }
 
@@ -249,6 +251,7 @@ export class RoomMessageRouter {
 			const userEvent = await this.deps.events.append(input.roomSessionId, draft);
 			await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "user_event_appended", { roomEventId: userEvent.id });
 			this.deps.bus?.publish(input.roomSessionId, { type: "room_event", event: userEvent });
+			await this.deps.activity?.record(input.roomSessionId, { eventId: userEvent.id, at: userEvent.createdAt, preview: content });
 
 			const begun = await this.deps.turnService.begin({
 				roomSessionId: input.roomSessionId,
@@ -325,14 +328,20 @@ export class RoomMessageRouter {
 			if (result.status === "completed" && result.finalContent?.trim()) {
 				const completed = await this.deps.turnService.complete(roomSessionId, turnId, result.finalContent);
 				const projection = await this.deps.turnService.project(roomSessionId, completed.id);
-				if (projection.event) this.deps.bus?.publish(roomSessionId, { type: "room_event", event: projection.event });
+				if (projection.event) {
+					this.deps.bus?.publish(roomSessionId, { type: "room_event", event: projection.event });
+					await this.deps.activity?.record(roomSessionId, { eventId: projection.event.id, at: projection.event.createdAt, preview: projection.event.content });
+				}
 				this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(projection.turn) });
 				return;
 			}
 			if (result.status === "cancelled") {
 				const cancelled = await this.deps.turnService.cancel(roomSessionId, turnId, result.terminalReason ?? "用户取消", result.finalContent);
 				const projection = await this.deps.turnService.project(roomSessionId, cancelled.id);
-				if (projection.event) this.deps.bus?.publish(roomSessionId, { type: "room_event", event: projection.event });
+				if (projection.event) {
+					this.deps.bus?.publish(roomSessionId, { type: "room_event", event: projection.event });
+					await this.deps.activity?.record(roomSessionId, { eventId: projection.event.id, at: projection.event.createdAt, preview: projection.event.content });
+				}
 				this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(projection.turn) });
 				return;
 			}
@@ -343,7 +352,10 @@ export class RoomMessageRouter {
 				result.finalContent,
 			);
 			const projection = await this.deps.turnService.project(roomSessionId, failed.id);
-			if (projection.event) this.deps.bus?.publish(roomSessionId, { type: "room_event", event: projection.event });
+			if (projection.event) {
+				this.deps.bus?.publish(roomSessionId, { type: "room_event", event: projection.event });
+				await this.deps.activity?.record(roomSessionId, { eventId: projection.event.id, at: projection.event.createdAt, preview: projection.event.content });
+			}
 			this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(projection.turn) });
 		})().finally(() => {
 			if (this.executions.get(key) === run) this.executions.delete(key);

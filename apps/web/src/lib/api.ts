@@ -2736,6 +2736,10 @@ export async function sendRoomMessage(
 	return { accepted: true, roomEventId: body!.roomEventId!, participantTurnId: body!.participantTurnId! };
 }
 
+export async function markRoomSessionRead(roomId: string, roomSessionId: string): Promise<void> {
+	await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(roomSessionId)}/read`, { method: "POST" }).catch(() => undefined);
+}
+
 export async function abortRoomTurn(roomId: string, roomSessionId: string): Promise<void> {
 	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(roomSessionId)}/abort`, { method: "POST" });
 	if (!res.ok) {
