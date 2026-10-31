@@ -657,6 +657,13 @@ export class RoomMessageRouter {
 		return { roomEventId: userEvent.id, turnId: turn.id, status: turn.status, replayed: false };
 	}
 
+	private stopFanout(turnId: string): void {
+		const operationId = this.turnFanout.get(turnId);
+		if (!operationId) return;
+		this.turnFanout.delete(turnId);
+		this.fanouts.delete(operationId);
+	}
+
 	private async continueFanout(turnId: string): Promise<void> {
 		const operationId = this.turnFanout.get(turnId);
 		if (!operationId) return;
@@ -728,6 +735,7 @@ export class RoomMessageRouter {
 			if (result.status === "unknown") {
 				const updated = await this.deps.turnService.markUnknown(roomSessionId, turnId, result.terminalReason ?? "执行结果不确定");
 				this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(updated) });
+				this.stopFanout(turnId);
 				return;
 			}
 			if (result.status === "reconciling") {
@@ -772,6 +780,7 @@ export class RoomMessageRouter {
 					await this.recordActivity(roomSessionId, projection.event);
 				}
 				this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(projection.turn) });
+				this.stopFanout(turnId);
 				return;
 			}
 			const failed = await this.deps.turnService.fail(
@@ -786,6 +795,7 @@ export class RoomMessageRouter {
 				await this.recordActivity(roomSessionId, projection.event);
 			}
 			this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(projection.turn) });
+			this.stopFanout(turnId);
 		})().finally(() => {
 			if (this.executions.get(key) === run) this.executions.delete(key);
 		});

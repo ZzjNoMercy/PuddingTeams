@@ -474,3 +474,21 @@ test("RoomMessageRouter: 多 @ 为一个用户事件顺序创建多个 Participa
 	assert.deepEqual(stored.find((event) => event.actor.kind === "user")?.mentions, ["worker-a", "worker-b"]);
 	assert.deepEqual(stored.filter((event) => event.actor.kind === "agent").map((event) => event.content).sort(), ["worker-a 的结论", "worker-b 的结论"]);
 });
+
+test("RoomMessageRouter: fanout 首个 Turn 取消后不再继续后续目标", async () => {
+	const { turns, bindings, router } = await makeRouter({ bindings: "all" });
+	await bindings.ensure({ roomId: ROOM_ID, roomSessionId: ROOM, agentId: "worker-b", role: "worker", agentSessionId: "agent-worker-b", cwdSnapshot: "/workspace" });
+	let runs = 0;
+	const runner: RoomParticipantRunner = {
+		run: async (input) => {
+			runs += 1;
+			await input.markInputDurable();
+			return { status: "cancelled", terminalReason: "用户停止" };
+		},
+	};
+	(router as unknown as { deps: { runner: RoomParticipantRunner } }).deps.runner = runner;
+	await router.send({ roomSessionId: ROOM, content: "多目标", mentions: ["worker-a", "worker-b"], operationId: "op-fanout-cancel" });
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	assert.equal(runs, 1);
+	assert.equal((await turns.list(ROOM)).length, 1, "首个取消后不应创建第二个 Turn");
+});
