@@ -22,3 +22,19 @@ test("RoomFanoutStore: 计划持久化、前进与删除", async () => {
 	await restarted.remove(plan.roomSessionId, "op-fanout-1");
 	assert.deepEqual(await restarted.list(), []);
 });
+
+test("RoomFanoutStore: 同 operationId 不同房间互不覆盖", async () => {
+	const file = path.join(mkdtempSync(path.join(tmpdir(), "pt-fanout-rooms-")), "plans.json");
+	const store = new RoomFanoutStore(file);
+	const base = { operationId: "same-key", sourceEventId: "event-1", targetAgentIds: ["worker-a"], nextIndex: 1, createdAt: "2026-10-31T00:00:00.000Z" };
+	await store.put({ ...base, roomSessionId: "room-aaaa-1111" });
+	await store.put({ ...base, roomSessionId: "room-bbbb-2222" });
+	assert.equal((await store.list()).length, 2);
+	await store.advance("room-aaaa-1111", "same-key", 2);
+	const plans = await store.list();
+	assert.equal(plans.find((plan) => plan.roomSessionId === "room-aaaa-1111")?.nextIndex, 2);
+	assert.equal(plans.find((plan) => plan.roomSessionId === "room-bbbb-2222")?.nextIndex, 1);
+	await store.remove("room-aaaa-1111", "same-key");
+	assert.equal((await store.list()).length, 1);
+	assert.equal((await store.list())[0]!.roomSessionId, "room-bbbb-2222");
+});
