@@ -436,7 +436,13 @@ export class PiSessionStore {	private active = new Map<string, AgentSession>();
 		return (await this.teamsStore?.getManager())?.piResources;
 	}
 
- private async sessionOwner(id: string, birth?: ManagerWindowContext) {
+ private async sessionOwner(id: string, birth?: ManagerWindowContext, explicitOwnerAgentId?: string) {
+  if (explicitOwnerAgentId) {
+   const agent = await this.teamsStore?.getAgent(explicitOwnerAgentId);
+   if (!agent) throw new Error(`session owner not found: ${explicitOwnerAgentId}`);
+   if (agent.enabled === false) throw new Error("session_owner_unavailable");
+   return piSessionOwner(agent);
+  }
   const ref = await this.teamsStore?.sessionRef?.(id);
   if (ref) return piSessionOwner(await this.teamsStore?.getAgent(ref.ownerAgentId));
   if (birth) return piSessionOwner(birth.type === "direct" ? await this.teamsStore?.getAgent(birth.members[0]!) : await this.teamsStore?.getManager());
@@ -683,6 +689,8 @@ export class PiSessionStore {	private active = new Map<string, AgentSession>();
 		ctx?: ManagerWindowContext;
 		cwd: string;
 		getSessionId: () => string;
+		/** RoomSession Participant 的显式 owner；缺省继续按 ref/birth 推断。 */
+		ownerAgentId?: string;
 		/** open() 重开已有会话：模型以 JSONL 最后一条 model_change 为准，
 		 *  不用 manager 默认模型覆盖用户的选择。 */
 		preferRecordedModel?: boolean;
@@ -690,7 +698,7 @@ export class PiSessionStore {	private active = new Map<string, AgentSession>();
 		 *  thinking_level_change 为准，不用 manager 默认档位覆盖（§10.6）。 */
 		preferRecordedThinkingLevel?: boolean;
 	}): Promise<AgentSession> {
-		const owner = await this.sessionOwner(opts.getSessionId(), opts.ctx);
+		const owner = await this.sessionOwner(opts.getSessionId(), opts.ctx, opts.ownerAgentId);
 		const settings = owner.settings;
 		const resources = owner.resources;
 		const { loader, plan, capabilityRuntime, codeSearch, assertKnowledge, knowledgeExecution } = await this.managerResourceLoader(
@@ -1257,18 +1265,21 @@ export class PiSessionStore {	private active = new Map<string, AgentSession>();
 		modelRef?: string,
 		window?: ManagerWindowContext,
 		sessionId?: string,
+		options?: { ownerAgentId?: string },
 	): Promise<SessionSummary> {
 		if (sessionId && (await this.list()).some((item) => item.id === sessionId)) {
 			throw new Error(`Session already exists: ${sessionId}`);
 		}
 		const model = modelRef ? await this.resolveModel(modelRef) : undefined;
 		const cwd = window?.cwd ?? this.cwd;
-		const binding: { sessionId: string } = { sessionId: "" };
 		const sessionManager = SessionManager.create(cwd, this.sessionDir, sessionId ? { id: sessionId } : undefined);
+		// 装配期间就能读到预留/生成的 Session id；显式 owner 的 Participant
+		// 会话必须在第一次进模型前固定身份，不能等装配结束才回填。
+		const binding: { sessionId: string } = { sessionId: sessionManager.getSessionId() };
 		let session: AgentSession | undefined;
 		for (let attempt = 0; attempt < 4; attempt++) {
 			const epoch = this.configEpoch;
-			const candidate = await this.assembleSession({ sessionManager, model, ctx: window, cwd, getSessionId: () => binding.sessionId });
+			const candidate = await this.assembleSession({ sessionManager, model, ctx: window, cwd, getSessionId: () => binding.sessionId, ownerAgentId: options?.ownerAgentId });
 			if (epoch === this.configEpoch) { session = candidate; break; }
 			candidate.dispose();
 			this.assembledManaged.delete(candidate.sessionId);
