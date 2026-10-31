@@ -274,3 +274,35 @@ test("RoomMessageRouter: 真实 Pi runner 的 prompt 被拒绝时不返回 accep
 		(error: unknown) => error instanceof RoomMessageError && error.code === "message_delivery_unconfirmed",
 	);
 });
+
+test("RoomMessageRouter: 原生 followUp 追加输入、不另起 runner，完成后只投影一次 final", async () => {
+	const { events, turns, router } = await makeRouter({ bindings: "all" });
+	let release!: () => void;
+	const pending = new Promise<void>((resolve) => { release = resolve; });
+	let runCalls = 0;
+	const runner: RoomParticipantRunner = {
+		run: async (input) => {
+			runCalls += 1;
+			await input.markInputDurable("initial-entry");
+			await pending;
+			return { status: "completed", finalContent: "最终结论" };
+		},
+		followUp: async (input) => { await input.markInputDurable("followup-entry"); },
+	};
+	(router as unknown as { deps: { runner: RoomParticipantRunner } }).deps.runner = runner;
+	const first = await router.send({ roomSessionId: ROOM, content: "开始", mentions: ["worker-a"], operationId: "op-follow-1" });
+	const follow = await router.send({
+		roomSessionId: ROOM, content: "补充", mentions: ["worker-a"], operationId: "op-follow-2",
+		delivery: "followUp", expectedParticipantTurnId: first.turnId,
+	});
+	assert.equal(follow.turnId, first.turnId);
+	assert.equal(runCalls, 1, "followUp 不能起第二个 runner");
+	const active = await turns.get(ROOM, first.turnId);
+	assert.equal(active?.inputs.length, 2);
+	assert.equal(active?.inputs[1]?.persistence, "durable");
+	release();
+	await wait(router, first.turnId);
+	const stored = await events.read(ROOM);
+	assert.equal(stored.filter((event) => event.kind === "message").length, 3, "两个用户输入 + 一次 final");
+	assert.equal(stored.filter((event) => event.kind === "terminal").length, 0);
+});

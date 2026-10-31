@@ -171,7 +171,7 @@ export function RoomChatPane({
 
 	const activeTurn = timeline?.activeTurn;
 	const recoveryRequired = Boolean(timeline?.capabilities.recoveryRequired);
-	const canSend = Boolean(roomSessionId) && !activeTurn && !recoveryRequired && !sending;
+	const canSend = Boolean(roomSessionId) && !recoveryRequired && !sending;
 	const labels = useMemo(() => {
 		const map = new Map<string, string>();
 		for (const member of room.members) map.set(member.name, agentDisplayName(member));
@@ -193,12 +193,13 @@ export function RoomChatPane({
 			await sendRoomMessage(room.id, roomSessionId, {
 				content,
 				mentions: targetAgentId ? [targetAgentId] : [],
+				...(activeTurn ? { delivery: "followUp" as const, expectedParticipantTurnId: activeTurn.id } : {}),
 			}, crypto.randomUUID());
 			setDraft("");
 		} catch (caught) {
 			toast.error(caught instanceof Error ? caught.message : String(caught));
 		} finally { setSending(false); }
-	}, [canSend, draft, room.id, roomSessionId, targetAgentId]);
+	}, [activeTurn, canSend, draft, room.id, roomSessionId, targetAgentId]);
 
 	const handleStop = useCallback(async () => {
 		if (!roomSessionId) return;
@@ -328,7 +329,7 @@ export function RoomChatPane({
 							void handleSend();
 						}
 					}}
-					placeholder={activeTurn ? "当前回合进行中；可停止或等待完成" : "输入消息，Enter 发送，Shift+Enter 换行"}
+					placeholder={activeTurn ? "当前回合进行中；发送会作为 followUp 追加" : "输入消息，Enter 发送，Shift+Enter 换行"}
 					disabled={!canSend}
 					className="min-h-[72px]"
 				/>

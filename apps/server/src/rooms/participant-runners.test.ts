@@ -211,3 +211,25 @@ test("PiParticipantRunner: preflight 后必须等 user entry 落盘才 durable",
 	});
 	assert.equal(durableSawEntry, true, "preflight 时 entry 尚未落盘，durable 必须后移");
 });
+
+test("PiParticipantRunner: followUp 走 streamingBehavior 并在 user entry 落盘后 durable", async () => {
+	const messages: Array<{ role: string; content: string }> = [];
+	let streaming: unknown;
+	let durableEntry: string | undefined;
+	const session = {
+		messages,
+		prompt: async (text: string, options?: { streamingBehavior?: unknown; preflightResult?: (disposition: unknown) => void }) => {
+			streaming = options?.streamingBehavior;
+			options?.preflightResult?.("queued");
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			messages.push({ role: "user", content: text });
+		},
+	};
+	const runner = new PiParticipantRunner({ sessions: { open: async () => session as never } });
+	await runner.followUp({
+		roomSessionId: runnerInput.roomSessionId, turn: runnerInput.turn, binding: runnerInput.binding,
+		text: "补充", markInputDurable: async (id) => { durableEntry = id; },
+	});
+	assert.equal(streaming, "followUp");
+	assert.equal(durableEntry, "user-entry");
+});

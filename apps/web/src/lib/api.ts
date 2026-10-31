@@ -2723,7 +2723,7 @@ export async function fetchRoomTimeline(roomId: string, roomSessionId: string): 
 export async function sendRoomMessage(
 	roomId: string,
 	roomSessionId: string,
-	input: { content: string; mentions: string[]; delivery?: "normal"; expectedParticipantTurnId?: string; attachments?: MessageAttachmentInput[] },
+	input: { content: string; mentions: string[]; delivery?: "normal" | "followUp"; expectedParticipantTurnId?: string; attachments?: MessageAttachmentInput[] },
 	operationKey: string,
 ): Promise<{ accepted: boolean; roomEventId: string; participantTurnId: string }> {
 	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(roomSessionId)}/messages`, {

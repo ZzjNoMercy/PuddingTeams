@@ -69,8 +69,18 @@ export interface RoomParticipantRunnerResult {
 	delegationIds?: string[];
 }
 
+export interface RoomParticipantFollowUpInput {
+	roomSessionId: string;
+	turn: ParticipantTurn;
+	binding: ParticipantBinding;
+	text: string;
+	markInputDurable(agentUserEntryId?: string): Promise<void>;
+}
+
 export interface RoomParticipantRunner {
 	run(input: RoomParticipantRunnerInput): Promise<RoomParticipantRunnerResult>;
+	/** 原生 followUp：应把输入交给同一 Agent 会话队列，不另起 runner。 */
+	followUp?(input: RoomParticipantFollowUpInput): Promise<void>;
 }
 
 export interface RoomContextBudget {
@@ -187,7 +197,6 @@ export class RoomMessageRouter {
 		const delivery = input.delivery ?? "normal";
 		if (delivery === "normal" && input.expectedParticipantTurnId) throw new RoomMessageError("invalid_delivery", "normal 消息不能携带 expectedParticipantTurnId");
 		if (delivery === "followUp" && !input.expectedParticipantTurnId) throw new RoomMessageError("invalid_delivery", "followUp 必须携带 expectedParticipantTurnId");
-		if (delivery === "followUp") throw new RoomMessageError("participant_delivery_unsupported", "同 Turn followUp 尚未接通；首期只支持 normal");
 		const hash = requestHash({ ...input, content }, content);
 
 		return withRoomAdmissionLock(input.roomSessionId, async () => {
@@ -213,6 +222,57 @@ export class RoomMessageRouter {
 					await this.deps.events.create(input.roomSessionId);
 					events = [];
 				} else throw error;
+			}
+			if (delivery === "followUp") {
+				const active = await this.activeTurn(input.roomSessionId);
+				if (!active || active.id !== input.expectedParticipantTurnId) {
+					throw new RoomMessageError("invalid_delivery", "followUp 的目标回合已不活动");
+				}
+				const binding = await this.deps.bindings.findActiveBySession(input.roomSessionId, active.agentSessionId);
+				if (!binding) throw new RoomMessageError("participant_binding_required", "followUp 的 ParticipantSession 没有 active binding");
+				if (!this.deps.runner.followUp) {
+					throw new RoomMessageError("participant_delivery_unsupported", "当前 Participant 不支持原生 followUp");
+				}
+				const eventId = randomUUID();
+				const draft = {
+					id: eventId, kind: "message" as const, actor: { kind: "user" as const },
+					content, mentions: [binding.agentId],
+					...(input.attachments?.length ? { attachments: input.attachments } : {}),
+					createdAt: this.now(),
+				};
+				const reserved = await this.deps.operations.reserveMessage(input.roomSessionId, { key: input.operationId, requestHash: hash });
+				if (!reserved.created) throw new RoomMessageError("message_delivery_unconfirmed", "消息操作已存在但未确认 accepted");
+				const userEvent = await this.deps.events.append(input.roomSessionId, draft);
+				await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "user_event_appended", { roomEventId: userEvent.id });
+				this.deps.bus?.publish(input.roomSessionId, { type: "room_event", event: userEvent });
+				await this.recordActivity(input.roomSessionId, userEvent, false);
+				const appended = await this.deps.turns.appendInput(input.roomSessionId, active.id, {
+					operationId: input.operationId,
+					sourceRoomEventId: userEvent.id,
+					...(binding.lastRoomEntryId ? { contextFromAfterRoomEventId: binding.lastRoomEntryId } : {}),
+					contextThroughRoomEventId: userEvent.id,
+					inputHash: hashText(content),
+					delivery: "followUp",
+					persistence: "pending",
+				});
+				await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "participant_bound", {
+					agentSessionId: binding.agentSessionId, participantTurnId: active.id,
+				});
+				let durableMarked = false;
+				let resolveDurable!: () => void;
+				const durableReached = new Promise<void>((resolve) => { resolveDurable = resolve; });
+				const markInputDurable = async (agentUserEntryId?: string) => {
+					if (durableMarked) return;
+					await this.deps.turnService.markInputDurable(input.roomSessionId, active.id, input.operationId, agentUserEntryId);
+					await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "participant_input_durable");
+					durableMarked = true;
+					resolveDurable();
+				};
+				const following = this.deps.runner.followUp({ roomSessionId: input.roomSessionId, turn: appended.turn, binding, text: content, markInputDurable });
+				await Promise.race([durableReached, following.then(() => undefined, () => undefined)]);
+				if (!durableMarked) throw new RoomMessageError("message_delivery_unconfirmed", "followUp 输入未确认落盘；请刷新时间线核对");
+				await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "accepted");
+				return { roomEventId: userEvent.id, turnId: active.id, status: appended.turn.status, replayed: false };
 			}
 			const active = await this.activeTurn(input.roomSessionId);
 			if (active) throw new RoomMessageError("room_turn_active", `房间已有未终态公开回合：${active.id}`);

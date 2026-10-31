@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import type { AgentInvokeParams, AgentInvokeResult, AgentInvoker } from "../agent-runtime/invoker.js";
 import type { PiSessionStore } from "../pi-bridge/session-store.js";
 import type {
+	RoomParticipantFollowUpInput,
 	RoomParticipantRunner,
 	RoomParticipantRunnerInput,
 	RoomParticipantRunnerResult,
@@ -126,6 +127,29 @@ export class PiParticipantRunner implements RoomParticipantRunner {
 		}
 		if (!final.text) return { status: "failed", terminalReason: "模型没有返回可发布的最终文本" };
 		return { status: "completed", finalContent: final.text, execution: { kind: "native_pi" } };
+	}
+
+	async followUp(input: RoomParticipantFollowUpInput): Promise<void> {
+		const session = await this.deps.sessions.open(input.binding.agentSessionId) as unknown as RunnerSession;
+		const priorUserIds = new Set((session.sessionManager?.getBranch() ?? [])
+			.filter((entry) => entry.type === "message" && entry.message?.role === "user")
+			.map((entry) => entry.id).filter((id): id is string => Boolean(id)));
+		const priorCount = session.messages.filter((message) => message.role === "user").length;
+		let accepted!: () => void;
+		const acceptedInput = new Promise<void>((resolve) => { accepted = resolve; });
+		const prompt = session.prompt(input.text, {
+			streamingBehavior: "followUp",
+			preflightResult: () => accepted(),
+		} as { preflightResult?: (disposition: unknown) => void });
+		const outcome = await Promise.race([
+			acceptedInput.then(() => "accepted" as const),
+			prompt.then(() => "finished" as const, () => "failed" as const),
+		]);
+		if (outcome === "failed") throw new Error("Agent 拒绝了 followUp 输入");
+		const userEntryId = await waitForDurableUserEntry(session, input.text, priorUserIds, priorCount);
+		if (!userEntryId) throw new Error("followUp 输入尚未写入 Agent 会话记录");
+		await input.markInputDurable(userEntryId);
+		void prompt.catch(() => undefined);
 	}
 }
 
