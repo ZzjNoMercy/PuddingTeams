@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import assert from "node:assert";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import Fastify from "fastify";
@@ -44,6 +44,7 @@ async function makeStack() {
 	registerRoomsRoutes(app, sessions, teams, invoker, undefined, {
 		activityStatePath: path.join(dir, "state", "room-activity.json"),
 		sessionCreationStatePath: path.join(dir, "state", "session-creation-operations.json"),
+		roomSessionsStatePath: path.join(dir, "state", "room-sessions"),
 	});
 	return { app, teams, sessions, delegations, invoker, dir, workerSessionDir };
 }
@@ -260,5 +261,23 @@ test("v4 HTTP: group Manager PS 不能经 Agent API 删除；单 RoomSession 整
 		const wholeRoom = await app.inject({ method: "DELETE", url: `/api/rooms/${room.id}?onlySession=${roomSessionId}` });
 		assert.equal(wholeRoom.statusCode, 204, wholeRoom.body);
 		assert.equal(await teams.getWindow(room.id), undefined);
+	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("v4 HTTP: group 建房写入 RoomSession 创建账本与空公共事件文件", async () => {
+	const { app, teams, sessions, dir } = await makeStack();
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		assert.equal(created.statusCode, 200, created.body);
+		const room = created.json().room as RoomSummary;
+		const roomSessionId = room.roomSessionIds![0]!;
+		const root = path.join(dir, "state", "room-sessions", roomSessionId);
+		assert.equal(existsSync(path.join(root, "events.jsonl")), true);
+		const operations = JSON.parse(readFileSync(path.join(root, "operations.json"), "utf8")) as { creation: Record<string, { phase: string }> };
+		assert.deepEqual(Object.values(operations.creation).map((item) => item.phase), ["attached"]);
+		const manager = (await teams.managerSession(room.id))!;
+		assert.equal((await teams.participantSession(manager))?.roomSessionId, roomSessionId);
+		assert.equal((await teams.roomSession(roomSessionId))?.roomId, room.id);
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });

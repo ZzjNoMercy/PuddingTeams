@@ -878,6 +878,7 @@ await registerRoomsRoutes(app, store, teams, invoker, workStates, {
 	productSettings,
 	activityStatePath: path.join(paths.state, "room-activity.json"),
 	sessionCreationStatePath: path.join(paths.state, "session-creation-operations.json"),
+	roomSessionsStatePath: path.join(paths.state, "room-sessions"),
 	chatNavigationStatePath: path.join(paths.state, "chat-navigation.json"),
 });
 await registerInteractionsRoutes(app, runtime, invoker, teams, workStates);

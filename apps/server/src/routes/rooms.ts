@@ -13,10 +13,12 @@ import { openNativeFile } from "../platform/native-file-opener.js";
 import { compareRoomActivity, RoomActivityProjector } from "./room-activity.js";
 import { SessionCreationOperations } from "../store/session-creation-operations.js";
 import { ChatNavigationStore } from "../store/chat-navigation.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { localViewerIdentity } from "./identity.js";
 import { identifyUploads, type FirstMessagePathReference, type UploadInput, type UploadStore } from "../store/uploads.js";
 import { internalFirstWorkFreezeToken, isWithin, localPathReferences } from "./chat.js";
+import { RoomEventStore } from "../rooms/room-event-store.js";
+import { RoomOperationStore } from "../rooms/room-operation-store.js";
 
 class FirstWorkMessageConflictError extends Error {
 	constructor() {
@@ -201,11 +203,15 @@ export function registerRoomsRoutes(
 		activityStatePath?: string;
 		sessionCreationStatePath?: string;
 		chatNavigationStatePath?: string;
+		/** state/room-sessions 根目录；用于 RoomEvent / 创建账本。 */
+		roomSessionsStatePath?: string;
 	},
 ): void {
 	const activityProjector = new RoomActivityProjector(localFiles?.activityStatePath);
 	const sessionCreationOperations = localFiles?.sessionCreationStatePath
 		? new SessionCreationOperations(localFiles.sessionCreationStatePath) : null;
+	const roomEvents = localFiles?.roomSessionsStatePath ? new RoomEventStore(localFiles.roomSessionsStatePath) : undefined;
+	const roomOperations = localFiles?.roomSessionsStatePath ? new RoomOperationStore(localFiles.roomSessionsStatePath) : undefined;
 	const summarize = (w: WindowConfig) => buildWindowSummary(sessions, teams, w, activityProjector);
 	const pendingSessionCreations = new Map<string, Promise<Awaited<ReturnType<PiSessionStore["create"]>>>>();
 	const pendingNewWork = new Map<string, Promise<{ sessionId: string; accepted: boolean }>>();
@@ -467,26 +473,56 @@ export function registerRoomsRoutes(
 					return { room: await summarize(w), existed: !createdHere };
 				}
 				let createdHere = false;
-				const w = await teams.createWindow({
-					type,
-					members,
-					workspaceId,
-					cwdSnapshot: context.cwdSnapshot,
-					name: req.body?.name,
-					prompt: req.body?.prompt,
-					requireEnabledMembers: true,
-					journalSession: true,
-					creationOperation,
-					createSession: (reservedId) => { createdHere = true; return sessions.create(undefined, {
+				const roomSessionId = randomUUID();
+				const creationLedgerKey = creationOperation?.key && creationOperation.key.length >= 8 ? creationOperation.key : randomUUID();
+				const creationRequestHash = creationOperation?.requestHash ?? createHash("sha256").update(JSON.stringify({
+					type, members, workspaceId: workspaceId ?? null, name: req.body?.name ?? null,
+					prompt: req.body?.prompt ?? null, cwd: context.cwdSnapshot,
+				})).digest("hex");
+				let createdWindow: WindowConfig | undefined;
+				try {
+					createdWindow = await teams.createWindow({
 						type,
 						members,
-						prompt: req.body?.prompt,
 						workspaceId,
-						cwd: context.cwdSnapshot,
-					}, reservedId, ownerOptionsFor(type, members)); },
-					rollbackSession: (id) => sessions.remove(id),
-				});
-				return { room: await summarize(w), existed: !createdHere };
+						cwdSnapshot: context.cwdSnapshot,
+						name: req.body?.name,
+						prompt: req.body?.prompt,
+						requireEnabledMembers: true,
+						journalSession: true,
+						creationOperation,
+						roomSessionId,
+						createSession: async (reservedId) => {
+							createdHere = true;
+							if (!reservedId) throw new Error("group 建房必须预留 Manager Session id");
+							if (roomOperations && roomEvents) {
+								await roomOperations.reserveCreation(roomSessionId, {
+									key: creationLedgerKey, requestHash: creationRequestHash, managerAgentSessionId: reservedId,
+								});
+								await roomEvents.create(roomSessionId);
+								await roomOperations.advanceCreation(roomSessionId, creationLedgerKey, "event_file_created");
+							}
+							const created = await sessions.create(undefined, {
+								type,
+								members,
+								prompt: req.body?.prompt,
+								workspaceId,
+								cwd: context.cwdSnapshot,
+							}, reservedId, ownerOptionsFor(type, members));
+							if (roomOperations) await roomOperations.advanceCreation(roomSessionId, creationLedgerKey, "manager_created");
+							return created;
+						},
+						rollbackSession: (id) => sessions.remove(id),
+					});
+					if (createdHere && roomOperations) {
+						await roomOperations.advanceCreation(roomSessionId, creationLedgerKey, "manager_bound");
+						await roomOperations.advanceCreation(roomSessionId, creationLedgerKey, "attached");
+					}
+					return { room: await summarize(createdWindow), existed: !createdHere };
+				} catch (error) {
+					if (!createdWindow && roomEvents) await roomEvents.remove(roomSessionId).catch(() => undefined);
+					throw error;
+				}
 			} catch (err) {
 				if (err instanceof RoomCreationOperationConflictError) return reply.code(409).send({ error: err.message, code: "room_operation_conflict" });
 				if (err instanceof RoomCreationOperationGoneError) return reply.code(409).send({ error: err.message, code: "room_operation_gone" });

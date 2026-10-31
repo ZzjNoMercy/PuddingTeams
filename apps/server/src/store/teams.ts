@@ -1969,6 +1969,8 @@ export class TeamsStore {
 		journalSession?: boolean;
 		creationOperation?: { key: string; requestHash: string };
 		sourceSnapshot?: RoomSourceSnapshot;
+		/** group 建房预生成的 RoomSession id；缺省随机。 */
+		roomSessionId?: string;
 	} & ({ sessionId: string; createSession?: never; rollbackSession?: never } | {
 		sessionId?: never;
 		createSession: (reservedId?: string) => Promise<{ id: string }>;
@@ -2020,7 +2022,8 @@ export class TeamsStore {
 			};
 			let window: WindowConfig;
 			if (type === "group") {
-				const roomSessionId = randomUUID();
+				const roomSessionId = opts.roomSessionId ?? randomUUID();
+				if (data.roomSessions[roomSessionId]) throw new Error(`RoomSession already exists: ${roomSessionId}`);
 				window = { ...base, roomSessionIds: [roomSessionId], activeRoomSessionId: roomSessionId };
 				data.roomSessions[roomSessionId] = {
 					roomSessionId,
