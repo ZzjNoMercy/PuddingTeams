@@ -53,6 +53,11 @@ function readPiVersion(): string | undefined {
 
 const piVersion = readPiVersion();
 
+/** 测试用的部分 TeamsStore 桩可能没有 v4 participant 查询；缺省视为非 Participant。 */
+async function participantSessionOf(teams: TeamsStore | undefined, id: string) {
+	return teams && typeof teams.participantSession === "function" ? await teams.participantSession(id) : undefined;
+}
+
 interface WsHandlerParams {
 	Params: { id: string };
 	Querystring: Record<string, never>;
@@ -338,7 +343,7 @@ export async function registerChatRoutes(
 
 	app.delete<{ Params: { id: string } }>("/api/sessions/:id", async (req, reply) => {
 		try {
-			if (teams && await teams.participantSession(req.params.id)) {
+			if (await participantSessionOf(teams, req.params.id)) {
 				return reply.code(409).send({ error: "Participant Session 由房间管理；请删除 RoomSession", code: "participant_session_managed" });
 			}
 			let existed = false;
@@ -465,6 +470,9 @@ export async function registerChatRoutes(
 		"/api/sessions/:id/messages",
 		{ bodyLimit: 28 * 1024 * 1024 },
 		async (req, reply) => {
+			if (await participantSessionOf(teams, req.params.id)) {
+				return reply.code(409).send({ error: "Participant Session 由房间回合管理；请使用房间消息接口", code: "participant_session_managed" });
+			}
 			const requestedDelivery = req.body?.delivery;
 			if (requestedDelivery !== undefined && !["normal", "followUp", "steer"].includes(requestedDelivery)) return reply.code(400).send({ error: "invalid delivery", code: "invalid_delivery" });
 			const content = req.body?.content?.trim();
@@ -714,6 +722,9 @@ export async function registerChatRoutes(
 	// clearQueue(); rebuild only carries text, hence the hasImages guard.
 	app.post<{ Params: { id: string; key: string }; Body: { action?: string } }>("/api/sessions/:id/queued-inputs/:key", async (req, reply) => {
 		try {
+			if (await participantSessionOf(teams, req.params.id)) {
+				return reply.code(409).send({ error: "Participant Session 的队列由房间管理", code: "participant_session_managed" });
+			}
 			await requireActiveSessionContext(req.params.id);
 			const action = req.body?.action;
 			if (action !== "steer" && action !== "cancel") return reply.code(400).send({ error: "invalid action", code: "invalid_action" });
@@ -763,6 +774,9 @@ export async function registerChatRoutes(
 
 	app.post<{ Params: { id: string } }>("/api/sessions/:id/abort", async (req, reply) => {
 		try {
+			if (await participantSessionOf(teams, req.params.id)) {
+				return reply.code(409).send({ error: "Participant Session 的停止由房间回合管理", code: "participant_session_managed" });
+			}
 			await requireActiveSessionContext(req.params.id);
 			// Stop is a durable execution boundary, not only an SDK cancellation.
 			// Fence every already-issued manager/worker callback by advancing the

@@ -20,7 +20,7 @@ import { registerChatRoutes } from "./chat.js";
 
 /** Delegated contexts cannot be used as ordinary chats; audit facts survive. */
 
-async function makeStack(roomRunner?: { run: (input: { markInputDurable(): Promise<void> }) => Promise<{ status: "completed"; finalContent?: string }> }) {
+async function makeStack(roomRunner?: { run: (input: { markInputDurable(): Promise<void>; prompt: string }) => Promise<{ status: "completed"; finalContent?: string }> }) {
 	const dir = mkdtempSync(path.join(tmpdir(), "pt-worker-sessions-"));
 	process.env.PI_CODING_AGENT_DIR = path.join(dir, "agent-dir");
 	const teams = new TeamsStore(
@@ -257,6 +257,15 @@ test("v4 HTTP: group Manager PS 不能经 Agent API 删除；单 RoomSession 整
 
 		const agentDelete = await app.inject({ method: "DELETE", url: `/api/sessions/${manager}` });
 		assert.equal(agentDelete.statusCode, 409, agentDelete.body);
+		for (const operation of [
+			{ method: "POST" as const, url: `/api/sessions/${manager}/messages`, payload: { content: "绕过房间" } },
+			{ method: "POST" as const, url: `/api/sessions/${manager}/abort` },
+			{ method: "POST" as const, url: `/api/sessions/${manager}/queued-inputs/op-1`, payload: { action: "cancel" } },
+		]) {
+			const denied = await app.inject(operation);
+			assert.equal(denied.statusCode, 409, denied.body);
+			assert.equal(denied.json().code, "participant_session_managed");
+		}
 		assert.equal(agentDelete.json().code, "participant_session_managed");
 		assert.ok(await teams.participantSession(manager), "Manager binding 必须保留");
 		assert.equal((await teams.getWindow(room.id))?.activeRoomSessionId, roomSessionId);
@@ -464,5 +473,25 @@ test("v4 HTTP: 房间消息附件冻结为引用并进入组合输入", async ()
 		assert.equal(userEvent.attachments[0].name, "note.txt");
 		assert.ok(userEvent.attachments[0].path.startsWith(path.join(dir, "uploads")));
 		assert.match(prompts[0]!, /附件：note\.txt（text\/plain，sha256=/);
+	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("v4 HTTP: RoomSession 摘要与改名，不写 Manager PS 的 sessionName", async () => {
+	const { app, teams, sessions, dir } = await makeStack();
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		const room = created.json().room as RoomSummary;
+		assert.equal(room.roomSessions?.length, 1);
+		assert.equal(room.roomSessions![0]!.name, "新对话");
+		const roomSessionId = room.roomSessionIds![0]!;
+		const manager = (await teams.managerSession(room.id))!;
+		const renamed = await app.inject({ method: "PATCH", url: `/api/rooms/${room.id}/sessions/${manager}`, payload: { name: "方案讨论" } });
+		assert.equal(renamed.statusCode, 200, renamed.body);
+		assert.equal(renamed.json().roomSessionId, roomSessionId);
+		const listed = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions` });
+		assert.equal(listed.json().roomSessions[0].name, "方案讨论");
+		assert.equal(listed.json().activeRoomSessionId, roomSessionId);
+		assert.equal((await teams.roomSession(roomSessionId))?.customName, "方案讨论");
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });

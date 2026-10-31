@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { MANAGER_AGENT_NAME, type TeamsStore } from "../store/teams.js";
+import { MANAGER_AGENT_NAME, agentRunConfigRevision, type TeamsStore } from "../store/teams.js";
 import type { PiSessionStore } from "../pi-bridge/session-store.js";
 import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import { RoomEventStore } from "./room-event-store.js";
@@ -65,7 +65,17 @@ export function createRoomRuntime(input: {
 	const runner = input.runner ?? new ConnectorParticipantRunner({
 		teams: input.teams,
 		pi: new PiParticipantRunner({ sessions: input.sessions }),
-		direct: input.invoker ? new DirectChatParticipantRunner({ invoker: input.invoker }) : undefined,
+		direct: input.invoker ? new DirectChatParticipantRunner({
+			invoker: input.invoker,
+			handleFor: (binding) => input.teams.participantProviderHandle(binding.agentSessionId),
+			rememberHandle: async (binding, agent, handle) => {
+				await input.teams.setParticipantProviderHandle(binding.agentSessionId, {
+					driverId: agent.connector?.connectorId ?? (agent.invoke?.type === "command" ? "command" : "legacy"),
+					agentRevision: agentRunConfigRevision(agent),
+					providerSessionHandle: handle,
+				});
+			},
+		}) : undefined,
 	});
 	const router = new RoomMessageRouter({
 		events,

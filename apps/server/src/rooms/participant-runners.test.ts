@@ -121,3 +121,24 @@ test("DirectChatParticipantRunner: 复用 direct_chat Delegation 并映射终态
 	assert.equal((await runner.run(runnerInput)).status, "cancelled");
 	assert.equal((await runner.run(runnerInput)).status, "unknown");
 });
+
+test("DirectChatParticipantRunner: provider handle 续接与持久", async () => {
+	const calls: AgentInvokeParams[] = [];
+	let persisted: string | undefined;
+	const results: AgentInvokeResult[] = [
+		{ status: "completed", content: "一", details: {}, delegationId: "d-1", sessionHandle: "handle-1", waitingInput: false },
+		{ status: "completed", content: "二", details: {}, delegationId: "d-2", waitingInput: false },
+	];
+	const runner = new DirectChatParticipantRunner({
+		invoker: {
+			requireAgent: async (name: string) => ({ name, description: "", connector: { extensionId: "puddingclaw", connectorId: "puddingclaw", transport: "spawn", config: {} } }),
+			delegate: async (params: AgentInvokeParams) => { calls.push(params); return results.shift()!; },
+		} as never,
+		handleFor: async () => persisted,
+		rememberHandle: async (_binding, _agent, handle) => { persisted = handle; },
+	});
+	await runner.run(runnerInput);
+	assert.equal(persisted, "handle-1");
+	await runner.run(runnerInput);
+	assert.equal(calls[1]!.sessionHandle, "handle-1");
+});

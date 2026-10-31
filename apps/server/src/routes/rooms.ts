@@ -110,6 +110,7 @@ export interface RoomSummary {
 	/** group：当前 RoomSession 与索引；solo/direct 为空。 */
 	activeRoomSessionId?: string;
 	roomSessionIds?: string[];
+	roomSessions?: Array<{ roomSessionId: string; name: string; active: boolean; managerParticipantSessionId?: string }>;
 	pinned: boolean;
 	/** 群聊协作提示词（仅 Group 可编辑；Direct 固定 relay，写入会被拒绝）。 */
 	prompt: string;
@@ -182,6 +183,16 @@ async function buildWindowSummary(
 		...(w.type === "group" ? {
 			activeRoomSessionId: w.activeRoomSessionId,
 			roomSessionIds: [...(w.roomSessionIds ?? [])],
+			roomSessions: await Promise.all((w.roomSessionIds ?? []).map(async (roomSessionId) => {
+				const room = await teams.roomSession(roomSessionId);
+				const manager = await teams.managerSessionForRoom(roomSessionId);
+				return {
+					roomSessionId,
+					name: room?.customName ?? room?.generatedName ?? "新对话",
+					active: w.activeRoomSessionId === roomSessionId,
+					...(manager ? { managerParticipantSessionId: manager } : {}),
+				};
+			})),
 		} : {}),
 		pinned: Boolean(w.pinned),
 		prompt: w.prompt ?? "",
@@ -837,7 +848,7 @@ export function registerRoomsRoutes(
 		return {
 			sessions: summary.sessions,
 			active: summary.activeSession,
-			...(w.type === "group" ? { roomSessionIds: summary.roomSessionIds, activeRoomSessionId: summary.activeRoomSessionId } : {}),
+			...(w.type === "group" ? { roomSessionIds: summary.roomSessionIds, activeRoomSessionId: summary.activeRoomSessionId, roomSessions: summary.roomSessions } : {}),
 		};
 	});
 
@@ -1444,6 +1455,14 @@ export function registerRoomsRoutes(
 			if (!w) return reply.code(404).send({ error: "window not found" });
 			if (typeof req.body?.name !== "string") {
 				return reply.code(400).send({ error: "body must be { name: string }" });
+			}
+			if (w.type === "group") {
+				const room = await teams.roomSession(req.params.sid);
+				const participant = room ? undefined : await teams.participantSession(req.params.sid);
+				const roomSessionId = room?.roomSessionId ?? participant?.roomSessionId;
+				if (!roomSessionId) return reply.code(404).send({ error: "session not found in window" });
+				const renamed = await teams.renameRoomSession(roomSessionId, req.body.name);
+				return { session: { id: roomSessionId, name: renamed.customName ?? "" }, roomSessionId };
 			}
 			const { sessions: sessionIds } = await teams.windowSessionList(w.id);
 			if (!sessionIds.includes(req.params.sid)) return reply.code(404).send({ error: "session not found in window" });

@@ -2343,6 +2343,20 @@ export class TeamsStore {
 		});
 	}
 
+	async renameRoomSession(roomSessionId: string, name: string | undefined): Promise<RoomSessionRefV4> {
+		return this.serialize(async () => {
+			const data = await this.loadWindowsFile();
+			const room = data.roomSessions[roomSessionId];
+			if (!room) throw new Error(`room session not found: ${roomSessionId}`);
+			const trimmed = name?.trim();
+			if (trimmed) room.customName = trimmed;
+			else delete room.customName;
+			data.roomSessions[roomSessionId] = room;
+			await this.writeWindows(data);
+			return room;
+		});
+	}
+
 	async setActiveRoomSession(windowId: string, roomSessionId: string): Promise<void> {
 		await this.serialize(async () => {
 			const data = await this.loadWindowsFile();
@@ -2415,6 +2429,23 @@ export class TeamsStore {
 			await this.writeWindows(data);
 			return participant;
 		});
+	}
+
+	async setParticipantProviderHandle(agentSessionId: string, provider: { driverId: string; agentRevision: number; providerSessionHandle?: string }): Promise<void> {
+		await this.serialize(async () => {
+			const data = await this.loadWindowsFile();
+			const participant = data.participantSessions[agentSessionId];
+			if (!participant || participant.state !== "active") throw new Error(`participant not active: ${agentSessionId}`);
+			const ref = data.sessionRefs[agentSessionId];
+			if (!ref) throw new Error(`participant sessionRef missing: ${agentSessionId}`);
+			ref.provider = provider;
+			data.sessionRefs[agentSessionId] = ref;
+			await this.writeWindows(data);
+		});
+	}
+
+	async participantProviderHandle(agentSessionId: string): Promise<string | undefined> {
+		return (await this.windowsFileData()).sessionRefs[agentSessionId]?.provider?.providerSessionHandle;
 	}
 
 	async participantSessionsForRoom(roomSessionId: string): Promise<ParticipantSessionRefV4[]> {

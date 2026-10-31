@@ -66,10 +66,15 @@ type DelegateFn = (params: AgentInvokeParams) => Promise<AgentInvokeResult>;
 export class DirectChatParticipantRunner implements RoomParticipantRunner {
 	constructor(private readonly deps: {
 		invoker: Pick<AgentInvoker, "requireAgent"> & { delegate: DelegateFn };
+		/** 读取持久 provider handle；缺省不续接（新 provider 会话）。 */
+		handleFor?: (binding: RoomParticipantRunnerInput["binding"]) => Promise<string | undefined>;
+		/** Driver started/完成带回 handle 时持久到 sessionRefs。 */
+		rememberHandle?: (binding: RoomParticipantRunnerInput["binding"], agent: Awaited<ReturnType<AgentInvoker["requireAgent"]>>, handle: string) => Promise<void>;
 	}) {}
 
 	async run(input: RoomParticipantRunnerInput): Promise<RoomParticipantRunnerResult> {
 		const agent = await this.deps.invoker.requireAgent(input.binding.agentId);
+		const sessionHandle = await this.deps.handleFor?.(input.binding);
 		const result = await this.deps.invoker.delegate({
 			agent,
 			windowId: input.binding.roomId,
@@ -77,11 +82,15 @@ export class DirectChatParticipantRunner implements RoomParticipantRunner {
 			invocationKind: "direct_chat",
 			message: input.prompt,
 			mode: "continue",
+			...(sessionHandle ? { sessionHandle } : {}),
 			operationId: input.turn.operationId,
 			...(input.binding.workspaceId ? { workspaceId: input.binding.workspaceId } : {}),
 			purpose: "execution",
 			signal: input.signal,
 		});
+		if (result.sessionHandle && this.deps.rememberHandle) {
+			await this.deps.rememberHandle(input.binding, agent, result.sessionHandle).catch(() => undefined);
+		}
 		if (!result.delegationId) return { status: "failed", terminalReason: "Worker 没有返回 Delegation 身份" };
 		const base = {
 			delegationIds: [result.delegationId],

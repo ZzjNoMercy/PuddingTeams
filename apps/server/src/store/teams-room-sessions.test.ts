@@ -99,3 +99,15 @@ test("v4: 未 settle 的建房 journal 不得把已提交 Manager PS 当孤儿�
 	const settled = JSON.parse(readFileSync(journal, "utf8")) as { pending: Record<string, unknown> };
 	assert.deepEqual(settled.pending, {}, "对账后必须 settle journal");
 });
+
+test("v4: participant provider handle 持久到 sessionRef", async () => {
+	const { store } = await makeStore();
+	const window = await store.createWindow({ type: "group", members: ["alpha", "beta"], sessionId: "manager-session-1" });
+	await store.addParticipantSession({
+		windowId: window.id, roomSessionId: window.activeRoomSessionId!, agentSessionId: "worker-session-1",
+		agentId: "alpha", role: "worker", cwdSnapshot: window.cwdSnapshot,
+	});
+	assert.equal(await store.participantProviderHandle("worker-session-1"), undefined);
+	await store.setParticipantProviderHandle("worker-session-1", { driverId: "puddingclaw", agentRevision: 1, providerSessionHandle: "upstream-1" });
+	assert.equal(await store.participantProviderHandle("worker-session-1"), "upstream-1");
+});
