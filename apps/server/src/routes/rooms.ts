@@ -730,7 +730,10 @@ export function registerRoomsRoutes(
 						const current = await teams.getWindow(req.params.id);
 						if (!current) throw new Error("window not found");
 						if (current.pinned) throw new Error("solo 窗口不可删除");
-						if (req.query.onlySession !== undefined && (current.sessions.length !== 1 || current.sessions[0] !== req.query.onlySession)) throw new Error("single_session_window_changed");
+						if (current.type === "group") {
+							const rooms = current.roomSessionIds ?? [];
+							if (req.query.onlySession !== undefined && (rooms.length !== 1 || rooms[0] !== req.query.onlySession)) throw new Error("single_session_window_changed");
+						} else if (req.query.onlySession !== undefined && (current.sessions.length !== 1 || current.sessions[0] !== req.query.onlySession)) throw new Error("single_session_window_changed");
 					},
 					remove,
 				);
@@ -873,10 +876,12 @@ export function registerRoomsRoutes(
 			}
 		}
 		let createdId: string | undefined;
+		let createdRoomSessionId: string | undefined;
 		try {
 			const created = await sessions.create(undefined, await contextFor(w), undefined, ownerOptionsFor(w.type, w.members));
 			createdId = created.id;
 			const roomSessionId = w.type === "group" ? await teams.addRoomSession(req.params.id, created.id) : undefined;
+			createdRoomSessionId = roomSessionId;
 			if (w.type !== "group") await teams.addWindowSession(req.params.id, created.id);
 			const goal = requestedGoal;
 			const completionBoundary = requestedBoundary;
@@ -894,8 +899,9 @@ export function registerRoomsRoutes(
 				: null;
 			return { session: created, workState, ...(roomSessionId ? { roomSessionId } : {}) };
 		} catch (err) {
+			if (createdRoomSessionId) await teams.removeRoomSession(req.params.id, createdRoomSessionId).catch(() => undefined);
 			if (createdId) {
-				await teams.removeWindowSession(req.params.id, createdId).catch(() => undefined);
+				if (w.type !== "group") await teams.removeWindowSession(req.params.id, createdId).catch(() => undefined);
 				await sessions.remove(createdId).catch(() => undefined);
 			}
 			if (err instanceof WorkStateOperationConflictError) return reply.code(409).send({ error: err.message, code: err.code });
@@ -1014,15 +1020,24 @@ export function registerRoomsRoutes(
 				if (!owner) return reply.code(404).send({ error: "window not found" });
 				if (owner.type === "group") {
 					const room = await teams.roomSession(req.params.sid);
-					const participant = room ? undefined : await teams.participantSession(req.params.sid);
-					const roomSessionId = room?.roomSessionId ?? participant?.roomSessionId;
-					if (!roomSessionId) return reply.code(404).send({ error: "session not found in window" });
-					const { removed, blocked, agentSessionIds } = await teams.removeRoomSession(req.params.id, roomSessionId);
+					if (!room) {
+						const participant = await teams.participantSession(req.params.sid);
+						if (participant) return reply.code(409).send({ error: "Participant Session 由房间管理；请删除 RoomSession", code: "participant_session_managed" });
+						return reply.code(404).send({ error: "session not found in window" });
+					}
+					const participants = await teams.participantSessionsForRoom(room.roomSessionId);
+					// 先收敛各 Participant 的 Run/Delegation/审批；失败则不删任何文件。
+					if (invoker) {
+						for (const participant of participants) {
+							await invoker.closeManagerSession(participant.agentSessionId, async () => undefined, async () => undefined);
+						}
+					}
+					const { removed, blocked, agentSessionIds } = await teams.removeRoomSession(req.params.id, room.roomSessionId);
 					if (blocked) throw new Error(blocked);
 					if (!removed) throw new Error("session not found in window");
 					for (const agentSessionId of agentSessionIds) {
-						await sessions.remove(agentSessionId).catch(() => undefined);
-						await workStates?.removeSession(agentSessionId).catch(() => undefined);
+						await sessions.remove(agentSessionId);
+						await workStates?.removeSession(agentSessionId);
 					}
 					return reply.code(204).send();
 				}

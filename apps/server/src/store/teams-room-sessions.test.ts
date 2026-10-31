@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { TeamsStore } from "./teams.js";
@@ -80,4 +80,22 @@ test("v4: 重启后 RoomSession/Participant 可解析，窗口索引保持", asy
 	assert.deepEqual(reloaded?.roomSessionIds, window.roomSessionIds);
 	assert.equal((await restarted.contextForSession("worker-session-1"))?.window.id, window.id);
 	assert.equal(await restarted.managerSession(window.id), "manager-session-1");
+});
+
+test("v4: 未 settle 的建房 journal 不得把已提交 Manager PS 当孤儿删除", async () => {
+	const { dir, store } = await makeStore();
+	const managerSessionId = "11111111-1111-4111-8111-111111111111";
+	const window = await store.createWindow({ type: "group", members: ["alpha", "beta"], sessionId: managerSessionId });
+	const journal = path.join(dir, "teams", "room-creation-journal.json");
+	writeFileSync(journal, JSON.stringify({ version: 1, pending: { [managerSessionId]: { createdAt: new Date().toISOString() } } }));
+	const removed: string[] = [];
+	const restarted = new TeamsStore({ state: path.join(dir, "teams"), assets: path.join(dir, "teams"), managedWorkspaces: path.join(dir, "managed") }, dir);
+	await restarted.init();
+	const result = await restarted.reconcileRoomCreations(async (id) => { removed.push(id); });
+	assert.deepEqual(removed, [], "已提交的 group Manager PS 不能被当孤儿删除");
+	assert.equal(result.removed, 0);
+	assert.ok(await restarted.participantSession(managerSessionId));
+	assert.deepEqual((await restarted.getWindow(window.id))?.roomSessionIds, window.roomSessionIds);
+	const settled = JSON.parse(readFileSync(journal, "utf8")) as { pending: Record<string, unknown> };
+	assert.deepEqual(settled.pending, {}, "对账后必须 settle journal");
 });

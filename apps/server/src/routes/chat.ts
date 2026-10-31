@@ -338,6 +338,9 @@ export async function registerChatRoutes(
 
 	app.delete<{ Params: { id: string } }>("/api/sessions/:id", async (req, reply) => {
 		try {
+			if (teams && await teams.participantSession(req.params.id)) {
+				return reply.code(409).send({ error: "Participant Session 由房间管理；请删除 RoomSession", code: "participant_session_managed" });
+			}
 			let existed = false;
 			const preflight = async () => {
 				const context = await requireActiveSessionContext(req.params.id);

@@ -208,7 +208,13 @@ export class SessionReadService {
 		let callerWorkspaceId: string | undefined;
 		if (caller.kind === "chat") {
 			const own = await this.teams.contextForSession(caller.sessionId());
-			if (own?.window.id === target.window.id) return target;
+			if (own?.window.id === target.window.id) {
+				// 同窗口不再等于同房间：ParticipantSession 的私有历史只允许自己读取。
+				if (await this.teams.participantSession(ref.sessionId)) {
+					if (caller.sessionId() !== ref.sessionId) throw new Error("ParticipantSession 的私有历史不可跨参与者读取");
+				}
+				return target;
+			}
 			callerWorkspaceId = own?.workspaceId;
 		} else {
 			callerWorkspaceId = caller.workspaceId();

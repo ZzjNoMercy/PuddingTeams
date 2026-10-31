@@ -236,3 +236,29 @@ test("parked 上下文里的归档会话可删除：活跃上下文不受影响�
 		assert.ok(listed.includes(project.id));
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("v4 HTTP: group Manager PS 不能经 Agent API 删除；单 RoomSession 整房删除可用", async () => {
+	const { app, teams, sessions, dir } = await makeStack();
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		assert.equal(created.statusCode, 200, created.body);
+		const room = created.json().room as RoomSummary;
+		const manager = (await teams.managerSession(room.id))!;
+		const roomSessionId = room.activeRoomSessionId!;
+		assert.ok(await teams.participantSession(manager));
+
+		const agentDelete = await app.inject({ method: "DELETE", url: `/api/sessions/${manager}` });
+		assert.equal(agentDelete.statusCode, 409, agentDelete.body);
+		assert.equal(agentDelete.json().code, "participant_session_managed");
+		assert.ok(await teams.participantSession(manager), "Manager binding 必须保留");
+		assert.equal((await teams.getWindow(room.id))?.activeRoomSessionId, roomSessionId);
+
+		const roomDeleteByManager = await app.inject({ method: "DELETE", url: `/api/rooms/${room.id}/sessions/${manager}` });
+		assert.equal(roomDeleteByManager.statusCode, 409, roomDeleteByManager.body);
+
+		const wholeRoom = await app.inject({ method: "DELETE", url: `/api/rooms/${room.id}?onlySession=${roomSessionId}` });
+		assert.equal(wholeRoom.statusCode, 204, wholeRoom.body);
+		assert.equal(await teams.getWindow(room.id), undefined);
+	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});
