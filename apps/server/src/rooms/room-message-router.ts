@@ -16,6 +16,7 @@ import type { ParticipantBinding, ParticipantBindingPort } from "./participant-b
 import { RoomTurnService, type ProjectionResult } from "./room-turn-service.js";
 import { RoomOperationStore } from "./room-operation-store.js";
 import { withRoomAdmissionLock } from "./room-admission-lock.js";
+import { publicTurn, type RoomEventBus } from "./room-event-bus.js";
 
 /**
  * 房间消息路由（方案 §6、§8.1、§8.2、§19.2、§21.2）。
@@ -92,6 +93,7 @@ export interface RoomMessageRouterDeps {
 	managerAgentId: string;
 	agentNames?: Record<string, string>;
 	budget: RoomContextBudget;
+	bus?: RoomEventBus;
 	now?: () => string;
 }
 
@@ -246,6 +248,7 @@ export class RoomMessageRouter {
 			if (!reserved.created) throw new RoomMessageError("message_delivery_unconfirmed", "消息操作已存在但未确认 accepted");
 			const userEvent = await this.deps.events.append(input.roomSessionId, draft);
 			await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "user_event_appended", { roomEventId: userEvent.id });
+			this.deps.bus?.publish(input.roomSessionId, { type: "room_event", event: userEvent });
 
 			const begun = await this.deps.turnService.begin({
 				roomSessionId: input.roomSessionId,
@@ -305,25 +308,32 @@ export class RoomMessageRouter {
 				});
 			}
 			if (result.status === "waiting_input") {
-				await this.deps.turns.update(roomSessionId, turnId, { status: "waiting_input" });
+				const updated = await this.deps.turns.update(roomSessionId, turnId, { status: "waiting_input" });
+				this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(updated) });
 				return;
 			}
 			if (result.status === "unknown") {
-				await this.deps.turnService.markUnknown(roomSessionId, turnId, result.terminalReason ?? "执行结果不确定");
+				const updated = await this.deps.turnService.markUnknown(roomSessionId, turnId, result.terminalReason ?? "执行结果不确定");
+				this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(updated) });
 				return;
 			}
 			if (result.status === "reconciling") {
-				await this.deps.turns.update(roomSessionId, turnId, { status: "reconciling" });
+				const updated = await this.deps.turns.update(roomSessionId, turnId, { status: "reconciling" });
+				this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(updated) });
 				return;
 			}
 			if (result.status === "completed" && result.finalContent?.trim()) {
 				const completed = await this.deps.turnService.complete(roomSessionId, turnId, result.finalContent);
-				await this.deps.turnService.project(roomSessionId, completed.id);
+				const projection = await this.deps.turnService.project(roomSessionId, completed.id);
+				if (projection.event) this.deps.bus?.publish(roomSessionId, { type: "room_event", event: projection.event });
+				this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(projection.turn) });
 				return;
 			}
 			if (result.status === "cancelled") {
 				const cancelled = await this.deps.turnService.cancel(roomSessionId, turnId, result.terminalReason ?? "用户取消", result.finalContent);
-				await this.deps.turnService.project(roomSessionId, cancelled.id);
+				const projection = await this.deps.turnService.project(roomSessionId, cancelled.id);
+				if (projection.event) this.deps.bus?.publish(roomSessionId, { type: "room_event", event: projection.event });
+				this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(projection.turn) });
 				return;
 			}
 			const failed = await this.deps.turnService.fail(
@@ -332,7 +342,9 @@ export class RoomMessageRouter {
 				result.terminalReason ?? (result.status === "completed" ? "模型没有返回可发布的最终文本" : "执行失败"),
 				result.finalContent,
 			);
-			await this.deps.turnService.project(roomSessionId, failed.id);
+			const projection = await this.deps.turnService.project(roomSessionId, failed.id);
+			if (projection.event) this.deps.bus?.publish(roomSessionId, { type: "room_event", event: projection.event });
+			this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(projection.turn) });
 		})().finally(() => {
 			if (this.executions.get(key) === run) this.executions.delete(key);
 		});

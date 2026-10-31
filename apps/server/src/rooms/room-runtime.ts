@@ -9,6 +9,8 @@ import { RoomTurnService } from "./room-turn-service.js";
 import { RoomMessageError, RoomMessageRouter, type RoomParticipantRunner, type RoomParticipantRunnerInput, type RoomParticipantRunnerResult } from "./room-message-router.js";
 import { PiParticipantRunner, DirectChatParticipantRunner } from "./participant-runners.js";
 import { TeamsParticipantBindingPort } from "./teams-binding-port.js";
+import { RoomEventBus } from "./room-event-bus.js";
+import { publicTurn } from "./room-event-bus.js";
 
 /**
  * 宿主装配：把 v4 房间账本、Pi/非 Pi runner 和 teams binding 端口接到
@@ -21,6 +23,8 @@ export interface RoomRuntime {
 	turns: ParticipantTurnStore;
 	operations: RoomOperationStore;
 	bindings: TeamsParticipantBindingPort;
+	bus: RoomEventBus;
+	abort(roomSessionId: string): Promise<{ turnId: string; status: string }>;
 }
 
 class ConnectorParticipantRunner implements RoomParticipantRunner {
@@ -50,12 +54,14 @@ export function createRoomRuntime(input: {
 	/** 测试/宿主替换执行器。 */
 	runner?: RoomParticipantRunner;
 	maxContextChars?: number;
+	attachmentRoot?: string;
 }): RoomRuntime {
-	const events = new RoomEventStore(input.root, { attachmentRoot: undefined });
+	const events = new RoomEventStore(input.root, { attachmentRoot: input.attachmentRoot });
 	const turns = new ParticipantTurnStore(input.root);
 	const operations = new RoomOperationStore(input.root);
 	const bindings = new TeamsParticipantBindingPort(input.teams);
 	const turnService = new RoomTurnService({ events, turns, bindings });
+	const bus = new RoomEventBus();
 	const runner = input.runner ?? new ConnectorParticipantRunner({
 		teams: input.teams,
 		pi: new PiParticipantRunner({ sessions: input.sessions }),
@@ -64,6 +70,7 @@ export function createRoomRuntime(input: {
 	const router = new RoomMessageRouter({
 		events,
 		turns,
+		bus,
 		bindings,
 		turnService,
 		operations,
@@ -112,5 +119,23 @@ export function createRoomRuntime(input: {
 			}
 		},
 	});
-	return { router, events, turns, operations, bindings };
+	const runtime: RoomRuntime = {
+		router, events, turns, operations, bindings, bus,
+		abort: async (roomSessionId) => {
+			const active = (await turns.list(roomSessionId)).find((turn) =>
+				["admitted", "running", "waiting_input", "reconciling", "unknown"].includes(turn.status));
+			if (!active) throw new Error("房间没有进行中的公开回合");
+			if (active.execution?.kind === "direct_chat" && input.invoker) {
+				await input.invoker.cancel(active.execution.delegationId);
+			} else {
+				await input.sessions.abort(active.agentSessionId).catch(() => undefined);
+			}
+			const cancelled = await turnService.cancel(roomSessionId, active.id, "用户停止");
+			const projection = await turnService.project(roomSessionId, cancelled.id);
+			if (projection.event) bus.publish(roomSessionId, { type: "room_event", event: projection.event });
+			bus.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(projection.turn) });
+			return { turnId: cancelled.id, status: cancelled.status };
+		},
+	};
+	return runtime;
 }

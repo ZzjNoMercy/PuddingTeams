@@ -14,12 +14,13 @@ import { DriverRegistry } from "../agent-runtime/driver-registry.js";
 import { AgentRuntime } from "../agent-runtime/runtime.js";
 import { AgentInvoker } from "../agent-runtime/invoker.js";
 import { PiSessionStore } from "../pi-bridge/session-store.js";
+import { UploadStore } from "../store/uploads.js";
 import { registerRoomsRoutes, type RoomSummary } from "./rooms.js";
 import { registerChatRoutes } from "./chat.js";
 
 /** Delegated contexts cannot be used as ordinary chats; audit facts survive. */
 
-async function makeStack() {
+async function makeStack(roomRunner?: { run: (input: { markInputDurable(): Promise<void> }) => Promise<{ status: "completed"; finalContent?: string }> }) {
 	const dir = mkdtempSync(path.join(tmpdir(), "pt-worker-sessions-"));
 	process.env.PI_CODING_AGENT_DIR = path.join(dir, "agent-dir");
 	const teams = new TeamsStore(
@@ -37,15 +38,19 @@ async function makeStack() {
 	const invoker = new AgentInvoker(teams, runtime, drivers, undefined, dir);
 	const sessions = new PiSessionStore(dir, path.join(dir, "sessions"), teams, invoker);
 	const workerSessionDir = path.join(dir, "worker-sessions");
+	const uploads = new UploadStore(path.join(dir, "uploads"));
+	await uploads.init();
 	const app = Fastify({ logger: false });
 	await app.register(websocket);
 	await registerChatRoutes(app, sessions, teams, undefined, undefined, invoker, undefined, undefined, undefined, undefined,
 		{ delegations });
 	registerRoomsRoutes(app, sessions, teams, invoker, undefined, {
+		attachmentRoot: path.join(dir, "uploads"),
+		uploads,
 		activityStatePath: path.join(dir, "state", "room-activity.json"),
 		sessionCreationStatePath: path.join(dir, "state", "session-creation-operations.json"),
 		roomSessionsStatePath: path.join(dir, "state", "room-sessions"),
-		roomRunner: { run: async (input) => { await input.markInputDurable(); return { status: "completed" as const, finalContent: "房间结论" }; } },
+		roomRunner: roomRunner ?? { run: async (input) => { await input.markInputDurable(); return { status: "completed" as const, finalContent: "房间结论" }; } },
 	});
 	return { app, teams, sessions, delegations, invoker, dir, workerSessionDir };
 }
@@ -372,5 +377,92 @@ test("v4 HTTP: reuseEmpty / 幂等新建 RoomSession 都建 events，首条消�
 			headers: { "idempotency-key": randomUUID() }, payload: { content: "首条", mentions: ["alpha"] },
 		});
 		assert.equal(send.statusCode, 202, send.body);
+	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("v4 HTTP: abort 收敛当前公开回合；close-unknown 解除锁", async () => {
+	let release!: () => void;
+	const pending = new Promise<void>((resolve) => { release = resolve; });
+	const { app, teams, sessions, dir } = await makeStack({
+		run: async (input) => {
+			await input.markInputDurable();
+			await pending;
+			return { status: "completed", finalContent: "太晚了" };
+		},
+	});
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		const room = created.json().room as RoomSummary;
+		const roomSessionId = room.roomSessionIds![0]!;
+		const sent = await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/messages`,
+			headers: { "idempotency-key": randomUUID() }, payload: { content: "慢慢做", mentions: ["alpha"] },
+		});
+		assert.equal(sent.statusCode, 202, sent.body);
+		const aborted = await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/abort` });
+		assert.equal(aborted.statusCode, 200, aborted.body);
+		const timeline = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` });
+		assert.equal(timeline.json().turns[0].status, "cancelled");
+		assert.equal(timeline.json().events.at(-1).kind, "terminal");
+		release();
+	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("v4 HTTP: runner 未确认输入时 409，close-unknown 写 terminal", async () => {
+	const { app, teams, sessions, dir } = await makeStack({
+		run: async () => { throw new Error("provider down"); },
+	});
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		const room = created.json().room as RoomSummary;
+		const roomSessionId = room.roomSessionIds![0]!;
+		const sent = await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/messages`,
+			headers: { "idempotency-key": randomUUID() }, payload: { content: "执行", mentions: ["alpha"] },
+		});
+		assert.equal(sent.statusCode, 409, sent.body);
+		assert.equal(sent.json().code, "message_delivery_unconfirmed");
+		const timeline = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` });
+		const turn = timeline.json().turns[0];
+		assert.equal(turn.status, "unknown");
+		const closed = await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/turns/${turn.id}/close-unknown`, payload: { reason: "确认无运行" } });
+		assert.equal(closed.statusCode, 200, closed.body);
+		const after = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` });
+		assert.equal(after.json().turns[0].status, "interrupted_unknown");
+		assert.equal(after.json().events.at(-1).kind, "terminal");
+	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("v4 HTTP: 房间消息附件冻结为引用并进入组合输入", async () => {
+	const prompts: string[] = [];
+	const { app, teams, sessions, dir } = await makeStack({
+		run: async (input) => {
+			prompts.push(input.prompt);
+			await input.markInputDurable();
+			return { status: "completed", finalContent: "收到了附件" };
+		},
+	});
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		const room = created.json().room as RoomSummary;
+		const roomSessionId = room.roomSessionIds![0]!;
+		const data = Buffer.from("hello attachment").toString("base64");
+		const sent = await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/messages`,
+			headers: { "idempotency-key": randomUUID() },
+			payload: {
+				content: "看附件", mentions: ["alpha"],
+				attachments: [{ filename: "note.txt", mediaType: "text/plain", data }],
+			},
+		});
+		assert.equal(sent.statusCode, 202, sent.body);
+		const timeline = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` });
+		const userEvent = timeline.json().events[0];
+		assert.equal(userEvent.attachments[0].name, "note.txt");
+		assert.ok(userEvent.attachments[0].path.startsWith(path.join(dir, "uploads")));
+		assert.match(prompts[0]!, /附件：note\.txt（text\/plain，sha256=/);
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });

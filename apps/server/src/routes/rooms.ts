@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import type { WebSocket } from "@fastify/websocket";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { TeamsStore, WindowSessionCleanupError, RoomCreationOperationConflictError, RoomCreationOperationGoneError, RoomWorkerUnavailableError, RoomWorkspaceUnavailableError, RoomSourceUnavailableError, RoomSourceChangedError, agentDisplayName, MANAGER_AGENT_NAME, type AgentConfig, type RoomSourceSnapshot, type WindowConfig, type WindowType } from "../store/teams.js";
 import { PiSessionStore } from "../pi-bridge/session-store.js";
@@ -22,6 +23,7 @@ import { RoomOperationStore } from "../rooms/room-operation-store.js";
 import { ParticipantTurnStore } from "../rooms/participant-turn-store.js";
 import { createRoomRuntime } from "../rooms/room-runtime.js";
 import { RoomMessageError, type RoomParticipantRunner } from "../rooms/room-message-router.js";
+import { publicTurn } from "../rooms/room-event-bus.js";
 
 class FirstWorkMessageConflictError extends Error {
 	constructor() {
@@ -219,7 +221,10 @@ export function registerRoomsRoutes(
 	const roomOperations = localFiles?.roomSessionsStatePath ? new RoomOperationStore(localFiles.roomSessionsStatePath) : undefined;
 	const roomTurns = localFiles?.roomSessionsStatePath ? new ParticipantTurnStore(localFiles.roomSessionsStatePath) : undefined;
 	const roomRuntime = localFiles?.roomSessionsStatePath
-		? createRoomRuntime({ root: localFiles.roomSessionsStatePath, teams, sessions, invoker, runner: localFiles.roomRunner })
+		? createRoomRuntime({
+			root: localFiles.roomSessionsStatePath, teams, sessions, invoker,
+			runner: localFiles.roomRunner, attachmentRoot: localFiles.attachmentRoot,
+		})
 		: undefined;
 	const summarize = (w: WindowConfig) => buildWindowSummary(sessions, teams, w, activityProjector);
 	const pendingSessionCreations = new Map<string, Promise<Awaited<ReturnType<PiSessionStore["create"]>>>>();
@@ -839,12 +844,13 @@ export function registerRoomsRoutes(
 	/** 房间公开消息：服务端原子准入，执行在后台继续。 */
 	app.post<{ Params: { id: string; sid: string }; Body: { content?: unknown; mentions?: unknown; delivery?: unknown; expectedParticipantTurnId?: unknown; attachments?: unknown } }>(
 		"/api/rooms/:id/sessions/:sid/messages",
+		{ bodyLimit: 28 * 1024 * 1024 },
 		async (req, reply) => {
 			if (!roomRuntime) return reply.code(503).send({ error: "room session stores are not configured" });
 			const key = req.headers["idempotency-key"];
 			if (typeof key !== "string" || !key) return reply.code(428).send({ error: "发送房间消息需要 Idempotency-Key", code: "message_operation_required" });
 			if (!/^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(key)) return reply.code(400).send({ error: "Idempotency-Key 格式无效", code: "invalid_operation_key" });
-			if (req.body?.attachments !== undefined) return reply.code(400).send({ error: "房间消息附件尚未接通", code: "attachments_unsupported" });
+			if (req.body?.attachments !== undefined && !Array.isArray(req.body.attachments)) return reply.code(400).send({ error: "attachments 必须是数组", code: "invalid_message" });
 			if (!req.body || typeof req.body.content !== "string" || !req.body.content.trim()) return reply.code(400).send({ error: "消息正文不能为空", code: "invalid_message" });
 			const mentions = req.body.mentions ?? [];
 			if (!Array.isArray(mentions) || mentions.some((item) => typeof item !== "string")) return reply.code(400).send({ error: "mentions 必须是字符串数组", code: "invalid_mentions" });
@@ -854,6 +860,27 @@ export function registerRoomsRoutes(
 			if (expectedParticipantTurnId !== undefined && typeof expectedParticipantTurnId !== "string") return reply.code(400).send({ error: "expectedParticipantTurnId 必须是字符串", code: "invalid_delivery" });
 			const context = await teams.contextForRoomSession(req.params.sid);
 			if (!context || context.window.id !== req.params.id) return reply.code(404).send({ error: "room session not found", code: "room_session_not_found" });
+			let attachments: Array<{ name: string; path: string; mediaType: string; size: number; sha256: string; kind: "file" | "image" }> | undefined;
+			let discardAttachments: (() => Promise<void>) | undefined;
+			if (Array.isArray(req.body.attachments) && req.body.attachments.length > 0) {
+				if (!localFiles?.uploads) return reply.code(503).send({ error: "附件存储未配置", code: "attachments_unavailable" });
+				try {
+					const inputs = req.body.attachments as UploadInput[];
+					const identities = identifyUploads(inputs);
+					const stored = await localFiles.uploads.save(req.params.sid, inputs);
+					attachments = stored.map((item, index) => {
+						const identity = identities[index]!;
+						return {
+							name: identity.name, path: item.path, mediaType: identity.mediaType,
+							size: identity.size, sha256: identity.sha256,
+							kind: identity.mediaType.startsWith("image/") ? "image" as const : "file" as const,
+						};
+					});
+					discardAttachments = async () => { await localFiles.uploads!.discard(req.params.sid, stored); };
+				} catch (error) {
+					return reply.code(400).send({ error: error instanceof Error ? error.message : String(error), code: "invalid_attachments" });
+				}
+			}
 			try {
 				const result = await roomRuntime.router.send({
 					roomSessionId: req.params.sid,
@@ -861,6 +888,7 @@ export function registerRoomsRoutes(
 					mentions: mentions as string[],
 					operationId: key,
 					delivery,
+					...(attachments ? { attachments } : {}),
 					...(expectedParticipantTurnId ? { expectedParticipantTurnId } : {}),
 				});
 				return reply.code(202).send({
@@ -871,6 +899,8 @@ export function registerRoomsRoutes(
 				});
 			} catch (error) {
 				if (error instanceof RoomMessageError) {
+					const keepAttachments = error.code === "message_delivery_unconfirmed";
+					if (!keepAttachments) await discardAttachments?.().catch(() => undefined);
 					const mapped = error.code === "context_too_large" ? { status: 422, code: "room_context_too_large" }
 						: error.code === "invalid_delivery" ? { status: 400, code: "room_delivery_unsupported" }
 						: error.code === "invalid_message" || error.code === "invalid_mentions" ? { status: 400, code: error.code }
@@ -881,6 +911,89 @@ export function registerRoomsRoutes(
 					return reply.code(503).send({ error: error.message, code: "room_recovery_required" });
 				}
 				throw error;
+			}
+		},
+	);
+
+	/** 停止当前公开回合；先取消/abort 执行，再收敛 Turn。 */
+	app.post<{ Params: { id: string; sid: string } }>("/api/rooms/:id/sessions/:sid/abort", async (req, reply) => {
+		if (!roomRuntime) return reply.code(503).send({ error: "room session stores are not configured" });
+		const context = await teams.contextForRoomSession(req.params.sid);
+		if (!context || context.window.id !== req.params.id) return reply.code(404).send({ error: "room session not found", code: "room_session_not_found" });
+		try {
+			return { ok: true, ...(await roomRuntime.abort(req.params.sid)) };
+		} catch (error) {
+			return reply.code(409).send({ error: error instanceof Error ? error.message : String(error), code: "room_abort_failed" });
+		}
+	});
+
+	/** 用户确认无 live Run 后解除 unknown/reconciling 锁。 */
+	app.post<{ Params: { id: string; sid: string; turnId: string }; Body: { reason?: unknown } }>(
+		"/api/rooms/:id/sessions/:sid/turns/:turnId/close-unknown",
+		async (req, reply) => {
+			if (!roomRuntime) return reply.code(503).send({ error: "room session stores are not configured" });
+			const context = await teams.contextForRoomSession(req.params.sid);
+			if (!context || context.window.id !== req.params.id) return reply.code(404).send({ error: "room session not found", code: "room_session_not_found" });
+			const reason = typeof req.body?.reason === "string" && req.body.reason.trim() ? req.body.reason.trim() : "用户确认无活动执行";
+			try {
+				const projection = await roomRuntime.router.closeUnknown(req.params.sid, req.params.turnId, reason);
+				return { ok: true, ...(projection.event ? { terminalEventId: projection.event.id } : {}) };
+			} catch (error) {
+				return reply.code(409).send({ error: error instanceof Error ? error.message : String(error), code: "close_unknown_failed" });
+			}
+		},
+	);
+
+	/** 房间实时频道：public events + participant_turn；不转发模型流式过程。 */
+	app.get<{ Params: { id: string; sid: string } }>(
+		"/api/rooms/:id/sessions/:sid/ws",
+		{ websocket: true },
+		async (socket: WebSocket, req) => {
+			const origin = req.headers.origin;
+			let sameOrigin = false;
+			if (origin) {
+				try { sameOrigin = new URL(origin).host === req.headers.host; }
+				catch { sameOrigin = false; }
+			}
+			if (origin && !sameOrigin) {
+				socket.close(1008, "origin not allowed");
+				return;
+			}
+			if (!roomRuntime || !roomEvents) {
+				socket.close(1011, "room session stores are not configured");
+				return;
+			}
+			const context = await teams.contextForRoomSession(req.params.sid);
+			if (!context || context.window.id !== req.params.id) {
+				socket.close(4404, "room session not found");
+				return;
+			}
+			const send = (payload: unknown) => {
+				if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(payload));
+			};
+			const unsubscribe = roomRuntime.bus.subscribe(req.params.sid, (event) => {
+				send({ ...event, roomId: req.params.id, roomSessionId: req.params.sid });
+			});
+			socket.on("close", unsubscribe);
+			socket.on("error", unsubscribe);
+			try {
+				const events = await roomEvents.read(req.params.sid);
+				const turns = await roomRuntime.turns.list(req.params.sid);
+				const activeTurn = turns.find((turn) => ["admitted", "running", "waiting_input", "reconciling", "unknown"].includes(turn.status));
+				send({
+					type: "room_ready",
+					roomId: req.params.id,
+					roomSessionId: req.params.sid,
+					snapshot: {
+						events,
+						...(activeTurn ? { activeTurn: publicTurn(activeTurn) } : {}),
+						lastEventSeq: events.at(-1)?.seq ?? 0,
+					},
+				});
+			} catch (error) {
+				send({ type: "error", roomId: req.params.id, roomSessionId: req.params.sid, message: error instanceof Error ? error.message : String(error) });
+				unsubscribe();
+				socket.close(1011, "room snapshot unavailable");
 			}
 		},
 	);
