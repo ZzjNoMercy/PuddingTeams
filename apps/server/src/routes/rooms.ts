@@ -1428,7 +1428,7 @@ export function registerRoomsRoutes(
 			capabilities: {
 				canSend: (!publicActiveTurn || activeNativePi) && !recoveryReason,
 				canStop: Boolean(publicActiveTurn),
-				busyInputModes: publicActiveTurn && activeNativePi ? ["followUp"] : [],
+				busyInputModes: publicActiveTurn ? (activeNativePi ? ["followUp"] : ["nextTurn"]) : [],
 				allowedMentions: window.members,
 				...(publicActiveTurn ? { activeParticipantTurnId: publicActiveTurn.id } : {}),
 				recoveryRequired: Boolean(recoveryReason),

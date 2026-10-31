@@ -173,8 +173,8 @@ export function RoomChatPane({
 
 	const activeTurn = timeline?.activeTurn;
 	const recoveryRequired = Boolean(timeline?.capabilities.recoveryRequired);
-	const activeBusyInputs = timeline?.capabilities.busyInputModes ?? [];
-	const canFollowUp = !activeTurn || activeBusyInputs.includes("followUp");
+	const activeBusyInputs = useMemo(() => timeline?.capabilities.busyInputModes ?? [], [timeline?.capabilities.busyInputModes]);
+	const canFollowUp = !activeTurn || activeBusyInputs.includes("followUp") || activeBusyInputs.includes("nextTurn");
 	const canSend = Boolean(roomSessionId) && !recoveryRequired && !sending && canFollowUp;
 	const labels = useMemo(() => {
 		const map = new Map<string, string>();
@@ -202,13 +202,15 @@ export function RoomChatPane({
 			await sendRoomMessage(room.id, roomSessionId, {
 				content,
 				mentions: targetAgentId ? [targetAgentId] : [],
-				...(activeTurn ? { delivery: "followUp" as const, expectedParticipantTurnId: activeTurn.id } : {}),
+				...(activeTurn && activeBusyInputs.includes("followUp")
+					? { delivery: "followUp" as const, expectedParticipantTurnId: activeTurn.id }
+					: {}),
 			}, crypto.randomUUID());
 			setDraft("");
 		} catch (caught) {
 			toast.error(caught instanceof Error ? caught.message : String(caught));
 		} finally { setSending(false); }
-	}, [activeTurn, canSend, draft, room.id, roomSessionId, targetAgentId, timeline?.participants, room.members]);
+	}, [activeBusyInputs, activeTurn, canSend, draft, room.id, roomSessionId, targetAgentId, timeline?.participants, room.members]);
 
 	const handleStop = useCallback(async () => {
 		if (!roomSessionId) return;

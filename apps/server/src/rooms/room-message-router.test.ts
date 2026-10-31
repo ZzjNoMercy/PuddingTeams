@@ -143,22 +143,29 @@ test("RoomMessageRouter: 同键并发只有一个准入，两个请求得到同�
 	await wait(router, a.turnId);
 });
 
-test("RoomMessageRouter: 不同键并发只有一个接单", async () => {
-	const { runner, router } = await makeRouter({ bindings: "all" });
+test("RoomMessageRouter: 不同键并发只有首个 Turn，第二个排队", async () => {
+	const { turns, runner, router } = await makeRouter({ bindings: "all" });
+	let calls = 0;
 	let release!: (result: RoomParticipantRunnerResult) => void;
-	runner.run = async (input) => { await input.markInputDurable(); return new Promise<RoomParticipantRunnerResult>((resolve) => { release = resolve; }); };
+	runner.run = async (input) => {
+		await input.markInputDurable();
+		calls += 1;
+		if (calls === 1) return new Promise<RoomParticipantRunnerResult>((resolve) => { release = resolve; });
+		return { status: "completed", finalContent: "排队完成" };
+	};
 	const results = await Promise.allSettled([
 		router.send({ roomSessionId: ROOM, content: "A", mentions: ["worker-a"], operationId: "op-message-1" }),
 		router.send({ roomSessionId: ROOM, content: "B", mentions: ["worker-a"], operationId: "op-message-2" }),
 	]);
-	const fulfilled = results.filter((result) => result.status === "fulfilled");
-	const rejected = results.filter((result) => result.status === "rejected");
-	assert.equal(fulfilled.length, 1);
-	assert.equal(rejected.length, 1);
-	assert.ok((rejected[0] as PromiseRejectedResult).reason instanceof RoomMessageError);
+	assert.equal(results.filter((result) => result.status === "fulfilled").length, 2);
+	const accepted = (results[0] as PromiseFulfilledResult<{ turnId: string; persistence?: string }>).value;
+	const queued = (results[1] as PromiseFulfilledResult<{ turnId: string; persistence?: string }>).value;
+	assert.ok(accepted.persistence === undefined || accepted.persistence === "durable");
+	assert.equal(queued.persistence, "pending");
+	assert.equal(queued.turnId, accepted.turnId);
 	release({ status: "completed", finalContent: "done" });
-	const accepted = (fulfilled[0] as PromiseFulfilledResult<{ turnId: string }>).value;
 	await wait(router, accepted.turnId);
+	assert.equal((await turns.get(ROOM, accepted.turnId))?.inputs.length, 2);
 });
 
 test("RoomMessageRouter: 上下文超预算时不写用户事件", async () => {
@@ -362,4 +369,35 @@ test("RoomMessageRouter: 不支持 followUp 时在写 RoomEvent 之前拒绝", a
 	assert.equal((await turns.get(ROOM, first.turnId))?.inputs.length, 1, "不得残留 pending 输入");
 	release();
 	await wait(router, first.turnId);
+});
+
+test("RoomMessageRouter: 非 Pi 活动回合的 normal 输入排队，首个 run 结束后顺序执行", async () => {
+	const { events, turns, router } = await makeRouter({ bindings: "all" });
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	let runs = 0;
+	const runner: RoomParticipantRunner = {
+		run: async (input) => {
+			runs += 1;
+			if (runs === 1) {
+				await input.markInputDurable("entry-1");
+				await gate;
+				return { status: "completed", finalContent: "第一段" };
+			}
+			await input.markInputDurable("entry-2");
+			return { status: "completed", finalContent: "排队后的最终结论" };
+		},
+	};
+	(router as unknown as { deps: { runner: RoomParticipantRunner } }).deps.runner = runner;
+	const first = await router.send({ roomSessionId: ROOM, content: "第一问", mentions: ["worker-a"], operationId: "op-next-1" });
+	const queued = await router.send({ roomSessionId: ROOM, content: "排队追问", mentions: ["worker-a"], operationId: "op-next-2" });
+	assert.equal(queued.persistence, "pending");
+	assert.equal(queued.turnId, first.turnId);
+	assert.equal((await turns.get(ROOM, first.turnId))?.inputs.length, 2);
+	release();
+	await wait(router, first.turnId);
+	const stored = await events.read(ROOM);
+	assert.equal(stored.filter((event) => event.actor.kind === "user").length, 2);
+	assert.equal(stored.at(-1)?.content, "排队后的最终结论");
+	assert.equal(runs, 2);
 });

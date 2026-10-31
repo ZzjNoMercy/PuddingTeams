@@ -343,9 +343,6 @@ export class ParticipantTurnStore {
 			if (turn.inputs.length === 0 && input.delivery !== "normal") {
 				throw new RoomTurnConflictError(roomSessionId, "Turn 的首个输入必须是 normal");
 			}
-			if (turn.inputs.length > 0 && input.delivery === "normal") {
-				throw new RoomTurnConflictError(roomSessionId, "同一 Turn 只能有一个 normal 输入；后续输入必须是 followUp");
-			}
 			turn.inputs = [...turn.inputs, { ...input }];
 			turn.updatedAt = new Date().toISOString();
 			await this.save(roomSessionId, turns);

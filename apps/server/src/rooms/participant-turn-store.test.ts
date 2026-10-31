@@ -94,14 +94,13 @@ test("ParticipantTurnStore: 首输入 normal，followUp 追加且同键回放", 
 	assert.deepEqual(follow.turn.inputs.map((item) => item.operationId), ["op-1", "op-2"]);
 });
 
-test("ParticipantTurnStore: 同一 Turn 不能有两个 normal 输入，终态后不能再追加", async () => {
+test("ParticipantTurnStore: 允许排队 normal 输入，终态后不能再追加", async () => {
 	const { store } = freshStore();
 	await store.admit(ROOM, newTurn());
 	await store.appendInput(ROOM, "turn-1", input());
-	await assert.rejects(
-		() => store.appendInput(ROOM, "turn-1", input({ operationId: "op-2" })),
-		RoomTurnConflictError,
-	);
+	const queued = await store.appendInput(ROOM, "turn-1", input({ operationId: "op-2" }));
+	assert.equal(queued.created, true);
+	assert.equal(queued.turn.inputs.length, 2);
 	await store.update(ROOM, "turn-1", { status: "cancelled", terminalReason: "用户停止" });
 	await assert.rejects(
 		() => store.appendInput(ROOM, "turn-1", input({ operationId: "op-3", delivery: "followUp" })),

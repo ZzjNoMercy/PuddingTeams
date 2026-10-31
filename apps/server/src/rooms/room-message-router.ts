@@ -327,7 +327,47 @@ export class RoomMessageRouter {
 				return { roomEventId: userEvent.id, turnId: active.id, status: appended.turn.status, replayed: false, persistence: "durable" };
 			}
 			const active = await this.activeTurn(input.roomSessionId);
-			if (active) throw new RoomMessageError("room_turn_active", `房间已有未终态公开回合：${active.id}`);
+			if (active) {
+				const requested = [...new Set(input.mentions)][0] ?? this.deps.managerAgentId;
+				const activeBinding = await this.deps.bindings.findActiveBySession(input.roomSessionId, active.agentSessionId);
+				if (!activeBinding) throw new RoomMessageError("participant_binding_required", "当前 ParticipantSession 没有 active binding");
+				if (requested !== activeBinding.agentId) {
+					throw new RoomMessageError("room_turn_active", `房间已有未终态公开回合：${active.id}`);
+				}
+				const nativeFollowUp = this.deps.runner.supportsFollowUp
+					? await this.deps.runner.supportsFollowUp(activeBinding)
+					: Boolean(this.deps.runner.followUp);
+				if (nativeFollowUp) {
+					throw new RoomMessageError("room_turn_active", "当前 Participant 支持 followUp；请使用 delivery=followUp");
+				}
+				const eventId = randomUUID();
+				const mentions = [activeBinding.agentId];
+				const draft = {
+					id: eventId, kind: "message" as const, actor: { kind: "user" as const },
+					content, mentions,
+					...(input.attachments?.length ? { attachments: input.attachments } : {}),
+					createdAt: this.now(),
+				};
+				const reserved = await this.deps.operations.reserveMessage(input.roomSessionId, { key: input.operationId, requestHash: hash });
+				if (!reserved.created) throw new RoomMessageError("message_delivery_unconfirmed", "消息操作已存在但未确认 accepted");
+				const userEvent = await this.deps.events.append(input.roomSessionId, draft);
+				await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "user_event_appended", { roomEventId: userEvent.id });
+				this.deps.bus?.publish(input.roomSessionId, { type: "room_event", event: userEvent });
+				await this.recordActivity(input.roomSessionId, userEvent, false);
+				await this.deps.turns.appendInput(input.roomSessionId, active.id, {
+					operationId: input.operationId,
+					sourceRoomEventId: userEvent.id,
+					...(activeBinding.lastRoomEntryId ? { contextFromAfterRoomEventId: activeBinding.lastRoomEntryId } : {}),
+					contextThroughRoomEventId: userEvent.id,
+					inputHash: hashText(content),
+					delivery: "normal",
+					persistence: "pending",
+				});
+				await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "participant_bound", {
+					agentSessionId: activeBinding.agentSessionId, participantTurnId: active.id,
+				});
+				return { roomEventId: userEvent.id, turnId: active.id, status: active.status, replayed: false, persistence: "pending" };
+			}
 			const target = await this.resolveTarget(input.roomSessionId, input.mentions);
 			const binding = await this.deps.bindings.get(input.roomSessionId, target.agentId);
 			if (!binding) throw new RoomMessageError("participant_binding_required", `agent ${target.agentId} 没有 active binding`);
@@ -425,6 +465,62 @@ export class RoomMessageRouter {
 		return false;
 	}
 
+	/** 非 Pi 队列：首个 run 结束后，按顺序消费 pending normal 输入。 */
+	private async drainQueuedNormalInputs(roomSessionId: string, turnId: string, binding: ParticipantBinding): Promise<{ terminal: boolean; finalContent?: string }> {
+		let finalContent: string | undefined;
+		while (true) {
+			const turn = await this.deps.turns.get(roomSessionId, turnId);
+			if (!turn || !["admitted", "running", "waiting_input", "reconciling"].includes(turn.status)) return { terminal: true };
+			const pending = turn.inputs.filter((input) => input.persistence === "pending" && input.delivery === "normal");
+			if (!pending.length) return { terminal: false, finalContent };
+			for (const input of pending) {
+				const events = await this.deps.events.read(roomSessionId);
+				const source = events.find((event) => event.id === input.sourceRoomEventId);
+				if (!source) return { terminal: true };
+				let context: BuiltRoomContext;
+				try {
+					context = buildRoomContext({
+						roomSessionId, events,
+						...(binding.lastRoomEntryId ? { after: binding.lastRoomEntryId } : {}),
+						current: {
+							eventId: source.id, content: source.content, mentions: [binding.agentId],
+							...(source.attachments?.length ? { attachments: source.attachments } : {}),
+							targetAgentName: this.deps.agentNames?.[binding.agentId] ?? binding.agentId,
+						},
+						maxChars: effectiveBudget(this.deps.budget),
+						...(this.deps.agentNames ? { agentNames: this.deps.agentNames } : {}),
+					});
+				} catch (error) {
+					const reason = error instanceof Error ? error.message : String(error);
+					const failed = await this.deps.turnService.fail(roomSessionId, turnId, reason);
+					await this.deps.turnService.project(roomSessionId, failed.id);
+					return { terminal: true };
+				}
+				const result = await this.deps.runner.run({
+					roomSessionId, turn: { ...turn, operationId: input.operationId }, binding,
+					prompt: context.text, context,
+					markInputDurable: async (agentUserEntryId?: string) => {
+						await this.deps.turnService.markInputDurable(roomSessionId, turnId, input.operationId, agentUserEntryId);
+						await this.deps.operations.advanceMessage(roomSessionId, input.operationId, "participant_input_durable");
+						await this.deps.operations.advanceMessage(roomSessionId, input.operationId, "accepted");
+					},
+				});
+				if (result.execution || result.delegationIds?.length) {
+					await this.deps.turns.update(roomSessionId, turnId, {
+						...(result.execution ? { execution: result.execution } : {}),
+						...(result.delegationIds?.length ? { delegationIds: result.delegationIds } : {}),
+					});
+				}
+				if (result.status !== "completed") {
+					const failed = await this.deps.turnService.fail(roomSessionId, turnId, result.terminalReason ?? "排队输入执行失败", result.finalContent);
+					await this.deps.turnService.project(roomSessionId, failed.id);
+					return { terminal: true };
+				}
+				finalContent = result.finalContent ?? finalContent;
+			}
+		}
+	}
+
 	private execute(roomSessionId: string, turnId: string, runnerInput: RoomParticipantRunnerInput): Promise<void> {
 		const key = this.executionKey(roomSessionId, turnId);
 		const run: Promise<void> = (async () => {
@@ -458,6 +554,9 @@ export class RoomMessageRouter {
 				return;
 			}
 			if (result.status === "completed" && result.finalContent?.trim()) {
+				const drained = await this.drainQueuedNormalInputs(roomSessionId, turnId, runnerInput.binding);
+				if (drained.terminal) return;
+				const finalContent = drained.finalContent ?? result.finalContent;
 				// 等待排队输入不能持有房间准入锁：否则长 delegation 期间所有发送都被挂起。
 				while (true) {
 					const ready = await this.waitForDurableInputs(roomSessionId, turnId);
@@ -470,7 +569,7 @@ export class RoomMessageRouter {
 						const latest = await this.deps.turns.get(roomSessionId, turnId);
 						if (!latest || !["admitted", "running", "waiting_input", "reconciling"].includes(latest.status)) return true;
 						if (latest.inputs.some((input) => input.persistence !== "durable")) return false;
-						const completed = await this.deps.turnService.complete(roomSessionId, turnId, result.finalContent!);
+						const completed = await this.deps.turnService.complete(roomSessionId, turnId, finalContent!);
 						const projection = await this.deps.turnService.project(roomSessionId, completed.id);
 						if (projection.event) {
 							this.deps.bus?.publish(roomSessionId, { type: "room_event", event: projection.event });
