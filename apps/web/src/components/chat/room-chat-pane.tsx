@@ -15,6 +15,7 @@ import {
 	supersedeGoal,
 	closeUnknownRoomTurn,
 	fetchRoomGoal,
+	fetchRoomSummary,
 	fetchRoomTimeline,
 	forkRoomSession,
 	getRoom,
@@ -276,6 +277,13 @@ export function RoomChatPane({
 				<div className="ml-auto flex items-center gap-2">
 					<Button size="sm" variant="outline" disabled={Boolean(activeTurn) || forking} onClick={() => void handleFork()}>{forking ? "Fork 中…" : "Fork"}</Button>
 					<Button size="sm" variant="outline" onClick={() => setGoalOpen(true)}>{goal ? "Goal…" : "设 Goal"}</Button>
+					<Button size="sm" variant="outline" onClick={() => {
+						if (!roomSessionId) return;
+						void fetchRoomSummary(room.id, roomSessionId)
+							.then((summary) => navigator.clipboard.writeText(summary.text || "（暂无公开摘要）"))
+							.then(() => toast.success("公共摘要已复制"))
+							.catch((caught: unknown) => toast.error(caught instanceof Error ? caught.message : String(caught)));
+					}}>分享摘要</Button>
 					{activeTurn ? <Button size="sm" variant="outline" onClick={() => void handleStop()}>停止</Button> : null}
 					{activeTurn && ["unknown", "reconciling"].includes(activeTurn.status)
 						? <Button size="sm" variant="outline" onClick={() => void handleCloseUnknown()}>确认无运行</Button> : null}

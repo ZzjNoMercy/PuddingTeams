@@ -1266,6 +1266,38 @@ export function registerRoomsRoutes(
 		},
 	);
 
+	/** 公共摘要：只基于 RoomEvent/PublicTurn 生成，可安全分享。 */
+	app.get<{ Params: { id: string; sid: string } }>("/api/rooms/:id/sessions/:sid/summary", async (req, reply) => {
+		if (!roomEvents) return reply.code(503).send({ error: "room session stores are not configured" });
+		const context = await teams.contextForRoomSession(req.params.sid);
+		if (!context || context.window.id !== req.params.id) return reply.code(404).send({ error: "room session not found", code: "room_session_not_found" });
+		let events: RoomEvent[];
+		try { events = await roomEvents.read(req.params.sid); }
+		catch (error) { return reply.code(503).send({ error: error instanceof Error ? error.message : String(error), code: "room_recovery_required" }); }
+		const participants = (await teams.participantSessionsForRoom(req.params.sid)).filter((participant) => participant.state === "active");
+		const manager = await teams.managerSessionForRoom(req.params.sid);
+		const goal = workStates && manager ? await workStates.getActive(manager) : undefined;
+		const firstUser = events.find((event) => event.kind === "message" && event.actor.kind === "user");
+		const lastAgent = [...events].reverse().find((event) => event.kind === "message" && event.actor.kind === "agent");
+		const firstUserText = firstUser?.content.replace(/\s+/g, " ").trim().slice(0, 200) ?? "";
+		const lastAgentText = lastAgent?.content.replace(/\s+/g, " ").trim().slice(0, 200) ?? "";
+		return {
+			roomSessionId: req.params.sid,
+			roomId: req.params.id,
+			createdAt: events[0]?.createdAt ?? context.roomSession.createdAt,
+			updatedAt: events.at(-1)?.createdAt ?? context.roomSession.createdAt,
+			eventCount: events.length,
+			lastEventSeq: events.at(-1)?.seq ?? 0,
+			userMessageCount: events.filter((event) => event.kind === "message" && event.actor.kind === "user").length,
+			agentMessageCount: events.filter((event) => event.kind === "message" && event.actor.kind === "agent").length,
+			participants: participants.map((participant) => ({ agentId: participant.agentId, role: participant.role })),
+			firstUserMessage: firstUserText,
+			lastAgentMessage: lastAgentText,
+			goal: goal ? { goalId: goal.goalId, goal: goal.goal, status: goal.status } : null,
+			text: [firstUserText ? `问题：${firstUserText}` : "", lastAgentText ? `结论：${lastAgentText}` : ""].filter(Boolean).join("\n"),
+		};
+	});
+
 	/** 房间公开事件搜索（当前为线性扫描；后续可换索引）。 */
 	app.get<{ Params: { id: string; sid: string }; Querystring: { q?: string; limit?: string } }>(
 		"/api/rooms/:id/sessions/:sid/search",

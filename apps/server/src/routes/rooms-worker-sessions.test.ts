@@ -859,3 +859,31 @@ test("v4 HTTP: 活动回合 followUp 不新建 Turn，final 只投影一次", as
 		assert.equal(timeline.events.filter((event: { kind: string; actor: { kind: string } }) => event.kind === "message" && event.actor.kind === "agent").length, 1);
 	} finally { release(); await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("v4 HTTP: 公共摘要只含 RoomEvent 事实", async () => {
+	const { app, teams, sessions, dir } = await makeStack();
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		const room = created.json().room as RoomSummary;
+		const roomSessionId = room.roomSessionIds![0]!;
+		await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/messages`,
+			headers: { "idempotency-key": randomUUID() }, payload: { content: "请检查登录", mentions: ["alpha"] },
+		});
+		for (let attempt = 0; attempt < 50; attempt += 1) {
+			const timeline = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` });
+			if (timeline.json().events.length >= 2) break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		const summary = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/summary` });
+		assert.equal(summary.statusCode, 200, summary.body);
+		assert.equal(summary.json().userMessageCount, 1);
+		assert.equal(summary.json().agentMessageCount, 1);
+		assert.equal(summary.json().firstUserMessage, "请检查登录");
+		assert.equal(summary.json().lastAgentMessage, "房间结论");
+		assert.match(summary.json().text, /问题：请检查登录/);
+		assert.match(summary.json().text, /结论：房间结论/);
+		assert.equal(summary.json().lastEventSeq, 2);
+	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});

@@ -2736,6 +2736,13 @@ export async function sendRoomMessage(
 	return { accepted: true, roomEventId: body!.roomEventId!, participantTurnId: body!.participantTurnId! };
 }
 
+export async function fetchRoomSummary(roomId: string, roomSessionId: string): Promise<{ text: string; userMessageCount: number; agentMessageCount: number; lastEventSeq: number }> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(roomSessionId)}/summary`);
+	const body = (await res.json().catch(() => null)) as { text?: string; userMessageCount?: number; agentMessageCount?: number; lastEventSeq?: number; error?: string } | null;
+	if (!res.ok) throw new Error(body?.error ?? `load room summary failed: ${res.status}`);
+	return { text: body?.text ?? "", userMessageCount: body?.userMessageCount ?? 0, agentMessageCount: body?.agentMessageCount ?? 0, lastEventSeq: body?.lastEventSeq ?? 0 };
+}
+
 export async function fetchRoomGoal(roomId: string, roomSessionId: string): Promise<{ goal: string; completionBoundary: string; status: string; goalId: string; revision: number; executionStatus?: string; managerParticipantSessionId: string } | null> {
 	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(roomSessionId)}/goal`);
 	const body = (await res.json().catch(() => null)) as { goal?: { goal?: string; completionBoundary?: string; status?: string; goalId?: string; revision?: number; executionStatus?: string } | null; managerParticipantSessionId?: string; error?: string } | null;
