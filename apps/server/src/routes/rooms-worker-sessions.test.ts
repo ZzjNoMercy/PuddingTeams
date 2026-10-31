@@ -640,7 +640,7 @@ test("v4 HTTP: group 最后一个 RoomSession 不能经 onlySession 删除整房
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("v4 HTTP: Fork 在活动回合时 409，含附件时 409", async () => {
+test("v4 HTTP: Fork 在活动回合时 409，附件复制到目标命名空间", async () => {
 	let release!: () => void;
 	const pending = new Promise<void>((resolve) => { release = resolve; });
 	const { app, teams, sessions, dir } = await makeStack({
@@ -670,7 +670,14 @@ test("v4 HTTP: Fork 在活动回合时 409，含附件时 409", async () => {
 		assert.equal(attached.statusCode, 202, attached.body);
 		await new Promise((resolve) => setTimeout(resolve, 100));
 		const attachmentFork = await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/fork`, payload: {} });
-		assert.equal(attachmentFork.statusCode, 409, attachmentFork.body);
-		assert.equal(attachmentFork.json().code, "fork_attachments_unsupported");
+		assert.equal(attachmentFork.statusCode, 201, attachmentFork.body);
+		const targetRoomId = attachmentFork.json().roomSessionId as string;
+		const targetTimeline = (await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${targetRoomId}/timeline` })).json();
+		const attachmentEvent = targetTimeline.events.find((event: { attachments?: unknown[] }) => event.attachments?.length);
+		assert.ok(attachmentEvent);
+		const copiedPath = attachmentEvent.attachments[0].path as string;
+		assert.ok(copiedPath.startsWith(path.join(dir, "uploads", targetRoomId)));
+		rmSync(path.join(dir, "uploads", roomSessionId), { recursive: true, force: true });
+		assert.equal(readFileSync(copiedPath, "utf8"), "x");
 	} finally { release(); await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });

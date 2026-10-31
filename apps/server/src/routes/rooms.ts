@@ -267,7 +267,7 @@ export function registerRoomsRoutes(
 	const activityProjector = new RoomActivityProjector(localFiles?.activityStatePath);
 	const sessionCreationOperations = localFiles?.sessionCreationStatePath
 		? new SessionCreationOperations(localFiles.sessionCreationStatePath) : null;
-	const roomEvents = localFiles?.roomSessionsStatePath ? new RoomEventStore(localFiles.roomSessionsStatePath) : undefined;
+	const roomEvents = localFiles?.roomSessionsStatePath ? new RoomEventStore(localFiles.roomSessionsStatePath, { attachmentRoot: localFiles.attachmentRoot }) : undefined;
 	const roomOperations = localFiles?.roomSessionsStatePath ? new RoomOperationStore(localFiles.roomSessionsStatePath) : undefined;
 	const roomTurns = localFiles?.roomSessionsStatePath ? new ParticipantTurnStore(localFiles.roomSessionsStatePath) : undefined;
 	const roomActivity = localFiles?.roomActivityStatePath ? new RoomActivityStore(localFiles.roomActivityStatePath) : undefined;
@@ -1112,9 +1112,6 @@ export function registerRoomsRoutes(
 			catch (error) { return reply.code(503).send({ error: error instanceof Error ? error.message : String(error), code: "room_recovery_required" }); }
 			const cutoffSeq = throughSeq === undefined ? (sourceEvents.at(-1)?.seq ?? 0) : throughSeq as number;
 			if (cutoffSeq > (sourceEvents.at(-1)?.seq ?? 0)) return reply.code(400).send({ error: "throughEventSeq 超出房间末条事件", code: "invalid_cutoff" });
-			if (sourceEvents.some((event) => event.seq <= cutoffSeq && event.attachments?.length)) {
-				return reply.code(409).send({ error: "源房间在 Fork 范围内含附件；附件独立快照尚未接通", code: "fork_attachments_unsupported" });
-			}
 			const managerSessionId = randomUUID();
 			const roomSessionId = randomUUID();
 			let createdSession: Awaited<ReturnType<PiSessionStore["create"]>> | undefined;

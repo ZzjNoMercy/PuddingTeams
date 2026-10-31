@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { withRoomFileLock } from "./room-file-lock.js";
 
@@ -448,6 +448,35 @@ export class RoomEventStore {
 	 * - 事件 id 全部重发，replyToEventId 重映射到新 id（目标不在 cutoff 内则丢弃）；
 	 * - sourceParticipantTurnId 作为来源 provenance 保留（目标的 Turn 不复制）。
 	 */
+	/** Fork 时把附件复制到目标 RoomSession 自己的冻结目录，避免共享源活路径。 */
+	private async forkAttachments(targetRoomSessionId: string, attachments: RoomAttachmentRef[]): Promise<RoomAttachmentRef[]> {
+		if (!this.attachmentRoot) throw new RoomEventInvalidRequestError(targetRoomSessionId, "Fork 附件需要配置 attachmentRoot");
+		const root = path.resolve(this.attachmentRoot);
+		const targetDir = path.join(root, targetRoomSessionId);
+		await mkdir(targetDir, { recursive: true, mode: 0o700 });
+		const copied: RoomAttachmentRef[] = [];
+		try {
+			for (const item of attachments) {
+				const source = path.resolve(item.path);
+				const relative = path.relative(root, source);
+				if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
+					throw new RoomEventInvalidRequestError(targetRoomSessionId, `Fork 附件路径不在冻结命名空间内: ${item.path}`);
+				}
+				const data = await readFile(source);
+				const sha256 = createHash("sha256").update(data).digest("hex");
+				const name = (path.basename(item.name) || "attachment").replace(/[^A-Za-z0-9._ -]/g, "_");
+				const target = path.join(targetDir, `${sha256.slice(0, 12)}-${name}`);
+				try { await writeFile(target, data, { mode: 0o600, flag: "wx" }); }
+				catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+				copied.push({ ...item, name, path: target, sha256, size: data.length });
+			}
+			return copied;
+		} catch (error) {
+			await rm(targetDir, { recursive: true, force: true }).catch(() => undefined);
+			throw error;
+		}
+	}
+
 	async fork(sourceRoomSessionId: string, targetRoomSessionId: string, opts: { throughSeq?: number } = {}): Promise<RoomEvent[]> {
 		assertRoomSessionId(targetRoomSessionId);
 		const events = await this.read(sourceRoomSessionId);
@@ -455,7 +484,12 @@ export class RoomEventStore {
 		if (!Number.isSafeInteger(through) || through < 0 || through > events.length) throw new RoomEventInvalidRequestError(sourceRoomSessionId, `throughSeq 越界: ${through}`);
 		const selected = events.slice(0, through);
 		const idMap = new Map(selected.map((event) => [event.id, randomUUID()]));
-		const copies: RoomEvent[] = selected.map((event, index) => ({
+		const copies: RoomEvent[] = [];
+		for (const [index, event] of selected.entries()) {
+			const attachments = event.attachments?.length
+				? await this.forkAttachments(targetRoomSessionId, event.attachments)
+				: undefined;
+			copies.push({
 			id: idMap.get(event.id)!,
 			roomSessionId: targetRoomSessionId,
 			seq: index + 1,
@@ -463,12 +497,13 @@ export class RoomEventStore {
 			actor: event.actor,
 			content: event.content,
 			mentions: event.mentions,
-			...(event.attachments ? { attachments: event.attachments } : {}),
+			...(attachments ? { attachments } : {}),
 			...(event.artifactRefs ? { artifactRefs: event.artifactRefs } : {}),
 			...(event.sourceParticipantTurnId ? { sourceParticipantTurnId: event.sourceParticipantTurnId } : {}),
 			...(event.replyToEventId ? (idMap.has(event.replyToEventId) ? { replyToEventId: idMap.get(event.replyToEventId)! } : {}) : {}),
 			createdAt: event.createdAt,
-		}));
+			});
+		}
 		const directory = this.sessionDir(targetRoomSessionId);
 		const file = this.eventsPath(targetRoomSessionId);
 		return this.runExclusive(targetRoomSessionId, async () => {
