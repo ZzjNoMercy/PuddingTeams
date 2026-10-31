@@ -280,6 +280,7 @@ test("RoomMessageRouter: 原生 followUp 追加输入、不另起 runner，完�
 	let release!: () => void;
 	const pending = new Promise<void>((resolve) => { release = resolve; });
 	let runCalls = 0;
+	let followText = "";
 	const runner: RoomParticipantRunner = {
 		run: async (input) => {
 			runCalls += 1;
@@ -287,7 +288,7 @@ test("RoomMessageRouter: 原生 followUp 追加输入、不另起 runner，完�
 			await pending;
 			return { status: "completed", finalContent: "最终结论" };
 		},
-		followUp: async (input) => { await input.markInputDurable("followup-entry"); return "durable" as const; },
+		followUp: async (input) => { followText = input.text; await input.markInputDurable("followup-entry"); return "durable" as const; },
 	};
 	(router as unknown as { deps: { runner: RoomParticipantRunner } }).deps.runner = runner;
 	const first = await router.send({ roomSessionId: ROOM, content: "开始", mentions: ["worker-a"], operationId: "op-follow-1" });
@@ -297,6 +298,8 @@ test("RoomMessageRouter: 原生 followUp 追加输入、不另起 runner，完�
 	});
 	assert.equal(follow.turnId, first.turnId);
 	assert.equal(runCalls, 1, "followUp 不能起第二个 runner");
+	assert.match(followText, /补充/);
+	assert.match(followText, /event=/);
 	const active = await turns.get(ROOM, first.turnId);
 	assert.equal(active?.inputs.length, 2);
 	assert.equal(active?.inputs[1]?.persistence, "durable");

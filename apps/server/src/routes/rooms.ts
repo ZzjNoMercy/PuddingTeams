@@ -1024,6 +1024,22 @@ export function registerRoomsRoutes(
 		}
 	});
 
+	/** 取消尚未 durable 的排队输入（房间级；替代 Participant Agent API）。 */
+	app.post<{ Params: { id: string; sid: string; operationId: string }; Body: { action?: unknown } }>(
+		"/api/rooms/:id/sessions/:sid/queued-inputs/:operationId",
+		async (req, reply) => {
+			if (!roomRuntime) return reply.code(503).send({ error: "room session stores are not configured" });
+			if (req.body?.action !== "cancel") return reply.code(400).send({ error: "首期只支持 action=cancel", code: "invalid_action" });
+			const context = await teams.contextForRoomSession(req.params.sid);
+			if (!context || context.window.id !== req.params.id) return reply.code(404).send({ error: "room session not found", code: "room_session_not_found" });
+			try {
+				return { ok: true, ...(await roomRuntime.cancelQueuedInput(req.params.sid, req.params.operationId)) };
+			} catch (error) {
+				return reply.code(409).send({ error: error instanceof Error ? error.message : String(error), code: "queued_input_cancel_failed" });
+			}
+		},
+	);
+
 	/** 用户确认无 live Run 后解除 unknown/reconciling 锁。 */
 	app.post<{ Params: { id: string; sid: string; turnId: string }; Body: { reason?: unknown } }>(
 		"/api/rooms/:id/sessions/:sid/turns/:turnId/close-unknown",
@@ -1339,7 +1355,10 @@ export function registerRoomsRoutes(
 			managerParticipantSessionId: (await teams.managerSessionForRoom(req.params.sid)) ?? null,
 			lastEventSeq: events.at(-1)?.seq ?? 0,
 			executionProjections: [],
-			queuedInputs: [],
+			queuedInputs: activeTurn ? activeTurn.inputs.filter((item) => item.persistence === "pending").map((item) => ({
+				operationId: item.operationId, sourceRoomEventId: item.sourceRoomEventId,
+				delivery: item.delivery, persistence: item.persistence,
+			})) : [],
 			activityRevision: roomActivity ? (await roomActivity.status(req.params.sid)).entry?.revision ?? 0 : 0,
 			capabilities: {
 				canSend: (!publicActiveTurn || activeNativePi) && !recoveryReason,

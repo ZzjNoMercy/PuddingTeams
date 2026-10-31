@@ -395,6 +395,23 @@ export class ParticipantTurnStore {
 		});
 	}
 
+	/** 显式取消未 durable 的排队输入；已 durable 的输入不能回滚。 */
+	async dropPendingInput(roomSessionId: string, turnId: string, operationId: string): Promise<ParticipantTurn> {
+		return this.runExclusive(roomSessionId, async () => {
+			const turns = await this.readUnlocked(roomSessionId);
+			const turn = turns[turnId];
+			if (!turn) throw new RoomTurnNotFoundError(roomSessionId, turnId);
+			const input = turn.inputs.find((item) => item.operationId === operationId);
+			if (!input) throw new RoomTurnConflictError(roomSessionId, `输入不存在: ${operationId}`);
+			if (input.persistence === "durable") throw new RoomTurnConflictError(roomSessionId, `输入已 durable，不能取消: ${operationId}`);
+			turn.inputs = turn.inputs.filter((item) => item.operationId !== operationId);
+			turn.updatedAt = new Date().toISOString();
+			turns[turnId] = validateTurn(roomSessionId, turnId, turn);
+			await this.save(roomSessionId, turns);
+			return turns[turnId]!;
+		});
+	}
+
 	/** 用户显式确认无 live Run 后解除公开回合锁。 */
 	async closeUnknown(roomSessionId: string, turnId: string, reason: string): Promise<ParticipantTurn> {
 		return this.runExclusive(roomSessionId, async () => {

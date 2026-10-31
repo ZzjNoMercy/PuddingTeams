@@ -131,3 +131,19 @@ test("ParticipantTurnStore: 原子写后文件可被重新读取", async () => {
 	assert.match(text, /"turn-1"/);
 	assert.equal(JSON.parse(text)["turn-1"].status, "admitted");
 });
+
+test("ParticipantTurnStore: 只能取消未 durable 的排队输入", async () => {
+	const { store } = freshStore();
+	const admitted = await store.admit(ROOM, newTurn());
+	await store.update(ROOM, admitted.turn.id, { status: "running" });
+	await store.appendInput(ROOM, admitted.turn.id, input());
+	await store.markInputDurable(ROOM, admitted.turn.id, "op-1");
+	await store.appendInput(ROOM, admitted.turn.id, input({
+		operationId: "op-2", sourceRoomEventId: "event-2", contextThroughRoomEventId: "event-2",
+		inputHash: "b".repeat(64), delivery: "followUp", persistence: "pending",
+	}));
+	assert.equal((await store.get(ROOM, admitted.turn.id))?.inputs.length, 2);
+	const dropped = await store.dropPendingInput(ROOM, admitted.turn.id, "op-2");
+	assert.equal(dropped.inputs.length, 1);
+	await assert.rejects(() => store.dropPendingInput(ROOM, admitted.turn.id, "op-1"), /已 durable/);
+});

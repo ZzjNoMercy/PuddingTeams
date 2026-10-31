@@ -244,12 +244,31 @@ export class RoomMessageRouter {
 					throw new RoomMessageError("participant_delivery_unsupported", "当前 Participant 不支持原生 followUp");
 				}
 				const eventId = randomUUID();
+				const mentions = [binding.agentId];
 				const draft = {
 					id: eventId, kind: "message" as const, actor: { kind: "user" as const },
-					content, mentions: [binding.agentId],
+					content, mentions,
 					...(input.attachments?.length ? { attachments: input.attachments } : {}),
 					createdAt: this.now(),
 				};
+				let followContext: BuiltRoomContext;
+				try {
+					followContext = buildRoomContext({
+						roomSessionId: input.roomSessionId,
+						events,
+						...(binding.lastRoomEntryId ? { after: binding.lastRoomEntryId } : {}),
+						current: {
+							eventId, content, mentions,
+							...(input.attachments?.length ? { attachments: input.attachments } : {}),
+							targetAgentName: this.deps.agentNames?.[binding.agentId] ?? binding.agentId,
+						},
+						maxChars: effectiveBudget(this.deps.budget),
+						...(this.deps.agentNames ? { agentNames: this.deps.agentNames } : {}),
+					});
+				} catch (error) {
+					if (error instanceof RoomContextTooLargeError) throw new RoomMessageError("context_too_large", error.message);
+					throw error;
+				}
 				const reserved = await this.deps.operations.reserveMessage(input.roomSessionId, { key: input.operationId, requestHash: hash });
 				if (!reserved.created) throw new RoomMessageError("message_delivery_unconfirmed", "消息操作已存在但未确认 accepted");
 				const userEvent = await this.deps.events.append(input.roomSessionId, draft);
@@ -261,7 +280,7 @@ export class RoomMessageRouter {
 					sourceRoomEventId: userEvent.id,
 					...(binding.lastRoomEntryId ? { contextFromAfterRoomEventId: binding.lastRoomEntryId } : {}),
 					contextThroughRoomEventId: userEvent.id,
-					inputHash: hashText(content),
+					inputHash: hashText(followContext.text),
 					delivery: "followUp",
 					persistence: "pending",
 				});
@@ -285,7 +304,7 @@ export class RoomMessageRouter {
 					resolveDurable();
 					await finalizeAccepted();
 				};
-				const pendingDurable = this.deps.runner.followUp({ roomSessionId: input.roomSessionId, turn: appended.turn, binding, text: content, markInputDurable });
+				const pendingDurable = this.deps.runner.followUp({ roomSessionId: input.roomSessionId, turn: appended.turn, binding, text: followContext.text, markInputDurable });
 				let disposition: "durable" | "queued";
 				try {
 					disposition = await pendingDurable;

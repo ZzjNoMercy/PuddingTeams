@@ -27,6 +27,7 @@ export interface RoomRuntime {
 	bus: RoomEventBus;
 	abort(roomSessionId: string): Promise<{ turnId: string; status: string }>;
 	recoverPending(roomSessionId: string): Promise<number>;
+	cancelQueuedInput(roomSessionId: string, operationId: string): Promise<{ turnId: string }>;
 }
 
 export class ConnectorParticipantRunner implements RoomParticipantRunner {
@@ -143,6 +144,13 @@ export function createRoomRuntime(input: {
 	});
 	const runtime: RoomRuntime = {
 		router, events, turns, operations, bindings, bus,
+		cancelQueuedInput: async (roomSessionId, operationId) => {
+			const active = (await turns.list(roomSessionId)).find((turn) =>
+				["admitted", "running", "waiting_input", "reconciling", "unknown"].includes(turn.status));
+			if (!active) throw new Error("房间没有进行中的公开回合");
+			await turns.dropPendingInput(roomSessionId, active.id, operationId);
+			return { turnId: active.id };
+		},
 		recoverPending: async (roomSessionId) => {
 			const recovered = await turnService.recoverInterrupted(roomSessionId, startedAt);
 			for (const turn of recovered) bus.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(turn) });
@@ -154,6 +162,9 @@ export function createRoomRuntime(input: {
 			const active = (await turns.list(roomSessionId)).find((turn) =>
 				["admitted", "running", "waiting_input", "reconciling", "unknown"].includes(turn.status));
 			if (!active) throw new Error("房间没有进行中的公开回合");
+			for (const queued of active.inputs.filter((item) => item.persistence === "pending")) {
+				await turns.dropPendingInput(roomSessionId, active.id, queued.operationId).catch(() => undefined);
+			}
 			if (active.execution?.kind === "direct_chat" && input.invoker) {
 				await input.invoker.cancel(active.execution.delegationId);
 			} else {
