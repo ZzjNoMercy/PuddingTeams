@@ -160,6 +160,21 @@ export class RoomTurnService {
 		return { turn: updated, watermarkAdvanced: true };
 	}
 
+	/** 启动/首次访问时把上一个进程遗留的活回合标成 unknown，等待用户显式 close-unknown。 */
+	async recoverInterrupted(roomSessionId: string, startedAt: string, reason = "进程重启，执行状态未知"): Promise<ParticipantTurn[]> {
+		const active = (await this.deps.turns.list(roomSessionId)).filter((turn) =>
+			["admitted", "running", "reconciling"].includes(turn.status) && turn.updatedAt < startedAt);
+		const recovered: ParticipantTurn[] = [];
+		for (const turn of active) {
+			try {
+				recovered.push(await this.deps.turns.update(roomSessionId, turn.id, { status: "unknown", terminalReason: reason }));
+			} catch {
+				// 并发完成/取消时不覆盖终态。
+			}
+		}
+		return recovered;
+	}
+
 	async markUnknown(roomSessionId: string, turnId: string, reason: string): Promise<ParticipantTurn> {
 		return this.deps.turns.markUnknown(roomSessionId, turnId, reason);
 	}

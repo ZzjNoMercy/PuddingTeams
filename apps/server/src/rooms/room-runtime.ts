@@ -26,6 +26,7 @@ export interface RoomRuntime {
 	bindings: TeamsParticipantBindingPort;
 	bus: RoomEventBus;
 	abort(roomSessionId: string): Promise<{ turnId: string; status: string }>;
+	recoverPending(roomSessionId: string): Promise<number>;
 }
 
 class ConnectorParticipantRunner implements RoomParticipantRunner {
@@ -64,6 +65,7 @@ export function createRoomRuntime(input: {
 	const bindings = new TeamsParticipantBindingPort(input.teams);
 	const turnService = new RoomTurnService({ events, turns, bindings });
 	const bus = new RoomEventBus();
+	const startedAt = new Date().toISOString();
 	const runner = input.runner ?? new ConnectorParticipantRunner({
 		teams: input.teams,
 		pi: new PiParticipantRunner({ sessions: input.sessions }),
@@ -134,6 +136,11 @@ export function createRoomRuntime(input: {
 	});
 	const runtime: RoomRuntime = {
 		router, events, turns, operations, bindings, bus,
+		recoverPending: async (roomSessionId) => {
+			const recovered = await turnService.recoverInterrupted(roomSessionId, startedAt);
+			for (const turn of recovered) bus.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(turn) });
+			return recovered.length;
+		},
 		abort: async (roomSessionId) => {
 			const active = (await turns.list(roomSessionId)).find((turn) =>
 				["admitted", "running", "waiting_input", "reconciling", "unknown"].includes(turn.status));

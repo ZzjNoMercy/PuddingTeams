@@ -1097,6 +1097,7 @@ export function registerRoomsRoutes(
 			if (error instanceof Error && error.name === "RoomSessionNotFoundError") events = [];
 			else return reply.code(503).send({ error: error instanceof Error ? error.message : String(error), code: "room_recovery_required" });
 		}
+		if (roomRuntime) await roomRuntime.recoverPending(req.params.sid);
 		let turns;
 		try { turns = await roomTurns.list(req.params.sid); }
 		catch (error) {

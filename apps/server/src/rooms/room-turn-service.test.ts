@@ -158,3 +158,17 @@ test("InMemoryParticipantBindingRegistry: active 唯一、CAS 水位与退役", 
 	assert.equal(await registry.get(ROOM, "worker-a"), undefined);
 	assert.equal(await registry.findActiveBySession(ROOM, "agent-session-1"), undefined);
 });
+
+test("RoomTurnService: 重启后遗留 running 标 unknown，close-unknown 后可继续", async () => {
+	const { turns, service } = await makeService();
+	const { turn } = await service.begin(beginInput);
+	await service.start(ROOM, turn.id);
+	await service.markInputDurable(ROOM, turn.id, "op-1");
+	assert.deepEqual(await service.recoverInterrupted(ROOM, "2000-01-01T00:00:00.000Z"), [], "进程启动前的旧回合不应被误标");
+	const recovered = await service.recoverInterrupted(ROOM, "9999-01-01T00:00:00.000Z");
+	assert.equal(recovered.length, 1);
+	assert.equal((await turns.get(ROOM, turn.id))?.status, "unknown");
+	const closed = await service.closeUnknown(ROOM, turn.id, "确认无运行");
+	assert.equal(closed.turn.status, "interrupted_unknown");
+	assert.equal(closed.projection.event?.kind, "terminal");
+});
