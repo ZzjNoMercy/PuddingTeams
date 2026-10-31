@@ -2383,6 +2383,40 @@ export class TeamsStore {
 		return result;
 	}
 
+	async advanceParticipantWatermark(roomSessionId: string, agentId: string, expectedRevision: number, eventId: string): Promise<ParticipantSessionRefV4> {
+		return this.serialize(async () => {
+			const data = await this.loadWindowsFile();
+			const participant = Object.values(data.participantSessions).find((item) =>
+				item.roomSessionId === roomSessionId && item.agentId === agentId && item.state === "active");
+			if (!participant) throw new Error(`participant not found: ${roomSessionId}/${agentId}`);
+			if (participant.revision !== expectedRevision) throw new Error(`participant revision conflict: expected ${expectedRevision}, actual ${participant.revision}`);
+			participant.lastRoomEntryId = eventId;
+			participant.revision += 1;
+			participant.updatedAt = new Date().toISOString();
+			data.participantSessions[participant.agentSessionId] = participant;
+			await this.writeWindows(data);
+			return participant;
+		});
+	}
+
+	async retireParticipantSession(roomSessionId: string, agentId: string, reason: "configuration_changed" | "room_session_deleted"): Promise<ParticipantSessionRefV4> {
+		return this.serialize(async () => {
+			const data = await this.loadWindowsFile();
+			const participant = Object.values(data.participantSessions).find((item) =>
+				item.roomSessionId === roomSessionId && item.agentId === agentId && item.state === "active");
+			if (!participant) throw new Error(`participant not found: ${roomSessionId}/${agentId}`);
+			const now = new Date().toISOString();
+			participant.state = reason === "room_session_deleted" ? "tombstoned" : "retired";
+			participant.revision += 1;
+			participant.retiredAt = now;
+			participant.retireReason = reason;
+			participant.updatedAt = now;
+			data.participantSessions[participant.agentSessionId] = participant;
+			await this.writeWindows(data);
+			return participant;
+		});
+	}
+
 	async participantSessionsForRoom(roomSessionId: string): Promise<ParticipantSessionRefV4[]> {
 		return Object.values((await this.windowsFileData()).participantSessions).filter((participant) => participant.roomSessionId === roomSessionId);
 	}

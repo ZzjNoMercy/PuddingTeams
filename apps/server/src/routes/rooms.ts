@@ -20,6 +20,8 @@ import { internalFirstWorkFreezeToken, isWithin, localPathReferences } from "./c
 import { RoomEventStore, type RoomEvent } from "../rooms/room-event-store.js";
 import { RoomOperationStore } from "../rooms/room-operation-store.js";
 import { ParticipantTurnStore } from "../rooms/participant-turn-store.js";
+import { createRoomRuntime } from "../rooms/room-runtime.js";
+import { RoomMessageError, type RoomParticipantRunner } from "../rooms/room-message-router.js";
 
 class FirstWorkMessageConflictError extends Error {
 	constructor() {
@@ -206,6 +208,8 @@ export function registerRoomsRoutes(
 		chatNavigationStatePath?: string;
 		/** state/room-sessions 根目录；用于 RoomEvent / 创建账本。 */
 		roomSessionsStatePath?: string;
+		/** 测试/宿主替换房间 runner。 */
+		roomRunner?: RoomParticipantRunner;
 	},
 ): void {
 	const activityProjector = new RoomActivityProjector(localFiles?.activityStatePath);
@@ -214,6 +218,9 @@ export function registerRoomsRoutes(
 	const roomEvents = localFiles?.roomSessionsStatePath ? new RoomEventStore(localFiles.roomSessionsStatePath) : undefined;
 	const roomOperations = localFiles?.roomSessionsStatePath ? new RoomOperationStore(localFiles.roomSessionsStatePath) : undefined;
 	const roomTurns = localFiles?.roomSessionsStatePath ? new ParticipantTurnStore(localFiles.roomSessionsStatePath) : undefined;
+	const roomRuntime = localFiles?.roomSessionsStatePath
+		? createRoomRuntime({ root: localFiles.roomSessionsStatePath, teams, sessions, invoker, runner: localFiles.roomRunner })
+		: undefined;
 	const summarize = (w: WindowConfig) => buildWindowSummary(sessions, teams, w, activityProjector);
 	const pendingSessionCreations = new Map<string, Promise<Awaited<ReturnType<PiSessionStore["create"]>>>>();
 	const pendingNewWork = new Map<string, Promise<{ sessionId: string; accepted: boolean }>>();
@@ -795,6 +802,49 @@ export function registerRoomsRoutes(
 			...(w.type === "group" ? { roomSessionIds: summary.roomSessionIds, activeRoomSessionId: summary.activeRoomSessionId } : {}),
 		};
 	});
+
+	/** 房间公开消息：服务端原子准入，执行在后台继续。 */
+	app.post<{ Params: { id: string; sid: string }; Body: { content?: unknown; mentions?: unknown; delivery?: unknown; expectedParticipantTurnId?: unknown } }>(
+		"/api/rooms/:id/sessions/:sid/messages",
+		async (req, reply) => {
+			if (!roomRuntime) return reply.code(503).send({ error: "room session stores are not configured" });
+			const key = req.headers["idempotency-key"];
+			if (typeof key !== "string" || !key) return reply.code(428).send({ error: "发送房间消息需要 Idempotency-Key", code: "message_operation_required" });
+			if (!req.body || typeof req.body.content !== "string" || !req.body.content.trim()) return reply.code(400).send({ error: "消息正文不能为空", code: "invalid_message" });
+			const mentions = req.body.mentions ?? [];
+			if (!Array.isArray(mentions) || mentions.some((item) => typeof item !== "string")) return reply.code(400).send({ error: "mentions 必须是字符串数组", code: "invalid_mentions" });
+			const delivery = req.body.delivery ?? "normal";
+			if (delivery !== "normal" && delivery !== "followUp") return reply.code(400).send({ error: "delivery 必须是 normal/followUp", code: "invalid_delivery" });
+			const expectedParticipantTurnId = req.body.expectedParticipantTurnId;
+			if (expectedParticipantTurnId !== undefined && typeof expectedParticipantTurnId !== "string") return reply.code(400).send({ error: "expectedParticipantTurnId 必须是字符串", code: "invalid_delivery" });
+			const context = await teams.contextForRoomSession(req.params.sid);
+			if (!context || context.window.id !== req.params.id) return reply.code(404).send({ error: "room session not found", code: "room_session_not_found" });
+			try {
+				const result = await roomRuntime.router.send({
+					roomSessionId: req.params.sid,
+					content: req.body.content,
+					mentions: mentions as string[],
+					operationId: key,
+					delivery,
+					...(expectedParticipantTurnId ? { expectedParticipantTurnId } : {}),
+				});
+				return reply.code(202).send({
+					accepted: true,
+					roomEventId: result.roomEventId,
+					participantTurnId: result.turnId,
+					persistence: "durable",
+				});
+			} catch (error) {
+				if (error instanceof RoomMessageError) {
+					const status = error.code === "context_too_large" ? 422
+						: error.code === "invalid_message" || error.code === "invalid_mentions" || error.code === "invalid_delivery" ? 400
+						: 409;
+					return reply.code(status).send({ error: error.message, code: error.code });
+				}
+				throw error;
+			}
+		},
+	);
 
 	/** 最小 RoomSession 时间线：公共事件 + Turn 状态，不含私有执行记录。 */
 	app.get<{ Params: { id: string; sid: string } }>("/api/rooms/:id/sessions/:sid/timeline", async (req, reply) => {

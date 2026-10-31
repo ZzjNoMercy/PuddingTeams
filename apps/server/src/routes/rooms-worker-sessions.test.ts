@@ -45,6 +45,7 @@ async function makeStack() {
 		activityStatePath: path.join(dir, "state", "room-activity.json"),
 		sessionCreationStatePath: path.join(dir, "state", "session-creation-operations.json"),
 		roomSessionsStatePath: path.join(dir, "state", "room-sessions"),
+		roomRunner: { run: async () => ({ status: "completed" as const, finalContent: "房间结论" }) },
 	});
 	return { app, teams, sessions, delegations, invoker, dir, workerSessionDir };
 }
@@ -298,5 +299,51 @@ test("v4 HTTP: 最小 timeline 返回公共事件、Turn 与 Manager Participant
 		assert.equal(snapshot.participants.length, 1);
 		assert.equal(snapshot.participants[0].role, "manager");
 		assert.equal(snapshot.lastEventSeq, 0);
+	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("v4 HTTP: 房间公开消息准入、幂等与 final 投影", async () => {
+	const { app, teams, sessions, dir } = await makeStack();
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		const room = created.json().room as RoomSummary;
+		const roomSessionId = room.roomSessionIds![0]!;
+		const missingKey = await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/messages`, payload: { content: "x" } });
+		assert.equal(missingKey.statusCode, 428);
+
+		const key = randomUUID();
+		const first = await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/messages`,
+			headers: { "idempotency-key": key },
+			payload: { content: "请检查", mentions: ["alpha"] },
+		});
+		assert.equal(first.statusCode, 202, first.body);
+		const accepted = first.json() as { roomEventId: string; participantTurnId: string };
+		assert.ok(accepted.roomEventId);
+		assert.ok(accepted.participantTurnId);
+
+		let events: Array<{ kind: string; content: string }> = [];
+		for (let attempt = 0; attempt < 50; attempt += 1) {
+			const timeline = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` });
+			events = timeline.json().events;
+			if (events.length >= 2) break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.equal(events.length, 2, JSON.stringify(events));
+		assert.equal(events[0]!.kind, "message");
+		assert.equal(events[1]!.kind, "message");
+		assert.equal(events[1]!.content, "房间结论");
+
+		const replay = await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/messages`,
+			headers: { "idempotency-key": key },
+			payload: { content: "请检查", mentions: ["alpha"] },
+		});
+		assert.equal(replay.statusCode, 202, replay.body);
+		assert.equal(replay.json().roomEventId, accepted.roomEventId);
+		assert.equal(replay.json().participantTurnId, accepted.participantTurnId);
+		const timeline = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` });
+		assert.equal(timeline.json().events.length, 2);
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });
