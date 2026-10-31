@@ -281,3 +281,22 @@ test("v4 HTTP: group 建房写入 RoomSession 创建账本与空公共事件文�
 		assert.equal((await teams.roomSession(roomSessionId))?.roomId, room.id);
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("v4 HTTP: 最小 timeline 返回公共事件、Turn 与 Manager Participant", async () => {
+	const { app, teams, sessions, dir } = await makeStack();
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		const room = created.json().room as RoomSummary;
+		const roomSessionId = room.roomSessionIds![0]!;
+		const timeline = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` });
+		assert.equal(timeline.statusCode, 200, timeline.body);
+		const snapshot = timeline.json();
+		assert.deepEqual(snapshot.events, []);
+		assert.deepEqual(snapshot.turns, []);
+		assert.equal(snapshot.managerParticipantSessionId, await teams.managerSession(room.id));
+		assert.equal(snapshot.participants.length, 1);
+		assert.equal(snapshot.participants[0].role, "manager");
+		assert.equal(snapshot.lastEventSeq, 0);
+	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});

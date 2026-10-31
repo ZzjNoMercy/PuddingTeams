@@ -17,8 +17,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { localViewerIdentity } from "./identity.js";
 import { identifyUploads, type FirstMessagePathReference, type UploadInput, type UploadStore } from "../store/uploads.js";
 import { internalFirstWorkFreezeToken, isWithin, localPathReferences } from "./chat.js";
-import { RoomEventStore } from "../rooms/room-event-store.js";
+import { RoomEventStore, type RoomEvent } from "../rooms/room-event-store.js";
 import { RoomOperationStore } from "../rooms/room-operation-store.js";
+import { ParticipantTurnStore } from "../rooms/participant-turn-store.js";
 
 class FirstWorkMessageConflictError extends Error {
 	constructor() {
@@ -212,6 +213,7 @@ export function registerRoomsRoutes(
 		? new SessionCreationOperations(localFiles.sessionCreationStatePath) : null;
 	const roomEvents = localFiles?.roomSessionsStatePath ? new RoomEventStore(localFiles.roomSessionsStatePath) : undefined;
 	const roomOperations = localFiles?.roomSessionsStatePath ? new RoomOperationStore(localFiles.roomSessionsStatePath) : undefined;
+	const roomTurns = localFiles?.roomSessionsStatePath ? new ParticipantTurnStore(localFiles.roomSessionsStatePath) : undefined;
 	const summarize = (w: WindowConfig) => buildWindowSummary(sessions, teams, w, activityProjector);
 	const pendingSessionCreations = new Map<string, Promise<Awaited<ReturnType<PiSessionStore["create"]>>>>();
 	const pendingNewWork = new Map<string, Promise<{ sessionId: string; accepted: boolean }>>();
@@ -787,7 +789,42 @@ export function registerRoomsRoutes(
 		const w = await teams.getWindow(req.params.id);
 		if (!w) return reply.code(404).send({ error: "window not found" });
 		const summary = await summarize(w);
-		return { sessions: summary.sessions, active: summary.activeSession };
+		return {
+			sessions: summary.sessions,
+			active: summary.activeSession,
+			...(w.type === "group" ? { roomSessionIds: summary.roomSessionIds, activeRoomSessionId: summary.activeRoomSessionId } : {}),
+		};
+	});
+
+	/** 最小 RoomSession 时间线：公共事件 + Turn 状态，不含私有执行记录。 */
+	app.get<{ Params: { id: string; sid: string } }>("/api/rooms/:id/sessions/:sid/timeline", async (req, reply) => {
+		if (!roomEvents || !roomTurns) return reply.code(503).send({ error: "room session stores are not configured" });
+		const context = await teams.contextForRoomSession(req.params.sid);
+		if (!context || context.window.id !== req.params.id) return reply.code(404).send({ error: "room session not found" });
+		let events: RoomEvent[];
+		try { events = await roomEvents.read(req.params.sid); }
+		catch (error) {
+			if (error instanceof Error && error.name === "RoomSessionNotFoundError") events = [];
+			else return reply.code(503).send({ error: error instanceof Error ? error.message : String(error), code: "room_recovery_required" });
+		}
+		const turns = await roomTurns.list(req.params.sid);
+		const activeTurn = turns.find((turn) => ["admitted", "running", "waiting_input", "reconciling", "unknown"].includes(turn.status));
+		const participants = await teams.participantSessionsForRoom(req.params.sid);
+		return {
+			roomId: req.params.id,
+			roomSessionId: req.params.sid,
+			events,
+			turns,
+			...(activeTurn ? { activeTurn } : {}),
+			participants: participants.map((participant) => ({
+				agentId: participant.agentId,
+				agentSessionId: participant.agentSessionId,
+				role: participant.role,
+				state: participant.state,
+			})),
+			managerParticipantSessionId: (await teams.managerSessionForRoom(req.params.sid)) ?? null,
+			lastEventSeq: events.at(-1)?.seq ?? 0,
+		};
 	});
 
 	/** Resolve a Manager deep link without treating a parked Session as active. */
@@ -913,12 +950,37 @@ export function registerRoomsRoutes(
 		}
 		let createdId: string | undefined;
 		let createdRoomSessionId: string | undefined;
+		let pendingRoomSessionId: string | undefined;
+		let roomLedgerKey: string | undefined;
 		try {
-			const created = await sessions.create(undefined, await contextFor(w), undefined, ownerOptionsFor(w.type, w.members));
-			createdId = created.id;
-			const roomSessionId = w.type === "group" ? await teams.addRoomSession(req.params.id, created.id) : undefined;
-			createdRoomSessionId = roomSessionId;
-			if (w.type !== "group") await teams.addWindowSession(req.params.id, created.id);
+			const ctx = await contextFor(w);
+			let created: Awaited<ReturnType<PiSessionStore["create"]>>;
+			if (w.type === "group" && roomOperations && roomEvents) {
+				const managerSessionId = randomUUID();
+				pendingRoomSessionId = randomUUID();
+				createdRoomSessionId = pendingRoomSessionId;
+				roomLedgerKey = randomUUID();
+				const requestHash = createHash("sha256").update(JSON.stringify({
+					roomId: req.params.id, goal: requestedGoal ?? null, boundary: requestedBoundary ?? null,
+				})).digest("hex");
+				await roomOperations.reserveCreation(pendingRoomSessionId, {
+					key: roomLedgerKey, requestHash, managerAgentSessionId: managerSessionId,
+				});
+				await roomEvents.create(pendingRoomSessionId);
+				await roomOperations.advanceCreation(pendingRoomSessionId, roomLedgerKey, "event_file_created");
+				created = await sessions.create(undefined, ctx, managerSessionId, ownerOptionsFor(w.type, w.members));
+				createdId = created.id;
+				await roomOperations.advanceCreation(pendingRoomSessionId, roomLedgerKey, "manager_created");
+				await teams.addRoomSession(req.params.id, created.id, { roomSessionId: pendingRoomSessionId });
+				await roomOperations.advanceCreation(pendingRoomSessionId, roomLedgerKey, "manager_bound");
+				await roomOperations.advanceCreation(pendingRoomSessionId, roomLedgerKey, "attached");
+			} else {
+				created = await sessions.create(undefined, ctx, undefined, ownerOptionsFor(w.type, w.members));
+				createdId = created.id;
+				const roomSessionId = w.type === "group" ? await teams.addRoomSession(req.params.id, created.id) : undefined;
+				createdRoomSessionId = roomSessionId;
+				if (w.type !== "group") await teams.addWindowSession(req.params.id, created.id);
+			}
 			const goal = requestedGoal;
 			const completionBoundary = requestedBoundary;
 			const workState = goal && completionBoundary && workStates
@@ -933,13 +995,14 @@ export function registerRoomsRoutes(
 						operationId: goalOperationId,
 					})
 				: null;
-			return { session: created, workState, ...(roomSessionId ? { roomSessionId } : {}) };
+			return { session: created, workState, ...(createdRoomSessionId ? { roomSessionId: createdRoomSessionId } : {}) };
 		} catch (err) {
 			if (createdRoomSessionId) await teams.removeRoomSession(req.params.id, createdRoomSessionId).catch(() => undefined);
 			if (createdId) {
 				if (w.type !== "group") await teams.removeWindowSession(req.params.id, createdId).catch(() => undefined);
 				await sessions.remove(createdId).catch(() => undefined);
 			}
+			if (!createdId && pendingRoomSessionId && roomEvents) await roomEvents.remove(pendingRoomSessionId).catch(() => undefined);
 			if (err instanceof WorkStateOperationConflictError) return reply.code(409).send({ error: err.message, code: err.code });
 			return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
 		}

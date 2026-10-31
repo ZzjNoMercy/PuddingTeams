@@ -183,6 +183,10 @@ export class RoomOperationStore {
 		if (this.uncertain.has(roomSessionId)) throw new RoomOperationPersistenceUncertainError(roomSessionId, "operations.json 持久化结果不确定；需重启对账");
 	}
 
+	async listCreation(roomSessionId: string): Promise<RoomCreationOperation[]> {
+		return this.runExclusive(roomSessionId, async () => Object.values((await this.readUnlocked(roomSessionId)).creation));
+	}
+
 	async getCreation(roomSessionId: string, key: string): Promise<RoomCreationOperation | undefined> {
 		return this.runExclusive(roomSessionId, async () => (await this.readUnlocked(roomSessionId)).creation[key]);
 	}

@@ -2291,7 +2291,7 @@ export class TeamsStore {
 	}
 
 	/** 为 group 追加一个 RoomSession，并登记其唯一 Manager ParticipantSession。 */
-	async addRoomSession(windowId: string, managerAgentSessionId: string, opts: { sourceSnapshotId?: string } = {}): Promise<string> {
+	async addRoomSession(windowId: string, managerAgentSessionId: string, opts: { sourceSnapshotId?: string; roomSessionId?: string } = {}): Promise<string> {
 		return this.serialize(async () => {
 			const data = await this.loadWindowsFile();
 			const window = data.windows[windowId];
@@ -2308,7 +2308,8 @@ export class TeamsStore {
 			const existingRef = data.sessionRefs[managerAgentSessionId];
 			if (existingRef && existingRef.ownerAgentId !== MANAGER_AGENT_NAME) throw new Error("manager session owner mismatch");
 			const now = new Date().toISOString();
-			const roomSessionId = randomUUID();
+			const roomSessionId = opts.roomSessionId ?? randomUUID();
+			if (data.roomSessions[roomSessionId]) throw new Error(`RoomSession already exists: ${roomSessionId}`);
 			window.roomSessionIds = [roomSessionId, ...(window.roomSessionIds ?? [])];
 			window.activeRoomSessionId = roomSessionId;
 			data.roomSessions[roomSessionId] = {

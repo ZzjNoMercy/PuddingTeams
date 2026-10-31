@@ -37,6 +37,9 @@ import { registerToolPreviewRoutes } from "./routes/tool-preview.js";
 import { registerResourcesRoutes } from "./routes/resources.js";
 import { registerChatNavigationRoutes } from "./routes/chat-navigation.js";
 import { registerRoomsRoutes } from "./routes/rooms.js";
+import { RoomEventStore } from "./rooms/room-event-store.js";
+import { RoomCreationReconciler } from "./rooms/room-creation-reconciler.js";
+import { RoomOperationStore } from "./rooms/room-operation-store.js";
 import { registerInteractionsRoutes } from "./routes/interactions.js";
 import { isWorkspaceOwnerClosed } from "./agent-runtime/workspace-owner-lifecycle.js";
 import { AgentRuntime } from "./agent-runtime/runtime.js";
@@ -493,6 +496,19 @@ if (recoveredMcpAgents.length > 0) app.log.warn({ agents: recoveredMcpAgents }, 
 const recoveredRoomCreations = await teams.reconcileRoomCreations((id) => store.remove(id));
 if (recoveredRoomCreations.kept || recoveredRoomCreations.removed) {
 	app.log.info(recoveredRoomCreations, "reconciled pending room Session creations before opening routes");
+}
+const roomSessionsStateRoot = path.join(paths.state, "room-sessions");
+const roomCreationReconcile = await new RoomCreationReconciler({
+	root: roomSessionsStateRoot,
+	events: new RoomEventStore(roomSessionsStateRoot),
+	operations: new RoomOperationStore(roomSessionsStateRoot),
+	teams,
+	sessionExists: async (agentSessionId) => (await store.list()).some((item) => item.id === agentSessionId),
+	removeSession: (agentSessionId) => store.remove(agentSessionId),
+	log: (message) => app.log.warn(message),
+}).reconcile();
+if (roomCreationReconcile.kept || roomCreationReconcile.removed || roomCreationReconcile.recoveryRequired.length) {
+	app.log.info(roomCreationReconcile, "reconciled RoomSession creation ledger before opening routes");
 }
 invoker.setManagerSender((managerSessionId, message, options) =>
 	store.sendCustomMessage(managerSessionId, message, options),
