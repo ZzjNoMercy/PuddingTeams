@@ -1266,6 +1266,41 @@ export function registerRoomsRoutes(
 		},
 	);
 
+	/** 显式把某个 Delegation 的执行过程分享为公共 artifact 事件。 */
+	app.post<{ Params: { id: string; sid: string }; Body: { delegationId?: unknown; name?: unknown } }>(
+		"/api/rooms/:id/sessions/:sid/process-share",
+		async (req, reply) => {
+			if (!roomEvents) return reply.code(503).send({ error: "room session stores are not configured" });
+			const context = await teams.contextForRoomSession(req.params.sid);
+			if (!context || context.window.id !== req.params.id) return reply.code(404).send({ error: "room session not found", code: "room_session_not_found" });
+			const delegationId = typeof req.body?.delegationId === "string" ? req.body.delegationId.trim() : "";
+			if (!delegationId) return reply.code(400).send({ error: "delegationId 不能为空", code: "invalid_delegation" });
+			const participants = (await teams.participantSessionsForRoom(req.params.sid)).filter((participant) => participant.state === "active");
+			let owned = false;
+			if (invoker) {
+				for (const participant of participants) {
+					const delegations = await invoker.delegationsForManagerSession(participant.agentSessionId);
+					if (delegations.some((item) => item.id === delegationId)) { owned = true; break; }
+				}
+			}
+			if (!owned) return reply.code(404).send({ error: "Delegation 不属于该 RoomSession", code: "delegation_not_found" });
+			const name = typeof req.body?.name === "string" && req.body.name.trim() ? req.body.name.trim() : "执行过程";
+			try {
+				const event = await roomEvents.append(req.params.sid, {
+					id: randomUUID(), kind: "artifact", actor: { kind: "system" },
+					content: `分享了执行过程：${name}`, mentions: [],
+					artifactRefs: [{ name, path: delegationId, kind: "delegation" }],
+					createdAt: new Date().toISOString(),
+				});
+				await roomActivity?.record(req.params.sid, { eventId: event.id, at: event.createdAt, preview: event.content }).catch(() => undefined);
+				roomRuntime?.bus.publish(req.params.sid, { type: "room_event", event });
+				return reply.code(201).send({ event });
+			} catch (error) {
+				return reply.code(503).send({ error: error instanceof Error ? error.message : String(error), code: "room_recovery_required" });
+			}
+		},
+	);
+
 	/** 公共摘要：只基于 RoomEvent/PublicTurn 生成，可安全分享。 */
 	app.get<{ Params: { id: string; sid: string } }>("/api/rooms/:id/sessions/:sid/summary", async (req, reply) => {
 		if (!roomEvents) return reply.code(503).send({ error: "room session stores are not configured" });

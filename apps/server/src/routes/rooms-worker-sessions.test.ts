@@ -887,3 +887,28 @@ test("v4 HTTP: 公共摘要只含 RoomEvent 事实", async () => {
 		assert.equal(summary.json().lastEventSeq, 2);
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("v4 HTTP: 显式过程分享只接受本房间 Delegation", async () => {
+	const { app, teams, sessions, invoker, dir } = await makeStack();
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		const room = created.json().room as RoomSummary;
+		const roomSessionId = room.roomSessionIds![0]!;
+		const manager = (await teams.managerSession(room.id))!;
+		(invoker as unknown as { delegationsForManagerSession: (id: string) => Promise<Array<{ id: string }>> }).delegationsForManagerSession = async (id) => id === manager ? [{ id: "delegation-room-1" }] : [];
+		const shared = await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/process-share`,
+			payload: { delegationId: "delegation-room-1", name: "查询过程" },
+		});
+		assert.equal(shared.statusCode, 201, shared.body);
+		assert.equal(shared.json().event.kind, "artifact");
+		assert.equal(shared.json().event.artifactRefs[0].path, "delegation-room-1");
+		const unknown = await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/process-share`,
+			payload: { delegationId: "delegation-other" },
+		});
+		assert.equal(unknown.statusCode, 404, unknown.body);
+		assert.equal(unknown.json().code, "delegation_not_found");
+	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});
