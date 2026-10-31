@@ -739,6 +739,17 @@ test("v4 HTTP: RoomSession Goal 归属 Manager PS，幂等且公开房间身份"
 		const room = created.json().room as RoomSummary;
 		const roomSessionId = room.roomSessionIds![0]!;
 		const manager = (await teams.managerSession(room.id))!;
+		await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/messages`,
+			headers: { "idempotency-key": randomUUID() }, payload: { content: "Goal 来源消息", mentions: ["alpha"] },
+		});
+		for (let attempt = 0; attempt < 50; attempt += 1) {
+			const timeline = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` });
+			if (timeline.json().events.length >= 2) break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		const timeline = (await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` })).json();
+		const sourceEventId = timeline.events.find((event: { actor: { kind: string } }) => event.actor.kind === "user").id;
 		const empty = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/goal` });
 		assert.equal(empty.statusCode, 200, empty.body);
 		assert.equal(empty.json().goal, null);
@@ -754,6 +765,7 @@ test("v4 HTTP: RoomSession Goal 归属 Manager PS，幂等且公开房间身份"
 		const goalId = createdGoal.json().goal.goalId as string;
 		assert.equal(createdGoal.json().roomSessionId, roomSessionId);
 		assert.deepEqual(createdGoal.json().goal.participantAgentIds, ["alpha", "beta"]);
+		assert.deepEqual(createdGoal.json().goal.contractProvenance.sourceMessageIds, [sourceEventId]);
 		const replay = await app.inject({
 			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/goal`,
 			headers: { "idempotency-key": key }, payload: { goal: "完成登录", completionBoundary: "测试通过" },

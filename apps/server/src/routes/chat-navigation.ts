@@ -3,8 +3,9 @@ import { agentDisplayName, type TeamsStore } from "../store/teams.js";
 import type { PiSessionStore } from "../pi-bridge/session-store.js";
 import { ChatNavigationStore } from "../store/chat-navigation.js";
 import type { RoomActivityStore } from "../rooms/room-activity-store.js";
+import type { RoomEventStore } from "../rooms/room-event-store.js";
 
-export function registerChatNavigationRoutes(app: FastifyInstance, deps: { teams: TeamsStore; sessions: Pick<PiSessionStore, "list">; statePath: string; roomActivity?: RoomActivityStore }): void {
+export function registerChatNavigationRoutes(app: FastifyInstance, deps: { teams: TeamsStore; sessions: Pick<PiSessionStore, "list">; statePath: string; roomActivity?: RoomActivityStore; roomEvents?: RoomEventStore }): void {
  const metadata = new ChatNavigationStore(deps.statePath);
  app.get("/api/chat-navigation", async () => {
   const [windows, listed, workspaces, agents, state] = await Promise.all([deps.teams.listWindows(), deps.sessions.list(), deps.teams.workspaces.list(), deps.teams.listAgents(), metadata.read()]);
@@ -19,6 +20,14 @@ export function registerChatNavigationRoutes(app: FastifyInstance, deps: { teams
      if (!roomSession) continue;
      const managerSessionId = await deps.teams.managerSessionForRoom(roomSessionId);
      const managerInfo = managerSessionId ? byId.get(managerSessionId) : undefined;
+     let firstRoomMessage = managerInfo?.firstMessage ?? "";
+     if (deps.roomEvents) {
+      try {
+       const events = await deps.roomEvents.read(roomSessionId);
+       const firstUser = events.find((event) => event.kind === "message" && event.actor.kind === "user" && event.content.trim());
+       if (firstUser) firstRoomMessage = firstUser.content.slice(0, 200);
+      } catch { /* 保持 Manager 摘要兜底 */ }
+     }
      const flags = Object.hasOwn(state.sessions, roomSessionId) ? state.sessions[roomSessionId] : undefined;
      const activity = activities.get(roomSessionId);
      const workspace = room.workspaceId ? projects.get(room.workspaceId) : undefined;
@@ -26,7 +35,7 @@ export function registerChatNavigationRoutes(app: FastifyInstance, deps: { teams
       roomId: room.id, sessionId: roomSessionId, ownerAgentId: "manager", agentName: "Manager", agentEnabled: true,
       roomType: "group", roomName: room.name ?? "",
       title: roomSession.customName ?? roomSession.generatedName ?? "新对话",
-      firstMessage: managerInfo?.firstMessage ?? "", modifiedAt: activity?.entry?.lastActivityAt ?? managerInfo?.modifiedAt ?? roomSession.createdAt,
+      firstMessage: firstRoomMessage, modifiedAt: activity?.entry?.lastActivityAt ?? managerInfo?.modifiedAt ?? roomSession.createdAt,
       workspaceId: room.workspaceId ?? null, workspaceName: workspace?.name ?? (room.workspaceId ? "已移除项目" : "默认工作目录"),
       cwdSnapshot: room.cwdSnapshot, contextActive: true,
       sourceSnapshotId: roomSession.sourceSnapshotId, pinned: flags?.pinned ?? false, archived: flags?.archived ?? false,

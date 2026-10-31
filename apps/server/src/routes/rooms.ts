@@ -1223,6 +1223,14 @@ export function registerRoomsRoutes(
 			if (!manager) return reply.code(409).send({ error: "RoomSession 缺少 Manager binding", code: "participant_binding_required" });
 			const reviewMode = req.body?.reviewMode === "manager" || req.body?.reviewMode === "independent" ? req.body.reviewMode : undefined;
 			const reviewerModel = typeof req.body?.reviewerModel === "string" ? req.body.reviewerModel : undefined;
+			let sourceMessageIds: string[] = [];
+			if (roomEvents) {
+				try {
+					const events = await roomEvents.read(req.params.sid);
+					const latestUser = events.filter((event) => event.kind === "message" && event.actor.kind === "user").at(-1);
+					if (latestUser) sourceMessageIds = [latestUser.id];
+				} catch { /* Goal 仍可创建，来源留空 */ }
+			}
 			try {
 				const created = await workStates.create({
 					sessionId: manager,
@@ -1231,7 +1239,7 @@ export function registerRoomsRoutes(
 					...(reviewMode ? { reviewMode } : {}),
 					...(reviewerModel ? { reviewerModel } : {}),
 					participantAgentIds: context.window.members,
-					contractProvenance: { criteriaOrigin: "user_input", sourceMessageIds: [] },
+					contractProvenance: { criteriaOrigin: "user_input", sourceMessageIds },
 					operationId: key,
 				});
 				return reply.code(201).send({ roomSessionId: req.params.sid, managerParticipantSessionId: manager, goal: created });

@@ -8,6 +8,7 @@ import { TeamsStore } from "../store/teams.js";
 import { ChatNavigationStore } from "../store/chat-navigation.js";
 import { registerChatNavigationRoutes } from "./chat-navigation.js";
 import { RoomActivityStore } from "../rooms/room-activity-store.js";
+import { RoomEventStore } from "../rooms/room-event-store.js";
 
 test("navigation metadata survives restart, serializes updates and preserves corrupt state", async () => {
  const dir = await mkdtemp(path.join(os.tmpdir(), "pt-nav-state-"));
@@ -63,11 +64,15 @@ test("group navigation 用 roomSessionId 作为行身份，flags 按房间键持
   await teams.upsertAgent({name:"beta",description:"Worker",invoke:{type:"command",command:"echo",runArgs:[]}});
   const group = await teams.createWindow({type:"group",members:["alpha","beta"],sessionId:"manager-g"});
   const roomSessionId = group.activeRoomSessionId!;
-  registerChatNavigationRoutes(app,{teams,statePath:path.join(dir,"nav.json"),sessions:{list:async()=>[{id:"manager-g",sessionFile:"fixture",firstMessage:"hello",modifiedAt:"2026-10-15T01:00:00Z",name:"Manager",active:false}]}});
+  const roomEvents = new RoomEventStore(path.join(dir,"room-events"));
+  await roomEvents.create(roomSessionId);
+  await roomEvents.append(roomSessionId, { id:"event-nav-1", kind:"message", actor:{kind:"user"}, content:"房间里的第一句话", mentions:[], createdAt:"2026-10-31T00:00:00.000Z" });
+  registerChatNavigationRoutes(app,{teams,statePath:path.join(dir,"nav.json"),roomEvents,sessions:{list:async()=>[{id:"manager-g",sessionFile:"fixture",firstMessage:"hello",modifiedAt:"2026-10-15T01:00:00Z",name:"Manager",active:false}]}});
   const index=(await app.inject({url:"/api/chat-navigation"})).json();
   const item=index.items.find((i:{sessionId:string})=>i.sessionId===roomSessionId);
   assert.ok(item); assert.equal(item.roomType,"group"); assert.equal(item.managerParticipantSessionId,"manager-g");
   assert.equal(item.workspaceName,"默认工作目录");
+  assert.equal(item.firstMessage,"房间里的第一句话");
   assert.equal((await app.inject({method:"PATCH",url:`/api/chat-navigation/${group.id}/${roomSessionId}`,payload:{pinned:true}})).statusCode,200);
   assert.equal((await new ChatNavigationStore(path.join(dir,"nav.json")).read()).sessions[roomSessionId]?.pinned,true);
   assert.equal((await app.inject({method:"PATCH",url:`/api/chat-navigation/other/${roomSessionId}`,payload:{pinned:true}})).statusCode,404);
