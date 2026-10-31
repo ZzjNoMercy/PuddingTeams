@@ -1180,6 +1180,53 @@ export function registerRoomsRoutes(
 		},
 	);
 
+	/** RoomSession 的 Goal 归属在 Manager Participant Session 上，公开响应带房间身份。 */
+	app.get<{ Params: { id: string; sid: string } }>("/api/rooms/:id/sessions/:sid/goal", async (req, reply) => {
+		const context = await teams.contextForRoomSession(req.params.sid);
+		if (!context || context.window.id !== req.params.id) return reply.code(404).send({ error: "room session not found", code: "room_session_not_found" });
+		if (!workStates) return reply.code(503).send({ error: "work state store is not configured" });
+		const manager = await teams.managerSessionForRoom(req.params.sid);
+		if (!manager) return reply.code(409).send({ error: "RoomSession 缺少 Manager binding", code: "participant_binding_required" });
+		const goal = await workStates.get(manager);
+		return { roomSessionId: req.params.sid, managerParticipantSessionId: manager, goal: goal ?? null };
+	});
+
+	app.post<{ Params: { id: string; sid: string }; Body: { goal?: unknown; completionBoundary?: unknown; reviewMode?: unknown; reviewerModel?: unknown } }>(
+		"/api/rooms/:id/sessions/:sid/goal",
+		async (req, reply) => {
+			const context = await teams.contextForRoomSession(req.params.sid);
+			if (!context || context.window.id !== req.params.id) return reply.code(404).send({ error: "room session not found", code: "room_session_not_found" });
+			if (!workStates) return reply.code(503).send({ error: "work state store is not configured" });
+			const key = req.headers["idempotency-key"];
+			if (typeof key !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(key)) {
+				return reply.code(428).send({ error: "创建房间 Goal 需要 Idempotency-Key", code: "goal_operation_required" });
+			}
+			const goal = typeof req.body?.goal === "string" ? req.body.goal.trim() : "";
+			const completionBoundary = typeof req.body?.completionBoundary === "string" ? req.body.completionBoundary.trim() : "";
+			if (!goal || !completionBoundary) return reply.code(400).send({ error: "goal 与 completionBoundary 不能为空", code: "invalid_goal" });
+			const manager = await teams.managerSessionForRoom(req.params.sid);
+			if (!manager) return reply.code(409).send({ error: "RoomSession 缺少 Manager binding", code: "participant_binding_required" });
+			const reviewMode = req.body?.reviewMode === "manager" || req.body?.reviewMode === "independent" ? req.body.reviewMode : undefined;
+			const reviewerModel = typeof req.body?.reviewerModel === "string" ? req.body.reviewerModel : undefined;
+			try {
+				const created = await workStates.create({
+					sessionId: manager,
+					goal,
+					completionBoundary,
+					...(reviewMode ? { reviewMode } : {}),
+					...(reviewerModel ? { reviewerModel } : {}),
+					participantAgentIds: context.window.members,
+					contractProvenance: { criteriaOrigin: "user_input", sourceMessageIds: [] },
+					operationId: key,
+				});
+				return reply.code(201).send({ roomSessionId: req.params.sid, managerParticipantSessionId: manager, goal: created });
+			} catch (error) {
+				if (error instanceof WorkStateOperationConflictError) return reply.code(409).send({ error: error.message, code: error.code });
+				return reply.code(409).send({ error: error instanceof Error ? error.message : String(error), code: "goal_conflict" });
+			}
+		},
+	);
+
 	/** 房间公开事件搜索（当前为线性扫描；后续可换索引）。 */
 	app.get<{ Params: { id: string; sid: string }; Querystring: { q?: string; limit?: string } }>(
 		"/api/rooms/:id/sessions/:sid/search",

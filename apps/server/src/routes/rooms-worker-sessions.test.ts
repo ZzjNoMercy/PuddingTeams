@@ -15,6 +15,7 @@ import { AgentRuntime } from "../agent-runtime/runtime.js";
 import { AgentInvoker } from "../agent-runtime/invoker.js";
 import { PiSessionStore } from "../pi-bridge/session-store.js";
 import { UploadStore } from "../store/uploads.js";
+import { WorkStateStore } from "../store/work-state.js";
 import { registerRoomsRoutes, type RoomSummary } from "./rooms.js";
 import { registerChatRoutes } from "./chat.js";
 
@@ -40,11 +41,13 @@ async function makeStack(roomRunner?: { run: (input: { markInputDurable(): Promi
 	const workerSessionDir = path.join(dir, "worker-sessions");
 	const uploads = new UploadStore(path.join(dir, "uploads"));
 	await uploads.init();
+	const workStates = new WorkStateStore(path.join(dir, "work-states"));
+	await workStates.init();
 	const app = Fastify({ logger: false });
 	await app.register(websocket);
 	await registerChatRoutes(app, sessions, teams, undefined, undefined, invoker, undefined, undefined, undefined, undefined,
 		{ delegations });
-	registerRoomsRoutes(app, sessions, teams, invoker, undefined, {
+	registerRoomsRoutes(app, sessions, teams, invoker, workStates, {
 		attachmentRoot: path.join(dir, "uploads"),
 		uploads,
 		activityStatePath: path.join(dir, "state", "room-activity.json"),
@@ -54,7 +57,7 @@ async function makeStack(roomRunner?: { run: (input: { markInputDurable(): Promi
 		roomForkStatePath: path.join(dir, "state", "room-fork-operations.json"),
 		roomRunner: roomRunner ?? { run: async (input) => { await input.markInputDurable(); return { status: "completed" as const, finalContent: "房间结论" }; } },
 	});
-	return { app, teams, sessions, delegations, invoker, dir, workerSessionDir };
+	return { app, teams, sessions, workStates, delegations, invoker, dir, workerSessionDir };
 }
 
 /** 造一个落盘的 worker 执行 session（user + assistant），返回 sessionHandle。 */
@@ -717,5 +720,45 @@ test("v4 HTTP: Fork 幂等键重放同一目标，fork-targets 列截断点", as
 		const gone = await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions/${sourceId}/fork`, headers: { "idempotency-key": key }, payload: {} });
 		assert.equal(gone.statusCode, 409, gone.body);
 		assert.equal(gone.json().code, "fork_target_gone");
+	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("v4 HTTP: RoomSession Goal 归属 Manager PS，幂等且公开房间身份", async () => {
+	const { app, teams, sessions, workStates, dir } = await makeStack();
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		const room = created.json().room as RoomSummary;
+		const roomSessionId = room.roomSessionIds![0]!;
+		const manager = (await teams.managerSession(room.id))!;
+		const empty = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/goal` });
+		assert.equal(empty.statusCode, 200, empty.body);
+		assert.equal(empty.json().goal, null);
+		assert.equal(empty.json().managerParticipantSessionId, manager);
+		const missingKey = await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/goal`, payload: { goal: "完成登录", completionBoundary: "测试通过" } });
+		assert.equal(missingKey.statusCode, 428);
+		const key = randomUUID();
+		const createdGoal = await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/goal`,
+			headers: { "idempotency-key": key }, payload: { goal: "完成登录", completionBoundary: "测试通过" },
+		});
+		assert.equal(createdGoal.statusCode, 201, createdGoal.body);
+		const goalId = createdGoal.json().goal.goalId as string;
+		assert.equal(createdGoal.json().roomSessionId, roomSessionId);
+		assert.deepEqual(createdGoal.json().goal.participantAgentIds, ["alpha", "beta"]);
+		const replay = await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/goal`,
+			headers: { "idempotency-key": key }, payload: { goal: "完成登录", completionBoundary: "测试通过" },
+		});
+		assert.equal(replay.statusCode, 201, replay.body);
+		assert.equal(replay.json().goal.goalId, goalId);
+		const second = await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/goal`,
+			headers: { "idempotency-key": randomUUID() }, payload: { goal: "另一个", completionBoundary: "边界" },
+		});
+		assert.equal(second.statusCode, 409, second.body);
+		assert.equal((await workStates.get(manager))?.goalId, goalId);
+		const read = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/goal` });
+		assert.equal(read.json().goal.goalId, goalId);
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });

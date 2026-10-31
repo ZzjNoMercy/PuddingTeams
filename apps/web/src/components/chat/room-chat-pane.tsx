@@ -8,6 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import {
 	abortRoomTurn,
 	closeUnknownRoomTurn,
+	fetchRoomGoal,
 	fetchRoomTimeline,
 	forkRoomSession,
 	getRoom,
@@ -58,6 +59,7 @@ export function RoomChatPane({
 	const [roomSessionId, setRoomSessionId] = useState(resolveSessionId);
 
 	const [timeline, setTimeline] = useState<RoomTimelineSnapshot | null>(null);
+	const [goal, setGoal] = useState<{ goal: string; completionBoundary: string; status: string; goalId: string } | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const loading = timeline === null && error === null;
 	const [draft, setDraft] = useState("");
@@ -69,8 +71,9 @@ export function RoomChatPane({
 	const load = useCallback(async () => {
 		if (!roomSessionId) { setTimeline(null); return; }
 		try {
-			const next = await fetchRoomTimeline(room.id, roomSessionId);
+			const [next, currentGoal] = await Promise.all([fetchRoomTimeline(room.id, roomSessionId), fetchRoomGoal(room.id, roomSessionId)]);
 			setTimeline((current) => current ? { ...next, events: mergeEvents(current.events, next.events), lastEventSeq: Math.max(current.lastEventSeq, next.lastEventSeq) } : next);
+			setGoal(currentGoal);
 			setError(null);
 			void markRoomSessionRead(room.id, roomSessionId);
 		} catch (caught) {
@@ -246,6 +249,13 @@ export function RoomChatPane({
 						? <Button size="sm" variant="outline" onClick={() => void handleCloseUnknown()}>确认无运行</Button> : null}
 				</div>
 			</header>
+			{goal ? (
+				<div className="border-b border-border/70 bg-muted/30 px-5 py-2 text-xs">
+					<span className="font-medium">Goal</span> · {goal.goal}
+					<span className="ml-2 text-muted-foreground">验收：{goal.completionBoundary}</span>
+					<span className="ml-2 text-muted-foreground">{goal.status}</span>
+				</div>
+			) : null}
 			{recoveryRequired ? (
 				<div className="border-b border-amber-500/30 bg-amber-500/10 px-5 py-2 text-xs text-amber-700">
 					房间需要恢复：{timeline?.capabilities.recoveryReason ?? "请检查服务端日志"}
