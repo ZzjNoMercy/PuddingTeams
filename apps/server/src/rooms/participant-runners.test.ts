@@ -148,11 +148,11 @@ test("Pi/Direct runner 在真实发送边界调用 markInputDurable", async () =
 	const pi = new PiParticipantRunner({
 		sessions: {
 			open: async () => ({
-				messages: [
-					{ role: "user", content: "x" },
-					{ role: "assistant", content: "ok", stopReason: "stop", timestamp: Date.now() },
-				],
-				prompt: async () => undefined,
+				messages: [] as Array<{ role: string; content: string; stopReason?: string }>,
+				prompt: async function (this: { messages: Array<{ role: string; content: string; stopReason?: string }> }, text: string) {
+					this.messages.push({ role: "user", content: text });
+					this.messages.push({ role: "assistant", content: "ok", stopReason: "stop" });
+				},
 			}),
 		} as never,
 	});
@@ -185,4 +185,29 @@ test("PiParticipantRunner: SDK 拒绝 prompt 时不推进 durability", async () 
 	const result = await runner.run({ ...runnerInput, markInputDurable: async () => { durable += 1; } });
 	assert.equal(result.status, "failed");
 	assert.equal(durable, 0);
+});
+
+test("PiParticipantRunner: preflight 后必须等 user entry 落盘才 durable", async () => {
+	let entryPushed = false;
+	let durableSawEntry: boolean | undefined;
+	const messages: Array<{ role: string; content: string; stopReason?: string }> = [];
+	const runner = new PiParticipantRunner({
+		sessions: {
+			open: async () => ({
+				messages,
+				prompt: async (text: string, options?: { preflightResult?: (disposition: unknown) => void }) => {
+					options?.preflightResult?.("started");
+					await new Promise((resolve) => setTimeout(resolve, 20));
+					entryPushed = true;
+					messages.push({ role: "user", content: text });
+					messages.push({ role: "assistant", content: "完成", stopReason: "stop" });
+				},
+			}),
+		} as never,
+	});
+	await runner.run({
+		...runnerInput,
+		markInputDurable: async () => { durableSawEntry = entryPushed; },
+	});
+	assert.equal(durableSawEntry, true, "preflight 时 entry 尚未落盘，durable 必须后移");
 });

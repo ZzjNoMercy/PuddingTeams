@@ -243,8 +243,8 @@ test("RoomMessageRouter: 真实 Pi runner 走 SDK preflight 后 durable 并投�
 			open: async () => ({
 				messages,
 				prompt: async (text: string, options?: { preflightResult?: (disposition: unknown) => void }) => {
-					messages.push({ role: "user", content: text, timestamp: Date.now() });
 					options?.preflightResult?.("started");
+					messages.push({ role: "user", content: text, timestamp: Date.now() });
 					messages.push({ role: "assistant", content: "Pi 结论", stopReason: "stop", timestamp: Date.now() });
 				},
 			}),

@@ -7,7 +7,7 @@ import type { AgentInvoker } from "../agent-runtime/invoker.js";
 import { isWorkspaceDirectoryAvailable, type WorkspaceSummary } from "../store/workspaces.js";
 import { WorkStateOperationConflictError, type WorkStateStore } from "../store/work-state.js";
 import type { ProductSettingsStore } from "../store/product-settings.js";
-import { readFile, realpath, stat } from "node:fs/promises";
+import { readFile, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { openNativeFile } from "../platform/native-file-opener.js";
@@ -885,6 +885,7 @@ export function registerRoomsRoutes(
 				for (const roomSessionId of groupRoomIds) {
 					await roomEvents?.remove(roomSessionId).catch(() => undefined);
 					await roomActivity?.removeRoom(roomSessionId).catch(() => undefined);
+					if (localFiles?.attachmentRoot) await rm(path.join(localFiles.attachmentRoot, roomSessionId), { recursive: true, force: true }).catch(() => undefined);
 				}
 			};
 			if (invoker) {
@@ -1123,6 +1124,31 @@ export function registerRoomsRoutes(
 				return reply.code(400).send({ error: "throughEventSeq 必须是正整数", code: "invalid_cutoff" });
 			}
 			const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+			const operationKeyHeader = req.headers["idempotency-key"];
+			if (operationKeyHeader !== undefined && (typeof operationKeyHeader !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(operationKeyHeader))) {
+				return reply.code(400).send({ error: "Idempotency-Key 格式无效", code: "invalid_operation_key" });
+			}
+			const operationKey = typeof operationKeyHeader === "string" ? operationKeyHeader : undefined;
+			// 幂等重放必须先于 active/cutoff 重算：201 丢失后源房间可能已新增事件或
+			// 又有活动回合，但账本里的 target 仍然是正确答案。
+			if (operationKey && roomForks) {
+				const existing = await roomForks.get(operationKey);
+				if (existing) {
+					if (existing.sourceRoomSessionId !== req.params.sid
+						|| (throughSeq !== undefined && existing.throughEventSeq !== throughSeq)) {
+						return reply.code(409).send({ error: "同一 Fork 键已用于不同源/截断", code: "fork_operation_conflict" });
+					}
+					const existingRoom = await teams.roomSession(existing.targetRoomSessionId);
+					if (!existingRoom) return reply.code(409).send({ error: "Fork 目标已删除", code: "fork_target_gone" });
+					if (existing.phase !== "attached") {
+						if (!(await teams.participantSession(existing.managerAgentSessionId))) {
+							return reply.code(409).send({ error: "Fork 尚未完成；请稍后重试", code: "fork_in_progress" });
+						}
+						await roomForks.markAttached(operationKey);
+					}
+					return { roomSessionId: existing.targetRoomSessionId, managerAgentSessionId: existing.managerAgentSessionId, replayed: true };
+				}
+			}
 			const active = (await roomTurns?.list(req.params.sid) ?? []).find((turn) =>
 				["admitted", "running", "waiting_input", "reconciling", "unknown"].includes(turn.status));
 			if (active) return reply.code(409).send({ error: `房间回合进行中，不能 Fork：${active.id}`, code: "room_turn_active" });
@@ -1131,23 +1157,6 @@ export function registerRoomsRoutes(
 			catch (error) { return reply.code(503).send({ error: error instanceof Error ? error.message : String(error), code: "room_recovery_required" }); }
 			const cutoffSeq = throughSeq === undefined ? (sourceEvents.at(-1)?.seq ?? 0) : throughSeq as number;
 			if (cutoffSeq > (sourceEvents.at(-1)?.seq ?? 0)) return reply.code(400).send({ error: "throughEventSeq 超出房间末条事件", code: "invalid_cutoff" });
-			const operationKeyHeader = req.headers["idempotency-key"];
-			if (operationKeyHeader !== undefined && (typeof operationKeyHeader !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(operationKeyHeader))) {
-				return reply.code(400).send({ error: "Idempotency-Key 格式无效", code: "invalid_operation_key" });
-			}
-			const operationKey = typeof operationKeyHeader === "string" ? operationKeyHeader : undefined;
-			if (operationKey && roomForks) {
-				const existing = await roomForks.get(operationKey);
-				if (existing) {
-					if (existing.sourceRoomSessionId !== req.params.sid || existing.throughEventSeq !== cutoffSeq) {
-						return reply.code(409).send({ error: "同一 Fork 键已用于不同源/截断", code: "fork_operation_conflict" });
-					}
-					if (existing.phase !== "attached") return reply.code(409).send({ error: "Fork 尚未完成；请稍后重试", code: "fork_in_progress" });
-					const existingRoom = await teams.roomSession(existing.targetRoomSessionId);
-					if (!existingRoom) return reply.code(409).send({ error: "Fork 目标已删除", code: "fork_target_gone" });
-					return { roomSessionId: existing.targetRoomSessionId, managerAgentSessionId: existing.managerAgentSessionId, replayed: true };
-				}
-			}
 			const managerSessionId = randomUUID();
 			const roomSessionId = randomUUID();
 			let reservedFork = false;
@@ -1172,6 +1181,7 @@ export function registerRoomsRoutes(
 				// addRoomSession 可能已提交但后续 ledger 失败；无条件尝试按房间回滚。
 				await teams.removeRoomSession(req.params.id, roomSessionId).catch(() => undefined);
 				await roomEvents.remove(roomSessionId).catch(() => undefined);
+				if (localFiles?.attachmentRoot) await rm(path.join(localFiles.attachmentRoot, roomSessionId), { recursive: true, force: true }).catch(() => undefined);
 				if (createdSession) await sessions.remove(createdSession.id).catch(() => undefined);
 				const message = error instanceof Error ? error.message : String(error);
 				const status = /throughSeq|cutoff|seq/i.test(message) ? 400 : 409;
@@ -1204,6 +1214,9 @@ export function registerRoomsRoutes(
 			const goal = typeof req.body?.goal === "string" ? req.body.goal.trim() : "";
 			const completionBoundary = typeof req.body?.completionBoundary === "string" ? req.body.completionBoundary.trim() : "";
 			if (!goal || !completionBoundary) return reply.code(400).send({ error: "goal 与 completionBoundary 不能为空", code: "invalid_goal" });
+			if (localFiles?.productSettings && (await localFiles.productSettings.get()).harness.goalActivation.group === "disabled") {
+				return reply.code(403).send({ error: "Harness 已禁用 group Goal", code: "goal_disabled" });
+			}
 			const manager = await teams.managerSessionForRoom(req.params.sid);
 			if (!manager) return reply.code(409).send({ error: "RoomSession 缺少 Manager binding", code: "participant_binding_required" });
 			const reviewMode = req.body?.reviewMode === "manager" || req.body?.reviewMode === "independent" ? req.body.reviewMode : undefined;
@@ -1650,6 +1663,7 @@ export function registerRoomsRoutes(
 						await roomOperations?.removeRoom(room.roomSessionId).catch(() => undefined);
 					}
 					await roomActivity?.removeRoom(room.roomSessionId).catch(() => undefined);
+					if (localFiles?.attachmentRoot) await rm(path.join(localFiles.attachmentRoot, room.roomSessionId), { recursive: true, force: true });
 					return reply.code(204).send();
 				}
 				const located = await teams.contextForSession(req.params.sid);

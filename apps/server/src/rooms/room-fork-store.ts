@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 /** RoomSession Fork 的幂等账本：operationKey → reserved/attached 目标。 */
@@ -39,7 +39,11 @@ export class RoomForkStore {
 		await mkdir(path.dirname(this.file), { recursive: true, mode: 0o700 });
 		const temp = `${this.file}.${randomUUID()}.tmp`;
 		await writeFile(temp, JSON.stringify({ version: 1, operations }) + "\n", { mode: 0o600 });
+		const handle = await open(temp, "r");
+		try { await handle.sync(); } finally { await handle.close(); }
 		await rename(temp, this.file);
+		const directory = await open(path.dirname(this.file), "r");
+		try { await directory.sync(); } finally { await directory.close(); }
 	}
 
 	private serialize<T>(operation: () => Promise<T>): Promise<T> {

@@ -464,10 +464,15 @@ export class RoomEventStore {
 				}
 				const data = await readFile(source);
 				const sha256 = createHash("sha256").update(data).digest("hex");
+				if (item.sha256 && item.sha256 !== sha256) {
+					throw new RoomEventConflictError(targetRoomSessionId, `附件内容与记录 sha256 不一致: ${item.name}`);
+				}
 				const name = (path.basename(item.name) || "attachment").replace(/[^A-Za-z0-9._ -]/g, "_");
 				const target = path.join(targetDir, `${sha256.slice(0, 12)}-${name}`);
-				try { await writeFile(target, data, { mode: 0o600, flag: "wx" }); }
-				catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+				try {
+					const handle = await open(target, "wx", 0o600);
+					try { await handle.writeFile(data); await handle.sync(); } finally { await handle.close(); }
+				} catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
 				copied.push({ ...item, name, path: target, sha256, size: data.length });
 			}
 			return copied;

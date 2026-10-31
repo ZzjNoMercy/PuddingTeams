@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import assert from "node:assert";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import Fastify from "fastify";
@@ -608,7 +608,8 @@ test("v4 HTTP: 删除 RoomSession 清理事件目录与活动投影", async () =
 		const roomSessionId = room.roomSessionIds![0]!;
 		await app.inject({
 			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/messages`,
-			headers: { "idempotency-key": randomUUID() }, payload: { content: "待删除", mentions: ["alpha"] },
+			headers: { "idempotency-key": randomUUID() },
+			payload: { content: "待删除", mentions: ["alpha"], attachments: [{ filename: "del.txt", mediaType: "text/plain", data: Buffer.from("bye").toString("base64") }] },
 		});
 		for (let attempt = 0; attempt < 50; attempt += 1) {
 			const timeline = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` });
@@ -620,6 +621,7 @@ test("v4 HTTP: 删除 RoomSession 清理事件目录与活动投影", async () =
 		const removed = await app.inject({ method: "DELETE", url: `/api/rooms/${room.id}/sessions/${roomSessionId}` });
 		assert.equal(removed.statusCode, 204, removed.body);
 		assert.equal(existsSync(path.join(dir, "state", "room-sessions", roomSessionId)), false);
+		assert.equal(existsSync(path.join(dir, "uploads", roomSessionId)), false);
 		const activityRaw = JSON.parse(readFileSync(path.join(dir, "state", "room-session-activity.json"), "utf8")) as { revisions: Record<string, unknown>; reads: Record<string, unknown> };
 		assert.equal(Object.hasOwn(activityRaw.revisions, roomSessionId), false);
 		assert.equal(Object.hasOwn(activityRaw.reads, roomSessionId), false);
@@ -711,6 +713,12 @@ test("v4 HTTP: Fork 幂等键重放同一目标，fork-targets 列截断点", as
 		const first = await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions/${sourceId}/fork`, headers: { "idempotency-key": key }, payload: {} });
 		assert.equal(first.statusCode, 201, first.body);
 		const targetId = first.json().roomSessionId as string;
+		// 201 丢失后源房间新增事件，同 key 重放仍必须返回原 target。
+		await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${sourceId}/messages`,
+			headers: { "idempotency-key": randomUUID() }, payload: { content: "后续消息", mentions: ["alpha"] },
+		});
+		await new Promise((resolve) => setTimeout(resolve, 100));
 		const replay = await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions/${sourceId}/fork`, headers: { "idempotency-key": key }, payload: {} });
 		assert.equal(replay.statusCode, 200, replay.body);
 		assert.equal(replay.json().roomSessionId, targetId);
@@ -768,5 +776,35 @@ test("v4 HTTP: RoomSession Goal 归属 Manager PS，幂等且公开房间身份"
 			headers: { "idempotency-key": randomUUID() }, payload: { goal: "新目标", completionBoundary: "新边界" },
 		});
 		assert.equal(nextGoal.statusCode, 201, nextGoal.body);
+	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("v4 HTTP: Fork 附件被篡改时 fail closed，不留下目标 uploads", async () => {
+	const { app, teams, sessions, dir } = await makeStack();
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		const room = created.json().room as RoomSummary;
+		const roomSessionId = room.roomSessionIds![0]!;
+		await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/messages`,
+			headers: { "idempotency-key": randomUUID() },
+			payload: { content: "带附件", mentions: ["alpha"], attachments: [{ filename: "a.txt", mediaType: "text/plain", data: Buffer.from("original").toString("base64") }] },
+		});
+		let attachmentPath: string | undefined;
+		for (let attempt = 0; attempt < 50; attempt += 1) {
+			const timeline = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` });
+			const event = timeline.json().events.find((item: { attachments?: Array<{ path: string }> }) => item.attachments?.length);
+			attachmentPath = event?.attachments?.[0]?.path;
+			if (attachmentPath) break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.ok(attachmentPath);
+		writeFileSync(attachmentPath!, "tampered");
+		const key = randomUUID();
+		const forked = await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/fork`, headers: { "idempotency-key": key }, payload: {} });
+		assert.equal(forked.statusCode, 409, forked.body);
+		assert.equal(forked.json().code, "room_fork_failed");
+		assert.deepEqual(readdirSync(path.join(dir, "uploads")).filter((name) => name !== roomSessionId), []);
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });

@@ -77,16 +77,25 @@ export function RoomChatPane({
 	const [replacingGoal, setReplacingGoal] = useState(false);
 	const [targetAgentId, setTargetAgentId] = useState<string | null>(null);
 	const bottomRef = useRef<HTMLDivElement | null>(null);
+	const loadGeneration = useRef(0);
+	const forkKeyRef = useRef<string | null>(null);
 
 	const load = useCallback(async () => {
+		const generation = ++loadGeneration.current;
 		if (!roomSessionId) { setTimeline(null); return; }
 		try {
-			const [next, currentGoal] = await Promise.all([fetchRoomTimeline(room.id, roomSessionId), fetchRoomGoal(room.id, roomSessionId)]);
+			const next = await fetchRoomTimeline(room.id, roomSessionId);
+			if (generation !== loadGeneration.current) return;
+			let currentGoal: Awaited<ReturnType<typeof fetchRoomGoal>> = null;
+			try { currentGoal = await fetchRoomGoal(room.id, roomSessionId); }
+			catch { currentGoal = null; }
+			if (generation !== loadGeneration.current) return;
 			setTimeline((current) => current ? { ...next, events: mergeEvents(current.events, next.events), lastEventSeq: Math.max(current.lastEventSeq, next.lastEventSeq) } : next);
 			setGoal(currentGoal);
 			setError(null);
 			void markRoomSessionRead(room.id, roomSessionId);
 		} catch (caught) {
+			if (generation !== loadGeneration.current) return;
 			setError(caught instanceof Error ? caught.message : String(caught));
 		}
 	}, [room.id, roomSessionId]);
@@ -205,8 +214,11 @@ export function RoomChatPane({
 	const handleFork = useCallback(async () => {
 		if (!roomSessionId) return;
 		setForking(true);
+		const operationKey = forkKeyRef.current ?? crypto.randomUUID();
+		forkKeyRef.current = operationKey;
 		try {
-			const forked = await forkRoomSession(room.id, roomSessionId, { operationKey: crypto.randomUUID() });
+			const forked = await forkRoomSession(room.id, roomSessionId, { operationKey });
+			forkKeyRef.current = null;
 			const updated = await getRoom(room.id);
 			onRoomUpdated?.(updated);
 			onSessionActivated?.(updated);
@@ -217,7 +229,9 @@ export function RoomChatPane({
 	}, [onRoomUpdated, onSessionActivated, room.id, roomSessionId]);
 
 	const handleSessionChange = useCallback(async (nextRoomSessionId: string) => {
+		loadGeneration.current += 1;
 		setTimeline(null);
+		setGoal(null);
 		setRoomSessionId(nextRoomSessionId);
 		try {
 			await setActiveRoomSession(room.id, nextRoomSessionId);
