@@ -9,6 +9,7 @@ import {
 	abortRoomTurn,
 	closeUnknownRoomTurn,
 	fetchRoomTimeline,
+	forkRoomSession,
 	getRoom,
 	markRoomSessionRead,
 	roomTimelineWsUrl,
@@ -156,6 +157,19 @@ export function RoomChatPane({
 		catch (caught) { toast.error(caught instanceof Error ? caught.message : String(caught)); }
 	}, [activeTurn, load, room.id, roomSessionId]);
 
+	const handleFork = useCallback(async () => {
+		if (!roomSessionId) return;
+		try {
+			const forked = await forkRoomSession(room.id, roomSessionId);
+			const updated = await getRoom(room.id);
+			onRoomUpdated?.(updated);
+			onSessionActivated?.(updated);
+			setRoomSessionId(forked.roomSessionId);
+		} catch (caught) {
+			toast.error(caught instanceof Error ? caught.message : String(caught));
+		}
+	}, [onRoomUpdated, onSessionActivated, room.id, roomSessionId]);
+
 	const handleSessionChange = useCallback(async (nextRoomSessionId: string) => {
 		setTimeline(null);
 		setRoomSessionId(nextRoomSessionId);
@@ -184,6 +198,7 @@ export function RoomChatPane({
 					</SelectContent>
 				</Select>
 				<div className="ml-auto flex items-center gap-2">
+					<Button size="sm" variant="outline" onClick={() => void handleFork()}>Fork</Button>
 					{activeTurn ? <Button size="sm" variant="outline" onClick={() => void handleStop()}>停止</Button> : null}
 					{activeTurn && ["unknown", "reconciling"].includes(activeTurn.status)
 						? <Button size="sm" variant="outline" onClick={() => void handleCloseUnknown()}>确认无运行</Button> : null}

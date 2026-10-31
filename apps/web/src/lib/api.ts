@@ -2736,6 +2736,15 @@ export async function sendRoomMessage(
 	return { accepted: true, roomEventId: body!.roomEventId!, participantTurnId: body!.participantTurnId! };
 }
 
+export async function forkRoomSession(roomId: string, roomSessionId: string, options: { throughEventSeq?: number; name?: string } = {}): Promise<{ roomSessionId: string; managerAgentSessionId: string }> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(roomSessionId)}/fork`, {
+		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(options),
+	});
+	const body = (await res.json().catch(() => null)) as { roomSessionId?: string; managerAgentSessionId?: string; error?: string } | null;
+	if (!res.ok) throw new Error(body?.error ?? `fork room session failed: ${res.status}`);
+	return { roomSessionId: body!.roomSessionId!, managerAgentSessionId: body!.managerAgentSessionId! };
+}
+
 export async function searchRoomEvents(roomId: string, roomSessionId: string, query: string, limit = 20): Promise<Array<{ eventId: string; seq: number; kind: string; content: string; createdAt: string }>> {
 	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(roomSessionId)}/search?q=${encodeURIComponent(query)}&limit=${limit}`);
 	const body = (await res.json().catch(() => null)) as { hits?: Array<{ eventId: string; seq: number; kind: string; content: string; createdAt: string }>; error?: string } | null;

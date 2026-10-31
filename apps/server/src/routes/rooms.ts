@@ -1058,6 +1058,40 @@ export function registerRoomsRoutes(
 		},
 	);
 
+	/** 从 RoomSession 的公开事件 fork 出新房间会话（新 Manager、不复制私有执行历史）。 */
+	app.post<{ Params: { id: string; sid: string }; Body: { throughEventSeq?: unknown; name?: unknown } }>(
+		"/api/rooms/:id/sessions/:sid/fork",
+		async (req, reply) => {
+			if (!roomEvents || !roomOperations) return reply.code(503).send({ error: "room session stores are not configured" });
+			const source = await teams.contextForRoomSession(req.params.sid);
+			if (!source || source.window.id !== req.params.id) return reply.code(404).send({ error: "room session not found", code: "room_session_not_found" });
+			const throughSeq = req.body?.throughEventSeq;
+			if (throughSeq !== undefined && (!Number.isInteger(throughSeq) || (throughSeq as number) < 1)) {
+				return reply.code(400).send({ error: "throughEventSeq 必须是正整数", code: "invalid_cutoff" });
+			}
+			const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+			const managerSessionId = randomUUID();
+			const roomSessionId = randomUUID();
+			let createdSession: Awaited<ReturnType<PiSessionStore["create"]>> | undefined;
+			let roomCreated = false;
+			try {
+				createdSession = await sessions.create(undefined, await contextFor(source.window), managerSessionId, { ownerAgentId: MANAGER_AGENT_NAME });
+				await roomEvents.fork(req.params.sid, roomSessionId, throughSeq === undefined ? {} : { throughSeq: throughSeq as number });
+				await ensureRoomSessionRecord(source.window, createdSession.id, { roomSessionId });
+				roomCreated = true;
+				if (name) await teams.renameRoomSession(roomSessionId, name);
+				return reply.code(201).send({ roomSessionId, managerAgentSessionId: createdSession.id });
+			} catch (error) {
+				if (roomCreated) await teams.removeRoomSession(req.params.id, roomSessionId).catch(() => undefined);
+				await roomEvents.remove(roomSessionId).catch(() => undefined);
+				if (createdSession) await sessions.remove(createdSession.id).catch(() => undefined);
+				const message = error instanceof Error ? error.message : String(error);
+				const status = /throughSeq|cutoff|seq/i.test(message) ? 400 : 409;
+				return reply.code(status).send({ error: message, code: status === 400 ? "invalid_cutoff" : "room_fork_failed" });
+			}
+		},
+	);
+
 	/** 房间公开事件搜索（当前为线性扫描；后续可换索引）。 */
 	app.get<{ Params: { id: string; sid: string }; Querystring: { q?: string; limit?: string } }>(
 		"/api/rooms/:id/sessions/:sid/search",
