@@ -307,11 +307,9 @@ export class RoomMessageRouter {
 				}
 				const eventId = randomUUID();
 				const mentions = [binding.agentId];
-				const sourceIds = await this.knowledgeSourceIds(eventId, binding, content, input.attachments);
 				const draft = {
 					id: eventId, kind: "message" as const, actor: { kind: "user" as const },
 					content, mentions,
-					...(sourceIds ? { knowledgeSourceIds: sourceIds } : {}),
 					...(input.attachments?.length ? { attachments: input.attachments } : {}),
 					createdAt: this.now(),
 				};
@@ -335,7 +333,8 @@ export class RoomMessageRouter {
 				}
 				const reserved = await this.deps.operations.reserveMessage(input.roomSessionId, { key: input.operationId, requestHash: hash });
 				if (!reserved.created) throw new RoomMessageError("message_delivery_unconfirmed", "消息操作已存在但未确认 accepted");
-				const userEvent = await this.deps.events.append(input.roomSessionId, draft);
+				const sourceIds = await this.knowledgeSourceIds(eventId, binding, content, input.attachments);
+				const userEvent = await this.deps.events.append(input.roomSessionId, sourceIds ? { ...draft, knowledgeSourceIds: sourceIds } : draft);
 				await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "user_event_appended", { roomEventId: userEvent.id });
 				this.deps.bus?.publish(input.roomSessionId, { type: "room_event", event: userEvent });
 				await this.recordActivity(input.roomSessionId, userEvent, false);
@@ -408,17 +407,16 @@ export class RoomMessageRouter {
 				}
 				const eventId = randomUUID();
 				const mentions = [activeBinding.agentId];
-				const sourceIds = await this.knowledgeSourceIds(eventId, activeBinding, content, input.attachments);
 				const draft = {
 					id: eventId, kind: "message" as const, actor: { kind: "user" as const },
 					content, mentions,
-					...(sourceIds ? { knowledgeSourceIds: sourceIds } : {}),
 					...(input.attachments?.length ? { attachments: input.attachments } : {}),
 					createdAt: this.now(),
 				};
 				const reserved = await this.deps.operations.reserveMessage(input.roomSessionId, { key: input.operationId, requestHash: hash });
 				if (!reserved.created) throw new RoomMessageError("message_delivery_unconfirmed", "消息操作已存在但未确认 accepted");
-				const userEvent = await this.deps.events.append(input.roomSessionId, draft);
+				const sourceIds = await this.knowledgeSourceIds(eventId, activeBinding, content, input.attachments);
+				const userEvent = await this.deps.events.append(input.roomSessionId, sourceIds ? { ...draft, knowledgeSourceIds: sourceIds } : draft);
 				await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "user_event_appended", { roomEventId: userEvent.id });
 				this.deps.bus?.publish(input.roomSessionId, { type: "room_event", event: userEvent });
 				await this.recordActivity(input.roomSessionId, userEvent, false);
@@ -605,11 +603,9 @@ export class RoomMessageRouter {
 		const binding = await this.deps.bindings.get(input.roomSessionId, first.agentId);
 		if (!binding) throw new RoomMessageError("participant_binding_required", `agent ${first.agentId} 没有 active binding`);
 		const eventId = randomUUID();
-		const sourceIds = await this.knowledgeSourceIds(eventId, binding, content, input.attachments);
 		const draft = {
 			id: eventId, kind: "message" as const, actor: { kind: "user" as const },
 			content, mentions,
-			...(sourceIds ? { knowledgeSourceIds: sourceIds } : {}),
 			...(input.attachments?.length ? { attachments: input.attachments } : {}),
 			createdAt: this.now(),
 		};
@@ -632,7 +628,8 @@ export class RoomMessageRouter {
 		}
 		const reserved = await this.deps.operations.reserveMessage(input.roomSessionId, { key: input.operationId, requestHash: requestHash({ ...input, content }, content) });
 		if (!reserved.created) throw new RoomMessageError("message_delivery_unconfirmed", "消息操作已存在但未确认 accepted");
-		const userEvent = await this.deps.events.append(input.roomSessionId, draft);
+		const sourceIds = await this.knowledgeSourceIds(eventId, binding, content, input.attachments);
+		const userEvent = await this.deps.events.append(input.roomSessionId, sourceIds ? { ...draft, knowledgeSourceIds: sourceIds } : draft);
 		await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "user_event_appended", { roomEventId: userEvent.id });
 		this.deps.bus?.publish(input.roomSessionId, { type: "room_event", event: userEvent });
 		await this.recordActivity(input.roomSessionId, userEvent, false);
