@@ -40,6 +40,7 @@ import { registerRoomsRoutes } from "./routes/rooms.js";
 import { RoomEventStore } from "./rooms/room-event-store.js";
 import { RoomCreationReconciler } from "./rooms/room-creation-reconciler.js";
 import { RoomActivityStore } from "./rooms/room-activity-store.js";
+import { RoomForkStore } from "./rooms/room-fork-store.js";
 import { RoomOperationStore } from "./rooms/room-operation-store.js";
 import { registerInteractionsRoutes } from "./routes/interactions.js";
 import { isWorkspaceOwnerClosed } from "./agent-runtime/workspace-owner-lifecycle.js";
@@ -511,6 +512,16 @@ const roomCreationReconcile = await new RoomCreationReconciler({
 }).reconcile();
 if (roomCreationReconcile.kept || roomCreationReconcile.removed || roomCreationReconcile.recoveryRequired.length) {
 	app.log.info(roomCreationReconcile, "reconciled RoomSession creation ledger before opening routes");
+}
+const roomForkStore = new RoomForkStore(path.join(paths.state, "room-fork-operations.json"));
+for (const operation of await roomForkStore.list()) {
+	if (operation.phase === "attached") continue;
+	const target = await teams.roomSession(operation.targetRoomSessionId);
+	const manager = await teams.participantSession(operation.managerAgentSessionId);
+	if (target && manager) {
+		await roomForkStore.markAttached(operation.key);
+		app.log.info({ key: operation.key, target: operation.targetRoomSessionId }, "adopted completed RoomSession fork");
+	}
 }
 invoker.setManagerSender((managerSessionId, message, options) =>
 	store.sendCustomMessage(managerSessionId, message, options),

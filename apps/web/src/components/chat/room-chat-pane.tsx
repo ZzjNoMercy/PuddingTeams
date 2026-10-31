@@ -11,6 +11,7 @@ import {
 	abandonGoal,
 	abortRoomTurn,
 	createRoomGoal,
+	resumeGoal,
 	supersedeGoal,
 	closeUnknownRoomTurn,
 	fetchRoomGoal,
@@ -64,7 +65,7 @@ export function RoomChatPane({
 	const [roomSessionId, setRoomSessionId] = useState(resolveSessionId);
 
 	const [timeline, setTimeline] = useState<RoomTimelineSnapshot | null>(null);
-	const [goal, setGoal] = useState<{ goal: string; completionBoundary: string; status: string; goalId: string; revision: number; managerParticipantSessionId: string } | null>(null);
+	const [goal, setGoal] = useState<{ goal: string; completionBoundary: string; status: string; goalId: string; revision: number; executionStatus?: string; managerParticipantSessionId: string } | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const loading = timeline === null && error === null;
 	const [draft, setDraft] = useState("");
@@ -338,7 +339,11 @@ export function RoomChatPane({
 			<Dialog open={goalOpen} onOpenChange={setGoalOpen}>
 				<DialogContent>
 					<DialogHeader><DialogTitle>{goal ? "当前 Goal" : "新建 Goal"}</DialogTitle><DialogDescription>Goal 归属当前 RoomSession 的 Manager Participant Session。</DialogDescription></DialogHeader>
-					{goal ? <div className="space-y-1 text-sm"><p>{goal.goal}</p><p className="text-muted-foreground">验收：{goal.completionBoundary}</p><p className="text-muted-foreground">状态：{goal.status}</p><Button size="sm" variant="outline" className="mt-2" onClick={() => setReplacingGoal(true)}>更换 Goal</Button></div> : null}
+					{goal ? <div className="space-y-1 text-sm"><p>{goal.goal}</p><p className="text-muted-foreground">验收：{goal.completionBoundary}</p><p className="text-muted-foreground">状态：{goal.status}</p><div className="mt-2 flex gap-2"><Button size="sm" variant="outline" onClick={() => setReplacingGoal(true)}>更换 Goal</Button>{goal.executionStatus === "interrupted" ? <Button size="sm" variant="outline" onClick={() => {
+							void resumeGoal(goal.managerParticipantSessionId, goal.goalId, goal.revision)
+								.then(() => { toast.success("Goal 已恢复"); return load(); })
+								.catch((caught: unknown) => toast.error(caught instanceof Error ? caught.message : String(caught)));
+						}}>恢复 Goal</Button> : null}</div></div> : null}
 					{(!goal || replacingGoal) ? (
 						<div className="space-y-3">
 							<Input value={goalDraft} onChange={(event) => setGoalDraft(event.target.value)} placeholder="Goal（要达成什么）" />

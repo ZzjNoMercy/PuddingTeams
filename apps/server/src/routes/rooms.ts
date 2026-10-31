@@ -1170,8 +1170,10 @@ export function registerRoomsRoutes(
 					reservedFork = reserved.created;
 					if (!reserved.created) return reply.code(409).send({ error: "Fork 键已被占用", code: "fork_operation_conflict" });
 				}
-				createdSession = await sessions.create(undefined, await contextFor(source.window), managerSessionId, { ownerAgentId: MANAGER_AGENT_NAME });
 				await roomEvents.fork(req.params.sid, roomSessionId, { throughSeq: cutoffSeq });
+				if (operationKey && roomForks) await roomForks.advance(operationKey, "snapshot_saved");
+				createdSession = await sessions.create(undefined, await contextFor(source.window), managerSessionId, { ownerAgentId: MANAGER_AGENT_NAME });
+				if (operationKey && roomForks) await roomForks.advance(operationKey, "session_saved");
 				await ensureRoomSessionRecord(source.window, createdSession.id, { roomSessionId });
 				if (name) await teams.renameRoomSession(roomSessionId, name);
 				if (operationKey && roomForks) await roomForks.markAttached(operationKey);

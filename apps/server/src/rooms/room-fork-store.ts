@@ -9,7 +9,7 @@ export interface RoomForkOperation {
 	throughEventSeq: number;
 	targetRoomSessionId: string;
 	managerAgentSessionId: string;
-	phase: "reserved" | "attached";
+	phase: "reserved" | "snapshot_saved" | "session_saved" | "attached";
 	createdAt: string;
 	updatedAt: string;
 }
@@ -73,17 +73,28 @@ export class RoomForkStore {
 		});
 	}
 
-	async markAttached(key: string): Promise<RoomForkOperation> {
+	async list(): Promise<RoomForkOperation[]> {
+		return Object.values(await this.read());
+	}
+
+	/** 只允许向前推进：reserved → snapshot_saved → session_saved → attached。 */
+	async advance(key: string, phase: Exclude<RoomForkOperation["phase"], "reserved">): Promise<RoomForkOperation> {
+		const order = ["reserved", "snapshot_saved", "session_saved", "attached"] as const;
 		return this.serialize(async () => {
 			const operations = await this.read();
 			const operation = operations[key];
 			if (!operation) throw new Error(`fork operation not found: ${key}`);
-			operation.phase = "attached";
+			if (order.indexOf(phase) < order.indexOf(operation.phase)) return operation;
+			operation.phase = phase;
 			operation.updatedAt = new Date().toISOString();
 			operations[key] = operation;
 			await this.write(operations);
 			return operation;
 		});
+	}
+
+	async markAttached(key: string): Promise<RoomForkOperation> {
+		return this.advance(key, "attached");
 	}
 
 	async remove(key: string): Promise<void> {
