@@ -845,10 +845,16 @@ export function registerRoomsRoutes(
 		if (w.pinned) return reply.code(405).send({ error: "solo 窗口不可删除" });
 		try {
 			const remove = async () => {
+				const current = await teams.getWindow(req.params.id);
+				const groupRoomIds = current?.type === "group" ? [...(current.roomSessionIds ?? [])] : [];
 				const sessionIds = await teams.removeWindow(req.params.id, req.query.onlySession);
 				for (const sid of sessionIds) {
 					await sessions.remove(sid);
 					await workStates?.removeSession(sid);
+				}
+				for (const roomSessionId of groupRoomIds) {
+					await roomEvents?.remove(roomSessionId).catch(() => undefined);
+					await roomActivity?.removeRoom(roomSessionId).catch(() => undefined);
 				}
 			};
 			if (invoker) {
@@ -1514,6 +1520,7 @@ export function registerRoomsRoutes(
 						await roomTurns?.removeRoom(room.roomSessionId).catch(() => undefined);
 						await roomOperations?.removeRoom(room.roomSessionId).catch(() => undefined);
 					}
+					await roomActivity?.removeRoom(room.roomSessionId).catch(() => undefined);
 					return reply.code(204).send();
 				}
 				const located = await teams.contextForSession(req.params.sid);

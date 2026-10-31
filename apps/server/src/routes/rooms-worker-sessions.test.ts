@@ -593,3 +593,30 @@ test("v4 HTTP: 从 RoomSession fork 公共事件到新房间会话", async () =>
 		assert.equal(cutoffTimeline.events.length, 1);
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("v4 HTTP: 删除 RoomSession 清理事件目录与活动投影", async () => {
+	const { app, teams, sessions, dir } = await makeStack();
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		const room = created.json().room as RoomSummary;
+		const roomSessionId = room.roomSessionIds![0]!;
+		await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/messages`,
+			headers: { "idempotency-key": randomUUID() }, payload: { content: "待删除", mentions: ["alpha"] },
+		});
+		for (let attempt = 0; attempt < 50; attempt += 1) {
+			const timeline = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` });
+			if (timeline.json().events.length >= 2) break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		const extra = await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions`, payload: { reuseEmpty: true } });
+		assert.equal(extra.statusCode, 200, extra.body);
+		const removed = await app.inject({ method: "DELETE", url: `/api/rooms/${room.id}/sessions/${roomSessionId}` });
+		assert.equal(removed.statusCode, 204, removed.body);
+		assert.equal(existsSync(path.join(dir, "state", "room-sessions", roomSessionId)), false);
+		const activityRaw = JSON.parse(readFileSync(path.join(dir, "state", "room-session-activity.json"), "utf8")) as { revisions: Record<string, unknown>; reads: Record<string, unknown> };
+		assert.equal(Object.hasOwn(activityRaw.revisions, roomSessionId), false);
+		assert.equal(Object.hasOwn(activityRaw.reads, roomSessionId), false);
+	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});

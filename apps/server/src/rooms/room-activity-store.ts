@@ -70,6 +70,17 @@ export class RoomActivityStore {
 		});
 	}
 
+	async removeRoom(roomSessionId: string): Promise<void> {
+		if (!SAFE_ID.test(roomSessionId)) throw new Error("invalid room session id");
+		await this.serialize(async () => {
+			const state = await this.read();
+			if (!Object.hasOwn(state.revisions, roomSessionId) && !Object.hasOwn(state.reads, roomSessionId)) return;
+			delete state.revisions[roomSessionId];
+			delete state.reads[roomSessionId];
+			await this.write(state);
+		});
+	}
+
 	async markRead(roomSessionId: string): Promise<{ readRevision: number; hasUnreadActivity: boolean; entry?: RoomSessionActivityEntry }> {
 		if (!SAFE_ID.test(roomSessionId)) throw new Error("invalid room session id");
 		return this.serialize(async () => {
