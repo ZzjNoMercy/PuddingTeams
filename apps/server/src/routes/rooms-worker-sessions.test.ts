@@ -941,3 +941,45 @@ test("v4 HTTP: 删除 RoomSession 拒绝活动回合并校验房间归属", asyn
 		await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/abort` });
 	} finally { release(); await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("v4 HTTP: 非 Pi 活动回合的 normal 输入排队并在首轮后执行", async () => {
+	let release!: () => void;
+	let calls = 0;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const { app, teams, sessions, dir } = await makeStack({
+		run: async (input) => {
+			await input.markInputDurable();
+			calls += 1;
+			if (calls === 1) { await gate; return { status: "completed", finalContent: "第一段" }; }
+			return { status: "completed", finalContent: "排队后的结论" };
+		},
+	});
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		const room = created.json().room as RoomSummary;
+		const roomSessionId = room.roomSessionIds![0]!;
+		const first = await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/messages`,
+			headers: { "idempotency-key": randomUUID() }, payload: { content: "第一问", mentions: ["alpha"] },
+		});
+		assert.equal(first.statusCode, 202, first.body);
+		const queued = await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/messages`,
+			headers: { "idempotency-key": randomUUID() }, payload: { content: "排队追问", mentions: ["alpha"] },
+		});
+		assert.equal(queued.statusCode, 202, queued.body);
+		assert.equal(queued.json().persistence, "pending");
+		assert.equal(queued.json().participantTurnId, first.json().participantTurnId);
+		release();
+		for (let attempt = 0; attempt < 100; attempt += 1) {
+			const timeline = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` });
+			if (timeline.json().turns[0]?.status === "completed") break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		const timeline = (await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` })).json();
+		assert.equal(timeline.turns.length, 1);
+		assert.equal(timeline.events.filter((event: { actor: { kind: string } }) => event.actor.kind === "user").length, 2);
+		assert.equal(timeline.events.at(-1).content, "排队后的结论");
+	} finally { release(); await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});
