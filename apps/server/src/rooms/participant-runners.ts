@@ -45,7 +45,11 @@ export class PiParticipantRunner implements RoomParticipantRunner {
 		};
 		const start = session.messages.length;
 		try {
-			await session.prompt(input.prompt);
+			// prompt() 先同步把 user input 交给 SDK，再进入模型执行；在调用边界
+			// 确认 durable，避免等整轮结束才放行 HTTP accepted。
+			const prompt = session.prompt(input.prompt);
+			await input.markInputDurable();
+			await prompt;
 		} catch (error) {
 			return { status: "failed", terminalReason: error instanceof Error ? error.message : String(error) };
 		}
@@ -75,6 +79,7 @@ export class DirectChatParticipantRunner implements RoomParticipantRunner {
 	async run(input: RoomParticipantRunnerInput): Promise<RoomParticipantRunnerResult> {
 		const agent = await this.deps.invoker.requireAgent(input.binding.agentId);
 		const sessionHandle = await this.deps.handleFor?.(input.binding);
+		await input.markInputDurable();
 		const result = await this.deps.invoker.delegate({
 			agent,
 			windowId: input.binding.roomId,

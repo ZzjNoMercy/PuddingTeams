@@ -142,3 +142,32 @@ test("DirectChatParticipantRunner: provider handle 续接与持久", async () =>
 	await runner.run(runnerInput);
 	assert.equal(calls[1]!.sessionHandle, "handle-1");
 });
+
+test("Pi/Direct runner 在真实发送边界调用 markInputDurable", async () => {
+	let piDurable = 0;
+	const pi = new PiParticipantRunner({
+		sessions: {
+			open: async () => ({
+				messages: [
+					{ role: "user", content: "x" },
+					{ role: "assistant", content: "ok", stopReason: "stop", timestamp: Date.now() },
+				],
+				prompt: async () => undefined,
+			}),
+		} as never,
+	});
+	const piInput = { ...runnerInput, markInputDurable: async () => { piDurable += 1; } };
+	await pi.run(piInput);
+	assert.equal(piDurable, 1);
+
+	let directDurable = 0;
+	const direct = new DirectChatParticipantRunner({
+		invoker: {
+			requireAgent: async (name: string) => ({ name }),
+			delegate: async () => ({ status: "completed", content: "done", details: {}, delegationId: "d-1", waitingInput: false }),
+		} as never,
+	});
+	const directInput = { ...runnerInput, markInputDurable: async () => { directDurable += 1; } };
+	await direct.run(directInput);
+	assert.equal(directDurable, 1);
+});

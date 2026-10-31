@@ -2748,6 +2748,22 @@ export async function fetchRoomGoal(roomId: string, roomSessionId: string): Prom
 	};
 }
 
+export async function createRoomGoal(
+	roomId: string, roomSessionId: string,
+	input: { goal: string; completionBoundary: string; reviewMode?: "manager" | "independent"; reviewerModel?: string },
+	operationKey: string,
+): Promise<void> {
+	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(roomSessionId)}/goal`, {
+		method: "POST",
+		headers: { "content-type": "application/json", "idempotency-key": operationKey },
+		body: JSON.stringify(input),
+	});
+	if (!res.ok) {
+		const body = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(body?.error ?? `create room goal failed: ${res.status}`);
+	}
+}
+
 export async function forkRoomSession(roomId: string, roomSessionId: string, options: { throughEventSeq?: number; name?: string; operationKey?: string } = {}): Promise<{ roomSessionId: string; managerAgentSessionId: string }> {
 	const { operationKey, ...payload } = options;
 	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(roomSessionId)}/fork`, {

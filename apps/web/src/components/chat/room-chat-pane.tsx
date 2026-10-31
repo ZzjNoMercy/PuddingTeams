@@ -4,10 +4,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { Input } from "@/components/ui/input";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
 	abandonGoal,
 	abortRoomTurn,
+	createRoomGoal,
 	closeUnknownRoomTurn,
 	fetchRoomGoal,
 	fetchRoomTimeline,
@@ -66,6 +69,10 @@ export function RoomChatPane({
 	const [draft, setDraft] = useState("");
 	const [sending, setSending] = useState(false);
 	const [forking, setForking] = useState(false);
+	const [goalOpen, setGoalOpen] = useState(false);
+	const [goalDraft, setGoalDraft] = useState("");
+	const [boundaryDraft, setBoundaryDraft] = useState("");
+	const [creatingGoal, setCreatingGoal] = useState(false);
 	const [targetAgentId, setTargetAgentId] = useState<string | null>(null);
 	const bottomRef = useRef<HTMLDivElement | null>(null);
 
@@ -245,6 +252,7 @@ export function RoomChatPane({
 				</Select>
 				<div className="ml-auto flex items-center gap-2">
 					<Button size="sm" variant="outline" disabled={Boolean(activeTurn) || forking} onClick={() => void handleFork()}>{forking ? "Fork 中…" : "Fork"}</Button>
+					<Button size="sm" variant="outline" onClick={() => setGoalOpen(true)}>{goal ? "Goal…" : "设 Goal"}</Button>
 					{activeTurn ? <Button size="sm" variant="outline" onClick={() => void handleStop()}>停止</Button> : null}
 					{activeTurn && ["unknown", "reconciling"].includes(activeTurn.status)
 						? <Button size="sm" variant="outline" onClick={() => void handleCloseUnknown()}>确认无运行</Button> : null}
@@ -311,6 +319,28 @@ export function RoomChatPane({
 					<Button size="sm" disabled={!canSend || !draft.trim()} onClick={() => void handleSend()}>{sending ? "发送中…" : "发送"}</Button>
 				</div>
 			</div>
+			<Dialog open={goalOpen} onOpenChange={setGoalOpen}>
+				<DialogContent>
+					<DialogHeader><DialogTitle>{goal ? "当前 Goal" : "新建 Goal"}</DialogTitle><DialogDescription>Goal 归属当前 RoomSession 的 Manager Participant Session。</DialogDescription></DialogHeader>
+					{goal ? <div className="space-y-1 text-sm"><p>{goal.goal}</p><p className="text-muted-foreground">验收：{goal.completionBoundary}</p><p className="text-muted-foreground">状态：{goal.status}</p></div> : (
+						<div className="space-y-3">
+							<Input value={goalDraft} onChange={(event) => setGoalDraft(event.target.value)} placeholder="Goal（要达成什么）" />
+							<Textarea value={boundaryDraft} onChange={(event) => setBoundaryDraft(event.target.value)} placeholder="验收边界（怎样算完成）" className="min-h-[72px]" />
+						</div>
+					)}
+					<DialogFooter>
+						<Button variant="outline" onClick={() => setGoalOpen(false)}>关闭</Button>
+						{!goal ? <Button disabled={creatingGoal || !goalDraft.trim() || !boundaryDraft.trim()} onClick={() => {
+							if (!roomSessionId) return;
+							setCreatingGoal(true);
+							void createRoomGoal(room.id, roomSessionId, { goal: goalDraft.trim(), completionBoundary: boundaryDraft.trim() }, crypto.randomUUID())
+								.then(() => { toast.success("Goal 已创建"); setGoalOpen(false); setGoalDraft(""); setBoundaryDraft(""); return load(); })
+								.catch((caught: unknown) => toast.error(caught instanceof Error ? caught.message : String(caught)))
+								.finally(() => setCreatingGoal(false));
+						}}>{creatingGoal ? "创建中…" : "创建"}</Button> : null}
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
 		</div>
 	);
 }
