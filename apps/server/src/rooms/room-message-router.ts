@@ -19,6 +19,7 @@ import { RoomOperationStore } from "./room-operation-store.js";
 import { withRoomAdmissionLock } from "./room-admission-lock.js";
 import { publicTurn, type RoomEventBus } from "./room-event-bus.js";
 import type { RoomActivityStore } from "./room-activity-store.js";
+import type { RoomFanoutStore } from "./room-fanout-store.js";
 
 /**
  * 房间消息路由（方案 §6、§8.1、§8.2、§19.2、§21.2）。
@@ -109,6 +110,7 @@ export interface RoomMessageRouterDeps {
 	budget: RoomContextBudget;
 	bus?: RoomEventBus;
 	activity?: RoomActivityStore;
+	fanouts?: RoomFanoutStore;
 	knowledge?: {
 		ownerId: string;
 		sources: {
@@ -645,6 +647,10 @@ export class RoomMessageRouter {
 		});
 		this.fanouts.set(input.operationId, { roomSessionId: input.roomSessionId, sourceEventId: userEvent.id, operationId: input.operationId, targets, nextIndex: 1 });
 		this.turnFanout.set(turn.id, input.operationId);
+		await this.deps.fanouts?.put({
+			operationId: input.operationId, roomSessionId: input.roomSessionId, sourceEventId: userEvent.id,
+			targetAgentIds: targets.map((item) => item.agentId), nextIndex: 1, createdAt: this.now(),
+		}).catch(() => undefined);
 		let durableMarked = false;
 		let resolveDurable!: () => void;
 		const durableReached = new Promise<void>((resolve) => { resolveDurable = resolve; });
@@ -670,6 +676,7 @@ export class RoomMessageRouter {
 		this.turnFanout.delete(turnId);
 		const plan = this.fanouts.get(operationId);
 		this.fanouts.delete(operationId);
+		await this.deps.fanouts?.remove(operationId).catch(() => undefined);
 		if (!plan) return;
 		for (const target of plan.targets.slice(plan.nextIndex)) {
 			try {
@@ -691,12 +698,13 @@ export class RoomMessageRouter {
 		const plan = this.fanouts.get(operationId);
 		if (!plan) return;
 		const target = plan.targets[plan.nextIndex];
-		if (!target) { this.fanouts.delete(operationId); return; }
+		if (!target) { this.fanouts.delete(operationId); await this.deps.fanouts?.remove(operationId).catch(() => undefined); return; }
 		const index = plan.nextIndex;
 		plan.nextIndex += 1;
+		await this.deps.fanouts?.advance(operationId, plan.nextIndex).catch(() => undefined);
 		await withRoomAdmissionLock(plan.roomSessionId, async () => {
 		const active = await this.activeTurn(plan.roomSessionId);
-		if (active) { this.fanouts.delete(operationId); return; }
+		if (active) { this.fanouts.delete(operationId); await this.deps.fanouts?.remove(operationId).catch(() => undefined); return; }
 		const binding = await this.deps.bindings.get(plan.roomSessionId, target.agentId);
 		if (!binding) { this.fanouts.delete(operationId); return; }
 		const events = await this.deps.events.read(plan.roomSessionId);

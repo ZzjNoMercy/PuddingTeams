@@ -12,6 +12,7 @@ import { PiParticipantRunner, DirectChatParticipantRunner } from "./participant-
 import { TeamsParticipantBindingPort } from "./teams-binding-port.js";
 import { RoomEventBus } from "./room-event-bus.js";
 import type { RoomActivityStore } from "./room-activity-store.js";
+import type { RoomFanoutStore } from "./room-fanout-store.js";
 import { publicTurn } from "./room-event-bus.js";
 
 /**
@@ -72,6 +73,7 @@ export function createRoomRuntime(input: {
 	maxContextChars?: number;
 	attachmentRoot?: string;
 	activity?: RoomActivityStore;
+	fanouts?: RoomFanoutStore;
 	knowledge?: {
 		ownerId: string;
 		sources: { createText(ownerId: string, text: string, origin?: Record<string, unknown>): Promise<{ id: string }> };
@@ -104,6 +106,7 @@ export function createRoomRuntime(input: {
 		turns,
 		bus,
 		...(input.activity ? { activity: input.activity } : {}),
+		...(input.fanouts ? { fanouts: input.fanouts } : {}),
 		...(input.knowledge ? { knowledge: input.knowledge } : {}),
 		bindings,
 		turnService,

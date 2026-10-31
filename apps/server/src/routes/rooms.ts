@@ -21,6 +21,7 @@ import { internalFirstWorkFreezeToken, isWithin, localPathReferences } from "./c
 import { RoomEventStore, type RoomEvent } from "../rooms/room-event-store.js";
 import { RoomActivityStore } from "../rooms/room-activity-store.js";
 import { RoomForkStore } from "../rooms/room-fork-store.js";
+import { RoomFanoutStore } from "../rooms/room-fanout-store.js";
 import { RoomOperationStore } from "../rooms/room-operation-store.js";
 import { ParticipantTurnStore } from "../rooms/participant-turn-store.js";
 import { createRoomRuntime } from "../rooms/room-runtime.js";
@@ -263,6 +264,7 @@ export function registerRoomsRoutes(
 		roomActivityStatePath?: string;
 		roomActivityStore?: RoomActivityStore;
 		roomForkStatePath?: string;
+		roomFanoutStatePath?: string;
 		roomKnowledge?: {
 			ownerId: string;
 			sources: { createText(ownerId: string, text: string, origin?: Record<string, unknown>): Promise<{ id: string }> };
@@ -276,11 +278,12 @@ export function registerRoomsRoutes(
 		? new SessionCreationOperations(localFiles.sessionCreationStatePath) : null;
 	const roomActivity = localFiles?.roomActivityStore ?? (localFiles?.roomActivityStatePath ? new RoomActivityStore(localFiles.roomActivityStatePath) : undefined);
 	const roomForks = localFiles?.roomForkStatePath ? new RoomForkStore(localFiles.roomForkStatePath) : undefined;
+	const roomFanouts = localFiles?.roomFanoutStatePath ? new RoomFanoutStore(localFiles.roomFanoutStatePath) : undefined;
 	const roomRuntime = localFiles?.roomSessionsStatePath
 		? createRoomRuntime({
 			root: localFiles.roomSessionsStatePath, teams, sessions, invoker,
 			runner: localFiles.roomRunner, attachmentRoot: localFiles.attachmentRoot, activity: roomActivity,
-			knowledge: localFiles.roomKnowledge,
+			fanouts: roomFanouts, knowledge: localFiles.roomKnowledge,
 		})
 		: undefined;
 	// 路由与 runtime 共用同一组 store 实例，避免 turns/operations 的实例内队列互相覆盖。

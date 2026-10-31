@@ -41,6 +41,7 @@ import { RoomEventStore } from "./rooms/room-event-store.js";
 import { RoomCreationReconciler } from "./rooms/room-creation-reconciler.js";
 import { RoomActivityStore } from "./rooms/room-activity-store.js";
 import { RoomForkStore } from "./rooms/room-fork-store.js";
+import { RoomFanoutStore } from "./rooms/room-fanout-store.js";
 import { RoomOperationStore } from "./rooms/room-operation-store.js";
 import { registerInteractionsRoutes } from "./routes/interactions.js";
 import { isWorkspaceOwnerClosed } from "./agent-runtime/workspace-owner-lifecycle.js";
@@ -515,6 +516,7 @@ if (roomCreationReconcile.kept || roomCreationReconcile.removed || roomCreationR
 	app.log.info(roomCreationReconcile, "reconciled RoomSession creation ledger before opening routes");
 }
 const roomForkStore = new RoomForkStore(path.join(paths.state, "room-fork-operations.json"));
+const roomFanoutStore = new RoomFanoutStore(path.join(paths.state, "room-fanout-plans.json"));
 for (const operation of await roomForkStore.list()) {
 	if (operation.phase === "attached") continue;
 	const target = await teams.roomSession(operation.targetRoomSessionId);
@@ -523,6 +525,19 @@ for (const operation of await roomForkStore.list()) {
 		await roomForkStore.markAttached(operation.key);
 		app.log.info({ key: operation.key, target: operation.targetRoomSessionId }, "adopted completed RoomSession fork");
 	}
+}
+for (const plan of await roomFanoutStore.list()) {
+	const room = await teams.roomSession(plan.roomSessionId);
+	if (room) {
+		for (const agentId of plan.targetAgentIds.slice(plan.nextIndex)) {
+			await roomEventStore.append(plan.roomSessionId, {
+				id: crypto.randomUUID(), kind: "terminal", actor: { kind: "system" },
+				content: `已跳过 @${agentId}：进程重启，fanout 未完成`, mentions: [agentId], createdAt: new Date().toISOString(),
+			}).catch(() => undefined);
+		}
+		app.log.warn({ operationId: plan.operationId }, "closed interrupted room fanout");
+	}
+	await roomFanoutStore.remove(plan.operationId);
 }
 invoker.setManagerSender((managerSessionId, message, options) =>
 	store.sendCustomMessage(managerSessionId, message, options),
@@ -913,6 +928,7 @@ await registerRoomsRoutes(app, store, teams, invoker, workStates, {
 	roomActivityStatePath: path.join(paths.state, "room-session-activity.json"),
 	roomActivityStore,
 	roomForkStatePath: path.join(paths.state, "room-fork-operations.json"),
+	roomFanoutStatePath: path.join(paths.state, "room-fanout-plans.json"),
 	roomKnowledge: { ownerId: localViewerIdentity().user.id, sources: knowledgeSources },
 	chatNavigationStatePath: path.join(paths.state, "chat-navigation.json"),
 });
