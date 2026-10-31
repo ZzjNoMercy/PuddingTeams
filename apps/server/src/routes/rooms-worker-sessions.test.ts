@@ -21,7 +21,7 @@ import { registerChatRoutes } from "./chat.js";
 
 /** Delegated contexts cannot be used as ordinary chats; audit facts survive. */
 
-async function makeStack(roomRunner?: { run: (input: { markInputDurable(): Promise<void>; prompt: string }) => Promise<{ status: "completed"; finalContent?: string }> }) {
+async function makeStack(roomRunner?: { run: (input: { markInputDurable(): Promise<void>; prompt: string }) => Promise<{ status: "completed"; finalContent?: string }>; followUp?: (input: { markInputDurable(): Promise<void>; text: string }) => Promise<void> }) {
 	const dir = mkdtempSync(path.join(tmpdir(), "pt-worker-sessions-"));
 	process.env.PI_CODING_AGENT_DIR = path.join(dir, "agent-dir");
 	const teams = new TeamsStore(
@@ -819,4 +819,43 @@ test("v4 HTTP: Fork 附件被篡改时 fail closed，不留下目标 uploads", a
 		assert.equal(forked.json().code, "room_fork_failed");
 		assert.deepEqual(readdirSync(path.join(dir, "uploads")).filter((name) => name !== roomSessionId), []);
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("v4 HTTP: 活动回合 followUp 不新建 Turn，final 只投影一次", async () => {
+	let release!: () => void;
+	const pending = new Promise<void>((resolve) => { release = resolve; });
+	const { app, teams, sessions, dir } = await makeStack({
+		run: async (input) => { await input.markInputDurable(); await pending; return { status: "completed", finalContent: "最终" }; },
+		followUp: async (input) => { await input.markInputDurable(); },
+	});
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		const room = created.json().room as RoomSummary;
+		const roomSessionId = room.roomSessionIds![0]!;
+		const first = await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/messages`,
+			headers: { "idempotency-key": randomUUID() }, payload: { content: "开始", mentions: ["alpha"] },
+		});
+		assert.equal(first.statusCode, 202, first.body);
+		const turnId = first.json().participantTurnId as string;
+		const follow = await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/messages`,
+			headers: { "idempotency-key": randomUUID() },
+			payload: { content: "补充", mentions: ["alpha"], delivery: "followUp", expectedParticipantTurnId: turnId },
+		});
+		assert.equal(follow.statusCode, 202, follow.body);
+		assert.equal(follow.json().participantTurnId, turnId);
+		release();
+		for (let attempt = 0; attempt < 50; attempt += 1) {
+			const timeline = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` });
+			if (timeline.json().turns[0]?.status === "completed") break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		const timeline = (await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/timeline` })).json();
+		assert.equal(timeline.turns.length, 1);
+		assert.equal(timeline.events.filter((event: { actor: { kind: string } }) => event.actor.kind === "user").length, 2);
+		assert.equal(timeline.events.filter((event: { kind: string }) => event.kind === "terminal").length, 0);
+		assert.equal(timeline.events.filter((event: { kind: string }) => event.kind === "message" && event.actor.kind === "agent").length, 1);
+	} finally { release(); await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });
