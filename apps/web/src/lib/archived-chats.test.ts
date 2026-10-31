@@ -24,4 +24,5 @@ test("delete rechecks archive status, protects unarchived siblings and atomicall
  rows=[{...target,archived:false}];await assert.rejects(()=>applyArchivedChatAction(target,"delete",deps),/已在其他窗口恢复/);assert.equal(calls.length,2);
  await applyArchivedChatAction(target,"restore",deps);assert.equal(calls.length,2);
  rows=[{...target,roomType:"solo",contextActive:false}];room={...room,pinned:true,sessions:[{id:"another-project"}] as RoomSummary["sessions"]};await applyArchivedChatAction(rows[0]!,"delete",deps);assert.equal(calls[2],"session:room:old","parked Manager deletion must not switch projects or remove its window");
+ const groupTarget=item("room-session-1",{roomType:"group"});rows=[groupTarget];room={id:"room",pinned:false,type:"group",sessions:[{id:"room-session-1"}],roomSessionIds:["room-session-1"],activeRoomSessionId:"room-session-1"} as RoomSummary;await applyArchivedChatAction(groupTarget,"delete",deps);assert.equal(calls[3],"session:room:room-session-1","group 最后 RoomSession 必须走会话删除，由服务端 409 守住");
 });

@@ -163,7 +163,7 @@ export class RoomTurnService {
 	/** 启动/首次访问时把上一个进程遗留的活回合标成 unknown，等待用户显式 close-unknown。 */
 	async recoverInterrupted(roomSessionId: string, startedAt: string, reason = "进程重启，执行状态未知"): Promise<ParticipantTurn[]> {
 		const active = (await this.deps.turns.list(roomSessionId)).filter((turn) =>
-			["admitted", "running", "reconciling"].includes(turn.status) && turn.updatedAt < startedAt);
+			["admitted", "running", "waiting_input", "reconciling"].includes(turn.status) && turn.updatedAt < startedAt);
 		const recovered: ParticipantTurn[] = [];
 		for (const turn of active) {
 			try {

@@ -53,13 +53,13 @@ export class RoomActivityStore {
 		return next;
 	}
 
-	async record(roomSessionId: string, input: { eventId: string; at: string; preview: string }): Promise<RoomSessionActivityEntry> {
+	async record(roomSessionId: string, input: { eventId: string; at: string; preview: string; unread?: boolean }): Promise<RoomSessionActivityEntry> {
 		if (!SAFE_ID.test(roomSessionId)) throw new Error("invalid room session id");
 		return this.serialize(async () => {
 			const state = await this.read();
 			const previous = state.revisions[roomSessionId];
 			const entry: RoomSessionActivityEntry = {
-				revision: (previous?.revision ?? 0) + 1,
+				revision: input.unread === false ? (previous?.revision ?? 0) : (previous?.revision ?? 0) + 1,
 				lastActivityAt: input.at,
 				lastMessagePreview: input.preview.slice(0, 200),
 				lastEventId: input.eventId,
@@ -81,12 +81,13 @@ export class RoomActivityStore {
 		});
 	}
 
-	async markRead(roomSessionId: string): Promise<{ readRevision: number; hasUnreadActivity: boolean; entry?: RoomSessionActivityEntry }> {
+	async markRead(roomSessionId: string, expectedRevision?: number): Promise<{ readRevision: number; hasUnreadActivity: boolean; entry?: RoomSessionActivityEntry }> {
 		if (!SAFE_ID.test(roomSessionId)) throw new Error("invalid room session id");
 		return this.serialize(async () => {
 			const state = await this.read();
 			const entry = state.revisions[roomSessionId];
 			const revision = entry?.revision ?? 0;
+			if (expectedRevision !== undefined && revision > expectedRevision) throw new Error(`activity revision changed: expected ${expectedRevision}, actual ${revision}`);
 			state.reads[roomSessionId] = { revision, readAt: new Date().toISOString() };
 			await this.write(state);
 			return { readRevision: revision, hasUnreadActivity: false, ...(entry ? { entry } : {}) };

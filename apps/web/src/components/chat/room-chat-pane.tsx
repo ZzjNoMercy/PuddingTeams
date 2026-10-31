@@ -23,6 +23,13 @@ import { agentDisplayName } from "@/lib/types";
  * 群聊房间时间线：只消费 RoomEvent/PublicTurn，不读 Manager 私有 JSONL。
  * 首期 UI 提供结构化 @（成员按钮）、发送、停止与 unknown 解除。
  */
+function mergeEvents(previous: RoomEventView[], next: RoomEventView[]): RoomEventView[] {
+	if (!previous.length) return next;
+	const byId = new Map(previous.map((event) => [event.id, event]));
+	for (const event of next) byId.set(event.id, event);
+	return [...byId.values()].sort((a, b) => a.seq - b.seq);
+}
+
 export function RoomChatPane({
 	room,
 	requestedSessionId,
@@ -60,7 +67,7 @@ export function RoomChatPane({
 		if (!roomSessionId) { setTimeline(null); return; }
 		try {
 			const next = await fetchRoomTimeline(room.id, roomSessionId);
-			setTimeline(next);
+			setTimeline((current) => current ? { ...next, events: mergeEvents(current.events, next.events), lastEventSeq: Math.max(current.lastEventSeq, next.lastEventSeq) } : next);
 			setError(null);
 			void markRoomSessionRead(room.id, roomSessionId);
 		} catch (caught) {
@@ -83,7 +90,12 @@ export function RoomChatPane({
 					event?: RoomEventView; turn?: RoomPublicTurn; message?: string;
 				};
 				if (payload.type === "room_ready" && payload.snapshot) {
-					setTimeline((current) => current ? { ...current, events: payload.snapshot!.events ?? current.events, ...(payload.snapshot!.activeTurn ? { activeTurn: payload.snapshot!.activeTurn } : {}) } : current);
+					setTimeline((current) => current ? {
+						...current,
+						events: mergeEvents(current.events, payload.snapshot!.events ?? []),
+						activeTurn: payload.snapshot!.activeTurn,
+						lastEventSeq: Math.max(current.lastEventSeq, ...(payload.snapshot!.events ?? []).map((event) => event.seq), 0),
+					} : current);
 					return;
 				}
 				if (payload.type === "room_event" && payload.event) {
@@ -198,7 +210,7 @@ export function RoomChatPane({
 					</SelectContent>
 				</Select>
 				<div className="ml-auto flex items-center gap-2">
-					<Button size="sm" variant="outline" onClick={() => void handleFork()}>Fork</Button>
+					<Button size="sm" variant="outline" disabled={Boolean(activeTurn)} onClick={() => void handleFork()}>Fork</Button>
 					{activeTurn ? <Button size="sm" variant="outline" onClick={() => void handleStop()}>停止</Button> : null}
 					{activeTurn && ["unknown", "reconciling"].includes(activeTurn.status)
 						? <Button size="sm" variant="outline" onClick={() => void handleCloseUnknown()}>确认无运行</Button> : null}

@@ -14,6 +14,7 @@ export async function applyArchivedChatAction(item: ChatNavigationItem, action: 
  }
  if (action === "restore") { await deps.update(item.roomId, item.sessionId, { archived: false }); return; }
  const room = await deps.room(item.roomId);
- if (!room.pinned && room.sessions.length === 1 && room.sessions[0]?.id === item.sessionId) await deps.removeRoom(item.roomId, item.sessionId);
+ // group 的最后 RoomSession 不能通过“整房 onlySession”删除；统一走会话删除，让服务端守住 409。
+ if (room.type !== "group" && !room.pinned && room.sessions.length === 1 && room.sessions[0]?.id === item.sessionId) await deps.removeRoom(item.roomId, item.sessionId);
  else await deps.removeSession(item.roomId, item.sessionId);
 }

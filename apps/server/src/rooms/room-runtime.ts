@@ -139,6 +139,8 @@ export function createRoomRuntime(input: {
 		recoverPending: async (roomSessionId) => {
 			const recovered = await turnService.recoverInterrupted(roomSessionId, startedAt);
 			for (const turn of recovered) bus.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(turn) });
+			// 补齐崩溃在“终态已写、公共投影未写”之间的 final/terminal。
+			await turnService.recoverPending(roomSessionId).catch(() => []);
 			return recovered.length;
 		},
 		abort: async (roomSessionId) => {
@@ -152,7 +154,11 @@ export function createRoomRuntime(input: {
 			}
 			const cancelled = await turnService.cancel(roomSessionId, active.id, "用户停止");
 			const projection = await turnService.project(roomSessionId, cancelled.id);
-			if (projection.event) bus.publish(roomSessionId, { type: "room_event", event: projection.event });
+			if (projection.event) {
+				bus.publish(roomSessionId, { type: "room_event", event: projection.event });
+				try { await input.activity?.record(roomSessionId, { eventId: projection.event.id, at: projection.event.createdAt, preview: projection.event.content }); }
+				catch { /* read model only */ }
+			}
 			bus.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(projection.turn) });
 			return { turnId: cancelled.id, status: cancelled.status };
 		},

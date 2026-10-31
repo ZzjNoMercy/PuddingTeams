@@ -183,6 +183,11 @@ async function buildWindowSummary(
 	const latestRoomStatus = w.type === "group"
 		? [...roomActivityStatuses.values()].sort((a, b) => (b.entry?.lastActivityAt ?? "").localeCompare(a.entry?.lastActivityAt ?? ""))[0]
 		: undefined;
+	const unreadRoom = w.type === "group"
+		? [...roomActivityStatuses.entries()]
+			.filter(([, status]) => status.hasUnreadActivity)
+			.sort((a, b) => (b[1].entry?.lastActivityAt ?? "").localeCompare(a[1].entry?.lastActivityAt ?? ""))[0]
+		: undefined;
 	return {
 		id: w.id,
 		type: w.type,
@@ -190,10 +195,11 @@ async function buildWindowSummary(
 		firstMessage: byId.get(ids[0]!)?.firstMessage ?? "",
 		modifiedAt: (w.type === "group" ? latestRoomStatus?.entry?.lastActivityAt : undefined) ?? activity.lastActivityAt ?? w.createdAt,
 		...activity,
-		activitySessionId: w.type === "group" ? (w.activeRoomSessionId ?? null) : (read.unreadSessionId ?? activity.activitySessionId),
-		lastMessagePreview: (w.type === "group" ? activeRoomStatus?.entry?.lastMessagePreview : undefined) ?? read.unreadPreview ?? activity.lastMessagePreview,
+		activitySessionId: w.type === "group" ? (unreadRoom?.[0] ?? w.activeRoomSessionId ?? null) : (read.unreadSessionId ?? activity.activitySessionId),
+		lastMessagePreview: (w.type === "group" ? (unreadRoom?.[1].entry?.lastMessagePreview ?? activeRoomStatus?.entry?.lastMessagePreview) : undefined) ?? read.unreadPreview ?? activity.lastMessagePreview,
 		readRevision: w.type === "group" ? (activeRoomStatus?.readRevision ?? 0) : read.readRevision,
-		hasUnreadActivity: w.type === "group" ? (activeRoomStatus?.hasUnreadActivity ?? false) : read.hasUnreadActivity,
+		hasUnreadActivity: w.type === "group" ? Boolean(unreadRoom) : read.hasUnreadActivity,
+		activityRevision: w.type === "group" ? (activeRoomStatus?.entry?.revision ?? 0) : activity.activityRevision,
 		members,
 		sessions: roomSummaries ?? ids.map((id) => {
 			const info = byId.get(id);
@@ -426,7 +432,25 @@ export function registerRoomsRoutes(
 		if (!Number.isSafeInteger(req.body?.activityRevision) || (req.body?.activityRevision ?? -1) < 0) {
 			return reply.code(400).send({ error: "activityRevision 必须是非负整数" });
 		}
-		if (typeof req.body?.sessionId !== "string" || !w.sessions.includes(req.body.sessionId)) {
+		if (typeof req.body?.sessionId !== "string") {
+			return reply.code(400).send({ error: "sessionId 必须属于该房间" });
+		}
+		if (w.type === "group") {
+			if (!roomActivity) return reply.code(503).send({ error: "room activity store is not configured" });
+			const room = await teams.roomSession(req.body.sessionId);
+			const participant = room ? undefined : await teams.participantSession(req.body.sessionId);
+			const roomSessionId = room?.roomSessionId ?? participant?.roomSessionId;
+			if (!roomSessionId || (room && room.roomId !== w.id) || (participant && participant.roomId !== w.id)) {
+				return reply.code(400).send({ error: "sessionId 必须属于该房间" });
+			}
+			try {
+				const status = await roomActivity.markRead(roomSessionId, req.body.activityRevision);
+				return { readRevision: status.readRevision, activityRevision: status.entry?.revision ?? 0, hasUnreadActivity: status.hasUnreadActivity };
+			} catch (error) {
+				return reply.code(409).send({ error: error instanceof Error ? error.message : String(error) });
+			}
+		}
+		if (!w.sessions.includes(req.body.sessionId)) {
 			return reply.code(400).send({ error: "sessionId 必须属于该房间" });
 		}
 		try {
@@ -843,6 +867,9 @@ export function registerRoomsRoutes(
 		const w = await teams.getWindow(req.params.id);
 		if (!w) return reply.code(404).send({ error: "window not found" });
 		if (w.pinned) return reply.code(405).send({ error: "solo 窗口不可删除" });
+		if (w.type === "group" && req.query.onlySession !== undefined) {
+			return reply.code(409).send({ error: "群聊请按 RoomSession 删除；最后一个 RoomSession 不可单独删除", code: "last_room_session" });
+		}
 		try {
 			const remove = async () => {
 				const current = await teams.getWindow(req.params.id);
@@ -1042,6 +1069,7 @@ export function registerRoomsRoutes(
 			});
 			socket.on("close", unsubscribe);
 			socket.on("error", unsubscribe);
+			await roomRuntime.recoverPending(req.params.sid);
 			try {
 				const events = await roomEvents.read(req.params.sid);
 				const turns = await roomRuntime.turns.list(req.params.sid);
@@ -1076,19 +1104,29 @@ export function registerRoomsRoutes(
 				return reply.code(400).send({ error: "throughEventSeq 必须是正整数", code: "invalid_cutoff" });
 			}
 			const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+			const active = (await roomTurns?.list(req.params.sid) ?? []).find((turn) =>
+				["admitted", "running", "waiting_input", "reconciling", "unknown"].includes(turn.status));
+			if (active) return reply.code(409).send({ error: `房间回合进行中，不能 Fork：${active.id}`, code: "room_turn_active" });
+			let sourceEvents: RoomEvent[];
+			try { sourceEvents = await roomEvents.read(req.params.sid); }
+			catch (error) { return reply.code(503).send({ error: error instanceof Error ? error.message : String(error), code: "room_recovery_required" }); }
+			const cutoffSeq = throughSeq === undefined ? (sourceEvents.at(-1)?.seq ?? 0) : throughSeq as number;
+			if (cutoffSeq > (sourceEvents.at(-1)?.seq ?? 0)) return reply.code(400).send({ error: "throughEventSeq 超出房间末条事件", code: "invalid_cutoff" });
+			if (sourceEvents.some((event) => event.seq <= cutoffSeq && event.attachments?.length)) {
+				return reply.code(409).send({ error: "源房间在 Fork 范围内含附件；附件独立快照尚未接通", code: "fork_attachments_unsupported" });
+			}
 			const managerSessionId = randomUUID();
 			const roomSessionId = randomUUID();
 			let createdSession: Awaited<ReturnType<PiSessionStore["create"]>> | undefined;
-			let roomCreated = false;
 			try {
 				createdSession = await sessions.create(undefined, await contextFor(source.window), managerSessionId, { ownerAgentId: MANAGER_AGENT_NAME });
-				await roomEvents.fork(req.params.sid, roomSessionId, throughSeq === undefined ? {} : { throughSeq: throughSeq as number });
+				await roomEvents.fork(req.params.sid, roomSessionId, { throughSeq: cutoffSeq });
 				await ensureRoomSessionRecord(source.window, createdSession.id, { roomSessionId });
-				roomCreated = true;
 				if (name) await teams.renameRoomSession(roomSessionId, name);
 				return reply.code(201).send({ roomSessionId, managerAgentSessionId: createdSession.id });
 			} catch (error) {
-				if (roomCreated) await teams.removeRoomSession(req.params.id, roomSessionId).catch(() => undefined);
+				// addRoomSession 可能已提交但后续 ledger 失败；无条件尝试按房间回滚。
+				await teams.removeRoomSession(req.params.id, roomSessionId).catch(() => undefined);
 				await roomEvents.remove(roomSessionId).catch(() => undefined);
 				if (createdSession) await sessions.remove(createdSession.id).catch(() => undefined);
 				const message = error instanceof Error ? error.message : String(error);
@@ -1185,7 +1223,7 @@ export function registerRoomsRoutes(
 			lastEventSeq: events.at(-1)?.seq ?? 0,
 			executionProjections: [],
 			queuedInputs: [],
-			activityRevision: 0,
+			activityRevision: roomActivity ? (await roomActivity.status(req.params.sid)).entry?.revision ?? 0 : 0,
 			capabilities: {
 				canSend: !publicActiveTurn && !recoveryReason,
 				canStop: Boolean(publicActiveTurn),

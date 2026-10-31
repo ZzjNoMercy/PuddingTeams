@@ -149,6 +149,12 @@ export class RoomMessageRouter {
 
 	constructor(private readonly deps: RoomMessageRouterDeps) {}
 
+	/** 活动读模型不得阻断准入/投影；失败只丢投影，重启可重建。 */
+	private async recordActivity(roomSessionId: string, event: RoomEvent, unread = true): Promise<void> {
+		try { await this.deps.activity?.record(roomSessionId, { eventId: event.id, at: event.createdAt, preview: event.content, unread }); }
+		catch { /* read model only */ }
+	}
+
 	private now(): string {
 		return this.deps.now?.() ?? new Date().toISOString();
 	}
@@ -251,7 +257,7 @@ export class RoomMessageRouter {
 			const userEvent = await this.deps.events.append(input.roomSessionId, draft);
 			await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "user_event_appended", { roomEventId: userEvent.id });
 			this.deps.bus?.publish(input.roomSessionId, { type: "room_event", event: userEvent });
-			await this.deps.activity?.record(input.roomSessionId, { eventId: userEvent.id, at: userEvent.createdAt, preview: content });
+			await this.recordActivity(input.roomSessionId, userEvent, false);
 
 			const begun = await this.deps.turnService.begin({
 				roomSessionId: input.roomSessionId,
@@ -330,7 +336,7 @@ export class RoomMessageRouter {
 				const projection = await this.deps.turnService.project(roomSessionId, completed.id);
 				if (projection.event) {
 					this.deps.bus?.publish(roomSessionId, { type: "room_event", event: projection.event });
-					await this.deps.activity?.record(roomSessionId, { eventId: projection.event.id, at: projection.event.createdAt, preview: projection.event.content });
+					await this.recordActivity(roomSessionId, projection.event);
 				}
 				this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(projection.turn) });
 				return;
@@ -340,7 +346,7 @@ export class RoomMessageRouter {
 				const projection = await this.deps.turnService.project(roomSessionId, cancelled.id);
 				if (projection.event) {
 					this.deps.bus?.publish(roomSessionId, { type: "room_event", event: projection.event });
-					await this.deps.activity?.record(roomSessionId, { eventId: projection.event.id, at: projection.event.createdAt, preview: projection.event.content });
+					await this.recordActivity(roomSessionId, projection.event);
 				}
 				this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(projection.turn) });
 				return;
@@ -354,7 +360,7 @@ export class RoomMessageRouter {
 			const projection = await this.deps.turnService.project(roomSessionId, failed.id);
 			if (projection.event) {
 				this.deps.bus?.publish(roomSessionId, { type: "room_event", event: projection.event });
-				await this.deps.activity?.record(roomSessionId, { eventId: projection.event.id, at: projection.event.createdAt, preview: projection.event.content });
+				await this.recordActivity(roomSessionId, projection.event);
 			}
 			this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(projection.turn) });
 		})().finally(() => {
@@ -374,6 +380,7 @@ export class RoomMessageRouter {
 
 	async closeUnknown(roomSessionId: string, turnId: string, reason: string): Promise<ProjectionResult> {
 		const closed = await this.deps.turnService.closeUnknown(roomSessionId, turnId, reason);
+		if (closed.projection.event) await this.recordActivity(roomSessionId, closed.projection.event);
 		return closed.projection;
 	}
 

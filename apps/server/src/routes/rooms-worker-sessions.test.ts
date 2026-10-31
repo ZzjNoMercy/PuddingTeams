@@ -245,7 +245,7 @@ test("parked 上下文里的归档会话可删除：活跃上下文不受影响�
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("v4 HTTP: group Manager PS 不能经 Agent API 删除；单 RoomSession 整房删除可用", async () => {
+test("v4 HTTP: group Manager PS 不能经 Agent API 删除；最后 RoomSession 不能 onlySession 整房删除", async () => {
 	const { app, teams, sessions, dir } = await makeStack();
 	try {
 		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
@@ -275,8 +275,9 @@ test("v4 HTTP: group Manager PS 不能经 Agent API 删除；单 RoomSession 整
 		assert.equal(roomDeleteByManager.statusCode, 409, roomDeleteByManager.body);
 
 		const wholeRoom = await app.inject({ method: "DELETE", url: `/api/rooms/${room.id}?onlySession=${roomSessionId}` });
-		assert.equal(wholeRoom.statusCode, 204, wholeRoom.body);
-		assert.equal(await teams.getWindow(room.id), undefined);
+		assert.equal(wholeRoom.statusCode, 409, wholeRoom.body);
+		assert.equal(wholeRoom.json().code, "last_room_session");
+		assert.ok(await teams.getWindow(room.id));
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -514,13 +515,13 @@ test("v4 HTTP: 房间活动/未读投影与已读", async () => {
 			await new Promise((resolve) => setTimeout(resolve, 20));
 		}
 		let activity = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/activity` });
-		for (let attempt = 0; attempt < 50 && activity.json().entry?.revision !== 2; attempt += 1) {
+		for (let attempt = 0; attempt < 50 && activity.json().entry?.revision !== 1; attempt += 1) {
 			await new Promise((resolve) => setTimeout(resolve, 20));
 			activity = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/activity` });
 		}
 		assert.equal(activity.statusCode, 200, activity.body);
 		assert.equal(activity.json().hasUnreadActivity, true);
-		assert.equal(activity.json().entry.revision, 2);
+		assert.equal(activity.json().entry.revision, 1, "自己的消息不制造新未读；仅 Agent final 推进 revision");
 		const summary = (await app.inject({ method: "GET", url: `/api/rooms/${room.id}` })).json().room as RoomSummary;
 		assert.equal(summary.hasUnreadActivity, true);
 		assert.equal(summary.activitySessionId, roomSessionId);
@@ -619,4 +620,57 @@ test("v4 HTTP: 删除 RoomSession 清理事件目录与活动投影", async () =
 		assert.equal(Object.hasOwn(activityRaw.revisions, roomSessionId), false);
 		assert.equal(Object.hasOwn(activityRaw.reads, roomSessionId), false);
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("v4 HTTP: group 最后一个 RoomSession 不能经 onlySession 删除整房", async () => {
+	const { app, teams, sessions, dir } = await makeStack();
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		const room = created.json().room as RoomSummary;
+		const roomSessionId = room.roomSessionIds![0]!;
+		const manager = (await teams.managerSession(room.id))!;
+		const denied = await app.inject({ method: "DELETE", url: `/api/rooms/${room.id}?onlySession=${roomSessionId}` });
+		assert.equal(denied.statusCode, 409, denied.body);
+		assert.equal(denied.json().code, "last_room_session");
+		assert.ok(await teams.getWindow(room.id));
+		assert.ok(await teams.roomSession(roomSessionId));
+		assert.ok(await teams.participantSession(manager));
+		assert.equal(existsSync(path.join(dir, "state", "room-sessions", roomSessionId, "events.jsonl")), true);
+	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("v4 HTTP: Fork 在活动回合时 409，含附件时 409", async () => {
+	let release!: () => void;
+	const pending = new Promise<void>((resolve) => { release = resolve; });
+	const { app, teams, sessions, dir } = await makeStack({
+		run: async (input) => { await input.markInputDurable(); await pending; return { status: "completed", finalContent: "结束" }; },
+	});
+	try {
+		await teams.upsertAgent({ name: "beta", description: "beta", invoke: { type: "command", command: "beta", runArgs: [] } });
+		const created = await app.inject({ method: "POST", url: "/api/rooms", headers: { "idempotency-key": randomUUID() }, payload: { type: "group", members: ["alpha", "beta"] } });
+		const room = created.json().room as RoomSummary;
+		const roomSessionId = room.roomSessionIds![0]!;
+		const sent = await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/messages`,
+			headers: { "idempotency-key": randomUUID() }, payload: { content: "运行中", mentions: ["alpha"] },
+		});
+		assert.equal(sent.statusCode, 202, sent.body);
+		const blocked = await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/fork`, payload: {} });
+		assert.equal(blocked.statusCode, 409, blocked.body);
+		assert.equal(blocked.json().code, "room_turn_active");
+		release();
+		await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/abort` });
+
+		const attached = await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/messages`,
+			headers: { "idempotency-key": randomUUID() },
+			payload: { content: "带附件", mentions: ["alpha"], attachments: [{ filename: "a.txt", mediaType: "text/plain", data: Buffer.from("x").toString("base64") }] },
+		});
+		assert.equal(attached.statusCode, 202, attached.body);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		const attachmentFork = await app.inject({ method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/fork`, payload: {} });
+		assert.equal(attachmentFork.statusCode, 409, attachmentFork.body);
+		assert.equal(attachmentFork.json().code, "fork_attachments_unsupported");
+	} finally { release(); await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });
