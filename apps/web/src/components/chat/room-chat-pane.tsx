@@ -78,7 +78,7 @@ export function RoomChatPane({
 	const [boundaryDraft, setBoundaryDraft] = useState("");
 	const [creatingGoal, setCreatingGoal] = useState(false);
 	const [replacingGoal, setReplacingGoal] = useState(false);
-	const [targetAgentId, setTargetAgentId] = useState<string | null>(null);
+	const [targetAgentIds, setTargetAgentIds] = useState<string[]>([]);
 	const bottomRef = useRef<HTMLDivElement | null>(null);
 	const loadGeneration = useRef(0);
 	const forkKeyRef = useRef<string | null>(null);
@@ -193,7 +193,11 @@ export function RoomChatPane({
 		const content = draft.trim();
 		if (!content || !roomSessionId || !canSend) return;
 		const activeAgentId = activeTurn ? timeline?.participants.find((item) => item.agentSessionId === activeTurn.agentSessionId)?.agentId : undefined;
-		if (activeTurn && targetAgentId && activeAgentId && targetAgentId !== activeAgentId) {
+		if (activeTurn && targetAgentIds.length > 1) {
+			toast.error("followUp 只能发给当前回合的单个 Participant");
+			return;
+		}
+		if (activeTurn && targetAgentIds[0] && activeAgentId && targetAgentIds[0] !== activeAgentId) {
 			toast.error(`当前回合属于 @${agentDisplayName(room.members.find((member) => member.name === activeAgentId) ?? { name: activeAgentId })}，followUp 只能发给同一 Participant`);
 			return;
 		}
@@ -201,7 +205,7 @@ export function RoomChatPane({
 		try {
 			await sendRoomMessage(room.id, roomSessionId, {
 				content,
-				mentions: targetAgentId ? [targetAgentId] : [],
+				mentions: targetAgentIds,
 				...(activeTurn && activeBusyInputs.includes("followUp")
 					? { delivery: "followUp" as const, expectedParticipantTurnId: activeTurn.id }
 					: {}),
@@ -210,7 +214,7 @@ export function RoomChatPane({
 		} catch (caught) {
 			toast.error(caught instanceof Error ? caught.message : String(caught));
 		} finally { setSending(false); }
-	}, [activeBusyInputs, activeTurn, canSend, draft, room.id, roomSessionId, targetAgentId, timeline?.participants, room.members]);
+	}, [activeBusyInputs, activeTurn, canSend, draft, room.id, roomSessionId, targetAgentIds, timeline?.participants, room.members]);
 
 	const handleStop = useCallback(async () => {
 		if (!roomSessionId) return;
@@ -349,9 +353,9 @@ export function RoomChatPane({
 			<div className="border-t border-border/70 px-5 py-3">
 				<div className="mb-2 flex flex-wrap items-center gap-1.5">
 					<span className="text-xs text-muted-foreground">发送给</span>
-					<Button size="sm" variant={targetAgentId === null ? "secondary" : "outline"} onClick={() => setTargetAgentId(null)}>Manager</Button>
+					<Button size="sm" variant={targetAgentIds.length === 0 ? "secondary" : "outline"} onClick={() => setTargetAgentIds([])}>Manager</Button>
 					{room.members.map((member) => (
-						<Button key={member.name} size="sm" variant={targetAgentId === member.name ? "secondary" : "outline"} onClick={() => setTargetAgentId(member.name)}>@{agentDisplayName(member)}</Button>
+						<Button key={member.name} size="sm" variant={targetAgentIds.includes(member.name) ? "secondary" : "outline"} onClick={() => setTargetAgentIds((current) => current.includes(member.name) ? current.filter((name) => name !== member.name) : [...current, member.name])}>@{agentDisplayName(member)}</Button>
 					))}
 				</div>
 				<Textarea

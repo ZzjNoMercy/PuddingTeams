@@ -168,6 +168,14 @@ function effectiveBudget(budget: RoomContextBudget): number {
 
 export class RoomMessageRouter {
 	private readonly executions = new Map<string, Promise<void>>();
+	private readonly fanouts = new Map<string, {
+		roomSessionId: string;
+		sourceEventId: string;
+		operationId: string;
+		targets: RoomParticipantTarget[];
+		nextIndex: number;
+	}>();
+	private readonly turnFanout = new Map<string, string>();
 
 	constructor(private readonly deps: RoomMessageRouterDeps) {}
 
@@ -210,6 +218,20 @@ export class RoomMessageRouter {
 	}
 
 	/** 结构化接收人：首期只接受 0 或 1 个 mention。 */
+	async resolveTargets(roomSessionId: string, mentions: readonly string[]): Promise<RoomParticipantTarget[]> {
+		const unique = [...new Set(mentions)];
+		if (unique.length !== mentions.length) throw new RoomMessageError("invalid_mentions", "mentions 不能重复");
+		if (!unique.length) return [await this.resolveTarget(roomSessionId, [])];
+		const targets: RoomParticipantTarget[] = [];
+		for (const agentId of unique) {
+			let binding = await this.deps.bindings.get(roomSessionId, agentId);
+			if (!binding && this.deps.ensureParticipant) binding = await this.deps.ensureParticipant(roomSessionId, agentId);
+			if (!binding) throw new RoomMessageError("participant_binding_required", `agent ${agentId} 没有可用的 ParticipantSession`);
+			targets.push({ agentId: binding.agentId, agentSessionId: binding.agentSessionId, role: binding.role });
+		}
+		return targets;
+	}
+
 	async resolveTarget(roomSessionId: string, mentions: readonly string[]): Promise<RoomParticipantTarget> {
 		const unique = [...new Set(mentions)];
 		if (unique.length !== mentions.length) throw new RoomMessageError("invalid_mentions", "mentions 不能重复");
@@ -359,6 +381,12 @@ export class RoomMessageRouter {
 				if (!durableMarked) throw new RoomMessageError("message_delivery_unconfirmed", "followUp 输入未确认落盘；请刷新时间线核对");
 				await finalizeAccepted();
 				return { roomEventId: userEvent.id, turnId: active.id, status: appended.turn.status, replayed: false, persistence: "durable" };
+			}
+			const uniqueMentions = [...new Set(input.mentions)];
+			if (uniqueMentions.length > 1) {
+				const activeForFanout = await this.activeTurn(input.roomSessionId);
+				if (activeForFanout) throw new RoomMessageError("room_turn_active", `房间已有未终态公开回合：${activeForFanout.id}`);
+				return await this.sendFanout(input, events, uniqueMentions);
 			}
 			const active = await this.activeTurn(input.roomSessionId);
 			if (active) {
@@ -559,6 +587,122 @@ export class RoomMessageRouter {
 		}
 	}
 
+	/** 多 @：一个用户事件，按 mentions 顺序为每个 Participant 建独立 Turn 执行。 */
+	private async sendFanout(input: SendRoomMessageInput, events: RoomEvent[], mentions: string[]): Promise<SendRoomMessageResult> {
+		const content = input.content.trim();
+		const targets = await this.resolveTargets(input.roomSessionId, mentions);
+		const first = targets[0]!;
+		const binding = await this.deps.bindings.get(input.roomSessionId, first.agentId);
+		if (!binding) throw new RoomMessageError("participant_binding_required", `agent ${first.agentId} 没有 active binding`);
+		const eventId = randomUUID();
+		const sourceIds = await this.knowledgeSourceIds(eventId, binding, content, input.attachments);
+		const draft = {
+			id: eventId, kind: "message" as const, actor: { kind: "user" as const },
+			content, mentions,
+			...(sourceIds ? { knowledgeSourceIds: sourceIds } : {}),
+			...(input.attachments?.length ? { attachments: input.attachments } : {}),
+			createdAt: this.now(),
+		};
+		let context: BuiltRoomContext;
+		try {
+			context = buildRoomContext({
+				roomSessionId: input.roomSessionId, events,
+				...(binding.lastRoomEntryId ? { after: binding.lastRoomEntryId } : {}),
+				current: {
+					eventId, content, mentions,
+					...(input.attachments?.length ? { attachments: input.attachments } : {}),
+					targetAgentName: this.deps.agentNames?.[first.agentId] ?? first.agentId,
+				},
+				maxChars: effectiveBudget(this.deps.budget),
+				...(this.deps.agentNames ? { agentNames: this.deps.agentNames } : {}),
+			});
+		} catch (error) {
+			if (error instanceof RoomContextTooLargeError) throw new RoomMessageError("context_too_large", error.message);
+			throw error;
+		}
+		const reserved = await this.deps.operations.reserveMessage(input.roomSessionId, { key: input.operationId, requestHash: requestHash({ ...input, content }, content) });
+		if (!reserved.created) throw new RoomMessageError("message_delivery_unconfirmed", "消息操作已存在但未确认 accepted");
+		const userEvent = await this.deps.events.append(input.roomSessionId, draft);
+		await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "user_event_appended", { roomEventId: userEvent.id });
+		this.deps.bus?.publish(input.roomSessionId, { type: "room_event", event: userEvent });
+		await this.recordActivity(input.roomSessionId, userEvent, false);
+		const begun = await this.deps.turnService.begin({
+			roomSessionId: input.roomSessionId, agentId: first.agentId, agentSessionId: first.agentSessionId,
+			sourceRoomEventId: userEvent.id, operationId: input.operationId, inputHash: hashText(context.text),
+			...(binding.lastRoomEntryId ? { contextFromAfterRoomEventId: binding.lastRoomEntryId } : {}),
+		});
+		const turn = await this.deps.turnService.start(input.roomSessionId, begun.turn.id);
+		this.deps.bus?.publish(input.roomSessionId, { type: "participant_turn", turn: publicTurn(turn) });
+		await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "participant_bound", {
+			agentSessionId: first.agentSessionId, participantTurnId: turn.id,
+		});
+		this.fanouts.set(input.operationId, { roomSessionId: input.roomSessionId, sourceEventId: userEvent.id, operationId: input.operationId, targets, nextIndex: 1 });
+		this.turnFanout.set(turn.id, input.operationId);
+		let durableMarked = false;
+		let resolveDurable!: () => void;
+		const durableReached = new Promise<void>((resolve) => { resolveDurable = resolve; });
+		const markInputDurable = async (agentUserEntryId?: string) => {
+			if (durableMarked) return;
+			await this.deps.turnService.markInputDurable(input.roomSessionId, turn.id, input.operationId, agentUserEntryId);
+			await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "participant_input_durable");
+			durableMarked = true;
+			resolveDurable();
+		};
+		const execution = this.execute(input.roomSessionId, turn.id, {
+			roomSessionId: input.roomSessionId, turn, binding, prompt: context.text, context, markInputDurable,
+		});
+		await Promise.race([durableReached, execution.then(() => undefined, () => undefined)]);
+		if (!durableMarked) throw new RoomMessageError("message_delivery_unconfirmed", "组合输入未确认落盘；消息已公开，请刷新时间线核对");
+		await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "accepted");
+		return { roomEventId: userEvent.id, turnId: turn.id, status: turn.status, replayed: false };
+	}
+
+	private async continueFanout(turnId: string): Promise<void> {
+		const operationId = this.turnFanout.get(turnId);
+		if (!operationId) return;
+		this.turnFanout.delete(turnId);
+		const plan = this.fanouts.get(operationId);
+		if (!plan) return;
+		const target = plan.targets[plan.nextIndex];
+		if (!target) { this.fanouts.delete(operationId); return; }
+		const index = plan.nextIndex;
+		plan.nextIndex += 1;
+		const binding = await this.deps.bindings.get(plan.roomSessionId, target.agentId);
+		if (!binding) { this.fanouts.delete(operationId); return; }
+		const events = await this.deps.events.read(plan.roomSessionId);
+		const source = events.find((event) => event.id === plan.sourceEventId);
+		if (!source) { this.fanouts.delete(operationId); return; }
+		let context: BuiltRoomContext;
+		try {
+			context = buildRoomContext({
+				roomSessionId: plan.roomSessionId, events,
+				...(binding.lastRoomEntryId ? { after: binding.lastRoomEntryId } : {}),
+				current: {
+					eventId: source.id, content: source.content, mentions: source.mentions,
+					...(source.attachments?.length ? { attachments: source.attachments } : {}),
+					targetAgentName: this.deps.agentNames?.[target.agentId] ?? target.agentId,
+				},
+				maxChars: effectiveBudget(this.deps.budget),
+				...(this.deps.agentNames ? { agentNames: this.deps.agentNames } : {}),
+			});
+		} catch { this.fanouts.delete(operationId); return; }
+		const internalOperationId = `${operationId}::${index}`;
+		const begun = await this.deps.turnService.begin({
+			roomSessionId: plan.roomSessionId, agentId: target.agentId, agentSessionId: target.agentSessionId,
+			sourceRoomEventId: source.id, operationId: internalOperationId, inputHash: hashText(context.text),
+			...(binding.lastRoomEntryId ? { contextFromAfterRoomEventId: binding.lastRoomEntryId } : {}),
+		});
+		const turn = await this.deps.turnService.start(plan.roomSessionId, begun.turn.id);
+		this.deps.bus?.publish(plan.roomSessionId, { type: "participant_turn", turn: publicTurn(turn) });
+		this.turnFanout.set(turn.id, operationId);
+		void this.execute(plan.roomSessionId, turn.id, {
+			roomSessionId: plan.roomSessionId, turn, binding, prompt: context.text, context,
+			markInputDurable: async (agentUserEntryId?: string) => {
+				await this.deps.turnService.markInputDurable(plan.roomSessionId, turn.id, internalOperationId, agentUserEntryId);
+			},
+		});
+	}
+
 	private execute(roomSessionId: string, turnId: string, runnerInput: RoomParticipantRunnerInput): Promise<void> {
 		const key = this.executionKey(roomSessionId, turnId);
 		const run: Promise<void> = (async () => {
@@ -614,6 +758,7 @@ export class RoomMessageRouter {
 							await this.recordActivity(roomSessionId, projection.event);
 						}
 						this.deps.bus?.publish(roomSessionId, { type: "participant_turn", turn: publicTurn(projection.turn) });
+						void this.continueFanout(turnId);
 						return true;
 					});
 					if (finished) return;

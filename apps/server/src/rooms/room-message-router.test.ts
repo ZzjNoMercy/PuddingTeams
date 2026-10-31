@@ -198,15 +198,15 @@ test("RoomMessageRouter: runner 未确认输入就失败→不返回 accepted，
 	assert.equal((await events.read(ROOM))[1]!.kind, "terminal");
 });
 
-test("RoomMessageRouter: mentions 非法/多目标不路由，也不写事件", async () => {
+test("RoomMessageRouter: mentions 重复/未知目标不路由，也不写事件", async () => {
 	const { events, router } = await makeRouter({ bindings: "all" });
 	await assert.rejects(
 		() => router.send({ roomSessionId: ROOM, content: "x", mentions: ["worker-a", "worker-a"], operationId: "op-message-1" }),
 		(error: unknown) => error instanceof RoomMessageError && error.code === "invalid_mentions",
 	);
 	await assert.rejects(
-		() => router.send({ roomSessionId: ROOM, content: "x", mentions: ["worker-a", "worker-b"], operationId: "op-message-2" }),
-		(error: unknown) => error instanceof RoomMessageError && error.code === "invalid_mentions",
+		() => router.send({ roomSessionId: ROOM, content: "x", mentions: ["worker-a", "worker-x"], operationId: "op-message-2" }),
+		(error: unknown) => error instanceof RoomMessageError && error.code === "participant_binding_required",
 	);
 	assert.equal((await events.read(ROOM)).length, 0);
 });
@@ -447,4 +447,30 @@ test("RoomMessageRouter: 附件也写入知识来源并共享 room origin", asyn
 	assert.deepEqual(event?.knowledgeSourceIds, ["text-source", "upload-source"]);
 	assert.equal(origins[0]?.roomSessionId, ROOM);
 	assert.equal(origins[0]?.sourceRoomEventId, event?.id);
+});
+
+test("RoomMessageRouter: 多 @ 为一个用户事件顺序创建多个 ParticipantTurn", async () => {
+	const { events, turns, bindings, router } = await makeRouter({ bindings: "all" });
+	await bindings.ensure({ roomId: ROOM_ID, roomSessionId: ROOM, agentId: "worker-b", role: "worker", agentSessionId: "agent-worker-b", cwdSnapshot: "/workspace" });
+	const runner: RoomParticipantRunner = {
+		run: async (input) => {
+			await input.markInputDurable(`entry-${input.binding.agentId}`);
+			return { status: "completed", finalContent: `${input.binding.agentId} 的结论` };
+		},
+	};
+	(router as unknown as { deps: { runner: RoomParticipantRunner } }).deps.runner = runner;
+	const accepted = await router.send({ roomSessionId: ROOM, content: "两位都看下", mentions: ["worker-a", "worker-b"], operationId: "op-fanout-1" });
+	assert.ok(accepted.turnId);
+	for (let attempt = 0; attempt < 100; attempt += 1) {
+		const list = await turns.list(ROOM);
+		if (list.length === 2 && list.every((turn) => turn.status === "completed")) break;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	const list = await turns.list(ROOM);
+	assert.equal(list.length, 2);
+	assert.deepEqual(list.map((turn) => turn.agentSessionId).sort(), ["agent-worker-a", "agent-worker-b"]);
+	const stored = await events.read(ROOM);
+	assert.equal(stored.filter((event) => event.actor.kind === "user").length, 1);
+	assert.deepEqual(stored.find((event) => event.actor.kind === "user")?.mentions, ["worker-a", "worker-b"]);
+	assert.deepEqual(stored.filter((event) => event.actor.kind === "agent").map((event) => event.content).sort(), ["worker-a 的结论", "worker-b 的结论"]);
 });
