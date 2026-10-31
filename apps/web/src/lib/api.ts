@@ -2736,12 +2736,16 @@ export async function sendRoomMessage(
 	return { accepted: true, roomEventId: body!.roomEventId!, participantTurnId: body!.participantTurnId! };
 }
 
-export async function fetchRoomGoal(roomId: string, roomSessionId: string): Promise<{ goal: string; completionBoundary: string; status: string; goalId: string } | null> {
+export async function fetchRoomGoal(roomId: string, roomSessionId: string): Promise<{ goal: string; completionBoundary: string; status: string; goalId: string; revision: number; managerParticipantSessionId: string } | null> {
 	const res = await fetch(`${SERVER_URL}/api/rooms/${encodeURIComponent(roomId)}/sessions/${encodeURIComponent(roomSessionId)}/goal`);
-	const body = (await res.json().catch(() => null)) as { goal?: { goal?: string; completionBoundary?: string; status?: string; goalId?: string } | null; error?: string } | null;
+	const body = (await res.json().catch(() => null)) as { goal?: { goal?: string; completionBoundary?: string; status?: string; goalId?: string; revision?: number } | null; managerParticipantSessionId?: string; error?: string } | null;
 	if (!res.ok) throw new Error(body?.error ?? `load room goal failed: ${res.status}`);
 	if (!body?.goal?.goal) return null;
-	return { goal: body.goal.goal, completionBoundary: body.goal.completionBoundary ?? "", status: body.goal.status ?? "active", goalId: body.goal.goalId ?? "" };
+	return {
+		goal: body.goal.goal, completionBoundary: body.goal.completionBoundary ?? "",
+		status: body.goal.status ?? "active", goalId: body.goal.goalId ?? "",
+		revision: body.goal.revision ?? 0, managerParticipantSessionId: body.managerParticipantSessionId ?? "",
+	};
 }
 
 export async function forkRoomSession(roomId: string, roomSessionId: string, options: { throughEventSeq?: number; name?: string; operationKey?: string } = {}): Promise<{ roomSessionId: string; managerAgentSessionId: string }> {

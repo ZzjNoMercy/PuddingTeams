@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
+	abandonGoal,
 	abortRoomTurn,
 	closeUnknownRoomTurn,
 	fetchRoomGoal,
@@ -59,7 +60,7 @@ export function RoomChatPane({
 	const [roomSessionId, setRoomSessionId] = useState(resolveSessionId);
 
 	const [timeline, setTimeline] = useState<RoomTimelineSnapshot | null>(null);
-	const [goal, setGoal] = useState<{ goal: string; completionBoundary: string; status: string; goalId: string } | null>(null);
+	const [goal, setGoal] = useState<{ goal: string; completionBoundary: string; status: string; goalId: string; revision: number; managerParticipantSessionId: string } | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const loading = timeline === null && error === null;
 	const [draft, setDraft] = useState("");
@@ -254,6 +255,15 @@ export function RoomChatPane({
 					<span className="font-medium">Goal</span> · {goal.goal}
 					<span className="ml-2 text-muted-foreground">验收：{goal.completionBoundary}</span>
 					<span className="ml-2 text-muted-foreground">{goal.status}</span>
+				<Button
+					size="sm" variant="ghost" className="ml-2 h-6 px-2 text-xs"
+					onClick={() => {
+						if (!goal.managerParticipantSessionId) return;
+						void abandonGoal(goal.managerParticipantSessionId, goal.goalId, goal.revision, "用户在房间放弃 Goal")
+							.then(() => { toast.success("Goal 已放弃"); void load(); })
+							.catch((caught: unknown) => toast.error(caught instanceof Error ? caught.message : String(caught)));
+					}}
+				>放弃 Goal</Button>
 				</div>
 			) : null}
 			{recoveryRequired ? (
