@@ -442,14 +442,12 @@ export class RoomMessageRouter {
 
 			const eventId = randomUUID();
 			const mentions = [...new Set(input.mentions)];
-			const sourceIds = await this.knowledgeSourceIds(eventId, binding, content, input.attachments);
 			const draft = {
 				id: eventId,
 				kind: "message" as const,
 				actor: { kind: "user" as const },
 				content,
 				mentions,
-				...(sourceIds ? { knowledgeSourceIds: sourceIds } : {}),
 				...(input.attachments?.length ? { attachments: input.attachments } : {}),
 				createdAt: this.now(),
 			};
@@ -476,7 +474,10 @@ export class RoomMessageRouter {
 
 			const reserved = await this.deps.operations.reserveMessage(input.roomSessionId, { key: input.operationId, requestHash: hash });
 			if (!reserved.created) throw new RoomMessageError("message_delivery_unconfirmed", "消息操作已存在但未确认 accepted");
-			const userEvent = await this.deps.events.append(input.roomSessionId, draft);
+			// 先完成预算与 operation 预留，再冻结知识来源，避免 422/冲突留下孤儿 source。
+			const sourceIds = await this.knowledgeSourceIds(eventId, binding, content, input.attachments);
+			const eventDraft = sourceIds ? { ...draft, knowledgeSourceIds: sourceIds } : draft;
+			const userEvent = await this.deps.events.append(input.roomSessionId, eventDraft);
 			await this.deps.operations.advanceMessage(input.roomSessionId, input.operationId, "user_event_appended", { roomEventId: userEvent.id });
 			this.deps.bus?.publish(input.roomSessionId, { type: "room_event", event: userEvent });
 			await this.recordActivity(input.roomSessionId, userEvent, false);

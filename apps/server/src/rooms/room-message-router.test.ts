@@ -514,3 +514,17 @@ test("RoomMessageRouter: fanout 首个失败后剩余目标落显式 skipped 终
 	assert.match(terminal.map((event) => event.content).join("\n"), /worker-c/);
 	assert.equal((await turns.list(ROOM)).length, 1, "失败后不应再创建后续 Turn");
 });
+
+test("RoomMessageRouter: 上下文超预算时不创建知识来源", async () => {
+	const { router } = await makeRouter({ bindings: "all", budget: { maxChars: 10 } });
+	let created = 0;
+	(router as unknown as { deps: { knowledge?: unknown } }).deps.knowledge = {
+		ownerId: "owner-1",
+		sources: { createText: async () => { created += 1; return { id: "s1" }; } },
+	};
+	await assert.rejects(
+		() => router.send({ roomSessionId: ROOM, content: "这条消息会超预算", mentions: ["worker-a"], operationId: "op-source-422" }),
+		(error: unknown) => error instanceof RoomMessageError && error.code === "context_too_large",
+	);
+	assert.equal(created, 0);
+});
