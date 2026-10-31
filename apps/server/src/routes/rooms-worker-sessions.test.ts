@@ -760,5 +760,13 @@ test("v4 HTTP: RoomSession Goal 归属 Manager PS，幂等且公开房间身份"
 		assert.equal((await workStates.get(manager))?.goalId, goalId);
 		const read = await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/goal` });
 		assert.equal(read.json().goal.goalId, goalId);
+		const revision = createdGoal.json().goal.revision as number;
+		await workStates.abandonGoal(manager, revision, { kind: "user", by: "web-user", reason: "房间放弃" }, randomUUID(), goalId);
+		assert.equal((await app.inject({ method: "GET", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/goal` })).json().goal, null);
+		const nextGoal = await app.inject({
+			method: "POST", url: `/api/rooms/${room.id}/sessions/${roomSessionId}/goal`,
+			headers: { "idempotency-key": randomUUID() }, payload: { goal: "新目标", completionBoundary: "新边界" },
+		});
+		assert.equal(nextGoal.statusCode, 201, nextGoal.body);
 	} finally { await app.close(); await sessions.disposeAll(); rmSync(dir, { recursive: true, force: true }); }
 });

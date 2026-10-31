@@ -11,6 +11,7 @@ import {
 	abandonGoal,
 	abortRoomTurn,
 	createRoomGoal,
+	supersedeGoal,
 	closeUnknownRoomTurn,
 	fetchRoomGoal,
 	fetchRoomTimeline,
@@ -73,6 +74,7 @@ export function RoomChatPane({
 	const [goalDraft, setGoalDraft] = useState("");
 	const [boundaryDraft, setBoundaryDraft] = useState("");
 	const [creatingGoal, setCreatingGoal] = useState(false);
+	const [replacingGoal, setReplacingGoal] = useState(false);
 	const [targetAgentId, setTargetAgentId] = useState<string | null>(null);
 	const bottomRef = useRef<HTMLDivElement | null>(null);
 
@@ -322,22 +324,29 @@ export function RoomChatPane({
 			<Dialog open={goalOpen} onOpenChange={setGoalOpen}>
 				<DialogContent>
 					<DialogHeader><DialogTitle>{goal ? "当前 Goal" : "新建 Goal"}</DialogTitle><DialogDescription>Goal 归属当前 RoomSession 的 Manager Participant Session。</DialogDescription></DialogHeader>
-					{goal ? <div className="space-y-1 text-sm"><p>{goal.goal}</p><p className="text-muted-foreground">验收：{goal.completionBoundary}</p><p className="text-muted-foreground">状态：{goal.status}</p></div> : (
+					{goal ? <div className="space-y-1 text-sm"><p>{goal.goal}</p><p className="text-muted-foreground">验收：{goal.completionBoundary}</p><p className="text-muted-foreground">状态：{goal.status}</p><Button size="sm" variant="outline" className="mt-2" onClick={() => setReplacingGoal(true)}>更换 Goal</Button></div> : null}
+					{(!goal || replacingGoal) ? (
 						<div className="space-y-3">
 							<Input value={goalDraft} onChange={(event) => setGoalDraft(event.target.value)} placeholder="Goal（要达成什么）" />
 							<Textarea value={boundaryDraft} onChange={(event) => setBoundaryDraft(event.target.value)} placeholder="验收边界（怎样算完成）" className="min-h-[72px]" />
 						</div>
-					)}
+					) : null}
 					<DialogFooter>
 						<Button variant="outline" onClick={() => setGoalOpen(false)}>关闭</Button>
-						{!goal ? <Button disabled={creatingGoal || !goalDraft.trim() || !boundaryDraft.trim()} onClick={() => {
+						{(!goal || replacingGoal) ? <Button disabled={creatingGoal || !goalDraft.trim() || !boundaryDraft.trim()} onClick={() => {
 							if (!roomSessionId) return;
 							setCreatingGoal(true);
-							void createRoomGoal(room.id, roomSessionId, { goal: goalDraft.trim(), completionBoundary: boundaryDraft.trim() }, crypto.randomUUID())
-								.then(() => { toast.success("Goal 已创建"); setGoalOpen(false); setGoalDraft(""); setBoundaryDraft(""); return load(); })
+							const action = goal && replacingGoal
+								? supersedeGoal(goal.managerParticipantSessionId, {
+									expectedGoalId: goal.goalId, expectedRevision: goal.revision, reason: "用户在房间更换 Goal",
+									goal: goalDraft.trim(), completionBoundary: boundaryDraft.trim(),
+								})
+								: createRoomGoal(room.id, roomSessionId, { goal: goalDraft.trim(), completionBoundary: boundaryDraft.trim() }, crypto.randomUUID());
+							void action
+								.then(() => { toast.success(goal && replacingGoal ? "Goal 已更换" : "Goal 已创建"); setGoalOpen(false); setReplacingGoal(false); setGoalDraft(""); setBoundaryDraft(""); return load(); })
 								.catch((caught: unknown) => toast.error(caught instanceof Error ? caught.message : String(caught)))
 								.finally(() => setCreatingGoal(false));
-						}}>{creatingGoal ? "创建中…" : "创建"}</Button> : null}
+						}}>{creatingGoal ? "提交中…" : goal && replacingGoal ? "更换" : "创建"}</Button> : null}
 					</DialogFooter>
 				</DialogContent>
 			</Dialog>

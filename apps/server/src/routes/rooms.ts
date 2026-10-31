@@ -1187,7 +1187,7 @@ export function registerRoomsRoutes(
 		if (!workStates) return reply.code(503).send({ error: "work state store is not configured" });
 		const manager = await teams.managerSessionForRoom(req.params.sid);
 		if (!manager) return reply.code(409).send({ error: "RoomSession 缺少 Manager binding", code: "participant_binding_required" });
-		const goal = await workStates.get(manager);
+		const goal = await workStates.getActive(manager);
 		return { roomSessionId: req.params.sid, managerParticipantSessionId: manager, goal: goal ?? null };
 	});
 
